@@ -5,7 +5,12 @@
 //! position and a game decodes without a board. The enumeration is rebuilt here
 //! once, on first use, from its generating rules.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
+
+mod pieces;
+
+pub use pieces::{decode_piece_word, encode_piece_word};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Color {
@@ -80,6 +85,9 @@ const FIRST_CASTLE: u16 = 0xb129;
 const FIRST_CASTLE_960: u16 = 0xb12d;
 /// First word above the move words: set-up pieces start here.
 pub const FIRST_PIECE_WORD: u16 = 0xc02d;
+
+/// Last set-up piece word.
+pub const LAST_PIECE_WORD: u16 = 0xc30c;
 
 /// ChessBase square (file-major) to rank-major.
 pub fn from_cb_square(cb: u8) -> Sq {
@@ -229,6 +237,29 @@ pub fn decode(word: u16) -> Option<MoveWord> {
     }
 }
 
+fn words() -> &'static HashMap<MoveWord, u16> {
+    static WORDS: OnceLock<HashMap<MoveWord, u16>> = OnceLock::new();
+    WORDS.get_or_init(|| table().iter().enumerate().skip(1).map(|(w, m)| (*m, w as u16)).collect())
+}
+
+fn castle_index(color: Color, side: CastleSide) -> u16 {
+    2 * (color == Color::Black) as u16 + (side == CastleSide::Short) as u16
+}
+
+/// Encodes a move as its word, the inverse of [`decode`]. A move no word names
+/// (a knight moving like a bishop, castling from a Chess960 position above
+/// 959) returns `None`.
+pub fn encode(mv: MoveWord) -> Option<u16> {
+    match mv {
+        MoveWord::Null => Some(NULL_MOVE),
+        MoveWord::Normal { .. } => words().get(&mv).copied(),
+        MoveWord::Castle { color, side } => Some(FIRST_CASTLE + castle_index(color, side)),
+        MoveWord::Castle960 { position, color, side } => {
+            (position < 960).then(|| FIRST_CASTLE_960 + 4 * position + castle_index(color, side))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +310,25 @@ mod tests {
             Some(MoveWord::Castle960 { position: 7, color: Color::Black, side: CastleSide::Short })
         );
         assert_eq!(decode(FIRST_PIECE_WORD), None);
+    }
+
+    #[test]
+    fn encode_inverts_decode() {
+        for w in 1..FIRST_PIECE_WORD {
+            assert_eq!(encode(decode(w).unwrap()), Some(w), "{w:#06x}");
+        }
+        assert_eq!(encode(MoveWord::Null), Some(NULL_MOVE));
+        assert_eq!(decode(NULL_MOVE), Some(MoveWord::Null));
+        let knight_as_bishop = MoveWord::Normal {
+            color: Color::White,
+            piece: Piece::Knight,
+            from: 0,
+            to: 9,
+            captured: Captured::Nothing,
+            promotion: None,
+        };
+        assert_eq!(encode(knight_as_bishop), None);
+        let beyond = MoveWord::Castle960 { position: 960, color: Color::White, side: CastleSide::Long };
+        assert_eq!(encode(beyond), None);
     }
 }

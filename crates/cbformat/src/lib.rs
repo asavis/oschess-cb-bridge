@@ -7,6 +7,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+#[cfg(feature = "fixture")]
+pub mod fixture;
 pub mod movetable;
 pub mod pgn;
 pub mod replay;
@@ -17,7 +19,7 @@ pub enum Error {
     Io(PathBuf, std::io::Error),
     Format(String),
     NoSuchGame(u32),
-    Move { ply: u32, reason: String },
+    Move { ply: u32, reason: replay::MoveError },
 }
 
 impl fmt::Display for Error {
@@ -53,7 +55,8 @@ mod tests {
         assert!(std::error::Error::source(&io).is_some());
         assert_eq!(Error::Format("x".into()).to_string(), "format error: x");
         assert_eq!(Error::NoSuchGame(7).to_string(), "no game with id 7");
-        assert_eq!(Error::Move { ply: 3, reason: "r".into() }.to_string(), "move 3: r");
+        let null = replay::MoveError::NullMove;
+        assert_eq!(Error::Move { ply: 3, reason: null }.to_string(), "move 3: null move");
         assert!(std::error::Error::source(&Error::NoSuchGame(1)).is_none());
     }
 }
