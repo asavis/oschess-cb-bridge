@@ -10,4 +10,3 @@ rust-version.workspace = true
 [dependencies]
 cozy-chess = "0.3"
 memmap2 = "0.9"
-thiserror = "2"

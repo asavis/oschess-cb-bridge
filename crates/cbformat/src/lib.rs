@@ -4,6 +4,7 @@
 //! [`replay`] plays decoded moves on a [`cozy_chess::Board`], checking each
 //! move word against the position.
 
+use std::fmt;
 use std::path::PathBuf;
 
 pub mod movetable;
@@ -11,16 +12,48 @@ pub mod pgn;
 pub mod replay;
 pub mod v2;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("{0}: {1}")]
-    Io(PathBuf, #[source] std::io::Error),
-    #[error("format error: {0}")]
+    Io(PathBuf, std::io::Error),
     Format(String),
-    #[error("no game with id {0}")]
     NoSuchGame(u32),
-    #[error("move {ply}: {reason}")]
     Move { ply: u32, reason: String },
 }
 
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(path, e) => write!(f, "{}: {e}", path.display()),
+            Error::Format(msg) => write!(f, "format error: {msg}"),
+            Error::NoSuchGame(id) => write!(f, "no game with id {id}"),
+            Error::Move { ply, reason } => write!(f, "move {ply}: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(_, e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_and_source() {
+        let io = Error::Io(PathBuf::from("db.2cbh"), std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+        assert_eq!(io.to_string(), "db.2cbh: missing");
+        assert!(std::error::Error::source(&io).is_some());
+        assert_eq!(Error::Format("x".into()).to_string(), "format error: x");
+        assert_eq!(Error::NoSuchGame(7).to_string(), "no game with id 7");
+        assert_eq!(Error::Move { ply: 3, reason: "r".into() }.to_string(), "move 3: r");
+        assert!(std::error::Error::source(&Error::NoSuchGame(1)).is_none());
+    }
+}

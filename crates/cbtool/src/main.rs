@@ -3,19 +3,20 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::replay::walk_tree;
 use cbformat::v2::{Database, RecordKind, Start, Token};
-use rayon::prelude::*;
 
 const USAGE: &str = "usage:
   cbtool info   <db>
   cbtool verify <db> [--limit N]           decode and replay every game and analysis
-  cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)";
+  cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)
+
+CBTOOL_THREADS sets the number of worker threads (default: one per CPU).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,7 +71,7 @@ struct Stats {
 }
 
 impl Stats {
-    fn add(mut self, o: Stats) -> Stats {
+    fn add(&mut self, o: &Stats) {
         self.games += o.games;
         self.texts += o.texts;
         self.analyses += o.analyses;
@@ -85,7 +86,6 @@ impl Stats {
         self.promo_captures_distinct += o.promo_captures_distinct;
         self.en_passant += o.en_passant;
         self.failures += o.failures;
-        self
     }
 }
 
@@ -100,6 +100,69 @@ fn same_kind(captured: Captured, promoted: cbformat::movetable::Piece) -> bool {
     )
 }
 
+/// Decodes and replays one record, adding to `s`; the first 50 failures of
+/// the whole run are kept in `failures`.
+fn verify_record(db: &Database, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
+    let fail = |s: &mut Stats, msg: String| {
+        s.failures += 1;
+        let mut f = failures.lock().unwrap_or_else(|e| e.into_inner());
+        if f.len() < 50 {
+            f.push((id, msg));
+        }
+    };
+    let r = match db.record(id) {
+        Ok(r) => r,
+        Err(e) => return fail(s, e.to_string()),
+    };
+    if r.is_deleted() {
+        s.deleted += 1;
+    }
+    match r.kind() {
+        RecordKind::Game => s.games += 1,
+        RecordKind::Analysis => s.analyses += 1,
+        RecordKind::Text => {
+            s.texts += 1;
+            return;
+        }
+        RecordKind::Unknown(_) => {
+            s.unknown_kind += 1;
+            return;
+        }
+    }
+    let moves = match db.moves_of(&r) {
+        Ok(m) => m,
+        Err(e) => return fail(s, e.to_string()),
+    };
+    if moves.is_chess960() {
+        s.chess960 += 1;
+    }
+    if matches!(moves.start(), Ok(Start::Setup(_))) {
+        s.setups += 1;
+    }
+    for t in moves.tokens() {
+        if let Token::Move(w) = t {
+            match movetable::decode(w) {
+                Some(MoveWord::Null) => s.null_moves += 1,
+                Some(MoveWord::Normal { captured: Captured::EnPassant, .. }) => s.en_passant += 1,
+                Some(MoveWord::Normal { captured, promotion: Some(p), .. }) if captured != Captured::Nothing => {
+                    s.promo_captures += 1;
+                    if !same_kind(captured, p) {
+                        s.promo_captures_distinct += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match walk_tree(&moves, |_, _, _| {}) {
+        Ok(t) => {
+            s.main_plies += t.main_line_plies as u64;
+            s.total_plies += t.total_plies as u64;
+        }
+        Err(e) => fail(s, e.to_string()),
+    }
+}
+
 fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
     let limit = match rest {
         [flag, n] if flag == "--limit" => Some(n.parse::<u32>()?),
@@ -110,78 +173,29 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
     let n = limit.map_or(db.record_count(), |l| l.min(db.record_count()));
     let failures: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
     let started = Instant::now();
-    let stats = (1..=n)
-        .into_par_iter()
-        .fold(Stats::default, |mut s, id| {
-            let fail = |s: &mut Stats, msg: String| {
-                s.failures += 1;
-                let mut f = failures.lock().unwrap();
-                if f.len() < 50 {
-                    f.push((id, msg));
-                }
-            };
-            let r = match db.record(id) {
-                Ok(r) => r,
-                Err(e) => {
-                    fail(&mut s, e.to_string());
-                    return s;
-                }
-            };
-            if r.is_deleted() {
-                s.deleted += 1;
-            }
-            match r.kind() {
-                RecordKind::Game => s.games += 1,
-                RecordKind::Analysis => s.analyses += 1,
-                RecordKind::Text => {
-                    s.texts += 1;
-                    return s;
-                }
-                RecordKind::Unknown(_) => {
-                    s.unknown_kind += 1;
-                    return s;
-                }
-            }
-            let moves = match db.moves_of(&r) {
-                Ok(m) => m,
-                Err(e) => {
-                    fail(&mut s, e.to_string());
-                    return s;
-                }
-            };
-            if moves.is_chess960() {
-                s.chess960 += 1;
-            }
-            if matches!(moves.start(), Ok(Start::Setup(_))) {
-                s.setups += 1;
-            }
-            for t in moves.tokens() {
-                if let Token::Move(w) = t {
-                    match movetable::decode(w) {
-                        Some(MoveWord::Null) => s.null_moves += 1,
-                        Some(MoveWord::Normal { captured: Captured::EnPassant, .. }) => s.en_passant += 1,
-                        Some(MoveWord::Normal { captured, promotion: Some(p), .. })
-                            if captured != Captured::Nothing =>
-                        {
-                            s.promo_captures += 1;
-                            if !same_kind(captured, p) {
-                                s.promo_captures_distinct += 1;
-                            }
-                        }
-                        _ => {}
+    // Workers claim runs of ids from a shared counter and fold their own
+    // statistics, merged once at the end.
+    const RUN: u32 = 4_096;
+    let next_run = AtomicU32::new(0);
+    let total = Mutex::new(Stats::default());
+    std::thread::scope(|scope| {
+        for _ in 0..threads() {
+            scope.spawn(|| {
+                let mut s = Stats::default();
+                loop {
+                    let first = next_run.fetch_add(1, Ordering::Relaxed).saturating_mul(RUN).saturating_add(1);
+                    if first > n {
+                        break;
+                    }
+                    for id in first..=first.saturating_add(RUN - 1).min(n) {
+                        verify_record(&db, id, &mut s, &failures);
                     }
                 }
-            }
-            match walk_tree(&moves, |_, _, _| {}) {
-                Ok(t) => {
-                    s.main_plies += t.main_line_plies as u64;
-                    s.total_plies += t.total_plies as u64;
-                }
-                Err(e) => fail(&mut s, e.to_string()),
-            }
-            s
-        })
-        .reduce(Stats::default, Stats::add);
+                total.lock().unwrap_or_else(|e| e.into_inner()).add(&s);
+            });
+        }
+    });
+    let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
     let secs = started.elapsed().as_secs_f64();
     println!("records verified   {n} in {secs:.1} s ({:.0} records/s)", n as f64 / secs);
     println!("games              {}", stats.games);
