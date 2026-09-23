@@ -181,7 +181,8 @@ The reader was checked against:
   castle although the stored castling byte lacks that right: 0 in an older
   database, `0x0b` in another. The reader starts such a game with the right its
   castling uses added, when the king and the rook stand where the right needs
-  them (`cbh::start_as_played`); otherwise the move is an error. The stored
+  them: their home squares, or in Chess960 the squares the record names
+  (`cbh::start_as_played`); otherwise the move is an error. The stored
   byte itself is still reported by `GameMoves::start`.
 - **Text encoding.** The description says ISO 8859-1. Names are read as
   Windows-1252, which ChessBase, a Windows program, means by the bytes
@@ -210,11 +211,14 @@ The reader was checked against:
   (`g1` `c1` `g8` `c8` for the side to move) as both squares; in any other game,
   two bytes moving the king from `e1` or `e8` to the `g` or `c` square of the
   same rank. Any other move onto a piece of the side to move is an error.
-- **Chess960 castling rooks.** The rook squares after a Chess960 start
-  position name the rook each castling right uses. A set-up keeps them, so a
-  right castles with the named rook even when another rook stands further
-  out, such as one promoted to. A square that is not on its side's back rank
-  names nothing, and that right uses the outermost rook on its wing.
+- **Chess960 castling squares.** The six squares after a Chess960 start
+  position name each side's king square and the rook each castling right
+  uses. A set-up keeps them: a side keeps its rights only while its king
+  stands on its named square, and a right castles with the named rook even
+  when another rook stands further out, such as one promoted to. A right the
+  reader adds for a castling move (above) obeys the same squares. A square
+  that is not on its side's back rank names nothing: the right then needs no
+  particular king square and uses the outermost rook on its wing.
 - **Nesting.** At most 1,024 variations may be open at once
   (`cbh::MAX_VARIATION_DEPTH`); a deeper tree is an error, raised before its
   position is saved. The deepest nesting measured is 74 in the Mega Database

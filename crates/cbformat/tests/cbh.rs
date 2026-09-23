@@ -490,3 +490,51 @@ fn ordinary_moves_onto_an_own_piece_are_refused() {
     let rook = raw(0, &[(235, 0), ((w >> 8) as u8, 0), (w as u8, 0), (255, 1)]);
     assert!(walk(&move_record(0x40, Some(&start), None, &rook)).unwrap_err().to_string().contains("h1f1 lands on"));
 }
+
+/// The Chess960 bytes of the review's records: kings e1 and e8; rooks f1 and
+/// d1 for white's king's and queen's side, f8 and d8 for black's; start
+/// position 15.
+const NAMED_SQUARES: [u8; 8] = [0x20, 0x27, 0x28, 0x18, 0x2f, 0x1f, 0x00, 0x0f];
+
+/// A mode-10 set-up with the squares above: the side to move has its king on
+/// `king` and a rook on its named short-side square, the other king stands in
+/// a corner, and the one move is short castling, written as the king's
+/// destination.
+fn short_castle_960(king: &str, black: bool, castling: u8) -> Vec<u8> {
+    use Color::{Black, White};
+    use cbformat::fixture_cbh::raw;
+    let (us, them, rook, other) = if black { (Black, White, "f8", "a1") } else { (White, Black, "f1", "a8") };
+    let pieces = [(king, Piece::King, us), (rook, Piece::Rook, us), (other, Piece::King, them)];
+    let start = start_position(&pieces, black, castling, 0);
+    let w: u16 = if black { 55 } else { 48 } * 65; // g8 or g1, as both squares
+    let stream = raw(10, &[(235, 0), ((w >> 8) as u8, 0), (w as u8, 0), (255, 1)]);
+    move_record(0x4a, Some(&start), Some(&NAMED_SQUARES), &stream)
+}
+
+/// The review's record: white Kd1 Rf1, black Ka8, no castling rights, and the
+/// castling encoding. The king is off the e1 square the record names.
+const KING_AWAY: &str = "4a00002c0100003c019000088000a80000000000000000000000000000000000202728182f1f000f1e426224";
+
+/// A right needs the king on the square the record names, whether it is
+/// stored or inferred from the game's castling.
+#[test]
+fn chess960_castling_needs_the_king_on_its_named_square() {
+    let rec = hex(KING_AWAY);
+    let g = GameMoves::parse(&rec).unwrap();
+    let Start::Setup(s) = g.start().unwrap() else { panic!("a set-up") };
+    assert_eq!(s.castling_kings, [Some(4), Some(4)]);
+    assert!(matches!(cbh::start_as_played(&g).unwrap(), Start::Setup(s) if s.castling == 0));
+    assert!(walk(&rec).unwrap_err().to_string().contains("castling without the right"));
+    let mut stored = rec.clone();
+    stored[6] = 2; // white O-O
+    assert!(walk(&stored).unwrap_err().to_string().contains("castling without the right"));
+    for black in [false, true] {
+        let (home, away, castled, bit) = if black { ("e8", "d8", "e8f8", 8) } else { ("e1", "d1", "e1f1", 2) };
+        for castling in [0, bit] {
+            let played = walk(&short_castle_960(home, black, castling)).unwrap().0;
+            assert_eq!(played, [castled], "{home}, castling {castling}");
+            let err = walk(&short_castle_960(away, black, castling)).unwrap_err().to_string();
+            assert!(err.contains("castling without the right"), "{away}, castling {castling}: {err}");
+        }
+    }
+}

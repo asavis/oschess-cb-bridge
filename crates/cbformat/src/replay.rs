@@ -72,6 +72,10 @@ fn setup_board(s: &Setup) -> Result<Board> {
         // A right is kept only when the king and a rook stand where it needs
         // them, so a stray bit cannot make the position unbuildable.
         let Some(kf) = king_file else { continue };
+        // A king the record names must stand on its named square.
+        if s.castling_kings[c.index()].is_some_and(|named| named != kf) {
+            continue;
+        }
         let home = |f: u8| (kf == 4 && rook_files.contains(&f)).then_some(f);
         // A rook the record names must stand on its wing of the king.
         let named = |i: usize, wing: fn(u8, u8) -> bool| {

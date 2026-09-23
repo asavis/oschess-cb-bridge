@@ -137,3 +137,15 @@ impl Pieces {
 fn lists(what: &str) -> Error {
     Error::Format(format!("piece lists: {what} does not match the board"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_variation_stack_stays_small() {
+        // An open variation keeps a board and the piece lists.
+        let entry = std::mem::size_of::<(Board, Pieces)>();
+        assert!(entry * crate::cbh::MAX_VARIATION_DEPTH < 400 << 10, "{entry} bytes per open variation");
+    }
+}

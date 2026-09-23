@@ -98,7 +98,8 @@ impl<'a> GameMoves<'a> {
             move_number,
             side_to_move,
             castling,
-            castling_rooks: self.chess960.map_or([None; 4], castling_rooks),
+            castling_rooks: self.chess960.map_or([None; 4], |e| named_squares(e).1),
+            castling_kings: self.chess960.map_or([None; 2], |e| named_squares(e).0),
             en_passant_file: (1..=8).contains(&ep).then(|| ep - 1),
             en_passant_raw: u16::from(ep),
             pieces,
@@ -106,15 +107,17 @@ impl<'a> GameMoves<'a> {
     }
 }
 
-/// The castling rook files the Chess960 squares name, in the order of the
-/// castling bits: white O-O-O, white O-O, black O-O-O, black O-O. The squares
-/// are the rooks' start squares; one that is not a square on its side's back
-/// rank names nothing, and its right falls back to the outermost rook.
-fn castling_rooks(extra: &[u8]) -> [Option<u8>; 4] {
-    // Bytes 2-5: white king's side, white queen's side, black king's side,
-    // black queen's side.
+/// The files of the king and rook squares the Chess960 bytes name: the
+/// kings (white, black), and the castling rooks in the order of the castling
+/// bits (white O-O-O, white O-O, black O-O-O, black O-O). They are the start
+/// squares, which a side's king and rook must still stand on to castle. One
+/// that is not a square on its side's back rank names nothing: a right then
+/// needs no particular king square and uses the outermost rook.
+fn named_squares(extra: &[u8]) -> ([Option<u8>; 2], [Option<u8>; 4]) {
+    // Bytes 0-1: the kings; 2-5: white king's side, white queen's side, black
+    // king's side, black queen's side.
     let file = |i: usize, back_rank: u8| (extra[i] < 64 && extra[i] % 8 == back_rank).then_some(extra[i] / 8);
-    [file(3, 0), file(2, 0), file(5, 7), file(4, 7)]
+    ([file(0, 0), file(1, 7)], [file(3, 0), file(2, 0), file(5, 7), file(4, 7)])
 }
 
 /// Decodes the 192-bit board stream: per square, a 0 bit for an empty square,

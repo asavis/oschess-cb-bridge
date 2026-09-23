@@ -319,7 +319,8 @@ impl TreeVisitor for Silent {
 /// moves in set-up games whose stored castling rights lack them; older
 /// databases store no rights at all. Such a game starts with the rights its
 /// castling moves use added, as long as the king and the rook stand where a
-/// right needs them. Otherwise, and for every other game, this is
+/// right needs them: on their home squares, or in Chess960 on the squares the
+/// record names. Otherwise, and for every other game, this is
 /// [`GameMoves::start`].
 pub fn start_as_played(game: &GameMoves<'_>) -> Result<Start> {
     let start = game.start()?;
@@ -339,7 +340,13 @@ pub fn start_as_played(game: &GameMoves<'_>) -> Result<Start> {
         if s.castling & bit != 0 {
             break;
         }
+        // Only a right the position can hold is added: king and rook on the
+        // squares it needs, the named ones when the record names them.
         s.castling |= bit;
+        if !start_board(&Start::Setup(s.clone())).is_ok_and(|b| b.castling_rook(color, side).is_some()) {
+            s.castling &= !bit;
+            break;
+        }
     }
     Ok(Start::Setup(s))
 }
@@ -383,15 +390,4 @@ fn run(
         Ok(w.stats)
     });
     (result, w.missing_right.get())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_variation_stack_stays_small() {
-        let entry = std::mem::size_of::<(Board, Pieces)>();
-        assert!(entry * MAX_VARIATION_DEPTH < 400 << 10, "{entry} bytes per open variation");
-    }
 }
