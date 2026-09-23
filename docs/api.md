@@ -166,9 +166,10 @@ cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
 are free, waits up to 5 seconds for the first one, and is answered `503 busy`
 when none comes free; many requests at once therefore wait for each other
 instead of multiplying the threads. Each worker reads headers into one 3 MiB
-buffer, reserved in the budget before it is allocated. What a worker builds,
-such as its matches or its share of a name table, grows in steps of a 256th of
-the budget, from 64 KiB to 1 MiB. A search's workers take at most half the
+buffer, reserved in the budget before it is allocated; a worker loading names
+reserves 64 KiB for one record, which is read to at most 4 KiB. What a worker
+builds, such as its matches or its share of a name table, grows in steps of a
+256th of the budget, from 64 KiB to 1 MiB. A search's workers take at most half the
 budget with their buffers and one step each, which leaves the other half for
 the rest of what they build, and with little budget left a search runs on
 fewer workers, down to one.
@@ -356,7 +357,9 @@ fields.
 
 Text fields in a row are cut at 200 characters and then end with `…`; the
 game's PGN has them in full. A window therefore stays small however long a
-name stored in the database is.
+name stored in the database is. Rows, like searches, read a name's entity
+record to at most 4 KiB; a longer record, which only a damaged file holds, is
+an empty name.
 
 ### `GET /v1/databases/{id}/games/{number}`
 

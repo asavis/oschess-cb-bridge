@@ -341,7 +341,8 @@ impl<'a> Names<'a> {
         if let Some(name) = self.players.get(&id) {
             return Ok(name.clone());
         }
-        let name = clip(self.db.entities().player(id)?.map(|p| p.pgn()).unwrap_or_default());
+        let name =
+            clip(self.db.entities().player_within(id, search::MAX_NAME_RECORD)?.map(|p| p.pgn()).unwrap_or_default());
         self.players.insert(id, name.clone());
         Ok(name)
     }
@@ -351,7 +352,11 @@ impl<'a> Names<'a> {
         if let Some(t) = self.tournaments.get(&id) {
             return Ok(t.clone());
         }
-        let t = self.db.entities().tournament(id)?.map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
+        let t = self
+            .db
+            .entities()
+            .tournament_within(id, search::MAX_NAME_RECORD)?
+            .map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
         self.tournaments.insert(id, t.clone());
         Ok(t)
     }
@@ -361,7 +366,7 @@ impl<'a> Names<'a> {
         if let Some(t) = self.titles.get(&id) {
             return Ok(t.clone());
         }
-        let t = clip(self.db.entities().title(id)?.unwrap_or_default());
+        let t = clip(self.db.entities().title_within(id, search::MAX_NAME_RECORD)?.unwrap_or_default());
         self.titles.insert(id, t.clone());
         Ok(t)
     }

@@ -15,6 +15,13 @@ use super::workers::{self, threads};
 const IDS_PER_WORKER_MIN: usize = 4096;
 /// Ids read between two cancellation checks.
 const IDS_PER_CHECK: usize = 1024;
+/// The longest entity record read for a name, in bytes. Real names are a few
+/// dozen bytes; a longer record, which only a damaged or hostile file holds,
+/// reads as an empty name, and none is ever read whole.
+pub const MAX_NAME_RECORD: usize = 4 << 10;
+/// Each name worker's workspace for one record, decoded and lowercased,
+/// reserved in the budget before the worker starts.
+const NAME_WORKSPACE: usize = 64 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -74,7 +81,7 @@ impl NameTable {
         // Two string ends per id, reserved before anything is read.
         let shared = Mutex::new(Hold::reserve(count.checked_mul(8).ok_or(Refused::TooLarge)?)?);
         let want = threads().min(count.div_ceil(IDS_PER_WORKER_MIN)).max(1);
-        let chunks = workers::run(want, 0, cancel, |w| {
+        let chunks = workers::run(want, NAME_WORKSPACE, cancel, |w| {
             let per = count.div_ceil(w.count).max(1);
             let (first, end) = ((w.index * per).min(count), ((w.index + 1) * per).min(count));
             let mut allow = Allowance::new(&shared);
@@ -93,9 +100,9 @@ impl NameTable {
                     return Err(SearchError::Superseded);
                 }
                 let name = match kind {
-                    Kind::Players => e.player(id as i64)?.map(|p| p.pgn()),
-                    Kind::Tournaments => e.tournament(id as i64)?.map(|t| t.title),
-                    Kind::Titles => e.title(id as i64)?,
+                    Kind::Players => e.player_within(id as i64, MAX_NAME_RECORD)?.map(|p| p.pgn()),
+                    Kind::Tournaments => e.tournament_within(id as i64, MAX_NAME_RECORD)?.map(|t| t.title),
+                    Kind::Titles => e.title_within(id as i64, MAX_NAME_RECORD)?,
                 }
                 .unwrap_or_default();
                 push_str(&mut c.names, &name, &mut allow)?;

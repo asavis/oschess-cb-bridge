@@ -409,29 +409,37 @@ fn texts_and_analyses_are_read_with_their_own_layouts() {
     );
 }
 
-/// 500 rows sharing one player whose name fills a 1 MiB container: names are
-/// cut to 200 characters and looked up once, so the window stays small.
+/// 500 rows sharing two players: one whose name fills a 1 MiB container and
+/// one with a 3,000-character name. A name record is read to at most 4 KiB,
+/// so the first is an empty name; the second is cut to 200 characters. Both
+/// are looked up once, and the window stays small.
 #[test]
 fn a_huge_shared_entity_does_not_blow_up_a_window() {
     let mut b = Builder::new();
     let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
-    for _ in 0..500 {
-        b.game(e4);
+    for n in 0..500i64 {
+        b.game(e4)[0x18..0x20].copy_from_slice(&(n % 2).to_le_bytes());
     }
-    let last = "M".repeat((1 << 20) - 16);
-    let player = strings(&[&last, ""]);
-    let mut lid = lid_header(1 << 20, 1);
-    lid.extend((player.len() as i32).to_le_bytes());
-    lid.extend(&player);
+    let container = 1usize << 20;
+    let mut lid = lid_header(container as i32, 2);
+    for last in ["M".repeat(container - 16), "L".repeat(3000)] {
+        let player = strings(&[&last, ""]);
+        let mut slot = (player.len() as i32).to_le_bytes().to_vec();
+        slot.extend(&player);
+        slot.resize(container, 0);
+        lid.extend(slot);
+    }
     b.lid(lid);
     let db = b.write("api-huge-entity");
     let r = start(&db, vec![], None);
     let w = get(r.port, &format!("/v1/databases/{}/games?limit=500", r.id), "");
     assert_eq!(w.status, 200);
     assert!(w.body.len() < 2 << 20, "window of {} bytes", w.body.len());
-    let white = w.body.split(r#""white":""#).nth(1).unwrap().split('"').next().unwrap();
-    assert_eq!(white.chars().count(), bridge::api::MAX_FIELD_CHARS + 1);
-    assert!(white.ends_with('…'));
+    let whites: Vec<&str> =
+        w.body.split(r#""white":""#).skip(1).map(|s| s.split('"').next().unwrap()).take(2).collect();
+    assert_eq!(whites[0], "", "a 1 MiB name record is not read");
+    assert_eq!(whites[1].chars().count(), bridge::api::MAX_FIELD_CHARS + 1);
+    assert!(whites[1].starts_with('L') && whites[1].ends_with('…'));
 }
 
 /// A window ending at record `u32::MAX` is served. The header file is sparse,

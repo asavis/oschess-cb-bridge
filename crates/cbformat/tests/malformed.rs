@@ -149,6 +149,38 @@ fn entity_ids_beyond_the_file_read_as_missing() {
     }
 }
 
+/// A player record: last name `last`, empty first name.
+fn player_record(last: &[u8]) -> Vec<u8> {
+    let mut r = (last.len() as i32).to_le_bytes().to_vec();
+    r.extend(last);
+    r.extend(0i32.to_le_bytes());
+    let mut c = (r.len() as i32).to_le_bytes().to_vec();
+    c.extend(r);
+    c
+}
+
+#[test]
+fn a_record_longer_than_the_limit_is_not_read() {
+    // Player 0 is short, player 1 fills its 64 KiB container.
+    let container = 64 << 10;
+    let mut lid = lid_header(container, 2);
+    let mut short = player_record(b"Tal");
+    short.resize(container as usize, 0);
+    let mut long = player_record(&vec![b'x'; container as usize - 12]);
+    long.resize(container as usize, 0);
+    lid.extend(short);
+    lid.extend(long);
+    let f = fixture("record-limit", lid, |_| {});
+    let db = Database::open(f.base()).unwrap();
+    let e = db.entities();
+    assert_eq!(e.player_within(0, 64).unwrap().map(|p| p.last), Some("Tal".to_string()));
+    assert_eq!(e.player_within(1, 4 << 10).unwrap(), None, "longer than the limit");
+    assert_eq!(e.player(1).unwrap().map(|p| p.last.len()), Some(container as usize - 12), "no limit");
+    assert_eq!(e.raw_within(0, 1, 4 << 10).unwrap(), None);
+    assert_eq!(e.tournament_within(0, 16).unwrap(), None, "no tournament table");
+    assert_eq!(e.title_within(0, 16).unwrap(), None, "no title table");
+}
+
 #[test]
 fn stored_counts_are_bounded_by_the_file() {
     // The header claims i64::MAX players; the file holds one container, cut short.

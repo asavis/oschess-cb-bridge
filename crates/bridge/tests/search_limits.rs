@@ -271,6 +271,58 @@ fn many_names_load_on_many_workers_within_a_small_budget() {
     assert_eq!(status, 200, "{out}");
 }
 
+/// A player table of `slots` 1 MiB containers, a hole on disk except for a
+/// 1 MiB name at the start of each worker's range of 4,096 ids.
+fn huge_names_lid(path: &Path, slots: i64) {
+    use std::io::{Seek, SeekFrom};
+    let container: i32 = 1 << 20;
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(&cbformat::fixture::lid_header(container, slots)).unwrap();
+    let mut record = vec![0u8; container as usize];
+    let last = container as usize - 12;
+    record[..4].copy_from_slice(&(last as i32 + 8).to_le_bytes());
+    record[4..8].copy_from_slice(&(last as i32).to_le_bytes());
+    record[8..8 + last].fill(b'x');
+    for id in (1..slots).step_by(4096) {
+        f.seek(SeekFrom::Start(184 + id as u64 * u64::from(container as u32))).unwrap();
+        f.write_all(&record).unwrap();
+    }
+    f.set_len(184 + slots as u64 * u64::from(container as u32)).unwrap();
+}
+
+/// Name records of 1 MiB at the start of each of sixteen workers' ranges,
+/// under the 256 MiB limit and a 16 MiB budget, with requests arriving at
+/// once: a name record is read to at most 4 KiB, so a longer one is an empty
+/// name, and every request gets an answer while the bridge keeps serving.
+#[test]
+fn huge_name_records_are_never_read_whole() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    b.game(e4)[0x18..0x20].copy_from_slice(&1i64.to_le_bytes());
+    let db = b.write("limits-huge-names");
+    huge_names_lid(&db.dir().join("db.2lid"), 16 * 4096);
+    let path = db.dir().join("db.2cbh");
+    let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
+    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    let answers: Vec<(u16, String)> = std::thread::scope(|s| {
+        let running: Vec<_> = (0..8)
+            .map(|n| {
+                let path = format!("/v1/databases/{}/games?q=player:absent{n}&limit=1", b.id);
+                let port = b.port;
+                s.spawn(move || get(port, &path))
+            })
+            .collect();
+        running.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (status, out) in &answers {
+        assert!(*status == 200 || (*status == 503 && out.contains(r#""code":"busy""#)), "{out}");
+    }
+    assert_eq!(get(b.port, "/v1/status").0, 200, "the bridge is still running");
+    let (status, out) = get(b.port, &format!("/v1/databases/{}/games?q=player:x&limit=1", b.id));
+    assert_eq!(status, 200, "{out}");
+    assert!(out.contains(r#""total":0"#), "a name over 4 KiB is empty: {out}");
+}
+
 /// Two dozen searches at once, under the 256 MiB limit, four workers and a
 /// 16 MiB search budget: every connection gets an answer, `200` or `503`, and
 /// the bridge keeps serving. Scans share the four workers instead of starting

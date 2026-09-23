@@ -36,6 +36,10 @@ Only the first 1,024 characters are read. After 32 terms (a `sort:` token does
 not count), further terms are ignored, and a value is cut to its first 256
 characters after trimming.
 
+Names are read from entity records of at most 4 KiB. A longer record, which
+only a damaged file holds, is searched and sorted as an empty name and never
+read whole.
+
 ## Qualifiers
 
 | Qualifier | Field | Matching |
