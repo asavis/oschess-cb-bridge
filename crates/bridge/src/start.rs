@@ -9,7 +9,9 @@ use std::sync::Arc;
 use crate::access::{DEFAULT_ORIGINS, Policy};
 use crate::api::App;
 use crate::catalog::Catalog;
-use crate::{config, pairing, server, token};
+use crate::fetch::System;
+use crate::sources::Sources;
+use crate::{config, documents, pairing, server, token};
 
 /// The options every way of starting the bridge takes.
 pub const OPTIONS: &str = "[--database <path>]... [--show-token] [--new-token]
@@ -17,6 +19,10 @@ pub const OPTIONS: &str = "[--database <path>]... [--show-token] [--new-token]
   --database <path>   serve this database too (repeatable)
   --show-token        show the pairing link, which contains the token
   --new-token         replace the pairing token; paired browsers must pair again
+
+The databases are those of ChessBase's database window (DBItems.cbini in
+Documents\\ChessBase; OSCHESS_BRIDGE_DOCUMENTS names another Documents folder),
+then those of bridge.toml, then --database.
 
 Settings live in bridge.toml in the data folder (OSCHESS_BRIDGE_HOME, else
 %APPDATA%\\oschess-bridge on Windows, ~/.config/oschess-bridge elsewhere).";
@@ -80,12 +86,19 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
     let listeners = server::bind(config.port).map_err(|e| format!("port {}: {e}", config.port))?;
     let token = if options.new_token { token::replace(dir) } else { token::load_or_create(dir) }
         .map_err(|e| format!("pairing token in {}: {e}", dir.display()))?;
-    let databases = options.databases.iter().cloned().chain(config.databases);
+    // The databases of bridge.toml are read by the catalog, again whenever
+    // the file changes.
+    let config_path = dir.join("bridge.toml");
+    let sources = Sources {
+        chessbase: documents::chessbase_folder(),
+        config: Some(config_path),
+        fixed: options.databases.clone(),
+    };
     let link = pairing::link(web, &token, config.port);
     let app = App {
         version: env!("CARGO_PKG_VERSION"),
         policy: Policy { port: config.port, origins, token: token.clone() },
-        catalog: Catalog::new(databases),
+        catalog: Catalog::with_sources(sources, Arc::new(System)),
         between_reads: None,
     };
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })

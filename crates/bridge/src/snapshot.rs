@@ -20,8 +20,11 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Database {
     pub id: String,
-    /// The name ChessBase shows: the file name without its extension.
+    /// The name ChessBase's window shows: its title for the database, else
+    /// the file name without its extension.
     pub name: String,
+    /// Checked without reading a file kept in the cloud: such a database is
+    /// `CloudOnly`, or `Downloading` once its games were asked for.
     pub state: State,
 }
 
@@ -52,12 +55,13 @@ impl Background {
     /// The state now. Checking a database opens it when it is ready, so call
     /// this from a thread that may wait on the disk.
     pub fn snapshot(&self) -> Snapshot {
-        let databases = self.app.catalog.entries().iter();
+        let entries = self.app.catalog.entries();
         Snapshot {
             version: self.app.version,
             port: self.port,
             stopped: self.stopped.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            databases: databases
+            databases: entries
+                .iter()
                 .map(|e| Database { id: e.id.clone(), name: e.name.clone(), state: e.state() })
                 .collect(),
         }

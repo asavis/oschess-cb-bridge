@@ -24,7 +24,7 @@ pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
     };
     println!("{:>3}  {:<6} {:<11} {:>10} {:>10}  name", "#", "format", "state", "listed", "records");
     for (i, e) in list.entries.iter().enumerate() {
-        let path = local_path(dir, &e.path, cfg!(windows));
+        let path = dbitems::local_path(dir, &e.path);
         // Every file the database would be opened through is checked from its
         // metadata first; a database is opened only when all of them are here.
         let files: Vec<(State, bool)> =
@@ -160,41 +160,9 @@ fn unallocated(len: u64, blocks: u64) -> State {
     if len > 0 && blocks == 0 { State::MaybeCloudOnly } else { State::Present }
 }
 
-/// A stored path as a path on this computer. ChessBase stores absolute Windows
-/// paths. Elsewhere (WSL) a drive path `X:\…` maps to `/mnt/x/…`. A relative
-/// path is taken relative to the documents folder.
-fn local_path(dir: &Path, stored: &str, windows: bool) -> PathBuf {
-    let b = stored.as_bytes();
-    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
-    if windows {
-        let p = PathBuf::from(stored);
-        return if p.is_absolute() || drive { p } else { dir.join(p) };
-    }
-    if drive {
-        let rest = stored[3..].replace('\\', "/");
-        return PathBuf::from(format!("/mnt/{}/{rest}", (b[0] as char).to_ascii_lowercase()));
-    }
-    if stored.starts_with('/') {
-        return PathBuf::from(stored);
-    }
-    dir.join(stored.replace('\\', "/"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stored_paths_on_this_computer() {
-        let dir = Path::new("/docs");
-        assert_eq!(
-            local_path(dir, r"C:\Users\u\Documents\A b.2cbh", false),
-            PathBuf::from("/mnt/c/Users/u/Documents/A b.2cbh")
-        );
-        assert_eq!(local_path(dir, r"MyWork\A.cbh", false), PathBuf::from("/docs/MyWork/A.cbh"));
-        assert_eq!(local_path(dir, "/tmp/x.2cbh", false), PathBuf::from("/tmp/x.2cbh"));
-        assert_eq!(local_path(dir, r"C:\A.2cbh", true), PathBuf::from(r"C:\A.2cbh"));
-    }
 
     #[test]
     fn a_database_is_as_available_as_its_least_available_file() {

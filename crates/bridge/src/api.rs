@@ -93,28 +93,42 @@ fn route(app: &App, req: &Request) -> Response {
 
 fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Response {
     match app.catalog.get(id) {
-        Some(entry) => f(entry),
+        Some(entry) => f(&entry),
         None => not_found(),
     }
 }
 
 fn status(app: &App) -> Response {
-    let states: Vec<State> = app.catalog.entries().iter().map(Entry::state).collect();
+    let entries = app.catalog.entries();
+    let states: Vec<State> = entries.iter().map(|e| e.state()).collect();
     let count = |s: State| states.iter().filter(|&&x| x == s).count() as i64;
     let dbs = Obj::new()
         .num("ready", count(State::Ready))
         .num("opening", 0)
         .num("missing", count(State::Missing))
-        .num("cloudOnly", 0)
+        .num("cloudOnly", count(State::CloudOnly))
+        .num("downloading", count(State::Downloading))
         .num("unsupported", count(State::Unsupported))
         .num("unreadable", count(State::Unreadable))
         .done();
     let bridge = Obj::new().str("version", app.version).num("api", API_VERSION).done();
-    ok(Obj::new().raw("bridge", &bridge).raw("databases", &dbs).done())
+    let mut body = Obj::new().raw("bridge", &bridge).raw("databases", &dbs);
+    // The downloads running or queued, together.
+    let downloads: Vec<_> = entries.iter().filter_map(|e| e.progress()).collect();
+    if !downloads.is_empty() {
+        let (present, total) = downloads.iter().fold((0, 0), |(p, t), d| (p + d.present(), t + d.total));
+        body = body.raw("download", &progress(present, total));
+    }
+    ok(body.done())
+}
+
+fn progress(present: u64, total: u64) -> String {
+    Obj::new().num("present", present as i64).num("total", total as i64).done()
 }
 
 fn databases(app: &App) -> Response {
-    let items = app.catalog.entries().iter().map(|e| {
+    let entries = app.catalog.entries();
+    let items = entries.iter().map(|e| {
         let o = Obj::new().str("id", &e.id).str("name", &e.name).str("format", e.format.name());
         match e.open() {
             Ok(open) => o
@@ -122,7 +136,16 @@ fn databases(app: &App) -> Response {
                 .num("records", open.db.record_count())
                 .str("generation", &format!("{:016x}", open.generation))
                 .done(),
-            Err(state) => o.str("state", state.name()).done(),
+            Err(state) => {
+                let o = o.str("state", state.name());
+                match (state, e.progress()) {
+                    (State::Downloading, Some(p)) => {
+                        o.num("size", p.total as i64).raw("progress", &progress(p.present(), p.total)).done()
+                    }
+                    (State::CloudOnly | State::Downloading, _) => o.num("size", e.size() as i64).done(),
+                    _ => o.done(),
+                }
+            }
         }
     });
     ok(Obj::new().raw("databases", &json::array(items)).done())
@@ -165,7 +188,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
     if req.param("q").is_some_and(|q| !q.trim().is_empty()) {
         return bad_parameter("q", "search is not served yet");
     }
-    let open = match entry.open() {
+    let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
@@ -324,7 +347,7 @@ fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
     // Languages ChessBase has no number for are passed over; English is the default.
     let options = pgn::Options::with_languages(req.param("lang").unwrap_or("en").split(','));
     for _ in 0..GAME_ATTEMPTS {
-        let open = match entry.open() {
+        let open = match entry.open_to_read() {
             Ok(open) => open,
             Err(state) => return unavailable(state),
         };

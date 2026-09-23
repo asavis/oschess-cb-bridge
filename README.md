@@ -52,6 +52,15 @@ pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
 same options, for development. `web` in `bridge.toml` points the pairing link
 at another allowed site, such as `https://staging.oschess.org`.
 
+It serves the databases ChessBase's database window shows, read from
+`DBItems.cbini` in `Documents\ChessBase`. The Documents folder is the one
+Windows reports, wherever it has been moved; `OSCHESS_BRIDGE_DOCUMENTS` names
+another one, and outside Windows only that variable gives one. Databases or
+folders of databases listed under `databases` in `bridge.toml`, and
+`--database`, add more. The list is read again when those files change. A
+database kept only in the cloud is not read while it is listed; opening it in
+oschess downloads it first ([docs/api.md](docs/api.md#cloud-only-databases)).
+
 A database path may name the `.2cbh` file or the common stem of its files.
 Databases are opened read-only and read with positional reads; nothing is
 written, and nothing leaves the machine except what the bridge serves to the

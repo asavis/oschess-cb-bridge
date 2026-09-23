@@ -16,5 +16,9 @@ cbformat = { version = "0.1.0", path = "../cbformat" }
 # The pairing token: the standard library has no public API for operating-system randomness.
 getrandom = "0.3"
 
+[target.'cfg(windows)'.dependencies]
+# The Documents known folder (documents.rs); already in the tree through same-file.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+
 [dev-dependencies]
 cbformat = { version = "0.1.0", path = "../cbformat", features = ["fixture"] }
