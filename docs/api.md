@@ -233,8 +233,9 @@ starts a download and is answered `409 database_unavailable` with state
 `downloading`. The bridge reads the database's files one after another in the
 background, one database at a time; a database waiting for its turn is
 `downloading` too. `/v1/databases` shows the `progress`. When the files are
-here the database is `ready`. A download that fails leaves it `cloudOnly`, and
-the next request for its games tries again.
+here the database is `ready`. A download that fails, or cannot start, leaves
+it `cloudOnly` (the request is then answered with that state), and the next
+request for its games tries again.
 
 The state follows the current marks alone: a database with any file marked
 as kept in the cloud is `cloudOnly` (or `downloading` while its download runs

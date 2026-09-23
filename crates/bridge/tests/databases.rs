@@ -352,6 +352,29 @@ fn a_failed_download_can_be_tried_again() {
     wait_for(&entry, State::Ready);
 }
 
+/// A download whose thread cannot start leaves the database cloud-only, not
+/// downloading for ever: once threads start again, the next request for its
+/// games downloads it.
+#[test]
+fn a_download_that_cannot_start_is_tried_again() {
+    let root = Root::new("no-thread");
+    let db = database_at(&root.path("bases"), "Remote");
+    let cloud = Arc::new(FakeCloud::with_files(files_of(&db), false));
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let entry = catalog.get(&id_of(&db)).unwrap();
+    catalog.downloads().refuse_starts(true);
+    for _ in 0..3 {
+        assert!(matches!(entry.open_to_read(), Err(State::CloudOnly)));
+        assert_eq!(entry.state(), State::CloudOnly);
+        assert!(entry.progress().is_none());
+    }
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0);
+    catalog.downloads().refuse_starts(false);
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    wait_for(&entry, State::Ready);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 3);
+}
+
 /// Databases download one at a time; a queued one reports downloading.
 #[test]
 fn downloads_run_one_at_a_time() {

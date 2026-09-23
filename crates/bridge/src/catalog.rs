@@ -179,13 +179,11 @@ impl Entry {
     }
 
     /// [`Entry::open`] for reading games: a cloud-only database starts
-    /// downloading and is reported [`State::Downloading`].
+    /// downloading and is reported [`State::Downloading`]; it stays
+    /// [`State::CloudOnly`] when the download cannot start.
     pub fn open_to_read(&self) -> Result<Opened, State> {
         match self.open() {
-            Err(State::CloudOnly) => {
-                self.download();
-                Err(State::Downloading)
-            }
+            Err(State::CloudOnly) if self.download() => Err(State::Downloading),
             other => other,
         }
     }
@@ -210,22 +208,27 @@ impl Entry {
     /// state afterwards follows the marks as they then are: a failed download,
     /// a file moved to the cloud meanwhile or a mark the provider keeps leave
     /// the database cloud-only, until the next request for its games.
-    fn download(&self) {
-        let mut running = lock(&self.held.running);
-        if running.is_some() {
-            return;
-        }
+    /// Whether a download now runs or waits.
+    fn download(&self) -> bool {
         let files = self.files();
         let local: u64 = files.present.iter().filter(|f| !f.2).map(|f| f.1).sum();
         let progress = Arc::new(Progress::new(local, files.size()));
-        *running = Some(Arc::clone(&progress));
+        {
+            let mut running = lock(&self.held.running);
+            if running.is_some() {
+                return true;
+            }
+            *running = Some(Arc::clone(&progress));
+        }
         self.held.kept.store(false, Ordering::Relaxed);
         let cloud_files: Vec<PathBuf> = files.present.into_iter().filter(|f| f.2).map(|f| f.0).collect();
         let (held, cloud, path, name) =
             (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone());
+        // Ends the download however the job ends, and also when it is
+        // dropped unrun because no thread could start.
+        let done = Done(Arc::clone(&held));
         self.shared.downloads.submit(Box::new(move || {
-            // Clears the running download however the job ends.
-            let _done = Done(Arc::clone(&held));
+            let _done = done;
             if let Err(e) = cloud_files.iter().try_for_each(|file| cloud.fetch(file, &mut |n| progress.add(n))) {
                 eprintln!("oschess-bridge: downloading {name} failed: {e}");
                 return;
@@ -240,7 +243,7 @@ impl Entry {
                     kept.len()
                 );
             }
-        }));
+        }))
     }
 
     /// A hash of the sizes and modification times of the database's files;
@@ -325,6 +328,11 @@ impl Catalog {
         let catalog = Catalog { sources, shared, listing: Mutex::new(listing), after_read: Mutex::new(None) };
         catalog.refresh(true);
         catalog
+    }
+
+    /// The queue downloads run in.
+    pub fn downloads(&self) -> &Serial {
+        &self.shared.downloads
     }
 
     /// Sets a function called each time the sources have been read, before
