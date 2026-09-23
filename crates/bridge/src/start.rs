@@ -1,5 +1,5 @@
 //! Starting the bridge, shared by `oschess-bridge`, `cbtool bridge` and the
-//! tray application to come: the settings, the port, the pairing token and the
+//! Windows application to come: the settings, the port, the pairing token and the
 //! databases served.
 
 use std::net::TcpListener;

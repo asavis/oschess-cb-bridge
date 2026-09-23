@@ -16,17 +16,5 @@ cbformat = { version = "0.1.0", path = "../cbformat" }
 # The pairing token: the standard library has no public API for operating-system randomness.
 getrandom = "0.3"
 
-[target.'cfg(windows)'.dependencies]
-# One bridge per user, starting with Windows and opening the browser: the Win32
-# API directly. The crate is already in the dependency tree through same-file.
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Registry",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
 [dev-dependencies]
 cbformat = { version = "0.1.0", path = "../cbformat", features = ["fixture"] }
