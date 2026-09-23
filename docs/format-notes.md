@@ -60,3 +60,82 @@ a board. A word must name the piece that stands on its origin, the piece (or
 nothing) on its destination, and a legal move; castling needs the right. The
 Mega passes with no failure: 11,964,285 games, 963,223,086 plies, 4,472 Chess960
 games, 2,398 set-up positions and 3,082 null moves.
+
+## The database window list: `DBItems.cbini`
+
+ChessBase keeps the databases its database window shows in `DBItems.cbini`, in
+the ChessBase documents folder. Nothing public describes it. This layout was read
+from two such files written by ChessBase '26 on two computers, 1.6 KB each. Both
+decode to their last byte with it.
+
+**Layout.** The file starts with the magic `0c 0b 0a 0e`, then the number of
+bytes that follow as a big-endian `uint`. After that comes a flat list of
+items, each laid out as:
+
+| Size | Description |
+|---|---|
+| 1 | the tag |
+| … | the value; its layout depends on the tag |
+| 4 + n | the key: its byte length as a little-endian `int`, then the bytes |
+
+| Tag | Value |
+|---|---|
+| `ff` | none. The item is a section header: the items after it, up to the next header, belong to it |
+| `01` | one byte |
+| `08` | a little-endian `int` |
+| `19`, `1a`, `1e` | a string, laid out like the key |
+
+Items carry no length, so a reader must know every tag. An unknown tag is an
+error.
+
+Strings are UTF-8 under tag `1e`, which ChessBase uses for text that is not
+ASCII, such as Cyrillic titles. Under `19` and `1a` only ASCII has been seen.
+Keys that are paths are UTF-8, Cyrillic ones included. The reader decodes
+anything that is not valid UTF-8 as Latin-1, so no byte is lost. What
+distinguishes `19` from `1a` is **unknown**: `1a` has held only the reference
+database's path.
+
+**Sections and items seen:**
+
+| Section | Items |
+|---|---|
+| `2cbg` | one per 2CBH database, keyed by its absolute path |
+| `2cbh` | `RefDB`: the path of the reference database |
+| `Databases` | one per database in another format (`.cbh`, `.pgn`), keyed by its path |
+| `Pathes` | none |
+| `Status` | `DesktopTop` (`int`), `Selected` (the selected database's path), `Sort` (`int`), `SortDir0` to `SortDir7` (bytes) |
+
+**A database entry** is a string whose key is the database's path and whose
+value is `title,a,b,c,d,e,f`. The reader takes the six numbers from the right,
+so a title may contain commas. In the files examined:
+
+- **title** is the name the window shows. It can differ from the file name, for
+  example `X (2cbh)` for `X.2cbh`.
+- **a** varies (0–245). Its meaning is **unknown**; it is perhaps the icon.
+- **b** is the format: 28 for 2CBH, 1 for CBH, 3 for PGN.
+- **c** is the number of games, equal to the database's record count.
+- **d** grows between the two files. Its meaning is **unknown**; it is perhaps a
+  use count.
+- **e** and **f** are ChessBase dates (`year << 9 | month << 5 | day`, as game
+  dates are stored). They are consistent with the last use and the date the
+  database was added.
+
+**The order.** The reader keeps the entries in file order: the `2cbg` section
+first, then `Databases`. The window sorts by `Sort` and `SortDir0`–`SortDir7`.
+The reader returns these raw, but their meaning is **not decoded**, so the file
+order need not be the order on screen.
+
+**Copies named after a computer.** `DBItems-<computer>.cbini` beside the file is
+a OneDrive sync-conflict copy. The same `-<computer>` suffix appears on unrelated
+files in the same OneDrive folder, and no such copy exists for the computer that
+wrote the current `DBItems.cbini`. ChessBase reads `DBItems.cbini`, and the
+reader ignores the copies.
+
+**Paths** are absolute Windows paths. Whether a database is a cloud-only
+OneDrive placeholder is read from its Windows file attributes
+(`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, `_RECALL_ON_OPEN`, `_OFFLINE`), never by
+opening it, so the check starts no download. A 2CBH database is checked through
+every file it is read through: `.2cbh`, `.2cbg` and `.2lid`, and `.2cba` when it
+is there. It is opened only when none of them is offline. Through WSL, a non-empty file with
+no blocks allocated is reported as possibly cloud-only. That heuristic has not
+been confirmed, because no placeholder was available.
