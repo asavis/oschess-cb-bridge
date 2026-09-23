@@ -10,6 +10,7 @@ The repository is a Cargo workspace:
 |---|---|
 | [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, and the full move tree of every game, checked move by move on a board. PGN output. |
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`. |
+| [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 
 A local bridge service for the [oschess](https://oschess.org) analysis board —
 a loopback-only HTTP API that serves an opening reference from a database on

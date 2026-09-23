@@ -21,6 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "chesscore"
+version = "0.1.0"
+dependencies = [
+ "cozy-chess",
+]
+
+[[package]]
 name = "cozy-chess"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
