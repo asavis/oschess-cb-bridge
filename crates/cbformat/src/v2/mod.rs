@@ -166,6 +166,22 @@ impl Database {
         annotation_content(tag, &content, offset).map(Some)
     }
 
+    /// Reads the header records from `first` into `buf`, as many as it holds
+    /// (192 bytes each) up to the last record, in one read, and returns how
+    /// many it read: none when `first` is 0 or past the end. It allocates
+    /// nothing, so a caller that scans many records reuses one buffer whose
+    /// memory it has accounted for; [`Record::from_bytes`] makes the records.
+    pub fn read_records(&self, first: u32, buf: &mut [u8]) -> Result<u32> {
+        if first == 0 || first > self.records {
+            return Ok(0);
+        }
+        let fits = u32::try_from(buf.len() / HEADER_RECORD_SIZE).unwrap_or(u32::MAX);
+        let count = fits.min(self.records - first + 1);
+        let bytes = count as usize * HEADER_RECORD_SIZE;
+        self.headers.read_into(u64::from(first) * HEADER_RECORD_SIZE as u64, &mut buf[..bytes])?;
+        Ok(count)
+    }
+
     /// Records `first..=last`, clamped to the database and to
     /// [`MAX_BATCH_RECORDS`] records, in one read. Each carries its id; fewer
     /// records than asked may come back.

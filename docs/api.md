@@ -161,6 +161,14 @@ per record while it is built and 4 bytes after, so the default budget sorts
 databases of up to about 89 million records. A Mega Database of 12 million
 records needs about 330 MB with three sort orders and the suggestion counts.
 
+Passes over a database run on workers shared by all requests: the machine's
+cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
+are free, waits up to 5 seconds for the first one, and is answered `503 busy`
+when none comes free; many requests at once therefore wait for each other
+instead of multiplying the threads. Each worker reads headers into one 3 MiB
+buffer, reserved in the budget before it is allocated; with little budget
+left a search runs on fewer workers, down to one.
+
 ## Cancellation
 
 A client names its searches' stream with the `stream` parameter: 1 to 64

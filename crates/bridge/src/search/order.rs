@@ -8,7 +8,7 @@ use cbformat::v2::{Database, Eco, Record, RecordKind};
 use super::SearchError;
 use super::memory::{Held, Hold, Refused};
 use super::query::{Sort, SortKey};
-use super::scan::{Control, scan, threads};
+use super::scan::{Control, scan};
 
 /// The ranks a key needs besides the record: players' name order, and the
 /// joint name order of tournaments and of the titles of guiding texts and
@@ -91,7 +91,7 @@ pub fn build(db: &Database, ctl: &Control<'_>, sort: Sort, ranks: &Ranks<'_>) ->
     let total = db.record_count() as usize;
     let mut hold = Hold::reserve(build_bytes(db.record_count()))?;
     let flip = if sort.descending { u32::MAX } else { 0 };
-    let mut runs = scan(
+    let runs = scan(
         db,
         ctl,
         |len| {
@@ -103,14 +103,9 @@ pub fn build(db: &Database, ctl: &Control<'_>, sort: Sort, ranks: &Ranks<'_>) ->
             run.push((u64::from(key(r, sort.key, ranks) ^ flip) << 32) | u64::from(r.id()));
             Ok(())
         },
+        // Each worker sorts its own range; the ranges are merged below.
+        |run| run.sort_unstable(),
     )?;
-    std::thread::scope(|s| {
-        let workers = threads().max(1);
-        let per = runs.len().div_ceil(workers).max(1);
-        for chunk in runs.chunks_mut(per) {
-            s.spawn(move || chunk.iter_mut().for_each(|run| run.sort_unstable()));
-        }
-    });
     let mut out: Vec<u32> = Vec::new();
     out.try_reserve_exact(total).map_err(|_| Refused::Busy)?;
     let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> =

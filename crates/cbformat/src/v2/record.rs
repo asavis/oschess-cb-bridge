@@ -60,6 +60,11 @@ impl GameResult {
 }
 
 impl Record {
+    /// The record numbered `id` from its header bytes, as
+    /// [`crate::v2::Database::read_records`] reads them.
+    pub fn from_bytes(id: u32, b: &[u8; HEADER_RECORD_SIZE]) -> Record {
+        Record { id, b: *b }
+    }
     pub fn id(&self) -> u32 {
         self.id
     }

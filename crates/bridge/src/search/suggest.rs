@@ -57,6 +57,7 @@ fn counts(
             }
             Ok(())
         },
+        |_| {},
     )?;
     let plain = |v: Vec<AtomicU32>| v.into_iter().map(AtomicU32::into_inner).collect();
     Ok(Held::new(Counts { players: plain(p), annotators: plain(a), tournaments: plain(t) }, hold))

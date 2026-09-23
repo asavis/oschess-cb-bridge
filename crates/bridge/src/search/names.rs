@@ -9,7 +9,7 @@ use cbformat::v2::{Database, GAME_TAG, PLAYER, TOURNAMENT};
 
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
-use super::scan::threads;
+use super::workers::{self, threads};
 
 /// Ids of a type read in one worker's go.
 const IDS_PER_WORKER_MIN: usize = 4096;
@@ -73,47 +73,39 @@ impl NameTable {
         }
         // Two string ends per id, reserved before anything is read.
         let shared = Mutex::new(Hold::reserve(count.checked_mul(8).ok_or(Refused::TooLarge)?)?);
-        let workers = threads().min(count.div_ceil(IDS_PER_WORKER_MIN)).max(1);
-        let per = count.div_ceil(workers).max(1);
-        let chunks: Vec<Result<Chunk, SearchError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..workers)
-                .map(|w| {
-                    let (first, end) = ((w * per).min(count), ((w + 1) * per).min(count));
-                    let shared = &shared;
-                    s.spawn(move || -> Result<Chunk, SearchError> {
-                        let mut allow = Allowance::new(shared);
-                        let n = end - first;
-                        let mut c = Chunk {
-                            first,
-                            names: String::new(),
-                            name_ends: Vec::new(),
-                            lower: String::new(),
-                            lower_ends: Vec::new(),
-                        };
-                        c.name_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
-                        c.lower_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
-                        for id in first..end {
-                            if (id - first) % IDS_PER_CHECK == 0 && cancel.is_cancelled() {
-                                return Err(SearchError::Superseded);
-                            }
-                            let name = match kind {
-                                Kind::Players => e.player(id as i64)?.map(|p| p.pgn()),
-                                Kind::Tournaments => e.tournament(id as i64)?.map(|t| t.title),
-                                Kind::Titles => e.title(id as i64)?,
-                            }
-                            .unwrap_or_default();
-                            push_str(&mut c.names, &name, &mut allow)?;
-                            push_str(&mut c.lower, &name.to_lowercase(), &mut allow)?;
-                            c.name_ends.push(u32::try_from(c.names.len()).map_err(|_| Refused::TooLarge)?);
-                            c.lower_ends.push(u32::try_from(c.lower.len()).map_err(|_| Refused::TooLarge)?);
-                        }
-                        Ok(c)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
-        });
-        let chunks = chunks.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let want = threads().min(count.div_ceil(IDS_PER_WORKER_MIN)).max(1);
+        let chunks = workers::run(want, 0, cancel, |w| {
+            let per = count.div_ceil(w.count).max(1);
+            let (first, end) = ((w.index * per).min(count), ((w.index + 1) * per).min(count));
+            let mut allow = Allowance::new(&shared);
+            let n = end - first;
+            let mut c = Chunk {
+                first,
+                names: String::new(),
+                name_ends: Vec::new(),
+                lower: String::new(),
+                lower_ends: Vec::new(),
+            };
+            c.name_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
+            c.lower_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
+            for id in first..end {
+                if (id - first) % IDS_PER_CHECK == 0 && (w.stopped() || cancel.is_cancelled()) {
+                    return Err(SearchError::Superseded);
+                }
+                let name = match kind {
+                    Kind::Players => e.player(id as i64)?.map(|p| p.pgn()),
+                    Kind::Tournaments => e.tournament(id as i64)?.map(|t| t.title),
+                    Kind::Titles => e.title(id as i64)?,
+                }
+                .unwrap_or_default();
+                push_str(&mut c.names, &name, &mut allow)?;
+                push_str(&mut c.lower, &name.to_lowercase(), &mut allow)?;
+                c.name_ends.push(u32::try_from(c.names.len()).map_err(|_| Refused::TooLarge)?);
+                c.lower_ends.push(u32::try_from(c.lower.len()).map_err(|_| Refused::TooLarge)?);
+            }
+            Ok(c)
+        })?;
+        let per = count.div_ceil(chunks.len()).max(1);
         let hold = shared.into_inner().unwrap_or_else(|e| e.into_inner());
         Ok(NameTable { len: count, per, chunks, _hold: hold })
     }

@@ -12,7 +12,9 @@ pub mod query;
 mod scan;
 mod sort;
 mod suggest;
+pub mod workers;
 
+pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
 
 use std::collections::{HashMap, VecDeque};
@@ -269,6 +271,7 @@ fn search(
             }
             Ok(())
         },
+        |_| {},
     )?;
     let parts: Vec<Vec<u32>> = parts.into_iter().map(|(numbers, _)| numbers).collect();
     let matches: usize = parts.iter().map(Vec::len).sum();

@@ -53,8 +53,8 @@ pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
 same options, for development. `web` in `bridge.toml` points the pairing link
 at another allowed site, such as `https://staging.oschess.org`. Searches
 use the oschess Library's grammar ([docs/search-grammar.md](docs/search-grammar.md))
-and read the headers on all cores, at most 16; `OSCHESS_BRIDGE_THREADS` sets
-another number. Their memory stays within 1 GiB, or `OSCHESS_BRIDGE_SEARCH_MIB`
+and read the headers on workers that all searches share, one per core and at
+most 16; `OSCHESS_BRIDGE_THREADS` sets another number. Their memory stays within 1 GiB, or `OSCHESS_BRIDGE_SEARCH_MIB`
 ([docs/api.md](docs/api.md#search-memory)).
 
 It serves the databases ChessBase's database window shows, read from

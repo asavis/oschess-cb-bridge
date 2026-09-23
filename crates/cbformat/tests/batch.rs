@@ -169,3 +169,21 @@ fn a_move_record_4_gib_past_the_span_is_read_on_its_own() {
     let got: Vec<Token> = batch.moves_of(&r).unwrap().moves().unwrap().tokens().collect();
     assert_eq!(got, alone);
 }
+
+#[test]
+fn read_records_fills_the_callers_buffer() {
+    let f = fixture(30, 0);
+    let db = Database::open(f.base()).unwrap();
+    let mut buf = vec![0u8; 7 * 192 + 100];
+    assert_eq!(db.read_records(1, &mut buf).unwrap(), 7);
+    let first = cbformat::v2::Record::from_bytes(1, buf[..192].try_into().unwrap());
+    assert_eq!(first.bytes(), db.record(1).unwrap().bytes());
+    assert_eq!(db.read_records(28, &mut buf).unwrap(), 3, "up to the last record");
+    assert_eq!(
+        cbformat::v2::Record::from_bytes(30, buf[2 * 192..3 * 192].try_into().unwrap()).bytes(),
+        db.record(30).unwrap().bytes()
+    );
+    assert_eq!(db.read_records(0, &mut buf).unwrap(), 0);
+    assert_eq!(db.read_records(31, &mut buf).unwrap(), 0);
+    assert_eq!(db.read_records(1, &mut [0u8; 100]).unwrap(), 0, "a buffer smaller than a record reads none");
+}

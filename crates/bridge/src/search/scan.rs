@@ -1,9 +1,9 @@
 //! Parallel passes over a database's header records, and the compiled search
 //! predicate they evaluate.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use cbformat::v2::{Database, Record, RecordKind};
+use cbformat::v2::{Database, HEADER_RECORD_SIZE, Record, RecordKind};
 
 use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
 use super::fields::{date_text, eco_text, round_text};
@@ -12,22 +12,12 @@ use super::SearchError;
 use super::memory::{Allowance, Cancel, Refused};
 use super::names::{BitSet, NameTable};
 use super::query::{Cmp, Field, Query, Value};
+use super::workers::{self, threads};
 
-/// Header records read at a time by one worker: 3 MiB.
+/// Header records read at a time by one worker.
 const CHUNK: u32 = 16 << 10;
-
-/// Workers for a pass: `OSCHESS_BRIDGE_THREADS` when set (1 to 64), else the
-/// machine's cores, at most 16.
-pub fn threads() -> usize {
-    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *THREADS.get_or_init(|| {
-        let set = std::env::var("OSCHESS_BRIDGE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
-        match set {
-            Some(n) => n.clamp(1, 64),
-            None => std::thread::available_parallelism().map_or(1, |n| n.get()).min(16),
-        }
-    })
-}
+/// The batch buffer of one worker: 3 MiB, reserved in the budget and reused.
+pub const BATCH_BYTES: usize = CHUNK as usize * HEADER_RECORD_SIZE;
 
 /// What a pass answers to: the cancellation of its search, and a count of the
 /// records it read.
@@ -36,73 +26,46 @@ pub struct Control<'a> {
     pub scanned: &'a AtomicU64,
 }
 
-/// Visits every record, in parallel over contiguous ranges of numbers. Each
-/// worker folds its range, in number order, into its own accumulator, made by
-/// `init` from the number of records it will visit; the accumulators come back
-/// in range order. Every worker stops at its next batch once one has failed or
-/// the search is superseded.
+/// Visits every record, in parallel over contiguous ranges of numbers, on the
+/// workers [`workers::run`] grants. Each worker folds its range, in number
+/// order, into its own accumulator, made by `init` from the number of records
+/// it will visit and finished by `finish`; the accumulators come back in range
+/// order. Every worker reads its batches into one reserved buffer, and stops at
+/// its next batch once one has failed or the search is superseded.
 pub fn scan<T: Send>(
     db: &Database,
     ctl: &Control<'_>,
     init: impl Fn(usize) -> Result<T, SearchError> + Sync,
     visit: impl Fn(&mut T, &Record) -> Result<(), SearchError> + Sync,
+    finish: impl Fn(&mut T) + Sync,
 ) -> Result<Vec<T>, SearchError> {
     let total = u64::from(db.record_count());
-    let workers = (threads() as u64).min(total.div_ceil(u64::from(CHUNK))).max(1);
-    let per = total.div_ceil(workers);
-    let (init, visit) = (&init, &visit);
-    let failed = AtomicBool::new(false);
-    let failed = &failed;
-    let parts: Vec<Result<T, SearchError>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let (first, last) = (w * per + 1, ((w + 1) * per).min(total));
-                s.spawn(move || -> Result<T, SearchError> {
-                    let run = || -> Result<T, SearchError> {
-                        let mut acc = init(last.saturating_sub(first - 1) as usize)?;
-                        let mut next = first;
-                        while next <= last {
-                            if failed.load(Ordering::Relaxed) {
-                                return Err(SearchError::Superseded);
-                            }
-                            if ctl.cancel.is_cancelled() {
-                                return Err(SearchError::Superseded);
-                            }
-                            let upto = last.min(next + u64::from(CHUNK) - 1);
-                            let records = db.records(next as u32, upto as u32)?;
-                            let Some(end) = records.last().map(|r| u64::from(r.id())) else { break };
-                            ctl.scanned.fetch_add(records.len() as u64, Ordering::Relaxed);
-                            for r in &records {
-                                visit(&mut acc, r)?;
-                            }
-                            next = end + 1;
-                        }
-                        Ok(acc)
-                    };
-                    let result = run();
-                    if result.is_err() {
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                    result
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
-    });
-    // The first real failure explains the others, which only stopped for it.
-    let mut out = Vec::with_capacity(parts.len());
-    let mut stopped = None;
-    for part in parts {
-        match part {
-            Ok(acc) => out.push(acc),
-            Err(SearchError::Superseded) => stopped = Some(SearchError::Superseded),
-            Err(e) => return Err(e),
+    let want = (threads() as u64).min(total.div_ceil(u64::from(CHUNK))).max(1) as usize;
+    workers::run(want, BATCH_BYTES, ctl.cancel, |w| {
+        let per = total.div_ceil(w.count as u64);
+        let (first, last) = (w.index as u64 * per + 1, ((w.index as u64 + 1) * per).min(total));
+        let mut acc = init(last.saturating_sub(first - 1) as usize)?;
+        let mut buf = w.buffer()?;
+        let mut next = first;
+        while next <= last {
+            if w.stopped() || ctl.cancel.is_cancelled() {
+                return Err(SearchError::Superseded);
+            }
+            let batch = (last - next + 1).min(u64::from(CHUNK)) as usize;
+            let read = db.read_records(next as u32, &mut buf[..batch * HEADER_RECORD_SIZE])?;
+            if read == 0 {
+                break;
+            }
+            ctl.scanned.fetch_add(u64::from(read), Ordering::Relaxed);
+            let bytes = read as usize * HEADER_RECORD_SIZE;
+            for (i, b) in buf[..bytes].as_chunks::<HEADER_RECORD_SIZE>().0.iter().enumerate() {
+                visit(&mut acc, &Record::from_bytes(next as u32 + i as u32, b))?;
+            }
+            next += u64::from(read);
         }
-    }
-    match stopped {
-        Some(e) => Err(e),
-        None => Ok(out),
-    }
+        finish(&mut acc);
+        Ok(acc)
+    })
 }
 
 /// Which of a game's player ids a name test looks at.

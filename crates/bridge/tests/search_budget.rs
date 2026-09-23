@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use bridge::search::memory::{Hold, budget, held};
 use bridge::search::query::Sort;
-use bridge::search::{self, Indexes, SearchError, Selection, SuggestField, Suggestion};
+use bridge::search::workers::{taken, threads};
+use bridge::search::{self, BATCH_BYTES, Indexes, SearchError, Selection, SuggestField, Suggestion};
 use cbformat::fixture::{Builder, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::v2::Database;
@@ -16,6 +17,7 @@ use cbformat::v2::Database;
 fn the_search_budget() {
     retained_orders_are_evicted_and_a_full_budget_answers_busy();
     suggestion_copies_hold_their_bytes();
+    concurrent_searches_share_the_workers_and_the_budget();
 }
 
 /// Retained sort orders are evicted when a new one would not fit, and a
@@ -42,15 +44,17 @@ fn retained_orders_are_evicted_and_a_full_budget_answers_busy() {
     let retained = held();
     assert!(retained >= RECORDS as usize * 4);
 
-    // Leave 10 MB free: an ECO order fits only once the date order is evicted,
-    // after which the budget holds the ECO order in its place.
-    let taken = Hold::reserve(budget() - retained - (10 << 20)).unwrap();
+    // Leave 10 MB free besides the workers' batch buffers: an ECO order fits
+    // only once the date order is evicted, after which the budget holds the
+    // ECO order in its place.
+    let buffers = threads() * BATCH_BYTES;
+    let taken = Hold::reserve(budget() - retained - buffers - (10 << 20)).unwrap();
     let scanned = idx.scanned();
     assert_eq!(order(&idx, "eco").unwrap(), RECORDS as usize);
     assert_eq!(held(), taken.bytes() + retained, "the date order made room");
 
-    // With 5 MB more taken, evicting the ECO order is not enough for another.
-    let more = Hold::reserve(5 << 20).unwrap();
+    // With 5 MB left, evicting the ECO order is not enough for another.
+    let more = Hold::reserve(budget() - held() - (5 << 20)).unwrap();
     assert!(matches!(order(&idx, "date"), Err(SearchError::Busy)));
     assert_eq!(held(), taken.bytes() + more.bytes(), "the refused build returned what it held");
 
@@ -109,4 +113,45 @@ fn suggestion_copies_hold_their_bytes() {
     let taken = Hold::reserve(budget() - before - copies + 1).unwrap();
     assert!(matches!(search::suggest(&db, &idx, SuggestField::Player, "mor", 20), Err(SearchError::Busy)));
     drop(taken);
+}
+
+/// Searches running at once share one set of workers and the budget: with room
+/// for two workers' buffers, eight non-matching searches each finish or are
+/// answered `Busy`, every byte and worker comes back, and with no room for a
+/// single buffer a search is refused at once.
+fn concurrent_searches_share_the_workers_and_the_budget() {
+    const RECORDS: u64 = 1_000_000;
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    b.game(e4);
+    let f = b.write("budget-concurrent");
+    let file = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.2cbh")).unwrap();
+    file.set_len((RECORDS + 1) * 192).unwrap();
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    // Not registered for eviction, so that the accounting below is exact.
+    let idx = Indexes::default();
+    // The first search loads the names; after it, only scans need memory.
+    assert!(search::select(&db, &idx, Some("needle"), None, None).is_ok());
+    let before = held();
+    let room = Hold::reserve(budget() - before - 2 * BATCH_BYTES).unwrap();
+    let results: Vec<Result<(), SearchError>> = std::thread::scope(|s| {
+        let running: Vec<_> = (0..8)
+            .map(|i| {
+                let (db, idx) = (&db, &idx);
+                s.spawn(move || search::select(db, idx, Some(&format!("needle{i}")), None, None).map(|_| ()))
+            })
+            .collect();
+        running.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(results.iter().all(|r| matches!(r, Ok(()) | Err(SearchError::Busy))), "{results:?}");
+    assert!(results.iter().any(Result::is_ok), "{results:?}");
+    assert_eq!(taken(), 0, "every worker came back");
+    assert_eq!(held(), before + room.bytes(), "every byte came back");
+    drop(room);
+    let all = Hold::reserve(budget() - held()).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(search::select(&db, &idx, Some("needle-last"), None, None), Err(SearchError::Busy)));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "refused without waiting");
+    drop(all);
+    assert_eq!(held(), before);
 }
