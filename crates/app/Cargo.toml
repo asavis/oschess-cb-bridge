@@ -1,0 +1,38 @@
+[package]
+name = "app"
+description = "The oschess bridge for Windows: a tray app that serves this machine's ChessBase databases to oschess"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oschess-bridge-app"
+path = "src/main.rs"
+
+[dependencies]
+bridge = { version = "0.1.0", path = "../bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The app itself runs on Windows only. Elsewhere the binary is a stub, so Linux
+# builds need neither WebKitGTK nor a Windows resource compiler.
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "=2.11.6", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "=2.5.1"
+tauri-plugin-clipboard-manager = "=2.3.3"
+tauri-plugin-dialog = "=2.7.3"
+tauri-plugin-notification = "=2.4.0"
+tauri-plugin-opener = "=2.5.5"
+tauri-plugin-single-instance = "=2.4.5"
+# The display language and the taskbar's theme; already in the tree.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Registry"] }
+
+[dev-dependencies]
+cbformat = { version = "0.1.0", path = "../cbformat", features = ["fixture"] }
+
+# Always a build dependency: a build script cannot tell a Windows target by
+# `cfg`, so build.rs asks CARGO_CFG_TARGET_OS and runs it only for Windows.
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }

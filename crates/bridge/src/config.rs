@@ -67,6 +67,59 @@ pub fn load_or_create(path: &Path) -> Result<Config, String> {
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The file for `config`: the default file's text and comments with its values.
+/// The Windows app writes its settings this way; comments of the user's own
+/// are not kept.
+pub fn render(config: &Config) -> String {
+    let list = |items: Vec<String>| {
+        if items.is_empty() {
+            "[]".to_string()
+        } else {
+            let lines: String = items.iter().map(|i| format!("    {},\n", quote(i))).collect();
+            format!("[\n{lines}]")
+        }
+    };
+    let origins = list(config.origins.clone());
+    let databases = list(config.databases.iter().map(|p| p.to_string_lossy().into_owned()).collect());
+    let web = if config.web == DEFAULT_WEB {
+        "# web = \"https://oschess.org\"".to_string()
+    } else {
+        format!("web = {}", quote(&config.web))
+    };
+    TEMPLATE
+        .replace("port = 39581", &format!("port = {}", config.port))
+        .replace("origins = []", &format!("origins = {origins}"))
+        .replace("databases = []", &format!("databases = {databases}"))
+        .replace("# web = \"https://oschess.org\"", &web)
+}
+
+/// Writes `config` to `path` through a temporary file, so a reader never sees
+/// half a file.
+pub fn save(path: &Path, config: &Config) -> Result<(), String> {
+    let temporary = path.with_extension("toml.new");
+    std::fs::write(&temporary, render(config)).map_err(|e| format!("{}: {e}", temporary.display()))?;
+    std::fs::rename(&temporary, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A string as a value: literal in single quotes when it can be, which keeps
+/// Windows paths readable, else in double quotes with escapes.
+fn quote(text: &str) -> String {
+    if !text.contains('\'') && !text.chars().any(char::is_control) {
+        return format!("'{text}'");
+    }
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 enum Value {
     Int(i64),
     Str(String),
@@ -218,6 +271,45 @@ mod tests {
         assert_eq!(c.databases, [PathBuf::from("C:\\Bases\\A # b.2cbh"), PathBuf::from("D:\\x\\\u{415}.2cbh")]);
         assert_eq!(c.web, DEFAULT_WEB);
         assert_eq!(parse("web = \"https://staging.oschess.org\"").unwrap().web, "https://staging.oschess.org");
+    }
+
+    #[test]
+    fn the_default_renders_as_the_template() {
+        assert_eq!(render(&Config::default()), TEMPLATE);
+    }
+
+    #[test]
+    fn rendered_settings_read_back_the_same() {
+        let configs = [
+            Config {
+                port: 40000,
+                origins: vec!["http://localhost:5173".into(), "http://127.0.0.1:4173".into()],
+                databases: vec![
+                    PathBuf::from(r"C:\Users\me\Documents\ChessBase\MyWork"),
+                    PathBuf::from(r"D:\Шахи\It's # here [1].2cbh"),
+                    PathBuf::from("E:\\quote\" and\ttab"),
+                ],
+                web: "https://staging.oschess.org".into(),
+            },
+            Config { databases: vec![PathBuf::from("/home/me/bases")], ..Config::default() },
+        ];
+        for config in configs {
+            let text = render(&config);
+            assert_eq!(parse(&text).unwrap(), config, "{text}");
+        }
+    }
+
+    #[test]
+    fn saving_replaces_the_file_whole() {
+        let dir = std::env::temp_dir().join(format!("bridge-config-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bridge.toml");
+        let mut config = load_or_create(&path).unwrap();
+        config.databases.push(PathBuf::from(r"C:\Bases"));
+        save(&path, &config).unwrap();
+        assert_eq!(load_or_create(&path).unwrap(), config);
+        assert!(!path.with_extension("toml.new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

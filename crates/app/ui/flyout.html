@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title data-i18n="window.flyout">oschess міст</title>
+  <link rel="stylesheet" href="common.css">
+  <link rel="stylesheet" href="flyout.css">
+  <script src="common.js" defer></script>
+  <script src="flyout.js" defer></script>
+</head>
+<body>
+  <main class="panel" id="panel">
+    <header class="head">
+      <span class="tile"><img src="img/logo.svg" width="28" height="28" alt=""></span>
+      <div class="grow">
+        <div class="title" data-i18n="app.name">oschess міст</div>
+        <div class="status cap12"><span class="dot" id="dot"></span><span id="status"></span></div>
+      </div>
+      <button class="icon-btn" id="settings" data-i18n-label="flyout.settings" data-i18n-title="flyout.settings"></button>
+    </header>
+    <section class="card" id="card">
+      <span id="card-icon"></span>
+      <div>
+        <div class="card-title" id="card-title"></div>
+        <div class="cap12 card-body" id="card-body"></div>
+      </div>
+    </section>
+    <div class="list-head" id="list-head">
+      <span class="lbl" data-i18n="flyout.databases">Бази</span>
+      <span class="cap12" id="count"></span>
+    </div>
+    <div class="list" id="list"></div>
+    <p class="cap12 empty" id="empty" data-i18n="flyout.none" hidden></p>
+    <footer class="foot">
+      <button class="btn accent wide" id="open"><span data-i18n="flyout.open">Відкрити oschess</span></button>
+    </footer>
+  </main>
+</body>
+</html>

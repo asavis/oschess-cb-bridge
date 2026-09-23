@@ -1,0 +1,30 @@
+body { background: #f9f9f9; overflow: hidden; }
+.panel { width: 380px; }
+.grow { flex: 1; min-width: 0; }
+
+.head { display: flex; align-items: center; gap: 12px; padding: 16px 12px 12px 16px; }
+.head .tile { width: 36px; height: 36px; }
+.title { font-size: 15px; font-weight: 600; }
+.status { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.dot { width: 8px; height: 8px; border-radius: 4px; display: inline-block; background: var(--ok); }
+.dot.attention { background: var(--attention); }
+.dot.problem { background: var(--bad); }
+
+.card { margin: 0 12px; padding: 10px 12px; border-radius: 6px; display: flex; align-items: center; gap: 10px; background: var(--ok-bg); color: var(--ok); }
+.card-title { font-weight: 600; color: var(--ok-text); }
+.card-body { color: #2f5e2f; }
+.card.problem { background: var(--bad-bg); color: var(--bad); }
+.card.problem .card-title { color: var(--bad); }
+.card.problem .card-body { color: #7a2a22; }
+
+.list-head { padding: 14px 16px 4px; display: flex; align-items: baseline; justify-content: space-between; }
+.list { margin: 0 4px; max-height: 336px; overflow-y: auto; }
+.row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px; color: var(--fg2); }
+.row .grow { color: var(--fg); }
+.row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.name { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .cap12 { margin-top: 2px; }
+.empty { margin: 4px 16px 8px; line-height: 18px; }
+
+.foot { padding: 12px 16px 16px; display: flex; gap: 8px; }
+.row .bar { margin-top: 6px; }

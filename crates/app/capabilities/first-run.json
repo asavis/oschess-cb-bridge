@@ -1,0 +1,11 @@
+{
+  "identifier": "first-run",
+  "description": "The first-run window: shows and copies the pairing code, opens oschess with it, and closes itself.",
+  "windows": ["first-run"],
+  "permissions": [
+    "core:window:allow-close",
+    "allow-pairing-code",
+    "allow-copy-code",
+    "allow-open-pairing"
+  ]
+}

@@ -8,7 +8,13 @@ pub const DEFAULT_WEB: &str = "https://oschess.org";
 /// The Library's ChessBase section on `web`, with the pairing fragment. The
 /// token is base64url, so it needs no escaping.
 pub fn link(web: &str, token: &str, port: u16) -> String {
-    format!("{}/library?source=chessbase#cb-bridge={token}&port={port}", web.trim_end_matches('/'))
+    format!("{}#cb-bridge={token}&port={port}", section(web))
+}
+
+/// The Library's ChessBase section on `web`, for a browser that paired
+/// already.
+pub fn section(web: &str) -> String {
+    format!("{}/library?source=chessbase", web.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -26,6 +32,11 @@ mod tests {
         assert!(!page.contains(token), "the token stays in the fragment");
         let fields: Vec<(&str, &str)> = fragment.split('&').map(|f| f.split_once('=').unwrap()).collect();
         assert_eq!(fields, [("cb-bridge", token), ("port", "39581")]);
+    }
+
+    #[test]
+    fn the_section_without_the_fragment() {
+        assert_eq!(section("https://oschess.org/"), "https://oschess.org/library?source=chessbase");
     }
 
     #[test]

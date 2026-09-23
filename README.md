@@ -12,6 +12,7 @@ The repository is a Cargo workspace:
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, and `bridge` to run the bridge in a console. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 | [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
+| [`app`](crates/app) | The bridge for Windows as a tray app built with [Tauri 2](https://tauri.app): the bridge's state in the tray, a status flyout, settings and a first-run window. Windows only; elsewhere it builds as a stub. |
 
 ## Status
 
@@ -66,6 +67,23 @@ Databases are opened read-only and read with positional reads; nothing is
 written, and nothing leaves the machine except what the bridge serves to the
 oschess page on this computer.
 
+## The Windows app
+
+`crates/app` wraps the bridge in a tray app. The oschess logo in the tray takes
+the colour of the bridge's state: the taskbar's own colour when the databases
+are ready; amber while one opens or downloads, or when one cannot be opened or
+is not found; red when the bridge cannot serve at all, such as with its port
+in use. The tooltip says which. A click opens a flyout with the state and the
+databases, and the right-click menu opens oschess, the settings (extra database
+folders, the port, the pairing code, starting with Windows) or quits. The
+windows are plain HTML, CSS and JavaScript in `crates/app/ui`, in Ukrainian or
+English after the Windows display language; `crates/app/icons/generate.py`
+draws the tray marks and the app icon from the logo.
+
+The app builds on Windows only. On Linux, `scripts/clippy-windows.sh` checks
+it for `x86_64-pc-windows-gnu` (`rustup target add x86_64-pc-windows-gnu`)
+without linking. The installer and updates come next (#23).
+
 ## Contributing
 
 See [CLAUDE.md](CLAUDE.md) for the repository rules, including the
@@ -73,6 +91,8 @@ cross-model review every change goes through.
 
 ## Legal
 
-MIT licensed; see [LICENSE](LICENSE). ChessBase is a trademark of ChessBase
+MIT licensed; see [LICENSE](LICENSE). The oschess name and logo, in
+`crates/app/icons` and `crates/app/ui/img`, are not covered by the MIT licence;
+see [crates/app/icons/NOTICE](crates/app/icons/NOTICE). ChessBase is a trademark of ChessBase
 GmbH. This project is not affiliated with, endorsed by or sponsored by
 ChessBase GmbH, and contains no ChessBase code or data.

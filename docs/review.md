@@ -73,7 +73,7 @@ Verify by running things, not only by reading:
 
   cargo fmt --all --check
   cargo clippy --all-targets -- -D warnings
-  cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+  scripts/clippy-windows.sh
   cargo test
 
 Write your own probes rather than trusting the bundled tests; a test written by

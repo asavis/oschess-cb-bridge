@@ -136,6 +136,12 @@ impl Entry {
         }
     }
 
+    /// Whether the database is on the list; one that left it stays `missing`
+    /// until the bridge restarts.
+    pub fn listed(&self) -> bool {
+        !self.removed.load(Ordering::Relaxed)
+    }
+
     /// The database's state, opening it if it is ready.
     pub fn state(&self) -> State {
         match self.open() {

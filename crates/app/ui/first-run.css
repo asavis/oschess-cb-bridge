@@ -1,0 +1,17 @@
+.first-run { padding: 18px 32px 28px; display: flex; flex-direction: column; gap: 18px; }
+.hero { display: flex; align-items: center; gap: 16px; }
+.hero .tile { width: 56px; height: 56px; border-radius: 12px; }
+h1 { font-size: 24px; font-weight: 600; line-height: 30px; margin: 0 0 2px; }
+.strong { font-weight: 600; }
+.opening { padding: 14px 16px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); display: flex; align-items: center; gap: 12px; color: var(--accent); }
+.opening .strong { color: var(--fg); }
+.opening .cap12 { margin-top: 2px; }
+.actions { display: flex; gap: 8px; }
+hr { width: 100%; height: 1px; border: 0; margin: 0; background: var(--stroke); }
+summary { display: flex; align-items: center; gap: 8px; font-weight: 600; list-style: none; cursor: default; }
+summary::-webkit-details-marker { display: none; }
+summary svg { transition: transform .15s; transform: rotate(-90deg); }
+details[open] summary svg { transform: none; }
+.hint { margin: 6px 0 10px 22px; line-height: 18px; }
+.code-line { margin-left: 22px; display: flex; gap: 8px; align-items: center; }
+.code-line .field { flex: 1; font-size: 13px; white-space: nowrap; overflow: hidden; }
