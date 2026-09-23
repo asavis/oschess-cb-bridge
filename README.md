@@ -8,7 +8,7 @@ The repository is a Cargo workspace:
 
 | Crate | What it is |
 |---|---|
-| [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, and the full move tree of every game, checked move by move on a board. PGN output. |
+| [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. |
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 | [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
@@ -18,7 +18,10 @@ The repository is a Cargo workspace:
 The reader decodes every game of a Mega Database 2026 — 11,964,285 games and
 963 million plies, including Chess960 games, set-up positions, variations and
 null moves — with every move checked for legality and for the piece it
-captures, in about 20 seconds on a desktop. Annotations are not read yet.
+captures, in about 20 seconds on a desktop. Annotations are decoded for all
+423,390 annotated games of that database: comments, symbols, coloured squares
+and arrows go into the PGN, and every other annotation type is read by its
+layout and left out.
 
 The format is undocumented by its vendor. This reader is written from the
 reverse-engineered description in the
@@ -33,9 +36,13 @@ cargo build --release
 target/release/cbtool info   "path/to/Database.2cbh"
 target/release/cbtool verify "path/to/Database.2cbh"
 target/release/cbtool pgn    "path/to/Database.2cbh" --out games.pgn
+target/release/cbtool pgn    "path/to/Database.2cbh" --lang de,en --out games.pgn
 target/release/cbtool databases "path/to/Documents/ChessBase"   # the databases ChessBase lists
 target/release/oschess-bridge --database "path/to/Database.2cbh" --show-token
 ```
+
+`--lang` chooses the language of comments stored in several languages, in
+order of preference; English is the default.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).

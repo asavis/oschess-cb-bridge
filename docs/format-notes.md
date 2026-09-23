@@ -52,6 +52,67 @@ knight, bishop, rook. 80,740 of the Mega's 87,099 promotion captures take a
 piece of a different kind from the one promoted to, so the other order would
 fail the capture check on replay.
 
+## Annotations (`.2cba`)
+
+Annotations carry no length field, so a reader must know the layout of every
+type it meets. The census below (`examples/annotation_census.rs`) decodes every
+record of the Mega (423,390 games with annotations), of 46 weekly Mega updates
+(278,306 records) and of the 306 smaller databases (64,207 annotated games) with
+no damaged record and no type left undecoded. What it needed beyond the
+description:
+
+**Squares and arrows** (`04`, `05`): the `int` length is followed by pairs
+(colour, square) and triples (colour, from, to), as in the classic format.
+Squares are **numbered from 1, file by file**: `a1` 1, `a2` 2, `b1` 9, `h8` 64.
+Evidence: for arrows on games without variations, the arrow's origin holds a
+piece after the annotated move in 287 of 343 cases when read file by file, and
+in 129 when read rank by rank. Colours are 2 green, 3 yellow and 4 red; 7, 8 and
+9 also occur (155 + 117 + 26 squares, 785 + 689 + 337 arrows in the Mega) and
+are **unknown**.
+
+**Symbols** (`03`): the three bytes are NAG numbers: `!`-type symbols 1-8, 22
+and 32 on the move; 8, 10-19, 32-44, 130-138 and 146 (novelty) on the position;
+140-145 as the prefix.
+
+**Game quotation** (`13`):
+
+- The two rating-list names after the `01 00 01 00 00` markers are an `int`
+  length and that many bytes, not the length-byte strings of the header.
+- Of the 29 bytes before the move count, byte 26 is 1 for a quoted game from
+  the standard position. It is 0, once in the Mega, for a set-up start: 64 bytes
+  follow, one per square file by file (1 king, 2 queen, 3 knight, 4 bishop,
+  5 rook, 6 pawn, +8 for black, 0 empty), then 11 bytes that are **unknown**,
+  then the last two of the 29.
+
+**Training** (`09`): the third byte of the header is the variant.
+
+| Variant | Solutions (after the `byte` count) |
+|---|---|
+| 1 | two squares, two unknown bytes, a list |
+| 2 | a points byte, then two lists: the answer and the reply shown for it |
+
+Variant 2 occurs in 29 Mega games, with multiple-choice questions.
+
+**Web link** (`1c`): `01`, then the URL and the caption, each an `int` length
+and that many bytes. 26 in the Mega.
+
+**Video** (`20`): `01 00`, a `short` that is likely a language, an `int` length
+and that many bytes. 22 in the Mega.
+
+**Type `27`**: not in the description. Two bytes, always on a move: the short
+1 in all 25 samples of the updates; 28 occur in the Mega. Its meaning is
+**unknown**.
+
+**Positions** follow the description: PGN order, with each alternative right
+after the move it replaces. No annotation in any database examined names a
+position past the last move. Two symbol annotations in the Mega sit on
+position −1, the game as a whole; PGN has no place for a NAG before the first
+move, so they are not written.
+
+**Text languages** in the Mega: 798,578 English, 783,156 "any language" (7),
+320,588 German, then French, Spanish, Portuguese, Dutch, Italian, Polish and
+Greek below 4,000 each.
+
 ## What `cbtool verify` checks
 
 For every game and analysis: the record framing (magic, sizes, trailing length

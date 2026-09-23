@@ -3,21 +3,24 @@
 use std::path::Path;
 use std::process::Command;
 
-use cbformat::fixture::{Builder, DbItems, TempDb, lid_header, quiet};
+use cbformat::fixture::{Builder, DbItems, TempDb, annotations, lid_header, quiet, text};
 use cbformat::movetable::{self, Color, Piece};
+use cbformat::v2::language;
 
 /// A one-game database (1.e4) with an empty entity file.
 fn fixture(name: &str) -> TempDb {
     fixture_with(name, 1, None)
 }
 
-/// `games` games, all 1.e4 and all sharing one move record; with
-/// `player_name`, every game's white and black is one player of that name.
+/// `games` games, all 1.e4 and all sharing one move record and one annotation
+/// record; with `player_name`, every game's white and black is one player of
+/// that name.
 fn fixture_with(name: &str, games: usize, player_name: Option<&[u8]>) -> TempDb {
     let mut b = Builder::new();
     let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    let comment = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "best by test")])]));
     for _ in 0..games {
-        b.game(e4);
+        b.annotated_game(e4, comment);
     }
     if let Some(last) = player_name {
         let mut player = Vec::new();
@@ -29,9 +32,7 @@ fn fixture_with(name: &str, games: usize, player_name: Option<&[u8]>) -> TempDb 
         lid.extend(&player);
         b.lid(lid);
     }
-    let db = b.write(&format!("cbtool-{name}"));
-    std::fs::write(db.dir().join("db.2cba"), b"annotations").unwrap();
-    db
+    b.write(&format!("cbtool-{name}"))
 }
 
 fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
@@ -59,7 +60,7 @@ fn export_works() {
     let r = pgn(f.dir(), &out);
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     let text = std::fs::read_to_string(&out).unwrap();
-    assert!(text.contains("1. e4 1-0"), "{text}");
+    assert!(text.contains("1. e4 {best by test} 1-0"), "{text}");
 }
 
 #[test]
@@ -264,4 +265,28 @@ fn verify_bounds_the_memory_of_hostile_nesting() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{text}{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("failures           1") && text.contains("nested deeper than 1024"), "{text}");
+}
+
+/// An annotation on a move the game does not have fails `verify` and the
+/// export of that game, instead of vanishing from the PGN.
+#[test]
+fn annotations_on_no_move_fail_verify_and_export() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    let good = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "fine")])]));
+    let bad = b.annotations(&annotations(&[(1, vec![text(false, language::ENGLISH, "on no move")])]));
+    b.annotated_game(e4, good);
+    b.annotated_game(e4, bad);
+    let f = b.write("cbtool-no-move");
+    let verify =
+        Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(f.dir().join("db.2cbh")).output().unwrap();
+    let text = String::from_utf8_lossy(&verify.stdout);
+    assert_eq!(verify.status.code(), Some(1), "{text}");
+    assert!(text.contains("annotated          2") && text.contains("failures           1"), "{text}");
+    assert!(text.contains("game 2: annotations:") && text.contains("position 1"), "{text}");
+    let out = f.dir().join("games.pgn");
+    let export = pgn(f.dir(), &out);
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("game 2:"), "{}", String::from_utf8_lossy(&export.stderr));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("1. e4 {fine} 1-0"));
 }

@@ -10,8 +10,9 @@ use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::server;
-use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
+use cbformat::fixture::{Builder, TempDb, annotations, arrows, lid_header, quiet, squares, symbols, text};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
+use cbformat::v2::language;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 const ORIGIN: &str = "https://oschess.org";
@@ -597,4 +598,137 @@ fn silent_queued_connections_do_not_delay_the_busy_answer() {
     drop(serving);
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert_eq!(get(p, "/v1/status", "").status, 200);
+}
+
+/// Game 1: 1.e4 e5 with annotation record `content`; game 2: 1.e4 with an
+/// empty annotation record.
+fn annotated_database(name: &str, content: &[u8]) -> TempDb {
+    let mut b = Builder::new();
+    let moves = b.moves(
+        1,
+        &[
+            MOVES,
+            quiet(Color::White, Piece::Pawn, "e2", "e4"),
+            quiet(Color::Black, Piece::Pawn, "e7", "e5"),
+            END_OF_LINE,
+        ],
+    );
+    let a = b.annotations(content);
+    b.annotated_game(moves, a);
+    b.game(moves);
+    b.write(name)
+}
+
+#[test]
+fn annotated_games_are_served_with_their_annotations() {
+    let content = annotations(&[
+        (-1, vec![text(false, language::ENGLISH, "A classic")]),
+        (
+            0,
+            vec![
+                symbols(1, 0, 0),
+                squares(&[(2, "e4")]),
+                arrows(&[(3, "g1", "f3")]),
+                text(false, language::ENGLISH, "Best by test"),
+                text(false, language::GERMAN, "Bestens"),
+            ],
+        ),
+        (1, vec![text(true, language::ENGLISH, "Then"), text(true, language::GERMAN, "Dann")]),
+    ]);
+    let db = annotated_database("api-annotated", &content);
+    let r = start(&db, vec![], None);
+    let game = |query: &str| get(r.port, &format!("/v1/databases/{}/games/1{query}", r.id), "");
+    let g = game("");
+    assert_eq!(g.status, 200, "{}", g.body);
+    assert!(
+        g.body.contains(r#"{A classic} 1. e4 $1 {[%csl Ge4][%cal Yg1f3] Best by test} {Then} 1... e5 1-0\n""#),
+        "{}",
+        g.body
+    );
+    assert!(g.body.ends_with(r#""annotations":"complete"}"#), "{}", g.body);
+    assert!(!g.body.contains("unreadableAnnotation"));
+    // The first preferred language the game has; a language ChessBase does not
+    // store is passed over.
+    for query in ["?lang=de", "?lang=uk,de,en", "?lang=uk%2Cde"] {
+        let g = game(query);
+        assert!(g.body.contains("Bestens} {Dann} 1... e5"), "{query}: {}", g.body);
+    }
+    for query in ["?lang=en,de", "?lang=uk", "?lang="] {
+        assert!(game(query).body.contains("Best by test} {Then}"), "{query}");
+    }
+    // A game with an empty annotation record, and a database without `.2cba`.
+    let g = get(r.port, &format!("/v1/databases/{}/games/2", r.id), "");
+    assert!(g.body.ends_with(r#""annotations":"none"}"#), "{}", g.body);
+    let plain = database("api-no-annotations", 1, 0, 0);
+    let r = start(&plain, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert!(g.body.ends_with(r#""annotations":"none"}"#), "{}", g.body);
+}
+
+#[test]
+fn an_unknown_annotation_layout_is_reported() {
+    // Type 1a has no known layout: the text after it cannot be found.
+    let content = annotations(&[
+        (0, vec![text(false, language::ENGLISH, "kept"), vec![0x1a, 0, 1, 2, 3], text(false, 0, "lost")]),
+        (1, vec![text(false, language::ENGLISH, "lost too")]),
+    ]);
+    let db = annotated_database("api-unknown-annotation", &content);
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 200, "{}", g.body);
+    assert!(g.body.contains(r#"1. e4 {kept} 1... e5 1-0"#), "{}", g.body);
+    assert!(!g.body.contains("lost"), "{}", g.body);
+    assert!(g.body.ends_with(r#""annotations":"incomplete","unreadableAnnotation":26}"#), "{}", g.body);
+}
+
+#[test]
+fn an_oversized_annotation_record_is_refused() {
+    let long = "x".repeat(bridge::api::MAX_GAME_BYTES);
+    let db = annotated_database("api-huge-annotation", &annotations(&[(0, vec![text(false, 0, &long)])]));
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 422, "{}", &g.body[..g.body.len().min(300)]);
+    assert!(
+        g.body.contains(r#""code":"unreadable_game""#)
+            && g.body.contains("annotation record")
+            && g.body.contains("limit"),
+        "{}",
+        g.body
+    );
+    // The other game of that database is served.
+    assert_eq!(get(r.port, &format!("/v1/databases/{}/games/2", r.id), "").status, 200);
+}
+
+/// A save that rewrites the annotation record during the read is detected
+/// like one that rewrites the moves: the read is retried.
+#[test]
+fn a_change_to_the_annotations_during_the_read_is_retried() {
+    let comment = |t: &str| annotations(&[(0, vec![text(false, language::ENGLISH, t)])]);
+    let db = annotated_database("api-annotation-retry", &comment("before"));
+    let cba = db.dir().join("db.2cba");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let hook = move || {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The first annotation record sits right after the 12-byte header.
+            let frame = cbformat::fixture::framed(cbformat::v2::ANNOTATION_TAG, &comment("latest"));
+            write_at(&cba, 12, &frame);
+        }
+    };
+    let r = start(&db, vec![], Some(Box::new(hook)));
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 200, "{}", g.body);
+    assert!(g.body.contains("1. e4 {latest}"), "the retry serves the saved annotations: {}", g.body);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// An annotation on a move the game does not have is a damaged record.
+#[test]
+fn an_annotation_on_no_move_is_an_unreadable_game() {
+    let content = annotations(&[(2, vec![text(false, language::ENGLISH, "past the end")])]);
+    let db = annotated_database("api-annotation-no-move", &content);
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 422, "{}", g.body);
+    assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("position 2"), "{}", g.body);
 }

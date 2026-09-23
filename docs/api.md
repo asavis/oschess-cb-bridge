@@ -104,7 +104,7 @@ with them.
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
-| 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
+| 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
@@ -268,7 +268,7 @@ One game as PGN.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `lang` | `en` | Comma-separated language preference for annotation text, for example `uk,en` (#22) |
+| `lang` | `en` | Comma-separated ISO 639-1 language preference for annotation text, for example `uk,de`. ChessBase stores comments in English, German, French, Spanish, Italian, Dutch, Portuguese, Polish and Greek; other codes are passed over. A game's texts are written in the first preferred language it has, else in English, else in the first language stored, and texts stored for any language always |
 
 ```json
 {
@@ -281,8 +281,8 @@ One game as PGN.
 
 | Field | Meaning |
 |---|---|
-| `pgn` | The game, with its variations and, from #22, its annotations: comments in `{}`, symbols as NAGs, coloured squares and arrows as `[%csl ...]` and `[%cal ...]` |
-| `annotations` | `none`, `complete`, or `incomplete` when an annotation of unknown layout stopped decoding; the PGN then has the annotations before it |
+| `pgn` | The game, with its variations and its annotations: comments in `{}`, symbols as NAGs, coloured squares and arrows as `[%csl ...]` and `[%cal ...]` (green, yellow and red; ChessBase's other colours are left out). Annotation types PGN has no form for (training questions, clocks, game quotations, medals and the like) are left out |
+| `annotations` | `none` when the game has no annotations or the database no annotation file; `complete` when every annotation was read; `incomplete` when an annotation of unknown layout stopped decoding, and the PGN then has the annotations before it |
 | `unreadableAnnotation` | With `incomplete`: the annotation type code, a number |
 
 A guiding text or an analysis is answered `422 not_a_game`, and a game whose
