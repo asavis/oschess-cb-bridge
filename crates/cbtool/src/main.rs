@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
+mod databases;
+
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::replay::walk_tree;
 use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
@@ -15,6 +17,8 @@ const USAGE: &str = "usage:
   cbtool info   <db>
   cbtool verify <db> [--limit N]           decode and replay every game and analysis
   cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)
+  cbtool databases <dir>                   the databases ChessBase's database window lists
+                                           (dir: the ChessBase documents folder)
 
 CBTOOL_THREADS sets the number of worker threads (default: one per CPU).";
 
@@ -24,6 +28,7 @@ fn main() -> ExitCode {
         Some("info") if args.len() == 2 => info(&args[1]),
         Some("verify") if args.len() >= 2 => verify(&args[1], &args[2..]),
         Some("pgn") if args.len() >= 2 => pgn(&args[1], &args[2..]),
+        Some("databases") if args.len() == 2 => databases::databases(&args[1]),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

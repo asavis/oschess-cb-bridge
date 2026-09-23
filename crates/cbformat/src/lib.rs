@@ -1,12 +1,14 @@
 //! Readers for ChessBase database files.
 //!
 //! [`v2`] reads the `.2cbh` family written by ChessBase 17 and later.
+//! [`dbitems`] reads the list of databases ChessBase's database window shows.
 //! [`replay`] plays decoded moves on a [`chesscore::Board`], checking each
 //! move word against the position.
 
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod dbitems;
 #[cfg(feature = "fixture")]
 pub mod fixture;
 pub mod movetable;

@@ -144,3 +144,75 @@ impl Builder {
         TempDb { dir }
     }
 }
+
+/// Builds a `DBItems.cbini` database window list, item by item, in the layout
+/// `crate::dbitems` reads.
+#[derive(Default)]
+pub struct DbItems {
+    body: Vec<u8>,
+}
+
+impl DbItems {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn string(&mut self, s: &[u8]) {
+        self.body.extend((s.len() as i32).to_le_bytes());
+        self.body.extend(s);
+    }
+
+    /// A section header.
+    pub fn section(&mut self, name: &str) -> &mut Self {
+        self.body.push(0xff);
+        self.string(name.as_bytes());
+        self
+    }
+
+    /// A string item with the given tag (`0x19`, `0x1a` or `0x1e`).
+    pub fn text(&mut self, tag: u8, key: &[u8], value: &[u8]) -> &mut Self {
+        self.body.push(tag);
+        self.string(value);
+        self.string(key);
+        self
+    }
+
+    pub fn int(&mut self, key: &str, value: i32) -> &mut Self {
+        self.body.push(0x08);
+        self.body.extend(value.to_le_bytes());
+        self.string(key.as_bytes());
+        self
+    }
+
+    pub fn byte(&mut self, key: &str, value: u8) -> &mut Self {
+        self.body.push(0x01);
+        self.body.push(value);
+        self.string(key.as_bytes());
+        self
+    }
+
+    /// A database entry: `title,n1,…,n6` keyed by `path`, tagged `0x1e` when
+    /// the title is not ASCII and `0x19` otherwise, as ChessBase writes them.
+    pub fn database(&mut self, path: &str, title: &str, numbers: [i64; 6]) -> &mut Self {
+        let mut value = title.to_owned();
+        for n in numbers {
+            value.push_str(&format!(",{n}"));
+        }
+        let tag = if value.is_ascii() { 0x19 } else { 0x1e };
+        self.text(tag, path.as_bytes(), value.as_bytes())
+    }
+
+    /// Appends raw bytes, for damaged files.
+    pub fn raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.body.extend(bytes);
+        self
+    }
+
+    /// The file: magic, the big-endian length of what follows, and the items.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut out = vec![0x0c, 0x0b, 0x0a, 0x0e];
+        out.extend((self.body.len() as u32).to_be_bytes());
+        out.extend(&self.body);
+        out
+    }
+}

@@ -9,7 +9,7 @@ The repository is a Cargo workspace:
 | Crate | What it is |
 |---|---|
 | [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, and the full move tree of every game, checked move by move on a board. PGN output. |
-| [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`. |
+| [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 
 A local bridge service for the [oschess](https://oschess.org) analysis board —
@@ -36,6 +36,7 @@ cargo build --release
 target/release/cbtool info   "path/to/Database.2cbh"
 target/release/cbtool verify "path/to/Database.2cbh"
 target/release/cbtool pgn    "path/to/Database.2cbh" --out games.pgn
+target/release/cbtool databases "path/to/Documents/ChessBase"   # the databases ChessBase lists
 ```
 
 A database path may name the `.2cbh` file or the common stem of its files.

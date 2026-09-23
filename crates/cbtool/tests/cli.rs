@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
+use cbformat::fixture::{Builder, DbItems, TempDb, lid_header, quiet};
 use cbformat::movetable::{self, Color, Piece};
 
 /// A one-game database (1.e4) with an empty entity file.
@@ -100,4 +100,34 @@ fn export_memory_is_bounded_when_games_share_a_large_record() {
         .status()
         .unwrap();
     assert!(status.success(), "export under a {limit_kib} KiB address-space limit: {status}");
+}
+
+/// `cbtool databases` reads the list ChessBase keeps, reports what is on this
+/// computer, and ignores OneDrive conflict copies.
+#[test]
+fn databases_lists_the_window_and_the_state_of_each_entry() {
+    let f = fixture_with("databases", 3, None);
+    let here = f.dir().join("db.2cbh");
+    let mut list = DbItems::new();
+    list.section("2cbg")
+        .database(here.to_str().unwrap(), "Здесь", [0, 28, 3, 1, 1037620, 1037559])
+        .database(f.dir().join("gone.2cbh").to_str().unwrap(), "Gone", [0, 28, 7, 1, 1037620, 1037559])
+        .section("Databases")
+        .database("sub/games.pgn", "", [0, 3, 9, 5, 1037616, 1037616]);
+    std::fs::write(f.dir().join("DBItems.cbini"), list.bytes()).unwrap();
+    std::fs::write(f.dir().join("DBItems-OTHER.cbini"), DbItems::new().bytes()).unwrap();
+    let r = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("databases").arg(f.dir()).output().unwrap();
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let out = String::from_utf8(r.stdout).unwrap();
+    let rows: Vec<Vec<&str>> = out
+        .lines()
+        .filter(|l| l.trim_start().starts_with(char::is_numeric))
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows.len(), 3, "{out}");
+    assert_eq!(rows[0], ["1", "2cbh", "present", "3", "3", "Здесь"]);
+    assert_eq!(rows[1], ["2", "2cbh", "missing", "7", "-", "Gone"]);
+    assert_eq!(rows[2], ["3", "pgn", "missing", "9", "-", "games"]);
+    assert!(out.contains("ignored: 1 OneDrive conflict copy"), "{out}");
+    assert!(!out.contains(f.dir().to_str().unwrap()), "stored paths are not printed: {out}");
 }
