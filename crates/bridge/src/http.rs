@@ -157,15 +157,23 @@ pub struct Response {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: String,
+    /// Budget held for the body until the response is written and dropped.
+    pub hold: Option<crate::budget::Reservation>,
 }
 
 impl Response {
     pub fn json(status: u16, body: String) -> Self {
-        Response { status, headers: Vec::new(), body }
+        Response { status, headers: Vec::new(), body, hold: None }
     }
 
     pub fn empty(status: u16) -> Self {
-        Response { status, headers: Vec::new(), body: String::new() }
+        Response { status, headers: Vec::new(), body: String::new(), hold: None }
+    }
+
+    /// Keeps `reservation` until the response is dropped, after its write.
+    pub fn holding(mut self, reservation: crate::budget::Reservation) -> Self {
+        self.hold = Some(reservation);
+        self
     }
 
     pub fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {

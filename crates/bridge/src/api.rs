@@ -8,6 +8,7 @@ use cbformat::pgn;
 use cbformat::v2::{Database, Eco, Record, RecordKind};
 
 use crate::access::{Policy, Verdict, cors};
+use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
@@ -22,6 +23,13 @@ const GAME_ATTEMPTS: usize = 3;
 /// record of any kind in a Mega Database is about 1.2 MB, a guiding text; a
 /// move record near the reader's 64 MiB limit would take gigabytes to render.
 pub const MAX_GAME_BYTES: usize = 2 << 20;
+/// The largest game answer: its PGN written as JSON. Real games stay far
+/// below; names or comments of control characters can grow sixfold in JSON.
+pub const MAX_GAME_RESPONSE: usize = 8 << 20;
+/// An upper bound for one list row in JSON: nine text fields of at most
+/// [`MAX_FIELD_CHARS`] characters, each character at most six bytes escaped,
+/// plus the keys and numbers.
+const MAX_ROW_BYTES: usize = 9 * MAX_FIELD_CHARS * 6 + 512;
 /// Games rendered at once; the others wait. With [`MAX_GAME_BYTES`] this keeps
 /// rendering within a few hundred megabytes whatever the requests.
 const MAX_RENDERS: usize = 4;
@@ -128,6 +136,11 @@ fn changing(entry: &Entry, generation: u64, e: &Error) -> bool {
     matches!(e, Error::Io(..)) || entry.generation() != Some(generation)
 }
 
+/// The answer when the response budget cannot hold another large body now.
+fn busy() -> Response {
+    error(503, "busy", "Too many large answers are being sent; retry")
+}
+
 fn database_changing() -> Response {
     error(503, "database_changing", "The database changed while it was read; retry")
 }
@@ -155,6 +168,8 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
+    // Reserved before the rows are built and held until the answer is written.
+    let Some(hold) = budget::reserve(limit as usize * MAX_ROW_BYTES) else { return busy() };
     let total = u64::from(open.db.record_count());
     let count = total.saturating_sub(offset).min(u64::from(limit)) as u32;
     let rows = if count == 0 {
@@ -172,13 +187,14 @@ fn games(entry: &Entry, req: &Request) -> Response {
     if descending {
         rows.reverse();
     }
-    ok(Obj::new()
+    let body = Obj::new()
         .str("generation", &format!("{:016x}", open.generation))
         .num("total", total as i64)
         .num("offset", offset as i64)
         .str("sort", if descending { "number-desc" } else { "number-asc" })
         .raw("rows", &json::array(rows))
-        .done())
+        .done();
+    ok(body).holding(hold)
 }
 
 /// Rows `first..first + count` in one header read.
@@ -333,11 +349,24 @@ fn game(app: &App, entry: &Entry, number: &str) -> Response {
             continue;
         }
         return match rendered {
-            Ok(text) => ok(Obj::new()
-                .str("generation", &format!("{:016x}", open.generation))
-                .num("number", number)
-                .str("pgn", &text)
-                .done()),
+            Ok(text) => {
+                let size = json::string_len(&text) + 128;
+                if size > MAX_GAME_RESPONSE {
+                    let reason =
+                        format!("the game's answer would be {size} bytes, over the {MAX_GAME_RESPONSE}-byte limit");
+                    return error_with(422, "unreadable_game", "The game is too large to serve", |o| {
+                        o.str("reason", &reason)
+                    });
+                }
+                // Reserved before the answer is built and held until it is written.
+                let Some(hold) = budget::reserve(size) else { return busy() };
+                let body = Obj::new()
+                    .str("generation", &format!("{:016x}", open.generation))
+                    .num("number", number)
+                    .str("pgn", &text)
+                    .done();
+                ok(body).holding(hold)
+            }
             Err(Error::Io(..)) => database_changing(),
             Err(e) => error_with(422, "unreadable_game", "The game's records are damaged", |o| {
                 o.str("reason", &e.to_string())

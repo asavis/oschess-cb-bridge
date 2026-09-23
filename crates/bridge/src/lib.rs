@@ -4,6 +4,7 @@
 
 pub mod access;
 pub mod api;
+pub mod budget;
 pub mod catalog;
 pub mod config;
 pub mod http;

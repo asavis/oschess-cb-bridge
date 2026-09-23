@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::access::cors;
 use crate::api::{self, App};
@@ -37,18 +37,24 @@ pub fn bind(port: u16) -> io::Result<Vec<TcpListener>> {
 
 /// Connections over the cap waiting for their `busy` answer; more are closed.
 const BUSY_QUEUE: usize = 64;
-/// How long the busy answer waits for a request head, to read its `Origin`.
-const BUSY_READ: Duration = Duration::from_secs(1);
+/// How long after acceptance the busy answer may wait for a request head, to
+/// read its `Origin`. The deadline runs from acceptance, not from the moment the
+/// refusing thread reaches the connection, so silent connections ahead in the
+/// queue cannot add their wait to the ones behind them.
+const BUSY_READ: Duration = Duration::from_millis(500);
+/// What a connection past its deadline still gets: a read of the bytes already
+/// there, enough for a request that arrived in time.
+const BUSY_LAST_LOOK: Duration = Duration::from_millis(5);
 
 /// Serves connections from every listener until they fail.
 pub fn serve(listeners: Vec<TcpListener>, app: Arc<App>) -> io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
-    let (busy, refused) = mpsc::sync_channel::<TcpStream>(BUSY_QUEUE);
+    let (busy, refused) = mpsc::sync_channel::<(TcpStream, Instant)>(BUSY_QUEUE);
     std::thread::scope(|scope| {
         let refuser = app.clone();
         scope.spawn(move || {
-            for stream in refused {
-                refuse_busy(stream, &refuser);
+            for (stream, accepted) in refused {
+                refuse_busy(stream, accepted, &refuser);
             }
         });
         for listener in listeners {
@@ -60,13 +66,13 @@ pub fn serve(listeners: Vec<TcpListener>, app: Arc<App>) -> io::Result<()> {
     Ok(())
 }
 
-fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: SyncSender<TcpStream>) {
+fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: SyncSender<(TcpStream, Instant)>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::SeqCst);
             // One thread answers them in turn; a full queue closes the connection.
-            let _ = busy.try_send(stream);
+            let _ = busy.try_send((stream, Instant::now()));
             continue;
         }
         let guard = Active(active.clone());
@@ -89,13 +95,14 @@ impl Drop for Active {
     }
 }
 
-/// Answers a connection over the cap `503 busy`. The request head is read for
-/// at most [`BUSY_READ`] so that an allowed page can read the answer and its
-/// retry delay through CORS.
-fn refuse_busy(stream: TcpStream, app: &App) {
+/// Answers a connection over the cap `503 busy`. The request head is read
+/// until [`BUSY_READ`] after acceptance, so that an allowed page can read the
+/// answer and its retry delay through CORS.
+fn refuse_busy(stream: TcpStream, accepted: Instant, app: &App) {
     let _ = stream.set_write_timeout(Some(BUSY_READ));
     let mut conn = Conn::new(stream);
-    let origin = match conn.read_request_within(BUSY_READ) {
+    let wait = BUSY_READ.saturating_sub(accepted.elapsed()).max(BUSY_LAST_LOOK);
+    let origin = match conn.read_request_within(wait) {
         Ok(req) => req.header("origin").map(str::to_string),
         Err(refusal) => refusal.origin,
     };

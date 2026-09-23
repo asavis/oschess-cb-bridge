@@ -104,11 +104,11 @@ with them.
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
-| 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or its move record is over 2 MiB, too large to serve; `reason` says which, in English |
+| 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
-| 503 | `busy` | Too many open connections; `Retry-After: 1` |
+| 503 | `busy` | Too many open connections, or too many large answers being sent at once; `Retry-After: 1` |
 
 ## Database identity and generations
 

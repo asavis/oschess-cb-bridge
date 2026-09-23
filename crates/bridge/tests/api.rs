@@ -550,3 +550,51 @@ fn busy_and_misdirected_answers_carry_cors() {
     assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After"));
     drop(idle);
 }
+
+/// A tiny game whose players and tournament are megabytes of control
+/// characters, each six bytes in JSON: its answer is refused before it is
+/// built, and the server goes on serving.
+#[test]
+fn a_game_whose_answer_would_be_huge_is_refused() {
+    let mut b = Builder::new();
+    let empty = b.moves(1, &[MOVES, END_OF_LINE]);
+    let game = b.game(empty);
+    game[0x28..0x30].copy_from_slice(&0i64.to_le_bytes());
+    let name = "\u{1}".repeat((1 << 20) - 16);
+    b.lid(lid_with(
+        1 << 20,
+        1,
+        &[
+            (0, 0, strings(&[&name, ""])),
+            (1, 0, [strings(&[&name[..1000], &name[..1000]]), 0i32.to_le_bytes().to_vec()].concat()),
+        ],
+    ));
+    let db = b.write("api-huge-answer");
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 422, "{}", &g.body[..g.body.len().min(300)]);
+    assert!(g.body.contains("too large") && g.body.contains("limit"), "{}", g.body);
+    assert_eq!(get(r.port, "/v1/status", "").status, 200);
+}
+
+/// Silent connections queued over the cap cannot delay the busy answer of a
+/// request behind them: every deadline runs from acceptance.
+#[test]
+fn silent_queued_connections_do_not_delay_the_busy_answer() {
+    let db = database("api-busy-queue", 1, 0, 0);
+    let p = start(&db, vec![], None).port;
+    let serving: Vec<TcpStream> =
+        (0..server::MAX_CONNECTIONS).map(|_| TcpStream::connect(("127.0.0.1", p)).unwrap()).collect();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let silent: Vec<TcpStream> = (0..12).map(|_| TcpStream::connect(("127.0.0.1", p)).unwrap()).collect();
+    let started = std::time::Instant::now();
+    let r = get(p, "/v1/status", "");
+    let waited = started.elapsed();
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
+    assert!(waited < std::time::Duration::from_millis(2500), "the busy answer took {waited:?}");
+    drop(silent);
+    drop(serving);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(get(p, "/v1/status", "").status, 200);
+}

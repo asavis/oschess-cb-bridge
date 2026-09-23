@@ -72,6 +72,18 @@ pub fn array<I: IntoIterator<Item = String>>(items: I) -> String {
     out
 }
 
+/// The length of `value` written as a quoted JSON string, without writing it.
+pub fn string_len(value: &str) -> usize {
+    2 + value
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' => 2,
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => 6,
+            c => c.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
 /// `value` as a quoted JSON string.
 pub fn string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -108,5 +120,8 @@ mod tests {
         assert_eq!(json, r#"{"s":"a\"b\\c\n\u0001","o":{"n":-3,"b":true},"a":["x"]}"#);
         assert_eq!(Obj::new().done(), "{}");
         assert_eq!(array(Vec::new()), "[]");
+        for s in ["", "plain", "a\"b\\c\n\u{1}\u{2028}é♞"] {
+            assert_eq!(string_len(s), string(s).len(), "{s:?}");
+        }
     }
 }
