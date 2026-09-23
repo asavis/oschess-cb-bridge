@@ -106,6 +106,7 @@ pub fn suggest(
         SuggestField::Annotator => (&players, &player_groups, &counts.annotators),
         SuggestField::Event => (&tournaments, &tournament_groups, &counts.tournaments),
     };
+    let people = matches!(field, SuggestField::Player | SuggestField::Annotator);
     let prefix = prefix.trim().to_lowercase();
     if limit == 0 {
         return Ok(Held::new(Vec::new(), Hold::default()));
@@ -125,7 +126,8 @@ pub fn suggest(
             continue;
         }
         let lower = table.lower(id);
-        let first_name = lower.split_once(", ").map(|(_, f)| f);
+        // A person's first name counts too; an event's name after a comma does not.
+        let first_name = if people { lower.split_once(", ").map(|(_, f)| f) } else { None };
         if !(lower.starts_with(&prefix) || first_name.is_some_and(|f| f.starts_with(&prefix))) {
             continue;
         }

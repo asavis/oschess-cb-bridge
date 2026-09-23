@@ -786,6 +786,32 @@ fn search_sort_and_unsupported_qualifiers() {
     }
 }
 
+/// An event's name is matched from its start: a comma in it does not begin a
+/// first name, as it does for people. Twenty events seen more often, whose
+/// names end in ", Paris", do not push «Paris Open» out of a `Paris` prefix.
+#[test]
+fn event_suggestions_match_the_start_of_the_name() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    let mut entities = Vec::new();
+    for t in 0..21usize {
+        let title = if t == 20 { "Paris Open".to_string() } else { format!("Other event {t:02}, Paris") };
+        let mut record = strings(&["", &title]);
+        record.extend(0i32.to_le_bytes());
+        entities.push((1, t, record));
+        for _ in 0..if t == 20 { 1 } else { 2 } {
+            b.game(e4)[0x28..0x30].copy_from_slice(&(t as i64).to_le_bytes());
+        }
+    }
+    b.lid(lid_with(64, 21, &entities));
+    let db = b.write("api-event-prefix");
+    let r = start(&db, vec![], None);
+    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=event&prefix=Paris&limit=20", r.id), "");
+    assert_eq!(s.status, 200, "{}", s.body);
+    assert!(s.body.contains(r#"{"value":"Paris Open","label":"Paris Open","games":1}"#), "{}", s.body);
+    assert!(!s.body.contains("Other event"), "{}", s.body);
+}
+
 #[test]
 fn a_changed_database_is_searched_afresh() {
     let db = database("api-search-fresh", 2, 0, 0);
