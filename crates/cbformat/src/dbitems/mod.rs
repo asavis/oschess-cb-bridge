@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use crate::v2::Date;
 use crate::{Error, Result};
 
+mod local;
+
+pub use local::local_path;
+
 /// The list's file name in the ChessBase documents folder.
 pub const FILE_NAME: &str = "DBItems.cbini";
 const MAGIC: [u8; 4] = [0x0c, 0x0b, 0x0a, 0x0e];

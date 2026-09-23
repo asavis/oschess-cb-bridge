@@ -100,7 +100,7 @@ with them.
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
-| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state |
+| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading` |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
@@ -153,17 +153,34 @@ snapshot to coordinate with. The bridge therefore promises:
 ```json
 {
   "bridge": { "version": "0.4.0", "api": 1 },
-  "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 0, "unsupported": 2, "unreadable": 0 }
+  "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
+  "download": { "present": 104857600, "total": 734003200 }
 }
 ```
 
 The web app calls it first. `api` below the version it was written for means
-the bridge is too old; the app then offers the download link.
+the bridge is too old; the app then offers the download link. `databases`
+counts the databases in each state. `download` is there while databases are
+being downloaded: the bytes on this computer and in all, over all of them.
 
 ### `GET /v1/databases`
 
-The databases of ChessBase's own database window, in its order (#20), followed
-by those added in `bridge.toml`.
+The databases of ChessBase's own database window, then those `bridge.toml`
+adds, then those given with `--database`, each once:
+
+- **The window's** are read from `DBItems.cbini` in `Documents\ChessBase`, in
+  the order the file stores them: 2CBH databases first, then the others. The
+  window can sort them differently on screen; that setting is not decoded.
+- **`bridge.toml`'s** follow in the order written. A folder gives the `.2cbh`
+  and `.cbh` database files directly in it, by file name; a folder or a pipe
+  named like one is not a database.
+- **The list is read again** on a request to `/v1/status` or `/v1/databases`
+  after `DBItems.cbini`, `bridge.toml` or a listed folder changed. Each of them
+  that cannot be read keeps the databases last read from it, and is read again
+  on the next such request until it can be, even if it has not changed since.
+  A database that leaves the list
+  stays at its end as `missing`, under the same `id`, until the bridge
+  restarts, so a page that holds its `id` learns what happened to it.
 
 ```json
 {
@@ -177,6 +194,14 @@ by those added in `bridge.toml`.
       "generation": "g1b2c3d4"
     },
     {
+      "id": "5e4f30219a8b7c6d",
+      "name": "Club 2025",
+      "format": "2cbh",
+      "state": "downloading",
+      "size": 734003200,
+      "progress": { "present": 104857600, "total": 734003200 }
+    },
+    {
       "id": "9a8b7c6d5e4f3021",
       "name": "Openings",
       "format": "pgn",
@@ -188,11 +213,38 @@ by those added in `bridge.toml`.
 
 | Field | Meaning |
 |---|---|
-| `name` | The file name without extension, as ChessBase shows it |
+| `name` | The name ChessBase's window shows: the title it keeps for the database, else the file name without extension. A database that is not in the window has its file name without extension |
 | `format` | `2cbh`, `cbh` or `pgn`; another value is possible later |
-| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone); `cloudOnly` (a OneDrive file not on this computer: make it available offline); `unsupported` (a format the bridge does not serve); `unreadable` (the files are present but cannot be opened: damaged, or locked by another program) |
+| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: `.cbh` until the bridge renders its games, `.pgn`, which the oschess Library imports itself, and any other); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one) |
 | `records` | Games, guiding texts and analyses; present when `ready` |
 | `generation` | See above; present when `ready` |
+| `size` | The bytes of the database's files; present when `cloudOnly` or `downloading` |
+| `progress` | `present` bytes on this computer of `total`; present when `downloading` |
+
+#### Cloud-only databases
+
+A database in a folder that a cloud storage service keeps in sync may be kept
+only in the cloud: its files are placeholders until something reads them, and
+reading one downloads it. The bridge recognises placeholders from their file
+attributes and never reads one while listing, so listing downloads nothing.
+
+The first request for the games of a `cloudOnly` database (a window or a game)
+starts a download and is answered `409 database_unavailable` with state
+`downloading`. The bridge reads the database's files one after another in the
+background, one database at a time; a database waiting for its turn is
+`downloading` too. `/v1/databases` shows the `progress`. When the files are
+here the database is `ready`. A download that fails, or cannot start, leaves
+it `cloudOnly` (the request is then answered with that state), and the next
+request for its games tries again.
+
+The state follows the current marks alone: a database with any file marked
+as kept in the cloud is `cloudOnly` (or `downloading` while its download runs
+or waits), and one without is opened as usual. So a file the service moves
+back to the cloud, or one moved there while the download read another, makes
+the database `cloudOnly` again, and the next request for its games downloads
+it. A service that keeps a file marked after all of it was read leaves the
+database `cloudOnly`; the bridge logs that, and downloads again only when its
+games are requested again.
 
 ### `GET /v1/databases/{id}/games`
 

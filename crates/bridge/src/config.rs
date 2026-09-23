@@ -1,5 +1,6 @@
 //! `bridge.toml`: the port, extra origins, extra databases and the oschess
-//! site the pairing link opens.
+//! site the pairing link opens. The bridge reads them when it starts, and the
+//! databases again whenever the file changes.
 //!
 //! The file is a small subset of TOML — `key = value` lines, `#` comments,
 //! integers, strings in `"double"` (with escapes) or `'single'` (literal)
@@ -17,7 +18,8 @@ pub struct Config {
     pub port: u16,
     /// Allowed origins in addition to the oschess ones.
     pub origins: Vec<String>,
-    /// Databases in addition to those ChessBase lists.
+    /// Databases in addition to those ChessBase lists: database files, or
+    /// folders of databases.
     pub databases: Vec<PathBuf>,
     /// The oschess site the pairing link opens.
     pub web: String,
@@ -30,7 +32,8 @@ impl Default for Config {
 }
 
 const TEMPLATE: &str = "\
-# oschess bridge settings. Restart the bridge after changing this file.
+# oschess bridge settings. A new port, origin or web site takes effect when the
+# bridge restarts; the databases take effect as soon as this file is saved.
 
 port = 39581
 
@@ -38,7 +41,8 @@ port = 39581
 # for example [\"http://localhost:5173\"].
 origins = []
 
-# Databases in addition to those ChessBase shows, as paths to .2cbh files,
+# Databases in addition to those ChessBase shows: paths to .2cbh files, or to
+# folders whose databases are all served,
 # for example ['C:\\Users\\me\\Documents\\ChessBase\\MyWork\\Games.2cbh'].
 databases = []
 
@@ -54,6 +58,10 @@ pub fn load_or_create(path: &Path) -> Result<Config, String> {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         std::fs::write(path, TEMPLATE).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    // A pipe would block the read.
+    if !path.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
