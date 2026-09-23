@@ -540,6 +540,8 @@ fn busy_and_misdirected_answers_carry_cors() {
     let p = start(&db, vec![], None).port;
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:1\r\nOrigin: {ORIGIN}"));
     assert_eq!((r.status, r.header("access-control-allow-origin")), (421, Some(ORIGIN)));
+    // That connection's slot was freed before it closed, so the next ones
+    // are the only ones counted.
     let idle: Vec<TcpStream> =
         (0..server::MAX_CONNECTIONS).map(|_| TcpStream::connect(("127.0.0.1", p)).unwrap()).collect();
     std::thread::sleep(std::time::Duration::from_millis(200));
