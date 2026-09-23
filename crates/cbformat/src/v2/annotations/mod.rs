@@ -115,8 +115,10 @@ pub mod language {
 
 impl GameAnnotations {
     /// Decodes a record's content. Damage (a length or count past the end, a
-    /// missing end marker, bytes after it, a square out of range) is an error;
-    /// a type of unknown layout ends decoding and sets [`Self::stopped_at`].
+    /// missing end marker, bytes after it, a position below −1, a square out
+    /// of range) is an error; a type of unknown layout ends decoding and sets
+    /// [`Self::stopped_at`]. Whether each position names a move of the game
+    /// is checked against the game by [`Self::check_positions`].
     pub fn parse(content: &[u8]) -> Result<Self> {
         let mut r = Reader { b: content, i: 0 };
         let mut out = GameAnnotations::default();
@@ -127,6 +129,9 @@ impl GameAnnotations {
                     return Err(r.bad("bytes after the end marker"));
                 }
                 return Ok(out);
+            }
+            if position < GAME_POSITION {
+                return Err(r.bad(&format!("position {position}")));
             }
             let count = r.i32()?;
             // Each annotation is at least its 2-byte type.
@@ -146,6 +151,20 @@ impl GameAnnotations {
                 }
             }
             out.blocks.push(Block { position, annotations });
+        }
+    }
+
+    /// Checks that every position, the one where decoding stopped included,
+    /// is the game (−1) or one of its `moves` moves (all lines counted, as
+    /// [`crate::replay::TreeStats::total_plies`]). An annotation on no move
+    /// would otherwise be dropped from the PGN without a trace.
+    pub fn check_positions(&self, moves: u32) -> Result<()> {
+        let positions = self.blocks.iter().map(|b| b.position).chain(self.stopped_at.map(|u| u.position));
+        match positions.filter(|&p| p >= 0).max() {
+            Some(p) if p as u32 >= moves => {
+                Err(Error::Format(format!("annotations at position {p}, past the last of the game's {moves} moves")))
+            }
+            _ => Ok(()),
         }
     }
 

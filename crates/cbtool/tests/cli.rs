@@ -266,3 +266,27 @@ fn verify_bounds_the_memory_of_hostile_nesting() {
     assert_eq!(out.status.code(), Some(1), "{text}{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("failures           1") && text.contains("nested deeper than 1024"), "{text}");
 }
+
+/// An annotation on a move the game does not have fails `verify` and the
+/// export of that game, instead of vanishing from the PGN.
+#[test]
+fn annotations_on_no_move_fail_verify_and_export() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    let good = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "fine")])]));
+    let bad = b.annotations(&annotations(&[(1, vec![text(false, language::ENGLISH, "on no move")])]));
+    b.annotated_game(e4, good);
+    b.annotated_game(e4, bad);
+    let f = b.write("cbtool-no-move");
+    let verify =
+        Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(f.dir().join("db.2cbh")).output().unwrap();
+    let text = String::from_utf8_lossy(&verify.stdout);
+    assert_eq!(verify.status.code(), Some(1), "{text}");
+    assert!(text.contains("annotated          2") && text.contains("failures           1"), "{text}");
+    assert!(text.contains("game 2: annotations:") && text.contains("position 1"), "{text}");
+    let out = f.dir().join("games.pgn");
+    let export = pgn(f.dir(), &out);
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("game 2:"), "{}", String::from_utf8_lossy(&export.stderr));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("1. e4 {fine} 1-0"));
+}

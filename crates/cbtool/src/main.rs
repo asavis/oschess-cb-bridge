@@ -179,17 +179,20 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
             }
         }
     }
-    match walk_tree(&moves, |_, _, _| {}) {
+    let plies = match walk_tree(&moves, |_, _, _| {}) {
         Ok(t) => {
             s.main_plies += t.main_line_plies as u64;
             s.total_plies += t.total_plies as u64;
+            t.total_plies
         }
         Err(e) => return fail(s, e.to_string()),
-    }
+    };
     match batch.annotations_of(&r) {
         Ok(Some(a)) if !a.is_empty() => {
             s.annotated += 1;
-            if let Some(u) = a.stopped_at {
+            if let Err(e) = a.check_positions(plies) {
+                fail(s, format!("annotations: {e}"));
+            } else if let Some(u) = a.stopped_at {
                 s.annotations_incomplete += 1;
                 fail(s, format!("annotations: type {:#04x} of unknown layout at position {}", u.type_code, u.position));
             }

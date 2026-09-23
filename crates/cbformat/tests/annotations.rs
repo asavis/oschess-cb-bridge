@@ -253,3 +253,27 @@ fn batches_read_the_same_annotations() {
     assert!(db.annotations_of(&db.record(1).unwrap()).unwrap().unwrap().is_empty());
     assert!(!db.annotations_of(&db.record(2).unwrap()).unwrap().unwrap().is_empty());
 }
+
+#[test]
+fn annotations_on_no_move_are_damage() {
+    // A one-move game: positions -1 and 0 exist, nothing else does.
+    let words = [MOVES, quiet(W, Pawn, "e2", "e4"), END];
+    let english = |t: &str| text(false, language::ENGLISH, t);
+    let cases = [
+        ("past-end", annotations(&[(0, vec![english("ok")]), (1, vec![english("past the end")])])),
+        ("below-game", annotations(&[(-2, vec![english("before the game")])])),
+        ("near-max", annotations(&[(2_147_483_646, vec![english("far away")])])),
+        // Decoding stops at an unknown layout on a position past the end.
+        ("stopped-past-end", annotations(&[(0, vec![english("ok")]), (1, vec![vec![0x1a, 0, 1]])])),
+    ];
+    for (name, content) in cases {
+        let db = one_game(&format!("no-move-{name}"), &words, Some(&content));
+        let db = Database::open(db.base()).unwrap();
+        let err = pgn::game(&db, 1).unwrap_err().to_string();
+        assert!(err.contains("position"), "{name}: {err}");
+    }
+    // The game comment and the last move are fine.
+    let ok = annotations(&[(-1, vec![english("game")]), (0, vec![english("last")])]);
+    let (movetext, status) = render("no-move-ok", &words, &ok, &Options::default());
+    assert_eq!((movetext.as_str(), status), ("{game} 1. e4 {last}", AnnotationStatus::Complete));
+}

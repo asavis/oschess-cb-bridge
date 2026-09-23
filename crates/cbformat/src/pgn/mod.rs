@@ -70,10 +70,13 @@ fn write_movetext(moves: &GameMoves<'_>, annotations: Option<&GameAnnotations>, 
     let mut tree = TreeBuilder::new();
     // walk() checks every move and the tree's shape, so a damaged record is an
     // error here exactly as it is in `cbtool verify`.
-    replay::walk(moves, &mut tree)?;
+    let stats = replay::walk(moves, &mut tree)?;
     let mut out = String::with_capacity(tree.text_len());
     match annotations.filter(|a| !a.is_empty()) {
         Some(a) => {
+            // An annotation on a move the game does not have is damage, not
+            // something to drop quietly.
+            a.check_positions(stats.total_plies)?;
             let mut commentary = Commentary::new(a, options);
             commentary.game_comment(&mut out);
             emit(&tree, &mut commentary, &mut out);
