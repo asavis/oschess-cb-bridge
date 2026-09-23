@@ -34,8 +34,8 @@ impl Options {
 /// How much of a game's annotations the PGN holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnotationStatus {
-    /// The database has no annotation file.
-    Unavailable,
+    /// The game has no annotations, or the database has no annotation file.
+    None,
     /// Every annotation was decoded. Types PGN has no form for (training,
     /// clocks, game quotations and the like) are left out by design.
     Complete,
@@ -173,8 +173,8 @@ pub fn game_from(
     }
     out.push_str(r.result().pgn());
     out.push('\n');
-    let status = match annotations {
-        None => AnnotationStatus::Unavailable,
+    let status = match annotations.filter(|a| !a.is_empty()) {
+        None => AnnotationStatus::None,
         Some(a) => match a.stopped_at {
             Some(u) => AnnotationStatus::Incomplete { type_code: u.type_code },
             None => AnnotationStatus::Complete,

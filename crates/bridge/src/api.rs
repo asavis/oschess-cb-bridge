@@ -19,9 +19,10 @@ pub const MAX_LIMIT: u32 = 500;
 const DEFAULT_LIMIT: u32 = 200;
 /// Reads of one game before a database that keeps changing is reported.
 const GAME_ATTEMPTS: usize = 3;
-/// The largest move record, content or spare area, served as PGN. The largest
-/// record of any kind in a Mega Database is about 1.2 MB, a guiding text; a
-/// move record near the reader's 64 MiB limit would take gigabytes to render.
+/// The largest move or annotation record, content or spare area, served as
+/// PGN. The largest record of any kind in a Mega Database is about 1.2 MB, a
+/// guiding text; a record near the reader's 64 MiB limit would take gigabytes
+/// to render.
 pub const MAX_GAME_BYTES: usize = 2 << 20;
 /// The largest game answer: its PGN written as JSON. Real games stay far
 /// below; names or comments of control characters can grow sixfold in JSON.
@@ -85,7 +86,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "status"] => status(app),
         ["v1", "databases"] => databases(app),
         ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(e, req)),
-        ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number)),
+        ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
         _ => not_found(),
     }
 }
@@ -318,8 +319,10 @@ fn row(names: &mut Names<'_>, r: &Record) -> cbformat::Result<String> {
     }
 }
 
-fn game(app: &App, entry: &Entry, number: &str) -> Response {
+fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
     let Some(number) = number.parse::<u32>().ok().filter(|&n| n > 0) else { return not_found() };
+    // Languages ChessBase has no number for are passed over; English is the default.
+    let options = pgn::Options::with_languages(req.param("lang").unwrap_or("en").split(','));
     for _ in 0..GAME_ATTEMPTS {
         let open = match entry.open() {
             Ok(open) => open,
@@ -335,12 +338,14 @@ fn game(app: &App, entry: &Entry, number: &str) -> Response {
         if !matches!(before.kind(), RecordKind::Game) {
             return error(422, "not_a_game", "Guiding texts and analyses are not served as PGN");
         }
+        // The move and annotation records are both read between the two
+        // header reads, so a change to either is detected the same way.
         let rendered = {
             let _render = RENDERS.enter();
-            open.db
-                .moves_of_within(&before, MAX_GAME_BYTES)
-                .and_then(|data| pgn::game_from(&open.db, &before, &data.moves()?, None, &pgn::Options::default()))
-                .map(|r| r.pgn)
+            open.db.moves_of_within(&before, MAX_GAME_BYTES).and_then(|data| {
+                let annotations = open.db.annotations_of_within(&before, MAX_GAME_BYTES)?;
+                pgn::game_from(&open.db, &before, &data.moves()?, annotations.as_ref(), &options)
+            })
         };
         if let Some(hook) = &app.between_reads {
             hook();
@@ -350,8 +355,10 @@ fn game(app: &App, entry: &Entry, number: &str) -> Response {
             continue;
         }
         return match rendered {
-            Ok(text) => {
-                let size = json::string_len(&text) + 128;
+            Ok(rendered) => {
+                let text = rendered.pgn;
+                // The PGN, and at most 192 bytes of keys, numbers and the status.
+                let size = json::string_len(&text) + 192;
                 if size > MAX_GAME_RESPONSE {
                     let reason =
                         format!("the game's answer would be {size} bytes, over the {MAX_GAME_RESPONSE}-byte limit");
@@ -364,9 +371,15 @@ fn game(app: &App, entry: &Entry, number: &str) -> Response {
                 let body = Obj::new()
                     .str("generation", &format!("{:016x}", open.generation))
                     .num("number", number)
-                    .str("pgn", &text)
-                    .done();
-                ok(body).holding(hold)
+                    .str("pgn", &text);
+                let body = match rendered.annotations {
+                    pgn::AnnotationStatus::None => body.str("annotations", "none"),
+                    pgn::AnnotationStatus::Complete => body.str("annotations", "complete"),
+                    pgn::AnnotationStatus::Incomplete { type_code } => {
+                        body.str("annotations", "incomplete").num("unreadableAnnotation", type_code)
+                    }
+                };
+                ok(body.done()).holding(hold)
             }
             Err(Error::Io(..)) => database_changing(),
             Err(e) => error_with(422, "unreadable_game", "The game's records are damaged", |o| {

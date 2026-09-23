@@ -218,10 +218,10 @@ fn without_an_annotation_file_the_pgn_is_unchanged() {
     let words = [MOVES, quiet(W, Pawn, "e2", "e4"), quiet(B, Pawn, "e7", "e5"), END];
     let bare = one_game("bare", &words, None);
     let (movetext, status) = rendered(&bare, &Options::default());
-    assert_eq!((movetext.as_str(), status), ("1. e4 e5", AnnotationStatus::Unavailable));
+    assert_eq!((movetext.as_str(), status), ("1. e4 e5", AnnotationStatus::None));
     let empty = one_game("empty", &words, Some(&annotations(&[])));
     let (movetext, status) = rendered(&empty, &Options::default());
-    assert_eq!((movetext.as_str(), status), ("1. e4 e5", AnnotationStatus::Complete));
+    assert_eq!((movetext.as_str(), status), ("1. e4 e5", AnnotationStatus::None));
 }
 
 #[test]
