@@ -51,13 +51,28 @@ The review gate follows the scheme of the `kidschessleague` project.
 
 ## Checks
 
+This repository is public, so anyone can open a pull request, and nobody else
+may trigger tests or builds (owner decision, 2026-09-23). The only workflow,
+`.github/workflows/ci.yml`, runs after a merge: on a push to `main`, which only
+collaborators can make, and only on our own runners (`bridge-local` for Linux,
+`bridge-windows` for Windows). Never add a workflow, trigger or job that a pull
+request, an issue, a comment or a fork can start, and never route a job to
+GitHub's hosted runners. Before a merge, every check runs on our own hosts,
+started by us: by the author before every push and by the reviewer on the
+reviewed commit.
+
 Before every push, in the pull request's worktree:
 
 ```
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 cargo test
 ```
+
+The Windows clippy run checks the Windows-only code without linking it
+(`rustup target add x86_64-pc-windows-gnu`). Say in the pull request what could
+not be run, such as tests of Windows-only behaviour.
 
 A change to the reader is also run with `cbtool verify` over every local
 database available, and the counts go in the pull request body. A reader change

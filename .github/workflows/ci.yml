@@ -1,12 +1,18 @@
 name: ci
 
+# After a merge only. The repository is public, so a pull request, an issue or a
+# comment from anyone must trigger nothing; only a push to main, which only
+# collaborators can make, runs the checks, and only on our own runners.
 on:
-  pull_request:
   push:
     branches: [main]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-main
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -14,9 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+        include:
+          - os: linux
+            runner: [self-hosted, linux, bridge-local]
+          - os: windows
+            runner: [self-hosted, windows, bridge-windows]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
@@ -32,11 +42,11 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
       - name: Upload the Windows executable
-        # A pull request's build, for trying it on Windows before a release.
-        if: runner.os == 'Windows' && github.event_name == 'pull_request'
+        # The build of main, for trying it on Windows before a release.
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: oschess-bridge-windows
           path: target/release/oschess-bridge.exe
           if-no-files-found: error
-          retention-days: 5
+          retention-days: 14
