@@ -166,3 +166,96 @@ fn many_random_games() {
         playout(Board::chess960(n).unwrap(), cozy_chess::Board::chess960_startpos(n as u32), &mut rng, 300, &label);
     }
 }
+
+/// A random square not yet used, marked used.
+fn free_square(used: &mut [bool; 64], rng: &mut Rng) -> usize {
+    loop {
+        let sq = rng.below(64);
+        if !used[sq] {
+            used[sq] = true;
+            return sq;
+        }
+    }
+}
+
+/// Random placements with random castling rights and en passant files: the
+/// builders agree on which are valid, and on the valid ones' FEN and moves.
+#[test]
+fn random_set_up_positions_match() {
+    use chesscore::{BoardBuilder, CastleSide, Color};
+    let mut rng = Rng(0x5eed_0000_0000_1234);
+    let (mut valid, mut invalid) = (0, 0);
+    for case in 0..20_000 {
+        let mut ours = BoardBuilder::empty();
+        let mut theirs = cozy_chess::BoardBuilder::empty();
+        let mut place = |sq: usize, p: Piece, c: Color| {
+            let s = Square::from_index(sq as u8).unwrap();
+            ours.set(s, Some((p, c)));
+            let cp = [
+                cozy_chess::Piece::Pawn,
+                cozy_chess::Piece::Knight,
+                cozy_chess::Piece::Bishop,
+                cozy_chess::Piece::Rook,
+                cozy_chess::Piece::Queen,
+                cozy_chess::Piece::King,
+            ][p.index()];
+            let cc = if c == Color::White { cozy_chess::Color::White } else { cozy_chess::Color::Black };
+            theirs.board[sq] = Some((cp, cc));
+        };
+        let mut used = [false; 64];
+        // Kings on their home squares half the time, so castling is reachable.
+        let wk = if rng.below(2) == 0 { 4 } else { free_square(&mut used, &mut rng) };
+        used[wk] = true;
+        let bk = if rng.below(2) == 0 && !used[60] { 60 } else { free_square(&mut used, &mut rng) };
+        used[bk] = true;
+        place(wk, Piece::King, Color::White);
+        place(bk, Piece::King, Color::Black);
+        for _ in 0..rng.below(20) {
+            let sq = free_square(&mut used, &mut rng);
+            let piece =
+                [Piece::Pawn, Piece::Pawn, Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen]
+                    [rng.below(7)];
+            place(sq, piece, if rng.below(2) == 0 { Color::White } else { Color::Black });
+        }
+        let side = if rng.below(2) == 0 { Color::White } else { Color::Black };
+        ours.side_to_move = side;
+        theirs.side_to_move = if side == Color::White { cozy_chess::Color::White } else { cozy_chess::Color::Black };
+        for (ci, color) in [Color::White, Color::Black].into_iter().enumerate() {
+            for (si, s) in [CastleSide::Short, CastleSide::Long].into_iter().enumerate() {
+                if rng.below(6) == 0 {
+                    let file = [7u8, 0][si];
+                    ours.castling[color.index()][s as usize] = Some(file);
+                    let f = cozy_chess::File::index(file as usize);
+                    let rights = &mut theirs.castle_rights[ci];
+                    if si == 0 { rights.short = Some(f) } else { rights.long = Some(f) }
+                }
+            }
+        }
+        if rng.below(6) == 0 {
+            let file = rng.below(8) as u8;
+            ours.en_passant_file = Some(file);
+            let rank = if side == Color::White { cozy_chess::Rank::Sixth } else { cozy_chess::Rank::Third };
+            theirs.en_passant = Some(cozy_chess::Square::new(cozy_chess::File::index(file as usize), rank));
+        }
+        // cozy-chess accepts kings on adjacent squares, an impossible position
+        // that chesscore refuses (the side not to move would be in check).
+        let wks = Square::from_index(wk as u8).unwrap();
+        if chesscore::attacks::king(wks) & Square::from_index(bk as u8).unwrap().bit() != 0 {
+            continue;
+        }
+        let built = ours.build();
+        // cozy-chess also accepts a triple check, which no legal game reaches.
+        if built == Err(chesscore::SetupError::ImpossibleCheck) {
+            continue;
+        }
+        match (built, theirs.build()) {
+            (Ok(b), Ok(c)) => {
+                valid += 1;
+                same_position(&b, &c, &format!("set-up {case}"));
+            }
+            (Err(_), Err(_)) => invalid += 1,
+            (o, t) => panic!("set-up {case}: chesscore {o:?}, cozy-chess {:?}", t.map(|b| b.to_string())),
+        }
+    }
+    assert!(valid > 1_000 && invalid > 1_000, "{valid} valid, {invalid} invalid");
+}

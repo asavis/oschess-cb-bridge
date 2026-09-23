@@ -2,8 +2,12 @@
 
 use std::fmt;
 
+use crate::attacks;
 use crate::board::{Board, CastleSide};
-use crate::types::{Color, Piece, Square};
+use crate::types::{Bitboard, Color, Piece, Square, squares};
+
+const RANK_1: Bitboard = 0xff;
+const RANK_8: Bitboard = 0xff << 56;
 
 /// The parts of a position, checked by [`BoardBuilder::build`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +36,10 @@ pub enum SetupError {
     Castling,
     /// An en passant file with no pawn that can have just made a double step.
     EnPassant,
+    /// A side has more than sixteen pieces or more than eight pawns.
+    TooManyPieces,
+    /// The side to move is checked by more than two pieces.
+    ImpossibleCheck,
 }
 
 impl fmt::Display for SetupError {
@@ -42,6 +50,8 @@ impl fmt::Display for SetupError {
             SetupError::OpponentInCheck => "the side not to move is in check",
             SetupError::Castling => "a castling right has no king or rook in place",
             SetupError::EnPassant => "the en passant file has no pawn that just made a double step",
+            SetupError::TooManyPieces => "a side has more than sixteen pieces or more than eight pawns",
+            SetupError::ImpossibleCheck => "the side to move is checked by more than two pieces",
         })
     }
 }
@@ -88,7 +98,8 @@ impl BoardBuilder {
 
     /// Whether the en passant file names a pawn of the side not to move that
     /// can have just made a double step: the pawn in place, the squares it
-    /// passed and left empty.
+    /// passed and left empty, and every check on the side to move given by
+    /// that pawn or opened through the square it left.
     pub fn en_passant_is_valid(&self) -> bool {
         let Some(file) = self.en_passant_file else { return true };
         if file >= 8 {
@@ -99,30 +110,51 @@ impl BoardBuilder {
             Color::White => (1, 2, 3),
             Color::Black => (6, 5, 4),
         };
-        self.squares[Square::new(file, to).index()] == Some((Piece::Pawn, mover))
-            && self.squares[Square::new(file, passed).index()].is_none()
-            && self.squares[Square::new(file, from).index()].is_none()
+        let (source, pawn) = (Square::new(file, from), Square::new(file, to));
+        if self.squares[pawn.index()] != Some((Piece::Pawn, mover))
+            || self.squares[Square::new(file, passed).index()].is_some()
+            || self.squares[source.index()].is_some()
+        {
+            return false;
+        }
+        let b = self.placement();
+        let king = self.squares.iter().position(|&p| p == Some((Piece::King, self.side_to_move)));
+        let Some(king) = king.and_then(|k| Square::from_index(k as u8)) else { return false };
+        let checkers = b.attackers_to(king, b.occupied()) & b.colors(mover);
+        squares(checkers).all(|c| c == pawn || attacks::between(c, king) & source.bit() != 0)
+    }
+
+    /// The pieces alone on a board, the side to move set.
+    fn placement(&self) -> Board {
+        let mut b = Board::empty();
+        for (i, piece) in self.squares.iter().enumerate() {
+            if let (Some((p, c)), Some(sq)) = (*piece, Square::from_index(i as u8)) {
+                b.put(sq, p, c);
+            }
+        }
+        b.set_side(self.side_to_move);
+        b
     }
 
     pub fn build(&self) -> Result<Board, SetupError> {
-        let mut b = Board::empty();
-        for (i, piece) in self.squares.iter().enumerate() {
-            if let Some((p, c)) = *piece {
-                let sq = Square::from_index(i as u8).expect("64 squares");
-                if p == Piece::Pawn && (sq.rank() == 0 || sq.rank() == 7) {
-                    return Err(SetupError::PawnOnBackRank);
-                }
-                b.put(sq, p, c);
-            }
+        let mut b = self.placement();
+        if b.pieces(Piece::Pawn) & (RANK_1 | RANK_8) != 0 {
+            return Err(SetupError::PawnOnBackRank);
         }
         for color in Color::ALL {
             if b.colored(Piece::King, color).count_ones() != 1 {
                 return Err(SetupError::KingCount);
             }
+            if b.colors(color).count_ones() > 16 || b.colored(Piece::Pawn, color).count_ones() > 8 {
+                return Err(SetupError::TooManyPieces);
+            }
         }
-        b.set_side(self.side_to_move);
         if b.is_attacked(b.king(!self.side_to_move), self.side_to_move, b.occupied()) {
             return Err(SetupError::OpponentInCheck);
+        }
+        let us = self.side_to_move;
+        if (b.attackers_to(b.king(us), b.occupied()) & b.colors(!us)).count_ones() > 2 {
+            return Err(SetupError::ImpossibleCheck);
         }
         for color in Color::ALL {
             for side in CastleSide::ALL {
