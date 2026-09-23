@@ -2,8 +2,8 @@
 
 use cozy_chess::{Board, Color as CColor, GameStatus, Move, Piece, Square};
 
-use crate::replay::{self, start_board};
-use crate::v2::{Database, GameMoves, Record, RecordKind, Start, Token};
+use crate::replay::{self, TreeVisitor, start_board};
+use crate::v2::{Database, GameMoves, Record, RecordKind, Start};
 use crate::{Error, Result};
 
 fn piece_letter(p: Piece) -> &'static str {
@@ -98,66 +98,98 @@ pub fn movetext(db: &Database, record: &Record<'_>) -> Result<String> {
 
 /// The move tree of a parsed move record as PGN movetext.
 pub fn movetext_of(moves: &GameMoves<'_>) -> Result<String> {
-    let mut board = start_board(&moves.start()?)?;
-    let mut nodes = vec![Node { san: String::new(), fullmove: 0, white: true, children: vec![] }];
-    let mut cur = 0usize;
-    let mut stack: Vec<(usize, Board)> = Vec::new();
-    let mut before_last: Option<(usize, Board)> = None;
-    for (ply, token) in moves.tokens().enumerate() {
-        match token {
-            Token::Move(w) => {
-                let before = board.clone();
-                let text =
-                    match replay::play(&mut board, w).map_err(|reason| Error::Move { ply: ply as u32 + 1, reason })? {
-                        Some(mv) => san(&before, mv),
-                        None => "--".to_string(),
-                    };
-                nodes.push(Node {
-                    san: text,
-                    fullmove: before.fullmove_number(),
-                    white: before.side_to_move() == CColor::White,
-                    children: vec![],
-                });
-                let id = nodes.len() - 1;
-                nodes[cur].children.push(id);
-                before_last = Some((cur, before));
-                cur = id;
-            }
-            Token::Alternative => {
-                stack.push(before_last.clone().ok_or_else(|| Error::Format("alternative before any move".into()))?);
-            }
-            Token::EndOfLine => match stack.pop() {
-                Some((node, b)) => {
-                    cur = node;
-                    board = b;
-                }
-                None => break,
-            },
-        }
-    }
+    let mut tree = TreeBuilder {
+        nodes: vec![Node { san: String::new(), fullmove: 0, white: true, children: vec![] }],
+        cur: 0,
+        parent_of_last: 0,
+        branches: Vec::new(),
+    };
+    // walk() checks every move and the tree's shape, so a damaged record is an
+    // error here exactly as it is in `cbtool verify`.
+    replay::walk(moves, &mut tree)?;
     let mut out = String::new();
-    emit(&nodes, 0, true, &mut out);
+    emit(&tree.nodes, &mut out);
     Ok(out.trim_end().to_string())
 }
 
-fn emit(nodes: &[Node], parent: usize, mut force_number: bool, out: &mut String) {
-    let mut parent = parent;
-    loop {
-        let children = &nodes[parent].children;
-        let Some(&main) = children.first() else { return };
-        write_move(&nodes[main], force_number, out);
-        force_number = false;
-        for &alt in &children[1..] {
-            out.push('(');
-            write_move(&nodes[alt], true, out);
-            emit(nodes, alt, false, out);
-            if out.ends_with(' ') {
-                out.pop();
+struct TreeBuilder {
+    nodes: Vec<Node>,
+    cur: usize,
+    parent_of_last: usize,
+    branches: Vec<usize>,
+}
+
+impl TreeVisitor for TreeBuilder {
+    fn play(&mut self, before: &Board, mv: Option<Move>, _main_line: bool) {
+        let san = match mv {
+            Some(mv) => san(before, mv),
+            None => "--".to_string(),
+        };
+        let white = before.side_to_move() == CColor::White;
+        self.nodes.push(Node { san, fullmove: before.fullmove_number(), white, children: vec![] });
+        let id = self.nodes.len() - 1;
+        self.nodes[self.cur].children.push(id);
+        self.parent_of_last = self.cur;
+        self.cur = id;
+    }
+    fn branch(&mut self) {
+        self.branches.push(self.parent_of_last);
+    }
+    fn resume(&mut self) {
+        // walk() calls resume only with a branch outstanding.
+        self.cur = self.branches.pop().unwrap_or(0);
+    }
+}
+
+/// Writes the tree below the root as movetext. Iterative, so that however
+/// deeply the variations nest, the depth costs heap and not stack.
+fn emit(nodes: &[Node], out: &mut String) {
+    enum Step {
+        /// Continue the line whose last written move is `node`.
+        Line {
+            node: usize,
+            force_number: bool,
+        },
+        /// Write the alternatives of `branch` from its `next`-th child.
+        Alternatives {
+            branch: usize,
+            next: usize,
+        },
+        Close,
+    }
+    let mut steps = vec![Step::Line { node: 0, force_number: true }];
+    while let Some(step) = steps.pop() {
+        match step {
+            Step::Line { node, force_number } => {
+                let children = &nodes[node].children;
+                let Some(&main) = children.first() else { continue };
+                write_move(&nodes[main], force_number, out);
+                if children.len() > 1 {
+                    steps.push(Step::Alternatives { branch: node, next: 1 });
+                } else {
+                    steps.push(Step::Line { node: main, force_number: false });
+                }
             }
-            out.push_str(") ");
-            force_number = true;
+            Step::Alternatives { branch, next } => {
+                let children = &nodes[branch].children;
+                if let Some(&alt) = children.get(next) {
+                    steps.push(Step::Alternatives { branch, next: next + 1 });
+                    steps.push(Step::Close);
+                    out.push('(');
+                    write_move(&nodes[alt], true, out);
+                    steps.push(Step::Line { node: alt, force_number: false });
+                } else {
+                    // Back on the main line after its alternatives: repeat the number.
+                    steps.push(Step::Line { node: children[0], force_number: true });
+                }
+            }
+            Step::Close => {
+                if out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push_str(") ");
+            }
         }
-        parent = main;
     }
 }
 
@@ -205,8 +237,8 @@ pub fn game(db: &Database, id: u32) -> Result<String> {
     if r.black_elo() > 0 {
         tag(&mut out, "BlackElo", &r.black_elo().to_string());
     }
-    if let Some((eco, _)) = r.eco() {
-        tag(&mut out, "ECO", &format!("{}{:02}", (b'A' + (eco / 100) as u8) as char, eco % 100));
+    if let Some(eco) = r.eco().pgn() {
+        tag(&mut out, "ECO", &eco);
     }
     let moves = db.moves_of(&r)?;
     let start = moves.start()?;

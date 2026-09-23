@@ -123,6 +123,12 @@ pub fn to_move(board: &Board, word: u16) -> std::result::Result<Move, String> {
             if board.piece_on(from) != Some(p) || board.color_on(from) != Some(c) {
                 return Err(format!("{word:#06x}: no {c:?} {p:?} on {from}"));
             }
+            // cozy-chess encodes castling as the king taking its own rook, so a
+            // normal move word onto a friendly piece must be refused here or
+            // is_legal would accept it as castling.
+            if board.color_on(to) == Some(c) {
+                return Err(format!("{word:#06x}: {from}{to} lands on a {c:?} piece"));
+            }
             let victim = board.piece_on(to);
             let expected = match captured {
                 Captured::Nothing | Captured::EnPassant => None,
@@ -166,10 +172,39 @@ pub struct TreeStats {
     pub lines: u32,
 }
 
+/// Receives the moves of a tree in stored order from [`walk`].
+///
+/// The tree arrives as a depth-first walk: `play` for each move, `branch`
+/// when the move just played has an alternative still to come, and `resume`
+/// when a line ends and the walk returns to the position before the move whose
+/// `branch` is most recent. The walk has already checked every move against its
+/// board and the shape of the tree, so a visitor needs no checks of its own.
+pub trait TreeVisitor {
+    /// A move (`None` for a null move) played from `before`.
+    fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool);
+    fn branch(&mut self) {}
+    fn resume(&mut self) {}
+}
+
+struct FnVisitor<F>(F);
+
+impl<F: FnMut(&Board, Option<Move>, bool)> TreeVisitor for FnVisitor<F> {
+    fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool) {
+        (self.0)(before, mv, main_line)
+    }
+}
+
 /// Walks every line of the tree, checking each move. `visit` sees the board
 /// before each move, the move (`None` for a null move) and whether it is on
 /// the main line.
-pub fn walk_tree(moves: &GameMoves<'_>, mut visit: impl FnMut(&Board, Option<Move>, bool)) -> Result<TreeStats> {
+pub fn walk_tree(moves: &GameMoves<'_>, visit: impl FnMut(&Board, Option<Move>, bool)) -> Result<TreeStats> {
+    walk(moves, &mut FnVisitor(visit))
+}
+
+/// Walks every line of the tree, checking each move and the tree's shape: an
+/// alternative marker must follow a move, the tree must end with its final
+/// end-of-line marker, and nothing may follow that.
+pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<TreeStats> {
     let mut board = start_board(&moves.start()?)?;
     let mut stack: Vec<Board> = Vec::new();
     let mut before_last: Option<Board> = None;
@@ -184,7 +219,7 @@ pub fn walk_tree(moves: &GameMoves<'_>, mut visit: impl FnMut(&Board, Option<Mov
             Token::Move(w) => {
                 let before = board.clone();
                 let mv = play(&mut board, w).map_err(|reason| Error::Move { ply: stats.total_plies + 1, reason })?;
-                visit(&before, mv, main);
+                visitor.play(&before, mv, main);
                 before_last = Some(before);
                 stats.total_plies += 1;
                 if main {
@@ -192,16 +227,20 @@ pub fn walk_tree(moves: &GameMoves<'_>, mut visit: impl FnMut(&Board, Option<Mov
                 }
             }
             Token::Alternative => {
+                // `take` leaves None, so a second marker after the same move is refused too.
                 let b =
-                    before_last.clone().ok_or_else(|| Error::Format("alternative marker before any move".into()))?;
+                    before_last.take().ok_or_else(|| Error::Format("alternative marker not after a move".into()))?;
                 stack.push(b);
+                visitor.branch();
             }
             Token::EndOfLine => {
                 main = false;
+                before_last = None;
                 match stack.pop() {
                     Some(b) => {
                         board = b;
                         stats.lines += 1;
+                        visitor.resume();
                     }
                     None => ended = true,
                 }

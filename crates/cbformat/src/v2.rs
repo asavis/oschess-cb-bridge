@@ -123,19 +123,16 @@ impl Database {
 /// tag, content, spare area and trailing length.
 fn framed_record(file: &[u8], offset: i64, verify_checksum: bool) -> Result<(u16, &[u8])> {
     let bad = |what: &str| Error::Format(format!("record at {offset:#x}: {what}"));
-    if offset < 0 || offset as usize + 0x1a > file.len() {
+    let o = usize::try_from(offset).map_err(|_| bad("negative offset"))?;
+    if o.checked_add(0x1a).is_none_or(|end| end > file.len()) {
         return Err(bad("offset out of range"));
     }
-    let o = offset as usize;
     if file[o..o + 8] != RECORD_MAGIC {
         return Err(bad("bad magic"));
     }
-    let a = le_i32(file, o + 8);
-    let b = le_i32(file, o + 12);
-    if a < 0 || b < 0 {
-        return Err(bad("negative size"));
-    }
-    let (a, b) = (a as usize, b as usize);
+    let a = usize::try_from(le_i32(file, o + 8)).map_err(|_| bad("negative size"))?;
+    let b = usize::try_from(le_i32(file, o + 12)).map_err(|_| bad("negative size"))?;
+    // a and b are below 2^31 and o + 0x1a is within the file, so no overflow.
     let end = o + 0x1a + a + b + 8;
     if end > file.len() {
         return Err(bad("runs past end of file"));
@@ -286,10 +283,14 @@ impl<'a> Record<'a> {
     pub fn black_elo(&self) -> i16 {
         le_i16(self.b, 0x70)
     }
-    /// ECO code 0-499 (A00-E99) and sub-code, when the field holds one.
-    pub fn eco(&self) -> Option<(u16, u8)> {
-        let v = le_u16(self.b, 0x80);
-        if v == 0 || v >= 64576 { None } else { Some((v / 128 - 1, (v % 128) as u8)) }
+    /// The ECO field: an opening code, a Chess960 start position, or nothing.
+    pub fn eco(&self) -> Eco {
+        match le_u16(self.b, 0x80) {
+            0 => Eco::None,
+            v @ 128..=64127 => Eco::Code { code: v / 128 - 1, sub: (v % 128) as u8 },
+            v @ 64576.. => Eco::Chess960(v - 64576),
+            v => Eco::Invalid(v),
+        }
     }
     pub fn flags(&self) -> u32 {
         le_u32(self.b, 0x84)
@@ -300,6 +301,31 @@ impl<'a> Record<'a> {
     }
     pub fn played_date(&self) -> Date {
         Date(le_i32(self.b, 0xbc))
+    }
+}
+
+/// The ECO field of a game record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Eco {
+    None,
+    /// `code` 0-499 is A00-E99; `sub` is ChessBase's sub-code.
+    Code {
+        code: u16,
+        sub: u8,
+    },
+    /// A Chess960 start position, 0-959.
+    Chess960(u16),
+    /// A value that is none of the above.
+    Invalid(u16),
+}
+
+impl Eco {
+    /// The PGN `ECO` tag value, for an opening code.
+    pub fn pgn(self) -> Option<String> {
+        match self {
+            Eco::Code { code, .. } => Some(format!("{}{:02}", (b'A' + (code / 100) as u8) as char, code % 100)),
+            _ => None,
+        }
     }
 }
 
@@ -462,6 +488,9 @@ impl<'a> GameMoves<'a> {
 
 // ---------------------------------------------------------------- entities
 
+/// Largest container size accepted; the real ones are at most 1,120 bytes.
+const MAX_CONTAINER: i32 = 1 << 20;
+
 pub const PLAYER: usize = 0;
 pub const TOURNAMENT: usize = 1;
 pub const SOURCE: usize = 2;
@@ -502,20 +531,32 @@ impl Entities {
         if d.len() < 8 {
             return Err(Error::Format(".2lid too short".into()));
         }
-        let header_size = be_i32(&d, 0) as usize;
-        let ntypes = be_i32(&d, 4) as usize;
-        if ntypes == 0 || ntypes > 32 || 8 + 20 * ntypes > header_size || header_size > d.len() {
-            return Err(Error::Format(format!(".2lid header size {header_size}, {ntypes} types")));
+        let bad = |what: String| Error::Format(format!(".2lid header: {what}"));
+        let (header_size, ntypes) = (be_i32(&d, 0), be_i32(&d, 4));
+        if !(1..=32).contains(&ntypes) {
+            return Err(bad(format!("{ntypes} entity types")));
+        }
+        let ntypes = ntypes as usize;
+        let header_size = usize::try_from(header_size).map_err(|_| bad(format!("size {header_size}")))?;
+        if 8 + 20 * ntypes > header_size || header_size > d.len() {
+            return Err(bad(format!("size {header_size} for {ntypes} types in a {}-byte file", d.len())));
         }
         let mut types = Vec::with_capacity(ntypes);
         let mut container_offset = Vec::with_capacity(ntypes);
-        let mut block_size = 0;
+        let mut block_size = 0usize;
         for i in 0..ntypes {
             let o = 8 + 20 * i;
-            let size = be_i32(&d, o) as usize;
-            types.push((size, be_i64(&d, o + 4), be_i64(&d, o + 12)));
+            let size = be_i32(&d, o);
+            if !(0..=MAX_CONTAINER).contains(&size) {
+                return Err(bad(format!("type {i} container size {size}")));
+            }
+            let count = be_i64(&d, o + 4);
+            if count < 0 {
+                return Err(bad(format!("type {i} count {count}")));
+            }
+            types.push((size as usize, count, be_i64(&d, o + 12)));
             container_offset.push(block_size);
-            block_size += size;
+            block_size += size as usize; // at most 32 · MAX_CONTAINER
         }
         Ok(Entities { d, header_size, types, container_offset, block_size })
     }
@@ -530,15 +571,16 @@ impl Entities {
         if id < 0 || id >= count {
             return None;
         }
-        let o = self.header_size + id as usize * self.block_size + self.container_offset[typ];
-        if o + 4 > self.d.len() {
+        let o = usize::try_from(id)
+            .ok()?
+            .checked_mul(self.block_size)?
+            .checked_add(self.header_size)?
+            .checked_add(self.container_offset[typ])?;
+        let n = usize::try_from(le_i32(self.d.get(o..o.checked_add(4)?)?, 0)).ok()?;
+        if n == 0 || n.checked_add(4)? > size {
             return None;
         }
-        let n = le_i32(&self.d, o);
-        if n <= 0 || n as usize + 4 > size || o + 4 + n as usize > self.d.len() {
-            return None;
-        }
-        Some(&self.d[o + 4..o + 4 + n as usize])
+        self.d.get(o + 4..o + 4 + n)
     }
 
     pub fn player(&self, id: i64) -> Option<Player> {
@@ -560,19 +602,17 @@ impl Entities {
 struct Cursor<'a>(&'a [u8], usize);
 
 impl Cursor<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let v = self.0.get(self.1..self.1.checked_add(n)?)?;
+        self.1 += n;
+        Some(v)
+    }
     fn i32(&mut self) -> Option<i32> {
-        let v = self.0.get(self.1..self.1 + 4)?;
-        self.1 += 4;
-        Some(i32::from_le_bytes(v.try_into().unwrap()))
+        self.take(4).map(|v| i32::from_le_bytes(v.try_into().unwrap()))
     }
     fn string(&mut self) -> Option<String> {
-        let n = self.i32()?;
-        if n < 0 {
-            return None;
-        }
-        let v = self.0.get(self.1..self.1 + n as usize)?;
-        self.1 += n as usize;
-        Some(String::from_utf8_lossy(v).into_owned())
+        let n = usize::try_from(self.i32()?).ok()?;
+        self.take(n).map(|v| String::from_utf8_lossy(v).into_owned())
     }
 }
 
@@ -587,6 +627,26 @@ mod tests {
         // m = 2: runs (0,1) (2,3) ... (14,15); byte 16 ignored
         let expect: u64 = (0..8).map(|i| ((2 * i + 2 * i + 1) as u64) << (8 * i)).sum();
         assert_eq!(checksum(&content), expect);
+    }
+
+    fn record_with_eco(v: u16) -> [u8; HEADER_RECORD_SIZE] {
+        let mut b = [0u8; HEADER_RECORD_SIZE];
+        b[0x80..0x82].copy_from_slice(&v.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn eco_field() {
+        let eco = |v| Record { id: 1, b: &record_with_eco(v) }.eco();
+        assert_eq!(eco(0), Eco::None);
+        assert_eq!(eco(128), Eco::Code { code: 0, sub: 0 });
+        assert_eq!(eco(128).pgn().as_deref(), Some("A00"));
+        assert_eq!(eco(500 * 128 + 5).pgn().as_deref(), Some("E99"));
+        assert_eq!(eco(64576 + 518), Eco::Chess960(518));
+        for v in [1, 127, 64128, 64575] {
+            assert_eq!(eco(v), Eco::Invalid(v), "{v}");
+            assert_eq!(eco(v).pgn(), None);
+        }
     }
 
     #[test]
