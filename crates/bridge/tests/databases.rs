@@ -305,32 +305,31 @@ fn wait_for(entry: &Entry, state: State) {
 /// it in the background, with its progress, and it is then ready.
 #[test]
 fn a_cloud_only_database_downloads_when_opened() {
-    for sticky in [false, true] {
-        let root = Root::new(if sticky { "cloud-sticky" } else { "cloud" });
-        let db = database_at(&root.path("bases"), "Remote");
-        let files = files_of(&db);
-        // Only the moves file is in the cloud: the others count as present.
-        let cloud = Arc::new(FakeCloud::with_files([files[1].clone()], sticky));
-        root.window(&[(&db, "")]);
-        let catalog = Catalog::with_sources(root.sources(), cloud.clone());
-        let entry = catalog.get(&id_of(&db)).unwrap();
-        assert_eq!(states(&catalog), ["cloudOnly"]);
-        assert_eq!(entry.size(), size_of(&files));
-        assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0, "listing fetched a file");
+    let root = Root::new("cloud");
+    let db = database_at(&root.path("bases"), "Remote");
+    let files = files_of(&db);
+    // Only the moves file is in the cloud: the others count as present.
+    let cloud = Arc::new(FakeCloud::with_files([files[1].clone()], false));
+    root.window(&[(&db, "")]);
+    let catalog = Catalog::with_sources(root.sources(), cloud.clone());
+    let entry = catalog.get(&id_of(&db)).unwrap();
+    assert_eq!(states(&catalog), ["cloudOnly"]);
+    assert_eq!(entry.size(), size_of(&files));
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0, "listing fetched a file");
 
-        cloud.hold(true);
-        assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
-        assert_eq!(entry.state(), State::Downloading);
-        let p = entry.progress().unwrap();
-        assert_eq!((p.present(), p.total), (size_of(&files) - size_of(&files[1..2]), size_of(&files)));
-        // A second request joins the download instead of starting another.
-        assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
-        cloud.hold(false);
-        wait_for(&entry, State::Ready);
-        assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1);
-        assert!(entry.progress().is_none());
-        assert!(entry.open_to_read().is_ok());
-    }
+    cloud.hold(true);
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    assert_eq!(entry.state(), State::Downloading);
+    let p = entry.progress().unwrap();
+    assert_eq!((p.present(), p.total), (size_of(&files) - size_of(&files[1..2]), size_of(&files)));
+    // A second request joins the download instead of starting another.
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    cloud.hold(false);
+    wait_for(&entry, State::Ready);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1);
+    assert!(entry.progress().is_none());
+    assert!(!entry.marks_kept());
+    assert!(entry.open_to_read().is_ok());
 }
 
 /// A failed download leaves the database cloud-only, and the next request
@@ -405,29 +404,77 @@ fn a_database_moved_back_to_the_cloud_is_cloud_only_again() {
     }
 }
 
-/// With a provider that keeps the cloud-only mark after a download, the
-/// download counts only while no mark changes: a file marked afterwards
-/// makes the database cloud-only again.
+/// Waits until the database's download, running or queued, has ended.
+fn wait_for_download(entry: &Entry) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while entry.progress().is_some() {
+        assert!(Instant::now() < deadline, "the download does not end");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A companion file moved to the cloud while the download of another ran
+/// keeps the database cloud-only when it ends, and the next request for its
+/// games downloads that file.
 #[test]
-fn a_kept_mark_counts_only_while_the_marks_stay_as_downloaded() {
-    let root = Root::new("sticky-marks");
+fn a_file_moved_to_the_cloud_during_a_download_is_downloaded_next_time() {
+    let root = Root::new("evict-during");
+    let db = database_at(&root.path("bases"), "Remote");
+    let files = files_of(&db);
+    let cloud = Arc::new(FakeCloud::with_files([files[0].clone()], false));
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let entry = catalog.get(&id_of(&db)).unwrap();
+    cloud.hold(true);
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    cloud.evict(&files[1..2]);
+    cloud.hold(false);
+    wait_for_download(&entry);
+    assert_eq!(entry.state(), State::CloudOnly);
+    assert!(!entry.marks_kept(), "the downloaded file lost its mark");
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1);
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    wait_for(&entry, State::Ready);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 2);
+}
+
+/// A provider that keeps a file marked after every byte of it was read
+/// leaves the database cloud-only, reported once; nothing downloads again
+/// until the next request for its games.
+#[test]
+fn a_mark_kept_after_a_download_keeps_the_database_cloud_only() {
+    let root = Root::new("kept-mark");
     let db = database_at(&root.path("bases"), "Remote");
     let files = files_of(&db);
     let cloud = Arc::new(FakeCloud::with_files([files[1].clone()], true));
     let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
     let entry = catalog.get(&id_of(&db)).unwrap();
     assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
-    wait_for(&entry, State::Ready);
-    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1);
-
-    cloud.evict(&files[2..3]);
+    wait_for_download(&entry);
     assert_eq!(entry.state(), State::CloudOnly);
-    // Unmarking it again does not bring the old download back.
-    cloud.cloud.lock().unwrap().remove(&files[2]);
-    assert_eq!(entry.state(), State::CloudOnly);
+    assert!(entry.marks_kept());
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(states(&catalog), ["cloudOnly"]);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1, "a kept mark started a download by itself");
     assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
-    wait_for(&entry, State::Ready);
+    wait_for_download(&entry);
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 2);
+}
+
+/// A database whose marks clear, however that happens, is ready at once and
+/// opens without a download.
+#[test]
+fn a_database_whose_marks_clear_is_ready() {
+    let root = Root::new("marks-clear");
+    let db = database_at(&root.path("bases"), "Remote");
+    let files = files_of(&db);
+    let cloud = Arc::new(FakeCloud::with_files(files.clone(), true));
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let entry = catalog.get(&id_of(&db)).unwrap();
+    assert_eq!(entry.state(), State::CloudOnly);
+    cloud.cloud.lock().unwrap().clear();
+    assert_eq!(entry.state(), State::Ready);
+    assert!(entry.open_to_read().is_ok());
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0);
 }
 
 /// A source that changes while the list is read is read again on the next

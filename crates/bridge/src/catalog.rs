@@ -98,16 +98,8 @@ struct Held {
     open: Mutex<Option<Opened>>,
     /// The download running or queued.
     running: Mutex<Option<Arc<Progress>>>,
-    /// How the files looked right after the last download read them all.
-    fetched: Mutex<Option<Fetched>>,
-}
-
-/// The files of a database as a finished download left them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Fetched {
-    generation: u64,
-    /// Whether each present file still carried a cloud-only mark, in order.
-    marks: Vec<bool>,
+    /// The last download read every file, yet a file kept its cloud-only mark.
+    kept: AtomicBool,
 }
 
 /// What the metadata of a database's files tells, without reading them.
@@ -128,10 +120,6 @@ impl Files {
 
     fn cloud_only(&self) -> bool {
         self.present.iter().any(|f| f.2)
-    }
-
-    fn marks(&self) -> Vec<bool> {
-        self.present.iter().map(|f| f.2).collect()
     }
 }
 
@@ -156,27 +144,11 @@ impl Entry {
         }
     }
 
-    /// The open database at its current generation, for listing: the handle
-    /// already held when the files have not changed, a freshly opened one
-    /// when they have. A file marked cloud-only is never read here, since
-    /// reading it would download it: see [`Entry::open_to_read`].
+    /// The open database at its current generation: the handle already held
+    /// when the files have not changed, a freshly opened one when they have.
+    /// A database with any file marked cloud-only is never opened, since
+    /// reading that file would download it: see [`Entry::open_to_read`].
     pub fn open(&self) -> Result<Opened, State> {
-        self.open_for(false)
-    }
-
-    /// [`Entry::open`] for reading games: a cloud-only database starts
-    /// downloading and is reported [`State::Downloading`].
-    pub fn open_to_read(&self) -> Result<Opened, State> {
-        match self.open_for(true) {
-            Err(State::CloudOnly) => {
-                self.download();
-                Err(State::Downloading)
-            }
-            other => other,
-        }
-    }
-
-    fn open_for(&self, reading: bool) -> Result<Opened, State> {
         if self.removed.load(Ordering::Relaxed) {
             return Err(State::Missing);
         }
@@ -191,31 +163,37 @@ impl Entry {
         if lock(&self.held.running).is_some() {
             return Err(State::Downloading);
         }
-        let mut slot = lock(&self.held.open);
-        let held = slot.as_ref().filter(|o| o.generation == generation).cloned();
+        // The current marks alone decide: a file the provider moves back to
+        // the cloud makes the database cloud-only again, whatever was read.
         if files.cloud_only() {
-            // A provider may keep a file marked cloud-only after it was read,
-            // and the mark is all the bridge sees. Such files count as here
-            // only when a download read them at this generation and no mark
-            // has changed since: a change may be the provider moving a file
-            // back to the cloud, so that download no longer counts.
-            let mut fetched = lock(&self.held.fetched);
-            let now = Fetched { generation, marks: files.marks() };
-            if fetched.as_ref() != Some(&now) {
-                *fetched = None;
-                return Err(State::CloudOnly);
-            }
-            if !reading {
-                // The download opened it; listing reads nothing marked.
-                return held.ok_or(State::CloudOnly);
-            }
+            return Err(State::CloudOnly);
         }
-        if let Some(open) = held {
-            return Ok(open);
+        let mut slot = lock(&self.held.open);
+        if let Some(open) = slot.as_ref().filter(|o| o.generation == generation) {
+            return Ok(open.clone());
         }
-        let open = open_at(&self.path, generation).ok_or(State::Unreadable)?;
+        let db = Database::open(&self.path).map_err(|_| State::Unreadable)?;
+        let open = Opened { db: Arc::new(db), generation };
         *slot = Some(open.clone());
         Ok(open)
+    }
+
+    /// [`Entry::open`] for reading games: a cloud-only database starts
+    /// downloading and is reported [`State::Downloading`].
+    pub fn open_to_read(&self) -> Result<Opened, State> {
+        match self.open() {
+            Err(State::CloudOnly) => {
+                self.download();
+                Err(State::Downloading)
+            }
+            other => other,
+        }
+    }
+
+    /// Whether the last download read every file, yet the provider kept a
+    /// file marked cloud-only, so that the database stayed cloud-only.
+    pub fn marks_kept(&self) -> bool {
+        self.held.kept.load(Ordering::Relaxed)
     }
 
     /// The download running or queued, if any.
@@ -228,8 +206,10 @@ impl Entry {
         self.files().size()
     }
 
-    /// Queues the reading of the database's cloud-only files, in order. A
-    /// failed download leaves the database cloud-only.
+    /// Queues the reading of the database's cloud-only files, in order. The
+    /// state afterwards follows the marks as they then are: a failed download,
+    /// a file moved to the cloud meanwhile or a mark the provider keeps leave
+    /// the database cloud-only, until the next request for its games.
     fn download(&self) {
         let mut running = lock(&self.held.running);
         if running.is_some() {
@@ -239,6 +219,7 @@ impl Entry {
         let local: u64 = files.present.iter().filter(|f| !f.2).map(|f| f.1).sum();
         let progress = Arc::new(Progress::new(local, files.size()));
         *running = Some(Arc::clone(&progress));
+        self.held.kept.store(false, Ordering::Relaxed);
         let cloud_files: Vec<PathBuf> = files.present.into_iter().filter(|f| f.2).map(|f| f.0).collect();
         let (held, cloud, path, name) =
             (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone());
@@ -249,12 +230,16 @@ impl Entry {
                 eprintln!("oschess-bridge: downloading {name} failed: {e}");
                 return;
             }
-            let files = generation_of(&path, &*cloud);
-            let Some(generation) = files.generation.filter(|_| !files.irregular) else { return };
-            *lock(&held.fetched) = Some(Fetched { generation, marks: files.marks() });
-            // Opened in the download's turn, while its files are known to be
-            // here, so that listing can show it ready without reading them.
-            *lock(&held.open) = open_at(&path, generation);
+            let after = generation_of(&path, &*cloud);
+            let kept: Vec<&PathBuf> =
+                after.present.iter().filter(|f| f.2 && cloud_files.contains(&f.0)).map(|f| &f.0).collect();
+            if !kept.is_empty() {
+                held.kept.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "oschess-bridge: downloaded {name}, but {} of its files still show as kept in the cloud",
+                    kept.len()
+                );
+            }
         }));
     }
 
@@ -267,11 +252,6 @@ impl Entry {
     fn files(&self) -> Files {
         generation_of(&self.path, &*self.shared.cloud)
     }
-}
-
-/// The database at `path`, opened and labelled with `generation`.
-fn open_at(path: &Path, generation: u64) -> Option<Opened> {
-    Database::open(path).ok().map(|db| Opened { db: Arc::new(db), generation })
 }
 
 /// Ends a download when dropped.

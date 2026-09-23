@@ -234,11 +234,14 @@ background, one database at a time; a database waiting for its turn is
 here the database is `ready`. A download that fails leaves it `cloudOnly`, and
 the next request for its games tries again.
 
-A download counts only while the files stay as it left them. When the service
-later moves a file back to the cloud, the database is `cloudOnly` again, even
-if its sizes and times did not change, and its games download it again. Some
-services may keep a file marked as cloud-only after it was read; the bridge
-then counts it as here only while no mark on the database's files changes.
+The state follows the current marks alone: a database with any file marked
+as kept in the cloud is `cloudOnly` (or `downloading` while its download runs
+or waits), and one without is opened as usual. So a file the service moves
+back to the cloud, or one moved there while the download read another, makes
+the database `cloudOnly` again, and the next request for its games downloads
+it. A service that keeps a file marked after all of it was read leaves the
+database `cloudOnly`; the bridge logs that, and downloads again only when its
+games are requested again.
 
 ### `GET /v1/databases/{id}/games`
 
