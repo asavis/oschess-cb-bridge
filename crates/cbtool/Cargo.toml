@@ -1,6 +1,6 @@
 [package]
 name = "cbtool"
-description = "Inspect, verify and export ChessBase 2 (.2cbh) chess databases"
+description = "Inspect, verify and export ChessBase 2 (.2cbh) chess databases, and run the oschess bridge in a console"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bridge = { version = "0.1.0", path = "../bridge" }
 cbformat = { version = "0.1.0", path = "../cbformat" }
 chesscore = { version = "0.1.0", path = "../chesscore" }
 same-file = "1"

@@ -31,3 +31,12 @@ jobs:
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
+      - name: Upload the Windows executable
+        # A pull request's build, for trying it on Windows before a release.
+        if: runner.os == 'Windows' && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oschess-bridge-windows
+          path: target/release/oschess-bridge.exe
+          if-no-files-found: error
+          retention-days: 5

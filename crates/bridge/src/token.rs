@@ -23,6 +23,11 @@ pub fn data_dir() -> Option<PathBuf> {
     base.map(|b| b.join("oschess-bridge"))
 }
 
+/// Whether `dir` holds a token already; it does not on the bridge's first run.
+pub fn exists(dir: &Path) -> bool {
+    dir.join(TOKEN_FILE).exists()
+}
+
 /// The token stored in `dir`, created on first use.
 pub fn load_or_create(dir: &Path) -> io::Result<String> {
     match std::fs::read_to_string(dir.join(TOKEN_FILE)) {
@@ -87,7 +92,9 @@ mod tests {
     fn token_is_created_once_and_kept() {
         let dir = std::env::temp_dir().join(format!("bridge-token-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(!exists(&dir));
         let first = load_or_create(&dir).unwrap();
+        assert!(exists(&dir));
         assert!(is_valid(&first));
         assert_eq!(load_or_create(&dir).unwrap(), first);
         let second = replace(&dir).unwrap();

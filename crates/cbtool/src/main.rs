@@ -1,5 +1,5 @@
 //! `cbtool`: inspect, verify and export ChessBase 2CBH databases; inspect
-//! and verify classic CBH ones.
+//! and verify classic CBH ones; run the bridge in a console.
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -25,6 +25,8 @@ const USAGE: &str = "usage:
                                            export games as PGN (all games when no ids)
   cbtool databases <dir>                   the databases ChessBase's database window lists
                                            (dir: the ChessBase documents folder)
+  cbtool bridge [--database <path>]... [--show-token] [--new-token]
+                                           run the oschess bridge in this console
 
 --lang takes ISO 639-1 codes in order of preference, comma-separated, for the
 language of comments (default: English, else the first a game has).
@@ -38,6 +40,9 @@ fn main() -> ExitCode {
         Some("verify") if args.len() >= 2 => verify(&args[1], &args[2..]),
         Some("pgn") if args.len() >= 2 => pgn(&args[1], &args[2..]),
         Some("databases") if args.len() == 2 => databases::databases(&args[1]),
+        Some("bridge") => {
+            bridge::start::console("cbtool bridge", args[1..].iter().cloned()).map(|()| true).map_err(Into::into)
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
