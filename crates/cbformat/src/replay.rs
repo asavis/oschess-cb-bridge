@@ -64,7 +64,7 @@ fn setup_board(s: &Setup) -> Result<Board> {
     }
     b.side_to_move = color(s.side_to_move);
     b.chess960 = s.chess960;
-    for (c, long_bit, short_bit) in [(CColor::White, 1, 2), (CColor::Black, 4, 8)] {
+    for (c, long, short) in [(CColor::White, 0, 1), (CColor::Black, 2, 3)] {
         let back = c.back_rank();
         let on = |f: u8, p: CPiece| b.squares[Square::new(f, back).index()] == Some((p, c));
         let king_file = (0..8).find(|&f| on(f, CPiece::King));
@@ -73,14 +73,24 @@ fn setup_board(s: &Setup) -> Result<Board> {
         // them, so a stray bit cannot make the position unbuildable.
         let Some(kf) = king_file else { continue };
         let home = |f: u8| (kf == 4 && rook_files.contains(&f)).then_some(f);
+        // A rook the record names must stand on its wing of the king.
+        let named = |i: usize, wing: fn(u8, u8) -> bool| {
+            s.castling_rooks[i].map(|f| (rook_files.contains(&f) && wing(f, kf)).then_some(f))
+        };
         let rights = &mut b.castling[c.index()];
-        if s.castling & short_bit != 0 {
-            rights[Side::Short as usize] =
-                if s.chess960 { rook_files.iter().copied().filter(|&f| f > kf).max() } else { home(7) };
+        if s.castling & (1 << short) != 0 {
+            rights[Side::Short as usize] = match named(short, |f, k| f > k) {
+                Some(named) => named,
+                None if s.chess960 => rook_files.iter().copied().filter(|&f| f > kf).max(),
+                None => home(7),
+            };
         }
-        if s.castling & long_bit != 0 {
-            rights[Side::Long as usize] =
-                if s.chess960 { rook_files.iter().copied().filter(|&f| f < kf).min() } else { home(0) };
+        if s.castling & (1 << long) != 0 {
+            rights[Side::Long as usize] = match named(long, |f, k| f < k) {
+                Some(named) => named,
+                None if s.chess960 => rook_files.iter().copied().filter(|&f| f < kf).min(),
+                None => home(0),
+            };
         }
     }
     b.en_passant_file = s.en_passant_file.filter(|&f| f < 8);

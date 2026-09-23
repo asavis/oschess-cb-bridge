@@ -355,3 +355,138 @@ fn mutated_records_never_panic() {
         }
     }
 }
+
+// ------------------------------------------------ review of 41f6571 (PR #29)
+
+/// The review's hostile record: a million variation starts, each followed by
+/// a null move, and no end. At move counter `n` the pair is the bytes
+/// `0xdc + n` and `0xaa + n`, which mode 0 reads as 254 and 0. It must fail
+/// on the nesting bound, before the saved positions pile up.
+#[test]
+fn hostile_nesting_is_refused_at_the_bound() {
+    let mut stream = Vec::with_capacity(2_000_000);
+    for n in 0..1_000_000u32 {
+        stream.extend([(0xdc + n) as u8, (0xaa + n) as u8]);
+    }
+    let rec = move_record(0, None, None, &stream);
+    assert_eq!(rec.len(), 2_000_004);
+    let err = walk(&rec).unwrap_err().to_string();
+    assert!(err.contains(&format!("nested deeper than {}", cbh::MAX_VARIATION_DEPTH)), "{err}");
+}
+
+/// Variations nested exactly as deep as the bound read; one more level fails.
+#[test]
+fn nesting_up_to_the_bound_reads() {
+    let nested = |depth: usize| {
+        let mut t = Vec::new();
+        for _ in 0..depth {
+            t.extend([V, M("--")]);
+        }
+        for _ in 0..depth {
+            t.extend([E, M("--")]);
+        }
+        t.push(E);
+        move_record(0, None, None, &encode(&Board::startpos(), &t, 0, false))
+    };
+    let (played, stats) = walk(&nested(cbh::MAX_VARIATION_DEPTH)).unwrap();
+    assert_eq!(played.len(), 2 * cbh::MAX_VARIATION_DEPTH);
+    assert_eq!(stats.lines as usize, cbh::MAX_VARIATION_DEPTH + 1);
+    assert!(walk(&nested(cbh::MAX_VARIATION_DEPTH + 1)).unwrap_err().to_string().contains("nested deeper"));
+}
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+/// The review's Chess960 set-up, from start position 15: white Ke1, Rf1 (the
+/// castling rook the extra bytes name) and Rh1, black Ka8, white O-O only.
+/// The stored castle, `g1` to `g1`, is the king taking the f1 rook.
+const NAMED_ROOK: &str = "4a00002c0100023c019000000880a8000a800000000000000000000000000000202728182f1f000f1e426224";
+
+#[test]
+fn chess960_castling_uses_the_rook_the_record_names() {
+    let rec = hex(NAMED_ROOK);
+    let g = GameMoves::parse(&rec).unwrap();
+    let Start::Setup(s) = g.start().unwrap() else { panic!("a set-up") };
+    // White O-O-O d1, white O-O f1, black O-O-O d8, black O-O f8.
+    assert_eq!(s.castling_rooks, [Some(3), Some(5), Some(3), Some(5)]);
+    let board = cbformat::replay::start_board(&Start::Setup(s)).unwrap();
+    assert_eq!(board.to_string(), "k7/8/8/8/8/8/8/4KR1R w F - 0 60");
+    assert_eq!(walk(&rec).unwrap().0, ["e1f1"]);
+    // Without a named rook the right falls back to the outermost one, h1,
+    // and castling through the f1 rook is refused.
+    let mut unnamed = rec.clone();
+    unnamed[32 + 2] = 0xff;
+    assert!(walk(&unnamed).is_err());
+}
+
+/// White Ke1 Rh1, black Ka8, white to move with O-O.
+fn castling_start() -> [u8; 28] {
+    use Color::{Black, White};
+    start_position(&[("e1", Piece::King, White), ("h1", Piece::Rook, White), ("a8", Piece::King, Black)], false, 2, 0)
+}
+
+/// A king move to a square that is not a castling square is not castling: the
+/// review's `e1g8` was read as O-O in modes 0, 4 and 5.
+#[test]
+fn only_the_castling_squares_castle() {
+    use cbformat::fixture_cbh::raw;
+    let start = castling_start();
+    // e1 is ChessBase square 32; g8 is 55 and g1 48.
+    let word = |to: u16| 32 | to << 6;
+    let compact = |mode: u8, w: u16| raw(mode, &[(235, 0), ((w >> 8) as u8, 0), (w as u8, 0), (255, 1)]);
+    let simple = |w: u16| {
+        let w = w | 0x4000;
+        raw(5, &[((w >> 8) as u8, 0), (w as u8, 0)])
+    };
+    for (mode, g8, g1) in [
+        (0, compact(0, word(55)), compact(0, word(48))),
+        (4, compact(4, word(55)), compact(4, word(48))),
+        (5, simple(word(55)), simple(word(48))),
+    ] {
+        let err = walk(&move_record(mode | 0x40, Some(&start), None, &g8)).unwrap_err().to_string();
+        assert!(err.contains("e1g8"), "mode {mode}: {err}");
+        assert_eq!(walk(&move_record(mode | 0x40, Some(&start), None, &g1)).unwrap().0, ["e1h1"], "mode {mode}");
+    }
+    // In a Chess960 game the destination names castling only on the side to
+    // move's back rank: `g8` for white is not castling.
+    let rec = hex(NAMED_ROOK);
+    let w = 55u16 * 65;
+    let mut g8 = rec[..40].to_vec();
+    g8.extend(raw(10, &[(235, 0), ((w >> 8) as u8, 0), (w as u8, 0), (255, 1)]));
+    let g8 = move_record(g8[0], Some(&g8[4..32]), Some(&g8[32..40]), &g8[40..]);
+    assert!(walk(&g8).unwrap_err().to_string().contains("to itself"));
+}
+
+/// An ordinary move onto a piece of the side to move is refused before
+/// `chesscore` could read a king onto its own rook as castling.
+#[test]
+fn ordinary_moves_onto_an_own_piece_are_refused() {
+    use cbformat::fixture_cbh::raw;
+    // Mode 10, compact code 3 (the king one square right): Ke1 onto Rf1.
+    let rec = hex(NAMED_ROOK);
+    let head = &rec[..40];
+    let code3 = move_record(head[0], Some(&head[4..32]), Some(&head[32..40]), &raw(10, &[(3, 0), (255, 1)]));
+    let err = walk(&code3).unwrap_err().to_string();
+    assert!(err.contains("e1f1 lands on a White piece"), "{err}");
+    // Mode 0 with white Ke1 Rf1 Rh1: the same one-byte king code onto Rf1,
+    // and the rook h1 onto f1 in two bytes.
+    use Color::{Black, White};
+    let start = start_position(
+        &[
+            ("e1", Piece::King, White),
+            ("f1", Piece::Rook, White),
+            ("h1", Piece::Rook, White),
+            ("a8", Piece::King, Black),
+        ],
+        false,
+        0,
+        0,
+    );
+    let king_right = raw(0, &[(3, 0), (255, 1)]);
+    assert!(walk(&move_record(0x40, Some(&start), None, &king_right)).unwrap_err().to_string().contains("lands on"));
+    // h1 (56) to f1 (40) in two bytes.
+    let w: u16 = 56 | 40 << 6;
+    let rook = raw(0, &[(235, 0), ((w >> 8) as u8, 0), (w as u8, 0), (255, 1)]);
+    assert!(walk(&move_record(0x40, Some(&start), None, &rook)).unwrap_err().to_string().contains("h1f1 lands on"));
+}

@@ -87,6 +87,7 @@ fn setup(castling: u8, ep_raw: u16) -> Setup {
         move_number: 20,
         side_to_move: W,
         castling,
+        castling_rooks: [None; 4],
         en_passant_file: if (1..=8).contains(&ep_raw) { Some(ep_raw as u8 - 1) } else { None },
         en_passant_raw: ep_raw,
         pieces: vec![

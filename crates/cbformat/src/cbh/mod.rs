@@ -24,7 +24,7 @@ mod record;
 pub(crate) mod tables;
 
 use bytes::{be_u16, be_u24};
-pub use decode::{start_as_played, walk};
+pub use decode::{MAX_VARIATION_DEPTH, start_as_played, walk};
 pub use entities::Entities;
 pub use moves::GameMoves;
 pub use record::{RECORD_SIZE, Record};

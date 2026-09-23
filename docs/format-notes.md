@@ -202,3 +202,20 @@ The reader was checked against:
   an error.
 - **Large files.** Offsets in `.cbh` are 32-bit; a `.cbg` larger than 4 GiB,
   which needs the 64-bit offsets of `.cbj`, is refused when opened.
+
+## Reader rules
+
+- **Castling** is read only from its defined encodings: the one-byte codes 9
+  and 10; in a Chess960 game, two bytes naming the king's destination
+  (`g1` `c1` `g8` `c8` for the side to move) as both squares; in any other game,
+  two bytes moving the king from `e1` or `e8` to the `g` or `c` square of the
+  same rank. Any other move onto a piece of the side to move is an error.
+- **Chess960 castling rooks.** The rook squares after a Chess960 start
+  position name the rook each castling right uses. A set-up keeps them, so a
+  right castles with the named rook even when another rook stands further
+  out, such as one promoted to. A square that is not on its side's back rank
+  names nothing, and that right uses the outermost rook on its wing.
+- **Nesting.** At most 1,024 variations may be open at once
+  (`cbh::MAX_VARIATION_DEPTH`); a deeper tree is an error, raised before its
+  position is saved. The deepest nesting measured is 74 in the Mega Database
+  2026 (three games reach 64 or more) and 63 in the classic databases above.

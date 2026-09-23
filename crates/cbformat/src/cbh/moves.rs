@@ -71,7 +71,8 @@ impl<'a> GameMoves<'a> {
 
     /// Where the game starts. A Chess960 game whose explicit position is one
     /// of the 960 start positions, untouched, is reported as that position, as
-    /// 2CBH stores it; any other explicit position is a set-up.
+    /// 2CBH stores it; any other explicit position is a set-up, whose castling
+    /// rights use the rooks the Chess960 squares name.
     pub fn start(&self) -> Result<Start> {
         let Some(s) = self.start else { return Ok(Start::Standard) };
         let board = decode_board(&s[4..])?;
@@ -97,11 +98,23 @@ impl<'a> GameMoves<'a> {
             move_number,
             side_to_move,
             castling,
+            castling_rooks: self.chess960.map_or([None; 4], castling_rooks),
             en_passant_file: (1..=8).contains(&ep).then(|| ep - 1),
             en_passant_raw: u16::from(ep),
             pieces,
         }))
     }
+}
+
+/// The castling rook files the Chess960 squares name, in the order of the
+/// castling bits: white O-O-O, white O-O, black O-O-O, black O-O. The squares
+/// are the rooks' start squares; one that is not a square on its side's back
+/// rank names nothing, and its right falls back to the outermost rook.
+fn castling_rooks(extra: &[u8]) -> [Option<u8>; 4] {
+    // Bytes 2-5: white king's side, white queen's side, black king's side,
+    // black queen's side.
+    let file = |i: usize, back_rank: u8| (extra[i] < 64 && extra[i] % 8 == back_rank).then_some(extra[i] / 8);
+    [file(3, 0), file(2, 0), file(5, 7), file(4, 7)]
 }
 
 /// Decodes the 192-bit board stream: per square, a 0 bit for an empty square,

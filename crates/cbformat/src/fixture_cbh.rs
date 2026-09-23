@@ -132,18 +132,7 @@ impl Lists {
 /// Encodes a move tree for encoding mode `mode` (0, 4, 5 or 10) from `start`.
 /// With `two_byte`, every compact move that can be written in two bytes is.
 pub fn encode(start: &Board, toks: &[Tok<'_>], mode: u8, two_byte: bool) -> Vec<u8> {
-    let (table, pre, simple) = match mode {
-        0 => (&tables::MODE_0, true, false),
-        4 => (&tables::MODE_4, false, false),
-        5 => (&tables::MODE_5, false, true),
-        10 => (&tables::MODE_10, false, false),
-        _ => panic!("no table for mode {mode}"),
-    };
-    let mut inv = [0u8; 256];
-    for (i, &v) in table.iter().enumerate() {
-        inv[v as usize] = i as u8;
-    }
-    let tr = |v: u8, n: u8| if pre { inv[v as usize].wrapping_add(n) } else { inv[v.wrapping_add(n) as usize] };
+    let (tr, simple) = translator(mode);
     let (mut board, mut lists, mut stack, mut out) = (start.clone(), Lists::new(start), Vec::new(), Vec::new());
     let (mut n, mut var, mut last) = (0u8, false, None::<(usize, u16, u8)>);
     for t in toks {
@@ -227,6 +216,33 @@ pub fn encode(start: &Board, toks: &[Tok<'_>], mode: u8, two_byte: bool) -> Vec<
         }
     }
     out
+}
+
+/// The byte that a decoder in encoding mode `mode` translates to `value`
+/// when `n` moves have been decoded, and whether the mode uses the simple
+/// encoder.
+fn translator(mode: u8) -> (impl Fn(u8, u8) -> u8, bool) {
+    let (table, pre, simple) = match mode {
+        0 => (&tables::MODE_0, true, false),
+        4 => (&tables::MODE_4, false, false),
+        5 => (&tables::MODE_5, false, true),
+        10 => (&tables::MODE_10, false, false),
+        _ => panic!("no table for mode {mode}"),
+    };
+    let mut inv = [0u8; 256];
+    for (i, &v) in table.iter().enumerate() {
+        inv[v as usize] = i as u8;
+    }
+    let tr = move |v: u8, n: u8| if pre { inv[v as usize].wrapping_add(n) } else { inv[v.wrapping_add(n) as usize] };
+    (tr, simple)
+}
+
+/// A stream of raw values, each translated for mode `mode` with its move
+/// counter: `(value, n)`. For hand-built records that [`encode`], which only
+/// writes legal trees, cannot write.
+pub fn raw(mode: u8, values: &[(u8, u8)]) -> Vec<u8> {
+    let (tr, _) = translator(mode);
+    values.iter().map(|&(v, n)| tr(v, n)).collect()
 }
 
 /// A 28-byte start position: `pieces` as (square, piece, colour).

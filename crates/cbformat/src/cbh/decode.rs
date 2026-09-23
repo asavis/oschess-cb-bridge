@@ -17,6 +17,12 @@ use crate::replay::{MoveError, TreeStats, TreeVisitor, start_board};
 use crate::v2::Start;
 use crate::{Error, Result};
 
+/// Most variations open at once in a game. Each open one keeps a board and
+/// the piece lists (about 350 bytes), so the stack stays under 400 KiB. The
+/// deepest nesting measured is 74, in a Mega Database 2026 game; the classic
+/// databases examined reach 63.
+pub const MAX_VARIATION_DEPTH: usize = 1024;
+
 /// The table, modifier and encoder of an encoding mode whose table is known.
 fn mode(m: u8) -> Result<(&'static [u8; 256], bool, bool)> {
     // (table, pre modifier, simple encoder)
@@ -58,6 +64,11 @@ impl<V: TreeVisitor> Walker<'_, V> {
     fn start_variation(&mut self) -> Result<()> {
         if self.branch_next {
             return Err(self.fail("two variation starts in a row".into()));
+        }
+        // Checked before the position is saved, so a hostile record cannot
+        // make the stack grow past the bound.
+        if self.stack.len() >= MAX_VARIATION_DEPTH {
+            return Err(self.fail(format!("variations nested deeper than {MAX_VARIATION_DEPTH}")));
         }
         self.branch_next = true;
         Ok(())
@@ -123,28 +134,50 @@ impl<V: TreeVisitor> Walker<'_, V> {
     }
 
     /// A move given by its squares, as the two-byte and simple forms give it.
+    ///
+    /// Castling has two encodings here and no other: in a Chess960 game the
+    /// king's destination, `g1` `c1` `g8` `c8` for the side to move, as both
+    /// squares; in any other game the king's move from `e1` or `e8` to the
+    /// `g` or `c` square of the same rank.
     fn by_squares(&self, v: u16, chess960: bool) -> Result<Option<Move>> {
         let (from, to) = ((v & 63) as u8, (v >> 6 & 63) as u8);
-        if from == to {
-            return match (chess960, to / 8) {
-                (_, 0) if v & 0x0fff == 0 => Ok(None),
-                (true, 6) => self.castle(CastleSide::Short).map(Some),
-                (true, 2) => self.castle(CastleSide::Long).map(Some),
-                _ => Err(self.fail(format!("a move from {} to itself", cb_square(from)))),
-            };
-        }
         let (from_sq, to_sq) = (cb_square(from), cb_square(to));
         let us = self.board.side_to_move();
+        let back = us.back_rank();
+        if from == to {
+            return match (chess960, to_sq.file(), to_sq.rank() == back) {
+                _ if v & 0x0fff == 0 => Ok(None),
+                (true, 6, true) => self.castle(CastleSide::Short).map(Some),
+                (true, 2, true) => self.castle(CastleSide::Long).map(Some),
+                _ => Err(self.fail(format!("a move from {from_sq} to itself"))),
+            };
+        }
+        let castling = !chess960 && from_sq == Square::new(4, back) && to_sq.rank() == back;
         match self.board.piece_at(from_sq) {
-            Some((CPiece::King, c)) if c == us && from_sq.file().abs_diff(to_sq.file()) == 2 => {
-                self.castle(if to_sq.file() > from_sq.file() { CastleSide::Short } else { CastleSide::Long }).map(Some)
+            Some((CPiece::King, c)) if c == us && castling && to_sq.file() == 6 => {
+                self.castle(CastleSide::Short).map(Some)
+            }
+            Some((CPiece::King, c)) if c == us && castling && to_sq.file() == 2 => {
+                self.castle(CastleSide::Long).map(Some)
             }
             Some((CPiece::Pawn, _)) if to_sq.rank() == 0 || to_sq.rank() == 7 => {
                 let promo = [CPiece::Queen, CPiece::Rook, CPiece::Bishop, CPiece::Knight][(v >> 12 & 3) as usize];
-                Ok(Some(Move::new(from_sq, to_sq, Some(promo))))
+                self.ordinary(Move::new(from_sq, to_sq, Some(promo)), v)
             }
-            _ => Ok(Some(Move::new(from_sq, to_sq, None))),
+            _ => self.ordinary(Move::new(from_sq, to_sq, None), v),
         }
+    }
+
+    /// `mv` as a move other than castling. One onto a piece of the side to
+    /// move is refused here: `chesscore` reads a king onto its own rook as
+    /// castling, which only the castling encodings may name.
+    fn ordinary(&self, mv: Move, word: u16) -> Result<Option<Move>> {
+        let us = self.board.side_to_move();
+        if self.board.piece_at(mv.to).is_some_and(|(_, c)| c == us) {
+            let reason = MoveError::OntoOwnPiece { word, color: us, from: mv.from, to: mv.to };
+            return Err(Error::Move { ply: self.stats.total_plies + 1, reason });
+        }
+        Ok(Some(mv))
     }
 
     /// A one-byte compact code other than the markers.
@@ -163,7 +196,7 @@ impl<V: TreeVisitor> Walker<'_, V> {
             0 => return Ok(None),
             1..=8 => {
                 let from = to_cb(self.board.king(us));
-                return Ok(Some(self.step(from, KING[(code - 1) as usize], None)));
+                return self.ordinary(self.step(from, KING[(code - 1) as usize], None), u16::from(code));
             }
             9 => return self.castle(CastleSide::Short).map(Some),
             10 => return self.castle(CastleSide::Long).map(Some),
@@ -183,7 +216,7 @@ impl<V: TreeVisitor> Walker<'_, V> {
                 if mv.to.rank() == 0 || mv.to.rank() == 7 {
                     return Err(self.fail("a promotion in a one-byte move".into()));
                 }
-                return Ok(Some(mv));
+                return self.ordinary(mv, u16::from(code));
             }
             143..=170 => (0, 1, line(code - 143, &Q)),
             171..=198 => (0, 2, line(code - 171, &Q)),
@@ -195,7 +228,7 @@ impl<V: TreeVisitor> Walker<'_, V> {
         let from = self.pieces.kinds[us.index()][kind]
             .get(index)
             .ok_or_else(|| self.fail(format!("no {:?} number {}", KINDS[kind], index + 1)))?;
-        Ok(Some(self.step(from, delta, None)))
+        self.ordinary(self.step(from, delta, None), u16::from(code))
     }
 
     fn pawns(&self, us: CColor) -> [Option<u8>; 8] {
@@ -350,4 +383,15 @@ fn run(
         Ok(w.stats)
     });
     (result, w.missing_right.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_variation_stack_stays_small() {
+        let entry = std::mem::size_of::<(Board, Pieces)>();
+        assert!(entry * MAX_VARIATION_DEPTH < 400 << 10, "{entry} bytes per open variation");
+    }
 }
