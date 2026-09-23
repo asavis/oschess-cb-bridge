@@ -182,11 +182,20 @@ fn tokens(movetext: &str) -> Vec<Tok> {
                 out.push(Tok::Close);
                 i += 1;
             }
+            '$' => {
+                // A NAG ends at its last digit, so `$1$14` and `e4$1` hold two
+                // tokens. One that is not a number stays in the comparison as
+                // `u16::MAX` instead of vanishing.
+                let digits = chars[i + 1..].iter().take_while(|x| x.is_ascii_digit()).count();
+                let n: String = chars[i + 1..i + 1 + digits].iter().collect();
+                out.push(Tok::Nag(n.parse().unwrap_or(u16::MAX)));
+                i += 1 + digits;
+            }
             c if c.is_whitespace() => i += 1,
             _ => {
                 let end = chars[i..]
                     .iter()
-                    .position(|x| x.is_whitespace() || "(){".contains(*x))
+                    .position(|x| x.is_whitespace() || "(){$".contains(*x))
                     .map_or(chars.len(), |e| i + e);
                 let word: String = chars[i..end].iter().collect();
                 i = end;
@@ -197,15 +206,9 @@ fn tokens(movetext: &str) -> Vec<Tok> {
     out
 }
 
-/// One word between spaces: a NAG, a result, a move number, or a move with or
+/// One word between spaces: a result, a move number, or a move with or
 /// without a move number glued in front (`1.e4`, `1...e5`).
 fn push_word(word: &str, out: &mut Vec<Tok>) {
-    if let Some(n) = word.strip_prefix('$') {
-        if let Ok(n) = n.parse() {
-            out.push(Tok::Nag(n));
-        }
-        return;
-    }
     if ["1-0", "0-1", "1/2-1/2", "*"].contains(&word) {
         return;
     }
@@ -388,6 +391,21 @@ mod tests {
         assert_eq!(p.comments, [(1, "text".to_string())]);
         assert_eq!(p.graphics, [(1, vec!["Gg1f3".to_string(), "Re5".to_string()])]);
         assert_eq!(p, parts("1. e4 $1 $14 {text [%csl Re5] [%cal Gg1f3]} 1... e5 $6"));
+    }
+
+    #[test]
+    fn adjacent_nags_are_kept() {
+        let spaced = parts("1. e4 $1 $14 1-0");
+        assert_eq!(spaced.nags, [(1, vec![1, 14])]);
+        assert_eq!(parts("1. e4 $1$14 1-0"), spaced);
+        assert_eq!(parts("1. e4$1$14 1-0"), spaced);
+        assert_ne!(parts("1. e4 1-0"), spaced);
+    }
+
+    #[test]
+    fn a_malformed_nag_is_not_dropped() {
+        assert_eq!(parts("1. e4 $ 1-0").nags, [(1, vec![u16::MAX])]);
+        assert_eq!(parts("1. e4 $99999 1-0").nags, [(1, vec![u16::MAX])]);
     }
 
     #[test]
