@@ -11,7 +11,7 @@ use crate::movetable::Captured;
 pub enum MoveError {
     /// The word is neither a move word nor the null move.
     NotAMoveWord(u16),
-    /// The null move, given to [`to_move`].
+    /// The null move, given to [`to_move`](super::to_move).
     NullMove,
     /// A null move while the side to move is in check.
     NullMoveInCheck,
