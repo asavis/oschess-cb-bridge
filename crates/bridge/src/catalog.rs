@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use cbformat::v2::{Database, EXTENSIONS};
 
 use crate::fetch::{Cloud, Progress, Serial, System};
-use crate::sources::{self, Listed, Sources};
+use crate::sources::{Listed, Read, Sources};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -307,11 +307,7 @@ type Hook = Box<dyn Fn() + Send + Sync>;
 
 /// The list as last read.
 struct Listing {
-    /// The sources' signature when they were read.
-    signature: u64,
-    /// The last lists read without error, kept when a later read fails.
-    window: Vec<Listed>,
-    configured: Vec<PathBuf>,
+    read: Read,
     /// The listed databases in order, then those that left the list.
     entries: Vec<Arc<Entry>>,
 }
@@ -325,7 +321,7 @@ impl Catalog {
     /// The databases of `sources`, read now and again whenever they change.
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
         let shared = Arc::new(Shared { cloud, downloads: Arc::default() });
-        let listing = Listing { signature: 0, window: Vec::new(), configured: Vec::new(), entries: Vec::new() };
+        let listing = Listing { read: Read::default(), entries: Vec::new() };
         let catalog = Catalog { sources, shared, listing: Mutex::new(listing), after_read: Mutex::new(None) };
         catalog.refresh(true);
         catalog
@@ -348,32 +344,18 @@ impl Catalog {
         lock(&self.listing).entries.iter().find(|e| e.id == id).cloned()
     }
 
-    /// Reads the list again when its sources' signature changed, or `always`.
-    /// The signature kept is the one taken before reading: a source that
-    /// changes while it is read then differs from it, and is read again on
-    /// the next request.
+    /// Reads again the sources that changed or failed last time
+    /// ([`Read`]), and rebuilds the list when any was read, or `always`.
     fn refresh(&self, always: bool) {
         let mut listing = lock(&self.listing);
-        let signature = self.sources.signature(&listing.configured);
-        if !always && signature == listing.signature {
-            return;
-        }
-        match self.sources.window() {
-            Ok(window) => listing.window = window,
-            Err(e) => eprintln!("oschess-bridge: the database window list is unreadable, keeping the last one: {e}"),
-        }
-        match self.sources.configured() {
-            Ok(configured) => listing.configured = configured,
-            Err(e) => eprintln!("oschess-bridge: keeping the last databases of bridge.toml: {e}"),
-        }
+        let changed = listing.read.update(&self.sources);
         if let Some(hook) = lock(&self.after_read).as_ref() {
             hook();
         }
-        listing.signature = signature;
-        let mut listed = listing.window.clone();
-        listed.extend(listing.configured.iter().flat_map(|p| sources::expand(p)));
-        listed.extend(self.sources.fixed.iter().cloned().map(Listed::at));
-        listing.entries = self.merge(&listing.entries, listed);
+        if changed || always {
+            let listed = listing.read.listed(&self.sources);
+            listing.entries = self.merge(&listing.entries, listed);
+        }
     }
 
     /// The new list: each database once, in order, keeping the entry (and its

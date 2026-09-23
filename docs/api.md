@@ -175,8 +175,10 @@ adds, then those given with `--database`, each once:
   and `.cbh` database files directly in it, by file name; a folder or a pipe
   named like one is not a database.
 - **The list is read again** on a request to `/v1/status` or `/v1/databases`
-  after `DBItems.cbini`, `bridge.toml` or a listed folder changed. When the new
-  list cannot be read, the last one stays. A database that leaves the list
+  after `DBItems.cbini`, `bridge.toml` or a listed folder changed. Each of them
+  that cannot be read keeps the databases last read from it, and is read again
+  on the next such request until it can be, even if it has not changed since.
+  A database that leaves the list
   stays at its end as `missing`, under the same `id`, until the bridge
   restarts, so a page that holds its `id` learns what happened to it.
 

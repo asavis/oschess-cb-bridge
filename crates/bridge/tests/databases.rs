@@ -553,6 +553,78 @@ fn files_that_are_not_regular_are_never_opened() {
     assert!(ready && config && startup);
 }
 
+/// A window list or `bridge.toml` that cannot be read for a while keeps the
+/// databases read before, and is read as soon as it can be again, although
+/// its size and time did not change meanwhile.
+#[cfg(unix)]
+#[test]
+fn a_source_unreadable_for_a_while_is_read_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+
+    let root = Root::new("unreadable-source");
+    let a = database_at(&root.path("bases"), "Alpha");
+    let b = database_at(&root.path("bases"), "Beta");
+    let c = database_at(&root.path("more"), "Gamma");
+    let (list, toml) = (root.chessbase().join("DBItems.cbini"), root.path("bridge.toml"));
+    root.window(&[(&a, "")]);
+    std::fs::write(&toml, "databases = []\n").unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    assert_eq!(names(&catalog), ["Alpha"]);
+
+    root.window(&[(&a, ""), (&b, "")]);
+    mode(&list, 0o000);
+    if std::fs::read(&list).is_ok() {
+        mode(&list, 0o644);
+        eprintln!("skipped: permissions do not apply to this user");
+        return;
+    }
+    assert_eq!(names(&catalog), ["Alpha"]);
+    assert_eq!(names(&catalog), ["Alpha"]);
+    mode(&list, 0o644);
+    assert_eq!(names(&catalog), ["Alpha", "Beta"]);
+
+    std::fs::write(&toml, format!("databases = ['{}']\n", c.display())).unwrap();
+    mode(&toml, 0o000);
+    assert_eq!(names(&catalog), ["Alpha", "Beta"]);
+    mode(&toml, 0o644);
+    assert_eq!(names(&catalog), ["Alpha", "Beta", "Gamma"]);
+    assert_eq!(states(&catalog), ["ready"; 3]);
+}
+
+/// A configured folder that cannot be listed for a while keeps its
+/// databases ready, and is listed again as soon as it can be: a database
+/// added meanwhile then appears.
+#[cfg(unix)]
+#[test]
+fn a_folder_unreadable_for_a_while_keeps_its_databases() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+
+    let root = Root::new("unreadable-folder");
+    let folder = root.path("folder");
+    database_at(&folder, "One");
+    let toml = root.path("bridge.toml");
+    std::fs::write(&toml, format!("databases = ['{}']\n", folder.display())).unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    assert_eq!(states(&catalog), ["ready"]);
+
+    // Not listable, still traversable and writable.
+    mode(&folder, 0o311);
+    if std::fs::read_dir(&folder).is_ok() {
+        mode(&folder, 0o755);
+        eprintln!("skipped: permissions do not apply to this user");
+        return;
+    }
+    database_at(&folder, "Two");
+    std::fs::write(&toml, format!("# changed\ndatabases = ['{}']\n", folder.display())).unwrap();
+    assert_eq!(names(&catalog), ["One"]);
+    assert_eq!(states(&catalog), ["ready"]);
+    mode(&folder, 0o755);
+    assert_eq!(names(&catalog), ["One", "Two"]);
+    assert_eq!(states(&catalog), ["ready", "ready"]);
+}
+
 fn get(port: u16, path: &str) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let raw = format!(
