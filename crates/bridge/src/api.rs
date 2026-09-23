@@ -13,6 +13,8 @@ use crate::catalog::{Catalog, Entry, State};
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
+use crate::search::query::Sort;
+use crate::search::{self, SearchError, Selection, SuggestField};
 
 pub const API_VERSION: i64 = 1;
 pub const MAX_LIMIT: u32 = 500;
@@ -87,6 +89,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "databases"] => databases(app),
         ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(e, req)),
         ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
+        ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(e, req)),
         _ => not_found(),
     }
 }
@@ -180,45 +183,124 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Some(Ok(n)) if (1..=MAX_LIMIT).contains(&n) => n,
         Some(_) => return bad_parameter("limit", "limit must be between 1 and 500"),
     };
-    let descending = match req.param("sort").unwrap_or("number") {
-        "number" | "number-asc" => false,
-        "number-desc" => true,
-        _ => return bad_parameter("sort", "only sort=number is served yet; the other keys come with search"),
+    let sort_param = match req.param("sort") {
+        None => None,
+        Some(text) => match Sort::parse(text) {
+            Some(sort) => Some(sort),
+            None => return bad_parameter("sort", "unknown sort key"),
+        },
     };
-    if req.param("q").is_some_and(|q| !q.trim().is_empty()) {
-        return bad_parameter("q", "search is not served yet");
-    }
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
+    let stream = match req.param("stream") {
+        None => None,
+        Some(s) if valid_stream(s) => Some(s),
+        Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
+    };
+    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
+        Ok(found) => found,
+        Err(e) => return search_error(entry, open.generation, e),
+    };
     // Reserved before the rows are built and held until the answer is written.
     let Some(hold) = budget::reserve(limit as usize * MAX_ROW_BYTES) else { return busy() };
-    let total = u64::from(open.db.record_count());
-    let count = total.saturating_sub(offset).min(u64::from(limit)) as u32;
-    let rows = if count == 0 {
-        Ok(Vec::new())
-    } else {
-        // Numbers in the window, in ascending order; reversed for descending.
-        let first = if descending { total - offset - u64::from(count) + 1 } else { offset + 1 } as u32;
-        window(&open.db, first, count)
+    let (total, rows) = match &selection {
+        Selection::All { descending } => {
+            let total = u64::from(open.db.record_count());
+            let count = total.saturating_sub(offset).min(u64::from(limit)) as u32;
+            let rows = if count == 0 {
+                Ok(Vec::new())
+            } else {
+                // Numbers in the window, in ascending order; reversed for descending.
+                let first = if *descending { total - offset - u64::from(count) + 1 } else { offset + 1 } as u32;
+                window(&open.db, first, count).map(|mut rows| {
+                    if *descending {
+                        rows.reverse();
+                    }
+                    rows
+                })
+            };
+            (total, rows)
+        }
+        Selection::Numbers(numbers) => {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(numbers.len());
+            let end = start.saturating_add(limit as usize).min(numbers.len());
+            let mut names = Names::new(&open.db);
+            let rows =
+                numbers[start..end].iter().map(|&n| open.db.record(n).and_then(|r| row(&mut names, &r))).collect();
+            (numbers.len() as u64, rows)
+        }
     };
-    let mut rows = match rows {
+    let rows = match rows {
         Ok(rows) => rows,
         Err(e) if changing(entry, open.generation, &e) => return database_changing(),
         Err(e) => return error(500, "internal", &e.to_string()),
     };
-    if descending {
-        rows.reverse();
-    }
     let body = Obj::new()
         .str("generation", &format!("{:016x}", open.generation))
         .num("total", total as i64)
         .num("offset", offset as i64)
-        .str("sort", if descending { "number-desc" } else { "number-asc" })
+        .str("sort", &sort.name())
         .raw("rows", &json::array(rows))
         .done();
     ok(body).holding(hold)
+}
+
+fn suggest(entry: &Entry, req: &Request) -> Response {
+    let field = match req.param("field") {
+        Some("player") => SuggestField::Player,
+        Some("event") => SuggestField::Event,
+        Some("annotator") => SuggestField::Annotator,
+        _ => return bad_parameter("field", "field must be player, event or annotator"),
+    };
+    let Some(prefix) = req.param("prefix").filter(|p| !p.trim().is_empty()) else {
+        return bad_parameter("prefix", "prefix must not be empty");
+    };
+    let limit = match req.param("limit").map(str::parse::<usize>) {
+        None => 20,
+        Some(Ok(n)) if (1..=20).contains(&n) => n,
+        Some(_) => return bad_parameter("limit", "limit must be between 1 and 20"),
+    };
+    let open = match entry.open() {
+        Ok(open) => open,
+        Err(state) => return unavailable(state),
+    };
+    let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
+        Ok(list) => list,
+        Err(e) => return search_error(entry, open.generation, e),
+    };
+    // A name escapes to at most 6 bytes a byte in JSON, and its label is shorter.
+    let size = list.iter().map(|s| s.name.len() * 12 + 128).sum::<usize>() + 256;
+    let Some(hold) = budget::reserve(size) else { return busy() };
+    let items = list
+        .iter()
+        .map(|s| Obj::new().str("value", &s.name).str("label", &clip(s.name.clone())).num("games", s.games).done());
+    let field = req.param("field").unwrap_or_default();
+    ok(Obj::new().str("field", field).raw("suggestions", &json::array(items)).done()).holding(hold)
+}
+
+/// A client's stream name: 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-` and `_`.
+fn valid_stream(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The answer to a search that could not finish.
+fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
+    match e {
+        SearchError::Unsupported(qualifier) => {
+            error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
+                o.str("qualifier", &qualifier)
+            })
+        }
+        SearchError::Superseded => error(409, "superseded", "A newer search on this database replaced this one"),
+        SearchError::TooLarge => {
+            error(422, "database_too_large", "The database is too large to search or sort within the memory budget")
+        }
+        SearchError::Busy => error(503, "busy", "Search memory is taken by other searches; retry"),
+        SearchError::Read(e) if changing(entry, generation, &e) => database_changing(),
+        SearchError::Read(e) => error(500, "internal", &e.to_string()),
+    }
 }
 
 /// Rows `first..first + count` in one header read.
@@ -259,7 +341,8 @@ impl<'a> Names<'a> {
         if let Some(name) = self.players.get(&id) {
             return Ok(name.clone());
         }
-        let name = clip(self.db.entities().player(id)?.map(|p| p.pgn()).unwrap_or_default());
+        let name =
+            clip(self.db.entities().player_within(id, search::MAX_NAME_RECORD)?.map(|p| p.pgn()).unwrap_or_default());
         self.players.insert(id, name.clone());
         Ok(name)
     }
@@ -269,7 +352,11 @@ impl<'a> Names<'a> {
         if let Some(t) = self.tournaments.get(&id) {
             return Ok(t.clone());
         }
-        let t = self.db.entities().tournament(id)?.map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
+        let t = self
+            .db
+            .entities()
+            .tournament_within(id, search::MAX_NAME_RECORD)?
+            .map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
         self.tournaments.insert(id, t.clone());
         Ok(t)
     }
@@ -279,7 +366,7 @@ impl<'a> Names<'a> {
         if let Some(t) = self.titles.get(&id) {
             return Ok(t.clone());
         }
-        let t = clip(self.db.entities().title(id)?.unwrap_or_default());
+        let t = clip(self.db.entities().title_within(id, search::MAX_NAME_RECORD)?.unwrap_or_default());
         self.titles.insert(id, t.clone());
         Ok(t)
     }

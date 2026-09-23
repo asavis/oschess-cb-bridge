@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use cbformat::v2::{Database, EXTENSIONS};
 
 use crate::fetch::{Cloud, Progress, Serial, System};
+use crate::search::Indexes;
 use crate::sources::{Listed, Read, Sources};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +73,8 @@ impl State {
 pub struct Opened {
     pub db: Arc<Database>,
     pub generation: u64,
+    /// Sort orders, names and searches built for this generation.
+    pub indexes: Arc<Indexes>,
 }
 
 pub struct Entry {
@@ -179,7 +182,7 @@ impl Entry {
             return Ok(open.clone());
         }
         let db = Database::open(&self.path).map_err(|_| State::Unreadable)?;
-        let open = Opened { db: Arc::new(db), generation };
+        let open = Opened { db: Arc::new(db), generation, indexes: Indexes::shared() };
         *slot = Some(open.clone());
         Ok(open)
     }

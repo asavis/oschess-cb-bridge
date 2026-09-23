@@ -207,8 +207,8 @@ fn game_windows() {
         ("?limit=0", "limit"),
         ("?limit=501", "limit"),
         ("?offset=-1", "offset"),
-        ("?sort=white", "sort"),
-        ("?q=player:morphy", "q"),
+        ("?sort=bogus", "sort"),
+        ("?sort=name", "sort"),
     ] {
         let e = get(r.port, &path(q), "");
         assert_eq!(e.status, 400, "{q}");
@@ -409,29 +409,37 @@ fn texts_and_analyses_are_read_with_their_own_layouts() {
     );
 }
 
-/// 500 rows sharing one player whose name fills a 1 MiB container: names are
-/// cut to 200 characters and looked up once, so the window stays small.
+/// 500 rows sharing two players: one whose name fills a 1 MiB container and
+/// one with a 3,000-character name. A name record is read to at most 4 KiB,
+/// so the first is an empty name; the second is cut to 200 characters. Both
+/// are looked up once, and the window stays small.
 #[test]
 fn a_huge_shared_entity_does_not_blow_up_a_window() {
     let mut b = Builder::new();
     let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
-    for _ in 0..500 {
-        b.game(e4);
+    for n in 0..500i64 {
+        b.game(e4)[0x18..0x20].copy_from_slice(&(n % 2).to_le_bytes());
     }
-    let last = "M".repeat((1 << 20) - 16);
-    let player = strings(&[&last, ""]);
-    let mut lid = lid_header(1 << 20, 1);
-    lid.extend((player.len() as i32).to_le_bytes());
-    lid.extend(&player);
+    let container = 1usize << 20;
+    let mut lid = lid_header(container as i32, 2);
+    for last in ["M".repeat(container - 16), "L".repeat(3000)] {
+        let player = strings(&[&last, ""]);
+        let mut slot = (player.len() as i32).to_le_bytes().to_vec();
+        slot.extend(&player);
+        slot.resize(container, 0);
+        lid.extend(slot);
+    }
     b.lid(lid);
     let db = b.write("api-huge-entity");
     let r = start(&db, vec![], None);
     let w = get(r.port, &format!("/v1/databases/{}/games?limit=500", r.id), "");
     assert_eq!(w.status, 200);
     assert!(w.body.len() < 2 << 20, "window of {} bytes", w.body.len());
-    let white = w.body.split(r#""white":""#).nth(1).unwrap().split('"').next().unwrap();
-    assert_eq!(white.chars().count(), bridge::api::MAX_FIELD_CHARS + 1);
-    assert!(white.ends_with('…'));
+    let whites: Vec<&str> =
+        w.body.split(r#""white":""#).skip(1).map(|s| s.split('"').next().unwrap()).take(2).collect();
+    assert_eq!(whites[0], "", "a 1 MiB name record is not read");
+    assert_eq!(whites[1].chars().count(), bridge::api::MAX_FIELD_CHARS + 1);
+    assert!(whites[1].starts_with('L') && whites[1].ends_with('…'));
 }
 
 /// A window ending at record `u32::MAX` is served. The header file is sparse,
@@ -733,4 +741,178 @@ fn an_annotation_on_no_move_is_an_unreadable_game() {
     let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
     assert_eq!(g.status, 422, "{}", g.body);
     assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("position 2"), "{}", g.body);
+}
+
+#[test]
+fn search_sort_and_unsupported_qualifiers() {
+    let db = database("api-search", 6, 3, 0);
+    let r = start(&db, vec![], None);
+    let list = |q: &str| get(r.port, &format!("/v1/databases/{}/games{q}", r.id), "");
+    let numbers = |reply: &Reply| -> Vec<u32> {
+        reply.body.split(r#""number":"#).skip(1).map(|s| s.split(',').next().unwrap().parse().unwrap()).collect()
+    };
+    // Record 3 is a guiding text: a qualifier keeps it out, a bare word does not.
+    let w = list("?q=player:morphy&limit=2&offset=1");
+    assert_eq!(w.status, 200, "{}", w.body);
+    assert!(w.body.contains(r#""total":5,"offset":1,"sort":"number-asc""#), "{}", w.body);
+    assert_eq!(numbers(&w), [2, 4]);
+    assert_eq!(numbers(&list("?q=result:1-0+sort:number-desc")), [6, 5, 4, 2, 1]);
+    let by_param = list("?q=result:1-0+sort:number-desc&sort=number");
+    assert!(by_param.body.contains(r#""sort":"number-asc""#), "the URL's sort wins: {}", by_param.body);
+    assert_eq!(numbers(&list("?sort=moves")).len(), 6);
+    let e = list("?q=tag:endgame");
+    assert_eq!(e.status, 400);
+    assert!(
+        e.body.contains(r#""code":"unsupported_qualifier""#) && e.body.contains(r#""qualifier":"tag""#),
+        "{}",
+        e.body
+    );
+    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix=mor", r.id), "");
+    assert_eq!(s.status, 200, "{}", s.body);
+    assert!(
+        s.body.contains(
+            r#"{"field":"player","suggestions":[{"value":"Morphy, Paul","label":"Morphy, Paul","games":5}]}"#
+        ),
+        "{}",
+        s.body
+    );
+    for (q, parameter) in [
+        ("?field=colour&prefix=m", "field"),
+        ("?field=player&prefix=+", "prefix"),
+        ("?field=event&prefix=p&limit=21", "limit"),
+    ] {
+        let e = get(r.port, &format!("/v1/databases/{}/suggest{q}", r.id), "");
+        assert!(e.status == 400 && e.body.contains(&format!(r#""parameter":"{parameter}""#)), "{q}: {}", e.body);
+    }
+}
+
+/// An event's name is matched from its start: a comma in it does not begin a
+/// first name, as it does for people. Twenty events seen more often, whose
+/// names end in ", Paris", do not push «Paris Open» out of a `Paris` prefix.
+#[test]
+fn event_suggestions_match_the_start_of_the_name() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    let mut entities = Vec::new();
+    for t in 0..21usize {
+        let title = if t == 20 { "Paris Open".to_string() } else { format!("Other event {t:02}, Paris") };
+        let mut record = strings(&["", &title]);
+        record.extend(0i32.to_le_bytes());
+        entities.push((1, t, record));
+        for _ in 0..if t == 20 { 1 } else { 2 } {
+            b.game(e4)[0x28..0x30].copy_from_slice(&(t as i64).to_le_bytes());
+        }
+    }
+    b.lid(lid_with(64, 21, &entities));
+    let db = b.write("api-event-prefix");
+    let r = start(&db, vec![], None);
+    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=event&prefix=Paris&limit=20", r.id), "");
+    assert_eq!(s.status, 200, "{}", s.body);
+    assert!(s.body.contains(r#"{"value":"Paris Open","label":"Paris Open","games":1}"#), "{}", s.body);
+    assert!(!s.body.contains("Other event"), "{}", s.body);
+}
+
+/// A person's first name comes from its own field: a last name with a comma in
+/// it, `Smith, Jr.` with first name `Alex`, is offered for `Alex`, not for
+/// `Jr.`, as a player and as an annotator.
+#[test]
+fn first_names_come_from_their_own_field() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    let rec = b.game(e4);
+    rec[0x18..0x20].copy_from_slice(&1i64.to_le_bytes());
+    rec[0x30..0x38].copy_from_slice(&1i64.to_le_bytes());
+    b.lid(lid_with(64, 2, &[(0, 1, strings(&["Smith, Jr.", "Alex"]))]));
+    let db = b.write("api-first-name-field");
+    let r = start(&db, vec![], None);
+    for field in ["player", "annotator"] {
+        let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id), "");
+        assert_eq!(s.status, 200, "{}", s.body);
+        assert!(s.body.contains(r#""value":"Smith, Jr., Alex""#), "{field}: {}", s.body);
+        let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Jr.", r.id), "");
+        assert!(s.body.contains(r#""suggestions":[]"#), "{field}: {}", s.body);
+    }
+}
+
+/// Entities that show the same name are one suggestion, and a first name of
+/// any of them counts: an unused `Smith, Alex` with no first name does not hide
+/// the `Smith` + `Alex` a game refers to, whichever comes first.
+#[test]
+fn a_first_name_counts_for_every_entity_of_a_shown_name() {
+    for (unused, used) in [(0usize, 1usize), (1, 0)] {
+        let mut b = Builder::new();
+        let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+        let rec = b.game(e4);
+        rec[0x18..0x20].copy_from_slice(&(used as i64).to_le_bytes());
+        rec[0x30..0x38].copy_from_slice(&(used as i64).to_le_bytes());
+        b.lid(lid_with(64, 2, &[(0, unused, strings(&["Smith, Alex", ""])), (0, used, strings(&["Smith", "Alex"]))]));
+        let db = b.write(&format!("api-first-name-group-{unused}"));
+        let r = start(&db, vec![], None);
+        for field in ["player", "annotator"] {
+            let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id), "");
+            assert_eq!(s.status, 200, "{}", s.body);
+            assert!(
+                s.body.contains(r#"{"value":"Smith, Alex","label":"Smith, Alex","games":1}"#),
+                "{field}, unused {unused}: {}",
+                s.body
+            );
+        }
+    }
+}
+
+#[test]
+fn a_changed_database_is_searched_afresh() {
+    let db = database("api-search-fresh", 2, 0, 0);
+    let r = start(&db, vec![], None);
+    let total = |reply: Reply| reply.body.split(r#""total":"#).nth(1).unwrap().split(',').next().unwrap().to_string();
+    let path = format!("/v1/databases/{}/games?q=player:morphy+sort:white", r.id);
+    assert_eq!(total(get(r.port, &path, "")), "2");
+    let bigger = database("api-search-fresh-bigger", 5, 0, 0);
+    for f in ["db.2cbh", "db.2cbg", "db.2lid"] {
+        std::fs::copy(bigger.dir().join(f), db.dir().join(f)).unwrap();
+    }
+    assert_eq!(total(get(r.port, &path, "")), "5", "the kept result and sort order belong to the old generation");
+}
+
+/// Percent-encodes everything but unreserved characters, for a query value.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// A suggestion's `value` is the complete name, usable verbatim in a quoted
+/// qualifier, and its `label` is clipped for display: two names that share
+/// their first 215 characters are two values, each finding its own game. A
+/// name longer than a query value can hold is not offered.
+#[test]
+fn suggestions_carry_the_complete_value_and_a_clipped_label() {
+    let prefix = "é".repeat(210);
+    let (a, b, long) = (format!("{prefix}TailA"), format!("{prefix}TailB"), format!("{prefix}{}", "x".repeat(60)));
+    let mut builder = Builder::new();
+    let e4 = builder.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for id in 0..3i64 {
+        let g = builder.game(e4);
+        g[0x18..0x20].copy_from_slice(&id.to_le_bytes());
+        g[0x20..0x28].copy_from_slice(&id.to_le_bytes());
+    }
+    let players: Vec<(usize, usize, Vec<u8>)> =
+        [&a, &b, &long].iter().enumerate().map(|(id, name)| (0, id, strings(&[name, ""]))).collect();
+    builder.lid(lid_with(1024, 3, &players));
+    let db = builder.write("api-suggest-long");
+    let r = start(&db, vec![], None);
+    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix={}", r.id, encode("éé")), "");
+    assert_eq!(s.status, 200, "{}", s.body);
+    let label: String = prefix.chars().take(200).collect::<String>() + "…";
+    for name in [&a, &b] {
+        let item = format!(r#"{{"value":"{name}","label":"{label}","games":1}}"#);
+        assert!(s.body.contains(&item), "{name}: {}", s.body);
+        let q = encode(&format!("player:\"{name}\""));
+        let w = get(r.port, &format!("/v1/databases/{}/games?q={q}", r.id), "");
+        assert!(w.body.contains(r#""total":1,"#), "{}", w.body);
+    }
+    assert!(!s.body.contains("xxx"), "a name of 270 characters is not offered: {}", s.body);
 }

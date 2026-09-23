@@ -94,21 +94,23 @@ with them.
 | Status | Code | Meaning |
 |---|---|---|
 | 400 | `bad_request` | A parameter is missing or malformed; `parameter` names it |
-| 400 | `query_syntax` | `q` cannot be parsed; `offset` is the character offset of the problem |
+| 400 | `query_syntax` | Reserved: the search grammar is lenient and no text is a syntax error today |
 | 400 | `unsupported_qualifier` | `q` uses a qualifier ChessBase databases do not have; `qualifier` names it |
 | 401 | `unauthorized` | Token missing or wrong |
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
 | 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading` |
+| 409 | `superseded` | A newer search (`q`) on the same database replaced this one while it ran; the page shows the newer answer |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
+| 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
-| 503 | `busy` | Too many open connections, or too many large answers being sent at once; `Retry-After: 1` |
+| 503 | `busy` | Too many open connections, too many large answers being sent at once, or search memory taken by other searches; `Retry-After: 1` |
 
 ## Database identity and generations
 
@@ -145,6 +147,45 @@ snapshot to coordinate with. The bridge therefore promises:
 - **Caches follow the generation.** Sort orders, suggestions and the position
   index are rebuilt when the generation changes, never mixed with a newer
   record count.
+
+## Search memory
+
+Name tables, sort orders, search results and suggestion counts are kept in
+memory within one budget, 1 GiB by default (`OSCHESS_BRIDGE_SEARCH_MIB` sets
+another, 16 to 65,536). Every structure reserves its bytes before it is
+allocated. When a new one does not fit, what other searches retained is
+dropped first and rebuilt when it is next needed; when it still does not fit,
+the request is answered `503 busy`. A structure larger than the whole budget
+is refused at once with `422 database_too_large`: a sort order needs 12 bytes
+per record while it is built and 4 bytes after, so the default budget sorts
+databases of up to about 89 million records. A Mega Database of 12 million
+records needs about 330 MB with three sort orders and the suggestion counts.
+
+Passes over a database run on workers shared by all requests: the machine's
+cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
+are free, waits up to 5 seconds for the first one, and is answered `503 busy`
+when none comes free; many requests at once therefore wait for each other
+instead of multiplying the threads. Each worker reads headers into one 3 MiB
+buffer, reserved in the budget before it is allocated; a worker loading names
+reserves 64 KiB for one record, which is read to at most 4 KiB. What a worker
+builds, such as its matches or its share of a name table, grows in steps of a
+256th of the budget, from 64 KiB to 1 MiB. A search's workers take at most half the
+budget with their buffers and one step each, which leaves the other half for
+the rest of what they build, and with little budget left a search runs on
+fewer workers, down to one.
+
+## Cancellation
+
+A client names its searches' stream with the `stream` parameter: 1 to 64
+characters of `A-Z`, `a-z`, `0-9`, `-` and `_`, chosen by the client, for
+example one per browser tab and list. A request that carries `q` and a
+`stream` supersedes the search still running in the same stream on the same
+database: that one stops at its next batch of headers and is answered
+`409 superseded`. An empty `q=` counts: clearing the search box supersedes
+the search it replaces. Other streams, requests without a `stream`, requests
+without `q`, and suggestions are never superseded, so a page in one tab never
+stops a search another tab still waits for. A database remembers its 256
+most recently used streams; a forgotten stream starts afresh.
 
 ## Endpoints
 
@@ -254,14 +295,18 @@ One window of the database's records, sorted and optionally searched.
 |---|---|---|
 | `offset` | `0` | The first row of the window, counted from 0 in the sorted order |
 | `limit` | `200` | Rows in the window, 1 to 500 |
-| `sort` | `number` | `<key>`, `<key>-asc` or `<key>-desc`; keys below |
-| `q` | | A search in the Library search grammar (#21, `docs/search-grammar.md`) |
+| `sort` | `number` | `<key>`, `<key>-asc` or `<key>-desc`; keys below. It wins over a `sort:` token in `q`; an unknown key is `400 bad_request` |
+| `q` | | A search in the Library search grammar ([search-grammar.md](search-grammar.md)); `total` then counts the matches |
+| `stream` | | The client's name for this list, which lets a newer search replace an older one ([Cancellation](#cancellation)); an invalid name is `400 bad_request` |
 
 Sort keys: `number`, `white`, `black`, `whiteElo`, `blackElo`, `result`,
 `moves`, `eco`, `tournament` (alias `event`), `date`, `round`, `annotator` —
 the oschess Library's keys plus `number` and the two Elo keys. Without a
 direction, `date` and `moves` sort descending and the others ascending, as in
-the Library. Ties are broken by `number`, ascending.
+the Library. Ties are broken by `number`, ascending, in both directions.
+Unknown values come first ascending and last descending. A guiding text or an
+analysis sorts by its title (as `tournament`) and its author (as `annotator`)
+and has no other key.
 
 ```json
 {
@@ -312,7 +357,9 @@ fields.
 
 Text fields in a row are cut at 200 characters and then end with `…`; the
 game's PGN has them in full. A window therefore stays small however long a
-name stored in the database is.
+name stored in the database is. Rows, like searches, read a name's entity
+record to at most 4 KiB; a longer record, which only a damaged file holds, is
+an empty name.
 
 ### `GET /v1/databases/{id}/games/{number}`
 
@@ -340,19 +387,26 @@ One game as PGN.
 A guiding text or an analysis is answered `422 not_a_game`, and a game whose
 records are damaged `422 unreadable_game`. Deleted games are served.
 
-### `GET /v1/databases/{id}/suggest` (planned, #21)
+### `GET /v1/databases/{id}/suggest`
 
 | Parameter | Meaning |
 |---|---|
 | `field` | `player`, `event` or `annotator` |
-| `prefix` | The typed beginning, case-insensitive, at least 1 character |
-| `limit` | At most 20, the default |
+| `prefix` | The typed beginning, case-insensitive, at least 1 character; for people, a first name that starts with it counts too |
+| `limit` | 1 to 20; 20 by default |
 
 ```json
-{ "field": "player", "suggestions": [ { "value": "Morphy, Paul", "games": 211 } ] }
+{ "field": "player", "suggestions": [ { "value": "Morphy, Paul", "label": "Morphy, Paul", "games": 211 } ] }
 ```
 
-Most games first, then alphabetical.
+`value` is the complete name. Put in double quotes after its qualifier
+(`player:"Morphy, Paul"`) it finds the games of that name. `label` is the name
+for display, cut at 200 characters with `…`. A name longer than a query value
+can hold (256 characters) or containing a double quote cannot be searched
+exactly and is not offered. `games` counts the games with the name in that
+role (either colour for `player`); guiding texts and analyses are not counted,
+and entities with the same name are counted together. Most games first, then
+alphabetical.
 
 ### `GET /v1/databases/{id}/explorer` (planned, #24)
 

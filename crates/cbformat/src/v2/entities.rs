@@ -89,11 +89,30 @@ impl Entities {
         self.types.get(typ).map_or(0, |t| t.1)
     }
 
+    /// The ids of type `typ` that can hold an entity: the header's count,
+    /// bounded by the containers that start inside the file as it was when
+    /// opened. Ids from 0 up to this are worth reading; the rest are missing.
+    pub fn stored_count(&self, typ: usize) -> i64 {
+        let Some(&(_, count, _)) = self.types.get(typ) else { return 0 };
+        if self.block_size == 0 {
+            return 0;
+        }
+        let start = (self.header_size + self.container_offset[typ]) as u64;
+        let fit = self.len.saturating_sub(start).div_ceil(self.block_size as u64);
+        count.min(i64::try_from(fit).unwrap_or(i64::MAX))
+    }
+
     /// The record bytes after the length field, or `None` for an unused id or
     /// one past the end of the file as it was when opened. One positional read
     /// of the container; a container inside that length that cannot be read
     /// now, because the file was truncated or failed, is an error.
     pub fn raw(&self, typ: usize, id: i64) -> Result<Option<Vec<u8>>> {
+        self.raw_within(typ, id, usize::MAX)
+    }
+
+    /// [`Entities::raw`], reading at most `limit` record bytes: a record longer
+    /// than that is `None`, as an unreadable one is, and is never read whole.
+    pub fn raw_within(&self, typ: usize, id: i64, limit: usize) -> Result<Option<Vec<u8>>> {
         let Some(&(size, count, _)) = self.types.get(typ) else { return Ok(None) };
         if id < 0 || id >= count {
             return Ok(None);
@@ -106,7 +125,7 @@ impl Entities {
         else {
             return Ok(None);
         };
-        let want = (size as u64).min(self.len.saturating_sub(o)) as usize;
+        let want = (size as u64).min(self.len.saturating_sub(o)).min(limit.saturating_add(4) as u64) as usize;
         if want < 4 {
             return Ok(None);
         }
@@ -122,7 +141,12 @@ impl Entities {
     /// The player `id`, or `None` for an unused or unreadable entry; errors
     /// as for [`Entities::raw`].
     pub fn player(&self, id: i64) -> Result<Option<Player>> {
-        Ok(self.raw(PLAYER, id)?.and_then(|r| {
+        self.player_within(id, usize::MAX)
+    }
+
+    /// [`Entities::player`] from a record of at most `limit` bytes.
+    pub fn player_within(&self, id: i64, limit: usize) -> Result<Option<Player>> {
+        Ok(self.raw_within(PLAYER, id, limit)?.and_then(|r| {
             let mut c = Cursor(&r, 0);
             Some(Player { last: c.string()?, first: c.string()? })
         }))
@@ -131,7 +155,12 @@ impl Entities {
     /// The tournament `id`, or `None` for an unused or unreadable entry;
     /// errors as for [`Entities::raw`].
     pub fn tournament(&self, id: i64) -> Result<Option<Tournament>> {
-        Ok(self.raw(TOURNAMENT, id)?.and_then(|r| {
+        self.tournament_within(id, usize::MAX)
+    }
+
+    /// [`Entities::tournament`] from a record of at most `limit` bytes.
+    pub fn tournament_within(&self, id: i64, limit: usize) -> Result<Option<Tournament>> {
+        Ok(self.raw_within(TOURNAMENT, id, limit)?.and_then(|r| {
             let mut c = Cursor(&r, 0);
             let place = c.string()?;
             let title = c.string()?;
@@ -147,7 +176,12 @@ impl Entities {
     /// `None` when all are empty or the id is unused. Errors as for
     /// [`Entities::raw`].
     pub fn title(&self, id: i64) -> Result<Option<String>> {
-        Ok(self.raw(GAME_TAG, id)?.and_then(|r| {
+        self.title_within(id, usize::MAX)
+    }
+
+    /// [`Entities::title`] from a record of at most `limit` bytes.
+    pub fn title_within(&self, id: i64, limit: usize) -> Result<Option<String>> {
+        Ok(self.raw_within(GAME_TAG, id, limit)?.and_then(|r| {
             let mut c = Cursor(&r, 0);
             let count = c.i32()?;
             for _ in 0..count.max(0) {
