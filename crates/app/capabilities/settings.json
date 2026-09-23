@@ -1,0 +1,19 @@
+{
+  "identifier": "settings",
+  "description": "The settings window: the databases and folders, autostart, updates, the pairing code and the port.",
+  "windows": ["settings"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-view",
+    "allow-settings",
+    "allow-add-folder",
+    "allow-remove-database",
+    "allow-set-autostart",
+    "allow-set-auto-update",
+    "allow-pairing-code",
+    "allow-copy-code",
+    "allow-new-code",
+    "allow-set-port"
+  ]
+}

@@ -1,0 +1,155 @@
+/* Windows 11 light-theme neutrals and the oschess accent, as in the design
+   mocks. Every page loads this file; the pages add only their layout. */
+:root {
+  --accent: #bc662f;
+  --accent-hover: #a9571f;
+  --accent-text: #8b3900;
+  --accent-soft: #ffe9d9;
+  --mica: #f3f3f3;
+  --layer: #fbfbfb;
+  --card: #ffffff;
+  --stroke: #e5e5e5;
+  --stroke-control: #d1d1d1;
+  --stroke-bottom: #b8b8b8;
+  --fg: #1a1a1a;
+  --fg2: #5d5d5d;
+  --fg3: #8a8a8a;
+  --ok: #0f7b0f;
+  --ok-bg: #dff6dd;
+  --ok-text: #0b5a0b;
+  --warn: #9d5d00;
+  --warn-bg: #fff4ce;
+  --bad: #c42b1c;
+  --bad-bg: #fde7e9;
+  --info-bg: #f6f6f6;
+  --cloud: #2b4f7e;
+  --cloud-bg: #eef2f8;
+  --attention: #b86e00;
+  --font: 'Segoe UI Variable Text', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  font-family: var(--font);
+  font-size: 14px;
+  color: var(--fg);
+  background: var(--mica);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+button, input { font: inherit; color: inherit; }
+svg { flex: none; display: block; }
+[hidden] { display: none !important; }
+
+.mono { font-family: var(--mono); }
+.muted { color: var(--fg2); }
+.cap12 { font-size: 12px; color: var(--fg2); }
+.lbl { font-size: 13px; font-weight: 600; color: var(--fg); }
+.selectable { user-select: text; cursor: text; }
+
+.btn {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, .0578);
+  border-bottom-color: rgba(0, 0, 0, .1622);
+  background: #fdfdfd;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+  flex: none;
+}
+.btn:hover { background: #f6f6f6; }
+.btn:active { background: #f5f5f5; color: var(--fg2); border-bottom-color: rgba(0, 0, 0, .0578); }
+.btn:disabled { color: var(--fg3); background: #f9f9f9; border-color: rgba(0, 0, 0, .0578); }
+.btn:focus-visible, .nav:focus-visible, .tog:focus-visible, .icon-btn:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 1px;
+}
+.btn.accent { background: var(--accent); color: #fff; border-color: rgba(255, 255, 255, .08); border-bottom-color: rgba(0, 0, 0, .4); }
+.btn.accent:hover { background: var(--accent-hover); }
+.btn.accent:disabled { background: #c9c9c9; color: #fff; }
+.btn.wide { flex: 1; }
+
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn:hover { background: rgba(0, 0, 0, .037); }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 11px;
+  font-size: 12px;
+  white-space: nowrap;
+  flex: none;
+}
+.chip.ready { background: var(--ok-bg); color: var(--ok); }
+.chip.cloudOnly { background: var(--cloud-bg); color: var(--cloud); }
+.chip.downloading { background: var(--accent-soft); color: var(--accent-text); }
+.chip.neutral { background: var(--info-bg); color: var(--fg2); border: 1px solid var(--stroke); }
+.chip.bad { background: var(--bad-bg); color: var(--bad); }
+
+.bar { height: 4px; border-radius: 2px; background: rgba(0, 0, 0, .08); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+.tile {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  background: #fffdf9;
+  border: 1px solid #eadfd3;
+}
+.tile img { display: block; }
+
+.tog {
+  width: 40px;
+  height: 20px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 3px;
+  flex: none;
+  border: 1px solid #858585;
+  background: rgba(0, 0, 0, .024);
+}
+.tog i { display: block; width: 12px; height: 12px; border-radius: 6px; background: #5d5d5d; }
+.tog[aria-checked="true"] { background: var(--accent); border-color: var(--accent); justify-content: flex-end; }
+.tog[aria-checked="true"] i { background: #fff; }
+
+.field {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 4px;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-bottom-color: var(--stroke-bottom);
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+input.field { outline: none; }
+input.field:focus { border-bottom: 2px solid var(--accent); }
+
+.error { color: var(--bad); font-size: 12px; }

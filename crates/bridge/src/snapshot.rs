@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::api::App;
-use crate::catalog::State;
+use crate::catalog::{Entry, State};
 use crate::server;
 use crate::start::Bridge;
 
@@ -23,9 +23,35 @@ pub struct Database {
     /// The name ChessBase's window shows: its title for the database, else
     /// the file name without its extension.
     pub name: String,
+    /// `2cbh`, `cbh`, `pgn` or `other`, as the API names it.
+    pub format: &'static str,
     /// Checked without reading a file kept in the cloud: such a database is
     /// `CloudOnly`, or `Downloading` once its games were asked for.
     pub state: State,
+    /// Games, guiding texts and analyses, when the database is ready.
+    pub records: Option<u32>,
+    /// The bytes of its files, while they are kept in the cloud or downloaded.
+    pub size: Option<u64>,
+    /// The bytes on this computer and in all, while it downloads.
+    pub progress: Option<(u64, u64)>,
+}
+
+impl Database {
+    fn of(entry: &Entry) -> Database {
+        let state = entry.state();
+        let records = if state == State::Ready { entry.open().ok().map(|o| o.db.record_count()) } else { None };
+        let size = matches!(state, State::CloudOnly | State::Downloading).then(|| entry.size());
+        let progress = entry.progress().filter(|_| state == State::Downloading).map(|p| (p.present(), p.total));
+        Database {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            format: entry.format.name(),
+            state,
+            records,
+            size,
+            progress,
+        }
+    }
 }
 
 /// A bridge serving on a thread of its own.
@@ -55,15 +81,11 @@ impl Background {
     /// The state now. Checking a database opens it when it is ready, so call
     /// this from a thread that may wait on the disk.
     pub fn snapshot(&self) -> Snapshot {
-        let entries = self.app.catalog.entries();
         Snapshot {
             version: self.app.version,
             port: self.port,
             stopped: self.stopped.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            databases: entries
-                .iter()
-                .map(|e| Database { id: e.id.clone(), name: e.name.clone(), state: e.state() })
-                .collect(),
+            databases: self.app.catalog.entries().iter().map(|e| Database::of(e)).collect(),
         }
     }
 }
@@ -77,6 +99,8 @@ mod tests {
     use super::*;
     use crate::access::{DEFAULT_ORIGINS, Policy};
     use crate::catalog::Catalog;
+    use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
+    use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
     const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 
@@ -92,10 +116,26 @@ mod tests {
         Bridge { listeners, app: Arc::new(app), port, token: TOKEN.into(), link: String::new(), first_run: false }
     }
 
+    /// A database of `games` games of 1.e4.
+    fn ready(name: &str, games: u32) -> TempDb {
+        let mut b = Builder::new();
+        let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+        for _ in 0..games {
+            b.game(e4);
+        }
+        let player = [&6i32.to_le_bytes()[..], b"Morphy"].concat();
+        let mut lid = lid_header(1024, 1);
+        lid.extend((player.len() as i32).to_le_bytes());
+        lid.extend(&player);
+        b.lid(lid);
+        b.write(name)
+    }
+
     #[test]
     fn a_serving_bridge_and_its_databases() {
         let missing = PathBuf::from("/no/such/folder/Games.2cbh");
-        let bridge = bridge(vec![missing.clone(), PathBuf::from("/no/such/folder/Old.pgn")]);
+        let db = ready("snapshot-ready", 3);
+        let bridge = bridge(vec![missing.clone(), PathBuf::from("/no/such/folder/Old.pgn"), db.dir().join("db.2cbh")]);
         let port = bridge.port;
         let background = Background::serve(bridge).unwrap();
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -109,8 +149,16 @@ mod tests {
 
         let snapshot = background.snapshot();
         assert_eq!((snapshot.version, snapshot.port, snapshot.stopped.as_deref()), ("test", port, None));
-        let states: Vec<(&str, State)> = snapshot.databases.iter().map(|d| (d.name.as_str(), d.state)).collect();
-        assert_eq!(states, [("Games", State::Missing), ("Old", State::Missing)]);
+        let states: Vec<(&str, &str, State, Option<u32>)> =
+            snapshot.databases.iter().map(|d| (d.name.as_str(), d.format, d.state, d.records)).collect();
+        assert_eq!(
+            states,
+            [
+                ("Games", "2cbh", State::Missing, None),
+                ("Old", "pgn", State::Missing, None),
+                ("db", "2cbh", State::Ready, Some(3))
+            ]
+        );
         assert_eq!(snapshot.databases[0].id, crate::catalog::id_of(&missing));
     }
 

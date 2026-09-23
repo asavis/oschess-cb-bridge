@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title data-i18n="window.firstRun">oschess міст</title>
+  <link rel="stylesheet" href="common.css">
+  <link rel="stylesheet" href="first-run.css">
+  <script src="common.js" defer></script>
+  <script src="first-run.js" defer></script>
+</head>
+<body>
+  <main class="first-run">
+    <header class="hero">
+      <span class="tile"><img src="img/logo.svg" width="44" height="44" alt=""></span>
+      <div>
+        <h1 data-i18n="firstRun.title">Міст встановлено</h1>
+        <div class="muted" data-i18n="firstRun.subtitle"></div>
+      </div>
+    </header>
+    <section class="opening" id="opening">
+      <div>
+        <div class="strong" data-i18n="firstRun.opening.title"></div>
+        <div class="cap12" data-i18n="firstRun.opening.hint"></div>
+      </div>
+    </section>
+    <div class="actions">
+      <button class="btn accent" id="open"><span data-i18n="firstRun.open"></span></button>
+      <button class="btn" id="close" data-i18n="firstRun.close"></button>
+    </div>
+    <hr>
+    <details open>
+      <summary><span data-i18n="firstRun.manual.title"></span></summary>
+      <p class="cap12 hint" data-i18n="firstRun.manual.hint"></p>
+      <div class="code-line">
+        <span class="field mono selectable" id="code"></span>
+        <button class="btn" id="copy"><span data-i18n="firstRun.copy"></span></button>
+      </div>
+    </details>
+  </main>
+</body>
+</html>

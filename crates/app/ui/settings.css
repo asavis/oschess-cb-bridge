@@ -1,0 +1,62 @@
+body { display: flex; height: 100vh; overflow: hidden; }
+
+.side { width: 236px; flex: none; padding: 14px 8px 12px; display: flex; flex-direction: column; gap: 2px; }
+.brand { display: flex; align-items: center; gap: 12px; padding: 6px 10px 18px; }
+.brand .tile { width: 40px; height: 40px; }
+.brand-name { font-weight: 600; }
+.nav {
+  position: relative;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+}
+.nav:hover { background: rgba(0, 0, 0, .037); }
+.nav[aria-current="page"] { background: rgba(0, 0, 0, .045); }
+.nav[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  width: 3px;
+  height: 16px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.content { flex: 1; min-width: 0; padding: 14px 32px 24px 12px; overflow-y: auto; }
+h1 { font-size: 28px; font-weight: 600; line-height: 36px; margin: 0 0 16px; }
+.group { margin: 18px 0 8px; }
+.group .lbl { font-size: 14px; }
+.group .cap12 { margin-top: 2px; }
+
+.cards { background: var(--layer); border: 1px solid var(--stroke); border-radius: 6px; }
+.row { display: flex; align-items: center; gap: 14px; min-height: 60px; padding: 10px 16px; }
+.row + .row, #folders > .row, #folders + .row { border-top: 1px solid var(--stroke); }
+#folders > .row:first-child { border-top: 0; }
+.row.top { align-items: flex-start; flex-wrap: wrap; }
+/* A line of its own under a row's text, aligned with it past the icon. */
+.row .wide { flex-basis: calc(100% - 34px); margin: 0 0 0 34px; }
+.row.top > .btn { margin-top: 4px; }
+.row.end { justify-content: flex-end; min-height: 52px; }
+.row > svg { color: var(--fg); }
+.text { flex: 1; min-width: 0; }
+.text .cap12 { margin-top: 2px; }
+.path { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.empty-row { color: var(--fg2); font-size: 13px; }
+
+.warning { display: flex; align-items: center; gap: 6px; color: var(--warn); margin-top: 4px; }
+.code-line, .confirm, .port-form { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.code-line .field { flex: 1; font-size: 13px; white-space: nowrap; overflow: hidden; }
+.port-form .field { width: 110px; }
+.error { margin-top: 6px; }
+
+.footer { margin-top: 18px; }
+.link { color: var(--accent-text); }
+.notice { position: fixed; right: 24px; bottom: 20px; margin: 0; padding: 10px 14px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); box-shadow: 0 8px 16px rgba(0, 0, 0, .14); }
+.row > .bar { width: 120px; flex: none; }

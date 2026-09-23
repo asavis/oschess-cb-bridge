@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title data-i18n="window.settings">Налаштування — oschess міст</title>
+  <link rel="stylesheet" href="common.css">
+  <link rel="stylesheet" href="settings.css">
+  <script src="common.js" defer></script>
+  <script src="settings.js" defer></script>
+</head>
+<body>
+  <nav class="side">
+    <div class="brand">
+      <span class="tile"><img src="img/logo.svg" width="31" height="31" alt=""></span>
+      <div>
+        <div class="brand-name" data-i18n="app.name">oschess міст</div>
+        <div class="cap12" id="version"></div>
+      </div>
+    </div>
+    <button class="nav" data-section="databases" data-icon="db"><span data-i18n="settings.nav.databases">Бази</span></button>
+    <button class="nav" data-section="general" data-icon="gear"><span data-i18n="settings.nav.general">Загальне</span></button>
+  </nav>
+
+  <main class="content">
+    <section id="databases" hidden>
+      <h1 data-i18n="settings.databases.title">Бази</h1>
+      <div class="group">
+        <div class="lbl" data-i18n="settings.served.title"></div>
+        <div class="cap12" data-i18n="settings.served.hint"></div>
+      </div>
+      <div class="cards" id="served"></div>
+      <div class="group">
+        <div class="lbl" data-i18n="settings.folders.title"></div>
+        <div class="cap12" data-i18n="settings.folders.hint"></div>
+      </div>
+      <div class="cards">
+        <div id="folders"></div>
+        <div class="row end">
+          <button class="btn" id="add-folder"><span data-i18n="settings.folders.add"></span></button>
+        </div>
+      </div>
+    </section>
+
+    <section id="general" hidden>
+      <h1 data-i18n="settings.general.title">Загальне</h1>
+      <div class="cards">
+        <div class="row" data-icon="power">
+          <div class="text">
+            <div data-i18n="settings.autostart.title"></div>
+            <div class="cap12" data-i18n="settings.autostart.hint"></div>
+          </div>
+          <span class="cap12" id="autostart-state"></span>
+          <button class="tog" id="autostart" role="switch" aria-checked="false" data-i18n-label="settings.autostart.title"><i></i></button>
+        </div>
+        <div class="row" data-icon="refresh">
+          <div class="text">
+            <div data-i18n="settings.autoUpdate.title"></div>
+            <div class="cap12" data-i18n="settings.autoUpdate.hint"></div>
+          </div>
+          <span class="cap12" id="auto-update-state"></span>
+          <button class="tog" id="auto-update" role="switch" aria-checked="false" data-i18n-label="settings.autoUpdate.title"><i></i></button>
+        </div>
+        <div class="row" data-icon="info">
+          <div class="text">
+            <div id="version-title"></div>
+            <div class="cap12" data-i18n="settings.versionRow.hint"></div>
+          </div>
+          <button class="btn" disabled data-i18n="settings.versionRow.check"></button>
+        </div>
+      </div>
+
+      <div class="group"><div class="lbl" data-i18n="settings.connection.title"></div></div>
+      <div class="cards">
+        <div class="row top" data-icon="key">
+          <div class="text">
+            <div data-i18n="settings.code.title"></div>
+            <div class="cap12" data-i18n="settings.code.hint"></div>
+            <div class="warning cap12" id="code-warning"><span data-i18n="settings.code.warning"></span></div>
+          </div>
+          <button class="btn" id="show-code" data-i18n="settings.code.show"></button>
+          <button class="btn" id="new-code" data-i18n="settings.code.new"></button>
+          <div class="wide code-line" id="code-line" hidden>
+            <span class="field mono selectable" id="code"></span>
+            <button class="btn" id="copy-code"><span data-i18n="settings.code.copy"></span></button>
+          </div>
+          <div class="wide confirm" id="confirm" hidden>
+            <button class="btn accent" id="new-code-yes" data-i18n="settings.code.newConfirm"></button>
+            <button class="btn" id="new-code-no" data-i18n="settings.cancel"></button>
+          </div>
+        </div>
+        <div class="row top" data-icon="port">
+          <div class="text">
+            <div id="port-title"></div>
+            <div class="cap12" data-i18n="settings.port.hint"></div>
+            <form class="port-form" id="port-form" hidden>
+              <input class="field mono" id="port-input" inputmode="numeric" maxlength="5" data-i18n-label="settings.port.label">
+              <button class="btn accent" type="submit" data-i18n="settings.port.save"></button>
+              <button class="btn" type="button" id="port-cancel" data-i18n="settings.cancel"></button>
+            </form>
+            <div class="error" id="port-error" hidden></div>
+          </div>
+          <button class="btn" id="port-change" data-i18n="settings.port.change"></button>
+        </div>
+      </div>
+      <p class="cap12 footer"><span data-i18n="settings.footer"></span> · <span class="link selectable">github.com/asavis/oschess-cb-bridge</span></p>
+    </section>
+
+    <p class="notice" id="notice" role="status" hidden></p>
+  </main>
+</body>
+</html>

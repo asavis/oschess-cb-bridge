@@ -1,0 +1,7 @@
+The oschess name and logo are not covered by this repository's MIT licence.
+
+logo.svg in this folder, ../ui/img/logo.svg, and the images drawn from the
+logo here (icon.ico, icon.png and tray/*.png) belong to the oschess project.
+They may be used only to identify this bridge as the oschess bridge. They may
+not be used for other software, or in a way that suggests the oschess project
+endorses a modified version of it.
