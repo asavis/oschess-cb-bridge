@@ -105,7 +105,9 @@ and that many bytes. 22 in the Mega.
 
 **Positions** follow the description: PGN order, with each alternative right
 after the move it replaces. No annotation in any database examined names a
-position past the last move.
+position past the last move. Two symbol annotations in the Mega sit on
+position −1, the game as a whole; PGN has no place for a NAG before the first
+move, so they are not written.
 
 **Text languages** in the Mega: 798,578 English, 783,156 "any language" (7),
 320,588 German, then French, Spanish, Portuguese, Dutch, Italian, Polish and

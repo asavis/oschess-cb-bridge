@@ -34,6 +34,7 @@ struct Census {
     nags: [BTreeMap<u8, u64>; 3],
     orphans: u64,
     orphan_games: u64,
+    game_level_symbols: u64,
     arrows_tested: u64,
     origin_occupied_file_major: u64,
     origin_occupied_rank_major: u64,
@@ -49,6 +50,7 @@ impl Census {
         self.unreadable_moves += o.unreadable_moves;
         self.orphans += o.orphans;
         self.orphan_games += o.orphan_games;
+        self.game_level_symbols += o.game_level_symbols;
         self.arrows_tested += o.arrows_tested;
         self.origin_occupied_file_major += o.origin_occupied_file_major;
         self.origin_occupied_rank_major += o.origin_occupied_rank_major;
@@ -161,6 +163,8 @@ fn main() {
                                         if *before { 0x82 } else { 0x02 }
                                     }
                                     Annotation::Symbols { on_move, on_position, prefix } => {
+                                        // PGN has no place for a NAG before the first move.
+                                        c.game_level_symbols += (b.position == GAME_POSITION) as u64;
                                         for (i, v) in [on_move, on_position, prefix].into_iter().enumerate() {
                                             *c.nags[i].entry(*v).or_default() += 1;
                                         }
@@ -229,6 +233,7 @@ fn main() {
     println!("NAGs on position       {:?}", c.nags[1]);
     println!("NAG prefixes           {:?}", c.nags[2]);
     println!("orphan annotations     {} in {} games", c.orphans, c.orphan_games);
+    println!("symbols on the game    {}", c.game_level_symbols);
     println!(
         "arrow origins occupied {} tested: file by file {}, rank by rank {}",
         c.arrows_tested, c.origin_occupied_file_major, c.origin_occupied_rank_major
