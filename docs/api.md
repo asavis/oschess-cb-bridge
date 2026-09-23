@@ -94,7 +94,7 @@ with them.
 | Status | Code | Meaning |
 |---|---|---|
 | 400 | `bad_request` | A parameter is missing or malformed; `parameter` names it |
-| 400 | `query_syntax` | `q` cannot be parsed; `offset` is the character offset of the problem |
+| 400 | `query_syntax` | Reserved: the search grammar is lenient and no text is a syntax error today |
 | 400 | `unsupported_qualifier` | `q` uses a qualifier ChessBase databases do not have; `qualifier` names it |
 | 401 | `unauthorized` | Token missing or wrong |
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
@@ -254,14 +254,17 @@ One window of the database's records, sorted and optionally searched.
 |---|---|---|
 | `offset` | `0` | The first row of the window, counted from 0 in the sorted order |
 | `limit` | `200` | Rows in the window, 1 to 500 |
-| `sort` | `number` | `<key>`, `<key>-asc` or `<key>-desc`; keys below |
-| `q` | | A search in the Library search grammar (#21, `docs/search-grammar.md`) |
+| `sort` | `number` | `<key>`, `<key>-asc` or `<key>-desc`; keys below. It wins over a `sort:` token in `q`; an unknown key is `400 bad_request` |
+| `q` | | A search in the Library search grammar ([search-grammar.md](search-grammar.md)); `total` then counts the matches |
 
 Sort keys: `number`, `white`, `black`, `whiteElo`, `blackElo`, `result`,
 `moves`, `eco`, `tournament` (alias `event`), `date`, `round`, `annotator` —
 the oschess Library's keys plus `number` and the two Elo keys. Without a
 direction, `date` and `moves` sort descending and the others ascending, as in
-the Library. Ties are broken by `number`, ascending.
+the Library. Ties are broken by `number`, ascending, in both directions.
+Unknown values come first ascending and last descending. A guiding text or an
+analysis sorts by its title (as `tournament`) and its author (as `annotator`)
+and has no other key.
 
 ```json
 {
@@ -340,19 +343,21 @@ One game as PGN.
 A guiding text or an analysis is answered `422 not_a_game`, and a game whose
 records are damaged `422 unreadable_game`. Deleted games are served.
 
-### `GET /v1/databases/{id}/suggest` (planned, #21)
+### `GET /v1/databases/{id}/suggest`
 
 | Parameter | Meaning |
 |---|---|
 | `field` | `player`, `event` or `annotator` |
-| `prefix` | The typed beginning, case-insensitive, at least 1 character |
-| `limit` | At most 20, the default |
+| `prefix` | The typed beginning, case-insensitive, at least 1 character; for people, a first name that starts with it counts too |
+| `limit` | 1 to 20; 20 by default |
 
 ```json
 { "field": "player", "suggestions": [ { "value": "Morphy, Paul", "games": 211 } ] }
 ```
 
-Most games first, then alphabetical.
+`games` counts the games with the name in that role (either colour for
+`player`); guiding texts and analyses are not counted, and entities with the
+same name are counted together. Most games first, then alphabetical.
 
 ### `GET /v1/databases/{id}/explorer` (planned, #24)
 

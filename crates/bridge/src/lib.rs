@@ -13,6 +13,7 @@ pub mod http;
 pub mod json;
 pub mod pairing;
 pub mod reply;
+pub mod search;
 pub mod server;
 pub mod snapshot;
 pub mod sources;

@@ -89,6 +89,19 @@ impl Entities {
         self.types.get(typ).map_or(0, |t| t.1)
     }
 
+    /// The ids of type `typ` that can hold an entity: the header's count,
+    /// bounded by the containers that start inside the file as it was when
+    /// opened. Ids from 0 up to this are worth reading; the rest are missing.
+    pub fn stored_count(&self, typ: usize) -> i64 {
+        let Some(&(_, count, _)) = self.types.get(typ) else { return 0 };
+        if self.block_size == 0 {
+            return 0;
+        }
+        let start = (self.header_size + self.container_offset[typ]) as u64;
+        let fit = self.len.saturating_sub(start).div_ceil(self.block_size as u64);
+        count.min(i64::try_from(fit).unwrap_or(i64::MAX))
+    }
+
     /// The record bytes after the length field, or `None` for an unused id or
     /// one past the end of the file as it was when opened. One positional read
     /// of the container; a container inside that length that cannot be read

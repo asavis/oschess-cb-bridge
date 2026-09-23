@@ -207,8 +207,8 @@ fn game_windows() {
         ("?limit=0", "limit"),
         ("?limit=501", "limit"),
         ("?offset=-1", "offset"),
-        ("?sort=white", "sort"),
-        ("?q=player:morphy", "q"),
+        ("?sort=bogus", "sort"),
+        ("?sort=name", "sort"),
     ] {
         let e = get(r.port, &path(q), "");
         assert_eq!(e.status, 400, "{q}");
@@ -733,4 +733,55 @@ fn an_annotation_on_no_move_is_an_unreadable_game() {
     let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
     assert_eq!(g.status, 422, "{}", g.body);
     assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("position 2"), "{}", g.body);
+}
+
+#[test]
+fn search_sort_and_unsupported_qualifiers() {
+    let db = database("api-search", 6, 3, 0);
+    let r = start(&db, vec![], None);
+    let list = |q: &str| get(r.port, &format!("/v1/databases/{}/games{q}", r.id), "");
+    let numbers = |reply: &Reply| -> Vec<u32> {
+        reply.body.split(r#""number":"#).skip(1).map(|s| s.split(',').next().unwrap().parse().unwrap()).collect()
+    };
+    // Record 3 is a guiding text: a qualifier keeps it out, a bare word does not.
+    let w = list("?q=player:morphy&limit=2&offset=1");
+    assert_eq!(w.status, 200, "{}", w.body);
+    assert!(w.body.contains(r#""total":5,"offset":1,"sort":"number-asc""#), "{}", w.body);
+    assert_eq!(numbers(&w), [2, 4]);
+    assert_eq!(numbers(&list("?q=result:1-0+sort:number-desc")), [6, 5, 4, 2, 1]);
+    let by_param = list("?q=result:1-0+sort:number-desc&sort=number");
+    assert!(by_param.body.contains(r#""sort":"number-asc""#), "the URL's sort wins: {}", by_param.body);
+    assert_eq!(numbers(&list("?sort=moves")).len(), 6);
+    let e = list("?q=tag:endgame");
+    assert_eq!(e.status, 400);
+    assert!(
+        e.body.contains(r#""code":"unsupported_qualifier""#) && e.body.contains(r#""qualifier":"tag""#),
+        "{}",
+        e.body
+    );
+    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix=mor", r.id), "");
+    assert_eq!(s.status, 200, "{}", s.body);
+    assert!(s.body.contains(r#"{"field":"player","suggestions":[{"value":"Morphy, Paul","games":5}]}"#), "{}", s.body);
+    for (q, parameter) in [
+        ("?field=colour&prefix=m", "field"),
+        ("?field=player&prefix=+", "prefix"),
+        ("?field=event&prefix=p&limit=21", "limit"),
+    ] {
+        let e = get(r.port, &format!("/v1/databases/{}/suggest{q}", r.id), "");
+        assert!(e.status == 400 && e.body.contains(&format!(r#""parameter":"{parameter}""#)), "{q}: {}", e.body);
+    }
+}
+
+#[test]
+fn a_changed_database_is_searched_afresh() {
+    let db = database("api-search-fresh", 2, 0, 0);
+    let r = start(&db, vec![], None);
+    let total = |reply: Reply| reply.body.split(r#""total":"#).nth(1).unwrap().split(',').next().unwrap().to_string();
+    let path = format!("/v1/databases/{}/games?q=player:morphy+sort:white", r.id);
+    assert_eq!(total(get(r.port, &path, "")), "2");
+    let bigger = database("api-search-fresh-bigger", 5, 0, 0);
+    for f in ["db.2cbh", "db.2cbg", "db.2lid"] {
+        std::fs::copy(bigger.dir().join(f), db.dir().join(f)).unwrap();
+    }
+    assert_eq!(total(get(r.port, &path, "")), "5", "the kept result and sort order belong to the old generation");
 }

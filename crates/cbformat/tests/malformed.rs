@@ -150,6 +150,19 @@ fn entity_ids_beyond_the_file_read_as_missing() {
 }
 
 #[test]
+fn stored_counts_are_bounded_by_the_file() {
+    // The header claims i64::MAX players; the file holds one container, cut short.
+    let mut lid = lid_header(1024, i64::MAX);
+    lid.extend([0u8; 10]);
+    let f = fixture("stored-count", lid, |_| {});
+    let db = Database::open(f.base()).unwrap();
+    assert_eq!(db.entities().stored_count(0), 1);
+    assert_eq!(db.entities().stored_count(7), 0);
+    let f = fixture("stored-count-none", lid_header(1024, i64::MAX), |_| {});
+    assert_eq!(Database::open(f.base()).unwrap().entities().stored_count(0), 0);
+}
+
+#[test]
 fn an_entity_file_truncated_after_opening_is_an_error() {
     // Player 0, the white and black of the game: "Tester, Ann".
     let mut lid = lid_header(1024, 1);
