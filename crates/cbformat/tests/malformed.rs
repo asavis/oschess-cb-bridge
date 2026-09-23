@@ -29,6 +29,34 @@ fn deeply_nested_variations_export_without_overflowing_the_stack() {
     assert_eq!(text.matches(')').count(), 100_000);
 }
 
+/// `depth` variations open at once: each move but the last has an alternative
+/// still to come, and every line then ends.
+fn nested(depth: usize) -> Vec<u8> {
+    let mut words = vec![MOVES];
+    for _ in 0..depth {
+        words.extend([NULL, ALT]);
+    }
+    words.extend(std::iter::repeat_n(END, depth + 1));
+    bytes(&words)
+}
+
+#[test]
+fn variation_nesting_is_bounded() {
+    use cbformat::replay::MAX_VARIATION_DEPTH;
+    let content = nested(MAX_VARIATION_DEPTH);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    assert!(walk_tree(&moves, |_, _, _| {}).is_ok());
+    let content = nested(MAX_VARIATION_DEPTH + 1);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    let err = walk_tree(&moves, |_, _, _| {}).unwrap_err().to_string();
+    assert!(err.contains("nested deeper than 1024"), "{err}");
+    assert!(movetext_of(&moves).is_err());
+    // A hostile record of a million open variations stops at the bound too.
+    let content = nested(1 << 20);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    assert!(walk_tree(&moves, |_, _, _| {}).is_err());
+}
+
 #[test]
 fn export_refuses_what_verify_refuses() {
     let e4 = quiet(Color::White, Piece::Pawn, "e2", "e4");

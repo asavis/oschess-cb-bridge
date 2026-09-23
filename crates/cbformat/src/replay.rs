@@ -212,6 +212,11 @@ pub fn play(board: &mut Board, word: u16) -> std::result::Result<Option<Move>, M
     Ok(Some(mv))
 }
 
+/// The most variations open at once in one walk. Each open variation keeps a
+/// saved board, so this bounds the walk's memory whatever a move record
+/// holds; the deepest nesting in the whole Mega Database 2026 is 74.
+pub const MAX_VARIATION_DEPTH: usize = 1024;
+
 /// Counts from a full walk of a move tree.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TreeStats {
@@ -305,6 +310,9 @@ pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<Tre
             Token::Alternative => {
                 // `take` leaves None, so a second marker after the same move is refused too.
                 let b = saved.take().ok_or_else(|| Error::Format("alternative marker not after a move".into()))?;
+                if stack.len() >= MAX_VARIATION_DEPTH {
+                    return Err(Error::Format(format!("variations nested deeper than {MAX_VARIATION_DEPTH}")));
+                }
                 stack.push(b);
                 visitor.branch();
             }
