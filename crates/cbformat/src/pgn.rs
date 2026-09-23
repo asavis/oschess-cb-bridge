@@ -288,8 +288,10 @@ pub fn game_from(db: &Database, r: &Record, moves: &GameMoves<'_>) -> Result<Str
         return Err(Error::Format(format!("record {} is not a game", r.id())));
     }
     let e = db.entities();
-    let t = e.tournament(r.tournament());
-    let name = |pid| e.player(pid).map(|p| p.pgn()).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into());
+    let t = e.tournament(r.tournament())?;
+    let name = |pid| -> Result<String> {
+        Ok(e.player(pid)?.map(|p| p.pgn()).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into()))
+    };
     let mut out = String::new();
     tag(&mut out, "Event", t.as_ref().map(|t| t.title.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
     tag(&mut out, "Site", t.as_ref().map(|t| t.place.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
@@ -300,8 +302,8 @@ pub fn game_from(db: &Database, r: &Record, moves: &GameMoves<'_>) -> Result<Str
         (n, s) => format!("{n}({s})"),
     };
     tag(&mut out, "Round", &round);
-    tag(&mut out, "White", &name(r.white()));
-    tag(&mut out, "Black", &name(r.black()));
+    tag(&mut out, "White", &name(r.white())?);
+    tag(&mut out, "Black", &name(r.black())?);
     tag(&mut out, "Result", r.result().pgn());
     if r.white_elo() > 0 {
         tag(&mut out, "WhiteElo", &r.white_elo().to_string());

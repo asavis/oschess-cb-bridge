@@ -27,6 +27,9 @@ const MAX_FRAME_PART: usize = 64 << 20;
 /// Largest span of `.2cbg` read for one batch; a batch whose moves lie wider
 /// apart reads each move record on its own.
 const MAX_BATCH_SPAN: u64 = 256 << 20;
+/// Most records read by one [`Database::records`] or [`Database::batch`]:
+/// 12 MiB of headers.
+pub const MAX_BATCH_RECORDS: u32 = 1 << 16;
 
 fn le_i16(b: &[u8], o: usize) -> i16 {
     i16::from_le_bytes([b[o], b[o + 1]])
@@ -208,20 +211,37 @@ impl Database {
         Ok(MoveData { tag, content: Cow::Owned(content) })
     }
 
-    /// Records `first..=last` (clamped to the database) with their move
-    /// records, read in two large reads, for scanning many games.
-    pub fn batch(&self, first: u32, last: u32) -> Result<Batch<'_>> {
-        let first = first.max(1);
-        let last = last.min(self.records);
+    /// Records `first..=last`, clamped to the database and to
+    /// [`MAX_BATCH_RECORDS`] records, in one read. Each carries its id; fewer
+    /// records than asked may come back.
+    pub fn records(&self, first: u32, last: u32) -> Result<Vec<Record>> {
+        let (first, last) = self.clamp(first, last);
         if first > last {
-            return Ok(Batch { db: self, first, headers: Vec::new(), span_at: 0, span: Vec::new() });
+            return Ok(Vec::new());
+        }
+        let headers = self.read_headers(first, last)?;
+        Ok(headers
+            .as_chunks::<HEADER_RECORD_SIZE>()
+            .0
+            .iter()
+            .zip(first..)
+            .map(|(b, id)| Record { id, b: *b })
+            .collect())
+    }
+
+    /// Records `first..=last`, clamped to the database and to
+    /// [`MAX_BATCH_RECORDS`] records, with their move records, read in two
+    /// large reads, for scanning many games. [`Batch::ids`] gives the ids read.
+    pub fn batch(&self, first: u32, last: u32) -> Result<Batch<'_>> {
+        let (first, last) = self.clamp(first, last);
+        if first > last {
+            return Ok(Batch { db: self, first, last, headers: Vec::new(), span_at: 0, span: Vec::new() });
         }
         // One record past the batch, when there is one: its move record starts
         // where the batch's last one ends, since move records are stored back
         // to back in id order.
         let upto = last.saturating_add(1).min(self.records);
-        let count = (upto - first + 1) as usize;
-        let headers = self.headers.read(u64::from(first) * HEADER_RECORD_SIZE as u64, count * HEADER_RECORD_SIZE)?;
+        let headers = self.read_headers(first, upto)?;
         let offsets: Vec<u64> = headers
             .as_chunks::<HEADER_RECORD_SIZE>()
             .0
@@ -238,7 +258,21 @@ impl Database {
         } else {
             Vec::new()
         };
-        Ok(Batch { db: self, first, headers, span_at, span })
+        Ok(Batch { db: self, first, last, headers, span_at, span })
+    }
+
+    /// `first..=last` within the database and at most [`MAX_BATCH_RECORDS`]
+    /// long; empty when `first > last`, with `first` at least 1.
+    fn clamp(&self, first: u32, last: u32) -> (u32, u32) {
+        let first = first.max(1);
+        (first, last.min(self.records).min(first.saturating_add(MAX_BATCH_RECORDS - 1)))
+    }
+
+    /// The header records `first..=last`, at most [`MAX_BATCH_RECORDS`] + 1.
+    fn read_headers(&self, first: u32, last: u32) -> Result<Vec<u8>> {
+        let count = (last - first + 1) as usize;
+        debug_assert!(count <= MAX_BATCH_RECORDS as usize + 1);
+        self.headers.read(u64::from(first) * HEADER_RECORD_SIZE as u64, count * HEADER_RECORD_SIZE)
     }
 }
 
@@ -246,6 +280,7 @@ impl Database {
 pub struct Batch<'db> {
     db: &'db Database,
     first: u32,
+    last: u32,
     /// The records of the batch, and possibly the one after it.
     headers: Vec<u8>,
     span_at: u64,
@@ -255,9 +290,7 @@ pub struct Batch<'db> {
 impl<'db> Batch<'db> {
     /// The ids the batch covers.
     pub fn ids(&self) -> RangeInclusive<u32> {
-        let n = (self.headers.len() / HEADER_RECORD_SIZE) as u32;
-        let last = (self.first + n.saturating_sub(1)).min(self.db.records);
-        self.first..=if n == 0 { self.first - 1 } else { last }
+        self.first..=self.last
     }
 
     pub fn record(&self, id: u32) -> Result<Record> {
@@ -764,44 +797,54 @@ impl Entities {
     }
 
     /// The record bytes after the length field, or `None` for an unused id or
-    /// one that cannot be read. One positional read of the container.
-    pub fn raw(&self, typ: usize, id: i64) -> Option<Vec<u8>> {
-        let (size, count, _) = *self.types.get(typ)?;
+    /// one past the end of the file as it was when opened. One positional read
+    /// of the container; a container inside that length that cannot be read
+    /// now, because the file was truncated or failed, is an error.
+    pub fn raw(&self, typ: usize, id: i64) -> Result<Option<Vec<u8>>> {
+        let Some(&(size, count, _)) = self.types.get(typ) else { return Ok(None) };
         if id < 0 || id >= count {
-            return None;
+            return Ok(None);
         }
-        let o = u64::try_from(id)
-            .ok()?
-            .checked_mul(self.block_size as u64)?
-            .checked_add(self.header_size as u64)?
-            .checked_add(self.container_offset[typ] as u64)?;
-        let want = (size as u64).min(self.len.checked_sub(o)?) as usize;
+        let Some(o) = u64::try_from(id)
+            .ok()
+            .and_then(|id| id.checked_mul(self.block_size as u64))
+            .and_then(|o| o.checked_add(self.header_size as u64))
+            .and_then(|o| o.checked_add(self.container_offset[typ] as u64))
+        else {
+            return Ok(None);
+        };
+        let want = (size as u64).min(self.len.saturating_sub(o)) as usize;
         if want < 4 {
-            return None;
+            return Ok(None);
         }
-        let mut buf = self.file.read(o, want).ok()?;
-        let n = usize::try_from(le_i32(&buf, 0)).ok()?;
-        if n == 0 || n.checked_add(4)? > want {
-            return None;
-        }
+        let mut buf = self.file.read(o, want)?;
+        let Some(n) = usize::try_from(le_i32(&buf, 0)).ok().filter(|&n| n != 0 && n <= want - 4) else {
+            return Ok(None);
+        };
         buf.truncate(4 + n);
         buf.drain(..4);
-        Some(buf)
+        Ok(Some(buf))
     }
 
-    pub fn player(&self, id: i64) -> Option<Player> {
-        let r = self.raw(PLAYER, id)?;
-        let mut c = Cursor(&r, 0);
-        Some(Player { last: c.string()?, first: c.string()? })
+    /// The player `id`, or `None` for an unused or unreadable entry; errors
+    /// as for [`Entities::raw`].
+    pub fn player(&self, id: i64) -> Result<Option<Player>> {
+        Ok(self.raw(PLAYER, id)?.and_then(|r| {
+            let mut c = Cursor(&r, 0);
+            Some(Player { last: c.string()?, first: c.string()? })
+        }))
     }
 
-    pub fn tournament(&self, id: i64) -> Option<Tournament> {
-        let r = self.raw(TOURNAMENT, id)?;
-        let mut c = Cursor(&r, 0);
-        let place = c.string()?;
-        let title = c.string()?;
-        let start = Date(c.i32()?);
-        Some(Tournament { title, place, start })
+    /// The tournament `id`, or `None` for an unused or unreadable entry;
+    /// errors as for [`Entities::raw`].
+    pub fn tournament(&self, id: i64) -> Result<Option<Tournament>> {
+        Ok(self.raw(TOURNAMENT, id)?.and_then(|r| {
+            let mut c = Cursor(&r, 0);
+            let place = c.string()?;
+            let title = c.string()?;
+            let start = Date(c.i32()?);
+            Some(Tournament { title, place, start })
+        }))
     }
 }
 

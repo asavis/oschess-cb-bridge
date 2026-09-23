@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use cbformat::movetable::{self, Captured, Color, MoveWord, Piece};
-use cbformat::v2::{Database, Token, checksum};
+use cbformat::v2::{Database, MAX_BATCH_RECORDS, Token, checksum};
 
 struct Fixture {
     dir: PathBuf,
@@ -120,9 +120,59 @@ fn batches_read_what_single_reads_read() {
                 assert_eq!(got, tokens(&db, id), "moves of {id}, batch size {size}");
                 assert_eq!(got.len(), (id % 7) as usize + 1);
             }
+            assert_eq!(batch.ids(), first..=(first + size - 1).min(300), "batch size {size}");
             first = batch.ids().end() + 1;
         }
     }
+}
+
+#[test]
+fn batch_ids_are_the_ids_asked_for() {
+    let f = fixture(4, 0);
+    let db = Database::open(f.dir.join("db")).unwrap();
+    // The batch reads one record past its end to bound its moves; that record
+    // is not one of its ids.
+    assert_eq!(db.batch(1, 1).unwrap().ids(), 1..=1);
+    let ids: Vec<u32> = [(1, 2), (3, 4)].iter().flat_map(|&(a, b)| db.batch(a, b).unwrap().ids()).collect();
+    assert_eq!(ids, [1, 2, 3, 4]);
+    let batch = db.batch(1, 2).unwrap();
+    assert_eq!(batch.record(3).unwrap().bytes(), db.record(3).unwrap().bytes());
+}
+
+#[test]
+fn record_runs_and_batches_are_bounded() {
+    let games = MAX_BATCH_RECORDS + 10;
+    let f = fixture(games, 0);
+    let db = Database::open(f.dir.join("db")).unwrap();
+    let batch = db.batch(1, u32::MAX).unwrap();
+    assert_eq!(batch.ids(), 1..=MAX_BATCH_RECORDS);
+    let last = batch.record(MAX_BATCH_RECORDS).unwrap();
+    assert_eq!(
+        tokens(&db, MAX_BATCH_RECORDS),
+        batch.moves_of(&last).unwrap().moves().unwrap().tokens().collect::<Vec<_>>()
+    );
+    let records = db.records(1, u32::MAX).unwrap();
+    assert_eq!(records.len(), MAX_BATCH_RECORDS as usize);
+    let tail = db.records(MAX_BATCH_RECORDS + 1, u32::MAX).unwrap();
+    assert_eq!(tail.iter().map(|r| r.id()).collect::<Vec<_>>(), (MAX_BATCH_RECORDS + 1..=games).collect::<Vec<_>>());
+    for r in records.iter().chain(&tail).step_by(997) {
+        assert_eq!(r.bytes(), db.record(r.id()).unwrap().bytes(), "record {}", r.id());
+    }
+    assert!(db.records(games + 1, u32::MAX).unwrap().is_empty());
+    assert!(db.records(5, 4).unwrap().is_empty());
+}
+
+#[test]
+fn a_header_file_truncated_after_opening_is_an_error() {
+    // Each test's fixture has its own game count, which names its directory.
+    let f = fixture(21, 0);
+    let db = Database::open(f.dir.join("db")).unwrap();
+    assert_eq!(db.records(1, 21).unwrap().len(), 21);
+    std::fs::OpenOptions::new().write(true).open(f.dir.join("db.2cbh")).unwrap().set_len(2 * 192).unwrap();
+    assert!(db.records(1, 21).is_err());
+    assert!(db.batch(1, 21).is_err());
+    assert!(db.record(2).is_err());
+    assert!(db.record(1).is_ok());
 }
 
 #[test]

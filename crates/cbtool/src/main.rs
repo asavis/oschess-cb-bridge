@@ -225,7 +225,7 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
 
 /// Refuses an output path that is one of the database's own files, by name or
 /// through any alias such as a hard link: creating it would truncate the input
-/// while it is memory-mapped.
+/// while it is being read.
 fn refuse_database_file(out: &Path, db: &Database) -> AnyResult<()> {
     if !out.exists() {
         return Ok(());
@@ -251,7 +251,7 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
         }
     }
     if ids.is_empty() {
-        ids = (1..=db.record_count()).filter(|&id| db.record(id).is_ok_and(|r| r.kind() == RecordKind::Game)).collect();
+        ids = game_ids(&db)?;
     }
     let sink: Box<dyn Write + Send> = match out_path {
         Some(p) => {
@@ -264,6 +264,22 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     let ok = export_in_order(&ids, threads(), &|id, r| r.game(&db, id), &mut w)?;
     w.flush()?;
     Ok(ok)
+}
+
+/// The id of every game, from headers read [`cbformat::v2::MAX_BATCH_RECORDS`]
+/// at a time. A failed read fails the export: a database damaged or truncated
+/// under it must not give a silently incomplete one.
+fn game_ids(db: &Database) -> cbformat::Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    let mut first = 1;
+    loop {
+        let records = db.records(first, db.record_count())?;
+        let Some(last) = records.last() else { break };
+        ids.extend(records.iter().filter(|r| r.kind() == RecordKind::Game).map(|r| r.id()));
+        let Some(next) = last.id().checked_add(1) else { break };
+        first = next;
+    }
+    Ok(ids)
 }
 
 /// Games per task, and the rendered text a task may hold before its turn to
