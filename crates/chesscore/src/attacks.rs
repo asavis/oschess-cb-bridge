@@ -88,8 +88,49 @@ static BETWEEN: [[Bitboard; 64]; 64] = {
     t
 };
 
+/// The direction from one square to another on a common line, or `NO_LINE`.
+static DIRECTION: [[u8; 64]; 64] = {
+    let mut t = [[NO_LINE; 64]; 64];
+    let mut from = 0;
+    while from < 64 {
+        let mut d = 0;
+        while d < 8 {
+            let (mut f, mut r) = ((from % 8) as i8, (from / 8) as i8);
+            loop {
+                f += DIRECTIONS[d].0;
+                r += DIRECTIONS[d].1;
+                if f < 0 || f >= 8 || r < 0 || r >= 8 {
+                    break;
+                }
+                t[from][(r * 8 + f) as usize] = d as u8;
+            }
+            d += 1;
+        }
+        from += 1;
+    }
+    t
+};
+const NO_LINE: u8 = 8;
+
+/// The direction (0-7) from `a` to `b` when they share a rank, file or
+/// diagonal.
 #[inline]
-fn ray(d: usize, sq: Square, occupied: Bitboard) -> Bitboard {
+pub(crate) fn direction(a: Square, b: Square) -> Option<usize> {
+    let d = DIRECTION[a.index()][b.index()];
+    (d != NO_LINE).then_some(d as usize)
+}
+
+/// Whether a slider moving in direction `d` is a rook-like mover (the first
+/// four directions alternate: N, NE, E, NW; S, SW, W, SE).
+#[inline]
+pub(crate) fn is_straight(d: usize) -> bool {
+    matches!(d, N | E | S | W)
+}
+
+/// The squares from `sq` in direction `d` up to and including the first
+/// occupied one.
+#[inline]
+pub(crate) fn ray(d: usize, sq: Square, occupied: Bitboard) -> Bitboard {
     let r = RAYS[d][sq.index()];
     let blockers = r & occupied;
     if blockers == 0 {
@@ -171,6 +212,18 @@ mod tests {
         assert_eq!(rook(sq("a1"), 0).count_ones(), 14);
         assert_eq!(bishop(sq("a1"), 0).count_ones(), 7);
         assert_eq!(queen(sq("d4"), 0).count_ones(), 27);
+    }
+
+    #[test]
+    fn directions() {
+        assert_eq!(direction(sq("e1"), sq("e8")), Some(N));
+        assert_eq!(direction(sq("e1"), sq("a5")), Some(NW));
+        assert_eq!(direction(sq("h8"), sq("a1")), Some(SW));
+        assert_eq!(direction(sq("a1"), sq("b3")), None);
+        assert_eq!(direction(sq("d4"), sq("d4")), None);
+        assert!(is_straight(W) && !is_straight(SE));
+        let occ = sq("e5").bit() | sq("e7").bit();
+        assert_eq!(names(ray(N, sq("e1"), occ)), ["e2", "e3", "e4", "e5"]);
     }
 
     #[test]

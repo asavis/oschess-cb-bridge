@@ -211,6 +211,36 @@ fn fen_round_trips() {
 }
 
 #[test]
+fn x_fen_names_a_castling_rook_that_is_not_the_outermost() {
+    // The f1 rook has the right although h1 holds a rook farther out.
+    let fen = "4k3/8/8/8/8/8/8/4KR1R w F - 0 1";
+    let b = board(fen);
+    assert_eq!(b.to_string(), fen);
+    assert_eq!(b.shredder_fen(), fen);
+    assert!(b.is_legal(mv("e1f1")));
+    assert!(board(&b.to_string()).is_legal(mv("e1f1")));
+    // The outermost rook is still written with a letter.
+    assert_eq!(board("4k3/8/8/8/8/8/8/R3KR1R w HA - 0 1").to_string(), "4k3/8/8/8/8/8/8/R3KR1R w KQ - 0 1");
+}
+
+#[test]
+fn malformed_fen_is_refused() {
+    let syntax = |fen: &str| matches!(Board::from_fen(fen), Err(FenError::Syntax(_)));
+    // En passant square on the wrong rank for the side to move.
+    for fen in
+        ["4k3/8/8/3pP3/8/8/8/4K3 w - d1 0 2", "4k3/8/8/3pP3/8/8/8/4K3 w - d3 0 2", "4k3/8/8/8/3Pp3/8/8/4K3 b - d6 0 2"]
+    {
+        assert!(syntax(fen), "{fen}");
+    }
+    assert!(board("4k3/8/8/8/3Pp3/8/8/4K3 b - d3 0 2").is_legal(mv("e4d3")));
+    // Oversized input is refused without being collected.
+    assert!(syntax(&"x ".repeat(4_000_000)));
+    assert!(syntax(&format!("{} w - -", "/".repeat(4_000_000))));
+    assert!(syntax(&format!("4k3/8/8/8/8/8/8/R3K2R w {} - 0 1", "K".repeat(1_000_000))));
+    assert!(syntax("4k3/8/8/8/8/8/8/4K3 w - - 0 1 extra"));
+}
+
+#[test]
 fn chess960_start_positions() {
     let standard = Board::chess960(518).unwrap();
     assert_eq!(standard.to_string(), Board::startpos().to_string());

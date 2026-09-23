@@ -52,15 +52,21 @@ fn cozy_perft(b: &cozy_chess::Board, depth: u32) -> u64 {
 
 /// Compares everything observable about one position.
 fn same_position(ours_b: &Board, cozy: &cozy_chess::Board, context: &str) {
+    // Shredder-FEN names every castling rook by its file on both sides.
     // cozy-chess stops the halfmove clock at 100; FEN does not, and neither
     // does chesscore. Compare it clamped and everything else exactly.
-    let fen = ours_b.to_string();
+    let fen = ours_b.shredder_fen();
     let (rest, full) = fen.rsplit_once(' ').unwrap();
     let (rest, half) = rest.rsplit_once(' ').unwrap();
     let clamped = format!("{rest} {} {full}", half.parse::<u16>().unwrap().min(100));
-    assert_eq!(clamped, cozy.to_string(), "FEN, {context}");
+    assert_eq!(clamped, format!("{cozy:#}"), "FEN, {context}");
+    // Our own FEN reads back to the same position.
+    let reread = Board::from_fen(&ours_b.fen()).unwrap_or_else(|e| panic!("{e}: {}, {context}", ours_b.fen()));
+    assert_eq!(reread.shredder_fen(), ours_b.shredder_fen(), "FEN round trip, {context}");
     assert_eq!(ours(ours_b), theirs(cozy), "legal moves, {context}");
     assert_eq!(ours_b.in_check(), !cozy.checkers().is_empty(), "check, {context}");
+    // The same squares: both number them a1 = 0, rank by rank.
+    assert_eq!(ours_b.checkers(), cozy.checkers().0, "checkers, {context}");
     assert_eq!(ours_b.hash(), ours_b.hash_from_scratch(), "incremental hash, {context}");
 }
 

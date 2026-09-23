@@ -35,12 +35,19 @@ impl Board {
     /// The halfmove clock and move number may be left out. A position whose
     /// castling needs Chess960 rules is marked as Chess960.
     pub fn from_fen(fen: &str) -> Result<Board, FenError> {
-        let fields: Vec<&str> = fen.split_whitespace().collect();
+        // Take at most one token past each limit, so no input can make the
+        // parser allocate more than a FEN needs.
+        let fields: Vec<&str> = fen.split_whitespace().take(7).collect();
         if !(4..=6).contains(&fields.len()) {
-            return Err(syntax(format!("{} fields", fields.len())));
+            return Err(syntax("a FEN has 4 to 6 fields"));
+        }
+        // The longest valid placement is 8 ranks of 8 pieces and 7 slashes, and
+        // the longest castling field names four rooks.
+        if fields[0].len() > 71 || fields[2].len() > 4 {
+            return Err(syntax("field too long"));
         }
         let mut b = BoardBuilder::empty();
-        let ranks: Vec<&str> = fields[0].split('/').collect();
+        let ranks: Vec<&str> = fields[0].split('/').take(9).collect();
         if ranks.len() != 8 {
             return Err(syntax("placement needs 8 ranks"));
         }
@@ -100,7 +107,14 @@ impl Board {
         }
         b.en_passant_file = match fields[3] {
             "-" => None,
-            s => Some(s.parse::<Square>().map_err(FenError::Syntax)?.file()),
+            s => {
+                let sq = s.parse::<Square>().map_err(FenError::Syntax)?;
+                let rank = if b.side_to_move == Color::White { 5 } else { 2 };
+                if sq.rank() != rank {
+                    return Err(syntax(format!("en passant square {s} is on the wrong rank")));
+                }
+                Some(sq.file())
+            }
         };
         let number = |i: usize, default: u16| match fields.get(i) {
             None => Ok(default),
@@ -112,7 +126,8 @@ impl Board {
         b.build().map_err(FenError::Setup)
     }
 
-    /// FEN, with castling written `KQkq`.
+    /// FEN, with castling in X-FEN: `KQkq` for the outermost rook on each
+    /// side, the rook's file otherwise.
     pub fn fen(&self) -> String {
         self.to_string()
     }
@@ -136,6 +151,17 @@ fn needs_chess960(b: &BoardBuilder) -> bool {
             || rights[CastleSide::Short as usize].is_some_and(|f| f != 7)
             || rights[CastleSide::Long as usize].is_some_and(|f| f != 0)
     })
+}
+
+/// Whether no other rook of `color` stands farther out on the back rank, on
+/// the `side` of the king, than the rook on `file`.
+fn is_outermost_rook(b: &Board, color: Color, side: CastleSide, file: u8) -> bool {
+    let back = color.back_rank();
+    let rook_on = |f: u8| b.piece_at(Square::new(f, back)) == Some((Piece::Rook, color));
+    match side {
+        CastleSide::Short => (file + 1..8).all(|f| !rook_on(f)),
+        CastleSide::Long => (0..file).all(|f| !rook_on(f)),
+    }
 }
 
 fn write_fen(b: &Board, f: &mut impl fmt::Write, shredder: bool) -> fmt::Result {
@@ -166,7 +192,9 @@ fn write_fen(b: &Board, f: &mut impl fmt::Write, shredder: bool) -> fmt::Result 
     for color in Color::ALL {
         for side in CastleSide::ALL {
             if let Some(file) = b.castling_rook(color, side) {
-                let c = if shredder {
+                // X-FEN: `k`/`q` name the outermost rook on that side of the
+                // king; any other rook is named by its file.
+                let c = if shredder || !is_outermost_rook(b, color, side, file) {
                     (b'a' + file) as char
                 } else if side == CastleSide::Short {
                     'k'

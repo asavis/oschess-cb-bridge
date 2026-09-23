@@ -87,6 +87,9 @@ pub struct Board {
     /// The Polyglot key without its en passant part, which depends on whether
     /// a capture is possible and is added by [`Board::hash`].
     key: u64,
+    /// The pieces giving check to the side to move, kept up to date by every
+    /// move so that legality needs no full attack scan.
+    checkers: Bitboard,
     chess960: bool,
 }
 
@@ -115,6 +118,7 @@ impl Board {
             halfmove: 0,
             fullmove: 1,
             key: KEYS[TURN],
+            checkers: 0,
             chess960: false,
         }
     }
@@ -272,12 +276,17 @@ impl Board {
     /// The pieces giving check to the side to move.
     #[inline]
     pub fn checkers(&self) -> Bitboard {
-        self.attackers_to(self.king(self.side), self.occupied()) & self.colors(!self.side)
+        self.checkers
     }
 
     #[inline]
     pub fn in_check(&self) -> bool {
-        self.is_attacked(self.king(self.side), !self.side, self.occupied())
+        self.checkers != 0
+    }
+
+    /// Recomputes the checkers from scratch, for constructors.
+    pub(crate) fn refresh_checkers(&mut self) {
+        self.checkers = self.attackers_to(self.king(self.side), self.occupied()) & self.colors(!self.side);
     }
 
     // ----------------------------------------------------------- mutation
@@ -335,6 +344,9 @@ impl Board {
         self.ep_file = None;
         self.halfmove = self.halfmove.saturating_add(1);
         let back = us.back_rank();
+        // Castling and en passant move or remove a second piece, so the
+        // checkers they give are recomputed in full.
+        let mut recompute_checkers = false;
 
         if piece == Piece::King && self.colors(us) & mv.to.bit() != 0 {
             // Castling: the king takes its own rook.
@@ -346,6 +358,7 @@ impl Board {
             self.put(Square::new(rook_file, back), Piece::Rook, us);
             self.set_castling(us, CastleSide::Short, None);
             self.set_castling(us, CastleSide::Long, None);
+            recompute_checkers = true;
         } else {
             let victim = self.piece_at(mv.to);
             if let Some((v, c)) = victim {
@@ -363,6 +376,7 @@ impl Board {
                     if self.colored(Piece::Pawn, them) & taken.bit() != 0 {
                         self.remove(taken, Piece::Pawn, them);
                     }
+                    recompute_checkers = true;
                 }
                 if mv.from.rank().abs_diff(mv.to.rank()) == 2 {
                     self.ep_file = Some(mv.from.file());
@@ -384,6 +398,37 @@ impl Board {
         }
         self.side = them;
         self.key ^= KEYS[TURN];
+
+        if recompute_checkers {
+            self.refresh_checkers();
+            return;
+        }
+        // A check now comes from the moved piece itself, or from a slider of
+        // ours the vacated square was blocking.
+        let king = self.king(them);
+        let occupied = self.occupied();
+        let landed = mv.promotion.unwrap_or(piece);
+        let direct = match landed {
+            Piece::Pawn => attacks::pawn(us, mv.to),
+            Piece::Knight => attacks::knight(mv.to),
+            Piece::Bishop => attacks::bishop(mv.to, occupied),
+            Piece::Rook => attacks::rook(mv.to, occupied),
+            Piece::Queen => attacks::queen(mv.to, occupied),
+            Piece::King => 0,
+        };
+        let mut checkers = if direct & king.bit() != 0 { mv.to.bit() } else { 0 };
+        if let Some(d) = attacks::direction(king, mv.from) {
+            checkers |= attacks::ray(d, king, occupied) & self.sliders(d) & self.colors(us);
+        }
+        self.checkers = checkers;
+    }
+
+    /// The pieces that attack along direction `d`: rooks and queens on ranks
+    /// and files, bishops and queens on diagonals.
+    #[inline]
+    fn sliders(&self, d: usize) -> Bitboard {
+        let line = if attacks::is_straight(d) { self.pieces(Piece::Rook) } else { self.pieces(Piece::Bishop) };
+        line | self.pieces(Piece::Queen)
     }
 
     fn drop_castling_rook(&mut self, color: Color, file: u8) {
@@ -394,10 +439,37 @@ impl Board {
         }
     }
 
-    /// Checks that `mv` is legal and plays it. On error the position is
-    /// unspecified and must be discarded; checking first and playing after
-    /// would cost a copy of the board per move.
+    /// Checks that `mv` is legal and plays it. Only en passant and castling are
+    /// confirmed after they are played; on that error the position is
+    /// unspecified and must be discarded. Checking every move on a copy would
+    /// cost a copy of the board per move.
     pub fn play_checked(&mut self, mv: Move) -> Result<(), IllegalMove> {
+        let verdict = self.check(mv)?;
+        let us = self.side;
+        self.play_unchecked(mv);
+        match verdict {
+            Verdict::Legal => Ok(()),
+            Verdict::IfKingSafe(error) if self.is_attacked(self.king(us), !us, self.occupied()) => Err(error),
+            Verdict::IfKingSafe(_) => Ok(()),
+        }
+    }
+
+    /// Whether `mv` is legal. Copies the board only for en passant and castling.
+    pub fn is_legal(&self, mv: Move) -> bool {
+        match self.check(mv) {
+            Err(_) => false,
+            Ok(Verdict::Legal) => true,
+            Ok(Verdict::IfKingSafe(_)) => {
+                let us = self.side;
+                let mut b = self.clone();
+                b.play_unchecked(mv);
+                !b.is_attacked(b.king(us), !us, b.occupied())
+            }
+        }
+    }
+
+    /// Everything about `mv` that can be decided without playing it.
+    fn check(&self, mv: Move) -> Result<Verdict, IllegalMove> {
         let us = self.side;
         let them = !us;
         let piece = match self.piece_at(mv.from) {
@@ -408,7 +480,9 @@ impl Board {
             if mv.promotion.is_some() {
                 return Err(IllegalMove::Promotion);
             }
-            return self.castle_checked(mv);
+            self.check_castling(mv)?;
+            // The castling rook may have been shielding the king's destination.
+            return Ok(Verdict::IfKingSafe(IllegalMove::Castling));
         }
         if (self.colors(us) | self.pieces(Piece::King)) & mv.to.bit() != 0 {
             return Err(IllegalMove::Occupied);
@@ -428,11 +502,38 @@ impl Board {
         if piece != Piece::Pawn && mv.promotion.is_some() {
             return Err(IllegalMove::Promotion);
         }
-        self.play_unchecked(mv);
-        if self.is_attacked(self.king(us), them, self.occupied()) {
-            return Err(IllegalMove::LeavesKingInCheck);
+        if piece == Piece::King {
+            // The king is lifted so it cannot shield the square it moves to.
+            if self.is_attacked(mv.to, them, occupied & !mv.from.bit()) {
+                return Err(IllegalMove::LeavesKingInCheck);
+            }
+            return Ok(Verdict::Legal);
         }
-        Ok(())
+        if piece == Piece::Pawn && mv.from.file() != mv.to.file() && self.colors(them) & mv.to.bit() == 0 {
+            // En passant empties two squares of the fifth rank at once.
+            return Ok(Verdict::IfKingSafe(IllegalMove::LeavesKingInCheck));
+        }
+        let king = self.king(us);
+        if self.checkers != 0 {
+            // Out of check only by taking the single checker or blocking it.
+            if self.checkers.count_ones() > 1 {
+                return Err(IllegalMove::LeavesKingInCheck);
+            }
+            let checker = Square::at(self.checkers.trailing_zeros());
+            if (checker.bit() | attacks::between(king, checker)) & mv.to.bit() == 0 {
+                return Err(IllegalMove::LeavesKingInCheck);
+            }
+        }
+        // A piece leaving the line between its king and an enemy slider.
+        if let Some(d) = attacks::direction(king, mv.from)
+            && attacks::direction(king, mv.to) != Some(d)
+        {
+            let after = (occupied & !mv.from.bit()) | mv.to.bit();
+            if attacks::ray(d, king, after) & self.sliders(d) & self.colors(them) != 0 {
+                return Err(IllegalMove::LeavesKingInCheck);
+            }
+        }
+        Ok(Verdict::Legal)
     }
 
     /// Whether a pawn move reaches its destination, checking its promotion.
@@ -470,7 +571,9 @@ impl Board {
         Ok(self.en_passant() == Some(mv.to))
     }
 
-    fn castle_checked(&mut self, mv: Move) -> Result<(), IllegalMove> {
+    /// The castling conditions that hold before the move: the right, an empty
+    /// path, and no attacked square from the king's start to its destination.
+    fn check_castling(&self, mv: Move) -> Result<(), IllegalMove> {
         let us = self.side;
         let them = !us;
         let back = us.back_rank();
@@ -502,17 +605,7 @@ impl Board {
         if squares(path).any(|sq| self.is_attacked(sq, them, without_king)) {
             return Err(IllegalMove::Castling);
         }
-        self.play_unchecked(mv);
-        // The rook may have been shielding the king's destination.
-        if self.is_attacked(self.king(us), them, self.occupied()) {
-            return Err(IllegalMove::Castling);
-        }
         Ok(())
-    }
-
-    /// Whether `mv` is legal. Costs a copy of the board.
-    pub fn is_legal(&self, mv: Move) -> bool {
-        self.clone().play_checked(mv).is_ok()
     }
 
     /// The position after passing the move, or `None` when in check.
@@ -528,6 +621,9 @@ impl Board {
         }
         b.side = !b.side;
         b.key ^= KEYS[TURN];
+        // The side that passed was not in check, and the side not to move
+        // never is, so neither side is now.
+        b.checkers = 0;
         Some(b)
     }
 
@@ -555,6 +651,14 @@ impl Board {
         }
         key
     }
+}
+
+/// What [`Board::check`] could decide before a move is played.
+enum Verdict {
+    Legal,
+    /// Legal if the mover's king is not attacked once it is played; otherwise
+    /// the error given.
+    IfKingSafe(IllegalMove),
 }
 
 impl fmt::Debug for Board {

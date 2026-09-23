@@ -138,6 +138,7 @@ impl BoardBuilder {
         b.set_ep_file(self.en_passant_file);
         b.set_clocks(self.halfmove_clock, self.fullmove_number);
         b.set_chess960(self.chess960);
+        b.refresh_checkers();
         Ok(b)
     }
 }
