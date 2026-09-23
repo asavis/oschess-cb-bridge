@@ -11,11 +11,31 @@ use cbformat::v2::Database;
 
 const DOC: &str = include_str!("../../../docs/search-grammar.md");
 
-/// The non-blank lines of the fenced block tagged `tag`.
+/// The non-blank lines of the document's fenced block tagged `tag`.
 fn block(tag: &str) -> Vec<&'static str> {
-    let start = DOC.find(&format!("```{tag}\n")).unwrap_or_else(|| panic!("no {tag} block")) + tag.len() + 4;
-    let end = start + DOC[start..].find("```").unwrap();
-    DOC[start..end].lines().filter(|l| !l.trim().is_empty()).collect()
+    block_in(DOC, tag)
+}
+
+/// The non-blank lines of `doc`'s fenced block tagged `tag`, with `\n` or
+/// `\r\n` line ends: a Windows checkout may convert them.
+fn block_in<'a>(doc: &'a str, tag: &str) -> Vec<&'a str> {
+    let fence = format!("```{tag}");
+    let open = doc
+        .match_indices(&fence)
+        .map(|(at, _)| at + fence.len())
+        .find(|&end| doc[end..].starts_with('\n') || doc[end..].starts_with("\r\n"))
+        .unwrap_or_else(|| panic!("no {tag} block"));
+    let start = open + doc[open..].find('\n').unwrap() + 1;
+    let end = start + doc[start..].find("```").unwrap();
+    doc[start..end].lines().filter(|l| !l.trim().is_empty()).collect()
+}
+
+#[test]
+fn blocks_read_the_same_with_crlf_line_ends() {
+    let crlf = DOC.replace('\n', "\r\n");
+    for tag in ["fixture", "corpus"] {
+        assert_eq!(block_in(&crlf, tag), block(tag), "{tag}");
+    }
 }
 
 /// Entity ids by name, in order of first use; id 0 is the empty name.
@@ -164,7 +184,7 @@ fn fixture(name: &str, extra: &[&str]) -> TempDb {
 }
 
 fn numbers(db: &Database, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
-    match search::select(db, idx, q, None) {
+    match search::select(db, idx, Some(q), None, None) {
         Ok((Selection::All { descending }, _)) => {
             let all = 1..=db.record_count();
             Ok(if descending { all.rev().collect() } else { all.collect() })
@@ -203,12 +223,13 @@ fn results_are_cached_and_the_url_sort_wins() {
     let f = fixture("search-cache", &[]);
     let db = Database::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
-    let first = search::select(&db, &idx, "player:morphy sort:white", None).ok().unwrap();
-    let again = search::select(&db, &idx, "player:morphy sort:white", None).ok().unwrap();
+    let first = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
+    let again = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
     let (Selection::Numbers(a), Selection::Numbers(b)) = (first.0, again.0) else { panic!("numbers expected") };
     assert!(std::sync::Arc::ptr_eq(&a, &b), "the second request reuses the first result");
     // The URL's sort wins over the query's token.
-    let by_param = search::select(&db, &idx, "player:morphy sort:white", search::query::Sort::parse("number-desc"));
+    let by_param =
+        search::select(&db, &idx, Some("player:morphy sort:white"), None, search::query::Sort::parse("number-desc"));
     let Ok((Selection::Numbers(v), sort)) = by_param else { panic!("numbers expected") };
     assert_eq!((v.as_slice(), sort.name().as_str()), (&[9, 3, 2, 1][..], "number-desc"));
 }
@@ -219,10 +240,9 @@ fn suggestions_by_prefix_and_count() {
     let db = Database::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let s = |field, prefix: &str| -> HashMap<String, u32> {
-        search::suggest(&db, &idx, field, prefix, 20).unwrap().into_iter().collect()
+        suggested(&db, &idx, field, prefix, 20).unwrap().into_iter().collect()
     };
-    let ordered =
-        |field, prefix: &str| -> Vec<(String, u32)> { search::suggest(&db, &idx, field, prefix, 20).unwrap() };
+    let ordered = |field, prefix: &str| -> Vec<(String, u32)> { suggested(&db, &idx, field, prefix, 20).unwrap() };
     assert_eq!(ordered(SuggestField::Player, "m"), [("Morphy, Paul".to_string(), 4), ("Tal, Mikhail".to_string(), 2)]);
     assert_eq!(ordered(SuggestField::Player, "LA"), [("Lasker, Emanuel".to_string(), 4)]);
     assert_eq!(s(SuggestField::Player, "mik").get("Tal, Mikhail"), Some(&2));
@@ -235,7 +255,7 @@ fn suggestions_by_prefix_and_count() {
     assert_eq!(ordered(SuggestField::Event, "st"), [("St Petersburg".to_string(), 3)]);
     let all = ordered(SuggestField::Player, "a");
     assert_eq!(all, [("Anderssen, Adolf".to_string(), 3)]);
-    assert_eq!(search::suggest(&db, &idx, SuggestField::Event, "", 1).unwrap().len(), 1, "limit applies");
+    assert_eq!(suggested(&db, &idx, SuggestField::Event, "", 1).unwrap().len(), 1, "limit applies");
 }
 
 /// Guiding texts and analyses have header layouts of their own: they are found
@@ -262,9 +282,20 @@ fn texts_and_analyses_by_their_own_layout() {
     assert_eq!(q("sort:annotator")[7..], [3, 5, 12, 10, 11], "authors sort as annotators");
     assert_eq!(q("sort:white")[..3], [8, 11, 12], "no other key: first ascending, by number");
     // Neither is counted for suggestions.
-    let annotators = search::suggest(&db, &idx, SuggestField::Annotator, "t", 20).unwrap();
+    let annotators = suggested(&db, &idx, SuggestField::Annotator, "t", 20).unwrap();
     assert_eq!(annotators, [("Tal, Mikhail".to_string(), 1)]);
-    assert!(search::suggest(&db, &idx, SuggestField::Event, "aaa", 20).unwrap().is_empty());
+    assert!(suggested(&db, &idx, SuggestField::Event, "aaa", 20).unwrap().is_empty());
+}
+
+/// Suggestions as (name, games) pairs.
+fn suggested(
+    db: &Database,
+    idx: &Indexes,
+    field: SuggestField,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<(String, u32)>, SearchError> {
+    search::suggest(db, idx, field, prefix, limit).map(|list| list.iter().map(|s| (s.name.clone(), s.games)).collect())
 }
 
 type Edit<'a> = &'a dyn Fn(&mut [u8; 192]);
@@ -304,7 +335,7 @@ fn long_names_are_matched_and_suggested_in_full() {
     let idx = Indexes::default();
     assert_eq!(numbers(&db, &idx, "player:suffixa").unwrap(), [1]);
     assert_eq!(numbers(&db, &idx, "player:SuffixB").unwrap(), [2]);
-    assert_eq!(search::suggest(&db, &idx, SuggestField::Player, "éé", 20).unwrap(), [(a, 1), (b, 1)]);
+    assert_eq!(suggested(&db, &idx, SuggestField::Player, "éé", 20).unwrap(), [(a, 1), (b, 1)]);
 }
 
 /// ECO codes sort as shown: ChessBase's hidden sub-code does not order two
@@ -345,7 +376,7 @@ fn a_game_counts_once_per_name() {
     let db = Database::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     assert_eq!(numbers(&db, &idx, "player:same").unwrap(), [1]);
-    assert_eq!(search::suggest(&db, &idx, SuggestField::Player, "same", 20).unwrap(), [("Same, Person".into(), 1)]);
+    assert_eq!(suggested(&db, &idx, SuggestField::Player, "same", 20).unwrap(), [("Same, Person".into(), 1)]);
 }
 
 /// A database of `records` headers of which only the first is written: the
@@ -368,7 +399,10 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
     let db = Database::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let started = std::time::Instant::now();
-    assert!(matches!(search::select(&db, &idx, "", search::query::Sort::parse("date")), Err(SearchError::TooLarge)));
+    assert!(matches!(
+        search::select(&db, &idx, None, None, search::query::Sort::parse("date")),
+        Err(SearchError::TooLarge)
+    ));
     assert_eq!(idx.scanned(), 0, "not a record was read");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
@@ -385,13 +419,13 @@ fn a_newer_search_stops_the_older_one() {
     let idx = std::sync::Arc::new(Indexes::default());
     let (db1, idx1) = (db.clone(), idx.clone());
     let first = std::thread::spawn(move || {
-        let r = search::select(&db1, &idx1, "needle", None);
+        let r = search::select(&db1, &idx1, Some("needle"), Some("tab"), None);
         (r.map(|_| ()), std::time::Instant::now())
     });
     while idx.scanned() == 0 {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    let second = search::select(&db, &idx, "other", None);
+    let second = search::select(&db, &idx, Some("other"), Some("tab"), None);
     let second_done = std::time::Instant::now();
     let (first, first_done) = first.join().unwrap();
     assert!(matches!(first, Err(SearchError::Superseded)), "{first:?}");
@@ -399,4 +433,70 @@ fn a_newer_search_stops_the_older_one() {
     assert!(first_done <= second_done, "the first search stopped before the second finished");
     let first_read = idx.scanned() - RECORDS;
     assert!(first_read < RECORDS / 2, "the first search read {first_read} of {RECORDS} records");
+}
+
+/// Names sort ignoring case only: `alpha` and `ALPHA` are one key, so their
+/// games stay in number order in both directions.
+#[test]
+fn names_sort_ignoring_case() {
+    let white = |id: i64| move |r: &mut [u8; 192]| (set_i64(r, 0x18, id), set_i64(r, 0x20, -1)).1;
+    let (alpha, upper, zulu) = (white(0), white(1), white(2));
+    let f = raw_db("search-case", &["alpha", "ALPHA", "zulu"], &[&zulu, &alpha, &upper]);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    assert_eq!(sorted(&db, &idx, "white"), [2, 3, 1]);
+    assert_eq!(sorted(&db, &idx, "white-desc"), [1, 2, 3]);
+    // Suggestions still tell the two spellings apart.
+    let s = suggested(&db, &idx, SuggestField::Player, "alp", 20).unwrap();
+    assert_eq!(s, [("ALPHA".into(), 1), ("alpha".into(), 1)]);
+}
+
+/// Of many matching names only the best `limit` come back, in order: most
+/// games first, then by name.
+#[test]
+fn suggestions_keep_the_best_of_many() {
+    const NAMES: usize = 20_000;
+    let names: Vec<String> = (0..NAMES).map(|i| format!("a{i:06}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    // One game each, a second game for every 1,000th name.
+    let player = |i: usize| move |r: &mut [u8; 192]| (set_i64(r, 0x18, i as i64), set_i64(r, 0x20, i as i64)).1;
+    let edits: Vec<_> = (0..NAMES).chain((999..NAMES).step_by(1000)).map(player).collect();
+    let edits: Vec<Edit<'_>> = edits.iter().map(|e| e as Edit<'_>).collect();
+    let f = raw_db("search-top", &refs, &edits);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    let s = suggested(&db, &idx, SuggestField::Player, "a", 20).unwrap();
+    let want: Vec<(String, u32)> = (999..NAMES)
+        .step_by(1000)
+        .map(|i| (format!("a{i:06}"), 2))
+        .chain((0..).filter(|i| i % 1000 != 999).map(|i| (format!("a{i:06}"), 1)))
+        .take(20)
+        .collect();
+    assert_eq!(s, want);
+    assert_eq!(suggested(&db, &idx, SuggestField::Player, "a01", 3).unwrap().len(), 3);
+}
+
+/// A search started without a stream is never superseded; one in a stream
+/// is, by any later request with `q` in the same stream, an empty one too.
+#[cfg(unix)]
+#[test]
+fn only_the_same_stream_supersedes() {
+    const RECORDS: u64 = 8_000_000;
+    let f = sparse("search-streams", RECORDS);
+    let db = std::sync::Arc::new(Database::open(f.dir().join("db.2cbh")).unwrap());
+    let idx = std::sync::Arc::new(Indexes::default());
+    let run = |q: &'static str, stream: Option<&'static str>| {
+        let (db1, idx1) = (db.clone(), idx.clone());
+        let before = idx.scanned();
+        let running = std::thread::spawn(move || search::select(&db1, &idx1, Some(q), stream, None).map(|_| ()));
+        while idx.scanned() == before && !running.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        running
+    };
+    let named = run("needle", Some("tab"));
+    let unnamed = run("pin", None);
+    assert!(search::select(&db, &idx, Some(""), Some("tab"), None).is_ok(), "an empty q");
+    assert!(matches!(named.join().unwrap(), Err(SearchError::Superseded)));
+    assert!(unnamed.join().unwrap().is_ok());
 }

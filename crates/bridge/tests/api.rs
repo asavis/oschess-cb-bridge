@@ -761,7 +761,13 @@ fn search_sort_and_unsupported_qualifiers() {
     );
     let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix=mor", r.id), "");
     assert_eq!(s.status, 200, "{}", s.body);
-    assert!(s.body.contains(r#"{"field":"player","suggestions":[{"value":"Morphy, Paul","games":5}]}"#), "{}", s.body);
+    assert!(
+        s.body.contains(
+            r#"{"field":"player","suggestions":[{"value":"Morphy, Paul","label":"Morphy, Paul","games":5}]}"#
+        ),
+        "{}",
+        s.body
+    );
     for (q, parameter) in [
         ("?field=colour&prefix=m", "field"),
         ("?field=player&prefix=+", "prefix"),
@@ -784,4 +790,47 @@ fn a_changed_database_is_searched_afresh() {
         std::fs::copy(bigger.dir().join(f), db.dir().join(f)).unwrap();
     }
     assert_eq!(total(get(r.port, &path, "")), "5", "the kept result and sort order belong to the old generation");
+}
+
+/// Percent-encodes everything but unreserved characters, for a query value.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// A suggestion's `value` is the complete name, usable verbatim in a quoted
+/// qualifier, and its `label` is clipped for display: two names that share
+/// their first 215 characters are two values, each finding its own game. A
+/// name longer than a query value can hold is not offered.
+#[test]
+fn suggestions_carry_the_complete_value_and_a_clipped_label() {
+    let prefix = "é".repeat(210);
+    let (a, b, long) = (format!("{prefix}TailA"), format!("{prefix}TailB"), format!("{prefix}{}", "x".repeat(60)));
+    let mut builder = Builder::new();
+    let e4 = builder.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for id in 0..3i64 {
+        let g = builder.game(e4);
+        g[0x18..0x20].copy_from_slice(&id.to_le_bytes());
+        g[0x20..0x28].copy_from_slice(&id.to_le_bytes());
+    }
+    let players: Vec<(usize, usize, Vec<u8>)> =
+        [&a, &b, &long].iter().enumerate().map(|(id, name)| (0, id, strings(&[name, ""]))).collect();
+    builder.lid(lid_with(1024, 3, &players));
+    let db = builder.write("api-suggest-long");
+    let r = start(&db, vec![], None);
+    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix={}", r.id, encode("éé")), "");
+    assert_eq!(s.status, 200, "{}", s.body);
+    let label: String = prefix.chars().take(200).collect::<String>() + "…";
+    for name in [&a, &b] {
+        let item = format!(r#"{{"value":"{name}","label":"{label}","games":1}}"#);
+        assert!(s.body.contains(&item), "{name}: {}", s.body);
+        let q = encode(&format!("player:\"{name}\""));
+        let w = get(r.port, &format!("/v1/databases/{}/games?q={q}", r.id), "");
+        assert!(w.body.contains(r#""total":1,"#), "{}", w.body);
+    }
+    assert!(!s.body.contains("xxx"), "a name of 270 characters is not offered: {}", s.body);
 }

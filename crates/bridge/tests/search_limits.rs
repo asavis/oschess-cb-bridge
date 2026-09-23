@@ -40,11 +40,15 @@ fn sparse(name: &str, records: u64) -> TempDb {
     db
 }
 
-/// A search with `q` makes the one still running on the same database answer
-/// `409 superseded`, and the newer one is served.
-#[test]
-fn a_superseded_search_answers_409() {
-    let db = sparse("limits-superseded", 8_000_000);
+struct Served {
+    port: u16,
+    id: String,
+    app: Arc<App>,
+    _db: TempDb,
+}
+
+fn serve_sparse(name: &str, records: u64) -> Served {
+    let db = sparse(name, records);
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
     let path = db.dir().join("db.2cbh");
@@ -56,18 +60,67 @@ fn a_superseded_search_answers_409() {
     });
     let served = app.clone();
     std::thread::spawn(move || server::serve(listeners, served));
-    let id = id_of(&path);
-    let first = std::thread::spawn(move || get(port, &format!("/v1/databases/{id}/games?q=needle")));
-    let id = id_of(&path);
-    let indexes = app.catalog.get(&id).unwrap().open().ok().unwrap().indexes;
-    while indexes.scanned() == 0 {
-        std::thread::sleep(Duration::from_millis(1));
+    Served { port, id: id_of(&path), app, _db: db }
+}
+
+impl Served {
+    /// Starts `query` on its own connection, and returns once its scan has read
+    /// headers.
+    fn start(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
+        let indexes = self.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes;
+        let before = indexes.scanned();
+        let (port, path) = (self.port, format!("/v1/databases/{}/games?{query}", self.id));
+        let running = std::thread::spawn(move || get(port, &path));
+        while indexes.scanned() == before && !running.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        running
     }
-    let (status, out) = get(port, &format!("/v1/databases/{id}/games?q=other"));
+
+    fn get(&self, query: &str) -> (u16, String) {
+        get(self.port, &format!("/v1/databases/{}/games?{query}", self.id))
+    }
+}
+
+/// A search with `q` in a stream makes the one still running in the same
+/// stream answer `409 superseded`, and the newer one is served.
+#[test]
+fn a_superseded_search_answers_409() {
+    let s = serve_sparse("limits-superseded", 8_000_000);
+    let first = s.start("q=needle&stream=tab-1");
+    let (status, out) = s.get("q=other&stream=tab-1");
     assert_eq!(status, 200, "{out}");
     let (status, out) = first.join().unwrap();
     assert_eq!(status, 409, "{out}");
     assert!(out.contains(r#""code":"superseded""#), "{out}");
+}
+
+/// Clearing the search box is a new query too: an empty `q=` supersedes.
+#[test]
+fn an_empty_q_supersedes_the_running_search() {
+    let s = serve_sparse("limits-empty-q", 8_000_000);
+    let first = s.start("q=needle&stream=tab-1");
+    let (status, out) = s.get("q=&stream=tab-1");
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(first.join().unwrap().0, 409);
+}
+
+/// Another stream, another origin or no stream at all never stops a search.
+#[test]
+fn other_streams_do_not_supersede() {
+    let s = serve_sparse("limits-streams", 8_000_000);
+    let first = s.start("q=needle&stream=oschess-tab");
+    let second = s.start("q=other&stream=staging-tab");
+    let (status, out) = s.get("q=third");
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(first.join().unwrap().0, 200);
+    assert_eq!(second.join().unwrap().0, 200);
+    for bad in ["", "has%20space", "x%2Fy"] {
+        let (status, out) = s.get(&format!("q=x&stream={bad}"));
+        assert!(status == 400 && out.contains(r#""parameter":"stream""#), "{bad}: {out}");
+    }
+    let (status, out) = s.get(&format!("q=x&stream={}", "a".repeat(65)));
+    assert_eq!(status, 400, "{out}");
 }
 
 /// A header file claiming 4,294,967,295 records, of 824 GB but a few bytes on

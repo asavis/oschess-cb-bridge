@@ -195,6 +195,36 @@ impl Cancel {
     }
 }
 
+/// The most streams whose searches a database tells apart; the one used least
+/// recently is forgotten beyond that.
+pub const MAX_STREAMS: usize = 256;
+
+/// The search counters of one database's streams: a client names a stream (a
+/// browser tab's list, say), and a search supersedes only the one still running
+/// in the same stream.
+#[derive(Default)]
+pub struct Streams {
+    /// Most recently used last.
+    counters: Mutex<std::collections::VecDeque<(String, Arc<AtomicU64>)>>,
+}
+
+impl Streams {
+    /// A new search in `stream`, which supersedes the one before it there.
+    pub fn newest(&self, stream: &str) -> Cancel {
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = match counters.iter().position(|(s, _)| s == stream) {
+            Some(i) => counters.remove(i).unwrap_or_else(|| (stream.to_string(), Arc::default())),
+            None => (stream.to_string(), Arc::default()),
+        };
+        let cancel = Cancel::newest(&entry.1);
+        counters.push_back(entry);
+        while counters.len() > MAX_STREAMS {
+            counters.pop_front();
+        }
+        cancel
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +258,21 @@ mod tests {
         let second = Cancel::newest(&latest);
         assert!(first.is_cancelled() && !second.is_cancelled());
         assert!(!Cancel::never().is_cancelled());
+    }
+
+    #[test]
+    fn streams_are_told_apart_and_bounded() {
+        let streams = Streams::default();
+        let (a1, b1) = (streams.newest("a"), streams.newest("b"));
+        let a2 = streams.newest("a");
+        assert!(a1.is_cancelled() && !b1.is_cancelled() && !a2.is_cancelled());
+        for i in 0..MAX_STREAMS {
+            streams.newest(&format!("s{i}"));
+        }
+        // "b" was forgotten: its running search is no longer reachable, and a
+        // new "b" starts a fresh counter.
+        let b2 = streams.newest("b");
+        assert!(!b1.is_cancelled() && !b2.is_cancelled());
+        assert_eq!(streams.counters.lock().unwrap().len(), MAX_STREAMS);
     }
 }

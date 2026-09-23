@@ -163,11 +163,16 @@ records needs about 330 MB with three sort orders and the suggestion counts.
 
 ## Cancellation
 
-A request with `q` supersedes the search still running on the same database:
-that one stops at its next batch of headers and is answered `409 superseded`.
-The latest search wins whoever sent it; a page shows the answer to its latest
-query and discards older ones anyway. Requests without `q`, and suggestions,
-are never superseded.
+A client names its searches' stream with the `stream` parameter: 1 to 64
+characters of `A-Z`, `a-z`, `0-9`, `-` and `_`, chosen by the client, for
+example one per browser tab and list. A request that carries `q` and a
+`stream` supersedes the search still running in the same stream on the same
+database: that one stops at its next batch of headers and is answered
+`409 superseded`. An empty `q=` counts: clearing the search box supersedes
+the search it replaces. Other streams, requests without a `stream`, requests
+without `q`, and suggestions are never superseded, so a page in one tab never
+stops a search another tab still waits for. A database remembers its 256
+most recently used streams; a forgotten stream starts afresh.
 
 ## Endpoints
 
@@ -279,6 +284,7 @@ One window of the database's records, sorted and optionally searched.
 | `limit` | `200` | Rows in the window, 1 to 500 |
 | `sort` | `number` | `<key>`, `<key>-asc` or `<key>-desc`; keys below. It wins over a `sort:` token in `q`; an unknown key is `400 bad_request` |
 | `q` | | A search in the Library search grammar ([search-grammar.md](search-grammar.md)); `total` then counts the matches |
+| `stream` | | The client's name for this list, which lets a newer search replace an older one ([Cancellation](#cancellation)); an invalid name is `400 bad_request` |
 
 Sort keys: `number`, `white`, `black`, `whiteElo`, `blackElo`, `result`,
 `moves`, `eco`, `tournament` (alias `event`), `date`, `round`, `annotator` —
@@ -375,12 +381,17 @@ records are damaged `422 unreadable_game`. Deleted games are served.
 | `limit` | 1 to 20; 20 by default |
 
 ```json
-{ "field": "player", "suggestions": [ { "value": "Morphy, Paul", "games": 211 } ] }
+{ "field": "player", "suggestions": [ { "value": "Morphy, Paul", "label": "Morphy, Paul", "games": 211 } ] }
 ```
 
-`games` counts the games with the name in that role (either colour for
-`player`); guiding texts and analyses are not counted, and entities with the
-same name are counted together. Most games first, then alphabetical.
+`value` is the complete name. Put in double quotes after its qualifier
+(`player:"Morphy, Paul"`) it finds the games of that name. `label` is the name
+for display, cut at 200 characters with `…`. A name longer than a query value
+can hold (256 characters) or containing a double quote cannot be searched
+exactly and is not offered. `games` counts the games with the name in that
+role (either colour for `player`); guiding texts and analyses are not counted,
+and entities with the same name are counted together. Most games first, then
+alphabetical.
 
 ### `GET /v1/databases/{id}/explorer` (planned, #24)
 

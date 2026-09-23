@@ -11,15 +11,18 @@ mod order;
 pub mod query;
 mod scan;
 mod sort;
+mod suggest;
+
+pub use suggest::{SuggestField, Suggestion, suggest};
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use cbformat::v2::{Database, RecordKind};
+use cbformat::v2::Database;
 
-use memory::{Allowance, Cancel, Evict, Held, Hold, Refused};
-use names::{BitSet, Groups, Kind, NO_GROUP, NameTable, groups, joint_ranks};
+use memory::{Allowance, Cancel, Evict, Held, Hold, Refused, Streams};
+use names::{BitSet, Groups, Kind, NameTable, joint_ranks};
 use query::{Field, Query, Sort, SortKey};
 use scan::Control;
 
@@ -45,11 +48,12 @@ pub struct Indexes {
     player_groups: Slot<Held<Groups>>,
     tournament_groups: Slot<Held<Groups>>,
     orders: Mutex<HashMap<Sort, Arc<OrderSlot>>>,
-    counts: Slot<Held<Counts>>,
+    counts: Slot<Held<suggest::Counts>>,
     /// The latest searches, newest last: the query and sort, and the result.
     results: Mutex<VecDeque<(String, Numbers)>>,
-    /// Searches started on this database; the latest supersedes the others.
-    searches: Arc<AtomicU64>,
+    /// Searches started on this database, per client stream: the latest in a
+    /// stream supersedes the others there.
+    streams: Streams,
     /// Records read by all passes, for tests and diagnostics.
     scanned: AtomicU64,
 }
@@ -57,7 +61,7 @@ pub struct Indexes {
 /// The value in `slot`, built by `build` the first time. Concurrent callers
 /// wait for the one build instead of repeating it; a failed build stores
 /// nothing, and the next caller builds again.
-fn cached<T, E>(slot: &Slot<T>, build: impl FnOnce() -> Result<T, E>) -> Result<Arc<T>, E> {
+pub(super) fn cached<T, E>(slot: &Slot<T>, build: impl FnOnce() -> Result<T, E>) -> Result<Arc<T>, E> {
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = guard.as_ref() {
         return Ok(v.clone());
@@ -81,7 +85,7 @@ impl Indexes {
         self.scanned.load(Ordering::Relaxed)
     }
 
-    fn names(&self, db: &Database, kind: Kind, cancel: &Cancel) -> Result<Arc<NameTable>, SearchError> {
+    pub(super) fn names(&self, db: &Database, kind: Kind, cancel: &Cancel) -> Result<Arc<NameTable>, SearchError> {
         let slot = match kind {
             Kind::Players => &self.players,
             Kind::Tournaments => &self.tournaments,
@@ -185,17 +189,23 @@ impl From<Refused> for SearchError {
 }
 
 /// The records `q` selects, in the order of `sort_param`, else of the query's
-/// `sort:` token, else by number; and that order. A request with a `q`
-/// supersedes the search still running on the same database.
+/// `sort:` token, else by number; and that order. A request that carries a `q`,
+/// even an empty one, and names a `stream` supersedes the search still running
+/// in that stream on the same database; without a stream nothing is superseded.
 pub fn select(
     db: &Database,
     idx: &Indexes,
-    q: &str,
+    q: Option<&str>,
+    stream: Option<&str>,
     sort_param: Option<Sort>,
 ) -> Result<(Selection, Sort), SearchError> {
+    let cancel = match (q, stream) {
+        (Some(_), Some(stream)) => idx.streams.newest(stream),
+        _ => Cancel::never(),
+    };
+    let q = q.unwrap_or("");
     let query = query::parse(q).map_err(|u| SearchError::Unsupported(u.0))?;
     let sort = sort_param.or(query.sort).unwrap_or(Sort::DEFAULT);
-    let cancel = if q.trim().is_empty() { Cancel::never() } else { Cancel::newest(&idx.searches) };
     let ctl = Control { cancel: &cancel, scanned: &idx.scanned };
     if query.terms.is_empty() {
         return Ok(match sort.key {
@@ -283,99 +293,4 @@ fn search(
     }
     hold.shrink(out.capacity() * 4);
     Ok(Held::new(out, hold))
-}
-
-/// How many games have each name identity as a player, annotator and tournament.
-struct Counts {
-    players: Vec<u32>,
-    annotators: Vec<u32>,
-    tournaments: Vec<u32>,
-}
-
-fn counts(
-    db: &Database,
-    ctl: &Control<'_>,
-    players: &Groups,
-    tournaments: &Groups,
-) -> Result<Held<Counts>, SearchError> {
-    let (np, nt) = (players.first_id.len(), tournaments.first_id.len());
-    let hold = Hold::reserve((2 * np + nt) * 4)?;
-    let zeros = |n: usize| -> Result<Vec<AtomicU32>, Refused> {
-        let mut v = Vec::new();
-        v.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
-        v.extend((0..n).map(|_| AtomicU32::new(0)));
-        Ok(v)
-    };
-    let (p, a, t) = (zeros(np)?, zeros(np)?, zeros(nt)?);
-    let group =
-        |g: &Groups, id: i64| usize::try_from(id).ok().and_then(|i| g.of_id.get(i)).copied().filter(|&x| x != NO_GROUP);
-    let bump = |v: &[AtomicU32], g: Option<u32>| {
-        if let Some(g) = g {
-            v[g as usize].fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    scan::scan(
-        db,
-        ctl,
-        |_| Ok(()),
-        |_, r| {
-            if matches!(r.kind(), RecordKind::Game) {
-                // A game counts once for a name, whichever colours carry it.
-                let (w, b) = (group(players, r.white()), group(players, r.black()));
-                bump(&p, w);
-                if b != w {
-                    bump(&p, b);
-                }
-                bump(&a, group(players, r.annotator()));
-                bump(&t, group(tournaments, r.tournament()));
-            }
-            Ok(())
-        },
-    )?;
-    let plain = |v: Vec<AtomicU32>| v.into_iter().map(AtomicU32::into_inner).collect();
-    Ok(Held::new(Counts { players: plain(p), annotators: plain(a), tournaments: plain(t) }, hold))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SuggestField {
-    Player,
-    Event,
-    Annotator,
-}
-
-/// Up to `limit` names of `field` starting with `prefix` (or whose first name
-/// does, for people), with their game counts: most games first, then by name.
-pub fn suggest(
-    db: &Database,
-    idx: &Indexes,
-    field: SuggestField,
-    prefix: &str,
-    limit: usize,
-) -> Result<Vec<(String, u32)>, SearchError> {
-    let never = Cancel::never();
-    let ctl = Control { cancel: &never, scanned: &idx.scanned };
-    let players = idx.names(db, Kind::Players, &never)?;
-    let tournaments = idx.names(db, Kind::Tournaments, &never)?;
-    let player_groups = cached(&idx.player_groups, || groups(&players))?;
-    let tournament_groups = cached(&idx.tournament_groups, || groups(&tournaments))?;
-    let counts = cached(&idx.counts, || counts(db, &ctl, &player_groups, &tournament_groups))?;
-    let (table, groups, games) = match field {
-        SuggestField::Player => (&players, &player_groups, &counts.players),
-        SuggestField::Annotator => (&players, &player_groups, &counts.annotators),
-        SuggestField::Event => (&tournaments, &tournament_groups, &counts.tournaments),
-    };
-    let prefix = prefix.trim().to_lowercase();
-    let mut list: Vec<(&str, u32)> = Vec::new();
-    for (g, &n) in games.iter().enumerate() {
-        let id = groups.first_id[g] as usize;
-        let lower = table.lower(id);
-        let first_name = lower.split_once(", ").map(|(_, f)| f);
-        if n > 0 && (lower.starts_with(&prefix) || first_name.is_some_and(|f| f.starts_with(&prefix))) {
-            list.push((table.name(id as i64), n));
-        }
-    }
-    list.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())).then_with(|| a.0.cmp(b.0))
-    });
-    Ok(list.into_iter().take(limit).map(|(name, n)| (name.to_string(), n)).collect())
 }

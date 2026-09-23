@@ -167,10 +167,11 @@ impl NameTable {
     }
 }
 
-/// Positions in one name order — case-insensitive, then exact — over several
-/// tables together, per table and id: a tournament and a guiding text's title
-/// sort among each other. Equal names share a position, and every empty name
-/// has position 0, which is also the key of a missing name.
+/// Positions in one case-insensitive name order over several tables together,
+/// per table and id: a tournament and a guiding text's title sort among each
+/// other. Names equal but for case share a position, so that sorting falls back
+/// to the record number, and every empty name has position 0, which is also the
+/// key of a missing name.
 pub fn joint_ranks(tables: &[&NameTable]) -> Result<Held<Vec<Vec<u32>>>, SearchError> {
     let total: usize = tables.iter().map(|t| t.len()).sum();
     // The ranks kept, and the sorted entries while they are built.
@@ -180,11 +181,8 @@ pub fn joint_ranks(tables: &[&NameTable]) -> Result<Held<Vec<Vec<u32>>>, SearchE
     for (t, table) in tables.iter().enumerate() {
         all.extend((0..table.len()).filter(|&id| !table.lower(id).is_empty()).map(|id| ((t as u64) << 48) | id as u64));
     }
-    let name = |e: u64| {
-        let (t, id) = ((e >> 48) as usize, (e & ((1 << 48) - 1)) as usize);
-        (tables[t].lower(id), tables[t].name(id as i64))
-    };
-    all.sort_unstable_by(|&a, &b| name(a).cmp(&name(b)));
+    let name = |e: u64| tables[(e >> 48) as usize].lower((e & ((1 << 48) - 1)) as usize);
+    all.sort_unstable_by(|&a, &b| name(a).cmp(name(b)));
     let mut ranks: Vec<Vec<u32>> = Vec::new();
     for t in tables {
         let mut r = Vec::new();
@@ -295,9 +293,9 @@ mod tests {
     #[test]
     fn ranks_groups_and_matching() {
         let t = table(&["", "b", "A", "a", "a"]);
-        assert_eq!(*joint_ranks(&[&t]).ok().unwrap(), [vec![0, 3, 1, 2, 2]], "empty is 0, equal names share");
+        assert_eq!(*joint_ranks(&[&t]).ok().unwrap(), [vec![0, 2, 1, 1, 1]], "empty is 0, case is ignored");
         let u = table(&["", "B", "a"]);
-        assert_eq!(*joint_ranks(&[&t, &u]).ok().unwrap(), [vec![0, 4, 1, 2, 2], vec![0, 3, 2]]);
+        assert_eq!(*joint_ranks(&[&t, &u]).ok().unwrap(), [vec![0, 2, 1, 1, 1], vec![0, 2, 1]]);
         let g = groups(&t).ok().unwrap();
         assert_eq!(g.of_id, [NO_GROUP, 2, 0, 1, 1]);
         assert_eq!(g.first_id, [2, 3, 1]);

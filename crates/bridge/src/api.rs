@@ -194,7 +194,12 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
-    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q").unwrap_or(""), sort_param) {
+    let stream = match req.param("stream") {
+        None => None,
+        Some(s) if valid_stream(s) => Some(s),
+        Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
+    };
+    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
         Ok(found) => found,
         Err(e) => return search_error(entry, open.generation, e),
     };
@@ -261,15 +266,23 @@ fn suggest(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
-    match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
-        Ok(list) => {
-            let items =
-                list.into_iter().map(|(value, games)| Obj::new().str("value", &clip(value)).num("games", games).done());
-            let field = req.param("field").unwrap_or_default();
-            ok(Obj::new().str("field", field).raw("suggestions", &json::array(items)).done())
-        }
-        Err(e) => search_error(entry, open.generation, e),
-    }
+    let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
+        Ok(list) => list,
+        Err(e) => return search_error(entry, open.generation, e),
+    };
+    // A name escapes to at most 6 bytes a byte in JSON, and its label is shorter.
+    let size = list.iter().map(|s| s.name.len() * 12 + 128).sum::<usize>() + 256;
+    let Some(hold) = budget::reserve(size) else { return busy() };
+    let items = list
+        .iter()
+        .map(|s| Obj::new().str("value", &s.name).str("label", &clip(s.name.clone())).num("games", s.games).done());
+    let field = req.param("field").unwrap_or_default();
+    ok(Obj::new().str("field", field).raw("suggestions", &json::array(items)).done()).holding(hold)
+}
+
+/// A client's stream name: 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-` and `_`.
+fn valid_stream(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The answer to a search that could not finish.
