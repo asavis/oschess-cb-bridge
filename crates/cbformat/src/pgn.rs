@@ -128,8 +128,8 @@ impl Node {
 }
 
 /// The move tree of a game as PGN movetext, without the result.
-pub fn movetext(db: &Database, record: &Record<'_>) -> Result<String> {
-    movetext_of(&db.moves_of(record)?)
+pub fn movetext(db: &Database, record: &Record) -> Result<String> {
+    movetext_of(&db.moves_of(record)?.moves()?)
 }
 
 /// The move tree of a parsed move record as PGN movetext.
@@ -277,6 +277,16 @@ pub fn game(db: &Database, id: u32) -> Result<String> {
     if r.kind() != RecordKind::Game {
         return Err(Error::Format(format!("record {id} is not a game")));
     }
+    let data = db.moves_of(&r)?;
+    game_from(db, &r, &data.moves()?)
+}
+
+/// [`game`] for a record and move record already read, as from a
+/// [`crate::v2::Batch`]; entities are read from `db`.
+pub fn game_from(db: &Database, r: &Record, moves: &GameMoves<'_>) -> Result<String> {
+    if r.kind() != RecordKind::Game {
+        return Err(Error::Format(format!("record {} is not a game", r.id())));
+    }
     let e = db.entities();
     let t = e.tournament(r.tournament());
     let name = |pid| e.player(pid).map(|p| p.pgn()).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into());
@@ -302,7 +312,6 @@ pub fn game(db: &Database, id: u32) -> Result<String> {
     if let Some(eco) = r.eco().pgn() {
         tag(&mut out, "ECO", &eco);
     }
-    let moves = db.moves_of(&r)?;
     let start = moves.start()?;
     if start != Start::Standard {
         let board = start_board(&start)?;
@@ -313,7 +322,7 @@ pub fn game(db: &Database, id: u32) -> Result<String> {
         tag(&mut out, "FEN", &format!("{board}"));
     }
     out.push('\n');
-    let text = movetext_of(&moves)?;
+    let text = movetext_of(moves)?;
     if !text.is_empty() {
         out.push_str(&text);
         out.push(' ');

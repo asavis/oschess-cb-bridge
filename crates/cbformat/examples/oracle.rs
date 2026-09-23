@@ -261,13 +261,15 @@ fn main() {
                     if first > u64::from(n) {
                         break;
                     }
-                    for id in first..=(first + 4095).min(u64::from(n)) {
-                        let id = id as u32;
-                        let Ok(r) = db.record(id) else { continue };
+                    let last = (first + 4095).min(u64::from(n)) as u32;
+                    let Ok(batch) = db.batch(first as u32, last) else { continue };
+                    for id in first as u32..=last {
+                        let Ok(r) = batch.record(id) else { continue };
                         if !matches!(r.kind(), RecordKind::Game | RecordKind::Analysis) {
                             continue;
                         }
-                        let Ok(moves) = db.moves_of(&r) else { continue };
+                        let Ok(data) = batch.moves_of(&r) else { continue };
+                        let Ok(moves) = data.moves() else { continue };
                         let mut rec = Recorder::default();
                         let ours_ok = replay::walk(&moves, &mut rec).is_ok();
                         let (cozy_states, cozy_ok) = cozy_walk(&moves);
