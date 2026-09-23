@@ -198,6 +198,27 @@ fn more_workers_than_the_budget_holds_buffers_for_still_search() {
     }
 }
 
+/// The same sixteen workers and 16 MiB, on a query that matches every one of
+/// 100,000 games: each worker's list of matches needs room of its own beside
+/// the batch buffers, so the buffers leave half the budget free for them.
+#[test]
+fn many_workers_leave_room_for_their_matches() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for _ in 0..100_000 {
+        b.game(e4)[0x8a..0x8c].copy_from_slice(&21i16.to_le_bytes());
+    }
+    let db = b.write("limits-many-matches");
+    let path = db.dir().join("db.2cbh");
+    let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
+    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    for query in ["q=moves:21&limit=1", "q=moves:21&sort=date&limit=1"] {
+        let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
+        assert_eq!(status, 200, "{query}: {out}");
+        assert!(out.contains(r#""total":100000"#), "{query}: {out}");
+    }
+}
+
 /// Two dozen searches at once, under the 256 MiB limit, four workers and a
 /// 16 MiB search budget: every connection gets an answer, `200` or `503`, and
 /// the bridge keeps serving. Scans share the four workers instead of starting

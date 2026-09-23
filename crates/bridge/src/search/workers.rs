@@ -107,18 +107,19 @@ impl Worker<'_> {
 }
 
 /// Runs `task` on up to `want` workers, each with `workspace` bytes of buffer
-/// reserved in the budget, and returns their results in worker order. It asks
-/// for no more workers than the whole budget has buffers for, and with little
-/// budget left it runs on fewer, down to one. When not even one buffer fits
-/// now, or a worker cannot be started, it answers `Busy`; a buffer larger than
-/// the whole budget is `TooLarge`. The first failure stops the other workers.
+/// reserved in the budget, and returns their results in worker order. The
+/// buffers of the workers it asks for take at most half the budget, so the
+/// other half stays for what the workers build, and with little budget left it
+/// runs on fewer, down to one. When not even one buffer fits now, or a worker
+/// cannot be started, it answers `Busy`; a buffer larger than the whole budget
+/// is `TooLarge`. The first failure stops the other workers.
 pub fn run<T: Send>(
     want: usize,
     workspace: usize,
     cancel: &Cancel,
     task: impl Fn(&Worker<'_>) -> Result<T, SearchError> + Sync,
 ) -> Result<Vec<T>, SearchError> {
-    let fit = budget().checked_div(workspace).unwrap_or(usize::MAX).max(1);
+    let fit = (budget() / 2).checked_div(workspace).unwrap_or(usize::MAX).max(1);
     let mut slots = acquire(want.min(fit), cancel)?;
     let _buffers = loop {
         match Hold::reserve(slots.0.checked_mul(workspace).ok_or(Refused::TooLarge)?) {
@@ -199,6 +200,12 @@ mod tests {
 
     #[test]
     fn a_pass_takes_no_more_workers_than_the_budget_has_buffers_for() {
+        // Buffers take at most half the budget: two of a quarter each, not three.
+        let got = run(3, budget() / 4, &Cancel::never(), |w| Ok(w.count));
+        assert!(!matches!(got, Err(SearchError::TooLarge)), "two buffers fit half the budget");
+        if let Ok(counts) = got {
+            assert!(counts.len() <= 2 && counts.iter().all(|&c| c == counts.len()), "{counts:?}");
+        }
         // Two buffers of just over half the budget never fit together, so the
         // pass runs on one worker instead of being refused as too large.
         let got = run(2, budget() / 2 + 1, &Cancel::never(), |w| Ok(w.count));
