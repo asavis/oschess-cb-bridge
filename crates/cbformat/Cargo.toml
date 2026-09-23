@@ -10,6 +10,11 @@ rust-version.workspace = true
 [dependencies]
 chesscore = { version = "0.1.0", path = "../chesscore" }
 
+[features]
+# Test database builder (`cbformat::fixture`), for the tests of this workspace.
+fixture = []
+
 [dev-dependencies]
+cbformat = { path = ".", features = ["fixture"] }
 # Test oracle only (examples/oracle.rs): never a dependency of the shipped code.
 cozy-chess = "0.3"

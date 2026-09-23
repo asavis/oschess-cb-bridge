@@ -1,26 +1,11 @@
 //! Move records built by hand, following the format description, and read back.
 
+use cbformat::fixture::{bytes, quiet, sq};
 use cbformat::movetable::{self, Captured, Color, MoveWord, Piece};
 use cbformat::pgn::movetext_of;
 use cbformat::replay::{start_board, walk_tree};
 use cbformat::v2::{GameMoves, Setup, Start};
 use chesscore::{CastleSide, Color as CColor, Move as CMove, Square};
-
-fn sq(name: &str) -> u8 {
-    let b = name.as_bytes();
-    (b[1] - b'1') * 8 + (b[0] - b'a')
-}
-
-/// The word for a non-capturing, non-promoting move of `piece` from `from` to `to`.
-fn word(color: Color, piece: Piece, from: &str, to: &str) -> u16 {
-    let want =
-        MoveWord::Normal { color, piece, from: sq(from), to: sq(to), captured: Captured::Nothing, promotion: None };
-    (1..0xb12d).find(|&w| movetable::decode(w) == Some(want)).expect("move word exists")
-}
-
-fn bytes(words: &[u16]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
 
 use Color::{Black as B, White as W};
 use Piece::{Bishop, Knight, Pawn};
@@ -31,23 +16,23 @@ fn variations_follow_the_documented_order() {
     let (alt, end) = (movetable::ALTERNATIVE, movetable::END_OF_LINE);
     let stream = [
         movetable::MOVES,
-        word(W, Pawn, "e2", "e4"),
-        word(B, Pawn, "c7", "c5"),
+        quiet(W, Pawn, "e2", "e4"),
+        quiet(B, Pawn, "c7", "c5"),
         alt,
-        word(W, Knight, "g1", "f3"),
-        word(B, Pawn, "d7", "d6"),
+        quiet(W, Knight, "g1", "f3"),
+        quiet(B, Pawn, "d7", "d6"),
         alt,
-        word(W, Pawn, "d2", "d4"),
+        quiet(W, Pawn, "d2", "d4"),
         end,
-        word(B, Knight, "b8", "c6"),
-        word(W, Bishop, "f1", "b5"),
+        quiet(B, Knight, "b8", "c6"),
+        quiet(W, Bishop, "f1", "b5"),
         end,
-        word(B, Pawn, "c7", "c6"),
+        quiet(B, Pawn, "c7", "c6"),
         alt,
-        word(W, Pawn, "d2", "d4"),
+        quiet(W, Pawn, "d2", "d4"),
         end,
-        word(B, Knight, "g8", "f6"),
-        word(W, Pawn, "e4", "e5"),
+        quiet(B, Knight, "g8", "f6"),
+        quiet(W, Pawn, "e4", "e5"),
         end,
     ];
     let content = bytes(&stream);
@@ -71,7 +56,7 @@ fn empty_game() {
 
 #[test]
 fn truncated_tree_is_an_error() {
-    let content = bytes(&[movetable::MOVES, word(W, Pawn, "e2", "e4")]);
+    let content = bytes(&[movetable::MOVES, quiet(W, Pawn, "e2", "e4")]);
     let moves = GameMoves::parse(1, &content).unwrap();
     assert!(walk_tree(&moves, |_, _, _| {}).is_err());
 }
@@ -87,9 +72,9 @@ fn wrong_capture_type_is_rejected() {
         captured: Captured::Knight,
         promotion: None,
     };
-    let w = (1..0xb12d).find(|&w| movetable::decode(w) == Some(pawn_x_knight)).unwrap();
+    let w = movetable::encode(pawn_x_knight).unwrap();
     let content =
-        bytes(&[movetable::MOVES, word(W, Pawn, "e2", "e4"), word(B, Pawn, "d7", "d5"), w, movetable::END_OF_LINE]);
+        bytes(&[movetable::MOVES, quiet(W, Pawn, "e2", "e4"), quiet(B, Pawn, "d7", "d5"), w, movetable::END_OF_LINE]);
     let moves = GameMoves::parse(1, &content).unwrap();
     let err = walk_tree(&moves, |_, _, _| {}).unwrap_err().to_string();
     assert!(err.contains("move 3"), "{err}");
