@@ -1,4 +1,5 @@
-//! `bridge.toml`: the port, extra origins and extra databases.
+//! `bridge.toml`: the port, extra origins, extra databases and the oschess
+//! site the pairing link opens.
 //!
 //! The file is a small subset of TOML — `key = value` lines, `#` comments,
 //! integers, strings in `"double"` (with escapes) or `'single'` (literal)
@@ -6,6 +7,8 @@
 //! dependency. Anything else is an error naming the line.
 
 use std::path::{Path, PathBuf};
+
+use crate::pairing::DEFAULT_WEB;
 
 pub const DEFAULT_PORT: u16 = 39581;
 
@@ -16,11 +19,13 @@ pub struct Config {
     pub origins: Vec<String>,
     /// Databases in addition to those ChessBase lists.
     pub databases: Vec<PathBuf>,
+    /// The oschess site the pairing link opens.
+    pub web: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { port: DEFAULT_PORT, origins: Vec::new(), databases: Vec::new() }
+        Config { port: DEFAULT_PORT, origins: Vec::new(), databases: Vec::new(), web: DEFAULT_WEB.to_string() }
     }
 }
 
@@ -36,6 +41,10 @@ origins = []
 # Databases in addition to those ChessBase shows, as paths to .2cbh files,
 # for example ['C:\\Users\\me\\Documents\\ChessBase\\MyWork\\Games.2cbh'].
 databases = []
+
+# The oschess site the pairing link opens, one of the allowed origins, for
+# example \"https://staging.oschess.org\".
+# web = \"https://oschess.org\"
 ";
 
 /// Reads `path`, writing the default file first when there is none.
@@ -52,8 +61,7 @@ pub fn load_or_create(path: &Path) -> Result<Config, String> {
 
 enum Value {
     Int(i64),
-    /// A lone string: no key takes one yet.
-    Str,
+    Str(String),
     List(Vec<String>),
 }
 
@@ -81,7 +89,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             ("origins", Value::List(v)) => config.origins = v,
             ("databases", Value::List(v)) => config.databases = v.into_iter().map(PathBuf::from).collect(),
-            ("port" | "origins" | "databases", _) => return Err(at("wrong type")),
+            ("web", Value::Str(v)) => config.web = v,
+            ("port" | "origins" | "databases" | "web", _) => return Err(at("wrong type")),
             (k, _) => return Err(at(&format!("unknown key {k}"))),
         }
     }
@@ -144,8 +153,8 @@ fn parse_value(text: &str) -> Result<Value, String> {
         return Ok(Value::List(items));
     }
     if text.starts_with(['"', '\'']) {
-        let (_, after) = parse_string(text)?;
-        return if after.trim().is_empty() { Ok(Value::Str) } else { Err("text after the string".into()) };
+        let (value, after) = parse_string(text)?;
+        return if after.trim().is_empty() { Ok(Value::Str(value)) } else { Err("text after the string".into()) };
     }
     text.parse::<i64>().map(Value::Int).map_err(|_| format!("not a value: {text}"))
 }
@@ -199,6 +208,8 @@ mod tests {
         assert_eq!(c.port, 40000);
         assert_eq!(c.origins, ["http://localhost:5173", "http://127.0.0.1:4173"]);
         assert_eq!(c.databases, [PathBuf::from("C:\\Bases\\A # b.2cbh"), PathBuf::from("D:\\x\\\u{415}.2cbh")]);
+        assert_eq!(c.web, DEFAULT_WEB);
+        assert_eq!(parse("web = \"https://staging.oschess.org\"").unwrap().web, "https://staging.oschess.org");
     }
 
     #[test]
@@ -212,6 +223,8 @@ mod tests {
             ("colour = 1", 1),
             ("port", 1),
             ("databases = ['x'] y", 1),
+            ("web = ['x']", 1),
+            ("origins = 'x'", 1),
         ] {
             let e = parse(text).unwrap_err();
             assert!(e.starts_with(&format!("line {line}:")), "{text:?}: {e}");

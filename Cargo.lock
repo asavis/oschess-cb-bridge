@@ -23,6 +23,7 @@ dependencies = [
 name = "cbtool"
 version = "0.1.0"
 dependencies = [
+ "bridge",
  "cbformat",
  "chesscore",
  "same-file",

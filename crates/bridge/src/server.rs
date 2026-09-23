@@ -78,8 +78,11 @@ fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: 
         let guard = Active(active.clone());
         let app = app.clone();
         let spawned = std::thread::Builder::new().name("bridge-conn".into()).spawn(move || {
-            let _guard = guard;
-            handle_connection(stream, &app);
+            let conn = handle_connection(stream, &app);
+            // The slot is free before the socket closes: a client that has
+            // seen its connection end may open another at once and be served.
+            drop(guard);
+            drop(conn);
         });
         // A failed spawn drops the closure, and with it the guard and the stream.
         drop(spawned);
@@ -87,6 +90,7 @@ fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: 
 }
 
 /// Counts a live connection until dropped, even when its thread panics.
+/// Dropped before the connection's socket closes, never after.
 struct Active(Arc<AtomicUsize>);
 
 impl Drop for Active {
@@ -110,26 +114,68 @@ fn refuse_busy(stream: TcpStream, accepted: Instant, app: &App) {
     let _ = conn.write(&cors(response, app.policy.allowed_origin(origin.as_deref())), false);
 }
 
-fn handle_connection(stream: TcpStream, app: &App) {
+/// Serves the requests of one connection until it ends, and returns it still
+/// open, for the caller to close.
+fn handle_connection(stream: TcpStream, app: &App) -> Conn {
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let mut conn = Conn::new(stream);
     loop {
         let (response, keep_alive): (Response, bool) = match conn.read_request() {
             Ok(req) => (api::handle(app, &req), req.keep_alive),
-            Err(Refusal { error: ReadError::Closed | ReadError::Dropped, .. }) => return,
+            Err(Refusal { error: ReadError::Closed | ReadError::Dropped, .. }) => return conn,
             Err(Refusal { error: refused, origin }) => {
                 let response = match refused {
                     ReadError::TooLarge => error(431, "headers_too_large", "Request line and headers exceed 16 KiB"),
                     ReadError::Body => error(413, "body_not_allowed", "Requests carry no body"),
                     ReadError::Malformed(what) => error(400, "bad_request", &format!("Malformed request: {what}")),
-                    ReadError::Closed | ReadError::Dropped => return,
+                    ReadError::Closed | ReadError::Dropped => return conn,
                 };
                 // The page that sent it can read the refusal when its origin is allowed.
                 (cors(response, app.policy.allowed_origin(origin.as_deref())), false)
             }
         };
         if conn.write(&response, keep_alive).is_err() || !keep_alive {
-            return;
+            return conn;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+    use crate::access::{DEFAULT_ORIGINS, Policy};
+    use crate::catalog::Catalog;
+
+    /// A client that has read a connection to its end may open another at
+    /// once: the slot is free before the socket closes. Freed after the close,
+    /// a descheduled connection thread kept it counted while its client went
+    /// on, and a request at the cap was refused (seen on Windows).
+    #[test]
+    fn a_connection_stops_counting_before_its_client_sees_it_close() {
+        let listener = bind(0).unwrap().remove(0);
+        let port = listener.local_addr().unwrap().port();
+        let app = Arc::new(App {
+            version: "test",
+            policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) },
+            catalog: Catalog::new(Vec::new()),
+            between_reads: None,
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+        let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);
+        let counted = active.clone();
+        std::thread::spawn(move || accept(listener, app, counted, busy));
+        let request = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        let mut late = 0;
+        for _ in 0..500 {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).unwrap();
+            assert!(answer.starts_with(b"HTTP/1.1 401"));
+            late += usize::from(active.load(Ordering::SeqCst) != 0);
+        }
+        assert_eq!(late, 0, "connections still counted after their client saw them close");
     }
 }

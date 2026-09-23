@@ -9,7 +9,7 @@ The repository is a Cargo workspace:
 | Crate | What it is |
 |---|---|
 | [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. |
-| [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`. |
+| [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, and `bridge` to run the bridge in a console. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 | [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
 
@@ -39,6 +39,7 @@ target/release/cbtool pgn    "path/to/Database.2cbh" --out games.pgn
 target/release/cbtool pgn    "path/to/Database.2cbh" --lang de,en --out games.pgn
 target/release/cbtool databases "path/to/Documents/ChessBase"   # the databases ChessBase lists
 target/release/oschess-bridge --database "path/to/Database.2cbh" --show-token
+target/release/cbtool bridge --database "path/to/Database.2cbh"   # the same bridge
 ```
 
 `--lang` chooses the language of comments stored in several languages, in
@@ -46,7 +47,10 @@ order of preference; English is the default.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
-`--show-token` prints the pairing link that connects oschess to it.
+`--show-token` prints the pairing link that connects oschess to it, and
+`--new-token` replaces the token. `cbtool bridge` runs the same bridge with the
+same options, for development. `web` in `bridge.toml` points the pairing link
+at another allowed site, such as `https://staging.oschess.org`.
 
 A database path may name the `.2cbh` file or the common stem of its files.
 Databases are opened read-only and read with positional reads; nothing is
