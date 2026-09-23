@@ -812,6 +812,28 @@ fn event_suggestions_match_the_start_of_the_name() {
     assert!(!s.body.contains("Other event"), "{}", s.body);
 }
 
+/// A person's first name comes from its own field: a last name with a comma in
+/// it, `Smith, Jr.` with first name `Alex`, is offered for `Alex`, not for
+/// `Jr.`, as a player and as an annotator.
+#[test]
+fn first_names_come_from_their_own_field() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    let rec = b.game(e4);
+    rec[0x18..0x20].copy_from_slice(&1i64.to_le_bytes());
+    rec[0x30..0x38].copy_from_slice(&1i64.to_le_bytes());
+    b.lid(lid_with(64, 2, &[(0, 1, strings(&["Smith, Jr.", "Alex"]))]));
+    let db = b.write("api-first-name-field");
+    let r = start(&db, vec![], None);
+    for field in ["player", "annotator"] {
+        let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id), "");
+        assert_eq!(s.status, 200, "{}", s.body);
+        assert!(s.body.contains(r#""value":"Smith, Jr., Alex""#), "{field}: {}", s.body);
+        let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Jr.", r.id), "");
+        assert!(s.body.contains(r#""suggestions":[]"#), "{field}: {}", s.body);
+    }
+}
+
 #[test]
 fn a_changed_database_is_searched_afresh() {
     let db = database("api-search-fresh", 2, 0, 0);

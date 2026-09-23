@@ -39,6 +39,9 @@ struct Chunk {
     name_ends: Vec<u32>,
     lower: String,
     lower_ends: Vec<u32>,
+    /// Where a person's first name starts in the lower-case name, from the
+    /// entity's own first-name field; 0 when there is none.
+    given: Vec<u32>,
 }
 
 fn part<'a>(text: &'a str, ends: &[u32], i: usize) -> &'a str {
@@ -78,8 +81,9 @@ impl NameTable {
         if count > u32::MAX as usize {
             return Err(Refused::TooLarge.into());
         }
-        // Two string ends per id, reserved before anything is read.
-        let shared = Mutex::new(Hold::reserve(count.checked_mul(8).ok_or(Refused::TooLarge)?)?);
+        // Two string ends and a first-name start per id, reserved before
+        // anything is read.
+        let shared = Mutex::new(Hold::reserve(count.checked_mul(12).ok_or(Refused::TooLarge)?)?);
         let want = threads().min(count.div_ceil(IDS_PER_WORKER_MIN)).max(1);
         let chunks = workers::run(want, NAME_WORKSPACE, cancel, |w| {
             let per = count.div_ceil(w.count).max(1);
@@ -92,23 +96,38 @@ impl NameTable {
                 name_ends: Vec::new(),
                 lower: String::new(),
                 lower_ends: Vec::new(),
+                given: Vec::new(),
             };
             c.name_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
             c.lower_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
+            c.given.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
             for id in first..end {
                 if (id - first) % IDS_PER_CHECK == 0 && (w.stopped() || cancel.is_cancelled()) {
                     return Err(SearchError::Superseded);
                 }
-                let name = match kind {
-                    Kind::Players => e.player_within(id as i64, MAX_NAME_RECORD)?.map(|p| p.pgn()),
-                    Kind::Tournaments => e.tournament_within(id as i64, MAX_NAME_RECORD)?.map(|t| t.title),
-                    Kind::Titles => e.title_within(id as i64, MAX_NAME_RECORD)?,
-                }
-                .unwrap_or_default();
+                let (name, first_name) = match kind {
+                    Kind::Players => match e.player_within(id as i64, MAX_NAME_RECORD)? {
+                        Some(p) => (p.pgn(), p.first.to_lowercase()),
+                        None => (String::new(), String::new()),
+                    },
+                    Kind::Tournaments => (
+                        e.tournament_within(id as i64, MAX_NAME_RECORD)?.map(|t| t.title).unwrap_or_default(),
+                        String::new(),
+                    ),
+                    Kind::Titles => (e.title_within(id as i64, MAX_NAME_RECORD)?.unwrap_or_default(), String::new()),
+                };
+                let lower = name.to_lowercase();
+                // The first name ends the name ("Last, First"); a comma inside
+                // the last name does not move it.
+                let given = match lower.strip_suffix(first_name.as_str()) {
+                    Some(before) if !first_name.is_empty() => before.len(),
+                    _ => 0,
+                };
                 push_str(&mut c.names, &name, &mut allow)?;
-                push_str(&mut c.lower, &name.to_lowercase(), &mut allow)?;
+                push_str(&mut c.lower, &lower, &mut allow)?;
                 c.name_ends.push(u32::try_from(c.names.len()).map_err(|_| Refused::TooLarge)?);
                 c.lower_ends.push(u32::try_from(c.lower.len()).map_err(|_| Refused::TooLarge)?);
+                c.given.push(u32::try_from(given).map_err(|_| Refused::TooLarge)?);
             }
             Ok(c)
         })?;
@@ -140,6 +159,14 @@ impl NameTable {
     pub fn lower(&self, id: usize) -> &str {
         let (c, i) = self.chunk(id);
         part(&c.lower, &c.lower_ends, i)
+    }
+
+    /// A person's first name in lower case, from the entity's first-name
+    /// field; `None` for a name without one.
+    pub fn given_lower(&self, id: usize) -> Option<&str> {
+        let (c, i) = self.chunk(id);
+        let at = c.given[i] as usize;
+        (at != 0).then(|| &part(&c.lower, &c.lower_ends, i)[at..])
     }
 
     /// The ids whose name contains `needle`, which is in lower case.
@@ -267,13 +294,20 @@ mod tests {
     use super::*;
 
     fn table(names: &[&str]) -> NameTable {
-        let mut c =
-            Chunk { first: 0, names: String::new(), name_ends: vec![], lower: String::new(), lower_ends: vec![] };
+        let mut c = Chunk {
+            first: 0,
+            names: String::new(),
+            name_ends: vec![],
+            lower: String::new(),
+            lower_ends: vec![],
+            given: vec![],
+        };
         for n in names {
             c.names.push_str(n);
             c.name_ends.push(c.names.len() as u32);
             c.lower.push_str(&n.to_lowercase());
             c.lower_ends.push(c.lower.len() as u32);
+            c.given.push(0);
         }
         NameTable { len: names.len(), per: names.len().max(1), chunks: vec![c], _hold: Hold::default() }
     }

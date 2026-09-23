@@ -126,8 +126,9 @@ pub fn suggest(
             continue;
         }
         let lower = table.lower(id);
-        // A person's first name counts too; an event's name after a comma does not.
-        let first_name = if people { lower.split_once(", ").map(|(_, f)| f) } else { None };
+        // A person's first name counts too, from its own field; an event's name
+        // after a comma does not.
+        let first_name = if people { table.given_lower(id) } else { None };
         if !(lower.starts_with(&prefix) || first_name.is_some_and(|f| f.starts_with(&prefix))) {
             continue;
         }
