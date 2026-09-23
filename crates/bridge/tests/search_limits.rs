@@ -183,6 +183,21 @@ fn a_database_too_large_to_sort_is_refused_under_a_memory_limit() {
     assert_eq!(get(b.port, "/v1/status").0, 200, "the bridge is still running");
 }
 
+/// Sixteen workers with a 16 MiB search budget: their batch buffers together
+/// would take more than the whole budget, so a pass runs on as many as fit
+/// instead of calling a small database too large.
+#[test]
+fn more_workers_than_the_budget_holds_buffers_for_still_search() {
+    let db = sparse("limits-many-workers", 300_000);
+    let path = db.dir().join("db.2cbh");
+    let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
+    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    for query in ["q=moves:12345", "sort=date"] {
+        let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
+        assert_eq!(status, 200, "{query}: {out}");
+    }
+}
+
 /// Two dozen searches at once, under the 256 MiB limit, four workers and a
 /// 16 MiB search budget: every connection gets an answer, `200` or `503`, and
 /// the bridge keeps serving. Scans share the four workers instead of starting

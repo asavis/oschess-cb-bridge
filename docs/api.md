@@ -166,8 +166,9 @@ cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
 are free, waits up to 5 seconds for the first one, and is answered `503 busy`
 when none comes free; many requests at once therefore wait for each other
 instead of multiplying the threads. Each worker reads headers into one 3 MiB
-buffer, reserved in the budget before it is allocated; with little budget
-left a search runs on fewer workers, down to one.
+buffer, reserved in the budget before it is allocated. A search takes no more
+workers than the whole budget has buffers for, and with little budget left it
+runs on fewer, down to one.
 
 ## Cancellation
 

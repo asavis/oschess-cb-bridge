@@ -8,7 +8,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::SearchError;
-use super::memory::{Cancel, Hold, Refused};
+use super::memory::{Cancel, Hold, Refused, budget};
 
 /// How long a pass waits for a free worker before it is answered `busy`.
 pub const WAIT: Duration = Duration::from_secs(5);
@@ -107,21 +107,23 @@ impl Worker<'_> {
 }
 
 /// Runs `task` on up to `want` workers, each with `workspace` bytes of buffer
-/// reserved in the budget, and returns their results in worker order. With
-/// little budget left the pass runs on fewer workers, down to one; when not
-/// even one buffer fits, or a worker cannot be started, it answers `Busy`. The
-/// first failure stops the other workers.
+/// reserved in the budget, and returns their results in worker order. It asks
+/// for no more workers than the whole budget has buffers for, and with little
+/// budget left it runs on fewer, down to one. When not even one buffer fits
+/// now, or a worker cannot be started, it answers `Busy`; a buffer larger than
+/// the whole budget is `TooLarge`. The first failure stops the other workers.
 pub fn run<T: Send>(
     want: usize,
     workspace: usize,
     cancel: &Cancel,
     task: impl Fn(&Worker<'_>) -> Result<T, SearchError> + Sync,
 ) -> Result<Vec<T>, SearchError> {
-    let mut slots = acquire(want, cancel)?;
+    let fit = budget().checked_div(workspace).unwrap_or(usize::MAX).max(1);
+    let mut slots = acquire(want.min(fit), cancel)?;
     let _buffers = loop {
         match Hold::reserve(slots.0.checked_mul(workspace).ok_or(Refused::TooLarge)?) {
             Ok(hold) => break hold,
-            Err(Refused::Busy) if slots.0 > 1 => {
+            Err(Refused::Busy | Refused::TooLarge) if slots.0 > 1 => {
                 let fewer = slots.0 / 2;
                 slots.shrink(fewer);
             }
@@ -193,5 +195,18 @@ mod tests {
         assert!(got.iter().enumerate().all(|(i, &(index, _))| i == index));
         let failed = run(4, 0, &Cancel::never(), |w| if w.index == 0 { Err(SearchError::Busy) } else { Ok(()) });
         assert!(matches!(failed, Err(SearchError::Busy)));
+    }
+
+    #[test]
+    fn a_pass_takes_no_more_workers_than_the_budget_has_buffers_for() {
+        // Two buffers of just over half the budget never fit together, so the
+        // pass runs on one worker instead of being refused as too large.
+        let got = run(2, budget() / 2 + 1, &Cancel::never(), |w| Ok(w.count));
+        assert!(!matches!(got, Err(SearchError::TooLarge)), "one buffer fits the budget");
+        if let Ok(counts) = got {
+            assert_eq!(counts, [1]);
+        }
+        // A buffer larger than the whole budget is too large on any number of workers.
+        assert!(matches!(run(2, budget() + 1, &Cancel::never(), |_| Ok(())), Err(SearchError::TooLarge)));
     }
 }
