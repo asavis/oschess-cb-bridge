@@ -11,10 +11,7 @@ The repository is a Cargo workspace:
 | [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, and the full move tree of every game, checked move by move on a board. PGN output. |
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
-
-A local bridge service for the [oschess](https://oschess.org) analysis board —
-a loopback-only HTTP API that serves an opening reference from a database on
-the user's own machine — is planned and will join the workspace.
+| [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
 
 ## Status
 
@@ -37,11 +34,17 @@ target/release/cbtool info   "path/to/Database.2cbh"
 target/release/cbtool verify "path/to/Database.2cbh"
 target/release/cbtool pgn    "path/to/Database.2cbh" --out games.pgn
 target/release/cbtool databases "path/to/Documents/ChessBase"   # the databases ChessBase lists
+target/release/oschess-bridge --database "path/to/Database.2cbh" --show-token
 ```
 
+`oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
+pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
+`--show-token` prints the pairing link that connects oschess to it.
+
 A database path may name the `.2cbh` file or the common stem of its files.
-Databases are opened read-only and memory-mapped; nothing is written and
-nothing leaves the machine.
+Databases are opened read-only and read with positional reads; nothing is
+written, and nothing leaves the machine except what the bridge serves to the
+oschess page on this computer.
 
 ## Contributing
 

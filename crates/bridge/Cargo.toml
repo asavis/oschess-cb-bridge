@@ -1,0 +1,20 @@
+[package]
+name = "bridge"
+description = "Serves the ChessBase databases of this machine to the oschess web app over loopback HTTP"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oschess-bridge"
+path = "src/main.rs"
+
+[dependencies]
+cbformat = { version = "0.1.0", path = "../cbformat" }
+# The pairing token: the standard library has no public API for operating-system randomness.
+getrandom = "0.3"
+
+[dev-dependencies]
+cbformat = { version = "0.1.0", path = "../cbformat", features = ["fixture"] }

@@ -23,7 +23,7 @@ use bytes::{le_i16, le_i64};
 pub use entities::{Entities, GAME_TAG, PLAYER, Player, SOURCE, TEAM, TOURNAMENT, Tournament};
 use file::DbFile;
 pub use frame::checksum;
-use frame::{FRAME_HEADER, frame_sizes, parse_frame};
+use frame::{FRAME_HEADER, MAX_FRAME_PART, frame_sizes, parse_frame};
 pub use moves::{GameMoves, Setup, Start, Token};
 pub use record::{Date, Eco, GameResult, Record, RecordKind};
 
@@ -123,6 +123,13 @@ impl Database {
 
     /// The move record a game or analysis header points at.
     pub fn moves_of(&self, record: &Record) -> Result<MoveData<'static>> {
+        self.moves_of_within(record, MAX_FRAME_PART)
+    }
+
+    /// [`Database::moves_of`], refusing before it is read a move record whose
+    /// content or spare area is larger than `limit` bytes: a caller that must
+    /// bound its work per game (a server) chooses the limit.
+    pub fn moves_of_within(&self, record: &Record, limit: usize) -> Result<MoveData<'static>> {
         let offset = record.moves_offset();
         let bad = |what: &str| Error::Format(format!("record at {offset:#x}: {what}"));
         let at = u64::try_from(offset).map_err(|_| bad("negative offset"))?;
@@ -132,6 +139,9 @@ impl Database {
         }
         let head = self.moves.read(at, FRAME_HEADER)?;
         let (a, b) = frame_sizes(&head, offset)?;
+        if a > limit || b > limit {
+            return Err(bad(&format!("move record of {} bytes, over the {limit}-byte limit", a.max(b))));
+        }
         let whole = (FRAME_HEADER + a + b + 8) as u64;
         if at + whole > file_len {
             return Err(bad("runs past end of file"));
