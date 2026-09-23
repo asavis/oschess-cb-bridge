@@ -24,6 +24,7 @@ name = "cbtool"
 version = "0.1.0"
 dependencies = [
  "cbformat",
+ "chesscore",
  "same-file",
 ]
 

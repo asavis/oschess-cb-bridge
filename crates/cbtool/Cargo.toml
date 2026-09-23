@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 cbformat = { version = "0.1.0", path = "../cbformat" }
+chesscore = { version = "0.1.0", path = "../chesscore" }
 same-file = "1"
 
 [dev-dependencies]

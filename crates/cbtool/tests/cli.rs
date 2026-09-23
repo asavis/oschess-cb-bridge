@@ -1,4 +1,4 @@
-//! `cbtool` never writes over the database it is reading.
+//! `cbtool` on the command line; it never writes over the database it is reading.
 
 use std::path::Path;
 use std::process::Command;
@@ -217,4 +217,51 @@ fn databases_never_opens_a_pipe_or_a_directory() {
     std::fs::remove_file(&cbg).unwrap();
     std::fs::create_dir(&cbg).unwrap();
     assert_eq!(row(), ["1", "2cbh", "unreadable", "3", "-", "Db"]);
+}
+
+/// A classic database is verified with the same report as a 2CBH one.
+#[test]
+fn verify_and_info_read_classic_databases() {
+    use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
+    let mut b = Builder::new();
+    for moves in [&["e2e4", "e7e5"][..], &["d2d4", "--", "c2c4"][..]] {
+        let mut toks: Vec<Tok<'_>> = moves.iter().map(|m| Tok::Mv(m)).collect();
+        toks.push(Tok::End);
+        b.game(&move_record(0, None, None, &encode(&chesscore::Board::startpos(), &toks, 0, false)));
+    }
+    let f = b.write("cli-classic");
+    let run = |cmd: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg(cmd).arg(f.dir().join("db.cbh")).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let v = run("verify");
+    for line in ["games              2", "null moves         1", "all plies          5", "failures           0"] {
+        assert!(v.contains(line), "{v}");
+    }
+    assert!(run("info").contains("players        2"));
+}
+
+/// The review's hostile classic record, a million nested variations in one
+/// 2 MB game, is a verify failure within a 256 MiB address space, not an
+/// allocation abort.
+#[cfg(unix)]
+#[test]
+fn verify_bounds_the_memory_of_hostile_nesting() {
+    use cbformat::fixture_cbh::{Builder, move_record};
+    let stream: Vec<u8> = (0..1_000_000u32).flat_map(|n| [(0xdc + n) as u8, (0xaa + n) as u8]).collect();
+    let mut b = Builder::new();
+    b.game(&move_record(0, None, None, &stream));
+    let f = b.write("cli-hostile-nesting");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v 262144 && exec \"$0\" verify \"$1\"")
+        .arg(env!("CARGO_BIN_EXE_cbtool"))
+        .arg(f.dir().join("db.cbh"))
+        .env("CBTOOL_THREADS", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("failures           1") && text.contains("nested deeper than 1024"), "{text}");
 }

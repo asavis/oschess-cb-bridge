@@ -14,7 +14,7 @@ use crate::{Error, Result};
 
 mod bytes;
 mod entities;
-mod file;
+pub(crate) mod file;
 mod frame;
 mod moves;
 mod record;

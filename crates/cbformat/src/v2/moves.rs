@@ -21,6 +21,14 @@ pub struct Setup {
     /// Castling rights from the high byte of the second word. Bits: 1 white
     /// O-O-O, 2 white O-O, 4 black O-O-O, 8 black O-O.
     pub castling: u8,
+    /// The file (0-7) of the rook each right castles with, when the record
+    /// names it, in the order of the `castling` bits: white O-O-O, white O-O,
+    /// black O-O-O, black O-O. A right without one castles with the outermost
+    /// rook on its wing in Chess960, and with the corner rook otherwise.
+    pub castling_rooks: [Option<u8>; 4],
+    /// The file (0-7) of the square each side's king must stand on to keep
+    /// its castling rights, when the record names it: white, black.
+    pub castling_kings: [Option<u8>; 2],
     /// En passant file 0-7 (`a`-`h`), when the third word names one.
     pub en_passant_file: Option<u8>,
     /// The third word itself. Zero in every set-up position examined; read as
@@ -102,6 +110,8 @@ impl<'a> GameMoves<'a> {
             move_number: s[0],
             side_to_move: if s[1] & 0xff == 0 { Color::White } else { Color::Black },
             castling: (s[1] >> 8) as u8,
+            castling_rooks: [None; 4],
+            castling_kings: [None; 2],
             en_passant_file: if (1..=8).contains(&s[2]) { Some(s[2] as u8 - 1) } else { None },
             en_passant_raw: s[2],
             pieces,
