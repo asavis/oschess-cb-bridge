@@ -163,3 +163,31 @@ fn set_up_section_round_trip() {
     assert_eq!(s, setup(2, 4));
     assert_eq!(format!("{}", start_board(&Start::Setup(s)).unwrap()), "4k3/8/8/3pP3/8/8/8/4K2R w K d6 0 20");
 }
+
+#[test]
+fn san_disambiguation_and_check_suffixes() {
+    use cbformat::pgn::san;
+    use cozy_chess::{Board, Move};
+    let cases = [
+        // Two knights on one rank: the file tells them apart.
+        ("7k/8/8/8/8/8/8/N1N4K w - - 0 1", "a1b3", "Nab3"),
+        // Two knights on one file: the rank does.
+        ("7k/8/8/N7/8/8/8/N6K w - - 0 1", "a1b3", "N1b3"),
+        // A pinned knight cannot move there, so there is nothing to tell apart.
+        ("4k3/8/8/b7/8/2N3N1/8/4K3 w - - 0 1", "g3e2", "Ne2"),
+        // Three queens: one shares the rank, one the file, so both are needed.
+        ("8/8/6k1/8/8/Q7/8/Q1Q4K w - - 0 1", "a1b2", "Qa1b2"),
+        ("6k1/6pp/8/8/8/8/8/R5K1 w - - 0 1", "a1a8", "Ra8+"),
+        ("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", "a1a8", "Ra8#"),
+        ("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1", "e1h1", "O-O"),
+        ("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1", "e1a1", "O-O-O"),
+        ("4k3/1P6/8/8/8/8/8/4K3 w - - 0 1", "b7b8q", "b8=Q+"),
+        ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2", "e5d6", "exd6"),
+    ];
+    for (fen, mv, want) in cases {
+        let board: Board = fen.parse().unwrap();
+        let mv: Move = mv.parse().unwrap();
+        assert!(board.is_legal(mv), "{fen} {mv}");
+        assert_eq!(san(&board, mv), want, "{fen}");
+    }
+}

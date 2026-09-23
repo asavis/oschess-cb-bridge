@@ -30,16 +30,25 @@ fn e2e4() -> u16 {
 
 /// A one-game database (1.e4) with an empty entity file.
 fn fixture(name: &str) -> Fixture {
+    fixture_with(name, 1, None)
+}
+
+/// `games` games, all 1.e4 and all sharing one move record; with
+/// `player_name`, every game's white and black is one player of that name.
+fn fixture_with(name: &str, games: usize, player_name: Option<&[u8]>) -> Fixture {
     let dir = std::env::temp_dir().join(format!("cbtool-cli-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut cbh = vec![0u8; 384];
+    let mut cbh = vec![0u8; 192 * (games + 1)];
     cbh[0x0a..0x0c].copy_from_slice(&192i16.to_le_bytes());
     cbh[0x0d] = 5;
-    cbh[192] = 1;
-    cbh[194] = 1;
-    cbh[195] = 1;
-    cbh[192 + 8..192 + 16].copy_from_slice(&12i64.to_le_bytes());
-    cbh[192 + 0x58] = 2;
+    for g in 1..=games {
+        let rec = &mut cbh[192 * g..192 * (g + 1)];
+        rec[0] = 1;
+        rec[2] = 1;
+        rec[3] = 1;
+        rec[8..16].copy_from_slice(&12i64.to_le_bytes());
+        rec[0x58] = 2;
+    }
     let content: Vec<u8> =
         [movetable::MOVES, e2e4(), movetable::END_OF_LINE].iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut rec = vec![0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
@@ -54,13 +63,24 @@ fn fixture(name: &str) -> Fixture {
     cbg.extend(12i16.to_le_bytes());
     cbg.extend([0, 5]);
     cbg.extend(rec);
+    let mut player = Vec::new();
+    if let Some(last) = player_name {
+        player.extend((last.len() as i32).to_le_bytes());
+        player.extend(last);
+        player.extend(0i32.to_le_bytes()); // no first name
+    }
+    let container = (4 + player.len()).max(1024);
     let mut lid = Vec::new();
     lid.extend(184i32.to_be_bytes());
     lid.extend(1i32.to_be_bytes());
-    lid.extend(1024i32.to_be_bytes());
-    lid.extend(0i64.to_be_bytes());
+    lid.extend((container as i32).to_be_bytes());
+    lid.extend(i64::from(player_name.is_some()).to_be_bytes());
     lid.extend((-1i64).to_be_bytes());
     lid.resize(184, 0);
+    if player_name.is_some() {
+        lid.extend((player.len() as i32).to_le_bytes());
+        lid.extend(&player);
+    }
     std::fs::write(dir.join("db.2cbh"), cbh).unwrap();
     std::fs::write(dir.join("db.2cbg"), cbg).unwrap();
     std::fs::write(dir.join("db.2lid"), lid).unwrap();
@@ -115,4 +135,23 @@ fn export_refuses_to_overwrite_the_database() {
         assert!(String::from_utf8_lossy(&r.stderr).contains("refusing"), "{}", String::from_utf8_lossy(&r.stderr));
         assert_eq!(snapshot(&f.dir), before, "input changed by --out {}", out.display());
     }
+}
+
+/// Games that share one large record must not make the export hold their
+/// rendered text in memory: 512 games naming one player with a 64 KiB name
+/// render to 64 MiB from a database of under 200 KiB.
+#[cfg(unix)]
+#[test]
+fn export_memory_is_bounded_when_games_share_a_large_record() {
+    let f = fixture_with("shared-large", 512, Some(&[b'A'; 64 << 10]));
+    let limit_kib = 96 * 1024;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v {limit_kib} && exec \"$0\" pgn \"$1\" > /dev/null"))
+        .arg(env!("CARGO_BIN_EXE_cbtool"))
+        .arg(f.dir.join("db.2cbh"))
+        .env("CBTOOL_THREADS", "2")
+        .status()
+        .unwrap();
+    assert!(status.success(), "export under a {limit_kib} KiB address-space limit: {status}");
 }

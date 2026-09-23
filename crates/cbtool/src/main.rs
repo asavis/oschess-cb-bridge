@@ -3,7 +3,8 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use cbformat::movetable::{self, Captured, MoveWord};
@@ -237,24 +238,189 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     if ids.is_empty() {
         ids = (1..=db.record_count()).filter(|&id| db.record(id).is_ok_and(|r| r.kind() == RecordKind::Game)).collect();
     }
-    let sink: Box<dyn Write> = match out_path {
+    let sink: Box<dyn Write + Send> = match out_path {
         Some(p) => {
             refuse_database_file(Path::new(&p), &db)?;
             Box::new(std::fs::File::create(p)?)
         }
-        None => Box::new(std::io::stdout().lock()),
+        None => Box::new(std::io::stdout()),
     };
-    let mut w = BufWriter::new(sink);
-    let mut ok = true;
-    for id in ids {
-        match cbformat::pgn::game(&db, id) {
-            Ok(text) => writeln!(w, "{text}")?,
-            Err(e) => {
-                eprintln!("game {id}: {e}");
-                ok = false;
-            }
-        }
-    }
+    let mut w = BufWriter::with_capacity(1 << 20, sink);
+    let ok = export_in_order(&ids, threads(), &|id, r| r.game(&db, id), &mut w)?;
     w.flush()?;
     Ok(ok)
+}
+
+/// Games per task, and the rendered text a task may hold before its turn to
+/// write. A task over the budget waits for its turn and then streams the rest
+/// of its games straight to the output, so memory stays near
+/// `threads × PGN_TASK_BYTES` however large each game renders.
+const PGN_CHUNK: usize = 1_024;
+const PGN_TASK_BYTES: usize = 4 << 20;
+
+/// Rendered games waiting for their turn to be written: the text, and each
+/// failure with the text offset it occurred at, to keep stderr in game order.
+#[derive(Default)]
+struct Rendered {
+    text: String,
+    errors: Vec<(usize, String)>,
+}
+
+impl Rendered {
+    fn game(&mut self, db: &Database, id: u32) {
+        match cbformat::pgn::game(db, id) {
+            Ok(game) => {
+                self.text.push_str(&game);
+                self.text.push('\n');
+            }
+            Err(e) => self.errors.push((self.text.len(), format!("game {id}: {e}"))),
+        }
+    }
+
+    fn write_to(&mut self, out: &mut dyn Write) -> std::io::Result<()> {
+        let mut at = 0;
+        for (offset, error) in &self.errors {
+            out.write_all(&self.text.as_bytes()[at..*offset])?;
+            eprintln!("{error}");
+            at = *offset;
+        }
+        out.write_all(&self.text.as_bytes()[at..])?;
+        self.text.clear();
+        self.errors.clear();
+        Ok(())
+    }
+}
+
+/// Renders `ids` with `render` on `threads` workers and writes them in the
+/// order given. Returns whether every game rendered, with failures reported on
+/// stderr in the same order. A write error stops every worker: no chunk is
+/// claimed and no game rendered after it, and waiting workers are woken.
+fn export_in_order(
+    ids: &[u32],
+    threads: usize,
+    render: &(dyn Fn(u32, &mut Rendered) + Sync),
+    out: &mut (dyn Write + Send),
+) -> AnyResult<bool> {
+    struct Turn<'w> {
+        next: usize,
+        out: &'w mut (dyn Write + Send),
+        ok: bool,
+        failed: Option<std::io::Error>,
+    }
+    let chunks: Vec<&[u32]> = ids.chunks(PGN_CHUNK).collect();
+    let claimed = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let turn = Mutex::new(Turn { next: 0, out, ok: true, failed: None });
+    let your_turn = Condvar::new();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.clamp(1, chunks.len().max(1)) {
+            scope.spawn(|| {
+                let mut r = Rendered::default();
+                while !stop.load(Ordering::Relaxed) {
+                    let k = claimed.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(k) else { break };
+                    let mut done = 0;
+                    while done < chunk.len() && r.text.len() < PGN_TASK_BYTES && !stop.load(Ordering::Relaxed) {
+                        render(chunk[done], &mut r);
+                        done += 1;
+                    }
+                    let mut t = turn.lock().unwrap_or_else(|e| e.into_inner());
+                    while t.next != k && t.failed.is_none() {
+                        t = your_turn.wait(t).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if t.failed.is_some() {
+                        break;
+                    }
+                    // Our turn: write what is held, then stream the rest.
+                    let mut chunk_ok = r.errors.is_empty();
+                    let mut result = r.write_to(&mut *t.out);
+                    for &id in &chunk[done..] {
+                        if result.is_err() {
+                            break;
+                        }
+                        render(id, &mut r);
+                        chunk_ok &= r.errors.is_empty();
+                        result = r.write_to(&mut *t.out);
+                    }
+                    t.ok &= chunk_ok;
+                    match result {
+                        Ok(()) => t.next += 1,
+                        Err(e) => {
+                            t.failed = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    your_turn.notify_all();
+                }
+            });
+        }
+    });
+    let t = turn.into_inner().unwrap_or_else(|e| e.into_inner());
+    match t.failed {
+        Some(e) => Err(e.into()),
+        None => Ok(t.ok),
+    }
+}
+
+/// Worker threads: `CBTOOL_THREADS` if set, otherwise one per CPU.
+fn threads() -> usize {
+    std::env::var("CBTOOL_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sink that accepts `left` bytes and then fails every write.
+    struct FailAfter {
+        left: usize,
+    }
+
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("sink full"));
+            }
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fake(id: u32, r: &mut Rendered) {
+        r.text.push_str(&format!("game {id}\n"));
+    }
+
+    #[test]
+    fn writes_in_order() {
+        let ids: Vec<u32> = (0..5_000).collect();
+        let mut out = Vec::new();
+        assert!(export_in_order(&ids, 4, &fake, &mut out).unwrap());
+        let want: String = ids.iter().map(|id| format!("game {id}\n")).collect();
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
+    fn a_write_error_stops_the_workers() {
+        let ids: Vec<u32> = (0..1_000_000).collect();
+        let rendered = AtomicUsize::new(0);
+        let render = |id: u32, r: &mut Rendered| {
+            rendered.fetch_add(1, Ordering::Relaxed);
+            fake(id, r);
+        };
+        let threads = 4;
+        let err = export_in_order(&ids, threads, &render, &mut FailAfter { left: 100 }).unwrap_err();
+        assert!(err.to_string().contains("sink full"), "{err}");
+        // At most the chunks already claimed when the write failed.
+        let bound = (threads + 1) * PGN_CHUNK;
+        let n = rendered.load(Ordering::Relaxed);
+        assert!(n <= bound, "rendered {n} games after the output failed; bound {bound}");
+    }
 }
