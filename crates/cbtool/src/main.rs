@@ -3,19 +3,20 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::replay::walk_tree;
 use cbformat::v2::{Database, RecordKind, Start, Token};
-use rayon::prelude::*;
 
 const USAGE: &str = "usage:
   cbtool info   <db>
   cbtool verify <db> [--limit N]           decode and replay every game and analysis
-  cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)";
+  cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)
+
+CBTOOL_THREADS sets the number of worker threads (default: one per CPU).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,7 +71,7 @@ struct Stats {
 }
 
 impl Stats {
-    fn add(mut self, o: Stats) -> Stats {
+    fn add(&mut self, o: &Stats) {
         self.games += o.games;
         self.texts += o.texts;
         self.analyses += o.analyses;
@@ -85,7 +86,6 @@ impl Stats {
         self.promo_captures_distinct += o.promo_captures_distinct;
         self.en_passant += o.en_passant;
         self.failures += o.failures;
-        self
     }
 }
 
@@ -100,6 +100,69 @@ fn same_kind(captured: Captured, promoted: cbformat::movetable::Piece) -> bool {
     )
 }
 
+/// Decodes and replays one record, adding to `s`; the first 50 failures of
+/// the whole run are kept in `failures`.
+fn verify_record(db: &Database, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
+    let fail = |s: &mut Stats, msg: String| {
+        s.failures += 1;
+        let mut f = failures.lock().unwrap_or_else(|e| e.into_inner());
+        if f.len() < 50 {
+            f.push((id, msg));
+        }
+    };
+    let r = match db.record(id) {
+        Ok(r) => r,
+        Err(e) => return fail(s, e.to_string()),
+    };
+    if r.is_deleted() {
+        s.deleted += 1;
+    }
+    match r.kind() {
+        RecordKind::Game => s.games += 1,
+        RecordKind::Analysis => s.analyses += 1,
+        RecordKind::Text => {
+            s.texts += 1;
+            return;
+        }
+        RecordKind::Unknown(_) => {
+            s.unknown_kind += 1;
+            return;
+        }
+    }
+    let moves = match db.moves_of(&r) {
+        Ok(m) => m,
+        Err(e) => return fail(s, e.to_string()),
+    };
+    if moves.is_chess960() {
+        s.chess960 += 1;
+    }
+    if matches!(moves.start(), Ok(Start::Setup(_))) {
+        s.setups += 1;
+    }
+    for t in moves.tokens() {
+        if let Token::Move(w) = t {
+            match movetable::decode(w) {
+                Some(MoveWord::Null) => s.null_moves += 1,
+                Some(MoveWord::Normal { captured: Captured::EnPassant, .. }) => s.en_passant += 1,
+                Some(MoveWord::Normal { captured, promotion: Some(p), .. }) if captured != Captured::Nothing => {
+                    s.promo_captures += 1;
+                    if !same_kind(captured, p) {
+                        s.promo_captures_distinct += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match walk_tree(&moves, |_, _, _| {}) {
+        Ok(t) => {
+            s.main_plies += t.main_line_plies as u64;
+            s.total_plies += t.total_plies as u64;
+        }
+        Err(e) => fail(s, e.to_string()),
+    }
+}
+
 fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
     let limit = match rest {
         [flag, n] if flag == "--limit" => Some(n.parse::<u32>()?),
@@ -110,78 +173,23 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
     let n = limit.map_or(db.record_count(), |l| l.min(db.record_count()));
     let failures: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
     let started = Instant::now();
-    let stats = (1..=n)
-        .into_par_iter()
-        .fold(Stats::default, |mut s, id| {
-            let fail = |s: &mut Stats, msg: String| {
-                s.failures += 1;
-                let mut f = failures.lock().unwrap();
-                if f.len() < 50 {
-                    f.push((id, msg));
-                }
-            };
-            let r = match db.record(id) {
-                Ok(r) => r,
-                Err(e) => {
-                    fail(&mut s, e.to_string());
-                    return s;
-                }
-            };
-            if r.is_deleted() {
-                s.deleted += 1;
-            }
-            match r.kind() {
-                RecordKind::Game => s.games += 1,
-                RecordKind::Analysis => s.analyses += 1,
-                RecordKind::Text => {
-                    s.texts += 1;
-                    return s;
-                }
-                RecordKind::Unknown(_) => {
-                    s.unknown_kind += 1;
-                    return s;
+    // Workers claim runs of ids from a shared counter and fold their own
+    // statistics, merged once at the end.
+    let next_run = AtomicU64::new(0);
+    let total = Mutex::new(Stats::default());
+    let runs = u64::from(n).div_ceil(u64::from(RUN));
+    if runs > 0 {
+        run_workers(threads().min(runs as usize), &|| {
+            let mut s = Stats::default();
+            while let Some(ids) = run_ids(next_run.fetch_add(1, Ordering::Relaxed), n) {
+                for id in ids {
+                    verify_record(&db, id, &mut s, &failures);
                 }
             }
-            let moves = match db.moves_of(&r) {
-                Ok(m) => m,
-                Err(e) => {
-                    fail(&mut s, e.to_string());
-                    return s;
-                }
-            };
-            if moves.is_chess960() {
-                s.chess960 += 1;
-            }
-            if matches!(moves.start(), Ok(Start::Setup(_))) {
-                s.setups += 1;
-            }
-            for t in moves.tokens() {
-                if let Token::Move(w) = t {
-                    match movetable::decode(w) {
-                        Some(MoveWord::Null) => s.null_moves += 1,
-                        Some(MoveWord::Normal { captured: Captured::EnPassant, .. }) => s.en_passant += 1,
-                        Some(MoveWord::Normal { captured, promotion: Some(p), .. })
-                            if captured != Captured::Nothing =>
-                        {
-                            s.promo_captures += 1;
-                            if !same_kind(captured, p) {
-                                s.promo_captures_distinct += 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            match walk_tree(&moves, |_, _, _| {}) {
-                Ok(t) => {
-                    s.main_plies += t.main_line_plies as u64;
-                    s.total_plies += t.total_plies as u64;
-                }
-                Err(e) => fail(&mut s, e.to_string()),
-            }
-            s
-        })
-        .reduce(Stats::default, Stats::add);
+            total.lock().unwrap_or_else(|e| e.into_inner()).add(&s);
+        });
+    }
+    let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
     let secs = started.elapsed().as_secs_f64();
     println!("records verified   {n} in {secs:.1} s ({:.0} records/s)", n as f64 / secs);
     println!("games              {}", stats.games);
@@ -312,47 +320,43 @@ fn export_in_order(
     let stop = AtomicBool::new(false);
     let turn = Mutex::new(Turn { next: 0, out, ok: true, failed: None });
     let your_turn = Condvar::new();
-    std::thread::scope(|scope| {
-        for _ in 0..threads.clamp(1, chunks.len().max(1)) {
-            scope.spawn(|| {
-                let mut r = Rendered::default();
-                while !stop.load(Ordering::Relaxed) {
-                    let k = claimed.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(k) else { break };
-                    let mut done = 0;
-                    while done < chunk.len() && r.text.len() < PGN_TASK_BYTES && !stop.load(Ordering::Relaxed) {
-                        render(chunk[done], &mut r);
-                        done += 1;
-                    }
-                    let mut t = turn.lock().unwrap_or_else(|e| e.into_inner());
-                    while t.next != k && t.failed.is_none() {
-                        t = your_turn.wait(t).unwrap_or_else(|e| e.into_inner());
-                    }
-                    if t.failed.is_some() {
-                        break;
-                    }
-                    // Our turn: write what is held, then stream the rest.
-                    let mut chunk_ok = r.errors.is_empty();
-                    let mut result = r.write_to(&mut *t.out);
-                    for &id in &chunk[done..] {
-                        if result.is_err() {
-                            break;
-                        }
-                        render(id, &mut r);
-                        chunk_ok &= r.errors.is_empty();
-                        result = r.write_to(&mut *t.out);
-                    }
-                    t.ok &= chunk_ok;
-                    match result {
-                        Ok(()) => t.next += 1,
-                        Err(e) => {
-                            t.failed = Some(e);
-                            stop.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    your_turn.notify_all();
+    run_workers(threads.min(chunks.len()), &|| {
+        let mut r = Rendered::default();
+        while !stop.load(Ordering::Relaxed) {
+            let k = claimed.fetch_add(1, Ordering::Relaxed);
+            let Some(chunk) = chunks.get(k) else { break };
+            let mut done = 0;
+            while done < chunk.len() && r.text.len() < PGN_TASK_BYTES && !stop.load(Ordering::Relaxed) {
+                render(chunk[done], &mut r);
+                done += 1;
+            }
+            let mut t = turn.lock().unwrap_or_else(|e| e.into_inner());
+            while t.next != k && t.failed.is_none() {
+                t = your_turn.wait(t).unwrap_or_else(|e| e.into_inner());
+            }
+            if t.failed.is_some() {
+                break;
+            }
+            // Our turn: write what is held, then stream the rest.
+            let mut chunk_ok = r.errors.is_empty();
+            let mut result = r.write_to(&mut *t.out);
+            for &id in &chunk[done..] {
+                if result.is_err() {
+                    break;
                 }
-            });
+                render(id, &mut r);
+                chunk_ok &= r.errors.is_empty();
+                result = r.write_to(&mut *t.out);
+            }
+            t.ok &= chunk_ok;
+            match result {
+                Ok(()) => t.next += 1,
+                Err(e) => {
+                    t.failed = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            your_turn.notify_all();
         }
     });
     let t = turn.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -362,13 +366,54 @@ fn export_in_order(
     }
 }
 
-/// Worker threads: `CBTOOL_THREADS` if set, otherwise one per CPU.
+/// Ids per run claimed by a `verify` worker.
+const RUN: u32 = 4_096;
+
+/// The ids of run `k` over `1..=n`, or `None` past the end. In 64 bits, so
+/// the last run ends at `n` even when `n` is `u32::MAX`.
+fn run_ids(k: u64, n: u32) -> Option<std::ops::RangeInclusive<u32>> {
+    let first = k.checked_mul(u64::from(RUN))?.checked_add(1)?;
+    if first > u64::from(n) {
+        return None;
+    }
+    let last = (first + u64::from(RUN) - 1).min(u64::from(n));
+    Some(first as u32..=last as u32)
+}
+
+/// Most worker threads started, whatever `CBTOOL_THREADS` asks for.
+const MAX_THREADS: usize = 256;
+
+/// Worker threads: `CBTOOL_THREADS` if set, otherwise one per CPU; at most
+/// [`MAX_THREADS`].
 fn threads() -> usize {
-    std::env::var("CBTOOL_THREADS")
-        .ok()
+    thread_count(std::env::var("CBTOOL_THREADS").ok().as_deref(), std::thread::available_parallelism().ok())
+}
+
+fn thread_count(setting: Option<&str>, cpus: Option<std::num::NonZeroUsize>) -> usize {
+    setting
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .unwrap_or_else(|| cpus.map_or(1, |n| n.get()))
+        .min(MAX_THREADS)
+}
+
+/// Runs `work` on up to `count` scoped threads. Every worker runs the same
+/// loop and takes its work from shared state, so a thread that cannot be
+/// started only costs parallelism; if none can, `work` runs on the calling
+/// thread.
+fn run_workers(count: usize, work: &(dyn Fn() + Sync)) {
+    std::thread::scope(|scope| {
+        let mut started = 0;
+        for _ in 0..count.max(1) {
+            if std::thread::Builder::new().spawn_scoped(scope, work).is_err() {
+                break;
+            }
+            started += 1;
+        }
+        if started == 0 {
+            work();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -396,6 +441,39 @@ mod tests {
 
     fn fake(id: u32, r: &mut Rendered) {
         r.text.push_str(&format!("game {id}\n"));
+    }
+
+    #[test]
+    fn runs_cover_every_id_up_to_the_largest_count() {
+        assert_eq!(run_ids(0, 0), None);
+        assert_eq!(run_ids(0, 1), Some(1..=1));
+        assert_eq!(run_ids(0, RUN), Some(1..=RUN));
+        assert_eq!(run_ids(1, RUN), None);
+        assert_eq!(run_ids(1, RUN + 1), Some(RUN + 1..=RUN + 1));
+        let last = u64::from(u32::MAX - 1) / u64::from(RUN);
+        assert_eq!(run_ids(last, u32::MAX).map(|r| *r.end()), Some(u32::MAX));
+        assert_eq!(run_ids(last + 1, u32::MAX), None);
+        assert_eq!(run_ids(u64::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn thread_count_is_bounded() {
+        let cpus = std::num::NonZeroUsize::new(8);
+        assert_eq!(thread_count(None, cpus), 8);
+        assert_eq!(thread_count(Some("3"), cpus), 3);
+        assert_eq!(thread_count(Some("0"), cpus), 8);
+        assert_eq!(thread_count(Some("many"), cpus), 8);
+        assert_eq!(thread_count(Some("18446744073709551615"), cpus), MAX_THREADS);
+        assert_eq!(thread_count(None, None), 1);
+    }
+
+    #[test]
+    fn workers_run_even_with_no_count() {
+        let runs = AtomicUsize::new(0);
+        run_workers(0, &|| {
+            runs.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
     #[test]
