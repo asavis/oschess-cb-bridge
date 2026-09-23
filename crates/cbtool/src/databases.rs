@@ -25,7 +25,11 @@ pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
     println!("{:>3}  {:<6} {:<11} {:>10} {:>10}  name", "#", "format", "state", "listed", "records");
     for (i, e) in list.entries.iter().enumerate() {
         let path = local_path(dir, &e.path, cfg!(windows));
-        let state = state_of(&path);
+        // Every file the database would be opened through is checked from its
+        // metadata first; a database is opened only when all of them are here.
+        let files: Vec<(State, bool)> =
+            database_files(&path, e.format).iter().map(|(file, required)| (state_of(file), *required)).collect();
+        let state = combine(&files);
         let records = match (e.format, state) {
             (Format::Cbh2, State::Present) => match Database::open(&path) {
                 Ok(db) => db.record_count().to_string(),
@@ -64,11 +68,9 @@ enum State {
     Present,
     Missing,
     /// A cloud-only OneDrive placeholder: not on disk, and reading it would download it.
-    #[cfg_attr(not(windows), allow(dead_code))]
     CloudOnly,
     /// No blocks allocated for a non-empty file, as a cloud-only placeholder shows
     /// through WSL. A heuristic: no placeholder has been available to confirm it.
-    #[cfg_attr(not(unix), allow(dead_code))]
     MaybeCloudOnly,
 }
 
@@ -83,8 +85,43 @@ impl State {
     }
 }
 
-/// The state of a database's header file, read from its metadata only, so a
-/// placeholder is never downloaded.
+/// The files a database is read through, each with whether it is required:
+/// for 2CBH the ones `Database::open` opens, plus the annotations when present.
+/// Other formats are not opened; their main file alone is checked.
+fn database_files(path: &Path, format: Format) -> Vec<(PathBuf, bool)> {
+    match format {
+        Format::Cbh2 => {
+            let stem = path.with_extension("");
+            [(".2cbh", true), (".2cbg", true), (".2lid", true), (".2cba", false)]
+                .iter()
+                .map(|&(ext, required)| {
+                    let mut p = stem.clone().into_os_string();
+                    p.push(ext);
+                    (PathBuf::from(p), required)
+                })
+                .collect()
+        }
+        _ => vec![(path.to_owned(), true)],
+    }
+}
+
+/// A database's state from the states of its files: missing when a required
+/// file is missing, otherwise cloud-only when any file that is there is.
+fn combine(files: &[(State, bool)]) -> State {
+    let present = || files.iter().filter(|(s, _)| *s != State::Missing).map(|(s, _)| *s);
+    if files.iter().any(|&(s, required)| required && s == State::Missing) {
+        State::Missing
+    } else if present().any(|s| s == State::CloudOnly) {
+        State::CloudOnly
+    } else if present().any(|s| s == State::MaybeCloudOnly) {
+        State::MaybeCloudOnly
+    } else {
+        State::Present
+    }
+}
+
+/// The state of one file, read from its metadata only, so a placeholder is
+/// never downloaded.
 fn state_of(path: &Path) -> State {
     match std::fs::metadata(path) {
         Err(_) => State::Missing,
@@ -149,6 +186,39 @@ mod tests {
         assert_eq!(local_path(dir, r"MyWork\A.cbh", false), PathBuf::from("/docs/MyWork/A.cbh"));
         assert_eq!(local_path(dir, "/tmp/x.2cbh", false), PathBuf::from("/tmp/x.2cbh"));
         assert_eq!(local_path(dir, r"C:\A.2cbh", true), PathBuf::from(r"C:\A.2cbh"));
+    }
+
+    #[test]
+    fn a_database_is_as_available_as_its_least_available_file() {
+        use State::{CloudOnly as C, MaybeCloudOnly as M, Missing as X, Present as P};
+        let db = |h, g, l, a| combine(&[(h, true), (g, true), (l, true), (a, false)]);
+        assert_eq!(db(P, P, P, P), P);
+        assert_eq!(db(P, P, P, X), P); // no annotation file: fine
+        assert_eq!(db(P, X, P, P), X);
+        // A resident header with an offline companion is not opened (Windows attributes).
+        assert_eq!(db(P, P, C, P), C);
+        assert_eq!(db(P, P, P, C), C);
+        // The same through the zero-block heuristic elsewhere.
+        assert_eq!(db(P, M, P, P), M);
+        assert_eq!(db(M, P, C, P), C);
+        assert_eq!(db(C, X, P, P), X);
+    }
+
+    #[test]
+    fn companion_files_of_a_2cbh_database() {
+        let files = database_files(Path::new("/d/Big Base.2cbh"), Format::Cbh2);
+        let names: Vec<(String, bool)> =
+            files.iter().map(|(p, r)| (p.file_name().unwrap().to_string_lossy().into_owned(), *r)).collect();
+        assert_eq!(
+            names,
+            [
+                ("Big Base.2cbh".to_string(), true),
+                ("Big Base.2cbg".to_string(), true),
+                ("Big Base.2lid".to_string(), true),
+                ("Big Base.2cba".to_string(), false)
+            ]
+        );
+        assert_eq!(database_files(Path::new("/d/a.pgn"), Format::Pgn), [(PathBuf::from("/d/a.pgn"), true)]);
     }
 
     #[test]

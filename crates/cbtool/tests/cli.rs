@@ -131,3 +131,46 @@ fn databases_lists_the_window_and_the_state_of_each_entry() {
     assert!(out.contains("ignored: 1 OneDrive conflict copy"), "{out}");
     assert!(!out.contains(f.dir().to_str().unwrap()), "stored paths are not printed: {out}");
 }
+
+/// A database whose header is here but a companion file is not is reported
+/// with the companion's state and never opened: its record count stays `-`.
+/// Zero-block files stand for placeholders, which needs a Unix file system.
+#[cfg(unix)]
+#[test]
+fn databases_never_opens_a_database_with_an_offline_companion() {
+    let f = fixture_with("databases-offline", 3, None);
+    let mut list = DbItems::new();
+    list.section("2cbg").database(f.dir().join("db.2cbh").to_str().unwrap(), "Db", [0, 28, 3, 1, 1037620, 1037559]);
+    std::fs::write(f.dir().join("DBItems.cbini"), list.bytes()).unwrap();
+    let row = || {
+        let r = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("databases").arg(f.dir()).output().unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let out = String::from_utf8(r.stdout).unwrap();
+        let row: Vec<String> = out
+            .lines()
+            .find(|l| l.trim_start().starts_with('1'))
+            .unwrap_or_else(|| panic!("{out}"))
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        row
+    };
+    assert_eq!(row(), ["1", "2cbh", "present", "3", "3", "Db"]);
+    // Replace a file by one of the same length with no blocks on disk.
+    let hollow = |name: &str| {
+        let p = f.dir().join(name);
+        let len = std::fs::metadata(&p).unwrap().len();
+        std::fs::remove_file(&p).unwrap();
+        std::fs::File::create(&p).unwrap().set_len(len.max(1)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&p).unwrap().blocks(), 0, "{name} is not sparse on this file system");
+    };
+    let saved_cba = std::fs::read(f.dir().join("db.2cba")).unwrap();
+    hollow("db.2cba");
+    assert_eq!(row(), ["1", "2cbh", "cloud-only?", "3", "-", "Db"]);
+    std::fs::write(f.dir().join("db.2cba"), &saved_cba).unwrap();
+    hollow("db.2lid");
+    assert_eq!(row(), ["1", "2cbh", "cloud-only?", "3", "-", "Db"]);
+    std::fs::remove_file(f.dir().join("db.2cbg")).unwrap();
+    assert_eq!(row(), ["1", "2cbh", "missing", "3", "-", "Db"]);
+}

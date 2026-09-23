@@ -121,8 +121,9 @@ so a title may contain commas. In the files examined:
   database was added.
 
 **The order.** The reader keeps the entries in file order: the `2cbg` section
-first, then `Databases`. The window sorts by `Sort` and `SortDir*`, whose values
-are **not decoded**, so the file order need not be the order on screen.
+first, then `Databases`. The window sorts by `Sort` and `SortDir0`–`SortDir7`.
+The reader returns these raw, but their meaning is **not decoded**, so the file
+order need not be the order on screen.
 
 **Copies named after a computer.** `DBItems-<computer>.cbini` beside the file is
 a OneDrive sync-conflict copy. The same `-<computer>` suffix appears on unrelated
@@ -133,6 +134,8 @@ reader ignores the copies.
 **Paths** are absolute Windows paths. Whether a database is a cloud-only
 OneDrive placeholder is read from its Windows file attributes
 (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, `_RECALL_ON_OPEN`, `_OFFLINE`), never by
-opening it, so the check starts no download. Through WSL, a non-empty file with
+opening it, so the check starts no download. A 2CBH database is checked through
+every file it is read through: `.2cbh`, `.2cbg` and `.2lid`, and `.2cba` when it
+is there. It is opened only when none of them is offline. Through WSL, a non-empty file with
 no blocks allocated is reported as possibly cloud-only. That heuristic has not
 been confirmed, because no placeholder was available.

@@ -37,7 +37,7 @@ fn sample() -> DbItems {
         .text(0x19, b"Selected", br"C:\Users\u\Documents\ChessBase\MyWork\Old.cbh")
         .int("Sort", 6);
     for i in 0..8 {
-        f.byte(&format!("SortDir{i}"), 0);
+        f.byte(&format!("SortDir{i}"), i % 2);
     }
     f
 }
@@ -49,8 +49,9 @@ fn entries_come_in_file_order_with_their_fields() {
     assert_eq!(names, ["Big Base", "Чорні - репертуар", "Club, 2026 games", "Old", "Downloads (pgn)"]);
     let formats: Vec<Format> = list.entries.iter().map(|e| e.format).collect();
     assert_eq!(formats, [Format::Cbh2, Format::Cbh2, Format::Cbh2, Format::Cbh, Format::Pgn]);
-    let sections: Vec<&str> = list.entries.iter().map(|e| e.section.as_str()).collect();
+    let sections: Vec<&str> = list.entries.iter().map(|e| list.section_of(e).unwrap()).collect();
     assert_eq!(sections, ["2cbg", "2cbg", "2cbg", "Databases", "Databases"]);
+    assert_eq!(list.sections, ["2cbg", "2cbh", "Databases", "Pathes", "Status"]);
     let big = &list.entries[0];
     assert_eq!(big.path, r"C:\Users\u\Documents\ChessBase\Bases\Big.2cbh");
     assert_eq!((big.type_code(), big.games()), (28, 11966514));
@@ -60,6 +61,45 @@ fn entries_come_in_file_order_with_their_fields() {
     assert_eq!(list.reference.as_deref(), Some(r"C:\Users\u\Documents\ChessBase\Bases\Big.2cbh"));
     assert_eq!(list.selected.as_deref(), Some(r"C:\Users\u\Documents\ChessBase\MyWork\Old.cbh"));
     assert_eq!(list.sort, Some(6));
+    assert_eq!(list.sort_dir, [0, 1, 0, 1, 0, 1, 0, 1].map(Some));
+}
+
+#[test]
+fn sort_directions_are_read_only_from_status() {
+    let mut f = DbItems::new();
+    f.section("Other").byte("SortDir0", 9).section("Status").byte("SortDir3", 1).byte("SortDir9", 1);
+    let list = dbitems::parse(&f.bytes()).unwrap();
+    assert_eq!(list.sort_dir, [None, None, None, Some(1), None, None, None, None]);
+    assert_eq!(list.sort, None);
+}
+
+#[test]
+fn an_entry_before_any_section_has_none() {
+    let mut f = DbItems::new();
+    f.database(r"C:\x\A.2cbh", "A", [0, 28, 1, 0, 0, 0]);
+    let list = dbitems::parse(&f.bytes()).unwrap();
+    assert_eq!(list.entries[0].section, None);
+    assert_eq!(list.section_of(&list.entries[0]), None);
+}
+
+/// A section name of 512 KiB over 10,000 entries: each name is stored once, so
+/// what the list holds stays within twice the file's size.
+#[test]
+fn a_long_section_name_is_not_copied_into_every_entry() {
+    let mut f = DbItems::new();
+    f.section(&"s".repeat(512 << 10));
+    for _ in 0..10_000 {
+        f.database("a.2cbh", "", [0, 28, 1, 0, 0, 0]);
+    }
+    let bytes = f.bytes();
+    assert!(bytes.len() as u64 <= dbitems::MAX_FILE);
+    let list = dbitems::parse(&bytes).unwrap();
+    assert_eq!(list.entries.len(), 10_000);
+    assert_eq!(list.sections.len(), 1);
+    let held: usize = list.sections.iter().map(String::len).sum::<usize>()
+        + list.entries.iter().map(|e| e.path.len() + e.name.len()).sum::<usize>();
+    assert!(held <= 2 * bytes.len(), "{held} bytes held for a {}-byte file", bytes.len());
+    assert!(list.entries.iter().all(|e| list.section_of(e).map(str::len) == Some(512 << 10)));
 }
 
 #[test]
@@ -68,7 +108,7 @@ fn every_item_is_read_to_the_end() {
     assert_eq!(items.len(), 5 + 5 + 1 + 3 + 8);
     assert_eq!(items[0].value, Value::Section);
     assert_eq!(items[0].key, "2cbg");
-    assert_eq!(items.last().unwrap().value, Value::Byte(0));
+    assert_eq!(items.last().unwrap().value, Value::Byte(1));
     assert!(matches!(items[2].value, Value::Text { tag: 0x1e, .. }));
 }
 
@@ -162,5 +202,13 @@ fn the_main_file_is_read_and_conflict_copies_are_not() {
     let corrupt = dir("corrupt");
     std::fs::write(corrupt.0.join("DBItems.cbini"), b"not a list").unwrap();
     assert!(dbitems::read(&corrupt.0).is_err());
+
+    // Larger than the bound: refused after reading just past it.
+    let large = dir("large");
+    let mut big = sample();
+    big.section(&"x".repeat(dbitems::MAX_FILE as usize));
+    std::fs::write(large.0.join("DBItems.cbini"), big.bytes()).unwrap();
+    let err = dbitems::read(&large.0).unwrap_err().to_string();
+    assert!(err.contains("more than 1048576 bytes"), "{err}");
     assert!(dbitems::locate(&corrupt.0.join("missing")).is_err());
 }

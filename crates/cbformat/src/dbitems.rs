@@ -4,6 +4,7 @@
 //! The file is a flat list of tagged key-value items; the layout is in
 //! `docs/format-notes.md`, "The database window list".
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::v2::Date;
@@ -12,7 +13,10 @@ use crate::{Error, Result};
 /// The list's file name in the ChessBase documents folder.
 pub const FILE_NAME: &str = "DBItems.cbini";
 const MAGIC: [u8; 4] = [0x0c, 0x0b, 0x0a, 0x0e];
-/// Largest file accepted. The lists examined are under 2 KB.
+/// Largest file accepted. The lists examined are under 2 KB. Decoding is
+/// linear in the input: the decoded strings hold at most twice its bytes (the
+/// Latin-1 fallback turns one byte into two), and each section name is stored
+/// once however many entries it holds.
 pub const MAX_FILE: u64 = 1 << 20;
 
 const TAG_SECTION: u8 = 0xff;
@@ -140,9 +144,10 @@ pub struct Entry {
     /// when the stored title is empty.
     pub name: String,
     pub format: Format,
-    /// The section holding the entry: `2cbg` for 2CBH databases and
-    /// `Databases` for the others in the files examined.
-    pub section: String,
+    /// The section holding the entry, an index into [`DbList::sections`]:
+    /// `2cbg` for 2CBH databases and `Databases` for the others in the files
+    /// examined. `None` before the first section header.
+    pub section: Option<usize>,
     /// The six numbers stored after the title, in order.
     pub numbers: [i64; 6],
 }
@@ -171,38 +176,67 @@ impl Entry {
 pub struct DbList {
     /// The databases, in file order.
     pub entries: Vec<Entry>,
+    /// The section names, in file order, each stored once.
+    pub sections: Vec<String>,
     /// The reference database's stored path (`RefDB` in section `2cbh`).
     pub reference: Option<String>,
     /// The stored path of the database selected in the window (`Selected` in `Status`).
     pub selected: Option<String>,
-    /// The window's sort setting (`Sort` in `Status`); its values are not decoded.
+    /// The window's sort setting (`Sort` in `Status`), raw: its values are
+    /// not yet interpreted.
     pub sort: Option<i32>,
+    /// `SortDir0` to `SortDir7` in `Status`, raw: their values are not yet
+    /// interpreted. With `sort` they should give the order the window shows.
+    pub sort_dir: [Option<u8>; 8],
+}
+
+impl DbList {
+    /// The name of the section holding `entry`.
+    pub fn section_of(&self, entry: &Entry) -> Option<&str> {
+        entry.section.and_then(|i| self.sections.get(i)).map(String::as_str)
+    }
 }
 
 /// Decodes a list file. A string item whose value is a title followed by six
 /// comma-separated integers is a database entry, keyed by its path.
 pub fn parse(bytes: &[u8]) -> Result<DbList> {
     let mut list = DbList::default();
-    let mut section = String::new();
+    let mut section: Option<usize> = None;
     for item in items(bytes)? {
+        let in_section = |name: &str| section.is_some_and(|i| list.sections[i] == name);
         match item.value {
-            Value::Section => section = item.key,
+            Value::Section => {
+                section = Some(list.sections.len());
+                list.sections.push(item.key);
+            }
             Value::Text { text, .. } => {
                 if let Some((title, numbers)) = title_and_numbers(&text) {
                     let name = if title.is_empty() { stem(&item.key).to_owned() } else { title.to_owned() };
                     let format = Format::of(&item.key);
-                    list.entries.push(Entry { path: item.key, name, format, section: section.clone(), numbers });
-                } else if section == "2cbh" && item.key == "RefDB" {
+                    list.entries.push(Entry { path: item.key, name, format, section, numbers });
+                } else if in_section("2cbh") && item.key == "RefDB" {
                     list.reference = Some(text);
-                } else if section == "Status" && item.key == "Selected" {
+                } else if in_section("Status") && item.key == "Selected" {
                     list.selected = Some(text);
                 }
             }
-            Value::Int(v) if section == "Status" && item.key == "Sort" => list.sort = Some(v),
+            Value::Int(v) if in_section("Status") && item.key == "Sort" => list.sort = Some(v),
+            Value::Byte(v) if in_section("Status") => {
+                if let Some(slot) = sort_dir_slot(&item.key) {
+                    list.sort_dir[slot] = Some(v);
+                }
+            }
             _ => {}
         }
     }
     Ok(list)
+}
+
+/// `SortDir0` to `SortDir7` as 0 to 7.
+fn sort_dir_slot(key: &str) -> Option<usize> {
+    let digit = key.strip_prefix("SortDir")?;
+    let slot: usize = digit.parse().ok().filter(|_| digit.len() == 1)?;
+    (slot < 8).then_some(slot)
 }
 
 /// Splits `title,n1,…,n6`. The title may itself contain commas, so the six
@@ -253,14 +287,23 @@ pub fn locate(dir: &Path) -> Result<Located> {
 }
 
 /// Reads the list of a ChessBase documents folder; `None` when it has none.
+/// The file is opened once and at most [`MAX_FILE`] + 1 bytes are read, so a
+/// file that grows after it was found is still read within the bound.
 pub fn read(dir: &Path) -> Result<Option<DbList>> {
     let Some(file) = locate(dir)?.file else { return Ok(None) };
-    let io = |e| Error::Io(file.clone(), e);
-    let len = std::fs::metadata(&file).map_err(io)?.len();
-    if len > MAX_FILE {
-        return Err(Error::Format(format!("{FILE_NAME}: {len} bytes, more than {MAX_FILE}")));
+    let opened = std::fs::File::open(&file).map_err(|e| Error::Io(file.clone(), e))?;
+    parse(&read_capped(opened, &file)?).map(Some)
+}
+
+/// Reads at most [`MAX_FILE`] + 1 bytes of `source`, the file `path`; more
+/// than [`MAX_FILE`] is an error.
+fn read_capped(source: impl Read, path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    source.take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|e| Error::Io(path.to_owned(), e))?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err(Error::Format(format!("{FILE_NAME}: more than {MAX_FILE} bytes")));
     }
-    parse(&std::fs::read(&file).map_err(io)?).map(Some)
+    Ok(bytes)
 }
 
 /// Windows file attributes that mark a cloud-only placeholder: the data is not
@@ -306,6 +349,26 @@ mod tests {
         assert!(is_cloud_only(0x0040_0000 | 0x0010_0000 | 0x0400)); // recall on data access, unpinned
         assert!(is_cloud_only(0x1000));
         assert!(!is_cloud_only(0x20));
+    }
+
+    #[test]
+    fn reads_are_capped_whatever_the_source_holds() {
+        // An endless source stands for a file that grows while it is read.
+        let path = Path::new(FILE_NAME);
+        let err = read_capped(std::io::repeat(0), path).unwrap_err().to_string();
+        assert!(err.contains("more than 1048576 bytes"), "{err}");
+        let exact = read_capped(std::io::repeat(7).take(MAX_FILE), path).unwrap();
+        assert_eq!(exact.len() as u64, MAX_FILE);
+    }
+
+    #[test]
+    fn sort_dir_keys() {
+        assert_eq!(sort_dir_slot("SortDir0"), Some(0));
+        assert_eq!(sort_dir_slot("SortDir7"), Some(7));
+        assert_eq!(sort_dir_slot("SortDir8"), None);
+        assert_eq!(sort_dir_slot("SortDir07"), None);
+        assert_eq!(sort_dir_slot("SortDir+1"), None);
+        assert_eq!(sort_dir_slot("Sort"), None);
     }
 
     #[test]
