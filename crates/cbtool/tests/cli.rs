@@ -1,4 +1,4 @@
-//! `cbtool` never writes over the database it is reading.
+//! `cbtool` on the command line; it never writes over the database it is reading.
 
 use std::path::Path;
 use std::process::Command;
@@ -217,4 +217,27 @@ fn databases_never_opens_a_pipe_or_a_directory() {
     std::fs::remove_file(&cbg).unwrap();
     std::fs::create_dir(&cbg).unwrap();
     assert_eq!(row(), ["1", "2cbh", "unreadable", "3", "-", "Db"]);
+}
+
+/// A classic database is verified with the same report as a 2CBH one.
+#[test]
+fn verify_and_info_read_classic_databases() {
+    use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
+    let mut b = Builder::new();
+    for moves in [&["e2e4", "e7e5"][..], &["d2d4", "--", "c2c4"][..]] {
+        let mut toks: Vec<Tok<'_>> = moves.iter().map(|m| Tok::Mv(m)).collect();
+        toks.push(Tok::End);
+        b.game(&move_record(0, None, None, &encode(&chesscore::Board::startpos(), &toks, 0, false)));
+    }
+    let f = b.write("cli-classic");
+    let run = |cmd: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg(cmd).arg(f.dir().join("db.cbh")).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let v = run("verify");
+    for line in ["games              2", "null moves         1", "all plies          5", "failures           0"] {
+        assert!(v.contains(line), "{v}");
+    }
+    assert!(run("info").contains("players        2"));
 }

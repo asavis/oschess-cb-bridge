@@ -139,3 +139,66 @@ every file it is read through: `.2cbh`, `.2cbg` and `.2lid`, and `.2cba` when it
 is there. It is opened only when none of them is offline. Through WSL, a non-empty file with
 no blocks allocated is reported as possibly cloud-only. That heuristic has not
 been confirmed, because no placeholder was available.
+
+# The classic format (`.cbh`)
+
+`cbformat::cbh` reads the previous ChessBase format, the `.cbh` family, from
+Morphy's [`format/v1`](https://github.com/Yarin78/morphy/tree/master/format/v1)
+description, which has no licence either: no text or code is copied from it.
+The translation tables of the move encodings are the facts the format needs;
+they are taken from the description as data, and a test checks each is a
+permutation.
+
+The reader was checked against:
+
+- six databases that exist in both formats: five weekly Mega updates of 2026
+  (28,488 games) and a user database (350 games). For every game of every pair
+  the whole move tree (every move of every line in stored order, whether it
+  lies on the main line, and where each variation opens and closes) is identical to the 2CBH copy's, and so are
+  the start position, result, ECO, date, ratings, round, players and
+  tournament, apart from the names listed below. `cbtool verify` prints the
+  same counts for both copies of each pair;
+- the first 4,971 records of a Mega Database 2026 converted to `.cbh` by
+  ChessBase and stopped part way: its 4,964 game trees, among them 422 set-up
+  positions and 157 null moves, equal the 2CBH Mega's first 4,964;
+- 245 databases that exist only in `.cbh` (40,635 games, 31,196 of them from
+  set-up positions, 1,628 guiding texts, 6,854 null moves): 244 verify with no
+  failure; the one that does not is damaged (below).
+
+## Findings
+
+- **Format version.** The byte at 0x05 of the `.cbh` header is 5 in the six
+  paired databases, the partial Mega and one other, and 1 in the remaining
+  244 examined; the description gives 1. The reader does not check it. The header's in-use size at 0x01 is 44 or 36, and the
+  `.cbg` header 26 or 10 bytes, as described.
+- **Encoding modes.** Every game examined uses mode 0. The reader supports the
+  modes whose tables the description gives: 0, 4 and 10 (compact) and 5
+  (simple); any other mode is an error naming it.
+- **Stray bytes after the end.** Two games of one database carry 3 and 7 bytes
+  after the final end-of-line byte, inside their records. The tree before them
+  is complete, and the reader ignores them.
+- **Castling without a stored right.** Four set-up games in two databases
+  castle although the stored castling byte lacks that right: 0 in an older
+  database, `0x0b` in another. The reader starts such a game with the right its
+  castling uses added, when the king and the rook stand where the right needs
+  them (`cbh::start_as_played`); otherwise the move is an error. The stored
+  byte itself is still reported by `GameMoves::start`.
+- **Text encoding.** The description says ISO 8859-1. Names are read as
+  Windows-1252, which ChessBase, a Windows program, means by the bytes
+  0x80-0x9f. A database ChessBase converted from 2CBH holds names as UTF-8
+  instead: 96 player and tournament names in the partial Mega. A field whose
+  bytes are valid UTF-8 is read as UTF-8; a UTF-8 text cut at the field's width
+  loses its incomplete last character.
+- **Names that differ from the 2CBH copy** do so for two reasons only. Names
+  with characters that no single-byte code page holds are stored in some other
+  form (25 in the user database). Names longer than their field are cut
+  at its width (63 in the user database, 32 in the partial Mega).
+- **2CBH analyses** are stored as ordinary games in a converted classic
+  database (5 in the partial Mega); their move trees are the same.
+- **Damage.** One old database fails on 3 of its 385 games: a game whose moves
+  stop without an end marker, a game whose record head gives size 0 (it starts
+  where the previous game's record ends), and a deleted game whose record
+  claims mode 62 and 8 MB past the end of the file. The reader reports each as
+  an error.
+- **Large files.** Offsets in `.cbh` are 32-bit; a `.cbg` larger than 4 GiB,
+  which needs the 64-bit offsets of `.cbj`, is refused when opened.

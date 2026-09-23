@@ -33,6 +33,21 @@ pub enum GameResult {
 }
 
 impl GameResult {
+    /// The result byte of a game record, as both formats store it.
+    pub fn from_field(v: u8) -> GameResult {
+        match v {
+            0 => GameResult::BlackWins,
+            1 => GameResult::Draw,
+            2 => GameResult::WhiteWins,
+            3 => GameResult::Line,
+            4 => GameResult::BlackWinsForfeit,
+            5 => GameResult::DrawForfeit,
+            6 => GameResult::WhiteWinsForfeit,
+            7 => GameResult::BothLost,
+            r => GameResult::Unknown(r),
+        }
+    }
+
     pub fn pgn(self) -> &'static str {
         match self {
             GameResult::BlackWins | GameResult::BlackWinsForfeit => "0-1",
@@ -112,17 +127,7 @@ impl Record {
         le_i64(&self.b, 0x28)
     }
     pub fn result(&self) -> GameResult {
-        match self.b[0x58] {
-            0 => GameResult::BlackWins,
-            1 => GameResult::Draw,
-            2 => GameResult::WhiteWins,
-            3 => GameResult::Line,
-            4 => GameResult::BlackWinsForfeit,
-            5 => GameResult::DrawForfeit,
-            6 => GameResult::WhiteWinsForfeit,
-            7 => GameResult::BothLost,
-            r => GameResult::Unknown(r),
-        }
+        GameResult::from_field(self.b[0x58])
     }
     pub fn round(&self) -> i16 {
         le_i16(&self.b, 0x5a)
@@ -141,12 +146,7 @@ impl Record {
     }
     /// The ECO field: an opening code, a Chess960 start position, or nothing.
     pub fn eco(&self) -> Eco {
-        match le_u16(&self.b, 0x80) {
-            0 => Eco::None,
-            v @ 128..=64127 => Eco::Code { code: v / 128 - 1, sub: (v % 128) as u8 },
-            v @ 64576.. => Eco::Chess960(v - 64576),
-            v => Eco::Invalid(v),
-        }
+        Eco::from_field(le_u16(&self.b, 0x80))
     }
     pub fn flags(&self) -> u32 {
         le_u32(&self.b, 0x84)
@@ -176,6 +176,16 @@ pub enum Eco {
 }
 
 impl Eco {
+    /// The ECO field of a game record, as both formats store it.
+    pub fn from_field(v: u16) -> Eco {
+        match v {
+            0 => Eco::None,
+            v @ 128..=64127 => Eco::Code { code: v / 128 - 1, sub: (v % 128) as u8 },
+            v @ 64576.. => Eco::Chess960(v - 64576),
+            v => Eco::Invalid(v),
+        }
+    }
+
     /// The PGN `ECO` tag value, for an opening code.
     pub fn pgn(self) -> Option<String> {
         match self {

@@ -1,4 +1,5 @@
-//! `cbtool`: inspect, verify and export ChessBase 2CBH databases.
+//! `cbtool`: inspect, verify and export ChessBase 2CBH databases; inspect
+//! and verify classic CBH ones.
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -13,9 +14,12 @@ use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::replay::walk_tree;
 use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
 
+mod classic;
+
 const USAGE: &str = "usage:
   cbtool info   <db>
   cbtool verify <db> [--limit N]           decode and replay every game and analysis
+                                           (<db> may be a classic .cbh database)
   cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)
   cbtool databases <dir>                   the databases ChessBase's database window lists
                                            (dir: the ChessBase documents folder)
@@ -47,6 +51,9 @@ fn main() -> ExitCode {
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn info(path: &str) -> AnyResult<bool> {
+    if classic::is_classic(path) {
+        return classic::info(path);
+    }
     let db = Database::open(path)?;
     println!("records        {}", db.record_count());
     println!("format version {}", db.format_version());
@@ -58,7 +65,7 @@ fn info(path: &str) -> AnyResult<bool> {
 }
 
 #[derive(Default)]
-struct Stats {
+pub(crate) struct Stats {
     games: u64,
     texts: u64,
     analyses: u64,
@@ -178,6 +185,9 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
         [] => None,
         _ => return Err(USAGE.into()),
     };
+    if classic::is_classic(path) {
+        return classic::verify(path, limit);
+    }
     let db = Database::open(path)?;
     let n = limit.map_or(db.record_count(), |l| l.min(db.record_count()));
     let failures: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
@@ -202,6 +212,12 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
         });
     }
     let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    Ok(report(n, started, &stats, failures))
+}
+
+/// Prints the statistics of a `verify` run and its first failures; whether
+/// every record passed.
+fn report(n: u32, started: Instant, stats: &Stats, failures: Mutex<Vec<(u32, String)>>) -> bool {
     let secs = started.elapsed().as_secs_f64();
     println!("records verified   {n} in {secs:.1} s ({:.0} records/s)", n as f64 / secs);
     println!("games              {}", stats.games);
@@ -220,12 +236,12 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
         stats.promo_captures, stats.promo_captures_distinct
     );
     println!("failures           {}", stats.failures);
-    let mut f = failures.into_inner().unwrap();
+    let mut f = failures.into_inner().unwrap_or_else(|e| e.into_inner());
     f.sort();
     for (id, msg) in &f {
         println!("  game {id}: {msg}");
     }
-    Ok(stats.failures == 0)
+    stats.failures == 0
 }
 
 /// Refuses an output path that is one of the database's own files, by name or

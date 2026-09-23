@@ -68,6 +68,11 @@ impl TempDb {
     pub fn base(&self) -> PathBuf {
         self.dir.join("db")
     }
+
+    /// Takes ownership of `dir`, which is removed on drop.
+    pub(crate) fn at(dir: PathBuf) -> TempDb {
+        TempDb { dir }
+    }
 }
 
 impl Drop for TempDb {
