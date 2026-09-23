@@ -18,3 +18,8 @@ fixture = []
 cbformat = { path = ".", features = ["fixture"] }
 # Test oracle only (examples/oracle.rs): never a dependency of the shipped code.
 cozy-chess = "0.3"
+
+# Its PGN reading has unit tests, which `cargo test` runs.
+[[example]]
+name = "compare_chessbase_pgn"
+test = true
