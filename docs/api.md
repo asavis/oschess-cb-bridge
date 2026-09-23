@@ -62,9 +62,16 @@ Vary: Origin
 
 and, when the preflight carries `Access-Control-Request-Private-Network: true`,
 also `Access-Control-Allow-Private-Network: true`. A preflight from any other
-origin is answered `403 forbidden_origin` without CORS headers. Every `GET`
-response to an allowed origin carries `Access-Control-Allow-Origin` and
-`Vary: Origin` as well.
+origin is answered `403 forbidden_origin` without CORS headers. Every other
+response to an allowed origin, errors included, carries
+
+```
+Access-Control-Allow-Origin: <the request's Origin>
+Access-Control-Expose-Headers: Retry-After
+Vary: Origin
+```
+
+so that the page can read the error body and the retry delay.
 
 Chrome and Edge, from version 142, let a public site reach `127.0.0.1` only
 after the user grants the **Local Network Access** permission for that site. No
@@ -96,7 +103,8 @@ with them.
 | 409 | `database_unavailable` | The database is not `ready`; `state` gives its state |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
-| 422 | `not_a_game` | The record is a guiding text, which has no PGN |
+| 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
+| 422 | `unreadable_game` | The game's records are damaged and stay so between reads; `reason` says how, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
@@ -118,10 +126,19 @@ with them.
 ChessBase writes a database while the bridge reads it, and offers no lock or
 snapshot to coordinate with. The bridge therefore promises:
 
-- **A game is never served mixed.** It is read optimistically: its header
-  record and the database's generation are checked before and after its move
-  and annotation records are read. If either changed, the read is retried up to
-  three times, and then answered `503 database_changing`.
+- **A game read during a detected change is retried.** A game is read
+  optimistically: its header record and the database's generation are checked
+  before and after its move and annotation records are read. If either
+  changed, the read is retried up to three times, and then answered
+  `503 database_changing`.
+- **That detection is best effort.** ChessBase saves a game in several steps
+  (the move record, the header, the annotations), and a read that falls
+  entirely between two of those steps sees nothing change. It can then serve a
+  game that combines the new moves with the old header, for example the old
+  result. Every served game is still a valid game: frame checksums and the full
+  move check apply to every read. A read after the save has finished is
+  correct. The bridge cannot do better without a lock that ChessBase does not
+  offer.
 - **A list window is as stored at the moment it was read.** A window read while
   ChessBase edits a game may show one row from before that edit and another
   from after it; the next request shows the new state.
@@ -136,7 +153,7 @@ snapshot to coordinate with. The bridge therefore promises:
 ```json
 {
   "bridge": { "version": "0.4.0", "api": 1 },
-  "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 0, "unsupported": 2 }
+  "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 0, "unsupported": 2, "unreadable": 0 }
 }
 ```
 
@@ -173,7 +190,7 @@ by those added in `bridge.toml`.
 |---|---|
 | `name` | The file name without extension, as ChessBase shows it |
 | `format` | `2cbh`, `cbh` or `pgn`; another value is possible later |
-| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone); `cloudOnly` (a OneDrive file not on this computer: make it available offline); `unsupported` (a format the bridge does not serve) |
+| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone); `cloudOnly` (a OneDrive file not on this computer: make it available offline); `unsupported` (a format the bridge does not serve); `unreadable` (the files are present but cannot be opened: damaged, or locked by another program) |
 | `records` | Games, guiding texts and analyses; present when `ready` |
 | `generation` | See above; present when `ready` |
 
@@ -263,7 +280,8 @@ One game as PGN.
 | `annotations` | `none`, `complete`, or `incomplete` when an annotation of unknown layout stopped decoding; the PGN then has the annotations before it |
 | `unreadableAnnotation` | With `incomplete`: the annotation type code, a number |
 
-A guiding text is answered `422 not_a_game`. Deleted games are served.
+A guiding text or an analysis is answered `422 not_a_game`, and a game whose
+records are damaged `422 unreadable_game`. Deleted games are served.
 
 ### `GET /v1/databases/{id}/suggest` (planned, #21)
 
