@@ -35,10 +35,17 @@ fn back_rank(c: CColor) -> Rank {
     }
 }
 
+/// The standard start position, built once: `Board::default()` builds it
+/// from scratch through `BoardBuilder` every time.
+fn standard_start() -> &'static Board {
+    static START: std::sync::OnceLock<Board> = std::sync::OnceLock::new();
+    START.get_or_init(Board::default)
+}
+
 /// The board a game starts from.
 pub fn start_board(start: &Start) -> Result<Board> {
     match start {
-        Start::Standard => Ok(Board::default()),
+        Start::Standard => Ok(standard_start().clone()),
         Start::Chess960(n) if *n < 960 => Ok(Board::chess960_startpos(*n as u32)),
         Start::Chess960(n) => Err(Error::Format(format!("Chess960 position {n}"))),
         Start::Setup(s) => setup_board(s),
@@ -120,17 +127,17 @@ pub fn to_move(board: &Board, word: u16) -> std::result::Result<Move, String> {
             if board.side_to_move() != c {
                 return Err(format!("{word:#06x}: {c:?} move with {:?} to move", board.side_to_move()));
             }
-            if board.piece_on(from) != Some(p) || board.color_on(from) != Some(c) {
+            // Bitboard tests rather than piece_on, which scans every piece type.
+            if !board.colored_pieces(c, p).has(from) {
                 return Err(format!("{word:#06x}: no {c:?} {p:?} on {from}"));
             }
             // cozy-chess encodes castling as the king taking its own rook, so a
             // normal move word onto a friendly piece must be refused here or
             // is_legal would accept it as castling.
-            if board.color_on(to) == Some(c) {
+            if board.colors(c).has(to) {
                 return Err(format!("{word:#06x}: {from}{to} lands on a {c:?} piece"));
             }
-            let victim = board.piece_on(to);
-            let expected = match captured {
+            let named = match captured {
                 Captured::Nothing | Captured::EnPassant => None,
                 Captured::Queen => Some(CPiece::Queen),
                 Captured::Knight => Some(CPiece::Knight),
@@ -138,19 +145,34 @@ pub fn to_move(board: &Board, word: u16) -> std::result::Result<Move, String> {
                 Captured::Rook => Some(CPiece::Rook),
                 Captured::Pawn => Some(CPiece::Pawn),
             };
-            if victim != expected {
+            let holds_named = match named {
+                None => !board.occupied().has(to),
+                Some(v) => board.colored_pieces(!c, v).has(to),
+            };
+            if !holds_named {
+                let victim = board.piece_on(to);
                 return Err(format!("{word:#06x}: {from}{to} names capture {captured:?}, square holds {victim:?}"));
             }
             if captured == Captured::EnPassant && board.en_passant() != Some(to.file()) {
                 return Err(format!("{word:#06x}: en passant {from}{to} not available"));
             }
-            let mv = Move { from, to, promotion: promotion.map(piece) };
-            if !board.is_legal(mv) {
-                return Err(format!("{word:#06x}: illegal {mv}"));
-            }
+            let mv = legal_move(board, from, to, promotion.map(piece))
+                .ok_or_else(|| format!("{word:#06x}: illegal {from}{to}"))?;
             Ok(mv)
         }
     }
+}
+
+/// `Some(move)` when it is legal on `board`.
+///
+/// A function of its own so that the three-byte `Move` is assembled in a
+/// register from its parts. Built inline in `to_move`, it went through the
+/// stack as two narrower stores read back by one wider load, and that failed
+/// store forwarding stalled every move of a replay.
+#[inline(never)]
+fn legal_move(board: &Board, from: Square, to: Square, promotion: Option<CPiece>) -> Option<Move> {
+    let mv = Move { from, to, promotion };
+    board.is_legal(mv).then_some(mv)
 }
 
 /// Plays `word` on `board`, including the null move.
@@ -174,14 +196,17 @@ pub struct TreeStats {
 
 /// Receives the moves of a tree in stored order from [`walk`].
 ///
-/// The tree arrives as a depth-first walk: `play` for each move, `branch`
-/// when the move just played has an alternative still to come, and `resume`
-/// when a line ends and the walk returns to the position before the move whose
-/// `branch` is most recent. The walk has already checked every move against its
-/// board and the shape of the tree, so a visitor needs no checks of its own.
+/// The tree arrives as a depth-first walk: `play` and then `played` for each
+/// move, `branch` when the move just played has an alternative still to come,
+/// and `resume` when a line ends and the walk returns to the position before
+/// the move whose `branch` is most recent. The walk has already checked every
+/// move against its board and the shape of the tree, so a visitor needs no
+/// checks of its own.
 pub trait TreeVisitor {
-    /// A move (`None` for a null move) played from `before`.
+    /// A move (`None` for a null move) about to be played from `before`.
     fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool);
+    /// The position the move announced by the last `play` produced.
+    fn played(&mut self, _after: &Board) {}
     fn branch(&mut self) {}
     fn resume(&mut self) {}
 }
@@ -204,23 +229,45 @@ pub fn walk_tree(moves: &GameMoves<'_>, visit: impl FnMut(&Board, Option<Move>, 
 /// Walks every line of the tree, checking each move and the tree's shape: an
 /// alternative marker must follow a move, the tree must end with its final
 /// end-of-line marker, and nothing may follow that.
+///
+/// Moves are played in place on one board. The position before a move is
+/// copied only when an alternative marker follows it, which is the one time it
+/// is needed again: a copy per move costs as much as the move itself.
 pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<TreeStats> {
     let mut board = start_board(&moves.start()?)?;
     let mut stack: Vec<Board> = Vec::new();
-    let mut before_last: Option<Board> = None;
+    // The position before the last move, kept when an alternative marker follows it.
+    let mut saved: Option<Board> = None;
     let mut stats = TreeStats { lines: 1, ..Default::default() };
     let mut main = true;
     let mut ended = false;
-    for token in moves.tokens() {
+    let mut tokens = moves.tokens().peekable();
+    while let Some(token) = tokens.next() {
         if ended {
             return Err(Error::Format("words after the final end of line".into()));
         }
         match token {
             Token::Move(w) => {
-                let before = board.clone();
-                let mv = play(&mut board, w).map_err(|reason| Error::Move { ply: stats.total_plies + 1, reason })?;
-                visitor.play(&before, mv, main);
-                before_last = Some(before);
+                let ply = stats.total_plies + 1;
+                let step = if w == movetable::NULL_MOVE {
+                    let next =
+                        board.null_move().ok_or(Error::Move { ply, reason: "null move while in check".into() })?;
+                    Step::Null(next)
+                } else {
+                    Step::Normal(to_move(&board, w).map_err(|reason| Error::Move { ply, reason })?)
+                };
+                saved = (tokens.peek() == Some(&Token::Alternative)).then(|| board.clone());
+                match step {
+                    Step::Normal(mv) => {
+                        visitor.play(&board, Some(mv), main);
+                        board.play_unchecked(mv);
+                    }
+                    Step::Null(next) => {
+                        visitor.play(&board, None, main);
+                        board = next;
+                    }
+                }
+                visitor.played(&board);
                 stats.total_plies += 1;
                 if main {
                     stats.main_line_plies += 1;
@@ -228,14 +275,13 @@ pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<Tre
             }
             Token::Alternative => {
                 // `take` leaves None, so a second marker after the same move is refused too.
-                let b =
-                    before_last.take().ok_or_else(|| Error::Format("alternative marker not after a move".into()))?;
+                let b = saved.take().ok_or_else(|| Error::Format("alternative marker not after a move".into()))?;
                 stack.push(b);
                 visitor.branch();
             }
             Token::EndOfLine => {
                 main = false;
-                before_last = None;
+                saved = None;
                 match stack.pop() {
                     Some(b) => {
                         board = b;
@@ -251,4 +297,10 @@ pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<Tre
         return Err(Error::Format("move tree not terminated".into()));
     }
     Ok(stats)
+}
+
+enum Step {
+    Normal(Move),
+    /// A null move, with the position it produces.
+    Null(Board),
 }

@@ -244,17 +244,39 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
         }
         None => Box::new(std::io::stdout().lock()),
     };
-    let mut w = BufWriter::new(sink);
+    let mut w = BufWriter::with_capacity(1 << 20, sink);
     let mut ok = true;
-    for id in ids {
-        match cbformat::pgn::game(&db, id) {
-            Ok(text) => writeln!(w, "{text}")?,
-            Err(e) => {
-                eprintln!("game {id}: {e}");
-                ok = false;
+    // Games are rendered in parallel, a batch at a time, and written in id
+    // order; the batch bounds how much rendered text is held at once.
+    for batch in ids.chunks(PGN_BATCH) {
+        let rendered: Vec<(String, Vec<String>)> = batch
+            .par_chunks(PGN_CHUNK)
+            .map(|chunk| {
+                let (mut text, mut errors) = (String::new(), Vec::new());
+                for &id in chunk {
+                    match cbformat::pgn::game(&db, id) {
+                        Ok(game) => {
+                            text.push_str(&game);
+                            text.push('\n');
+                        }
+                        Err(e) => errors.push(format!("game {id}: {e}")),
+                    }
+                }
+                (text, errors)
+            })
+            .collect();
+        for (text, errors) in rendered {
+            w.write_all(text.as_bytes())?;
+            for e in &errors {
+                eprintln!("{e}");
             }
+            ok &= errors.is_empty();
         }
     }
     w.flush()?;
     Ok(ok)
 }
+
+/// Games rendered per parallel task, and per batch held in memory before writing.
+const PGN_CHUNK: usize = 1_024;
+const PGN_BATCH: usize = 128 * PGN_CHUNK;

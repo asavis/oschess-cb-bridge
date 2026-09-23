@@ -1,6 +1,8 @@
 //! PGN output: standard algebraic notation and a game's full move tree.
 
-use cozy_chess::{Board, Color as CColor, GameStatus, Move, Piece, Square};
+use std::fmt::Write;
+
+use cozy_chess::{Board, Color as CColor, Move, Piece, Square, get_bishop_moves, get_knight_moves, get_rook_moves};
 
 use crate::replay::{self, TreeVisitor, start_board};
 use crate::v2::{Database, GameMoves, Record, RecordKind, Start};
@@ -20,60 +22,82 @@ fn piece_letter(p: Piece) -> &'static str {
 /// The SAN of a legal move `mv` in `board`. Castling is written `O-O` /
 /// `O-O-O` (cozy-chess encodes it as the king taking its own rook).
 pub fn san(board: &Board, mv: Move) -> String {
-    let us = board.side_to_move();
-    let piece = board.piece_on(mv.from).expect("legal move has a piece on its origin");
-    let mut s = String::new();
-    if piece == Piece::King && board.color_on(mv.to) == Some(us) {
-        s.push_str(if mv.to.file() > mv.from.file() { "O-O" } else { "O-O-O" });
-    } else {
-        let capture = board.color_on(mv.to) == Some(!us) || (piece == Piece::Pawn && mv.from.file() != mv.to.file());
-        if piece == Piece::Pawn {
-            if capture {
-                s.push(file_char(mv.from));
-            }
-        } else {
-            s.push_str(piece_letter(piece));
-            // Other pieces of the same kind that can also reach the destination.
-            let mut same_file = false;
-            let mut same_rank = false;
-            let mut ambiguous = false;
-            board.generate_moves_for(board.colored_pieces(us, piece), |pm| {
-                for m in pm {
-                    if m.to == mv.to && m.from != mv.from {
-                        ambiguous = true;
-                        same_file |= m.from.file() == mv.from.file();
-                        same_rank |= m.from.rank() == mv.from.rank();
-                    }
-                }
-                false
-            });
-            if ambiguous {
-                if !same_file {
-                    s.push(file_char(mv.from));
-                } else if !same_rank {
-                    s.push(rank_char(mv.from));
-                } else {
-                    s.push(file_char(mv.from));
-                    s.push(rank_char(mv.from));
-                }
-            }
-        }
-        if capture {
-            s.push('x');
-        }
-        s.push(file_char(mv.to));
-        s.push(rank_char(mv.to));
-        if let Some(p) = mv.promotion {
-            s.push('=');
-            s.push_str(piece_letter(p));
-        }
-    }
+    let mut s = String::with_capacity(8);
+    write_san_body(&mut s, board, mv);
     let mut after = board.clone();
     after.play_unchecked(mv);
-    if !after.checkers().is_empty() {
-        s.push(if after.status() == GameStatus::Won { '#' } else { '+' });
-    }
+    write_check_suffix(&mut s, &after);
     s
+}
+
+/// Everything of a SAN but the check or mate suffix, which needs the position
+/// after the move.
+fn write_san_body(s: &mut String, board: &Board, mv: Move) {
+    let us = board.side_to_move();
+    let Some(piece) = board.piece_on(mv.from) else { return };
+    if piece == Piece::King && board.colors(us).has(mv.to) {
+        s.push_str(if mv.to.file() > mv.from.file() { "O-O" } else { "O-O-O" });
+        return;
+    }
+    let capture = board.colors(!us).has(mv.to) || (piece == Piece::Pawn && mv.from.file() != mv.to.file());
+    if piece == Piece::Pawn {
+        if capture {
+            s.push(file_char(mv.from));
+        }
+    } else {
+        s.push_str(piece_letter(piece));
+        disambiguate(s, board, piece, mv);
+    }
+    if capture {
+        s.push('x');
+    }
+    s.push(file_char(mv.to));
+    s.push(rank_char(mv.to));
+    if let Some(p) = mv.promotion {
+        s.push('=');
+        s.push_str(piece_letter(p));
+    }
+}
+
+/// Adds the origin file, rank or both when another piece of the same kind can
+/// also move legally to the destination. The candidates are the pieces that
+/// attack the destination, so the common unambiguous move costs one lookup and
+/// no move generation.
+fn disambiguate(s: &mut String, board: &Board, piece: Piece, mv: Move) {
+    let occupied = board.occupied();
+    let reach = match piece {
+        Piece::Knight => get_knight_moves(mv.to),
+        Piece::Bishop => get_bishop_moves(mv.to, occupied),
+        Piece::Rook => get_rook_moves(mv.to, occupied),
+        Piece::Queen => get_bishop_moves(mv.to, occupied) | get_rook_moves(mv.to, occupied),
+        Piece::King | Piece::Pawn => return,
+    };
+    let others = board.colored_pieces(board.side_to_move(), piece) & reach & !mv.from.bitboard();
+    let (mut ambiguous, mut same_file, mut same_rank) = (false, false, false);
+    for from in others {
+        if board.is_legal(Move { from, to: mv.to, promotion: None }) {
+            ambiguous = true;
+            same_file |= from.file() == mv.from.file();
+            same_rank |= from.rank() == mv.from.rank();
+        }
+    }
+    if ambiguous {
+        if !same_file {
+            s.push(file_char(mv.from));
+        } else if !same_rank {
+            s.push(rank_char(mv.from));
+        } else {
+            s.push(file_char(mv.from));
+            s.push(rank_char(mv.from));
+        }
+    }
+}
+
+fn write_check_suffix(s: &mut String, after: &Board) {
+    if !after.checkers().is_empty() {
+        // In check with no legal move is mate.
+        s.push(if after.generate_moves(|_| true) { '+' } else { '#' });
+    }
 }
 
 fn file_char(sq: Square) -> char {
@@ -84,11 +108,23 @@ fn rank_char(sq: Square) -> char {
     (b'1' + sq.rank() as u8) as char
 }
 
+const NONE: u32 = u32::MAX;
+
+/// A move of the tree. Children form a linked list, and every SAN lives in one
+/// shared buffer, so building the tree allocates nothing per move.
 struct Node {
-    san: String,
+    san: (u32, u32),
     fullmove: u16,
     white: bool,
-    children: Vec<usize>,
+    first_child: u32,
+    last_child: u32,
+    next_sibling: u32,
+}
+
+impl Node {
+    fn new(san: (u32, u32), fullmove: u16, white: bool) -> Node {
+        Node { san, fullmove, white, first_child: NONE, last_child: NONE, next_sibling: NONE }
+    }
 }
 
 /// The move tree of a game as PGN movetext, without the result.
@@ -99,7 +135,8 @@ pub fn movetext(db: &Database, record: &Record<'_>) -> Result<String> {
 /// The move tree of a parsed move record as PGN movetext.
 pub fn movetext_of(moves: &GameMoves<'_>) -> Result<String> {
     let mut tree = TreeBuilder {
-        nodes: vec![Node { san: String::new(), fullmove: 0, white: true, children: vec![] }],
+        nodes: vec![Node::new((0, 0), 0, true)],
+        sans: String::new(),
         cur: 0,
         parent_of_last: 0,
         branches: Vec::new(),
@@ -107,30 +144,44 @@ pub fn movetext_of(moves: &GameMoves<'_>) -> Result<String> {
     // walk() checks every move and the tree's shape, so a damaged record is an
     // error here exactly as it is in `cbtool verify`.
     replay::walk(moves, &mut tree)?;
-    let mut out = String::new();
-    emit(&tree.nodes, &mut out);
-    Ok(out.trim_end().to_string())
+    let mut out = String::with_capacity(tree.sans.len() + 4 * tree.nodes.len());
+    emit(&tree.nodes, &tree.sans, &mut out);
+    let len = out.trim_end().len();
+    out.truncate(len);
+    Ok(out)
 }
 
 struct TreeBuilder {
     nodes: Vec<Node>,
-    cur: usize,
-    parent_of_last: usize,
-    branches: Vec<usize>,
+    sans: String,
+    cur: u32,
+    parent_of_last: u32,
+    branches: Vec<u32>,
 }
 
 impl TreeVisitor for TreeBuilder {
     fn play(&mut self, before: &Board, mv: Option<Move>, _main_line: bool) {
-        let san = match mv {
-            Some(mv) => san(before, mv),
-            None => "--".to_string(),
-        };
+        let start = self.sans.len() as u32;
+        match mv {
+            Some(mv) => write_san_body(&mut self.sans, before, mv),
+            None => self.sans.push_str("--"),
+        }
         let white = before.side_to_move() == CColor::White;
-        self.nodes.push(Node { san, fullmove: before.fullmove_number(), white, children: vec![] });
-        let id = self.nodes.len() - 1;
-        self.nodes[self.cur].children.push(id);
+        let id = self.nodes.len() as u32;
+        self.nodes.push(Node::new((start, self.sans.len() as u32), before.fullmove_number(), white));
+        let cur = self.cur as usize;
+        match self.nodes[cur].last_child {
+            NONE => self.nodes[cur].first_child = id,
+            last => self.nodes[last as usize].next_sibling = id,
+        }
+        self.nodes[cur].last_child = id;
         self.parent_of_last = self.cur;
         self.cur = id;
+    }
+    fn played(&mut self, after: &Board) {
+        // The suffix extends the SAN just written, which ends the buffer.
+        write_check_suffix(&mut self.sans, after);
+        self.nodes[self.cur as usize].san.1 = self.sans.len() as u32;
     }
     fn branch(&mut self) {
         self.branches.push(self.parent_of_last);
@@ -143,44 +194,57 @@ impl TreeVisitor for TreeBuilder {
 
 /// Writes the tree below the root as movetext. Iterative, so that however
 /// deeply the variations nest, the depth costs heap and not stack.
-fn emit(nodes: &[Node], out: &mut String) {
+fn emit(nodes: &[Node], sans: &str, out: &mut String) {
     enum Step {
         /// Continue the line whose last written move is `node`.
         Line {
-            node: usize,
+            node: u32,
             force_number: bool,
         },
-        /// Write the alternatives of `branch` from its `next`-th child.
+        /// Write the alternative `alt` to the main move `main`, and those after it.
         Alternatives {
-            branch: usize,
-            next: usize,
+            main: u32,
+            alt: u32,
         },
         Close,
     }
+    let write = |out: &mut String, n: u32, force_number: bool| {
+        let n = &nodes[n as usize];
+        // Writing to a String cannot fail.
+        let _ = if n.white {
+            write!(out, "{}. ", n.fullmove)
+        } else if force_number {
+            write!(out, "{}... ", n.fullmove)
+        } else {
+            Ok(())
+        };
+        out.push_str(&sans[n.san.0 as usize..n.san.1 as usize]);
+        out.push(' ');
+    };
     let mut steps = vec![Step::Line { node: 0, force_number: true }];
     while let Some(step) = steps.pop() {
         match step {
             Step::Line { node, force_number } => {
-                let children = &nodes[node].children;
-                let Some(&main) = children.first() else { continue };
-                write_move(&nodes[main], force_number, out);
-                if children.len() > 1 {
-                    steps.push(Step::Alternatives { branch: node, next: 1 });
-                } else {
-                    steps.push(Step::Line { node: main, force_number: false });
+                let main = nodes[node as usize].first_child;
+                if main == NONE {
+                    continue;
+                }
+                write(out, main, force_number);
+                match nodes[main as usize].next_sibling {
+                    NONE => steps.push(Step::Line { node: main, force_number: false }),
+                    alt => steps.push(Step::Alternatives { main, alt }),
                 }
             }
-            Step::Alternatives { branch, next } => {
-                let children = &nodes[branch].children;
-                if let Some(&alt) = children.get(next) {
-                    steps.push(Step::Alternatives { branch, next: next + 1 });
+            Step::Alternatives { main, alt } => {
+                if alt == NONE {
+                    // Back on the main line after its alternatives: repeat the number.
+                    steps.push(Step::Line { node: main, force_number: true });
+                } else {
+                    steps.push(Step::Alternatives { main, alt: nodes[alt as usize].next_sibling });
                     steps.push(Step::Close);
                     out.push('(');
-                    write_move(&nodes[alt], true, out);
+                    write(out, alt, true);
                     steps.push(Step::Line { node: alt, force_number: false });
-                } else {
-                    // Back on the main line after its alternatives: repeat the number.
-                    steps.push(Step::Line { node: children[0], force_number: true });
                 }
             }
             Step::Close => {
@@ -193,19 +257,17 @@ fn emit(nodes: &[Node], out: &mut String) {
     }
 }
 
-fn write_move(n: &Node, force_number: bool, out: &mut String) {
-    if n.white {
-        out.push_str(&format!("{}. ", n.fullmove));
-    } else if force_number {
-        out.push_str(&format!("{}... ", n.fullmove));
-    }
-    out.push_str(&n.san);
-    out.push(' ');
-}
-
 fn tag(out: &mut String, name: &str, value: &str) {
-    let v = value.replace('\\', "\\\\").replace('"', "\\\"");
-    out.push_str(&format!("[{name} \"{v}\"]\n"));
+    out.push('[');
+    out.push_str(name);
+    out.push_str(" \"");
+    for c in value.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push_str("\"]\n");
 }
 
 /// A game as a complete PGN record with the seven-tag roster, Elo tags and,
@@ -251,7 +313,7 @@ pub fn game(db: &Database, id: u32) -> Result<String> {
         tag(&mut out, "FEN", &format!("{board}"));
     }
     out.push('\n');
-    let text = movetext(db, &r)?;
+    let text = movetext_of(&moves)?;
     if !text.is_empty() {
         out.push_str(&text);
         out.push(' ');
