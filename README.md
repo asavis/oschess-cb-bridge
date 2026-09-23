@@ -42,8 +42,9 @@ pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
 `--show-token` prints the pairing link that connects oschess to it.
 
 A database path may name the `.2cbh` file or the common stem of its files.
-Databases are opened read-only and memory-mapped; nothing is written and
-nothing leaves the machine.
+Databases are opened read-only and read with positional reads; nothing is
+written, and nothing leaves the machine except what the bridge serves to the
+oschess page on this computer.
 
 ## Contributing
 
