@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/asavis/oschess-cb-bridge"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
