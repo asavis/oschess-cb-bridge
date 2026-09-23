@@ -1,12 +1,18 @@
 //! The app's three windows: the status flyout by the tray, the settings
 //! window and the first-run window. Each page is a file in `ui/`, told its
 //! language by a `lang` parameter.
+//!
+//! Every window is built by [`spawn_window`], on a worker thread. On Windows,
+//! building a WebView on the thread that runs the event loop deadlocks, and a
+//! synchronous command, a menu handler and a tray handler all run there
+//! (Tauri's `WebviewWindowBuilder::new`, "Known issues"). A test in
+//! `crate::window_rules` keeps it so.
 
 use std::time::{Duration, Instant};
 
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Rect, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    Window, WindowEvent,
+    Window, WindowEvent, Wry,
 };
 
 use super::shared;
@@ -24,25 +30,62 @@ const MARGIN: f64 = 12.0;
 /// click this soon after that must not open it again.
 const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
-fn page(app: &AppHandle, name: &str, query: &str) -> WebviewUrl {
-    let lang = shared(app).strings.lang().code();
-    WebviewUrl::App(format!("{name}.html?lang={lang}{query}").into())
+type Builder<'a> = WebviewWindowBuilder<'a, Wry, AppHandle>;
+
+/// A window to build: its label, its page in `ui/` with the page's query, the
+/// dictionary key of its title, and the rest of its look.
+struct Spec {
+    label: &'static str,
+    page: &'static str,
+    query: String,
+    title: &'static str,
+    configure: fn(Builder<'_>) -> Builder<'_>,
 }
 
-pub fn create_flyout(app: &AppHandle) -> tauri::Result<WebviewWindow> {
-    WebviewWindowBuilder::new(app, FLYOUT, page(app, "flyout", ""))
-        .title(shared(app).strings.get("window.flyout"))
-        .inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
-        .decorations(false)
-        .resizable(false)
-        .skip_taskbar(true)
-        .always_on_top(true)
-        .shadow(true)
-        .visible(false)
-        .build()
+/// Builds the window of `spec` on a worker thread, unless it exists already.
+fn spawn_window(app: &AppHandle, spec: Spec) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if app.get_webview_window(spec.label).is_some() {
+            return;
+        }
+        if let Err(e) = build_window(&app, &spec) {
+            eprintln!("oschess bridge: the {} window: {e}", spec.label);
+        }
+    });
+}
+
+fn build_window(app: &AppHandle, spec: &Spec) -> tauri::Result<WebviewWindow> {
+    let lang = shared(app).strings.lang().code();
+    let url = WebviewUrl::App(format!("{}.html?lang={lang}{}", spec.page, spec.query).into());
+    let builder = WebviewWindowBuilder::new(app, spec.label, url).title(shared(app).strings.get(spec.title));
+    (spec.configure)(builder).build()
+}
+
+/// Builds the flyout, hidden until the tray mark is clicked.
+pub fn create_flyout(app: &AppHandle) {
+    spawn_window(
+        app,
+        Spec {
+            label: FLYOUT,
+            page: "flyout",
+            query: String::new(),
+            title: "window.flyout",
+            configure: |b| {
+                b.inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
+                    .decorations(false)
+                    .resizable(false)
+                    .skip_taskbar(true)
+                    .always_on_top(true)
+                    .shadow(true)
+                    .visible(false)
+            },
+        },
+    );
 }
 
 /// Opens the flyout by the tray mark at `rect`, or closes it when it is open.
+/// A click in the moment before the flyout is built does nothing.
 pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
     let Some(window) = app.get_webview_window(FLYOUT) else { return };
     if window.is_visible().unwrap_or(false) {
@@ -101,36 +144,34 @@ fn place(window: &WebviewWindow, anchor: Option<(f64, f64, f64, f64)>) {
 
 /// Opens the settings window at `section` (`databases`, `general` or `code`),
 /// or brings it forward there.
-pub fn open_settings(app: &AppHandle, section: &str) -> tauri::Result<()> {
+pub fn open_settings(app: &AppHandle, section: &str) {
     hide_flyout(app);
     if let Some(window) = app.get_webview_window(SETTINGS) {
         let _ = window.unminimize();
-        window.show()?;
-        window.set_focus()?;
-        return window.emit_to(SETTINGS, "section", section);
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit_to(SETTINGS, "section", section);
+        return;
     }
-    WebviewWindowBuilder::new(app, SETTINGS, page(app, "settings", &format!("&section={section}")))
-        .title(shared(app).strings.get("window.settings"))
-        .inner_size(960.0, 680.0)
-        .min_inner_size(760.0, 520.0)
-        .center()
-        .build()?;
-    Ok(())
+    let spec = Spec {
+        label: SETTINGS,
+        page: "settings",
+        query: format!("&section={section}"),
+        title: "window.settings",
+        configure: |b| b.inner_size(960.0, 680.0).min_inner_size(760.0, 520.0).center(),
+    };
+    spawn_window(app, spec);
 }
 
-pub fn open_first_run(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window(FIRST_RUN) {
-        return window.set_focus();
-    }
-    WebviewWindowBuilder::new(app, FIRST_RUN, page(app, "first-run", ""))
-        .title(shared(app).strings.get("window.firstRun"))
-        .inner_size(620.0, 420.0)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .center()
-        .build()?;
-    Ok(())
+pub fn open_first_run(app: &AppHandle) {
+    let spec = Spec {
+        label: FIRST_RUN,
+        page: "first-run",
+        query: String::new(),
+        title: "window.firstRun",
+        configure: |b| b.inner_size(620.0, 420.0).resizable(false).maximizable(false).minimizable(false).center(),
+    };
+    spawn_window(app, spec);
 }
 
 /// The flyout hides when it loses the focus, as the system's own flyouts do.

@@ -34,6 +34,8 @@ pub struct Database {
     pub size: Option<u64>,
     /// The bytes on this computer and in all, while it downloads.
     pub progress: Option<(u64, u64)>,
+    /// Whether the database is on the list: one that left it is `missing`.
+    pub listed: bool,
 }
 
 impl Database {
@@ -50,6 +52,7 @@ impl Database {
             records,
             size,
             progress,
+            listed: entry.listed(),
         }
     }
 }
@@ -160,6 +163,7 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.databases[0].id, crate::catalog::id_of(&missing));
+        assert!(snapshot.databases.iter().all(|d| d.listed));
     }
 
     #[test]

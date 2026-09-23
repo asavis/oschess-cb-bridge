@@ -52,9 +52,11 @@ pub fn open_oschess_now(app: &AppHandle) {
     let _ = app.opener().open_url(shared(app).section_url(), None::<&str>);
 }
 
+/// Asynchronous, like every command that may open a window: a synchronous
+/// command runs on the event loop's thread.
 #[tauri::command]
-pub fn open_settings(app: AppHandle, section: Option<String>) -> Answer<()> {
-    windows::open_settings(&app, section.as_deref().unwrap_or("databases")).map_err(text)
+pub async fn open_settings(app: AppHandle, section: Option<String>) {
+    windows::open_settings(&app, section.as_deref().unwrap_or("databases"));
 }
 
 #[tauri::command]

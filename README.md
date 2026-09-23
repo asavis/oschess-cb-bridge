@@ -71,8 +71,9 @@ oschess page on this computer.
 
 `crates/app` wraps the bridge in a tray app. The oschess logo in the tray takes
 the colour of the bridge's state: the taskbar's own colour when the databases
-are ready, amber while one opens or downloads, red on a problem such as a port
-in use; the tooltip says which. A click opens a flyout with the state and the
+are ready; amber while one opens or downloads, or when one cannot be opened or
+is not found; red when the bridge cannot serve at all, such as with its port
+in use. The tooltip says which. A click opens a flyout with the state and the
 databases, and the right-click menu opens oschess, the settings (extra database
 folders, the port, the pairing code, starting with Windows) or quits. The
 windows are plain HTML, CSS and JavaScript in `crates/app/ui`, in Ukrainian or

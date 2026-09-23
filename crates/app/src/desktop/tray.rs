@@ -119,12 +119,8 @@ pub fn update(app: &AppHandle, strings: &Strings, view: &View, theme: Theme, sca
 fn on_menu(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         "open" => commands::open_oschess_now(app),
-        "settings" => {
-            let _ = windows::open_settings(app, "databases");
-        }
-        "code" => {
-            let _ = windows::open_settings(app, "code");
-        }
+        "settings" => windows::open_settings(app, "databases"),
+        "code" => windows::open_settings(app, "code"),
         AUTOSTART => {
             let on = !app.autolaunch().is_enabled().unwrap_or(false);
             let _ = commands::switch_autostart(app, on);

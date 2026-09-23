@@ -11,3 +11,6 @@ pub mod status;
 
 #[cfg(windows)]
 pub mod desktop;
+
+#[cfg(test)]
+mod window_rules;

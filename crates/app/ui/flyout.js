@@ -19,9 +19,8 @@ async function main() {
 
 function render(view) {
   const downloading = view.databases.filter((d) => d.state === 'downloading').length;
-  const busy = downloading + view.databases.filter((d) => d.state === 'opening').length;
-  const dot = document.getElementById('dot');
-  dot.className = `dot${view.problem ? ' problem' : busy ? ' attention' : ''}`;
+  // The tray mark's colour, decided by the app.
+  document.getElementById('dot').className = `dot${view.mark === 'ready' ? '' : ` ${view.mark}`}`;
   let status = view.problem ? t('flyout.notWorking') : t('flyout.working');
   if (!view.problem && downloading) status += ` · ${plural('flyout.downloading', downloading)}`;
   document.getElementById('status').textContent = status;

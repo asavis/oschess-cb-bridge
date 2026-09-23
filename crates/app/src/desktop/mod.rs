@@ -61,9 +61,9 @@ pub fn run() {
             let shared = Arc::new(started.shared);
             app.manage(shared.clone());
             tray::create(app.handle())?;
-            windows::create_flyout(app.handle())?;
+            windows::create_flyout(app.handle());
             if started.first_run {
-                windows::open_first_run(app.handle())?;
+                windows::open_first_run(app.handle());
             }
             if started.pair {
                 commands::open_pairing_now(app.handle());

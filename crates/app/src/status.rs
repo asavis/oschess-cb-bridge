@@ -51,15 +51,22 @@ pub struct View {
     pub version: String,
     pub port: u16,
     pub problem: Option<Problem>,
+    /// The databases on the list: one that left it is not shown.
     pub databases: Vec<DatabaseView>,
+    /// [`View::tray`]'s name, for the windows to show the same state.
+    pub mark: &'static str,
 }
 
 /// The tray mark's colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tray {
+    /// Every listed database that the bridge can serve is ready.
     Ready,
-    /// A database is opening or downloading.
+    /// The bridge serves, but a database needs a look or is on its way:
+    /// downloading, opening, unreadable (damaged or locked) or not found.
     Attention,
+    /// The bridge does not serve at all until this is fixed: a port in use, or
+    /// a server that stopped.
     Problem,
 }
 
@@ -99,6 +106,7 @@ impl View {
             databases: snapshot
                 .databases
                 .iter()
+                .filter(|d| d.listed)
                 .map(|d| DatabaseView {
                     id: d.id.clone(),
                     name: d.name.clone(),
@@ -109,12 +117,20 @@ impl View {
                     progress: d.progress.map(|(present, total)| Progress { present, total }),
                 })
                 .collect(),
+            mark: "",
         }
+        .marked()
     }
 
     /// The view of a bridge that could not start.
     pub fn failed(version: &str, port: u16, problem: Problem) -> View {
-        View { version: version.to_string(), port, problem: Some(problem), databases: Vec::new() }
+        View { version: version.to_string(), port, problem: Some(problem), databases: Vec::new(), mark: "" }.marked()
+    }
+
+    /// The view with its `mark` set from its state.
+    pub fn marked(mut self) -> View {
+        self.mark = self.tray().name();
+        self
     }
 
     fn counting(&self, state: &str) -> usize {
@@ -124,7 +140,7 @@ impl View {
     pub fn tray(&self) -> Tray {
         if self.problem.is_some() {
             Tray::Problem
-        } else if self.counting("downloading") + self.counting("opening") > 0 {
+        } else if ["downloading", "opening", "unreadable", "missing"].iter().any(|s| self.counting(s) > 0) {
             Tray::Attention
         } else {
             Tray::Ready
@@ -145,8 +161,15 @@ impl View {
                 }
             }
             None if self.counting("opening") > 0 => strings.get("tray.opening").to_string(),
+            None if self.counting("unreadable") > 0 => {
+                strings.plural("tray.unreadable", self.counting("unreadable") as u64, &[])
+            }
+            None if self.counting("missing") > 0 => {
+                strings.plural("tray.missing", self.counting("missing") as u64, &[])
+            }
             None => match self.counting("ready") {
-                0 => strings.get("tray.running").to_string(),
+                0 if self.databases.is_empty() => strings.get("tray.none").to_string(),
+                0 => strings.get("tray.noneReady").to_string(),
                 n => strings.plural("tray.ready", n as u64, &[]),
             },
         }
@@ -194,18 +217,26 @@ mod tests {
                     progress: None,
                 })
                 .collect(),
+            mark: "",
         }
+        .marked()
     }
 
     #[test]
     fn the_mark_and_the_tooltip_follow_the_state() {
         let uk = Strings::new(Lang::Uk);
         let cases = [
-            (view(&["ready", "ready", "missing", "unsupported"]), Tray::Ready, "oschess міст — 2 бази готові"),
+            (view(&["ready", "ready", "unsupported"]), Tray::Ready, "oschess міст — 2 бази готові"),
             (view(&["ready"]), Tray::Ready, "oschess міст — 1 база готова"),
             (view(&["ready"; 5]), Tray::Ready, "oschess міст — 5 баз готові"),
-            (view(&[]), Tray::Ready, "oschess міст — працює"),
+            (view(&[]), Tray::Ready, "oschess міст — баз поки немає"),
+            (view(&["cloudOnly", "unsupported"]), Tray::Ready, "oschess міст — готових баз немає"),
             (view(&["ready", "cloudOnly"]), Tray::Ready, "oschess міст — 1 база готова"),
+            (view(&["ready", "unreadable"]), Tray::Attention, "oschess міст — 1 база не відкривається"),
+            (view(&["unreadable", "unreadable", "missing"]), Tray::Attention, "oschess міст — 2 бази не відкриваються"),
+            (view(&["ready", "missing"]), Tray::Attention, "oschess міст — 1 базу не знайдено"),
+            (view(&["missing"; 5]), Tray::Attention, "oschess міст — 5 баз не знайдено"),
+            (view(&["unreadable", "downloading"]), Tray::Attention, "oschess міст — база завантажується"),
             (view(&["ready", "downloading"]), Tray::Attention, "oschess міст — база завантажується"),
             (view(&["opening"]), Tray::Attention, "oschess міст — база відкривається"),
             (downloading(420, 1000), Tray::Attention, "oschess міст — завантаження бази: 42 %"),
@@ -215,16 +246,19 @@ mod tests {
                 "oschess міст — порт 39581 зайнятий",
             ),
             (
-                View { problem: Some(Problem::Stopped { reason: "x".into() }), ..view(&["ready"]) },
+                View { problem: Some(Problem::Stopped { reason: "x".into() }), ..view(&["ready"]) }.marked(),
                 Tray::Problem,
                 "oschess міст — не працює",
             ),
         ];
         for (view, tray, tooltip) in cases {
             assert_eq!((view.tray(), view.tooltip(&uk).as_str()), (tray, tooltip), "{view:?}");
+            assert_eq!(view.mark, tray.name());
         }
         let en = Strings::new(Lang::En);
         assert_eq!(view(&["ready", "ready"]).tooltip(&en), "oschess bridge — 2 databases ready");
+        assert_eq!(view(&["unreadable"]).tooltip(&en), "oschess bridge — 1 database cannot be opened");
+        assert_eq!(view(&["missing", "missing"]).tooltip(&en), "oschess bridge — 2 databases not found");
     }
 
     #[test]
@@ -241,6 +275,7 @@ mod tests {
                 records: Some(7),
                 size: None,
                 progress: None,
+                listed: true,
             }],
         };
         let view = View::of(&snapshot);
@@ -248,10 +283,11 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         assert_eq!(
             json,
-            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}]}"#
+            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"mark":"ready"}"#
         );
         let stopped = View::of(&Snapshot { stopped: Some("accept failed".into()), ..snapshot });
         assert_eq!(stopped.problem, Some(Problem::Stopped { reason: "accept failed".into() }));
+        assert_eq!(stopped.mark, "problem");
         assert_eq!(serde_json::to_string(&Problem::PortBusy { port: 1 }).unwrap(), r#"{"kind":"portBusy","port":1}"#);
     }
 
@@ -260,7 +296,7 @@ mod tests {
         let mut view = view(&["downloading"]);
         view.databases[0].size = Some(total);
         view.databases[0].progress = Some(Progress { present, total });
-        view
+        view.marked()
     }
 
     #[test]

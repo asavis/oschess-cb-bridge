@@ -29,6 +29,9 @@ tauri-plugin-single-instance = "=2.4.5"
 # The display language and the taskbar's theme; already in the tree.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Registry"] }
 
+[dev-dependencies]
+cbformat = { version = "0.1.0", path = "../cbformat", features = ["fixture"] }
+
 # Always a build dependency: a build script cannot tell a Windows target by
 # `cfg`, so build.rs asks CARGO_CFG_TARGET_OS and runs it only for Windows.
 [build-dependencies]
