@@ -1,6 +1,7 @@
 //! The v1 endpoints of `docs/api.md`.
 
 use std::collections::HashMap;
+use std::sync::{Condvar, Mutex};
 
 use cbformat::Error;
 use cbformat::pgn;
@@ -17,6 +18,41 @@ pub const MAX_LIMIT: u32 = 500;
 const DEFAULT_LIMIT: u32 = 200;
 /// Reads of one game before a database that keeps changing is reported.
 const GAME_ATTEMPTS: usize = 3;
+/// The largest move record, content or spare area, served as PGN. The largest
+/// record of any kind in a Mega Database is about 1.2 MB, a guiding text; a
+/// move record near the reader's 64 MiB limit would take gigabytes to render.
+pub const MAX_GAME_BYTES: usize = 2 << 20;
+/// Games rendered at once; the others wait. With [`MAX_GAME_BYTES`] this keeps
+/// rendering within a few hundred megabytes whatever the requests.
+const MAX_RENDERS: usize = 4;
+
+/// A counting gate: at most `MAX_RENDERS` holders at a time.
+struct Gate {
+    held: Mutex<usize>,
+    freed: Condvar,
+}
+
+static RENDERS: Gate = Gate { held: Mutex::new(0), freed: Condvar::new() };
+
+impl Gate {
+    fn enter(&self) -> GateGuard<'_> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held >= MAX_RENDERS {
+            held = self.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        *held += 1;
+        GateGuard(self)
+    }
+}
+
+struct GateGuard<'a>(&'a Gate);
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.held.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.freed.notify_one();
+    }
+}
 
 pub struct App {
     pub version: &'static str,
@@ -283,7 +319,12 @@ fn game(app: &App, entry: &Entry, number: &str) -> Response {
         if !matches!(before.kind(), RecordKind::Game) {
             return error(422, "not_a_game", "Guiding texts and analyses are not served as PGN");
         }
-        let rendered = open.db.moves_of(&before).and_then(|data| pgn::game_from(&open.db, &before, &data.moves()?));
+        let rendered = {
+            let _render = RENDERS.enter();
+            open.db
+                .moves_of_within(&before, MAX_GAME_BYTES)
+                .and_then(|data| pgn::game_from(&open.db, &before, &data.moves()?))
+        };
         if let Some(hook) = &app.between_reads {
             hook();
         }

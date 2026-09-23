@@ -5,6 +5,8 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::time::Duration;
 
 use crate::access::cors;
 use crate::api::{self, App};
@@ -33,24 +35,38 @@ pub fn bind(port: u16) -> io::Result<Vec<TcpListener>> {
     }
 }
 
+/// Connections over the cap waiting for their `busy` answer; more are closed.
+const BUSY_QUEUE: usize = 64;
+/// How long the busy answer waits for a request head, to read its `Origin`.
+const BUSY_READ: Duration = Duration::from_secs(1);
+
 /// Serves connections from every listener until they fail.
 pub fn serve(listeners: Vec<TcpListener>, app: Arc<App>) -> io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
+    let (busy, refused) = mpsc::sync_channel::<TcpStream>(BUSY_QUEUE);
     std::thread::scope(|scope| {
+        let refuser = app.clone();
+        scope.spawn(move || {
+            for stream in refused {
+                refuse_busy(stream, &refuser);
+            }
+        });
         for listener in listeners {
-            let (app, active) = (app.clone(), active.clone());
-            scope.spawn(move || accept(listener, app, active));
+            let (app, active, busy) = (app.clone(), active.clone(), busy.clone());
+            scope.spawn(move || accept(listener, app, active, busy));
         }
+        drop(busy);
     });
     Ok(())
 }
 
-fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>) {
+fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: SyncSender<TcpStream>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::SeqCst);
-            refuse_busy(stream);
+            // One thread answers them in turn; a full queue closes the connection.
+            let _ = busy.try_send(stream);
             continue;
         }
         let guard = Active(active.clone());
@@ -73,9 +89,18 @@ impl Drop for Active {
     }
 }
 
-fn refuse_busy(stream: TcpStream) {
-    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
-    let _ = Conn::new(stream).write(&error(503, "busy", "Too many open connections"), false);
+/// Answers a connection over the cap `503 busy`. The request head is read for
+/// at most [`BUSY_READ`] so that an allowed page can read the answer and its
+/// retry delay through CORS.
+fn refuse_busy(stream: TcpStream, app: &App) {
+    let _ = stream.set_write_timeout(Some(BUSY_READ));
+    let mut conn = Conn::new(stream);
+    let origin = match conn.read_request_within(BUSY_READ) {
+        Ok(req) => req.header("origin").map(str::to_string),
+        Err(refusal) => refusal.origin,
+    };
+    let response = error(503, "busy", "Too many open connections");
+    let _ = conn.write(&cors(response, app.policy.allowed_origin(origin.as_deref())), false);
 }
 
 fn handle_connection(stream: TcpStream, app: &App) {

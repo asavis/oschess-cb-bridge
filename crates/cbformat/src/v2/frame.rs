@@ -9,7 +9,7 @@ const RECORD_MAGIC: [u8; 8] = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
 pub(super) const FRAME_HEADER: usize = 0x1a;
 /// Largest content or spare area accepted in one move record. The largest in
 /// a Mega Database is about 1.2 MB, a guiding text.
-const MAX_FRAME_PART: usize = 64 << 20;
+pub(super) const MAX_FRAME_PART: usize = 64 << 20;
 
 /// The content and spare sizes of a frame, from its first bytes.
 pub(super) fn frame_sizes(frame: &[u8], offset: i64) -> Result<(usize, usize)> {

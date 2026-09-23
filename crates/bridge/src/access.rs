@@ -26,7 +26,8 @@ pub enum Verdict {
 impl Policy {
     pub fn check(&self, req: &Request) -> Verdict {
         if !self.host_ok(req.header("host")) {
-            return Verdict::Answer(error(421, "misdirected_host", "Host is not a loopback name for this bridge"));
+            let refusal = error(421, "misdirected_host", "Host is not a loopback name for this bridge");
+            return Verdict::Answer(cors(refusal, self.allowed_origin(req.header("origin"))));
         }
         let origin = match req.header("origin") {
             None => None,

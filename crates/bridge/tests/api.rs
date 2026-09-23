@@ -512,3 +512,41 @@ fn a_second_instance_leaves_the_token_alone() {
     assert_eq!(std::fs::read_to_string(home.join("token")).unwrap(), TOKEN);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A move record over the rendering limit is refused before it is read, and
+/// the server goes on serving.
+#[test]
+fn a_game_too_large_to_render_is_refused() {
+    let mut b = Builder::new();
+    let mut words = vec![MOVES];
+    words.extend(std::iter::repeat_n(cbformat::movetable::NULL_MOVE, bridge::api::MAX_GAME_BYTES / 2 + 1));
+    words.push(END_OF_LINE);
+    let huge = b.moves(1, &words);
+    b.game(huge);
+    let db = b.write("api-huge-game");
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 422, "{}", g.body);
+    assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("limit"), "{}", g.body);
+    assert_eq!(get(r.port, "/v1/status", "").status, 200);
+}
+
+/// Over the connection cap, the `busy` answer is readable by an allowed page,
+/// and so is a refused `Host`.
+#[test]
+fn busy_and_misdirected_answers_carry_cors() {
+    let db = database("api-busy", 1, 0, 0);
+    let p = start(&db, vec![], None).port;
+    let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:1\r\nOrigin: {ORIGIN}"));
+    assert_eq!((r.status, r.header("access-control-allow-origin")), (421, Some(ORIGIN)));
+    let idle: Vec<TcpStream> =
+        (0..server::MAX_CONNECTIONS).map(|_| TcpStream::connect(("127.0.0.1", p)).unwrap()).collect();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let r = get(p, "/v1/status", "");
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert!(r.body.contains(r#""code":"busy""#));
+    assert_eq!(r.header("retry-after"), Some("1"));
+    assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
+    assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After"));
+    drop(idle);
+}

@@ -91,6 +91,12 @@ impl Conn {
     }
 
     pub fn read_request(&mut self) -> Result<Request, Refusal> {
+        self.read_request_within(REQUEST_TIMEOUT)
+    }
+
+    /// [`Conn::read_request`] with `limit` in place of [`REQUEST_TIMEOUT`],
+    /// and no longer than that to wait for the first byte either.
+    pub fn read_request_within(&mut self, limit: Duration) -> Result<Request, Refusal> {
         let mut started = (!self.buf.is_empty()).then(Instant::now);
         loop {
             let too_large = |buf: &[u8]| Refusal { error: ReadError::TooLarge, origin: sniff_origin(buf) };
@@ -105,8 +111,8 @@ impl Conn {
                 return Err(too_large(&self.buf));
             }
             let timeout = match started {
-                None => IDLE_TIMEOUT,
-                Some(t) => match REQUEST_TIMEOUT.checked_sub(t.elapsed()).filter(|d| !d.is_zero()) {
+                None => IDLE_TIMEOUT.min(limit),
+                Some(t) => match limit.checked_sub(t.elapsed()).filter(|d| !d.is_zero()) {
                     Some(left) => left,
                     None => return Err(ReadError::Dropped.quiet()),
                 },
