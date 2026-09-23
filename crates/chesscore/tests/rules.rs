@@ -238,6 +238,22 @@ fn malformed_fen_is_refused() {
     assert!(syntax(&format!("{} w - -", "/".repeat(4_000_000))));
     assert!(syntax(&format!("4k3/8/8/8/8/8/8/R3K2R w {} - 0 1", "K".repeat(1_000_000))));
     assert!(syntax("4k3/8/8/8/8/8/8/4K3 w - - 0 1 extra"));
+    // Every field, oversized: refused, with a short message.
+    let huge = "\u{1}".repeat(1_000_000);
+    for fen in [
+        format!("4k3/8/8/8/8/8/8/4K3 {} - - 0 1", "x".repeat(1_000_000)),
+        format!("4k3/8/8/8/8/8/8/4K3 w - {huge} 0 1"),
+        format!("4k3/8/8/8/8/8/8/4K3 w - - {} 1", "9".repeat(1_000_000)),
+        format!("4k3/8/8/8/8/8/8/4K3 w - - 0 {}", "9".repeat(1_000_000)),
+    ] {
+        let err = Board::from_fen(&fen).unwrap_err().to_string();
+        assert!(err.len() < 100, "{} bytes: {}", err.len(), &err[..100.min(err.len())]);
+    }
+    // Short but wrong fields still name what is wrong.
+    assert!(Board::from_fen("4k3/8/8/8/8/8/8/4K3 x - - 0 1").unwrap_err().to_string().contains("bad side \"x\""));
+    assert!(Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - z 1").unwrap_err().to_string().contains("bad number \"z\""));
+    let long_square = "a1".repeat(1_000).parse::<Square>().unwrap_err().to_string();
+    assert!(long_square.len() < 40, "{long_square}");
 }
 
 #[test]

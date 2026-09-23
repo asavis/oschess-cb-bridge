@@ -5,7 +5,9 @@ use std::str::FromStr;
 
 use crate::board::{Board, CastleSide};
 use crate::setup::{BoardBuilder, SetupError};
-use crate::types::{Color, ParseError, Piece, Square};
+use crate::types::{Color, ParseError, Piece, Square, excerpt};
+
+const MAX_FEN_BYTES: usize = 256;
 
 /// A FEN that does not parse, or parses to an invalid position.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,8 +37,11 @@ impl Board {
     /// The halfmove clock and move number may be left out. A position whose
     /// castling needs Chess960 rules is marked as Chess960.
     pub fn from_fen(fen: &str) -> Result<Board, FenError> {
-        // Take at most one token past each limit, so no input can make the
-        // parser allocate more than a FEN needs.
+        // The longest valid FEN is under 100 bytes. Refusing anything much
+        // longer first bounds every allocation below, error messages included.
+        if fen.len() > MAX_FEN_BYTES {
+            return Err(syntax(format!("FEN longer than {MAX_FEN_BYTES} bytes")));
+        }
         let fields: Vec<&str> = fen.split_whitespace().take(7).collect();
         if !(4..=6).contains(&fields.len()) {
             return Err(syntax("a FEN has 4 to 6 fields"));
@@ -79,7 +84,7 @@ impl Board {
         b.side_to_move = match fields[1] {
             "w" => Color::White,
             "b" => Color::Black,
-            s => return Err(syntax(format!("bad side {s}"))),
+            s => return Err(syntax(format!("bad side {}", excerpt(s)))),
         };
         let mut shredder = false;
         if fields[2] != "-" {
@@ -111,14 +116,14 @@ impl Board {
                 let sq = s.parse::<Square>().map_err(FenError::Syntax)?;
                 let rank = if b.side_to_move == Color::White { 5 } else { 2 };
                 if sq.rank() != rank {
-                    return Err(syntax(format!("en passant square {s} is on the wrong rank")));
+                    return Err(syntax(format!("en passant square {} is on the wrong rank", excerpt(s))));
                 }
                 Some(sq.file())
             }
         };
         let number = |i: usize, default: u16| match fields.get(i) {
             None => Ok(default),
-            Some(s) => s.parse::<u16>().map_err(|_| syntax(format!("bad number {s}"))),
+            Some(s) => s.parse::<u16>().map_err(|_| syntax(format!("bad number {}", excerpt(s)))),
         };
         b.halfmove_clock = number(4, 0)?;
         b.fullmove_number = number(5, 1)?;

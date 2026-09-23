@@ -158,7 +158,7 @@ impl FromStr for Square {
     fn from_str(s: &str) -> Result<Square, ParseError> {
         match s.as_bytes() {
             &[f @ b'a'..=b'h', r @ b'1'..=b'8'] => Ok(Square::new(f - b'a', r - b'1')),
-            _ => Err(ParseError(format!("bad square {s:?}"))),
+            _ => Err(ParseError(format!("bad square {}", excerpt(s)))),
         }
     }
 }
@@ -219,7 +219,7 @@ impl FromStr for Move {
     /// UCI, `e2e4` or `e7e8q`; castling as the king taking its own rook.
     fn from_str(s: &str) -> Result<Move, ParseError> {
         if !(4..=5).contains(&s.len()) || !s.is_ascii() {
-            return Err(ParseError(format!("bad move {s:?}")));
+            return Err(ParseError(format!("bad move {}", excerpt(s))));
         }
         let from = s[0..2].parse()?;
         let to = s[2..4].parse()?;
@@ -229,10 +229,18 @@ impl FromStr for Move {
             Some(b'b') => Some(Piece::Bishop),
             Some(b'r') => Some(Piece::Rook),
             Some(b'q') => Some(Piece::Queen),
-            Some(_) => return Err(ParseError(format!("bad promotion in {s:?}"))),
+            Some(_) => return Err(ParseError(format!("bad promotion in {}", excerpt(s)))),
         };
         Ok(Move { from, to, promotion })
     }
+}
+
+/// At most the first 16 characters of `s`, quoted, for an error message: a
+/// message must not grow with a malformed input.
+pub(crate) fn excerpt(s: &str) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(16).collect();
+    if chars.next().is_some() { format!("{head:?}…") } else { format!("{head:?}") }
 }
 
 /// A square, move or FEN that could not be parsed.
