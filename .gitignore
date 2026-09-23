@@ -1,0 +1,11 @@
+/target
+/.worktrees
+# Local databases used for verification never enter the repository.
+*.2cbh
+*.2cbg
+*.2cba
+*.2lid
+*.2lgd
+*.2lcd
+*.cb?
+*.pgn

@@ -1,0 +1,165 @@
+//! Move records built by hand, following the format description, and read back.
+
+use cbformat::movetable::{self, Captured, Color, MoveWord, Piece};
+use cbformat::pgn::movetext_of;
+use cbformat::replay::{start_board, walk_tree};
+use cbformat::v2::{GameMoves, Setup, Start};
+use cozy_chess::{File, Square};
+
+fn sq(name: &str) -> u8 {
+    let b = name.as_bytes();
+    (b[1] - b'1') * 8 + (b[0] - b'a')
+}
+
+/// The word for a non-capturing, non-promoting move of `piece` from `from` to `to`.
+fn word(color: Color, piece: Piece, from: &str, to: &str) -> u16 {
+    let want =
+        MoveWord::Normal { color, piece, from: sq(from), to: sq(to), captured: Captured::Nothing, promotion: None };
+    (1..0xb12d).find(|&w| movetable::decode(w) == Some(want)).expect("move word exists")
+}
+
+fn bytes(words: &[u16]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+use Color::{Black as B, White as W};
+use Piece::{Bishop, Knight, Pawn};
+
+#[test]
+fn variations_follow_the_documented_order() {
+    // 1.e4 c5 (1...c6 2.d4) (1...Nf6 2.e5) 2.Nf3 d6 (2...Nc6 3.Bb5) 3.d4
+    let (alt, end) = (movetable::ALTERNATIVE, movetable::END_OF_LINE);
+    let stream = [
+        movetable::MOVES,
+        word(W, Pawn, "e2", "e4"),
+        word(B, Pawn, "c7", "c5"),
+        alt,
+        word(W, Knight, "g1", "f3"),
+        word(B, Pawn, "d7", "d6"),
+        alt,
+        word(W, Pawn, "d2", "d4"),
+        end,
+        word(B, Knight, "b8", "c6"),
+        word(W, Bishop, "f1", "b5"),
+        end,
+        word(B, Pawn, "c7", "c6"),
+        alt,
+        word(W, Pawn, "d2", "d4"),
+        end,
+        word(B, Knight, "g8", "f6"),
+        word(W, Pawn, "e4", "e5"),
+        end,
+    ];
+    let content = bytes(&stream);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    assert_eq!(moves.start().unwrap(), Start::Standard);
+    assert_eq!(
+        movetext_of(&moves).unwrap(),
+        "1. e4 c5 (1... c6 2. d4) (1... Nf6 2. e5) 2. Nf3 d6 (2... Nc6 3. Bb5) 3. d4"
+    );
+    let stats = walk_tree(&moves, |_, _, _| {}).unwrap();
+    assert_eq!((stats.main_line_plies, stats.total_plies, stats.lines), (5, 11, 4));
+    assert_eq!(moves.main_line().count(), 5);
+}
+
+#[test]
+fn empty_game() {
+    let content = bytes(&[movetable::MOVES, movetable::END_OF_LINE]);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    assert_eq!(movetext_of(&moves).unwrap(), "");
+}
+
+#[test]
+fn truncated_tree_is_an_error() {
+    let content = bytes(&[movetable::MOVES, word(W, Pawn, "e2", "e4")]);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    assert!(walk_tree(&moves, |_, _, _| {}).is_err());
+}
+
+#[test]
+fn wrong_capture_type_is_rejected() {
+    // 1.e4 d5 2.exd5 written as capturing a knight rather than a pawn.
+    let pawn_x_knight = MoveWord::Normal {
+        color: W,
+        piece: Pawn,
+        from: sq("e4"),
+        to: sq("d5"),
+        captured: Captured::Knight,
+        promotion: None,
+    };
+    let w = (1..0xb12d).find(|&w| movetable::decode(w) == Some(pawn_x_knight)).unwrap();
+    let content =
+        bytes(&[movetable::MOVES, word(W, Pawn, "e2", "e4"), word(B, Pawn, "d7", "d5"), w, movetable::END_OF_LINE]);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    let err = walk_tree(&moves, |_, _, _| {}).unwrap_err().to_string();
+    assert!(err.contains("move 3"), "{err}");
+}
+
+fn setup(castling: u8, ep_raw: u16) -> Setup {
+    // White: Ke1, Rh1, Pe5. Black: Ke8, Pd5 (just played ...d7-d5). White to move.
+    Setup {
+        chess960: false,
+        move_number: 20,
+        side_to_move: W,
+        castling,
+        en_passant_file: if (1..=8).contains(&ep_raw) { Some(ep_raw as u8 - 1) } else { None },
+        en_passant_raw: ep_raw,
+        pieces: vec![
+            (sq("e1"), W, Piece::King),
+            (sq("h1"), W, Piece::Rook),
+            (sq("e5"), W, Pawn),
+            (sq("e8"), B, Piece::King),
+            (sq("d5"), B, Pawn),
+        ],
+    }
+}
+
+#[test]
+fn set_up_en_passant() {
+    let board = start_board(&Start::Setup(setup(0, 4))).unwrap();
+    assert_eq!(board.en_passant(), Some(File::D));
+    assert!(board.is_legal(cozy_chess::Move { from: Square::E5, to: Square::D6, promotion: None }));
+}
+
+#[test]
+fn set_up_en_passant_that_cannot_exist_is_dropped() {
+    // A file with no pawn that could just have made a double step, and values
+    // out of range.
+    for raw in [3u16, 12, 15, 0xffff] {
+        let board = start_board(&Start::Setup(setup(0, raw))).unwrap();
+        assert_eq!(board.en_passant(), None, "raw {raw}");
+    }
+}
+
+#[test]
+fn set_up_castling_rights_need_king_and_rook_at_home() {
+    // Bits 1-8 all set: only white O-O has its king and rook in place.
+    let board = start_board(&Start::Setup(setup(15, 0))).unwrap();
+    assert_eq!(board.castle_rights(cozy_chess::Color::White).short, Some(File::H));
+    assert_eq!(board.castle_rights(cozy_chess::Color::White).long, None);
+    assert_eq!(board.castle_rights(cozy_chess::Color::Black).short, None);
+    assert!(board.is_legal(cozy_chess::Move { from: Square::E1, to: Square::H1, promotion: None }));
+}
+
+#[test]
+fn set_up_section_round_trip() {
+    // fffb; move number; side to move | castling << 8; en passant file; pieces; fffc.
+    let stream = [
+        movetable::START_POSITION,
+        20,
+        2 << 8,
+        4,
+        0xc02d + 4 * 8,          // white king e1: piece 0, ChessBase square e1 = 4*8+0
+        0xc02d + 4 * 64 + 7 * 8, // white rook h1: piece 4
+        0xc2ad + 6 * 4 + 3,      // white pawn e5: file e, rank 5
+        0xc16d + 4 * 8 + 7,      // black king e8
+        0xc2dd + 6 * 3 + 3,      // black pawn d5
+        movetable::MOVES,
+        movetable::END_OF_LINE,
+    ];
+    let content = bytes(&stream);
+    let moves = GameMoves::parse(1, &content).unwrap();
+    let Start::Setup(s) = moves.start().unwrap() else { panic!("expected a set-up start") };
+    assert_eq!(s, setup(2, 4));
+    assert_eq!(format!("{}", start_board(&Start::Setup(s)).unwrap()), "4k3/8/8/3pP3/8/8/8/4K2R w K d6 0 20");
+}
