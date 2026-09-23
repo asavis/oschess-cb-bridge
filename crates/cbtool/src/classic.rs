@@ -135,5 +135,5 @@ pub(crate) fn verify(path: &str, limit: Option<u32>) -> AnyResult<bool> {
         });
     }
     let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
-    Ok(report(n, started, &stats, failures))
+    Ok(report(n, started, &stats, failures, None))
 }

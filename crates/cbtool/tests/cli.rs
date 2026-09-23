@@ -3,21 +3,24 @@
 use std::path::Path;
 use std::process::Command;
 
-use cbformat::fixture::{Builder, DbItems, TempDb, lid_header, quiet};
+use cbformat::fixture::{Builder, DbItems, TempDb, annotations, lid_header, quiet, text};
 use cbformat::movetable::{self, Color, Piece};
+use cbformat::v2::language;
 
 /// A one-game database (1.e4) with an empty entity file.
 fn fixture(name: &str) -> TempDb {
     fixture_with(name, 1, None)
 }
 
-/// `games` games, all 1.e4 and all sharing one move record; with
-/// `player_name`, every game's white and black is one player of that name.
+/// `games` games, all 1.e4 and all sharing one move record and one annotation
+/// record; with `player_name`, every game's white and black is one player of
+/// that name.
 fn fixture_with(name: &str, games: usize, player_name: Option<&[u8]>) -> TempDb {
     let mut b = Builder::new();
     let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    let comment = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "best by test")])]));
     for _ in 0..games {
-        b.game(e4);
+        b.annotated_game(e4, comment);
     }
     if let Some(last) = player_name {
         let mut player = Vec::new();
@@ -29,9 +32,7 @@ fn fixture_with(name: &str, games: usize, player_name: Option<&[u8]>) -> TempDb 
         lid.extend(&player);
         b.lid(lid);
     }
-    let db = b.write(&format!("cbtool-{name}"));
-    std::fs::write(db.dir().join("db.2cba"), b"annotations").unwrap();
-    db
+    b.write(&format!("cbtool-{name}"))
 }
 
 fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
@@ -59,7 +60,7 @@ fn export_works() {
     let r = pgn(f.dir(), &out);
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     let text = std::fs::read_to_string(&out).unwrap();
-    assert!(text.contains("1. e4 1-0"), "{text}");
+    assert!(text.contains("1. e4 {best by test} 1-0"), "{text}");
 }
 
 #[test]

@@ -339,7 +339,8 @@ fn game(app: &App, entry: &Entry, number: &str) -> Response {
             let _render = RENDERS.enter();
             open.db
                 .moves_of_within(&before, MAX_GAME_BYTES)
-                .and_then(|data| pgn::game_from(&open.db, &before, &data.moves()?))
+                .and_then(|data| pgn::game_from(&open.db, &before, &data.moves()?, None, &pgn::Options::default()))
+                .map(|r| r.pgn)
         };
         if let Some(hook) = &app.between_reads {
             hook();

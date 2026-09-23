@@ -82,16 +82,18 @@ impl Drop for TempDb {
 }
 
 /// Builds a database: game records, move records in the order they are added,
-/// and a `.2lid` file that holds no entities unless replaced.
+/// a `.2lid` file that holds no entities unless replaced, and a `.2cba` file
+/// once an annotation record is added.
 pub struct Builder {
     records: Vec<[u8; 192]>,
     cbg: Vec<u8>,
+    cba: Option<Vec<u8>>,
     lid: Vec<u8>,
 }
 
 impl Default for Builder {
     fn default() -> Self {
-        Builder { records: Vec::new(), cbg: vec![0; 12], lid: lid_header(1024, 0) }
+        Builder { records: Vec::new(), cbg: vec![0; 12], cba: None, lid: lid_header(1024, 0) }
     }
 }
 
@@ -106,6 +108,23 @@ impl Builder {
         let offset = self.cbg.len() as i64;
         self.cbg.extend(framed(tag, &bytes(words)));
         offset
+    }
+
+    /// Appends an annotation record holding `content` (see [`annotations`]),
+    /// and returns its offset in `.2cba`.
+    pub fn annotations(&mut self, content: &[u8]) -> i64 {
+        let cba = self.cba.get_or_insert_with(|| vec![0; 12]);
+        let offset = cba.len() as i64;
+        cba.extend(framed(crate::v2::ANNOTATION_TAG, content));
+        offset
+    }
+
+    /// Appends a game whose move record is at `moves` and annotation record
+    /// at `annotations`.
+    pub fn annotated_game(&mut self, moves: i64, annotations: i64) -> &mut [u8; 192] {
+        let rec = self.game(moves);
+        rec[0x10..0x18].copy_from_slice(&annotations.to_le_bytes());
+        rec
     }
 
     /// Appends a game, won by white, whose move record is at `offset`, and
@@ -129,14 +148,31 @@ impl Builder {
 
     /// Writes the database to a new temporary directory named after `name`,
     /// which must be unique among the tests that run at the same time.
+    ///
+    /// When there is a `.2cba`, a game without an annotation record gets an
+    /// empty one, as in databases ChessBase writes.
     pub fn write(&self, name: &str) -> TempDb {
         let dir = std::env::temp_dir().join(format!("cbformat-fixture-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut cbh = vec![0u8; 192];
         cbh[0x0a..0x0c].copy_from_slice(&192i16.to_le_bytes());
         cbh[0x0d] = 5;
+        let mut cba = self.cba.clone();
         for rec in &self.records {
+            let mut rec = *rec;
+            if let Some(cba) = &mut cba
+                && rec[0x10..0x18] == [0; 8]
+            {
+                rec[0x10..0x18].copy_from_slice(&(cba.len() as i64).to_le_bytes());
+                cba.extend(framed(crate::v2::ANNOTATION_TAG, &annotations(&[])));
+            }
             cbh.extend(rec);
+        }
+        if let Some(mut cba) = cba {
+            let total = cba.len() as i64;
+            cba[..8].copy_from_slice(&total.to_le_bytes());
+            cba[8..10].copy_from_slice(&12i16.to_le_bytes());
+            std::fs::write(dir.join("db.2cba"), cba).unwrap();
         }
         let mut cbg = self.cbg.clone();
         let total = cbg.len() as i64;
@@ -220,4 +256,59 @@ impl DbItems {
         out.extend(&self.body);
         out
     }
+}
+
+/// An annotation record's content: position blocks, each a position (−1 for
+/// the game) and its annotations, then the end marker.
+pub fn annotations(blocks: &[(i32, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for (position, anns) in blocks {
+        v.extend(position.to_le_bytes());
+        v.extend((anns.len() as i32).to_le_bytes());
+        for a in anns {
+            v.extend(a);
+        }
+    }
+    v.extend(0x7fff_ffffi32.to_le_bytes());
+    v
+}
+
+/// A text annotation: after the move, or before it; `language` as in
+/// [`crate::v2::language`].
+pub fn text(before: bool, language: u16, text: &str) -> Vec<u8> {
+    let mut v = (if before { 0x82u16 } else { 0x02 }).to_le_bytes().to_vec();
+    v.extend([0, 0]);
+    v.extend(language.to_le_bytes());
+    v.extend((text.len() as i32).to_le_bytes());
+    v.extend(text.as_bytes());
+    v
+}
+
+/// A symbols annotation: NAGs on the move, on the position, and a prefix.
+pub fn symbols(on_move: u8, on_position: u8, prefix: u8) -> Vec<u8> {
+    vec![3, 0, on_move, on_position, prefix]
+}
+
+/// A square numbered from 1, file by file, as annotations store it.
+fn cb_square(name: &str) -> u8 {
+    let s = sq(name);
+    (s % 8) * 8 + s / 8 + 1
+}
+
+/// A coloured-squares annotation from (colour, square) pairs.
+pub fn squares(items: &[(u8, &str)]) -> Vec<u8> {
+    let data: Vec<u8> = items.iter().flat_map(|&(c, s)| [c, cb_square(s)]).collect();
+    let mut v = vec![4, 0];
+    v.extend((data.len() as i32).to_le_bytes());
+    v.extend(data);
+    v
+}
+
+/// An arrows annotation from (colour, from, to) triples.
+pub fn arrows(items: &[(u8, &str, &str)]) -> Vec<u8> {
+    let data: Vec<u8> = items.iter().flat_map(|&(c, f, t)| [c, cb_square(f), cb_square(t)]).collect();
+    let mut v = vec![5, 0];
+    v.extend((data.len() as i32).to_le_bytes());
+    v.extend(data);
+    v
 }

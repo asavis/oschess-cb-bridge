@@ -11,6 +11,7 @@ use std::time::Instant;
 mod databases;
 
 use cbformat::movetable::{self, Captured, MoveWord};
+use cbformat::pgn::{AnnotationStatus, Options};
 use cbformat::replay::walk_tree;
 use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
 
@@ -20,9 +21,13 @@ const USAGE: &str = "usage:
   cbtool info   <db>
   cbtool verify <db> [--limit N]           decode and replay every game and analysis
                                            (<db> may be a classic .cbh database)
-  cbtool pgn    <db> [--out FILE] [ID...]  export games as PGN (all games when no ids)
+  cbtool pgn    <db> [--out FILE] [--lang LANGS] [ID...]
+                                           export games as PGN (all games when no ids)
   cbtool databases <dir>                   the databases ChessBase's database window lists
                                            (dir: the ChessBase documents folder)
+
+--lang takes ISO 639-1 codes in order of preference, comma-separated, for the
+language of comments (default: English, else the first a game has).
 
 CBTOOL_THREADS sets the number of worker threads (default: one per CPU).";
 
@@ -79,6 +84,8 @@ pub(crate) struct Stats {
     promo_captures: u64,
     promo_captures_distinct: u64,
     en_passant: u64,
+    annotated: u64,
+    annotations_incomplete: u64,
     failures: u64,
 }
 
@@ -97,6 +104,8 @@ impl Stats {
         self.promo_captures += o.promo_captures;
         self.promo_captures_distinct += o.promo_captures_distinct;
         self.en_passant += o.en_passant;
+        self.annotated += o.annotated;
+        self.annotations_incomplete += o.annotations_incomplete;
         self.failures += o.failures;
     }
 }
@@ -175,7 +184,18 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
             s.main_plies += t.main_line_plies as u64;
             s.total_plies += t.total_plies as u64;
         }
-        Err(e) => fail(s, e.to_string()),
+        Err(e) => return fail(s, e.to_string()),
+    }
+    match batch.annotations_of(&r) {
+        Ok(Some(a)) if !a.is_empty() => {
+            s.annotated += 1;
+            if let Some(u) = a.stopped_at {
+                s.annotations_incomplete += 1;
+                fail(s, format!("annotations: type {:#04x} of unknown layout at position {}", u.type_code, u.position));
+            }
+        }
+        Ok(_) => {}
+        Err(e) => fail(s, format!("annotations: {e}")),
     }
 }
 
@@ -212,12 +232,19 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
         });
     }
     let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
-    Ok(report(n, started, &stats, failures))
+    Ok(report(n, started, &stats, failures, Some(db.has_annotations())))
 }
 
 /// Prints the statistics of a `verify` run and its first failures; whether
-/// every record passed.
-fn report(n: u32, started: Instant, stats: &Stats, failures: Mutex<Vec<(u32, String)>>) -> bool {
+/// every record passed. `annotations` says whether the database has an
+/// annotation file, and is `None` when the run does not read annotations.
+fn report(
+    n: u32,
+    started: Instant,
+    stats: &Stats,
+    failures: Mutex<Vec<(u32, String)>>,
+    annotations: Option<bool>,
+) -> bool {
     let secs = started.elapsed().as_secs_f64();
     println!("records verified   {n} in {secs:.1} s ({:.0} records/s)", n as f64 / secs);
     println!("games              {}", stats.games);
@@ -235,6 +262,14 @@ fn report(n: u32, started: Instant, stats: &Stats, failures: Mutex<Vec<(u32, Str
         "promotion captures {} ({} with captured != promoted piece)",
         stats.promo_captures, stats.promo_captures_distinct
     );
+    match annotations {
+        Some(true) => {
+            println!("annotated          {}", stats.annotated);
+            println!("  incomplete       {}", stats.annotations_incomplete);
+        }
+        Some(false) => println!("annotated          no annotation file"),
+        None => {}
+    }
     println!("failures           {}", stats.failures);
     let mut f = failures.into_inner().unwrap_or_else(|e| e.into_inner());
     f.sort();
@@ -262,11 +297,14 @@ fn refuse_database_file(out: &Path, db: &Database) -> AnyResult<()> {
 fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     let db = Database::open(path)?;
     let mut out_path = None;
+    let mut options = Options::default();
     let mut ids = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         if a == "--out" {
             out_path = Some(it.next().ok_or(USAGE)?.clone());
+        } else if a == "--lang" {
+            options = Options::with_languages(it.next().ok_or(USAGE)?.split(','));
         } else {
             ids.push(a.parse::<u32>()?);
         }
@@ -282,7 +320,7 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
         None => Box::new(std::io::stdout()),
     };
     let mut w = BufWriter::with_capacity(1 << 20, sink);
-    let ok = export_in_order(&ids, threads(), &|id, r| r.game(&db, id), &mut w)?;
+    let ok = export_in_order(&ids, threads(), &|id, r| r.game(&db, id, &options), &mut w)?;
     w.flush()?;
     Ok(ok)
 }
@@ -311,11 +349,13 @@ const PGN_CHUNK: usize = 1_024;
 const PGN_TASK_BYTES: usize = 4 << 20;
 
 /// Rendered games waiting for their turn to be written: the text, and each
-/// failure with the text offset it occurred at, to keep stderr in game order.
+/// message for stderr with the text offset it belongs at, to keep stderr in
+/// game order. A message is a failure unless it only notes incomplete
+/// annotations.
 #[derive(Default)]
 struct Rendered<'db> {
     text: String,
-    errors: Vec<(usize, String)>,
+    errors: Vec<(usize, String, bool)>,
     /// The records around the last one rendered, read together.
     batch: Option<Batch<'db>>,
 }
@@ -324,32 +364,41 @@ struct Rendered<'db> {
 const RENDER_BATCH: u32 = 1_024;
 
 impl<'db> Rendered<'db> {
-    fn game(&mut self, db: &'db Database, id: u32) {
+    fn game(&mut self, db: &'db Database, id: u32, options: &Options) {
         if !self.batch.as_ref().is_some_and(|b| b.ids().contains(&id)) {
             self.batch = db.batch(id, id.saturating_add(RENDER_BATCH - 1)).ok();
         }
         let rendered = match &self.batch {
             Some(batch) => batch.record(id).and_then(|r| {
                 if r.kind() != RecordKind::Game {
-                    return cbformat::pgn::game(db, id);
+                    return cbformat::pgn::game_with(db, id, options);
                 }
                 let data = batch.moves_of(&r)?;
-                cbformat::pgn::game_from(db, &r, &data.moves()?)
+                let annotations = batch.annotations_of(&r)?;
+                cbformat::pgn::game_from(db, &r, &data.moves()?, annotations.as_ref(), options)
             }),
-            None => cbformat::pgn::game(db, id),
+            None => cbformat::pgn::game_with(db, id, options),
         };
         match rendered {
             Ok(game) => {
-                self.text.push_str(&game);
+                if let AnnotationStatus::Incomplete { type_code } = game.annotations {
+                    let note = format!("game {id}: annotations incomplete: type {type_code:#04x} of unknown layout");
+                    self.errors.push((self.text.len(), note, false));
+                }
+                self.text.push_str(&game.pgn);
                 self.text.push('\n');
             }
-            Err(e) => self.errors.push((self.text.len(), format!("game {id}: {e}"))),
+            Err(e) => self.errors.push((self.text.len(), format!("game {id}: {e}"), true)),
         }
+    }
+
+    fn failed(&self) -> bool {
+        self.errors.iter().any(|e| e.2)
     }
 
     fn write_to(&mut self, out: &mut dyn Write) -> std::io::Result<()> {
         let mut at = 0;
-        for (offset, error) in &self.errors {
+        for (offset, error, _) in &self.errors {
             out.write_all(&self.text.as_bytes()[at..*offset])?;
             eprintln!("{error}");
             at = *offset;
@@ -400,14 +449,14 @@ fn export_in_order<'db>(
                 break;
             }
             // Our turn: write what is held, then stream the rest.
-            let mut chunk_ok = r.errors.is_empty();
+            let mut chunk_ok = !r.failed();
             let mut result = r.write_to(&mut *t.out);
             for &id in &chunk[done..] {
                 if result.is_err() {
                     break;
                 }
                 render(id, &mut r);
-                chunk_ok &= r.errors.is_empty();
+                chunk_ok &= !r.failed();
                 result = r.write_to(&mut *t.out);
             }
             t.ok &= chunk_ok;
