@@ -254,8 +254,13 @@ the Library. Ties are broken by `number`, ascending.
 | `flags.deleted` | ChessBase marked the record deleted; it is still listed, as ChessBase lists it |
 | `flags.chess960` | The game starts from a Chess960 position |
 
-A row for a guiding text has `kind: "text"`, its title in `event`, and empty
-player fields.
+A row for a guiding text or an analysis has `kind: "text"` or `"analysis"`,
+its title in `event`, its author in `annotator`, `result: "*"`, and empty game
+fields.
+
+Text fields in a row are cut at 200 characters and then end with `…`; the
+game's PGN has them in full. A window therefore stays small however long a
+name stored in the database is.
 
 ### `GET /v1/databases/{id}/games/{number}`
 

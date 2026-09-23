@@ -30,8 +30,10 @@ impl Policy {
         }
         let origin = match req.header("origin") {
             None => None,
-            Some(o) if self.origins.iter().any(|allowed| allowed == o) => Some(o.to_string()),
-            Some(_) => return Verdict::Answer(error(403, "forbidden_origin", "Origin is not allowed")),
+            Some(o) => match self.allowed_origin(Some(o)) {
+                Some(o) => Some(o.to_string()),
+                None => return Verdict::Answer(error(403, "forbidden_origin", "Origin is not allowed")),
+            },
         };
         if req.method == "OPTIONS" {
             return Verdict::Answer(match &origin {
@@ -47,6 +49,11 @@ impl Policy {
             return refuse(error(405, "method_not_allowed", "Only GET is served").header("Allow", "GET, OPTIONS"));
         }
         Verdict::Serve { origin }
+    }
+
+    /// `origin` when it is on the allowlist.
+    pub fn allowed_origin<'a>(&self, origin: Option<&'a str>) -> Option<&'a str> {
+        origin.filter(|o| self.origins.iter().any(|allowed| allowed == o))
     }
 
     fn host_ok(&self, host: Option<&str>) -> bool {

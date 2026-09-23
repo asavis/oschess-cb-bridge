@@ -141,6 +141,27 @@ impl Entities {
     }
 }
 
+impl Entities {
+    /// The first non-empty title of game tag `id`: the title of the guiding
+    /// text or analysis that refers to it. A tag holds one title per language;
+    /// `None` when all are empty or the id is unused. Errors as for
+    /// [`Entities::raw`].
+    pub fn title(&self, id: i64) -> Result<Option<String>> {
+        Ok(self.raw(GAME_TAG, id)?.and_then(|r| {
+            let mut c = Cursor(&r, 0);
+            let count = c.i32()?;
+            for _ in 0..count.max(0) {
+                let _language = c.i32()?;
+                let title = c.string()?;
+                if !title.is_empty() {
+                    return Some(title);
+                }
+            }
+            None
+        }))
+    }
+}
+
 struct Cursor<'a>(&'a [u8], usize);
 
 impl Cursor<'_> {

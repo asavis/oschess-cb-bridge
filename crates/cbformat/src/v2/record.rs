@@ -94,6 +94,23 @@ impl Record {
     pub fn game_tag(&self) -> i64 {
         le_i64(&self.b, 0x50)
     }
+    /// A guiding text's author, a player id. Guiding texts share only their
+    /// first eight bytes with games; the game accessors do not apply to them.
+    pub fn text_author(&self) -> i64 {
+        le_i64(&self.b, 0x20)
+    }
+    /// The game tag holding a guiding text's title; see [`crate::v2::Entities::title`].
+    pub fn text_title(&self) -> i64 {
+        le_i64(&self.b, 0x28)
+    }
+    /// The game tag holding an analysis's title.
+    pub fn analysis_title(&self) -> i64 {
+        le_i64(&self.b, 0x18)
+    }
+    /// An analysis's author, a player id.
+    pub fn analysis_author(&self) -> i64 {
+        le_i64(&self.b, 0x28)
+    }
     pub fn result(&self) -> GameResult {
         match self.b[0x58] {
             0 => GameResult::BlackWins,

@@ -55,6 +55,30 @@ pub enum ReadError {
     Malformed(&'static str),
 }
 
+/// A request that could not be read, with the `Origin` its bytes named, so
+/// that a refusal can still carry CORS headers for an allowed page.
+#[derive(Debug)]
+pub struct Refusal {
+    pub error: ReadError,
+    pub origin: Option<String>,
+}
+
+impl ReadError {
+    fn quiet(self) -> Refusal {
+        Refusal { error: self, origin: None }
+    }
+}
+
+/// The `Origin` header among the lines of a request head, however malformed
+/// the rest of it is.
+fn sniff_origin(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(&head[..head.len().min(MAX_HEAD)]);
+    text.split("\r\n").skip(1).take_while(|l| !l.is_empty()).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("origin").then(|| value.trim().to_string())
+    })
+}
+
 /// A connection with the bytes read past the last request.
 pub struct Conn {
     stream: TcpStream,
@@ -66,38 +90,40 @@ impl Conn {
         Conn { stream, buf: Vec::new() }
     }
 
-    pub fn read_request(&mut self) -> Result<Request, ReadError> {
+    pub fn read_request(&mut self) -> Result<Request, Refusal> {
         let mut started = (!self.buf.is_empty()).then(Instant::now);
         loop {
+            let too_large = |buf: &[u8]| Refusal { error: ReadError::TooLarge, origin: sniff_origin(buf) };
             if let Some(end) = find_head_end(&self.buf) {
                 if end > MAX_HEAD {
-                    return Err(ReadError::TooLarge);
+                    return Err(too_large(&self.buf));
                 }
                 let head: Vec<u8> = self.buf.drain(..end + 4).collect();
-                return parse(&head[..end]);
+                return parse(&head[..end]).map_err(|error| Refusal { error, origin: sniff_origin(&head) });
             }
             if self.buf.len() > MAX_HEAD {
-                return Err(ReadError::TooLarge);
+                return Err(too_large(&self.buf));
             }
             let timeout = match started {
                 None => IDLE_TIMEOUT,
-                Some(t) => {
-                    REQUEST_TIMEOUT.checked_sub(t.elapsed()).filter(|d| !d.is_zero()).ok_or(ReadError::Dropped)?
-                }
+                Some(t) => match REQUEST_TIMEOUT.checked_sub(t.elapsed()).filter(|d| !d.is_zero()) {
+                    Some(left) => left,
+                    None => return Err(ReadError::Dropped.quiet()),
+                },
             };
             let lost = if started.is_some() { ReadError::Dropped } else { ReadError::Closed };
             if self.stream.set_read_timeout(Some(timeout)).is_err() {
-                return Err(lost);
+                return Err(lost.quiet());
             }
             let mut chunk = [0u8; 4096];
             match self.stream.read(&mut chunk) {
-                Ok(0) => return Err(lost),
+                Ok(0) => return Err(lost.quiet()),
                 Ok(n) => {
                     started.get_or_insert_with(Instant::now);
                     self.buf.extend_from_slice(&chunk[..n]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(lost),
+                Err(_) => return Err(lost.quiet()),
             }
         }
     }
@@ -286,6 +312,14 @@ mod tests {
         let r = req("GET / HTTP/1.1\r\nHost: h\r\nConnection: close").unwrap();
         assert!(!r.keep_alive);
         assert!(!req("GET / HTTP/1.0").unwrap().keep_alive);
+    }
+
+    #[test]
+    fn finds_the_origin_of_a_refused_request() {
+        let head = b"GET /?q=%zz HTTP/1.1\r\nHost: h\r\norigin:  https://oschess.org \r\n\r\nOrigin: later";
+        assert_eq!(sniff_origin(head).as_deref(), Some("https://oschess.org"));
+        assert_eq!(sniff_origin(b"GET / HTTP/1.1\r\nHost: h"), None);
+        assert_eq!(sniff_origin(b"Origin: first-line-is-the-request-line"), None);
     }
 
     #[test]

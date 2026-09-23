@@ -1,5 +1,7 @@
 //! The v1 endpoints of `docs/api.md`.
 
+use std::collections::HashMap;
+
 use cbformat::Error;
 use cbformat::pgn;
 use cbformat::v2::{Database, Eco, Record, RecordKind};
@@ -145,45 +147,123 @@ fn games(entry: &Entry, req: &Request) -> Response {
 
 /// Rows `first..first + count` in one header read.
 fn window(db: &Database, first: u32, count: u32) -> cbformat::Result<Vec<String>> {
-    let records = db.records(first, first + count - 1)?;
-    records.iter().map(|r| row(db, r)).collect()
+    // `first + count` itself may not fit when the window ends at `u32::MAX`.
+    let records = db.records(first, first + (count - 1))?;
+    let mut names = Names::new(db);
+    records.iter().map(|r| row(&mut names, r)).collect()
 }
 
-fn row(db: &Database, r: &Record) -> cbformat::Result<String> {
-    let e = db.entities();
-    let player = |id: i64| -> cbformat::Result<String> { Ok(e.player(id)?.map(|p| p.pgn()).unwrap_or_default()) };
-    let tournament = e.tournament(r.tournament())?;
-    let kind = match r.kind() {
-        RecordKind::Game => "game",
-        RecordKind::Text => "text",
-        RecordKind::Analysis => "analysis",
-        RecordKind::Unknown(_) => "unknown",
+/// The longest text, in characters, a list row carries in one field. Longer
+/// names are cut and end with `…`; the game's PGN has them in full. With 500
+/// rows this bounds a window to a few megabytes, whatever an entity holds.
+pub const MAX_FIELD_CHARS: usize = 200;
+
+fn clip(text: String) -> String {
+    match text.char_indices().nth(MAX_FIELD_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
+
+/// Entity names for one window, each looked up once: rows of a tournament
+/// share their players and event, and one entity can be up to a megabyte.
+struct Names<'a> {
+    db: &'a Database,
+    players: HashMap<i64, String>,
+    tournaments: HashMap<i64, (String, String)>,
+    titles: HashMap<i64, String>,
+}
+
+impl<'a> Names<'a> {
+    fn new(db: &'a Database) -> Self {
+        Names { db, players: HashMap::new(), tournaments: HashMap::new(), titles: HashMap::new() }
+    }
+
+    fn player(&mut self, id: i64) -> cbformat::Result<String> {
+        if let Some(name) = self.players.get(&id) {
+            return Ok(name.clone());
+        }
+        let name = clip(self.db.entities().player(id)?.map(|p| p.pgn()).unwrap_or_default());
+        self.players.insert(id, name.clone());
+        Ok(name)
+    }
+
+    /// The tournament's title and place.
+    fn tournament(&mut self, id: i64) -> cbformat::Result<(String, String)> {
+        if let Some(t) = self.tournaments.get(&id) {
+            return Ok(t.clone());
+        }
+        let t = self.db.entities().tournament(id)?.map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
+        self.tournaments.insert(id, t.clone());
+        Ok(t)
+    }
+
+    /// A guiding text's or an analysis's title, from its game tag.
+    fn title(&mut self, id: i64) -> cbformat::Result<String> {
+        if let Some(t) = self.titles.get(&id) {
+            return Ok(t.clone());
+        }
+        let t = clip(self.db.entities().title(id)?.unwrap_or_default());
+        self.titles.insert(id, t.clone());
+        Ok(t)
+    }
+}
+
+/// One list row. Guiding texts and analyses have header layouts of their own
+/// (only the first eight bytes are shared with games): their row carries the
+/// title in `event` and the author in `annotator`, and no game fields.
+fn row(names: &mut Names<'_>, r: &Record) -> cbformat::Result<String> {
+    let base = Obj::new().num("number", r.id());
+    let other = |base: Obj, kind: &str, title: String, author: String| {
+        base.str("kind", kind)
+            .str("white", "")
+            .num("whiteElo", 0)
+            .str("black", "")
+            .num("blackElo", 0)
+            .str("result", "*")
+            .num("moves", 0)
+            .str("eco", "")
+            .str("event", &title)
+            .str("site", "")
+            .str("date", "????.??.??")
+            .str("round", "")
+            .str("annotator", &author)
+            .raw("flags", &Obj::new().bool("deleted", r.is_deleted()).bool("chess960", false).done())
+            .done()
     };
-    let is_game = !matches!(r.kind(), RecordKind::Text);
-    let names = |id: i64| if is_game { player(id) } else { Ok(String::new()) };
-    let round = match (r.round(), r.subround()) {
-        (n, _) if n <= 0 => String::new(),
-        (n, s) if s <= 0 => n.to_string(),
-        (n, s) => format!("{n}({s})"),
-    };
-    let flags = Obj::new().bool("deleted", r.is_deleted()).bool("chess960", matches!(r.eco(), Eco::Chess960(_))).done();
-    Ok(Obj::new()
-        .num("number", r.id())
-        .str("kind", kind)
-        .str("white", &names(r.white())?)
-        .num("whiteElo", r.white_elo().max(0))
-        .str("black", &names(r.black())?)
-        .num("blackElo", r.black_elo().max(0))
-        .str("result", r.result().pgn())
-        .num("moves", r.move_count().max(0))
-        .str("eco", &r.eco().pgn().unwrap_or_default())
-        .str("event", tournament.as_ref().map_or("", |t| &t.title))
-        .str("site", tournament.as_ref().map_or("", |t| &t.place))
-        .str("date", &r.played_date().pgn())
-        .str("round", &round)
-        .str("annotator", &player(r.annotator())?)
-        .raw("flags", &flags)
-        .done())
+    match r.kind() {
+        RecordKind::Text => Ok(other(base, "text", names.title(r.text_title())?, names.player(r.text_author())?)),
+        RecordKind::Analysis => {
+            Ok(other(base, "analysis", names.title(r.analysis_title())?, names.player(r.analysis_author())?))
+        }
+        RecordKind::Unknown(_) => Ok(other(base, "unknown", String::new(), String::new())),
+        RecordKind::Game => {
+            let (event, site) = names.tournament(r.tournament())?;
+            let round = match (r.round(), r.subround()) {
+                (n, _) if n <= 0 => String::new(),
+                (n, s) if s <= 0 => n.to_string(),
+                (n, s) => format!("{n}({s})"),
+            };
+            let flags =
+                Obj::new().bool("deleted", r.is_deleted()).bool("chess960", matches!(r.eco(), Eco::Chess960(_))).done();
+            Ok(base
+                .str("kind", "game")
+                .str("white", &names.player(r.white())?)
+                .num("whiteElo", r.white_elo().max(0))
+                .str("black", &names.player(r.black())?)
+                .num("blackElo", r.black_elo().max(0))
+                .str("result", r.result().pgn())
+                .num("moves", r.move_count().max(0))
+                .str("eco", &r.eco().pgn().unwrap_or_default())
+                .str("event", &event)
+                .str("site", &site)
+                .str("date", &r.played_date().pgn())
+                .str("round", &round)
+                .str("annotator", &names.player(r.annotator())?)
+                .raw("flags", &flags)
+                .done())
+        }
+    }
 }
 
 fn game(app: &App, entry: &Entry, number: &str) -> Response {

@@ -46,8 +46,8 @@ struct Running {
 }
 
 fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sync>>) -> Running {
-    let listener = server::bind(0).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let listeners = server::bind(0).unwrap();
+    let port = listeners[0].local_addr().unwrap().port();
     let path = db.dir().join("db.2cbh");
     let mut paths = vec![path.clone()];
     paths.extend(extra);
@@ -58,7 +58,7 @@ fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sy
         between_reads: hook,
     };
     let app = Arc::new(app);
-    std::thread::spawn(move || server::serve(listener, app));
+    std::thread::spawn(move || server::serve(listeners, app));
     Running { port, id: id_of(&path) }
 }
 
@@ -323,4 +323,192 @@ fn a_connection_serves_several_requests() {
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
     assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
+}
+
+/// A `.2lid` with six entity types (players, tournaments, sources, the unused
+/// type 3, teams, game tags), `count` entities each in containers of `size`
+/// bytes, holding `entities` as (type, id, record after its length field).
+fn lid_with(size: usize, count: usize, entities: &[(usize, usize, Vec<u8>)]) -> Vec<u8> {
+    const TYPES: usize = 6;
+    const HEADER: usize = 184;
+    let mut d = Vec::new();
+    d.extend((HEADER as i32).to_be_bytes());
+    d.extend((TYPES as i32).to_be_bytes());
+    for _ in 0..TYPES {
+        d.extend((size as i32).to_be_bytes());
+        d.extend((count as i64).to_be_bytes());
+        d.extend((-1i64).to_be_bytes());
+    }
+    d.resize(HEADER + size * TYPES * count, 0);
+    for (typ, id, record) in entities {
+        let o = HEADER + id * size * TYPES + typ * size;
+        d[o..o + 4].copy_from_slice(&(record.len() as i32).to_le_bytes());
+        d[o + 4..o + 4 + record.len()].copy_from_slice(record);
+    }
+    d
+}
+
+fn strings(parts: &[&str]) -> Vec<u8> {
+    parts.iter().flat_map(|s| (s.len() as i32).to_le_bytes().into_iter().chain(s.bytes())).collect()
+}
+
+/// A game tag: one title in language 0, one empty one in language 1.
+fn titles(title: &str) -> Vec<u8> {
+    let mut r = 2i32.to_le_bytes().to_vec();
+    r.extend(0i32.to_le_bytes());
+    r.extend(strings(&[title]));
+    r.extend(1i32.to_le_bytes());
+    r.extend(strings(&[""]));
+    r
+}
+
+/// Guiding texts and analyses have header layouts of their own; their rows
+/// carry their title and author, never fields read through the game layout.
+#[test]
+fn texts_and_analyses_are_read_with_their_own_layouts() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    let game = b.game(e4);
+    game[0x28..0x30].copy_from_slice(&1i64.to_le_bytes()); // tournament 1
+    let text = b.game(e4);
+    text[0] |= 2;
+    text[0x10..0x18].copy_from_slice(&1i64.to_le_bytes()); // a text's tournament
+    text[0x20..0x28].copy_from_slice(&1i64.to_le_bytes()); // author: player 1
+    text[0x28..0x30].copy_from_slice(&0i64.to_le_bytes()); // title: game tag 0
+    let analysis = b.game(e4);
+    analysis[2] = 2;
+    analysis[0x18..0x20].copy_from_slice(&1i64.to_le_bytes()); // title: game tag 1
+    analysis[0x28..0x30].copy_from_slice(&1i64.to_le_bytes()); // author: player 1
+    b.lid(lid_with(
+        256,
+        2,
+        &[
+            (0, 0, strings(&["Morphy", "Paul"])),
+            (0, 1, strings(&["Author", "Text"])),
+            (1, 1, [strings(&["Paris", "Paris m"]), 0i32.to_le_bytes().to_vec()].concat()),
+            (5, 0, titles("Review text")),
+            (5, 1, titles("1.d4 d5 2.c4")),
+        ],
+    ));
+    let db = b.write("api-kinds");
+    let r = start(&db, vec![], None);
+    let w = get(r.port, &format!("/v1/databases/{}/games", r.id), "");
+    assert_eq!(w.status, 200, "{}", w.body);
+    let rows: Vec<&str> = w.body.split(r#"{"number":"#).skip(1).collect();
+    assert!(rows[0].contains(r#""kind":"game","white":"Morphy, Paul""#), "{}", rows[0]);
+    assert!(rows[0].contains(r#""event":"Paris m","site":"Paris""#), "{}", rows[0]);
+    assert!(rows[1].contains(r#""kind":"text","white":"""#), "{}", rows[1]);
+    assert!(rows[1].contains(r#""event":"Review text","site":"""#), "{}", rows[1]);
+    assert!(rows[1].contains(r#""annotator":"Author, Text""#), "{}", rows[1]);
+    assert!(rows[2].contains(r#""kind":"analysis","white":"""#), "{}", rows[2]);
+    assert!(
+        rows[2].contains(r#""event":"1.d4 d5 2.c4""#) && rows[2].contains(r#""annotator":"Author, Text""#),
+        "{}",
+        rows[2]
+    );
+}
+
+/// 500 rows sharing one player whose name fills a 1 MiB container: names are
+/// cut to 200 characters and looked up once, so the window stays small.
+#[test]
+fn a_huge_shared_entity_does_not_blow_up_a_window() {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for _ in 0..500 {
+        b.game(e4);
+    }
+    let last = "M".repeat((1 << 20) - 16);
+    let player = strings(&[&last, ""]);
+    let mut lid = lid_header(1 << 20, 1);
+    lid.extend((player.len() as i32).to_le_bytes());
+    lid.extend(&player);
+    b.lid(lid);
+    let db = b.write("api-huge-entity");
+    let r = start(&db, vec![], None);
+    let w = get(r.port, &format!("/v1/databases/{}/games?limit=500", r.id), "");
+    assert_eq!(w.status, 200);
+    assert!(w.body.len() < 2 << 20, "window of {} bytes", w.body.len());
+    let white = w.body.split(r#""white":""#).nth(1).unwrap().split('"').next().unwrap();
+    assert_eq!(white.chars().count(), bridge::api::MAX_FIELD_CHARS + 1);
+    assert!(white.ends_with('…'));
+}
+
+/// A window ending at record `u32::MAX` is served. The header file is sparse,
+/// which needs a Unix file system.
+#[cfg(unix)]
+#[test]
+fn a_window_at_the_last_record_number() {
+    let db = database("api-max", 1, 0, 0);
+    let file = std::fs::OpenOptions::new().write(true).open(db.dir().join("db.2cbh")).unwrap();
+    file.set_len((u64::from(u32::MAX) + 1) * 192).unwrap();
+    let r = start(&db, vec![], None);
+    let numbers = |q: &str| -> Vec<u64> {
+        let w = get(r.port, &format!("/v1/databases/{}/games{q}", r.id), "");
+        assert_eq!(w.status, 200, "{q}: {}", w.body);
+        w.body.split(r#""number":"#).skip(1).map(|s| s.split(',').next().unwrap().parse().unwrap()).collect()
+    };
+    assert_eq!(numbers("?offset=4294967294&limit=1"), [4294967295]);
+    assert_eq!(numbers("?offset=4294967293&limit=5"), [4294967294, 4294967295]);
+    assert_eq!(numbers("?sort=number-desc&limit=2"), [4294967295, 4294967294]);
+}
+
+/// Refusals made before a request is routed carry CORS headers for an allowed
+/// origin, so the page can read them.
+#[test]
+fn refusals_before_routing_are_readable_by_the_page() {
+    let db = database("api-refusals", 1, 0, 0);
+    let p = start(&db, vec![], None).port;
+    let host = format!("Host: 127.0.0.1:{p}");
+    for (head, status) in [
+        (format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}\r\nContent-Length: 1"), 413),
+        (format!("GET /v1/status?q=%zz HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}"), 400),
+        (format!("GET /v1/status HTTP/1.1\r\nOrigin: {ORIGIN}\r\n{host}\r\nX-Big: {}", "x".repeat(17 << 10)), 431),
+    ] {
+        let r = plain(p, &head);
+        assert_eq!(r.status, status);
+        assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN), "{status}");
+        assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After"), "{status}");
+    }
+    let r =
+        plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: https://evil.example\r\nContent-Length: 1"));
+    assert_eq!((r.status, r.header("access-control-allow-origin")), (413, None));
+}
+
+/// The bridge also answers on `[::1]`, where the machine has IPv6 loopback.
+#[test]
+fn the_ipv6_loopback_is_served() {
+    if std::net::TcpListener::bind(("::1", 0)).is_err() {
+        eprintln!("no IPv6 loopback on this machine; nothing to test");
+        return;
+    }
+    let db = database("api-ipv6", 1, 0, 0);
+    let p = start(&db, vec![], None).port;
+    let mut s = TcpStream::connect(("::1", p)).unwrap();
+    let raw = format!(
+        "GET /v1/status HTTP/1.1\r\nHost: [::1]:{p}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+}
+
+/// A second instance fails on the port before it touches the token, which the
+/// running bridge still accepts.
+#[test]
+fn a_second_instance_leaves_the_token_alone() {
+    let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = busy.local_addr().unwrap().port();
+    let home = std::env::temp_dir().join(format!("bridge-second-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
+    std::fs::write(home.join("token"), TOKEN).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oschess-bridge"))
+        .arg("--new-token")
+        .env("OSCHESS_BRIDGE_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(home.join("token")).unwrap(), TOKEN);
+    let _ = std::fs::remove_dir_all(&home);
 }
