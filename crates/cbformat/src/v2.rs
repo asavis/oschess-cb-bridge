@@ -12,6 +12,9 @@ use crate::movetable::{self, Color, Piece, Sq, from_cb_square};
 use crate::{Error, Result};
 
 pub const HEADER_RECORD_SIZE: usize = 192;
+
+/// The extensions of the files that make up a database.
+pub const EXTENSIONS: [&str; 6] = [".2cbh", ".2cbg", ".2cba", ".2lid", ".2lgd", ".2lcd"];
 const RECORD_MAGIC: [u8; 8] = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
 
 fn le_i16(b: &[u8], o: usize) -> i16 {
@@ -86,6 +89,18 @@ impl Database {
 
     pub fn stem(&self) -> &Path {
         &self.stem
+    }
+
+    /// The paths of every file of the database, whether or not each exists.
+    pub fn file_paths(&self) -> Vec<PathBuf> {
+        EXTENSIONS
+            .iter()
+            .map(|ext| {
+                let mut s = self.stem.clone().into_os_string();
+                s.push(ext);
+                PathBuf::from(s)
+            })
+            .collect()
     }
 
     /// Number of records, including deleted games, texts and analyses.

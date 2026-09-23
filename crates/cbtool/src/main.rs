@@ -1,6 +1,7 @@
 //! `cbtool`: inspect, verify and export ChessBase 2CBH databases.
 
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -206,6 +207,21 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
     Ok(stats.failures == 0)
 }
 
+/// Refuses an output path that is one of the database's own files, by name or
+/// through any alias such as a hard link: creating it would truncate the input
+/// while it is memory-mapped.
+fn refuse_database_file(out: &Path, db: &Database) -> AnyResult<()> {
+    if !out.exists() {
+        return Ok(());
+    }
+    for input in db.file_paths() {
+        if input.exists() && same_file::is_same_file(out, &input)? {
+            return Err(format!("refusing to overwrite {}, a file of the database being read", out.display()).into());
+        }
+    }
+    Ok(())
+}
+
 fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     let db = Database::open(path)?;
     let mut out_path = None;
@@ -222,7 +238,10 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
         ids = (1..=db.record_count()).filter(|&id| db.record(id).is_ok_and(|r| r.kind() == RecordKind::Game)).collect();
     }
     let sink: Box<dyn Write> = match out_path {
-        Some(p) => Box::new(std::fs::File::create(p)?),
+        Some(p) => {
+            refuse_database_file(Path::new(&p), &db)?;
+            Box::new(std::fs::File::create(p)?)
+        }
         None => Box::new(std::io::stdout().lock()),
     };
     let mut w = BufWriter::new(sink);
