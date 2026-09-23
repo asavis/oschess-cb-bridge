@@ -40,8 +40,10 @@ const SW: usize = 5;
 const W: usize = 6;
 const SE: usize = 7;
 
-const RAYS: [[Bitboard; 64]; 8] = {
-    let mut t = [[0; 64]; 8];
+/// Rays per direction, plus a ninth, empty "direction" for squares that share
+/// no line, so a ray can be taken without first testing for one.
+const RAYS: [[Bitboard; 64]; 9] = {
+    let mut t = [[0; 64]; 9];
     let mut d = 0;
     while d < 8 {
         let mut sq = 0;
@@ -113,31 +115,43 @@ static DIRECTION: [[u8; 64]; 64] = {
 const NO_LINE: u8 = 8;
 
 /// The direction (0-7) from `a` to `b` when they share a rank, file or
-/// diagonal.
+/// diagonal, and [`NO_LINE`] (8, whose ray is empty) when they do not.
 #[inline]
-pub(crate) fn direction(a: Square, b: Square) -> Option<usize> {
-    let d = DIRECTION[a.index()][b.index()];
-    (d != NO_LINE).then_some(d as usize)
+pub(crate) fn direction(a: Square, b: Square) -> usize {
+    DIRECTION[a.index()][b.index()] as usize
 }
 
-/// Whether a slider moving in direction `d` is a rook-like mover (the first
-/// four directions alternate: N, NE, E, NW; S, SW, W, SE).
+#[cfg(test)]
+pub(crate) const NO_LINE_DIRECTION: usize = NO_LINE as usize;
+
+/// All ones when direction `d` runs along a rank or file, else zero.
 #[inline]
-pub(crate) fn is_straight(d: usize) -> bool {
-    matches!(d, N | E | S | W)
+pub(crate) fn straight_mask(d: usize) -> Bitboard {
+    const MASKS: [Bitboard; 9] = [!0, 0, !0, 0, !0, 0, !0, 0, 0];
+    MASKS[d.min(8)]
+}
+
+/// All ones when direction `d` runs along a diagonal, else zero.
+#[inline]
+pub(crate) fn diagonal_mask(d: usize) -> Bitboard {
+    const MASKS: [Bitboard; 9] = [0, !0, 0, !0, 0, !0, 0, !0, 0];
+    MASKS[d.min(8)]
 }
 
 /// The squares from `sq` in direction `d` up to and including the first
-/// occupied one.
+/// occupied one; empty for direction 8, no line.
+///
+/// Branch-free: a sentinel bit on the far corner stands in for "no blocker",
+/// and the ray from that corner in the same direction is empty.
 #[inline]
 pub(crate) fn ray(d: usize, sq: Square, occupied: Bitboard) -> Bitboard {
+    let d = d.min(8);
     let r = RAYS[d][sq.index()];
     let blockers = r & occupied;
-    if blockers == 0 {
-        return r;
-    }
-    let first = if d < 4 { blockers.trailing_zeros() } else { 63 - blockers.leading_zeros() };
-    r ^ RAYS[d][first as usize]
+    let up = (blockers | 1 << 63).trailing_zeros();
+    let down = 63 - (blockers | 1).leading_zeros();
+    let first = if d < 4 { up } else { down };
+    r ^ RAYS[d][(first & 63) as usize]
 }
 
 #[inline]
@@ -216,14 +230,51 @@ mod tests {
 
     #[test]
     fn directions() {
-        assert_eq!(direction(sq("e1"), sq("e8")), Some(N));
-        assert_eq!(direction(sq("e1"), sq("a5")), Some(NW));
-        assert_eq!(direction(sq("h8"), sq("a1")), Some(SW));
-        assert_eq!(direction(sq("a1"), sq("b3")), None);
-        assert_eq!(direction(sq("d4"), sq("d4")), None);
-        assert!(is_straight(W) && !is_straight(SE));
+        assert_eq!(direction(sq("e1"), sq("e8")), N);
+        assert_eq!(direction(sq("e1"), sq("a5")), NW);
+        assert_eq!(direction(sq("h8"), sq("a1")), SW);
+        assert_eq!(direction(sq("a1"), sq("b3")), NO_LINE_DIRECTION);
+        assert_eq!(direction(sq("d4"), sq("d4")), NO_LINE_DIRECTION);
+        assert!(straight_mask(W) == !0 && straight_mask(SE) == 0 && diagonal_mask(SE) == !0);
+        assert_eq!(straight_mask(NO_LINE_DIRECTION) | diagonal_mask(NO_LINE_DIRECTION), 0);
         let occ = sq("e5").bit() | sq("e7").bit();
         assert_eq!(names(ray(N, sq("e1"), occ)), ["e2", "e3", "e4", "e5"]);
+        assert_eq!(names(ray(N, sq("e1"), 0)), ["e2", "e3", "e4", "e5", "e6", "e7", "e8"]);
+        assert_eq!(names(ray(S, sq("h8"), sq("h8").bit())), ["h1", "h2", "h3", "h4", "h5", "h6", "h7"]);
+        assert_eq!(names(ray(SW, sq("h8"), sq("a1").bit())), ["a1", "b2", "c3", "d4", "e5", "f6", "g7"]);
+        assert_eq!(ray(NO_LINE_DIRECTION, sq("d4"), 0), 0);
+    }
+
+    /// The branch-free ray against a square-by-square walk, for every square,
+    /// direction and a spread of occupancies.
+    #[test]
+    fn rays_match_a_walk() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let occ = x & x.rotate_left(29);
+            for s in 0..64u8 {
+                let from = Square::from_index(s).unwrap();
+                for (d, &(df, dr)) in DIRECTIONS.iter().enumerate() {
+                    let (mut f, mut r, mut want) = (from.file() as i8, from.rank() as i8, 0u64);
+                    loop {
+                        f += df;
+                        r += dr;
+                        if !(0..8).contains(&f) || !(0..8).contains(&r) {
+                            break;
+                        }
+                        let b = 1u64 << (r * 8 + f);
+                        want |= b;
+                        if occ & b != 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(ray(d, from, occ), want, "{from} direction {d}");
+                }
+            }
+        }
     }
 
     #[test]

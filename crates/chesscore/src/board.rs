@@ -7,8 +7,6 @@ use crate::attacks;
 use crate::types::{Bitboard, Color, Move, Piece, Square, squares};
 use crate::zobrist::{CASTLE, EN_PASSANT, KEYS, PIECE, TURN};
 
-const EMPTY: u8 = 0xff;
-
 /// The two castling sides. Short castling ends with the king on the g-file,
 /// long castling on the c-file, in standard chess and Chess960 alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -75,8 +73,8 @@ impl std::error::Error for IllegalMove {}
 pub struct Board {
     pieces: [Bitboard; 6],
     colors: [Bitboard; 2],
-    /// `piece << 1 | color` for each square, or `EMPTY`.
-    mailbox: [u8; 64],
+    /// The piece on each square.
+    mailbox: [Option<(Piece, Color)>; 64],
     side: Color,
     /// The file of the rook each castling right belongs to, by colour and side.
     castling: [[Option<u8>; 2]; 2],
@@ -104,6 +102,13 @@ fn castle_key(color: Color, side: CastleSide) -> u64 {
     KEYS[CASTLE + 2 * color.index() + side.index()]
 }
 
+// Per piece kind (pawn, knight, bishop, rook, queen, king): all ones when it
+// has the property, for branch-free selection.
+const MOVES_STRAIGHT: [Bitboard; 6] = [0, 0, 0, !0, !0, 0];
+const MOVES_DIAGONAL: [Bitboard; 6] = [0, 0, !0, 0, !0, 0];
+const IS_KNIGHT: [Bitboard; 6] = [0, !0, 0, 0, 0, 0];
+const IS_PAWN: [Bitboard; 6] = [!0, 0, 0, 0, 0, 0];
+
 impl Board {
     /// A board with nothing on it, white to move. Not a valid position until
     /// pieces are added; used by the constructors.
@@ -111,7 +116,7 @@ impl Board {
         Board {
             pieces: [0; 6],
             colors: [0; 2],
-            mailbox: [EMPTY; 64],
+            mailbox: [None; 64],
             side: Color::White,
             castling: [[None; 2]; 2],
             ep_file: None,
@@ -168,12 +173,7 @@ impl Board {
 
     #[inline]
     pub fn piece_at(&self, sq: Square) -> Option<(Piece, Color)> {
-        let v = self.mailbox[sq.index()];
-        if v == EMPTY {
-            return None;
-        }
-        let color = if v & 1 == 0 { Color::White } else { Color::Black };
-        Piece::from_index((v >> 1) as usize).map(|p| (p, color))
+        self.mailbox[sq.index()]
     }
 
     #[inline]
@@ -295,7 +295,7 @@ impl Board {
     pub(crate) fn put(&mut self, sq: Square, piece: Piece, color: Color) {
         self.pieces[piece.index()] |= sq.bit();
         self.colors[color.index()] |= sq.bit();
-        self.mailbox[sq.index()] = (piece.index() as u8) << 1 | color.index() as u8;
+        self.mailbox[sq.index()] = Some((piece, color));
         self.key ^= piece_key(piece, color, sq);
     }
 
@@ -303,7 +303,7 @@ impl Board {
     fn remove(&mut self, sq: Square, piece: Piece, color: Color) {
         self.pieces[piece.index()] &= !sq.bit();
         self.colors[color.index()] &= !sq.bit();
-        self.mailbox[sq.index()] = EMPTY;
+        self.mailbox[sq.index()] = None;
         self.key ^= piece_key(piece, color, sq);
     }
 
@@ -404,31 +404,33 @@ impl Board {
             return;
         }
         // A check now comes from the moved piece itself, or from a slider of
-        // ours the vacated square was blocking.
+        // ours the vacated square was blocking. Both are computed from the
+        // enemy king outwards, with masks rather than branches: which piece
+        // moved and whether it lines up with the king are unpredictable.
         let king = self.king(them);
         let occupied = self.occupied();
-        let landed = mv.promotion.unwrap_or(piece);
-        let direct = match landed {
-            Piece::Pawn => attacks::pawn(us, mv.to),
-            Piece::Knight => attacks::knight(mv.to),
-            Piece::Bishop => attacks::bishop(mv.to, occupied),
-            Piece::Rook => attacks::rook(mv.to, occupied),
-            Piece::Queen => attacks::queen(mv.to, occupied),
-            Piece::King => 0,
-        };
-        let mut checkers = if direct & king.bit() != 0 { mv.to.bit() } else { 0 };
-        if let Some(d) = attacks::direction(king, mv.from) {
-            checkers |= attacks::ray(d, king, occupied) & self.sliders(d) & self.colors(us);
-        }
-        self.checkers = checkers;
+        let landed = mv.promotion.unwrap_or(piece) as usize;
+        let to = mv.to.bit();
+        let d_to = attacks::direction(king, mv.to);
+        let along = attacks::ray(d_to, king, occupied) & to;
+        let direct = (along
+            & ((attacks::straight_mask(d_to) & MOVES_STRAIGHT[landed])
+                | (attacks::diagonal_mask(d_to) & MOVES_DIAGONAL[landed])))
+            | (attacks::knight(king) & to & IS_KNIGHT[landed])
+            | (attacks::pawn(them, king) & to & IS_PAWN[landed]);
+        let d_from = attacks::direction(king, mv.from);
+        let discovered = attacks::ray(d_from, king, occupied) & self.sliders(d_from) & self.colors(us);
+        self.checkers = direct | discovered;
     }
 
     /// The pieces that attack along direction `d`: rooks and queens on ranks
-    /// and files, bishops and queens on diagonals.
+    /// and files, bishops and queens on diagonals, none for no line.
     #[inline]
     fn sliders(&self, d: usize) -> Bitboard {
-        let line = if attacks::is_straight(d) { self.pieces(Piece::Rook) } else { self.pieces(Piece::Bishop) };
-        line | self.pieces(Piece::Queen)
+        let (straight, diagonal) = (attacks::straight_mask(d), attacks::diagonal_mask(d));
+        (self.pieces(Piece::Rook) & straight)
+            | (self.pieces(Piece::Bishop) & diagonal)
+            | (self.pieces(Piece::Queen) & (straight | diagonal))
     }
 
     fn drop_castling_rook(&mut self, color: Color, file: u8) {
@@ -524,14 +526,14 @@ impl Board {
                 return Err(IllegalMove::LeavesKingInCheck);
             }
         }
-        // A piece leaving the line between its king and an enemy slider.
-        if let Some(d) = attacks::direction(king, mv.from)
-            && attacks::direction(king, mv.to) != Some(d)
-        {
-            let after = (occupied & !mv.from.bit()) | mv.to.bit();
-            if attacks::ray(d, king, after) & self.sliders(d) & self.colors(them) != 0 {
-                return Err(IllegalMove::LeavesKingInCheck);
-            }
+        // A piece leaving the line between its king and an enemy slider;
+        // computed whether or not the piece is on such a line, since that is
+        // unpredictable and the ray is cheap.
+        let d = attacks::direction(king, mv.from);
+        let leaves_line = u64::from(attacks::direction(king, mv.to) != d).wrapping_neg();
+        let after = (occupied & !mv.from.bit()) | mv.to.bit();
+        if attacks::ray(d, king, after) & self.sliders(d) & self.colors(them) & leaves_line != 0 {
+            return Err(IllegalMove::LeavesKingInCheck);
         }
         Ok(Verdict::Legal)
     }
