@@ -79,10 +79,9 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub format: Format,
-    open: Mutex<Option<Opened>>,
     /// Set when the database left the list: it is then reported `missing`.
     removed: AtomicBool,
-    fetch: Arc<Fetch>,
+    held: Arc<Held>,
     shared: Arc<Shared>,
 }
 
@@ -92,12 +91,23 @@ struct Shared {
     downloads: Arc<Serial>,
 }
 
-/// A database's download: the one running or queued, and the generation its
-/// files had when they were last all read.
+/// What stays with a database when the list is read again or the window
+/// renames it: the open handle and the download.
 #[derive(Default)]
-struct Fetch {
+struct Held {
+    open: Mutex<Option<Opened>>,
+    /// The download running or queued.
     running: Mutex<Option<Arc<Progress>>>,
-    fetched: Mutex<Option<u64>>,
+    /// How the files looked right after the last download read them all.
+    fetched: Mutex<Option<Fetched>>,
+}
+
+/// The files of a database as a finished download left them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fetched {
+    generation: u64,
+    /// Whether each present file still carried a cloud-only mark, in order.
+    marks: Vec<bool>,
 }
 
 /// What the metadata of a database's files tells, without reading them.
@@ -106,6 +116,9 @@ struct Files {
     generation: Option<u64>,
     /// The files that are there, each with its size and whether it is cloud-only.
     present: Vec<(PathBuf, u64, bool)>,
+    /// Some file is there but is not a regular file: a directory, a pipe or a
+    /// device, which could block a reader or mislead it.
+    irregular: bool,
 }
 
 impl Files {
@@ -116,18 +129,21 @@ impl Files {
     fn cloud_only(&self) -> bool {
         self.present.iter().any(|f| f.2)
     }
+
+    fn marks(&self) -> Vec<bool> {
+        self.present.iter().map(|f| f.2).collect()
+    }
 }
 
 impl Entry {
-    fn new(listed: Listed, shared: &Arc<Shared>, fetch: Arc<Fetch>) -> Entry {
+    fn new(listed: Listed, shared: &Arc<Shared>, held: Arc<Held>) -> Entry {
         Entry {
             id: id_of(&listed.path),
             name: listed.name,
             format: Format::of(&listed.path),
             path: listed.path,
-            open: Mutex::new(None),
             removed: AtomicBool::new(false),
-            fetch,
+            held,
             shared: Arc::clone(shared),
         }
     }
@@ -140,38 +156,18 @@ impl Entry {
         }
     }
 
-    /// The open database at its current generation: the handle already held
-    /// when the files have not changed, a freshly opened one when they have.
-    /// A cloud-only database stays unread: see [`Entry::open_to_read`].
+    /// The open database at its current generation, for listing: the handle
+    /// already held when the files have not changed, a freshly opened one
+    /// when they have. A file marked cloud-only is never read here, since
+    /// reading it would download it: see [`Entry::open_to_read`].
     pub fn open(&self) -> Result<Opened, State> {
-        if self.removed.load(Ordering::Relaxed) {
-            return Err(State::Missing);
-        }
-        if self.format != Format::TwoCbh {
-            return Err(if self.path.exists() { State::Unsupported } else { State::Missing });
-        }
-        let files = self.files();
-        let generation = files.generation.ok_or(State::Missing)?;
-        if lock(&self.fetch.running).is_some() {
-            return Err(State::Downloading);
-        }
-        if files.cloud_only() && *lock(&self.fetch.fetched) != Some(generation) {
-            return Err(State::CloudOnly);
-        }
-        let mut slot = lock(&self.open);
-        if let Some(open) = slot.as_ref().filter(|o| o.generation == generation) {
-            return Ok(open.clone());
-        }
-        let db = Database::open(&self.path).map_err(|_| State::Unreadable)?;
-        let open = Opened { db: Arc::new(db), generation };
-        *slot = Some(open.clone());
-        Ok(open)
+        self.open_for(false)
     }
 
     /// [`Entry::open`] for reading games: a cloud-only database starts
     /// downloading and is reported [`State::Downloading`].
     pub fn open_to_read(&self) -> Result<Opened, State> {
-        match self.open() {
+        match self.open_for(true) {
             Err(State::CloudOnly) => {
                 self.download();
                 Err(State::Downloading)
@@ -180,9 +176,51 @@ impl Entry {
         }
     }
 
+    fn open_for(&self, reading: bool) -> Result<Opened, State> {
+        if self.removed.load(Ordering::Relaxed) {
+            return Err(State::Missing);
+        }
+        if self.format != Format::TwoCbh {
+            return Err(if self.path.exists() { State::Unsupported } else { State::Missing });
+        }
+        let files = self.files();
+        let generation = files.generation.ok_or(State::Missing)?;
+        if files.irregular {
+            return Err(State::Unreadable);
+        }
+        if lock(&self.held.running).is_some() {
+            return Err(State::Downloading);
+        }
+        let mut slot = lock(&self.held.open);
+        let held = slot.as_ref().filter(|o| o.generation == generation).cloned();
+        if files.cloud_only() {
+            // A provider may keep a file marked cloud-only after it was read,
+            // and the mark is all the bridge sees. Such files count as here
+            // only when a download read them at this generation and no mark
+            // has changed since: a change may be the provider moving a file
+            // back to the cloud, so that download no longer counts.
+            let mut fetched = lock(&self.held.fetched);
+            let now = Fetched { generation, marks: files.marks() };
+            if fetched.as_ref() != Some(&now) {
+                *fetched = None;
+                return Err(State::CloudOnly);
+            }
+            if !reading {
+                // The download opened it; listing reads nothing marked.
+                return held.ok_or(State::CloudOnly);
+            }
+        }
+        if let Some(open) = held {
+            return Ok(open);
+        }
+        let open = open_at(&self.path, generation).ok_or(State::Unreadable)?;
+        *slot = Some(open.clone());
+        Ok(open)
+    }
+
     /// The download running or queued, if any.
     pub fn progress(&self) -> Option<Arc<Progress>> {
-        lock(&self.fetch.running).clone()
+        lock(&self.held.running).clone()
     }
 
     /// The size of the database's files, in bytes.
@@ -193,7 +231,7 @@ impl Entry {
     /// Queues the reading of the database's cloud-only files, in order. A
     /// failed download leaves the database cloud-only.
     fn download(&self) {
-        let mut running = lock(&self.fetch.running);
+        let mut running = lock(&self.held.running);
         if running.is_some() {
             return;
         }
@@ -202,16 +240,21 @@ impl Entry {
         let progress = Arc::new(Progress::new(local, files.size()));
         *running = Some(Arc::clone(&progress));
         let cloud_files: Vec<PathBuf> = files.present.into_iter().filter(|f| f.2).map(|f| f.0).collect();
-        let (fetch, cloud, path, name) =
-            (Arc::clone(&self.fetch), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone());
+        let (held, cloud, path, name) =
+            (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone());
         self.shared.downloads.submit(Box::new(move || {
             // Clears the running download however the job ends.
-            let _done = Done(Arc::clone(&fetch));
-            let result = cloud_files.iter().try_for_each(|file| cloud.fetch(file, &mut |n| progress.add(n)));
-            match result {
-                Ok(()) => *lock(&fetch.fetched) = generation_of(&path, &*cloud).generation,
-                Err(e) => eprintln!("oschess-bridge: downloading {name} failed: {e}"),
+            let _done = Done(Arc::clone(&held));
+            if let Err(e) = cloud_files.iter().try_for_each(|file| cloud.fetch(file, &mut |n| progress.add(n))) {
+                eprintln!("oschess-bridge: downloading {name} failed: {e}");
+                return;
             }
+            let files = generation_of(&path, &*cloud);
+            let Some(generation) = files.generation.filter(|_| !files.irregular) else { return };
+            *lock(&held.fetched) = Some(Fetched { generation, marks: files.marks() });
+            // Opened in the download's turn, while its files are known to be
+            // here, so that listing can show it ready without reading them.
+            *lock(&held.open) = open_at(&path, generation);
         }));
     }
 
@@ -226,8 +269,13 @@ impl Entry {
     }
 }
 
+/// The database at `path`, opened and labelled with `generation`.
+fn open_at(path: &Path, generation: u64) -> Option<Opened> {
+    Database::open(path).ok().map(|db| Opened { db: Arc::new(db), generation })
+}
+
 /// Ends a download when dropped.
-struct Done(Arc<Fetch>);
+struct Done(Arc<Held>);
 
 impl Drop for Done {
     fn drop(&mut self) {
@@ -240,32 +288,42 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The metadata of the 2CBH database at `path`: its generation and files.
+/// Metadata only, following links: nothing is opened.
 fn generation_of(path: &Path, cloud: &dyn Cloud) -> Files {
     let stem = path.with_extension("");
     let mut hash = Hash::new();
-    let mut present = Vec::new();
+    let mut files = Files { generation: None, present: Vec::new(), irregular: false };
     for ext in EXTENSIONS {
         let mut path = stem.clone().into_os_string();
         path.push(ext);
         let path = PathBuf::from(path);
         match std::fs::metadata(&path) {
+            Ok(m) if !m.is_file() => {
+                files.irregular = true;
+                hash.write(&[0xfe]);
+            }
             Ok(m) => {
                 hash.write_meta(&m);
                 let cloud_only = cloud.is_cloud_only(&path, &m);
-                present.push((path, m.len(), cloud_only));
+                files.present.push((path, m.len(), cloud_only));
             }
-            Err(_) if ext == ".2cbh" => return Files { generation: None, present },
+            Err(_) if ext == ".2cbh" => return files,
             Err(_) => hash.write(&[0xff]),
         }
     }
-    Files { generation: Some(hash.finish()), present }
+    files.generation = Some(hash.finish());
+    files
 }
 
 pub struct Catalog {
     sources: Sources,
     shared: Arc<Shared>,
     listing: Mutex<Listing>,
+    /// Called after the sources are read, before the list is rebuilt.
+    after_read: Mutex<Option<Hook>>,
 }
+
+type Hook = Box<dyn Fn() + Send + Sync>;
 
 /// The list as last read.
 struct Listing {
@@ -288,9 +346,16 @@ impl Catalog {
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
         let shared = Arc::new(Shared { cloud, downloads: Arc::default() });
         let listing = Listing { signature: 0, window: Vec::new(), configured: Vec::new(), entries: Vec::new() };
-        let catalog = Catalog { sources, shared, listing: Mutex::new(listing) };
+        let catalog = Catalog { sources, shared, listing: Mutex::new(listing), after_read: Mutex::new(None) };
         catalog.refresh(true);
         catalog
+    }
+
+    /// Sets a function called each time the sources have been read, before
+    /// the list is rebuilt from them. Tests use it to change a source at
+    /// exactly that moment.
+    pub fn after_read(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *lock(&self.after_read) = Some(Box::new(hook));
     }
 
     /// The databases, the list read again first if its sources changed.
@@ -304,6 +369,9 @@ impl Catalog {
     }
 
     /// Reads the list again when its sources' signature changed, or `always`.
+    /// The signature kept is the one taken before reading: a source that
+    /// changes while it is read then differs from it, and is read again on
+    /// the next request.
     fn refresh(&self, always: bool) {
         let mut listing = lock(&self.listing);
         let signature = self.sources.signature(&listing.configured);
@@ -318,8 +386,10 @@ impl Catalog {
             Ok(configured) => listing.configured = configured,
             Err(e) => eprintln!("oschess-bridge: keeping the last databases of bridge.toml: {e}"),
         }
-        // Taken after reading, so that a change during the read shows next time.
-        listing.signature = self.sources.signature(&listing.configured);
+        if let Some(hook) = lock(&self.after_read).as_ref() {
+            hook();
+        }
+        listing.signature = signature;
         let mut listed = listing.window.clone();
         listed.extend(listing.configured.iter().flat_map(|p| sources::expand(p)));
         listed.extend(self.sources.fixed.iter().cloned().map(Listed::at));
@@ -340,7 +410,7 @@ impl Catalog {
             let entry = match old.iter().find(|e| e.id == id) {
                 Some(e) if e.name == item.name => Arc::clone(e),
                 // Renamed in the window: the same database under its new name.
-                Some(e) => Arc::new(Entry::new(item, &self.shared, Arc::clone(&e.fetch))),
+                Some(e) => Arc::new(Entry::new(item, &self.shared, Arc::clone(&e.held))),
                 None => Arc::new(Entry::new(item, &self.shared, Arc::default())),
             };
             entry.removed.store(false, Ordering::Relaxed);

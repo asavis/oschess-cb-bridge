@@ -172,7 +172,8 @@ adds, then those given with `--database`, each once:
   the order the file stores them: 2CBH databases first, then the others. The
   window can sort them differently on screen; that setting is not decoded.
 - **`bridge.toml`'s** follow in the order written. A folder gives the `.2cbh`
-  and `.cbh` databases directly in it, by file name.
+  and `.cbh` database files directly in it, by file name; a folder or a pipe
+  named like one is not a database.
 - **The list is read again** on a request to `/v1/status` or `/v1/databases`
   after `DBItems.cbini`, `bridge.toml` or a listed folder changed. When the new
   list cannot be read, the last one stays. A database that leaves the list
@@ -212,7 +213,7 @@ adds, then those given with `--database`, each once:
 |---|---|
 | `name` | The name ChessBase's window shows: the title it keeps for the database, else the file name without extension. A database that is not in the window has its file name without extension |
 | `format` | `2cbh`, `cbh` or `pgn`; another value is possible later |
-| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: `.cbh` until the bridge renders its games, `.pgn`, which the oschess Library imports itself, and any other); `unreadable` (the files are present but cannot be opened: damaged, or locked by another program) |
+| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: `.cbh` until the bridge renders its games, `.pgn`, which the oschess Library imports itself, and any other); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one) |
 | `records` | Games, guiding texts and analyses; present when `ready` |
 | `generation` | See above; present when `ready` |
 | `size` | The bytes of the database's files; present when `cloudOnly` or `downloading` |
@@ -232,6 +233,12 @@ background, one database at a time; a database waiting for its turn is
 `downloading` too. `/v1/databases` shows the `progress`. When the files are
 here the database is `ready`. A download that fails leaves it `cloudOnly`, and
 the next request for its games tries again.
+
+A download counts only while the files stay as it left them. When the service
+later moves a file back to the cloud, the database is `cloudOnly` again, even
+if its sizes and times did not change, and its games download it again. Some
+services may keep a file marked as cloud-only after it was read; the bridge
+then counts it as here only while no mark on the database's files changes.
 
 ### `GET /v1/databases/{id}/games`
 

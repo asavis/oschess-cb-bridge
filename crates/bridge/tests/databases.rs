@@ -57,6 +57,12 @@ impl Root {
         std::fs::write(self.chessbase().join("DBItems.cbini"), f.bytes()).unwrap();
     }
 
+    /// [`Root::window`] from a handle that must not remove the folder.
+    fn window_keep(self, entries: &[(&Path, &str)]) {
+        self.window(entries);
+        std::mem::forget(self);
+    }
+
     fn sources(&self) -> Sources {
         Sources { chessbase: Some(self.chessbase()), config: Some(self.path("bridge.toml")), fixed: Vec::new() }
     }
@@ -243,6 +249,12 @@ impl FakeCloud {
         *self.held.lock().unwrap() = held;
         self.freed.notify_all();
     }
+
+    /// The provider moves `files` back to the cloud, keeping their sizes and
+    /// modification times.
+    fn evict(&self, files: &[PathBuf]) {
+        self.cloud.lock().unwrap().extend(files.iter().cloned());
+    }
 }
 
 impl Cloud for FakeCloud {
@@ -360,6 +372,138 @@ fn downloads_run_one_at_a_time() {
     }
     assert_eq!(cloud.most_at_once.load(Ordering::SeqCst), 1);
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 9);
+}
+
+/// A downloaded database that the provider moves back to the cloud is
+/// cloud-only again, although its sizes and times are unchanged: listing does
+/// not show it ready, and its games download it again through the queue.
+/// Both orders: evicted after its games were read, and before.
+#[test]
+fn a_database_moved_back_to_the_cloud_is_cloud_only_again() {
+    for read_first in [true, false] {
+        let root = Root::new(if read_first { "evict-after-read" } else { "evict-before-read" });
+        let db = database_at(&root.path("bases"), "Remote");
+        let files = files_of(&db);
+        let cloud = Arc::new(FakeCloud::with_files(files.clone(), false));
+        let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+        let entry = catalog.get(&id_of(&db)).unwrap();
+        assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+        wait_for(&entry, State::Ready);
+        if read_first {
+            assert!(entry.open_to_read().is_ok());
+        }
+        let fetched = cloud.fetches.load(Ordering::SeqCst);
+        assert_eq!(fetched, 3);
+
+        cloud.evict(&files);
+        assert_eq!(states(&catalog), ["cloudOnly"]);
+        assert_eq!(entry.generation(), catalog.get(&id_of(&db)).unwrap().generation());
+        assert_eq!(cloud.fetches.load(Ordering::SeqCst), fetched, "listing fetched a file");
+        assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+        wait_for(&entry, State::Ready);
+        assert_eq!(cloud.fetches.load(Ordering::SeqCst), fetched + 3);
+    }
+}
+
+/// With a provider that keeps the cloud-only mark after a download, the
+/// download counts only while no mark changes: a file marked afterwards
+/// makes the database cloud-only again.
+#[test]
+fn a_kept_mark_counts_only_while_the_marks_stay_as_downloaded() {
+    let root = Root::new("sticky-marks");
+    let db = database_at(&root.path("bases"), "Remote");
+    let files = files_of(&db);
+    let cloud = Arc::new(FakeCloud::with_files([files[1].clone()], true));
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let entry = catalog.get(&id_of(&db)).unwrap();
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    wait_for(&entry, State::Ready);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1);
+
+    cloud.evict(&files[2..3]);
+    assert_eq!(entry.state(), State::CloudOnly);
+    // Unmarking it again does not bring the old download back.
+    cloud.cloud.lock().unwrap().remove(&files[2]);
+    assert_eq!(entry.state(), State::CloudOnly);
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    wait_for(&entry, State::Ready);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 2);
+}
+
+/// A source that changes while the list is read is read again on the next
+/// request, even when the change came after it was read.
+#[test]
+fn a_source_changed_while_it_is_read_is_read_again() {
+    let root = Root::new("mid-refresh");
+    let a = database_at(&root.path("bases"), "Alpha");
+    let b = database_at(&root.path("bases"), "Beta");
+    let c = database_at(&root.path("bases"), "Gamma2");
+    root.window(&[(&a, "")]);
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    assert_eq!(names(&catalog), ["Alpha"]);
+
+    let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (root_dir, a2, b2) = (root.0.clone(), a.clone(), b.clone());
+    catalog.after_read(move || {
+        if !once.swap(true, Ordering::SeqCst) {
+            Root(root_dir.clone()).window_keep(&[(&a2, ""), (&b2, "")]);
+        }
+    });
+    root.window(&[(&a, ""), (&c, "")]);
+    // This request read the list before the hook changed it again.
+    assert_eq!(names(&catalog), ["Alpha", "Gamma2"]);
+    // The next one reads the change made during that read; Gamma2 left the list.
+    assert_eq!(names(&catalog), ["Alpha", "Beta", "Gamma2"]);
+    assert_eq!(states(&catalog), ["ready", "ready", "missing"]);
+}
+
+/// Pipes and folders named like database files are never opened: a folder's
+/// discovery skips them, and a database with one among its files is
+/// unreadable. Nothing blocks, and a pipe as `bridge.toml` is an error.
+#[cfg(unix)]
+#[test]
+fn files_that_are_not_regular_are_never_opened() {
+    use std::process::Command;
+    use std::sync::mpsc;
+
+    let root = Root::new("pipes");
+    let mkfifo = |path: &Path| assert!(Command::new("mkfifo").arg(path).status().unwrap().success());
+    let folder = root.path("folder");
+    let good = database_at(&folder, "Good");
+    mkfifo(&folder.join("Pipe.2cbh"));
+    std::fs::create_dir_all(folder.join("Dir.2cbh")).unwrap();
+    // A database whose moves file is a pipe, and one whose header file is.
+    let companion = database_at(&root.path("bases"), "Companion");
+    std::fs::remove_file(companion.with_extension("2cbg")).unwrap();
+    mkfifo(&companion.with_extension("2cbg"));
+    let header = root.path("bases/Header.2cbh");
+    mkfifo(&header);
+    std::fs::write(
+        root.path("bridge.toml"),
+        format!("databases = ['{}', '{}', '{}']\n", folder.display(), companion.display(), header.display()),
+    )
+    .unwrap();
+    let pipe_config = root.path("pipe.toml");
+    mkfifo(&pipe_config);
+
+    let (sources, good_id, companion_id) = (root.sources(), id_of(&good), id_of(&companion));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let catalog = Catalog::with_sources(sources, Arc::new(bridge::fetch::System));
+        let listed: Vec<(String, &str)> =
+            catalog.entries().iter().map(|e| (e.name.clone(), e.state().name())).collect();
+        let games = catalog.get(&companion_id).unwrap().open_to_read().err();
+        let ready = catalog.get(&good_id).unwrap().open_to_read().is_ok();
+        let config = Sources { config: Some(pipe_config.clone()), ..Sources::default() }.configured().is_err();
+        let startup = bridge::config::load_or_create(&pipe_config).is_err();
+        tx.send((listed, games, ready, config, startup)).unwrap();
+    });
+    let (listed, games, ready, config, startup) =
+        rx.recv_timeout(Duration::from_secs(20)).expect("a pipe blocked the bridge");
+    let listed: Vec<(&str, &str)> = listed.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    assert_eq!(listed, [("Good", "ready"), ("Companion", "unreadable"), ("Header", "unreadable")]);
+    assert_eq!(games, Some(State::Unreadable));
+    assert!(ready && config && startup);
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {

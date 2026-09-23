@@ -58,9 +58,14 @@ impl Sources {
     /// The `databases` of `bridge.toml`, as written; empty when there is no file.
     pub fn configured(&self) -> Result<Vec<PathBuf>, String> {
         let Some(path) = &self.config else { return Ok(Vec::new()) };
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            // A pipe would block the read.
+            Ok(m) if !m.is_file() => return Err(format!("{}: not a regular file", path.display())),
+            _ => {}
+        }
         match std::fs::read_to_string(path) {
             Ok(text) => config::parse(&text).map(|c| c.databases).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
@@ -80,7 +85,9 @@ impl Sources {
 }
 
 /// The databases a configured path names: the path itself, or for a folder
-/// the ChessBase databases directly in it, by file name.
+/// the ChessBase databases directly in it, by file name. In a folder only
+/// regular files (or links to them) count: a pipe or a folder named like a
+/// database is none.
 pub fn expand(path: &Path) -> Vec<Listed> {
     if !path.is_dir() {
         return vec![Listed::at(path.to_owned())];
@@ -89,7 +96,7 @@ pub fn expand(path: &Path) -> Vec<Listed> {
     let mut found: Vec<PathBuf> = dir
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| matches!(Format::of(p), Format::TwoCbh | Format::Cbh))
+        .filter(|p| matches!(Format::of(p), Format::TwoCbh | Format::Cbh) && p.is_file())
         .collect();
     found.sort();
     found.into_iter().map(Listed::at).collect()

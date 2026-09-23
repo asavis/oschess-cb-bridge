@@ -59,6 +59,10 @@ pub fn load_or_create(path: &Path) -> Result<Config, String> {
         }
         std::fs::write(path, TEMPLATE).map_err(|e| format!("{}: {e}", path.display()))?;
     }
+    // A pipe would block the read.
+    if !path.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
