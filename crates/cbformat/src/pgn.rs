@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use cozy_chess::{Board, Color as CColor, Move, Piece, Square, get_bishop_moves, get_knight_moves, get_rook_moves};
+use chesscore::{Board, Color as CColor, Move, Piece, Square, attacks, squares};
 
 use crate::replay::{self, TreeVisitor, start_board};
 use crate::v2::{Database, GameMoves, Record, RecordKind, Start};
@@ -20,7 +20,7 @@ fn piece_letter(p: Piece) -> &'static str {
 }
 
 /// The SAN of a legal move `mv` in `board`. Castling is written `O-O` /
-/// `O-O-O` (cozy-chess encodes it as the king taking its own rook).
+/// `O-O-O` (chesscore encodes it as the king taking its own rook).
 pub fn san(board: &Board, mv: Move) -> String {
     let mut s = String::with_capacity(8);
     write_san_body(&mut s, board, mv);
@@ -34,12 +34,12 @@ pub fn san(board: &Board, mv: Move) -> String {
 /// after the move.
 fn write_san_body(s: &mut String, board: &Board, mv: Move) {
     let us = board.side_to_move();
-    let Some(piece) = board.piece_on(mv.from) else { return };
-    if piece == Piece::King && board.colors(us).has(mv.to) {
+    let Some((piece, _)) = board.piece_at(mv.from) else { return };
+    if piece == Piece::King && board.colors(us) & mv.to.bit() != 0 {
         s.push_str(if mv.to.file() > mv.from.file() { "O-O" } else { "O-O-O" });
         return;
     }
-    let capture = board.colors(!us).has(mv.to) || (piece == Piece::Pawn && mv.from.file() != mv.to.file());
+    let capture = board.colors(!us) & mv.to.bit() != 0 || (piece == Piece::Pawn && mv.from.file() != mv.to.file());
     if piece == Piece::Pawn {
         if capture {
             s.push(file_char(mv.from));
@@ -66,16 +66,16 @@ fn write_san_body(s: &mut String, board: &Board, mv: Move) {
 fn disambiguate(s: &mut String, board: &Board, piece: Piece, mv: Move) {
     let occupied = board.occupied();
     let reach = match piece {
-        Piece::Knight => get_knight_moves(mv.to),
-        Piece::Bishop => get_bishop_moves(mv.to, occupied),
-        Piece::Rook => get_rook_moves(mv.to, occupied),
-        Piece::Queen => get_bishop_moves(mv.to, occupied) | get_rook_moves(mv.to, occupied),
+        Piece::Knight => attacks::knight(mv.to),
+        Piece::Bishop => attacks::bishop(mv.to, occupied),
+        Piece::Rook => attacks::rook(mv.to, occupied),
+        Piece::Queen => attacks::queen(mv.to, occupied),
         Piece::King | Piece::Pawn => return,
     };
-    let others = board.colored_pieces(board.side_to_move(), piece) & reach & !mv.from.bitboard();
+    let others = board.colored(piece, board.side_to_move()) & reach & !mv.from.bit();
     let (mut ambiguous, mut same_file, mut same_rank) = (false, false, false);
-    for from in others {
-        if board.is_legal(Move { from, to: mv.to, promotion: None }) {
+    for from in squares(others) {
+        if board.is_legal(Move::new(from, mv.to, None)) {
             ambiguous = true;
             same_file |= from.file() == mv.from.file();
             same_rank |= from.rank() == mv.from.rank();
@@ -94,18 +94,18 @@ fn disambiguate(s: &mut String, board: &Board, piece: Piece, mv: Move) {
 }
 
 fn write_check_suffix(s: &mut String, after: &Board) {
-    if !after.checkers().is_empty() {
+    if after.in_check() {
         // In check with no legal move is mate.
-        s.push(if after.generate_moves(|_| true) { '+' } else { '#' });
+        s.push(if after.has_legal_move() { '+' } else { '#' });
     }
 }
 
 fn file_char(sq: Square) -> char {
-    (b'a' + sq.file() as u8) as char
+    (b'a' + sq.file()) as char
 }
 
 fn rank_char(sq: Square) -> char {
-    (b'1' + sq.rank() as u8) as char
+    (b'1' + sq.rank()) as char
 }
 
 const NONE: u32 = u32::MAX;

@@ -6,6 +6,7 @@ version = 4
 name = "cbformat"
 version = "0.1.0"
 dependencies = [
+ "chesscore",
  "cozy-chess",
  "memmap2",
 ]

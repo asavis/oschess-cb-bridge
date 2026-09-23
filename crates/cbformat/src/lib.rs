@@ -1,7 +1,7 @@
 //! Readers for ChessBase database files.
 //!
 //! [`v2`] reads the `.2cbh` family written by ChessBase 17 and later.
-//! [`replay`] plays decoded moves on a [`cozy_chess::Board`], checking each
+//! [`replay`] plays decoded moves on a [`chesscore::Board`], checking each
 //! move word against the position.
 
 use std::fmt;
