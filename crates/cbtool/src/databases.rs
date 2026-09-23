@@ -72,6 +72,9 @@ enum State {
     /// No blocks allocated for a non-empty file, as a cloud-only placeholder shows
     /// through WSL. A heuristic: no placeholder has been available to confirm it.
     MaybeCloudOnly,
+    /// Something other than a regular file (a directory, a pipe, a device):
+    /// opening it could block or read something that is not a database.
+    NotAFile,
 }
 
 impl State {
@@ -81,6 +84,7 @@ impl State {
             State::Missing => "missing",
             State::CloudOnly => "cloud-only",
             State::MaybeCloudOnly => "cloud-only?",
+            State::NotAFile => "unreadable",
         }
     }
 }
@@ -106,11 +110,14 @@ fn database_files(path: &Path, format: Format) -> Vec<(PathBuf, bool)> {
 }
 
 /// A database's state from the states of its files: missing when a required
-/// file is missing, otherwise cloud-only when any file that is there is.
+/// file is missing, unreadable when any file that is there is not a regular
+/// file, otherwise cloud-only when any file that is there is.
 fn combine(files: &[(State, bool)]) -> State {
     let present = || files.iter().filter(|(s, _)| *s != State::Missing).map(|(s, _)| *s);
     if files.iter().any(|&(s, required)| required && s == State::Missing) {
         State::Missing
+    } else if present().any(|s| s == State::NotAFile) {
+        State::NotAFile
     } else if present().any(|s| s == State::CloudOnly) {
         State::CloudOnly
     } else if present().any(|s| s == State::MaybeCloudOnly) {
@@ -125,6 +132,7 @@ fn combine(files: &[(State, bool)]) -> State {
 fn state_of(path: &Path) -> State {
     match std::fs::metadata(path) {
         Err(_) => State::Missing,
+        Ok(m) if !m.is_file() => State::NotAFile,
         Ok(m) => placeholder_state(&m),
     }
 }
@@ -202,6 +210,11 @@ mod tests {
         assert_eq!(db(P, M, P, P), M);
         assert_eq!(db(M, P, C, P), C);
         assert_eq!(db(C, X, P, P), X);
+        // Anything but a regular file makes the database unreadable, even offline.
+        use State::NotAFile as N;
+        assert_eq!(db(P, N, P, P), N);
+        assert_eq!(db(P, P, C, N), N);
+        assert_eq!(db(N, X, P, P), X);
     }
 
     #[test]

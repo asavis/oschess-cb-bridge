@@ -174,3 +174,47 @@ fn databases_never_opens_a_database_with_an_offline_companion() {
     std::fs::remove_file(f.dir().join("db.2cbg")).unwrap();
     assert_eq!(row(), ["1", "2cbh", "missing", "3", "-", "Db"]);
 }
+
+/// A companion that is not a regular file is reported and never opened:
+/// opening a pipe would block until a writer appears. The listing must finish
+/// promptly with the database unreadable.
+#[cfg(unix)]
+#[test]
+fn databases_never_opens_a_pipe_or_a_directory() {
+    let f = fixture_with("databases-fifo", 3, None);
+    let mut list = DbItems::new();
+    list.section("2cbg").database(f.dir().join("db.2cbh").to_str().unwrap(), "Db", [0, 28, 3, 1, 1037620, 1037559]);
+    std::fs::write(f.dir().join("DBItems.cbini"), list.bytes()).unwrap();
+    let row = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("databases")
+            .arg(f.dir())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                child.kill().unwrap();
+                panic!("cbtool databases did not finish within 10 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+        out.lines()
+            .find(|l| l.trim_start().starts_with('1'))
+            .unwrap_or_else(|| panic!("{out}"))
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let cbg = f.dir().join("db.2cbg");
+    std::fs::remove_file(&cbg).unwrap();
+    let made = Command::new("mkfifo").arg(&cbg).status().unwrap();
+    assert!(made.success(), "mkfifo failed");
+    assert_eq!(row(), ["1", "2cbh", "unreadable", "3", "-", "Db"]);
+    std::fs::remove_file(&cbg).unwrap();
+    std::fs::create_dir(&cbg).unwrap();
+    assert_eq!(row(), ["1", "2cbh", "unreadable", "3", "-", "Db"]);
+}
