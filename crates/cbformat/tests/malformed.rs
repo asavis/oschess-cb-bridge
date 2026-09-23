@@ -180,10 +180,30 @@ fn entity_ids_beyond_the_file_read_as_missing() {
     for id in [1, 1 << 40, i64::MAX - 1] {
         let f = fixture(&format!("far-id-{id}"), lid(1024, i64::MAX), |r| set_player_ids(r, id));
         let db = Database::open(f.dir.join("db")).unwrap();
-        assert_eq!(db.entities().player(id), None);
+        assert_eq!(db.entities().player(id).unwrap(), None);
         let text = pgn::game(&db, 1).unwrap();
         assert!(text.contains("[White \"?\"]"), "{text}");
     }
+}
+
+#[test]
+fn an_entity_file_truncated_after_opening_is_an_error() {
+    // Player 0, the white and black of the game: "Tester, Ann".
+    let mut lid = lid(1024, 1);
+    let mut player = Vec::new();
+    for s in [&b"Tester"[..], b"Ann"] {
+        player.extend((s.len() as i32).to_le_bytes());
+        player.extend(s);
+    }
+    lid.extend((player.len() as i32).to_le_bytes());
+    lid.extend(&player);
+    let f = fixture("truncated-lid", lid, |_| {});
+    let db = Database::open(f.dir.join("db")).unwrap();
+    let text = pgn::game(&db, 1).unwrap();
+    assert!(text.contains("[White \"Tester, Ann\"]"), "{text}");
+    std::fs::OpenOptions::new().write(true).open(f.dir.join("db.2lid")).unwrap().set_len(184).unwrap();
+    assert!(db.entities().player(0).is_err());
+    assert!(pgn::game(&db, 1).is_err());
 }
 
 #[test]

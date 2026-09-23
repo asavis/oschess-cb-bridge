@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::replay::walk_tree;
-use cbformat::v2::{Database, RecordKind, Start, Token};
+use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
 
 const USAGE: &str = "usage:
   cbtool info   <db>
@@ -102,7 +102,7 @@ fn same_kind(captured: Captured, promoted: cbformat::movetable::Piece) -> bool {
 
 /// Decodes and replays one record, adding to `s`; the first 50 failures of
 /// the whole run are kept in `failures`.
-fn verify_record(db: &Database, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
+fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
     let fail = |s: &mut Stats, msg: String| {
         s.failures += 1;
         let mut f = failures.lock().unwrap_or_else(|e| e.into_inner());
@@ -110,7 +110,7 @@ fn verify_record(db: &Database, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u3
             f.push((id, msg));
         }
     };
-    let r = match db.record(id) {
+    let r = match batch.record(id) {
         Ok(r) => r,
         Err(e) => return fail(s, e.to_string()),
     };
@@ -129,7 +129,11 @@ fn verify_record(db: &Database, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u3
             return;
         }
     }
-    let moves = match db.moves_of(&r) {
+    let data = match batch.moves_of(&r) {
+        Ok(d) => d,
+        Err(e) => return fail(s, e.to_string()),
+    };
+    let moves = match data.moves() {
         Ok(m) => m,
         Err(e) => return fail(s, e.to_string()),
     };
@@ -182,8 +186,11 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
         run_workers(threads().min(runs as usize), &|| {
             let mut s = Stats::default();
             while let Some(ids) = run_ids(next_run.fetch_add(1, Ordering::Relaxed), n) {
+                // A run is read in two large reads; if that fails, its records
+                // are read one by one and report their own errors.
+                let Ok(batch) = db.batch(*ids.start(), *ids.end()).or_else(|_| db.batch(1, 0)) else { continue };
                 for id in ids {
-                    verify_record(&db, id, &mut s, &failures);
+                    verify_record(&batch, id, &mut s, &failures);
                 }
             }
             total.lock().unwrap_or_else(|e| e.into_inner()).add(&s);
@@ -218,7 +225,7 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
 
 /// Refuses an output path that is one of the database's own files, by name or
 /// through any alias such as a hard link: creating it would truncate the input
-/// while it is memory-mapped.
+/// while it is being read.
 fn refuse_database_file(out: &Path, db: &Database) -> AnyResult<()> {
     if !out.exists() {
         return Ok(());
@@ -244,7 +251,7 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
         }
     }
     if ids.is_empty() {
-        ids = (1..=db.record_count()).filter(|&id| db.record(id).is_ok_and(|r| r.kind() == RecordKind::Game)).collect();
+        ids = game_ids(&db)?;
     }
     let sink: Box<dyn Write + Send> = match out_path {
         Some(p) => {
@@ -259,6 +266,22 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     Ok(ok)
 }
 
+/// The id of every game, from headers read [`cbformat::v2::MAX_BATCH_RECORDS`]
+/// at a time. A failed read fails the export: a database damaged or truncated
+/// under it must not give a silently incomplete one.
+fn game_ids(db: &Database) -> cbformat::Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    let mut first = 1;
+    loop {
+        let records = db.records(first, db.record_count())?;
+        let Some(last) = records.last() else { break };
+        ids.extend(records.iter().filter(|r| r.kind() == RecordKind::Game).map(|r| r.id()));
+        let Some(next) = last.id().checked_add(1) else { break };
+        first = next;
+    }
+    Ok(ids)
+}
+
 /// Games per task, and the rendered text a task may hold before its turn to
 /// write. A task over the budget waits for its turn and then streams the rest
 /// of its games straight to the output, so memory stays near
@@ -269,14 +292,32 @@ const PGN_TASK_BYTES: usize = 4 << 20;
 /// Rendered games waiting for their turn to be written: the text, and each
 /// failure with the text offset it occurred at, to keep stderr in game order.
 #[derive(Default)]
-struct Rendered {
+struct Rendered<'db> {
     text: String,
     errors: Vec<(usize, String)>,
+    /// The records around the last one rendered, read together.
+    batch: Option<Batch<'db>>,
 }
 
-impl Rendered {
-    fn game(&mut self, db: &Database, id: u32) {
-        match cbformat::pgn::game(db, id) {
+/// Records read together when rendering; ids outside the batch start a new one.
+const RENDER_BATCH: u32 = 1_024;
+
+impl<'db> Rendered<'db> {
+    fn game(&mut self, db: &'db Database, id: u32) {
+        if !self.batch.as_ref().is_some_and(|b| b.ids().contains(&id)) {
+            self.batch = db.batch(id, id.saturating_add(RENDER_BATCH - 1)).ok();
+        }
+        let rendered = match &self.batch {
+            Some(batch) => batch.record(id).and_then(|r| {
+                if r.kind() != RecordKind::Game {
+                    return cbformat::pgn::game(db, id);
+                }
+                let data = batch.moves_of(&r)?;
+                cbformat::pgn::game_from(db, &r, &data.moves()?)
+            }),
+            None => cbformat::pgn::game(db, id),
+        };
+        match rendered {
             Ok(game) => {
                 self.text.push_str(&game);
                 self.text.push('\n');
@@ -303,10 +344,10 @@ impl Rendered {
 /// order given. Returns whether every game rendered, with failures reported on
 /// stderr in the same order. A write error stops every worker: no chunk is
 /// claimed and no game rendered after it, and waiting workers are woken.
-fn export_in_order(
+fn export_in_order<'db>(
     ids: &[u32],
     threads: usize,
-    render: &(dyn Fn(u32, &mut Rendered) + Sync),
+    render: &(dyn Fn(u32, &mut Rendered<'db>) + Sync),
     out: &mut (dyn Write + Send),
 ) -> AnyResult<bool> {
     struct Turn<'w> {
@@ -439,7 +480,7 @@ mod tests {
         }
     }
 
-    fn fake(id: u32, r: &mut Rendered) {
+    fn fake(id: u32, r: &mut Rendered<'_>) {
         r.text.push_str(&format!("game {id}\n"));
     }
 
