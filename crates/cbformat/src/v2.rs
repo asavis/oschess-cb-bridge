@@ -224,7 +224,7 @@ impl Database {
             .as_chunks::<HEADER_RECORD_SIZE>()
             .0
             .iter()
-            .zip(first..)
+            .zip(first..=last)
             .map(|(b, id)| Record { id, b: *b })
             .collect())
     }
@@ -307,7 +307,12 @@ impl<'db> Batch<'db> {
     /// inside it and read on its own otherwise.
     pub fn moves_of(&self, record: &Record) -> Result<MoveData<'_>> {
         let offset = record.moves_offset();
-        let inside = u64::try_from(offset).ok().and_then(|at| at.checked_sub(self.span_at)).map(|rel| rel as usize);
+        // A position that does not fit in `usize` (on a 32-bit target) lies
+        // outside the span and is read on its own.
+        let inside = u64::try_from(offset)
+            .ok()
+            .and_then(|at| at.checked_sub(self.span_at))
+            .and_then(|rel| usize::try_from(rel).ok());
         if let Some(rel) = inside.filter(|&rel| rel.saturating_add(FRAME_HEADER) <= self.span.len())
             && let Ok((a, b)) = frame_sizes(&self.span[rel..], offset)
             && rel + FRAME_HEADER + a + b + 8 <= self.span.len()

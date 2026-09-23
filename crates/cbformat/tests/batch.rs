@@ -189,3 +189,47 @@ fn a_batch_past_the_end_or_empty_reads_nothing() {
     assert!(empty.moves_of(&r).is_ok());
     assert!(empty.record(21).is_err());
 }
+
+/// The last id `u32::MAX` is read without overflow. The header file is sparse:
+/// 824 GB long and a few bytes on disk, which needs a Unix file system.
+#[cfg(unix)]
+#[test]
+fn the_largest_record_id_is_read_without_overflow() {
+    let f = fixture(22, 0);
+    let file = std::fs::OpenOptions::new().write(true).open(f.dir.join("db.2cbh")).unwrap();
+    file.set_len((u64::from(u32::MAX) + 1) * 192).unwrap();
+    let db = Database::open(f.dir.join("db")).unwrap();
+    assert_eq!(db.record_count(), u32::MAX);
+    let ids: Vec<u32> = db.records(u32::MAX - 2, u32::MAX).unwrap().iter().map(|r| r.id()).collect();
+    assert_eq!(ids, [u32::MAX - 2, u32::MAX - 1, u32::MAX]);
+    assert_eq!(db.records(u32::MAX, u32::MAX).unwrap().len(), 1);
+    let batch = db.batch(u32::MAX, u32::MAX).unwrap();
+    assert_eq!(batch.ids(), u32::MAX..=u32::MAX);
+    assert_eq!(batch.record(u32::MAX).unwrap().bytes(), db.record(u32::MAX).unwrap().bytes());
+}
+
+/// A move record 4 GiB past a batch's span is read on its own. On a 32-bit
+/// target its distance from the span does not fit in `usize`, and must not
+/// wrap onto a frame inside the span. The move file is sparse, which needs a
+/// Unix file system.
+#[cfg(unix)]
+#[test]
+fn a_move_record_4_gib_past_the_span_is_read_on_its_own() {
+    use std::os::unix::fs::FileExt;
+    let f = fixture(23, 0);
+    let far = (1i64 << 32) + 12;
+    let null = movetable::NULL_MOVE;
+    let content: Vec<u8> =
+        [movetable::MOVES, null, null, movetable::END_OF_LINE].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let cbg = std::fs::OpenOptions::new().write(true).open(f.dir.join("db.2cbg")).unwrap();
+    cbg.write_all_at(&frame(&content), far as u64).unwrap();
+    let cbh = std::fs::OpenOptions::new().write(true).open(f.dir.join("db.2cbh")).unwrap();
+    cbh.write_all_at(&far.to_le_bytes(), 3 * 192 + 8).unwrap();
+    let db = Database::open(f.dir.join("db")).unwrap();
+    let r = db.record(3).unwrap();
+    let alone: Vec<Token> = db.moves_of(&r).unwrap().moves().unwrap().tokens().collect();
+    assert_eq!(alone, [Token::Move(null), Token::Move(null), Token::EndOfLine]);
+    let batch = db.batch(1, 1).unwrap();
+    let got: Vec<Token> = batch.moves_of(&r).unwrap().moves().unwrap().tokens().collect();
+    assert_eq!(got, alone);
+}
