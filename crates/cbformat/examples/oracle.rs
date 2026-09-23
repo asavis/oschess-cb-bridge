@@ -3,6 +3,11 @@
 //! `cozy-chess` replay, comparing the position after every move and the
 //! verdict on every record.
 //!
+//! A classic (`.cbh`) database stores moves relative to the position, so its
+//! moves come from the reader's decoder (`cbh::walk`); cozy-chess then checks
+//! that each is legal where it is played and compares every position, along
+//! the same variations.
+//!
 //! `cargo run --release --example oracle -- <database> [threads]`
 //!
 //! Built on the `cozy-chess` dev-dependency; never shipped.
@@ -13,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cbformat::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece};
 use cbformat::replay::{self, TreeVisitor};
 use cbformat::v2::{Database, GameMoves, RecordKind, Start, Token};
+use cbformat::view::{Format, format_of};
 use chesscore::{Board, CastleSide as Side, Color as CColor, Move, Piece as CPiece, squares};
 
 /// Everything compared about a position.
@@ -243,12 +249,162 @@ fn cozy_walk(moves: &GameMoves<'_>) -> (Vec<State>, bool) {
     (out, ended)
 }
 
+// ------------------------------------------------------- classic databases
+
+/// What the reader's classic walk reports: the moves with the branch points,
+/// and the position after each move from chesscore.
+#[derive(Default)]
+struct Events {
+    events: Vec<Event>,
+    states: Vec<State>,
+}
+
+enum Event {
+    Play(Option<Move>),
+    Branch,
+    Resume,
+}
+
+impl TreeVisitor for Events {
+    fn play(&mut self, _before: &Board, mv: Option<Move>, _main_line: bool) {
+        self.events.push(Event::Play(mv));
+    }
+    fn played(&mut self, after: &Board) {
+        self.states.push(ours(after));
+    }
+    fn branch(&mut self) {
+        self.events.push(Event::Branch);
+    }
+    fn resume(&mut self) {
+        self.events.push(Event::Resume);
+    }
+}
+
+/// The positions after each of `events`' moves, from cozy-chess, and whether
+/// every move was legal and every branch point sound.
+fn cozy_events(start: &Start, events: &[Event]) -> (Vec<State>, bool) {
+    use cozy_chess::{Piece as P, Square as Q};
+    let mut out = Vec::new();
+    let Ok(mut board) = cozy_start(start) else { return (out, false) };
+    let mut stack: Vec<cozy_chess::Board> = Vec::new();
+    let mut before_last: Option<cozy_chess::Board> = None;
+    for e in events {
+        match e {
+            Event::Play(mv) => {
+                let before = board.clone();
+                match mv {
+                    Some(m) => {
+                        let promotion = m.promotion.map(|p| match p {
+                            CPiece::Queen => P::Queen,
+                            CPiece::Knight => P::Knight,
+                            CPiece::Bishop => P::Bishop,
+                            _ => P::Rook,
+                        });
+                        let mv =
+                            cozy_chess::Move { from: Q::index(m.from.index()), to: Q::index(m.to.index()), promotion };
+                        if !board.is_legal(mv) {
+                            return (out, false);
+                        }
+                        board.play_unchecked(mv);
+                    }
+                    None => match board.null_move() {
+                        Some(b) => board = b,
+                        None => return (out, false),
+                    },
+                }
+                out.push(theirs(&board));
+                before_last = Some(before);
+            }
+            Event::Branch => match before_last.take() {
+                Some(b) => stack.push(b),
+                None => return (out, false),
+            },
+            Event::Resume => match stack.pop() {
+                Some(b) => {
+                    board = b;
+                    before_last = None;
+                }
+                None => return (out, false),
+            },
+        }
+    }
+    (out, true)
+}
+
+fn classic(path: &str, threads: usize) {
+    let db = cbformat::cbh::Database::open(path).expect("open the database");
+    let n = db.record_count();
+    let next = AtomicU64::new(1);
+    let (records, plies, differences) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let examples: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let first = next.fetch_add(4096, Ordering::Relaxed);
+                    if first > u64::from(n) {
+                        break;
+                    }
+                    let last = (first + 4095).min(u64::from(n)) as u32;
+                    let Ok(batch) = db.batch(first as u32, last) else { continue };
+                    for id in first as u32..=last {
+                        let Ok(r) = batch.record(id) else { continue };
+                        if r.kind() != RecordKind::Game {
+                            continue;
+                        }
+                        let Ok(data) = batch.moves_of(&r) else { continue };
+                        let Ok(moves) = data.moves() else { continue };
+                        let Ok(start) = cbformat::cbh::start_as_played(&moves) else { continue };
+                        let mut ev = Events::default();
+                        let ours_ok = cbformat::cbh::walk(&moves, &mut ev).is_ok();
+                        records.fetch_add(1, Ordering::Relaxed);
+                        plies.fetch_add(ev.states.len() as u64, Ordering::Relaxed);
+                        // A walk that fails reports the moves before the
+                        // failure: those are compared, and cozy-chess must
+                        // accept every move of a walk that succeeds.
+                        let (cozy_states, cozy_ok) = cozy_events(&start, &ev.events);
+                        let common = ev.states.len().min(cozy_states.len());
+                        let first_diff = (0..common).find(|&i| ev.states[i] != cozy_states[i]);
+                        if (ours_ok && !cozy_ok) || ev.states.len() != cozy_states.len() || first_diff.is_some() {
+                            differences.fetch_add(1, Ordering::Relaxed);
+                            let mut e = examples.lock().unwrap();
+                            if e.len() < 20 {
+                                e.push(format!(
+                                    "record {id}: verdict ours {ours_ok} cozy {cozy_ok}, plies {} vs {}, first difference at {:?}",
+                                    ev.states.len(),
+                                    cozy_states.len(),
+                                    first_diff
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    report(&records, &plies, &differences, examples);
+}
+
+fn report(records: &AtomicU64, plies: &AtomicU64, differences: &AtomicU64, examples: Mutex<Vec<String>>) {
+    // Squares iterate from a1, as a guard that both sides number them alike.
+    assert_eq!(squares(1).next().map(|s| s.index()), Some(0));
+    println!("records compared   {}", records.load(Ordering::Relaxed));
+    println!("positions compared {}", plies.load(Ordering::Relaxed));
+    println!("differences        {}", differences.load(Ordering::Relaxed));
+    for e in examples.into_inner().unwrap() {
+        println!("  {e}");
+    }
+}
+
 // ------------------------------------------------------------------ main
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let db = Database::open(&args[1]).expect("open the database");
     let threads: usize = args.get(2).map_or(8, |t| t.parse().expect("thread count"));
+    if format_of(std::path::Path::new(&args[1])) == Format::Cbh {
+        return classic(&args[1], threads);
+    }
+    let db = Database::open(&args[1]).expect("open the database");
     let n = db.record_count();
     let next = AtomicU64::new(1);
     let (records, plies, differences) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
@@ -296,12 +452,5 @@ fn main() {
             });
         }
     });
-    // Squares iterate from a1, as a guard that both sides number them alike.
-    assert_eq!(squares(1).next().map(|s| s.index()), Some(0));
-    println!("records compared   {}", records.load(Ordering::Relaxed));
-    println!("positions compared {}", plies.load(Ordering::Relaxed));
-    println!("differences        {}", differences.load(Ordering::Relaxed));
-    for e in examples.into_inner().unwrap() {
-        println!("  {e}");
-    }
+    report(&records, &plies, &differences, examples);
 }

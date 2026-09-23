@@ -20,6 +20,7 @@ mod frame;
 mod moves;
 mod record;
 
+pub(crate) use annotations::decode_text as annotations_text;
 pub use annotations::{
     ANNOTATION_TAG, Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Square, Unknown, language,
 };

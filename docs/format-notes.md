@@ -215,16 +215,23 @@ The reader was checked against:
 - six databases that exist in both formats: five weekly Mega updates of 2026
   (28,488 games) and a user database (350 games). For every game of every pair
   the whole move tree (every move of every line in stored order, whether it
-  lies on the main line, and where each variation opens and closes) is identical to the 2CBH copy's, and so are
-  the start position, result, ECO, date, ratings, round, players and
-  tournament, apart from the names listed below. `cbtool verify` prints the
-  same counts for both copies of each pair;
+  lies on the main line, and where each variation opens and closes) is
+  identical to the 2CBH copy's, and so are the start position, result, ECO,
+  date, ratings, round, players and tournament, apart from the names listed
+  below. The PGN of every game, annotations included, is byte for byte the
+  2CBH copy's, with English and with German comments; the only exceptions are
+  87 games of the user database whose tags carry one of those names.
+  `cbtool verify` prints the same counts for both copies of each pair,
+  annotations included, and the rules oracle (`examples/oracle.rs`, which
+  replays the decoded moves in `cozy-chess`) finds no difference in their
+  2,617,380 positions;
 - the first 4,971 records of a Mega Database 2026 converted to `.cbh` by
   ChessBase and stopped part way: its 4,964 game trees, among them 422 set-up
   positions and 157 null moves, equal the 2CBH Mega's first 4,964;
 - 245 databases that exist only in `.cbh` (40,635 games, 31,196 of them from
-  set-up positions, 1,628 guiding texts, 6,854 null moves): 244 verify with no
-  failure; the one that does not is damaged (below).
+  set-up positions, 1,628 guiding texts, 6,854 null moves, 30,485 annotated
+  games): 243 verify with no failure. One is damaged (below), and one holds
+  two games with annotations past their last move (below).
 
 ## Findings
 
@@ -262,8 +269,47 @@ The reader was checked against:
   where the previous game's record ends), and a deleted game whose record
   claims mode 62 and 8 MB past the end of the file. The reader reports each as
   an error.
-- **Large files.** Offsets in `.cbh` are 32-bit; a `.cbg` larger than 4 GiB,
-  which needs the 64-bit offsets of `.cbj`, is refused when opened.
+- **Large files.** Offsets in `.cbh` are 32-bit. When `.cbg` or `.cba` is
+  larger than 4 GiB, the reader takes each game's offsets from its `.cbj`
+  record instead, where they are 64-bit: moves at 0x1e and annotations at
+  0x0c, big-endian. `.cbj` is read only then. Its record must be long enough
+  to hold both (38 bytes, version 6 on), and the low 32 bits of each must
+  equal the `.cbh` offset, or the game is an error. In the six paired
+  databases, every game's `.cbj` offsets equal its `.cbh` offsets.
+
+## Annotations (`.cba`)
+
+A game's `.cba` record is a 14-byte head (the game id, the bytes `01 00 0e 0e`,
+the number of annotations plus one, and the record's size) followed by the
+annotations, each with its position, its type and its own size. Integers are
+big-endian. The reader maps them to the same annotations as 2CBH's, so the PGN
+writer handles both formats alike.
+
+- **Positions count in stored order**: depth first, the main line first at
+  every position, which is the order the moves are stored in `.cbg`. 2CBH
+  counts in PGN order. The paired databases confirm it: with each format's
+  numbering, every annotated game's PGN is the same.
+- **Every type has its size**, so a type whose layout is unknown is skipped,
+  and a classic record is never left incomplete. The types met in the paired
+  Mega updates are `02` text, `03` symbols, `13` game quotation, `18`
+  critical position, `22` medals and `26` evaluations; the user database adds
+  `04` coloured squares and `05` arrows.
+- **A text's language** is a nation number: 42 (England) is English, 53
+  (Germany) German and 0 any language, as the pairs show against the 2CBH
+  languages. French, Spanish, Italian, Dutch, Portuguese, Polish and Greek map
+  by their nations (49, 43, 70, 103, 117, 116, 55). Any other nation is a
+  language of its own, which no preference names.
+- **Squares** in coloured squares and arrows are numbered from 1.
+- **The file header** is 26 bytes, or 10 in old databases, as for `.cbg`: 139 of
+  the 245 classic-only databases have the short header, and their first
+  record starts at 10.
+- **Checks.** The head's game id equals the game, and its count and size
+  equal the record's contents, in every record of every database examined.
+  The reader treats a mismatch, an annotation running past the record, a
+  position below −1 and a square out of range as damage. So is a position past
+  the last move, as for 2CBH: two set-up games of one classic-only database
+  have such annotations (positions 52 and 16, in games of 51 and 11 moves), and
+  both are reported as errors.
 
 ## Reader rules
 

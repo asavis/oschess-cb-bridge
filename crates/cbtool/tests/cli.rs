@@ -243,6 +243,52 @@ fn verify_and_info_read_classic_databases() {
     assert!(run("info").contains("players        2"));
 }
 
+/// A classic database exports and verifies its annotations like a 2CBH one: a
+/// comment on a move the game has is written, one on no move fails both, and
+/// the export never writes over one of the database's own files.
+#[test]
+fn classic_annotations_export_and_verify() {
+    use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = Builder::new();
+    b.game(&e4);
+    b.annotations(&annotation_record(1, &[(0, 0x02, b"\x00\x2afine"), (0, 0x03, &[1])]));
+    b.game(&e4);
+    b.annotations(&annotation_record(2, &[(1, 0x02, b"\x00\x2aon no move")]));
+    b.game(&e4);
+    let f = b.write("cli-classic-annotations");
+    let db = f.dir().join("db.cbh");
+    let verify = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(&db).output().unwrap();
+    let text = String::from_utf8_lossy(&verify.stdout);
+    assert_eq!(verify.status.code(), Some(1), "{text}");
+    assert!(text.contains("annotated          2") && text.contains("incomplete       0"), "{text}");
+    assert!(text.contains("failures           1") && text.contains("game 2: annotations:"), "{text}");
+
+    let out = f.dir().join("games.pgn");
+    let export =
+        Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("pgn").arg(&db).arg("--out").arg(&out).output().unwrap();
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("game 2:"), "{}", String::from_utf8_lossy(&export.stderr));
+    let pgn = std::fs::read_to_string(&out).unwrap();
+    assert!(pgn.contains("[White \"Morphy\"]") && pgn.contains("[Event \"Paris\"]"), "{pgn}");
+    assert!(pgn.contains("1. e4 $1 {fine} 1-0") && pgn.contains("\n1. e4 1-0"), "{pgn}");
+
+    let one = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("pgn").arg(f.base()).arg("3").output().unwrap();
+    assert!(one.status.success(), "{}", String::from_utf8_lossy(&one.stderr));
+    assert!(String::from_utf8_lossy(&one.stdout).ends_with("\n1. e4 1-0\n\n"));
+
+    for file in ["db.cbh", "db.cbg", "db.cba", "db.cbp"] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("pgn")
+            .arg(&db)
+            .arg("--out")
+            .arg(f.dir().join(file))
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("refusing"), "{file}");
+    }
+}
+
 /// The review's hostile classic record, a million nested variations in one
 /// 2 MB game, is a verify failure within a 256 MiB address space, not an
 /// allocation abort.

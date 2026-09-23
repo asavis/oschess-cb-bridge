@@ -85,26 +85,36 @@ impl TreeVisitor for TreeBuilder {
     }
 }
 
-/// What goes around each move, by the move's index in PGN order: the order a
-/// PGN lists the moves, each alternative and everything after it right after
-/// the move it replaces.
+/// Where a move stands in the tree, in both of the orders annotation
+/// positions count in.
+#[derive(Clone, Copy)]
+pub(super) struct At {
+    /// In PGN order: the order a PGN lists the moves, each alternative and
+    /// everything after it right after the move it replaces.
+    pub(super) pgn: u32,
+    /// In stored order: the order the moves were played into the tree, depth
+    /// first with the main line first at every position.
+    pub(super) stored: u32,
+}
+
+/// What goes around each move.
 pub(super) trait Notes {
     /// Writes what comes before the move, ending in a space, and says whether
     /// it wrote anything: the move then repeats its number.
-    fn before(&mut self, index: u32, out: &mut String) -> bool;
+    fn before(&mut self, at: At, out: &mut String) -> bool;
     /// Writes what follows the move, each part after a space, and says whether
     /// it ended in a comment: a black move after it then repeats its number.
-    fn after(&mut self, index: u32, out: &mut String) -> bool;
+    fn after(&mut self, at: At, out: &mut String) -> bool;
 }
 
 /// No annotations.
 pub(super) struct Bare;
 
 impl Notes for Bare {
-    fn before(&mut self, _index: u32, _out: &mut String) -> bool {
+    fn before(&mut self, _at: At, _out: &mut String) -> bool {
         false
     }
-    fn after(&mut self, _index: u32, _out: &mut String) -> bool {
+    fn after(&mut self, _at: At, _out: &mut String) -> bool {
         false
     }
 }
@@ -130,9 +140,10 @@ pub(super) fn emit(tree: &TreeBuilder, notes: &mut impl Notes, out: &mut String)
     // Writes move `n`, its number when due and its notes; says whether a
     // comment followed it.
     let mut write = |out: &mut String, n: u32, force_number: bool| -> bool {
-        let i = index;
+        // Node 0 is the root; the moves are numbered from 1 as they were played.
+        let at = At { pgn: index, stored: n - 1 };
         index += 1;
-        let force_number = notes.before(i, out) || force_number;
+        let force_number = notes.before(at, out) || force_number;
         let n = &nodes[n as usize];
         // Writing to a String cannot fail.
         let _ = if n.white {
@@ -143,7 +154,7 @@ pub(super) fn emit(tree: &TreeBuilder, notes: &mut impl Notes, out: &mut String)
             Ok(())
         };
         out.push_str(&tree.sans[n.san.0 as usize..n.san.1 as usize]);
-        let commented = notes.after(i, out);
+        let commented = notes.after(at, out);
         out.push(' ');
         commented
     };

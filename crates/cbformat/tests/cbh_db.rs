@@ -133,3 +133,54 @@ fn damaged_files_are_refused() {
         assert!(db.moves_of(&db.record(1).unwrap()).is_err());
     });
 }
+
+/// A move file over 4 GiB is read through the 64-bit offsets of `.cbj`: the
+/// game's record is moved past 4 GiB in a sparse copy of `.cbg`, where only
+/// `.cbj` can reach it.
+#[cfg(unix)]
+#[test]
+fn a_move_file_over_4_gib_is_read_through_cbj() {
+    use std::os::unix::fs::FileExt;
+    let f = builder(1).write("wide");
+    let path = |ext: &str| f.dir().join(format!("db{ext}"));
+    let cbg = std::fs::read(path(".cbg")).unwrap();
+    let rec = &cbg[26..];
+    let far: u64 = (1 << 32) + 26;
+    let file = std::fs::File::create(path(".cbg")).unwrap();
+    file.set_len(far + rec.len() as u64).unwrap();
+    file.write_all_at(&cbg[..26], 0).unwrap();
+    file.write_all_at(rec, far).unwrap();
+    drop(file);
+    let cbj = |moves: u64| {
+        let mut b = Vec::new();
+        for v in [11i32, 120, 1] {
+            b.extend(v.to_le_bytes());
+        }
+        b.resize(32 + 120, 0);
+        b[32 + 0x1e..32 + 0x26].copy_from_slice(&moves.to_be_bytes());
+        b
+    };
+
+    let err = Database::open(f.base()).err().expect("no .cbj");
+    assert!(err.to_string().contains(".cbj"), "{err}");
+
+    std::fs::write(path(".cbj"), cbj(far)).unwrap();
+    let db = Database::open(f.base()).unwrap();
+    let r = db.record(1).unwrap();
+    assert_eq!(r.moves_offset(), 26, "the .cbh offset keeps only the low 32 bits");
+    let mut n = 0;
+    cbformat::cbh::walk(&db.moves_of(&r).unwrap().moves().unwrap(), &mut Count(&mut n)).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(db.batch(1, 1).unwrap().moves_of(&r).unwrap().bytes(), rec);
+    assert!(cbformat::pgn::classic_game(&db, 1).unwrap().contains("\n1. e4 0-1"));
+
+    // Offsets that do not agree with `.cbh` are damage.
+    std::fs::write(path(".cbj"), cbj(far + 1)).unwrap();
+    let db = Database::open(f.base()).unwrap();
+    assert!(db.moves_of(&db.record(1).unwrap()).is_err());
+    // A record too short for the offsets refuses the database.
+    let mut short = cbj(far);
+    short[4..8].copy_from_slice(&20i32.to_le_bytes());
+    std::fs::write(path(".cbj"), short).unwrap();
+    assert!(Database::open(f.base()).is_err());
+}

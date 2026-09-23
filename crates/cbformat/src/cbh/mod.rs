@@ -11,10 +11,11 @@ use std::borrow::Cow;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::v2::MAX_BATCH_RECORDS;
 use crate::v2::file::DbFile;
+use crate::v2::{GameAnnotations, MAX_BATCH_RECORDS};
 use crate::{Error, Result};
 
+pub mod annotations;
 mod bytes;
 mod decode;
 mod entities;
@@ -22,6 +23,7 @@ mod moves;
 mod pieces;
 mod record;
 pub(crate) mod tables;
+mod wide;
 
 use bytes::{be_u16, be_u24};
 pub use decode::{MAX_VARIATION_DEPTH, start_as_played, walk};
@@ -33,6 +35,9 @@ pub use record::{RECORD_SIZE, Record};
 /// uses or that must not be overwritten by an export.
 pub const EXTENSIONS: [&str; 12] =
     [".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj", ".cbe", ".cbl", ".cbtt", ".flags"];
+/// The smallest file header of `.cbg` and `.cba`, where the first record may
+/// start: 26 bytes, or 10 in databases made by old versions.
+const MIN_FILE_HEADER: u64 = 10;
 /// Largest span of `.cbg` read for one batch; a batch whose moves lie wider
 /// apart reads each move record on its own.
 const MAX_BATCH_SPAN: u64 = 256 << 20;
@@ -42,6 +47,11 @@ pub struct Database {
     stem: PathBuf,
     headers: DbFile,
     moves: DbFile,
+    /// `None` when the database has no `.cba` file.
+    annotations: Option<DbFile>,
+    /// The 64-bit offsets of `.cbj`, read only when `.cbg` or `.cba` is over
+    /// 4 GiB and the 32-bit ones of `.cbh` cannot reach every record.
+    wide: Option<wide::Wide>,
     entities: Entities,
     records: u32,
     format_version: u8,
@@ -75,13 +85,19 @@ impl Database {
             return Err(Error::Format(format!(".cbh record size {record_size}, expected 46")));
         }
         let moves = DbFile::open(with(".cbg"))?;
-        // Offsets in `.cbh` are 32-bit; a larger move file would need the
-        // 64-bit ones of `.cbj`, which this reader does not use yet.
-        if moves.len()? > u64::from(u32::MAX) {
-            return Err(Error::Format(".cbg larger than 4 GiB is not supported".into()));
-        }
+        let annotations = match DbFile::open(with(".cba")) {
+            Ok(f) => Some(f),
+            Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let large = |f: &DbFile| f.len().map(|n| n > u64::from(u32::MAX));
+        let wide = if large(&moves)? || annotations.as_ref().map(large).transpose()?.unwrap_or(false) {
+            Some(wide::Wide::open(with(".cbj"))?)
+        } else {
+            None
+        };
         let entities = Entities::open(with)?;
-        Ok(Database { stem, headers, moves, entities, records, format_version: header[0x05] })
+        Ok(Database { stem, headers, moves, annotations, wide, entities, records, format_version: header[0x05] })
     }
 
     pub fn stem(&self) -> &Path {
@@ -124,12 +140,22 @@ impl Database {
         Ok(Record { id, b })
     }
 
+    /// Where a game's moves and annotations are: from `.cbh`, or from `.cbj`
+    /// when the files are too large for its offsets.
+    fn offsets(&self, record: &Record) -> Result<(u64, u64)> {
+        let short = (record.moves_offset(), record.annotations_offset());
+        match &self.wide {
+            Some(w) => w.offsets(record.id(), short),
+            None => Ok((u64::from(short.0), u64::from(short.1))),
+        }
+    }
+
     /// The move record a game header points at: its 4-byte head names its size.
     pub fn moves_of(&self, record: &Record) -> Result<MoveData<'static>> {
-        let at = u64::from(record.moves_offset());
+        let at = self.offsets(record)?.0;
         let bad = |what: &str| Error::Format(format!("move record at {at:#x}: {what}"));
         let file_len = self.moves.len()?;
-        if at < 10 || at + 4 > file_len {
+        if at < MIN_FILE_HEADER || at + 4 > file_len {
             return Err(bad("offset out of range"));
         }
         let size = be_u24(&self.moves.read(at, 4)?, 1) as u64;
@@ -140,6 +166,41 @@ impl Database {
             return Err(bad("runs past end of file"));
         }
         Ok(MoveData { bytes: Cow::Owned(self.moves.read(at, size as usize)?) })
+    }
+
+    /// Whether the database has a `.cba` file.
+    pub fn has_annotations(&self) -> bool {
+        self.annotations.is_some()
+    }
+
+    /// The annotations of a game, or `None` when the database has no `.cba`
+    /// file. A game without annotations has an empty set. Positions count the
+    /// moves in stored order ([`annotations`]).
+    pub fn annotations_of(&self, record: &Record) -> Result<Option<GameAnnotations>> {
+        self.annotations_of_within(record, usize::MAX)
+    }
+
+    /// [`Database::annotations_of`], refusing before it is read an annotation
+    /// record larger than `limit` bytes.
+    pub fn annotations_of_within(&self, record: &Record, limit: usize) -> Result<Option<GameAnnotations>> {
+        let Some(file) = &self.annotations else { return Ok(None) };
+        let at = self.offsets(record)?.1;
+        if at == 0 {
+            return Ok(Some(GameAnnotations::default()));
+        }
+        let bad = |what: &str| Error::Format(format!("annotation record at {at:#x}: {what}"));
+        let file_len = file.len()?;
+        if at < MIN_FILE_HEADER || at + annotations::HEAD as u64 > file_len {
+            return Err(bad("offset out of range"));
+        }
+        let size = annotations::record_size(&file.read(at, annotations::HEAD)?);
+        if size < annotations::HEAD || at + size as u64 > file_len {
+            return Err(bad("runs past end of file"));
+        }
+        if size > limit {
+            return Err(bad(&format!("{size} bytes, over the limit of {limit}")));
+        }
+        annotations::parse(&file.read(at, size)?, record.id()).map(Some)
     }
 
     /// Records `first..=last`, clamped to the database and to
@@ -160,6 +221,12 @@ impl Database {
         let (first, last) = self.clamp(first, last);
         if first > last {
             return Ok(Batch { db: self, first, last, headers: Vec::new(), span_at: 0, span: Vec::new() });
+        }
+        if self.wide.is_some() {
+            // The headers' 32-bit offsets cannot place a span; every move
+            // record is read on its own through `.cbj`.
+            let headers = self.read_headers(first, last)?;
+            return Ok(Batch { db: self, first, last, headers, span_at: 0, span: Vec::new() });
         }
         // One record past the batch, when there is one: its move record starts
         // where the batch's last one ends, as move records are in id order.
@@ -235,6 +302,11 @@ impl Batch<'_> {
             }
         }
         self.db.moves_of(record)
+    }
+
+    /// The annotations of `record`, as [`Database::annotations_of`].
+    pub fn annotations_of(&self, record: &Record) -> Result<Option<GameAnnotations>> {
+        self.db.annotations_of(record)
     }
 }
 

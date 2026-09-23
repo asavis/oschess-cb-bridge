@@ -1,23 +1,26 @@
 //! A game's annotations as PGN: comments, NAGs and `[%csl]` / `[%cal]`
-//! graphics, placed by position in PGN order.
+//! graphics, placed by position in the numbering of the game's format: PGN
+//! order for 2CBH, stored order for the classic format.
 
 use std::collections::BTreeMap;
 
 use super::Options;
 use super::san::{file_char, rank_char};
-use super::tree::Notes;
+use super::tree::{At, Notes};
 use crate::movetable::Sq;
 use crate::v2::{Annotation, GAME_POSITION, GameAnnotations, language};
+use crate::view::PositionOrder;
 
 /// The annotations of one game, grouped by position, with the one language
 /// its texts are written in.
 pub(super) struct Commentary<'a> {
     by_position: BTreeMap<i32, Vec<&'a Annotation>>,
     language: Option<u16>,
+    order: PositionOrder,
 }
 
 impl<'a> Commentary<'a> {
-    pub(super) fn new(annotations: &'a GameAnnotations, options: &Options) -> Self {
+    pub(super) fn new(annotations: &'a GameAnnotations, order: PositionOrder, options: &Options) -> Self {
         let mut by_position: BTreeMap<i32, Vec<&Annotation>> = BTreeMap::new();
         for b in &annotations.blocks {
             by_position.entry(b.position).or_default().extend(&b.annotations);
@@ -40,7 +43,16 @@ impl<'a> Commentary<'a> {
             .chain([language::ENGLISH])
             .find(|l| languages.contains(l))
             .or(languages.first().copied());
-        Commentary { by_position, language }
+        Commentary { by_position, language, order }
+    }
+
+    /// The annotations at the move `at`, in this game's numbering.
+    fn at(&self, at: At) -> Option<&Vec<&'a Annotation>> {
+        let position = match self.order {
+            PositionOrder::Pgn => at.pgn,
+            PositionOrder::Stored => at.stored,
+        };
+        self.by_position.get(&(position as i32))
     }
 
     /// The comment on the game as a whole, before the first move: its texts
@@ -71,14 +83,14 @@ impl<'a> Commentary<'a> {
 }
 
 impl Notes for Commentary<'_> {
-    fn before(&mut self, index: u32, out: &mut String) -> bool {
-        let Some(anns) = self.by_position.get(&(index as i32)) else { return false };
+    fn before(&mut self, at: At, out: &mut String) -> bool {
+        let Some(anns) = self.at(at) else { return false };
         let text: Vec<String> = self.texts(anns, true).into_iter().collect();
         comment(out, &text, "", " ")
     }
 
-    fn after(&mut self, index: u32, out: &mut String) -> bool {
-        let Some(anns) = self.by_position.get(&(index as i32)) else { return false };
+    fn after(&mut self, at: At, out: &mut String) -> bool {
+        let Some(anns) = self.at(at) else { return false };
         for a in anns {
             if let Annotation::Symbols { on_move, on_position, prefix } = a {
                 for nag in [on_move, on_position, prefix] {
