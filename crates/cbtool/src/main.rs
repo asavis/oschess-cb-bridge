@@ -3,7 +3,8 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use cbformat::movetable::{self, Captured, MoveWord};
@@ -237,46 +238,126 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     if ids.is_empty() {
         ids = (1..=db.record_count()).filter(|&id| db.record(id).is_ok_and(|r| r.kind() == RecordKind::Game)).collect();
     }
-    let sink: Box<dyn Write> = match out_path {
+    let sink: Box<dyn Write + Send> = match out_path {
         Some(p) => {
             refuse_database_file(Path::new(&p), &db)?;
             Box::new(std::fs::File::create(p)?)
         }
-        None => Box::new(std::io::stdout().lock()),
+        None => Box::new(std::io::stdout()),
     };
     let mut w = BufWriter::with_capacity(1 << 20, sink);
-    let mut ok = true;
-    // Games are rendered in parallel, a batch at a time, and written in id
-    // order; the batch bounds how much rendered text is held at once.
-    for batch in ids.chunks(PGN_BATCH) {
-        let rendered: Vec<(String, Vec<String>)> = batch
-            .par_chunks(PGN_CHUNK)
-            .map(|chunk| {
-                let (mut text, mut errors) = (String::new(), Vec::new());
-                for &id in chunk {
-                    match cbformat::pgn::game(&db, id) {
-                        Ok(game) => {
-                            text.push_str(&game);
-                            text.push('\n');
-                        }
-                        Err(e) => errors.push(format!("game {id}: {e}")),
-                    }
-                }
-                (text, errors)
-            })
-            .collect();
-        for (text, errors) in rendered {
-            w.write_all(text.as_bytes())?;
-            for e in &errors {
-                eprintln!("{e}");
-            }
-            ok &= errors.is_empty();
-        }
-    }
+    let ok = export_in_order(&db, &ids, &mut w)?;
     w.flush()?;
     Ok(ok)
 }
 
-/// Games rendered per parallel task, and per batch held in memory before writing.
+/// Games per task, and the rendered text a task may hold before its turn to
+/// write. A task over the budget waits for its turn and then streams the rest
+/// of its games straight to the output, so memory stays near
+/// `threads × PGN_TASK_BYTES` however large each game renders.
 const PGN_CHUNK: usize = 1_024;
-const PGN_BATCH: usize = 128 * PGN_CHUNK;
+const PGN_TASK_BYTES: usize = 4 << 20;
+
+/// Rendered games waiting for their turn to be written: the text, and each
+/// failure with the text offset it occurred at, to keep stderr in game order.
+#[derive(Default)]
+struct Rendered {
+    text: String,
+    errors: Vec<(usize, String)>,
+}
+
+impl Rendered {
+    fn add(&mut self, db: &Database, id: u32) {
+        match cbformat::pgn::game(db, id) {
+            Ok(game) => {
+                self.text.push_str(&game);
+                self.text.push('\n');
+            }
+            Err(e) => self.errors.push((self.text.len(), format!("game {id}: {e}"))),
+        }
+    }
+
+    fn write_to(&mut self, out: &mut dyn Write) -> std::io::Result<()> {
+        let mut at = 0;
+        for (offset, error) in &self.errors {
+            out.write_all(&self.text.as_bytes()[at..*offset])?;
+            eprintln!("{error}");
+            at = *offset;
+        }
+        out.write_all(&self.text.as_bytes()[at..])?;
+        self.text.clear();
+        self.errors.clear();
+        Ok(())
+    }
+}
+
+/// Renders the games on worker threads and writes them in the order given.
+/// Returns whether every game rendered; failures are reported on stderr in
+/// the same order.
+fn export_in_order(db: &Database, ids: &[u32], out: &mut (dyn Write + Send)) -> AnyResult<bool> {
+    struct Turn<'w> {
+        next: usize,
+        out: &'w mut (dyn Write + Send),
+        ok: bool,
+        failed: Option<std::io::Error>,
+    }
+    let chunks: Vec<&[u32]> = ids.chunks(PGN_CHUNK).collect();
+    let claimed = AtomicUsize::new(0);
+    let turn = Mutex::new(Turn { next: 0, out, ok: true, failed: None });
+    let your_turn = Condvar::new();
+    std::thread::scope(|scope| {
+        for _ in 0..threads().min(chunks.len().max(1)) {
+            scope.spawn(|| {
+                let mut r = Rendered::default();
+                loop {
+                    let k = claimed.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(k) else { break };
+                    let mut done = 0;
+                    while done < chunk.len() && r.text.len() < PGN_TASK_BYTES {
+                        r.add(db, chunk[done]);
+                        done += 1;
+                    }
+                    let mut t = turn.lock().unwrap_or_else(|e| e.into_inner());
+                    while t.next != k {
+                        t = your_turn.wait(t).unwrap_or_else(|e| e.into_inner());
+                    }
+                    let mut chunk_ok = r.errors.is_empty();
+                    if t.failed.is_none() {
+                        // Our turn: write what is held, then stream the rest.
+                        let mut result = r.write_to(&mut *t.out);
+                        for &id in &chunk[done..] {
+                            if result.is_err() {
+                                break;
+                            }
+                            r.add(db, id);
+                            chunk_ok &= r.errors.is_empty();
+                            result = r.write_to(&mut *t.out);
+                        }
+                        if let Err(e) = result {
+                            t.failed = Some(e);
+                        }
+                    }
+                    r.text.clear();
+                    r.errors.clear();
+                    t.ok &= chunk_ok;
+                    t.next += 1;
+                    your_turn.notify_all();
+                }
+            });
+        }
+    });
+    let t = turn.into_inner().unwrap_or_else(|e| e.into_inner());
+    match t.failed {
+        Some(e) => Err(e.into()),
+        None => Ok(t.ok),
+    }
+}
+
+/// Worker threads: `CBTOOL_THREADS` if set, otherwise one per CPU.
+fn threads() -> usize {
+    std::env::var("CBTOOL_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
