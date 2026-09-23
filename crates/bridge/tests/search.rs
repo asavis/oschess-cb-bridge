@@ -58,7 +58,6 @@ fn string(s: &str) -> Vec<u8> {
 /// A `.2lid` with the six entity types, holding players (type 0), tournaments
 /// (type 1) and the game tags that carry titles (type 5).
 fn lid(players: &[String], tournaments: &[String], titles: &[String]) -> Vec<u8> {
-    const SIZE: usize = 64;
     let tables: [Vec<Vec<u8>>; 6] = [
         players
             .iter()
@@ -75,18 +74,20 @@ fn lid(players: &[String], tournaments: &[String], titles: &[String]) -> Vec<u8>
         titles.iter().map(|t| [1i32.to_le_bytes().to_vec(), 0i32.to_le_bytes().to_vec(), string(t)].concat()).collect(),
     ];
     let count = tables.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    // Containers big enough for the longest record.
+    let size = tables.iter().flatten().map(|r| r.len() + 4).max().unwrap_or(0).max(64).next_multiple_of(8);
     let mut d = Vec::new();
     d.extend(184i32.to_be_bytes());
     d.extend(6i32.to_be_bytes());
     for _ in &tables {
-        d.extend((SIZE as i32).to_be_bytes());
+        d.extend((size as i32).to_be_bytes());
         d.extend((count as i64).to_be_bytes());
         d.extend((-1i64).to_be_bytes());
     }
     d.resize(184, 0);
     for id in 0..count {
         for table in &tables {
-            d.extend(container(SIZE, table.get(id).map_or(&[][..], Vec::as_slice)));
+            d.extend(container(size, table.get(id).map_or(&[][..], Vec::as_slice)));
         }
     }
     d
@@ -170,7 +171,7 @@ fn numbers(db: &Database, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
         }
         Ok((Selection::Numbers(v), _)) => Ok(v.to_vec()),
         Err(SearchError::Unsupported(q)) => Err(q),
-        Err(SearchError::Read(e)) => panic!("{e}"),
+        Err(e) => panic!("{e:?}"),
     }
 }
 
@@ -264,4 +265,138 @@ fn texts_and_analyses_by_their_own_layout() {
     let annotators = search::suggest(&db, &idx, SuggestField::Annotator, "t", 20).unwrap();
     assert_eq!(annotators, [("Tal, Mikhail".to_string(), 1)]);
     assert!(search::suggest(&db, &idx, SuggestField::Event, "aaa", 20).unwrap().is_empty());
+}
+
+type Edit<'a> = &'a dyn Fn(&mut [u8; 192]);
+
+/// A database of games sharing one move record, each header set by its edit,
+/// with `players` as player entities 0, 1, … and no tournaments.
+fn raw_db(name: &str, players: &[&str], edits: &[Edit<'_>]) -> TempDb {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for edit in edits {
+        edit(b.game(e4));
+    }
+    let players: Vec<String> = players.iter().map(|p| p.to_string()).collect();
+    b.lid(lid(&players, &[], &[]));
+    b.write(name)
+}
+
+fn set_i64(rec: &mut [u8; 192], at: usize, v: i64) {
+    put(rec, at, &v.to_le_bytes());
+}
+
+fn sorted(db: &Database, idx: &Indexes, sort: &str) -> Vec<u32> {
+    numbers(db, idx, &format!("sort:{sort}")).unwrap()
+}
+
+/// Names are matched and told apart in full, however long: two names that
+/// share 140 bytes and differ at the end are both found and both suggested.
+#[test]
+fn long_names_are_matched_and_suggested_in_full() {
+    let (a, b) = (format!("{}SuffixA", "é".repeat(70)), format!("{}SuffixB", "é".repeat(70)));
+    let f = raw_db(
+        "search-long-names",
+        &[&a, &b],
+        &[&|r| (set_i64(r, 0x18, 0), set_i64(r, 0x20, 0)).1, &|r| (set_i64(r, 0x18, 1), set_i64(r, 0x20, 1)).1],
+    );
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    assert_eq!(numbers(&db, &idx, "player:suffixa").unwrap(), [1]);
+    assert_eq!(numbers(&db, &idx, "player:SuffixB").unwrap(), [2]);
+    assert_eq!(search::suggest(&db, &idx, SuggestField::Player, "éé", 20).unwrap(), [(a, 1), (b, 1)]);
+}
+
+/// ECO codes sort as shown: ChessBase's hidden sub-code does not order two
+/// games with the same code, which stay in number order both ways.
+#[test]
+fn equal_eco_codes_keep_number_order() {
+    let eco = |v: u16| move |r: &mut [u8; 192]| put(r, 0x80, &v.to_le_bytes());
+    let (b52_2, b52_1, a00) = (eco(153 * 128 + 2), eco(153 * 128 + 1), eco(128));
+    let f = raw_db("search-eco-sub", &["x"], &[&b52_2, &b52_1, &a00]);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    assert_eq!(numbers(&db, &idx, "eco:B52").unwrap(), [1, 2]);
+    assert_eq!(sorted(&db, &idx, "eco"), [3, 1, 2]);
+    assert_eq!(sorted(&db, &idx, "eco-desc"), [1, 2, 3]);
+}
+
+/// An empty name, a missing entity and a record without the field all sort as
+/// the same empty key, in number order.
+#[test]
+fn empty_and_missing_names_share_a_rank() {
+    let empty = |r: &mut [u8; 192]| set_i64(r, 0x18, 0);
+    let missing = |r: &mut [u8; 192]| set_i64(r, 0x18, -1);
+    let named = |r: &mut [u8; 192]| set_i64(r, 0x18, 1);
+    let text = |r: &mut [u8; 192]| r[0] |= 2;
+    let f = raw_db("search-empty-names", &["", "Zed"], &[&empty, &missing, &named, &text]);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    assert_eq!(sorted(&db, &idx, "white"), [1, 2, 4, 3]);
+    assert_eq!(sorted(&db, &idx, "white-desc"), [3, 1, 2, 4]);
+}
+
+/// Two entities with one name are one suggestion, and a game that has that
+/// name on both sides counts once.
+#[test]
+fn a_game_counts_once_per_name() {
+    let both = |r: &mut [u8; 192]| (set_i64(r, 0x18, 0), set_i64(r, 0x20, 1)).1;
+    let f = raw_db("search-same-name", &["Same, Person", "Same, Person"], &[&both]);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    assert_eq!(numbers(&db, &idx, "player:same").unwrap(), [1]);
+    assert_eq!(search::suggest(&db, &idx, SuggestField::Player, "same", 20).unwrap(), [("Same, Person".into(), 1)]);
+}
+
+/// A database of `records` headers of which only the first is written: the
+/// rest of the header file is a hole, read as zeros, which needs a file system
+/// with sparse files.
+#[cfg(unix)]
+fn sparse(name: &str, records: u64) -> TempDb {
+    let f = raw_db(name, &["x"], &[&|_| {}]);
+    let file = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.2cbh")).unwrap();
+    file.set_len((records + 1) * 192).unwrap();
+    f
+}
+
+/// A sort order that could never fit in the memory budget is refused before
+/// anything is allocated: 200 million records need 2.4 GB to sort.
+#[cfg(unix)]
+#[test]
+fn a_sort_that_cannot_fit_is_refused_up_front() {
+    let f = sparse("search-too-large", 200_000_000);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    let started = std::time::Instant::now();
+    assert!(matches!(search::select(&db, &idx, "", search::query::Sort::parse("date")), Err(SearchError::TooLarge)));
+    assert_eq!(idx.scanned(), 0, "not a record was read");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// A newer search on the same database stops the one still scanning: the
+/// first answers `Superseded` before the second is done, having read only
+/// a part of the database.
+#[cfg(unix)]
+#[test]
+fn a_newer_search_stops_the_older_one() {
+    const RECORDS: u64 = 8_000_000;
+    let f = sparse("search-superseded", RECORDS);
+    let db = std::sync::Arc::new(Database::open(f.dir().join("db.2cbh")).unwrap());
+    let idx = std::sync::Arc::new(Indexes::default());
+    let (db1, idx1) = (db.clone(), idx.clone());
+    let first = std::thread::spawn(move || {
+        let r = search::select(&db1, &idx1, "needle", None);
+        (r.map(|_| ()), std::time::Instant::now())
+    });
+    while idx.scanned() == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let second = search::select(&db, &idx, "other", None);
+    let second_done = std::time::Instant::now();
+    let (first, first_done) = first.join().unwrap();
+    assert!(matches!(first, Err(SearchError::Superseded)), "{first:?}");
+    assert!(matches!(second, Ok((Selection::Numbers(ref v), _)) if v.is_empty()));
+    assert!(first_done <= second_done, "the first search stopped before the second finished");
+    let first_read = idx.scanned() - RECORDS;
+    assert!(first_read < RECORDS / 2, "the first search read {first_read} of {RECORDS} records");
 }

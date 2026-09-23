@@ -196,13 +196,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
     };
     let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q").unwrap_or(""), sort_param) {
         Ok(found) => found,
-        Err(SearchError::Unsupported(qualifier)) => {
-            return error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
-                o.str("qualifier", &qualifier)
-            });
-        }
-        Err(SearchError::Read(e)) if changing(entry, open.generation, &e) => return database_changing(),
-        Err(SearchError::Read(e)) => return error(500, "internal", &e.to_string()),
+        Err(e) => return search_error(entry, open.generation, e),
     };
     // Reserved before the rows are built and held until the answer is written.
     let Some(hold) = budget::reserve(limit as usize * MAX_ROW_BYTES) else { return busy() };
@@ -269,12 +263,30 @@ fn suggest(entry: &Entry, req: &Request) -> Response {
     };
     match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
         Ok(list) => {
-            let items = list.iter().map(|(value, games)| Obj::new().str("value", value).num("games", *games).done());
+            let items =
+                list.into_iter().map(|(value, games)| Obj::new().str("value", &clip(value)).num("games", games).done());
             let field = req.param("field").unwrap_or_default();
             ok(Obj::new().str("field", field).raw("suggestions", &json::array(items)).done())
         }
-        Err(e) if changing(entry, open.generation, &e) => database_changing(),
-        Err(e) => error(500, "internal", &e.to_string()),
+        Err(e) => search_error(entry, open.generation, e),
+    }
+}
+
+/// The answer to a search that could not finish.
+fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
+    match e {
+        SearchError::Unsupported(qualifier) => {
+            error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
+                o.str("qualifier", &qualifier)
+            })
+        }
+        SearchError::Superseded => error(409, "superseded", "A newer search on this database replaced this one"),
+        SearchError::TooLarge => {
+            error(422, "database_too_large", "The database is too large to search or sort within the memory budget")
+        }
+        SearchError::Busy => error(503, "busy", "Search memory is taken by other searches; retry"),
+        SearchError::Read(e) if changing(entry, generation, &e) => database_changing(),
+        SearchError::Read(e) => error(500, "internal", &e.to_string()),
     }
 }
 

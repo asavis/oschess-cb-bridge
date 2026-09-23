@@ -107,16 +107,16 @@ direction, `date` and `moves` sort descending and every other key ascending.
 | `whiteElo`, `blackElo` | the rating |
 | `result` | `*`, `0-0`, `0-1`, `1-0`, `1/2-1/2` |
 | `moves` | full moves |
-| `eco` | the ECO code |
+| `eco` | the ECO code as shown; ChessBase's hidden sub-code does not order it |
 | `date` (also `pgndate`) | year, month, day; an unknown part before any known one |
 | `round` | round, then sub-round |
 
-Unknown values (no rating, no ECO code, no date, no round, an empty name) come
-first in ascending order and last in descending order. Equal names are equal
-keys, and a guiding text or an analysis sorts by its title as the tournament
-(among the tournaments' names) and by its author as the annotator, and has no
-other key. Records with equal keys
-stay in number order, ascending, in both directions.
+Unknown values (no rating, no ECO code, no date, no round, an empty or missing
+name) are one key, which comes first in ascending order and last in descending
+order. Names are compared in full. Equal names are equal keys, and a guiding
+text or an analysis sorts by its title as the tournament (among the
+tournaments' names) and by its author as the annotator, and has no other key.
+Records with equal keys stay in number order, ascending, in both directions.
 
 The Library's `name`, `title`, `created` and `updated` keys do not exist for a
 ChessBase database and are ignored like any unknown key.
@@ -254,6 +254,8 @@ has:eco                            => unsupported has
 names that start with the prefix, ignoring case; for people, a first name that
 starts with it counts too (`mik` offers `Tal, Mikhail`). Each name comes with
 the number of games that have it in that role, either colour for `player`;
-guiding texts and analyses are not counted. Names without games in the role are not offered,
-entities with the same name are counted together, and the list is sorted by
-that count, most first, then by name.
+guiding texts and analyses are not counted. Names are compared in full, and
+entities with the same name are one suggestion: a game counts once for it,
+even when both its players are entities of that name. Names without games in
+the role are not offered, and the list is sorted by that count, most first,
+then by name.

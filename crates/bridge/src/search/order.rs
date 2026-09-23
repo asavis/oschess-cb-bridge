@@ -5,8 +5,10 @@ use std::collections::BinaryHeap;
 
 use cbformat::v2::{Database, Eco, Record, RecordKind};
 
+use super::SearchError;
+use super::memory::{Held, Hold, Refused};
 use super::query::{Sort, SortKey};
-use super::scan::{scan, threads};
+use super::scan::{Control, scan, threads};
 
 /// The ranks a key needs besides the record: players' name order, and the
 /// joint name order of tournaments and of the titles of guiding texts and
@@ -33,8 +35,9 @@ fn result_rank(pgn: &str) -> u32 {
 /// an analysis has its own layout: it sorts by its title as the tournament and
 /// by its author as the annotator, and has no other key.
 fn key(r: &Record, key: SortKey, ranks: &Ranks<'_>) -> u32 {
+    // An empty name has rank 0, and so has a missing one.
     let rank = |table: Option<&[u32]>, id: i64| {
-        usize::try_from(id).ok().and_then(|i| table.and_then(|t| t.get(i))).map_or(0, |&r| r + 1)
+        usize::try_from(id).ok().and_then(|i| table.and_then(|t| t.get(i))).copied().unwrap_or(0)
     };
     let other = match r.kind() {
         RecordKind::Game => None,
@@ -60,22 +63,47 @@ fn key(r: &Record, key: SortKey, ranks: &Ranks<'_>) -> u32 {
         SortKey::BlackElo => r.black_elo().max(0) as u32,
         SortKey::Result => result_rank(r.result().pgn()),
         SortKey::Moves => r.move_count().max(0) as u32,
+        // The code as shown; ChessBase's hidden sub-code does not order it.
         SortKey::Eco => match r.eco() {
-            Eco::Code { code, sub } => u32::from(code) * 128 + u32::from(sub) + 1,
+            Eco::Code { code, .. } => u32::from(code) + 1,
             _ => 0,
         },
         SortKey::Date => (r.played_date().0 & 0x1f_ffff) as u32,
-        SortKey::Round => ((i32::from(r.round()).max(0) as u32) << 16) | i32::from(r.subround()).max(0) as u32,
+        // A sub-round is shown only with a round.
+        SortKey::Round => match (r.round(), r.subround()) {
+            (n, _) if n <= 0 => 0,
+            (n, s) => ((n as u32) << 16) | s.max(0) as u32,
+        },
     }
+}
+
+/// Bytes a sort order needs while it is built: a key and number per record,
+/// and the finished order.
+pub fn build_bytes(records: u32) -> usize {
+    records as usize * 12
 }
 
 /// Every record number in `sort` order; ties by number, ascending, in both
 /// directions. Each worker sorts its own range, and the ranges are merged.
-pub fn build(db: &Database, sort: Sort, ranks: &Ranks<'_>) -> cbformat::Result<Vec<u32>> {
+/// The memory is reserved before anything is allocated, and the order keeps
+/// what it holds.
+pub fn build(db: &Database, ctl: &Control<'_>, sort: Sort, ranks: &Ranks<'_>) -> Result<Held<Vec<u32>>, SearchError> {
+    let total = db.record_count() as usize;
+    let mut hold = Hold::reserve(build_bytes(db.record_count()))?;
     let flip = if sort.descending { u32::MAX } else { 0 };
-    let mut runs = scan(db, Vec::new, |run: &mut Vec<u64>, r| {
-        run.push((u64::from(key(r, sort.key, ranks) ^ flip) << 32) | u64::from(r.id()));
-    })?;
+    let mut runs = scan(
+        db,
+        ctl,
+        |len| {
+            let mut run: Vec<u64> = Vec::new();
+            run.try_reserve_exact(len).map_err(|_| Refused::Busy)?;
+            Ok(run)
+        },
+        |run, r| {
+            run.push((u64::from(key(r, sort.key, ranks) ^ flip) << 32) | u64::from(r.id()));
+            Ok(())
+        },
+    )?;
     std::thread::scope(|s| {
         let workers = threads().max(1);
         let per = runs.len().div_ceil(workers).max(1);
@@ -83,18 +111,22 @@ pub fn build(db: &Database, sort: Sort, ranks: &Ranks<'_>) -> cbformat::Result<V
             s.spawn(move || chunk.iter_mut().for_each(|run| run.sort_unstable()));
         }
     });
-    let total: usize = runs.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(total);
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve_exact(total).map_err(|_| Refused::Busy)?;
     let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> =
         runs.iter().enumerate().filter(|(_, r)| !r.is_empty()).map(|(i, r)| Reverse((r[0], i, 0))).collect();
     while let Some(Reverse((packed, run, at))) = heap.pop() {
+        if out.len().is_multiple_of(1 << 20) && ctl.cancel.is_cancelled() {
+            return Err(SearchError::Superseded);
+        }
         out.push(packed as u32);
         if let Some(&next) = runs[run].get(at + 1) {
             heap.push(Reverse((next, run, at + 1)));
         }
     }
-    runs.clear();
-    Ok(out)
+    drop(runs);
+    hold.shrink(out.capacity() * 4);
+    Ok(Held::new(out, hold))
 }
 
 #[cfg(test)]

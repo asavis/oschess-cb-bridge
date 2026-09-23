@@ -101,14 +101,16 @@ with them.
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
 | 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading` |
+| 409 | `superseded` | A newer search (`q`) on the same database replaced this one while it ran; the page shows the newer answer |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
+| 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
-| 503 | `busy` | Too many open connections, or too many large answers being sent at once; `Retry-After: 1` |
+| 503 | `busy` | Too many open connections, too many large answers being sent at once, or search memory taken by other searches; `Retry-After: 1` |
 
 ## Database identity and generations
 
@@ -145,6 +147,27 @@ snapshot to coordinate with. The bridge therefore promises:
 - **Caches follow the generation.** Sort orders, suggestions and the position
   index are rebuilt when the generation changes, never mixed with a newer
   record count.
+
+## Search memory
+
+Name tables, sort orders, search results and suggestion counts are kept in
+memory within one budget, 1 GiB by default (`OSCHESS_BRIDGE_SEARCH_MIB` sets
+another, 16 to 65,536). Every structure reserves its bytes before it is
+allocated. When a new one does not fit, what other searches retained is
+dropped first and rebuilt when it is next needed; when it still does not fit,
+the request is answered `503 busy`. A structure larger than the whole budget
+is refused at once with `422 database_too_large`: a sort order needs 12 bytes
+per record while it is built and 4 bytes after, so the default budget sorts
+databases of up to about 89 million records. A Mega Database of 12 million
+records needs about 330 MB with three sort orders and the suggestion counts.
+
+## Cancellation
+
+A request with `q` supersedes the search still running on the same database:
+that one stops at its next batch of headers and is answered `409 superseded`.
+The latest search wins whoever sent it; a page shows the answer to its latest
+query and discards older ones anyway. Requests without `q`, and suggestions,
+are never superseded.
 
 ## Endpoints
 

@@ -182,7 +182,7 @@ impl Entry {
             return Ok(open.clone());
         }
         let db = Database::open(&self.path).map_err(|_| State::Unreadable)?;
-        let open = Opened { db: Arc::new(db), generation, indexes: Arc::default() };
+        let open = Opened { db: Arc::new(db), generation, indexes: Indexes::shared() };
         *slot = Some(open.clone());
         Ok(open)
     }

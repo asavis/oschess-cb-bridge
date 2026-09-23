@@ -1,10 +1,15 @@
 //! Parallel passes over a database's header records, and the compiled search
 //! predicate they evaluate.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use cbformat::v2::{Database, Record, RecordKind};
 
+use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
 use super::fields::{date_text, eco_text, round_text};
 
+use super::SearchError;
+use super::memory::{Allowance, Cancel, Refused};
 use super::names::{BitSet, NameTable};
 use super::query::{Cmp, Field, Query, Value};
 
@@ -24,40 +29,80 @@ pub fn threads() -> usize {
     })
 }
 
+/// What a pass answers to: the cancellation of its search, and a count of the
+/// records it read.
+pub struct Control<'a> {
+    pub cancel: &'a Cancel,
+    pub scanned: &'a AtomicU64,
+}
+
 /// Visits every record, in parallel over contiguous ranges of numbers. Each
-/// worker folds its range, in number order, into its own accumulator; the
-/// accumulators come back in range order.
+/// worker folds its range, in number order, into its own accumulator, made by
+/// `init` from the number of records it will visit; the accumulators come back
+/// in range order. Every worker stops at its next batch once one has failed or
+/// the search is superseded.
 pub fn scan<T: Send>(
     db: &Database,
-    init: impl Fn() -> T + Sync,
-    visit: impl Fn(&mut T, &Record) + Sync,
-) -> cbformat::Result<Vec<T>> {
+    ctl: &Control<'_>,
+    init: impl Fn(usize) -> Result<T, SearchError> + Sync,
+    visit: impl Fn(&mut T, &Record) -> Result<(), SearchError> + Sync,
+) -> Result<Vec<T>, SearchError> {
     let total = u64::from(db.record_count());
     let workers = (threads() as u64).min(total.div_ceil(u64::from(CHUNK))).max(1);
     let per = total.div_ceil(workers);
     let (init, visit) = (&init, &visit);
-    std::thread::scope(|s| {
+    let failed = AtomicBool::new(false);
+    let failed = &failed;
+    let parts: Vec<Result<T, SearchError>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
                 let (first, last) = (w * per + 1, ((w + 1) * per).min(total));
-                s.spawn(move || -> cbformat::Result<T> {
-                    let mut acc = init();
-                    let mut next = first;
-                    while next <= last {
-                        let upto = last.min(next + u64::from(CHUNK) - 1);
-                        let records = db.records(next as u32, upto as u32)?;
-                        let Some(end) = records.last().map(|r| u64::from(r.id())) else { break };
-                        for r in &records {
-                            visit(&mut acc, r);
+                s.spawn(move || -> Result<T, SearchError> {
+                    let run = || -> Result<T, SearchError> {
+                        let mut acc = init(last.saturating_sub(first - 1) as usize)?;
+                        let mut next = first;
+                        while next <= last {
+                            if failed.load(Ordering::Relaxed) {
+                                return Err(SearchError::Superseded);
+                            }
+                            if ctl.cancel.is_cancelled() {
+                                return Err(SearchError::Superseded);
+                            }
+                            let upto = last.min(next + u64::from(CHUNK) - 1);
+                            let records = db.records(next as u32, upto as u32)?;
+                            let Some(end) = records.last().map(|r| u64::from(r.id())) else { break };
+                            ctl.scanned.fetch_add(records.len() as u64, Ordering::Relaxed);
+                            for r in &records {
+                                visit(&mut acc, r)?;
+                            }
+                            next = end + 1;
                         }
-                        next = end + 1;
+                        Ok(acc)
+                    };
+                    let result = run();
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
                     }
-                    Ok(acc)
+                    result
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
-    })
+    });
+    // The first real failure explains the others, which only stopped for it.
+    let mut out = Vec::with_capacity(parts.len());
+    let mut stopped = None;
+    for part in parts {
+        match part {
+            Ok(acc) => out.push(acc),
+            Err(SearchError::Superseded) => stopped = Some(SearchError::Superseded),
+            Err(e) => return Err(e),
+        }
+    }
+    match stopped {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 /// Which of a game's player ids a name test looks at.
@@ -67,22 +112,6 @@ enum Role {
     Black,
     Either,
     Annotator,
-}
-
-/// A comparison of fixed-width text (ECO codes, dates) in byte order. A bound
-/// followed by `~` sorts after every text that starts with it, which turns a
-/// prefix into the upper end of a range.
-enum TextCmp {
-    Prefix(Vec<u8>),
-    AtLeast(Vec<u8>),
-    AtMost(Vec<u8>),
-    Above(Vec<u8>),
-    Below(Vec<u8>),
-}
-
-enum IntCmp {
-    Range(i64, i64),
-    Never,
 }
 
 enum Test {
@@ -155,45 +184,44 @@ pub fn shared(field: Field) -> bool {
 }
 
 impl Matcher {
-    pub fn new(query: &Query, tables: &Tables<'_>) -> Matcher {
-        let set = |t: Option<&NameTable>, needle: &str| t.map_or_else(|| BitSet::new(0), |t| t.containing(needle));
-        let names = |needle: &str| set(tables.players, needle);
-        let events = |needle: &str| set(tables.tournaments, needle);
-        let titles = |needle: &str| set(tables.titles, needle);
-        let terms = query
-            .terms
-            .iter()
-            .map(|term| CompiledTerm {
-                negated: term.negated,
-                tests: term
-                    .values
-                    .iter()
-                    .map(|v| {
-                        let needle = v.text.to_lowercase();
-                        match term.field {
-                            Field::Text => Test::Text {
-                                players: names(&needle),
-                                tournaments: events(&needle),
-                                titles: titles(&needle),
-                            },
-                            Field::White => Test::Players(names(&needle), Role::White),
-                            Field::Black => Test::Players(names(&needle), Role::Black),
-                            Field::Player => Test::Players(names(&needle), Role::Either),
-                            Field::Annotator => Test::Players(names(&needle), Role::Annotator),
-                            Field::Event => Test::Event { tournaments: events(&needle), titles: titles(&needle) },
-                            Field::Result => Test::Result(v.text.clone()),
-                            Field::Round => Test::Round(needle),
-                            Field::Eco => Test::Eco(text_cmps(v.text.as_bytes(), v)),
-                            Field::Date => date_test(v),
-                            Field::Moves => Test::Moves(int_cmp(v)),
-                            Field::Elo => Test::Elo(int_cmp(v)),
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+    /// The query compiled against `tables`; the id sets its name terms need
+    /// are taken from `allow`.
+    pub fn new(query: &Query, tables: &Tables<'_>, allow: &mut Allowance<'_>) -> Result<Matcher, Refused> {
+        let mut set = |t: Option<&NameTable>, needle: &str| match t {
+            Some(t) => t.containing(needle, allow),
+            None => BitSet::new(0, allow),
+        };
+        let mut terms = Vec::with_capacity(query.terms.len());
+        for term in &query.terms {
+            let mut tests = Vec::with_capacity(term.values.len());
+            for v in &term.values {
+                let needle = v.text.to_lowercase();
+                tests.push(match term.field {
+                    Field::Text => Test::Text {
+                        players: set(tables.players, &needle)?,
+                        tournaments: set(tables.tournaments, &needle)?,
+                        titles: set(tables.titles, &needle)?,
+                    },
+                    Field::White => Test::Players(set(tables.players, &needle)?, Role::White),
+                    Field::Black => Test::Players(set(tables.players, &needle)?, Role::Black),
+                    Field::Player => Test::Players(set(tables.players, &needle)?, Role::Either),
+                    Field::Annotator => Test::Players(set(tables.players, &needle)?, Role::Annotator),
+                    Field::Event => Test::Event {
+                        tournaments: set(tables.tournaments, &needle)?,
+                        titles: set(tables.titles, &needle)?,
+                    },
+                    Field::Result => Test::Result(v.text.clone()),
+                    Field::Round => Test::Round(needle),
+                    Field::Eco => Test::Eco(text_cmps(v.text.as_bytes(), v)),
+                    Field::Date => date_test(v),
+                    Field::Moves => Test::Moves(int_cmp(v)),
+                    Field::Elo => Test::Elo(int_cmp(v)),
+                });
+            }
+            terms.push(CompiledTerm { negated: term.negated, tests });
+        }
         let games_only = query.terms.iter().any(|t| !shared(t.field));
-        Matcher { terms, games_only }
+        Ok(Matcher { terms, games_only })
     }
 
     pub fn matches(&self, r: &Record) -> bool {
@@ -203,57 +231,6 @@ impl Matcher {
         }
         self.terms.iter().all(|t| t.tests.iter().any(|test| test.holds(r, other.as_ref())) != t.negated)
     }
-}
-
-fn int_cmp(v: &Value) -> IntCmp {
-    let parse = |s: &str| s.trim().parse::<i64>().ok();
-    let Some(low) = parse(&v.text) else { return IntCmp::Never };
-    match v.cmp {
-        Cmp::Equal => IntCmp::Range(low, low),
-        Cmp::Greater => IntCmp::Range(low.saturating_add(1), i64::MAX),
-        Cmp::GreaterOrEqual => IntCmp::Range(low, i64::MAX),
-        Cmp::Less => IntCmp::Range(i64::MIN, low.saturating_sub(1)),
-        Cmp::LessOrEqual => IntCmp::Range(i64::MIN, low),
-        Cmp::Range => match v.upper.as_deref().and_then(parse) {
-            Some(high) => IntCmp::Range(low, high),
-            None => IntCmp::Never,
-        },
-    }
-}
-
-fn with_tilde(bound: &[u8]) -> Vec<u8> {
-    let mut v = bound.to_vec();
-    v.push(b'~');
-    v
-}
-
-/// The comparisons `v` asks for, on `low` and, for a range, `v.upper`.
-fn text_cmps(low: &[u8], v: &Value) -> Vec<TextCmp> {
-    let high = v.upper.as_deref().map_or(low, str::as_bytes);
-    match v.cmp {
-        Cmp::Equal => vec![TextCmp::Prefix(low.to_vec())],
-        Cmp::GreaterOrEqual => vec![TextCmp::AtLeast(low.to_vec())],
-        Cmp::Greater => vec![TextCmp::Above(with_tilde(low))],
-        Cmp::Less => vec![TextCmp::Below(low.to_vec())],
-        Cmp::LessOrEqual => vec![TextCmp::AtMost(with_tilde(low))],
-        Cmp::Range => vec![TextCmp::AtLeast(low.to_vec()), TextCmp::AtMost(with_tilde(high))],
-    }
-}
-
-/// A typed date in the stored `YYYY.MM.DD` prefix form: `2024`, `2024-3` →
-/// `2024.03`, `2024/03/15` → `2024.03.15`; `None` when it is not a date.
-pub fn normalize_date(text: &str) -> Option<String> {
-    let mut parts = text.trim().split(['-', '.', '/']);
-    let year = parts.next().filter(|y| y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()))?;
-    let mut out = year.to_string();
-    for part in parts.by_ref().take(2) {
-        if part.is_empty() || part.len() > 2 || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        out.push('.');
-        out.push_str(&format!("{part:0>2}"));
-    }
-    parts.next().is_none().then_some(out)
 }
 
 fn date_test(v: &Value) -> Test {
@@ -269,27 +246,6 @@ fn date_test(v: &Value) -> Test {
     let known = if v.cmp == Cmp::Range { low.len().max(high.len()) } else { low.len() };
     let bounds = Value { text: low.clone(), cmp: v.cmp.clone(), upper: Some(high) };
     Test::Date { cmps: text_cmps(low.as_bytes(), &bounds), known }
-}
-
-impl TextCmp {
-    fn holds(&self, s: &[u8]) -> bool {
-        match self {
-            TextCmp::Prefix(p) => s.len() >= p.len() && s[..p.len()].eq_ignore_ascii_case(p),
-            TextCmp::AtLeast(b) => s >= &b[..],
-            TextCmp::AtMost(b) => s <= &b[..],
-            TextCmp::Above(b) => s > &b[..],
-            TextCmp::Below(b) => s < &b[..],
-        }
-    }
-}
-
-impl IntCmp {
-    fn holds(&self, v: i64) -> bool {
-        match *self {
-            IntCmp::Range(low, high) => (low..=high).contains(&v),
-            IntCmp::Never => false,
-        }
-    }
 }
 
 impl Test {
@@ -328,33 +284,5 @@ impl Test {
             Test::Elo(cmp) => [r.white_elo(), r.black_elo()].into_iter().any(|e| e > 0 && cmp.holds(i64::from(e))),
             Test::Never => false,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dates_normalise_as_typed() {
-        assert_eq!(normalize_date("2024").as_deref(), Some("2024"));
-        assert_eq!(normalize_date("2024-3").as_deref(), Some("2024.03"));
-        assert_eq!(normalize_date("2024/03/5").as_deref(), Some("2024.03.05"));
-        for bad in ["24", "2024-", "2024-123", "2024-01-02-03", "x", "2024-1a"] {
-            assert_eq!(normalize_date(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn text_comparisons_with_the_tilde_bound() {
-        let v = |cmp, upper: Option<&str>| Value { text: "B9".into(), cmp, upper: upper.map(Into::into) };
-        let all = |cmps: Vec<TextCmp>, s: &str| cmps.iter().all(|c| c.holds(s.as_bytes()));
-        assert!(all(text_cmps(b"B9", &v(Cmp::Equal, None)), "B90"));
-        assert!(!all(text_cmps(b"B9", &v(Cmp::Equal, None)), "B80"));
-        assert!(all(text_cmps(b"B9", &v(Cmp::LessOrEqual, None)), "B99"));
-        assert!(!all(text_cmps(b"B9", &v(Cmp::Greater, None)), "B99"));
-        assert!(all(text_cmps(b"B9", &v(Cmp::Greater, None)), "C00"));
-        assert!(all(text_cmps(b"B9", &v(Cmp::Range, Some("C1"))), "C19"));
-        assert!(!all(text_cmps(b"B9", &v(Cmp::Range, Some("C1"))), "C20"));
     }
 }
