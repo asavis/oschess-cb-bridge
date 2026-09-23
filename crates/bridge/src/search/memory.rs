@@ -13,8 +13,12 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 /// The budget when `OSCHESS_BRIDGE_SEARCH_MIB` does not set another: 1 GiB. A
 /// Mega Database of 12 million games needs about 330 MB with three sort orders.
 pub const DEFAULT_BUDGET_MIB: usize = 1024;
-/// Bytes a worker reserves at a time as a structure grows.
-pub const STEP: usize = 1 << 20;
+/// Bytes a worker reserves at a time as a structure grows: a 256th of the
+/// budget, from 64 KiB to 1 MiB, so that sixteen workers' unused steps stay a
+/// small part of even the smallest budget.
+pub fn step() -> usize {
+    (budget() / 256).clamp(64 << 10, 1 << 20)
+}
 
 /// The budget in bytes: `OSCHESS_BRIDGE_SEARCH_MIB` (16 to 65,536) or the default.
 pub fn budget() -> usize {
@@ -117,7 +121,7 @@ impl<T> std::ops::Deref for Held<T> {
 }
 
 /// One worker's share of a structure that several workers grow together: it
-/// reserves [`STEP`] bytes at a time in the structure's shared hold, and gives
+/// reserves [`step`] bytes at a time in the structure's shared hold, and gives
 /// back what it did not use when dropped.
 pub struct Allowance<'a> {
     shared: &'a Mutex<Hold>,
@@ -131,7 +135,7 @@ impl<'a> Allowance<'a> {
 
     pub fn take(&mut self, bytes: usize) -> Result<(), Refused> {
         if bytes > self.left {
-            let step = (bytes - self.left).max(STEP);
+            let step = (bytes - self.left).max(step());
             self.shared.lock().unwrap_or_else(|e| e.into_inner()).grow(step)?;
             self.left += step;
         }
@@ -245,7 +249,7 @@ mod tests {
         {
             let mut a = Allowance::new(&shared);
             a.take(10).unwrap();
-            assert_eq!(shared.lock().unwrap().bytes(), STEP);
+            assert_eq!(shared.lock().unwrap().bytes(), step());
         }
         assert_eq!(shared.lock().unwrap().bytes(), 10, "the unused part is given back");
     }

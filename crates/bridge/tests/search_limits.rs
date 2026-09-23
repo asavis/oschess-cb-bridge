@@ -219,6 +219,58 @@ fn many_workers_leave_room_for_their_matches() {
     }
 }
 
+/// A `.2lid` holding only players, `names[id]` for each id; id 0 is empty.
+fn players_lid(names: &[String]) -> Vec<u8> {
+    let field = |s: &str| [(s.len() as i32).to_le_bytes().to_vec(), s.as_bytes().to_vec()].concat();
+    let size = 64usize;
+    let mut d = Vec::new();
+    d.extend(184i32.to_be_bytes());
+    d.extend(6i32.to_be_bytes());
+    for _ in 0..6 {
+        d.extend((size as i32).to_be_bytes());
+        d.extend((names.len() as i64).to_be_bytes());
+        d.extend((-1i64).to_be_bytes());
+    }
+    d.resize(184, 0);
+    for name in names {
+        let record = if name.is_empty() { Vec::new() } else { [field(name), field("")].concat() };
+        let mut player = vec![0u8; size];
+        if !record.is_empty() {
+            player[..4].copy_from_slice(&(record.len() as i32).to_le_bytes());
+            player[4..4 + record.len()].copy_from_slice(&record);
+        }
+        d.extend(player);
+        d.extend(vec![0u8; size * 5]);
+    }
+    d
+}
+
+/// Name tables load on the shared workers too: 100,000 short player names,
+/// sixteen workers and a 16 MiB budget. Each worker grows its share of the
+/// table in steps that scale with the budget, so sixteen shares fit beside
+/// the table's offsets instead of being refused as too large.
+#[test]
+fn many_names_load_on_many_workers_within_a_small_budget() {
+    let names: Vec<String> = std::iter::once(String::new()).chain((1..=100_000).map(|i| format!("a{i:06}"))).collect();
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for id in 1..names.len() as i64 {
+        b.game(e4)[0x18..0x20].copy_from_slice(&id.to_le_bytes());
+    }
+    b.lid(players_lid(&names));
+    let db = b.write("limits-many-names");
+    let path = db.dir().join("db.2cbh");
+    let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
+    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    for (query, total) in [("q=player:a&limit=1", "100000"), ("q=player:nomatch&limit=1", "0")] {
+        let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
+        assert_eq!(status, 200, "{query}: {out}");
+        assert!(out.contains(&format!(r#""total":{total}"#)), "{query}: {out}");
+    }
+    let (status, out) = get(b.port, &format!("/v1/databases/{}/suggest?field=player&prefix=a0&limit=3", b.id));
+    assert_eq!(status, 200, "{out}");
+}
+
 /// Two dozen searches at once, under the 256 MiB limit, four workers and a
 /// 16 MiB search budget: every connection gets an answer, `200` or `503`, and
 /// the bridge keeps serving. Scans share the four workers instead of starting

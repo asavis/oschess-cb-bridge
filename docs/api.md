@@ -166,10 +166,12 @@ cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
 are free, waits up to 5 seconds for the first one, and is answered `503 busy`
 when none comes free; many requests at once therefore wait for each other
 instead of multiplying the threads. Each worker reads headers into one 3 MiB
-buffer, reserved in the budget before it is allocated. The buffers of a
-search's workers take at most half the budget, which leaves the other half for
-the matches they collect, and with little budget left a search runs on fewer
-workers, down to one.
+buffer, reserved in the budget before it is allocated. What a worker builds,
+such as its matches or its share of a name table, grows in steps of a 256th of
+the budget, from 64 KiB to 1 MiB. A search's workers take at most half the
+budget with their buffers and one step each, which leaves the other half for
+the rest of what they build, and with little budget left a search runs on
+fewer workers, down to one.
 
 ## Cancellation
 
