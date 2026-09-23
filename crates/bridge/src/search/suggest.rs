@@ -1,12 +1,13 @@
 //! Suggestions: names by prefix with their game counts, the most games first.
 
 use std::cmp::Ordering as Order;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use cbformat::v2::{Database, RecordKind};
 
-use super::memory::{Cancel, Held, Hold, Refused};
-use super::names::{Groups, Kind, NO_GROUP, NameTable, groups};
+use super::memory::{Allowance, Cancel, Held, Hold, Refused};
+use super::names::{BitSet, Groups, Kind, NO_GROUP, NameTable, groups};
 use super::query::MAX_VALUE_CHARS;
 use super::scan::{self, Control};
 use super::{Indexes, SearchError, cached};
@@ -118,6 +119,24 @@ pub fn suggest(
             .then_with(|| table.lower(a.1).cmp(table.lower(b.1)))
             .then_with(|| table.name(a.1 as i64).cmp(table.name(b.1 as i64)))
     };
+    // A person's first name counts too, from its own field; an event's name
+    // after a comma does not. Entities that show the same name are one
+    // suggestion, so a group counts when any of its people has a first name
+    // with the prefix.
+    let named_hold = Mutex::new(Hold::default());
+    let mut named_allow = Allowance::new(&named_hold);
+    let named = if people {
+        let mut set = BitSet::new(groups.first_id.len(), &mut named_allow)?;
+        for id in 0..table.len() {
+            let g = groups.of_id[id];
+            if g != NO_GROUP && table.given_lower(id).is_some_and(|f| f.starts_with(&prefix)) {
+                set.insert(g as usize);
+            }
+        }
+        Some(set)
+    } else {
+        None
+    };
     let mut best: Vec<(u32, usize)> = Vec::new();
     best.try_reserve_exact(limit + 1).map_err(|_| Refused::Busy)?;
     for (g, &n) in games.iter().enumerate() {
@@ -125,11 +144,7 @@ pub fn suggest(
         if n == 0 || (best.len() == limit && order((n, id), best[limit - 1]) != Order::Less) {
             continue;
         }
-        let lower = table.lower(id);
-        // A person's first name counts too, from its own field; an event's name
-        // after a comma does not.
-        let first_name = if people { table.given_lower(id) } else { None };
-        if !(lower.starts_with(&prefix) || first_name.is_some_and(|f| f.starts_with(&prefix))) {
+        if !(table.lower(id).starts_with(&prefix) || named.as_ref().is_some_and(|set| set.contains(g))) {
             continue;
         }
         if !searchable(table.name(id as i64)) {

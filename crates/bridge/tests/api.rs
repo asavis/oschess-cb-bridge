@@ -834,6 +834,32 @@ fn first_names_come_from_their_own_field() {
     }
 }
 
+/// Entities that show the same name are one suggestion, and a first name of
+/// any of them counts: an unused `Smith, Alex` with no first name does not hide
+/// the `Smith` + `Alex` a game refers to, whichever comes first.
+#[test]
+fn a_first_name_counts_for_every_entity_of_a_shown_name() {
+    for (unused, used) in [(0usize, 1usize), (1, 0)] {
+        let mut b = Builder::new();
+        let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+        let rec = b.game(e4);
+        rec[0x18..0x20].copy_from_slice(&(used as i64).to_le_bytes());
+        rec[0x30..0x38].copy_from_slice(&(used as i64).to_le_bytes());
+        b.lid(lid_with(64, 2, &[(0, unused, strings(&["Smith, Alex", ""])), (0, used, strings(&["Smith", "Alex"]))]));
+        let db = b.write(&format!("api-first-name-group-{unused}"));
+        let r = start(&db, vec![], None);
+        for field in ["player", "annotator"] {
+            let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id), "");
+            assert_eq!(s.status, 200, "{}", s.body);
+            assert!(
+                s.body.contains(r#"{"value":"Smith, Alex","label":"Smith, Alex","games":1}"#),
+                "{field}, unused {unused}: {}",
+                s.body
+            );
+        }
+    }
+}
+
 #[test]
 fn a_changed_database_is_searched_afresh() {
     let db = database("api-search-fresh", 2, 0, 0);
