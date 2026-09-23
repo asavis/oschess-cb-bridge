@@ -17,11 +17,10 @@ use crate::replay::{MoveError, TreeStats, TreeVisitor, start_board};
 use crate::v2::Start;
 use crate::{Error, Result};
 
-/// Most variations open at once in a game. Each open one keeps a board and
-/// the piece lists (about 350 bytes), so the stack stays under 400 KiB. The
-/// deepest nesting measured is 74, in a Mega Database 2026 game; the classic
-/// databases examined reach 63.
-pub const MAX_VARIATION_DEPTH: usize = 1024;
+/// Most variations open at once in a game, as for 2CBH games. Each open one
+/// keeps a board and the piece lists (about 350 bytes), so the stack stays
+/// under 400 KiB.
+pub use crate::replay::MAX_VARIATION_DEPTH;
 
 /// The table, modifier and encoder of an encoding mode whose table is known.
 fn mode(m: u8) -> Result<(&'static [u8; 256], bool, bool)> {
