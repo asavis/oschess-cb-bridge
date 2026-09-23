@@ -177,6 +177,17 @@ fn set_up_positions_are_validated() {
     assert_eq!(err("4k3/4R3/8/8/8/8/8/4K3 w - - 0 1"), SetupError::OpponentInCheck);
     assert_eq!(err("4k3/8/8/8/8/8/8/4K3 w K - 0 1"), SetupError::Castling);
     assert_eq!(err("4k3/8/8/8/8/8/8/4K3 w - e6 0 1"), SetupError::EnPassant);
+    // A check that existed before the double step: the rook on a6 already
+    // attacked e6, so ...d7-d5 cannot have been the last move.
+    assert_eq!(err("k7/8/r3K3/3pP3/8/8/8/8 w - d6 0 1"), SetupError::EnPassant);
+    // Checks the double step can have given: by the pawn itself, or opened
+    // through the square it left.
+    assert!(Board::from_fen("7k/8/8/3pP3/4K3/8/8/8 w - d6 0 1").is_ok());
+    assert!(Board::from_fen("2b4k/8/4K3/3pP3/8/8/8/8 w - d6 0 1").is_ok());
+    assert_eq!(err("4k3/8/8/8/8/P7/PPPPPPPP/4K3 w - - 0 1"), SetupError::TooManyPieces);
+    assert_eq!(err("4k3/8/8/8/NNNNNNNN/8/PPPPPPPP/4K3 w - - 0 1"), SetupError::TooManyPieces);
+    assert_eq!(err("4r2k/7b/5n2/8/4K3/8/8/8 w - - 0 1"), SetupError::ImpossibleCheck);
+    assert!(Board::from_fen("4r2k/8/5n2/8/4K3/8/8/8 w - - 0 1").is_ok(), "double check is possible");
     assert!(matches!(Board::from_fen("4k3/8/8/8/8/8/8/4K3 x - - 0 1"), Err(FenError::Syntax(_))));
     assert!(matches!(Board::from_fen("4k3/8/8/8/8/8/8/4K4 w - - 0 1"), Err(FenError::Syntax(_))));
 

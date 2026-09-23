@@ -196,3 +196,28 @@ fn malformed_eco_is_left_out_of_the_pgn() {
         assert!(text.ends_with("1. e4 1-0\n"), "{text}");
     }
 }
+
+fn words(hex: &str) -> Vec<u8> {
+    hex.split_whitespace().flat_map(|w| u16::from_str_radix(w, 16).unwrap().to_le_bytes()).collect()
+}
+
+#[test]
+fn en_passant_is_dropped_when_a_check_predates_the_double_step() {
+    // White Ke6 Pe5, black Ka8 Ra6 Pd5, white to move, en passant d6 stored:
+    // the rook's check on e6 existed before ...d7-d5, so exd6 is not available.
+    let content = words("fffb 0001 0000 0004 c052 c174 c272 c2f2 c2c8 fffc ad67 ffff");
+    let moves = GameMoves::parse(1, &content).unwrap();
+    let err = walk_tree(&moves, |_, _, _| {}).unwrap_err().to_string();
+    assert!(err.contains("en passant e5d6 not available"), "{err}");
+    assert!(movetext_of(&moves).is_err());
+}
+
+#[test]
+fn set_up_positions_with_too_many_pieces_are_refused() {
+    // White Ke1 with pawns a2-h2 and a3: nine pawns.
+    let content = words("fffb 0001 0000 0000 c04d c194 c2ad c2b3 c2b9 c2bf c2c5 c2cb c2d1 c2d7 c2ae fffc ffff");
+    let moves = GameMoves::parse(1, &content).unwrap();
+    let err = walk_tree(&moves, |_, _, _| {}).unwrap_err().to_string();
+    assert!(err.contains("set-up position"), "{err}");
+    assert!(movetext_of(&moves).is_err());
+}

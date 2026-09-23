@@ -4,7 +4,7 @@ use cbformat::movetable::{self, Captured, Color, MoveWord, Piece};
 use cbformat::pgn::movetext_of;
 use cbformat::replay::{start_board, walk_tree};
 use cbformat::v2::{GameMoves, Setup, Start};
-use cozy_chess::{File, Square};
+use chesscore::{CastleSide, Color as CColor, Move as CMove, Square};
 
 fn sq(name: &str) -> u8 {
     let b = name.as_bytes();
@@ -117,8 +117,8 @@ fn setup(castling: u8, ep_raw: u16) -> Setup {
 #[test]
 fn set_up_en_passant() {
     let board = start_board(&Start::Setup(setup(0, 4))).unwrap();
-    assert_eq!(board.en_passant(), Some(File::D));
-    assert!(board.is_legal(cozy_chess::Move { from: Square::E5, to: Square::D6, promotion: None }));
+    assert_eq!(board.en_passant(), Some("d6".parse::<Square>().unwrap()));
+    assert!(board.is_legal("e5d6".parse::<CMove>().unwrap()));
 }
 
 #[test]
@@ -135,10 +135,10 @@ fn set_up_en_passant_that_cannot_exist_is_dropped() {
 fn set_up_castling_rights_need_king_and_rook_at_home() {
     // Bits 1-8 all set: only white O-O has its king and rook in place.
     let board = start_board(&Start::Setup(setup(15, 0))).unwrap();
-    assert_eq!(board.castle_rights(cozy_chess::Color::White).short, Some(File::H));
-    assert_eq!(board.castle_rights(cozy_chess::Color::White).long, None);
-    assert_eq!(board.castle_rights(cozy_chess::Color::Black).short, None);
-    assert!(board.is_legal(cozy_chess::Move { from: Square::E1, to: Square::H1, promotion: None }));
+    assert_eq!(board.castling_rook(CColor::White, CastleSide::Short), Some(7));
+    assert_eq!(board.castling_rook(CColor::White, CastleSide::Long), None);
+    assert_eq!(board.castling_rook(CColor::Black, CastleSide::Short), None);
+    assert!(board.is_legal("e1h1".parse::<CMove>().unwrap()));
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn set_up_section_round_trip() {
 #[test]
 fn san_disambiguation_and_check_suffixes() {
     use cbformat::pgn::san;
-    use cozy_chess::{Board, Move};
+    use chesscore::{Board, Move};
     let cases = [
         // Two knights on one rank: the file tells them apart.
         ("7k/8/8/8/8/8/8/N1N4K w - - 0 1", "a1b3", "Nab3"),
