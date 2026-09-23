@@ -1,6 +1,6 @@
 //! Batched reads return exactly what single reads return.
 
-use cbformat::fixture::{Builder, TempDb, bytes, framed, quiet};
+use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::v2::{Database, MAX_BATCH_RECORDS, Token};
 
@@ -151,6 +151,7 @@ fn the_largest_record_id_is_read_without_overflow() {
 #[cfg(unix)]
 #[test]
 fn a_move_record_4_gib_past_the_span_is_read_on_its_own() {
+    use cbformat::fixture::{bytes, framed};
     use std::os::unix::fs::FileExt;
     let f = fixture(23, 0);
     let far = (1i64 << 32) + 12;
