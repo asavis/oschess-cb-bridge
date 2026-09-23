@@ -719,6 +719,42 @@ fn cloud_states_over_http() {
     assert!(body.contains("\"state\":\"ready\",\"records\":1"), "{body}");
 }
 
+/// The snapshot a user interface polls shows a cloud database as the list
+/// does, without reading it: cloud-only, downloading once its games were
+/// asked for, then ready.
+#[test]
+fn the_snapshot_shows_cloud_states() {
+    use bridge::snapshot::Background;
+    use bridge::start::Bridge;
+
+    let root = Root::new("snapshot");
+    let db = database_at(&root.path("bases"), "Remote");
+    let cloud = Arc::new(FakeCloud::with_files(files_of(&db), false));
+    let listeners = server::bind(0).unwrap();
+    let port = listeners[0].local_addr().unwrap().port();
+    let app = Arc::new(App {
+        version: "test",
+        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
+        catalog: Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone()),
+        between_reads: None,
+    });
+    let bridge =
+        Bridge { listeners, app: app.clone(), port, token: TOKEN.into(), link: String::new(), first_run: false };
+    let background = Background::serve(bridge).unwrap();
+    let snapshot_states = || background.snapshot().databases.iter().map(|d| d.state).collect::<Vec<_>>();
+    assert_eq!(snapshot_states(), [State::CloudOnly]);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0);
+
+    cloud.hold(true);
+    let entry = app.catalog.get(&id_of(&db)).unwrap();
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    assert_eq!(snapshot_states(), [State::Downloading]);
+    cloud.hold(false);
+    wait_for(&entry, State::Ready);
+    assert_eq!(snapshot_states(), [State::Ready]);
+    assert_eq!(background.snapshot().databases[0].name, "Remote");
+}
+
 /// The binary finds the window list through `OSCHESS_BRIDGE_DOCUMENTS`.
 #[test]
 fn the_bridge_reads_the_window_of_the_documents_folder() {
