@@ -2,7 +2,8 @@
 //! database. The differences the classic format explains are a closed list
 //! ([`NameDiff`]); any other is a failure.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use cbformat::cbh::Entity;
@@ -138,6 +139,29 @@ fn annotator(classic: &str, stored: usize, two: &str) -> NameDiff {
     match text(classic, stored, two, 45) {
         NameDiff::Other if !classic.is_empty() && words(classic) == words(two) => NameDiff::WordOrder,
         d => d,
+    }
+}
+
+/// The most suggestions the bridge gives for one prefix (`docs/api.md`).
+pub const SUGGESTION_LIMIT: usize = 20;
+
+/// Whether two suggestion lists for one prefix, as (name, games) pairs,
+/// differ only by names that differ in a known way (`differing`). Those are
+/// left out of both lists, and the rest must be equal as far as both reach. A
+/// list may end sooner only where the bridge's limit cut it: the names past the
+/// limit may be the ones the other list shows, because the known names took
+/// their places. Any other missing suggestion is unexplained.
+pub fn suggestions_agree(a: &[(String, u64)], b: &[(String, u64)], differing: &HashSet<String>) -> bool {
+    let keep = |v: &[(String, u64)]| v.iter().filter(|x| !differing.contains(&x.0)).cloned().collect::<Vec<_>>();
+    let (ka, kb) = (keep(a), keep(b));
+    let n = ka.len().min(kb.len());
+    if ka[..n] != kb[..n] {
+        return false;
+    }
+    match ka.len().cmp(&kb.len()) {
+        Ordering::Equal => true,
+        Ordering::Less => a.len() == SUGGESTION_LIMIT,
+        Ordering::Greater => b.len() == SUGGESTION_LIMIT,
     }
 }
 
@@ -281,6 +305,33 @@ mod tests {
         assert_eq!(utf8(&euro(26)[..26], &euro(26), 30), NameDiff::Other);
         // Part of that character stored up to byte 29 is dropped when read.
         assert_eq!(text(&euro(27)[..27], 29, &euro(27), 30), NameDiff::Cut);
+    }
+
+    fn list(names: &[&str]) -> Vec<(String, u64)> {
+        names.iter().map(|n| (format!("\"{n}\""), 1)).collect()
+    }
+
+    #[test]
+    fn suggestions_need_an_explanation() {
+        let none = HashSet::new();
+        let known: HashSet<String> = ["\"Morphy, Paul\"".to_string()].into();
+        // A name only one copy suggests, with no known difference behind it,
+        // is unexplained, even against an empty list.
+        assert!(!suggestions_agree(&list(&["Alpha, Beta"]), &[], &none));
+        assert!(!suggestions_agree(&list(&["A", "B"]), &list(&["A"]), &none));
+        // A name that differs in a known way is left out of both.
+        assert!(suggestions_agree(&list(&["A", "Morphy, Paul", "B"]), &list(&["A", "B"]), &known));
+        // Another games count is a difference.
+        assert!(!suggestions_agree(&[("\"A\"".into(), 2)], &list(&["A"]), &none));
+        // A full list whose known name took the place of the last one: the
+        // other copy's last name is past this list's limit.
+        let names: Vec<String> = (0..SUGGESTION_LIMIT).map(|i| format!("N{i:02}")).collect();
+        let full: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut with_known: Vec<&str> = full[..SUGGESTION_LIMIT - 1].to_vec();
+        with_known.insert(3, "Morphy, Paul");
+        assert!(suggestions_agree(&list(&with_known), &list(&full), &known));
+        // The same shortfall in a list the limit did not cut is unexplained.
+        assert!(!suggestions_agree(&list(&full[..SUGGESTION_LIMIT - 1]), &list(&full), &known));
     }
 
     #[test]

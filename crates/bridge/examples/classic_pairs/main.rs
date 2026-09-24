@@ -54,7 +54,7 @@ mod json;
 mod names;
 
 use json::Json;
-use names::{ANNOTATOR, BLACK, EVENT, FIELDS, Names, WHITE, bit};
+use names::{ANNOTATOR, BLACK, EVENT, FIELDS, Names, WHITE, bit, suggestions_agree};
 
 const TOKEN: &str = "classic-pairs-harness-token-0123456789abcdef";
 const DOC: &str = include_str!("../../../../docs/search-grammar.md");
@@ -529,7 +529,7 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
     println!("  of which refused the same way by both: {errors_equal}");
 
     // Suggestions: a name that differs in a known way in either copy is left
-    // out of both lists, and the rest must agree as far as both reach.
+    // out of both lists, and the rest must agree (`names::suggestions_agree`).
     let mut differing: HashSet<String> = HashSet::new();
     for id in 1..=classic.record_count().min(two.record_count()) {
         let m = names.known_bits(id);
@@ -565,11 +565,7 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
                 suggestions.identical += 1;
                 continue;
             }
-            let keep =
-                |v: &[(String, u64)]| v.iter().filter(|x| !differing.contains(&x.0)).cloned().collect::<Vec<_>>();
-            let (ka, kb) = (keep(&a), keep(&b));
-            let n = ka.len().min(kb.len());
-            if ka[..n] == kb[..n] {
+            if suggestions_agree(&a, &b, &differing) {
                 *suggestions
                     .by_names
                     .entry(if field == "annotator" { "annotator" } else { "players/event" })
