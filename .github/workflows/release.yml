@@ -1,0 +1,312 @@
+name: release
+
+# The release of the Windows app, from a version tag: the bare
+# oschess-bridge.exe and its per-user NSIS installer, each signed by SignPath
+# once that is switched on, the updater's signature and latest.json once its key
+# exists, their SHA-256, and a DRAFT release that the owner checks and publishes
+# (docs/release.md).
+#
+# The one exception to our own-runners rule (owner decision on #23,
+# 2026-09-24): SignPath requires every job before a signing request to run on
+# GitHub's hosted runners. It starts only on a version tag, which only
+# collaborators can push; no pull request, issue, comment or fork can start it.
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: x86_64-pc-windows-msvc
+  # The CLI of the tauri crates in Cargo.lock (tauri-utils 2.9.3).
+  TAURI_CLI_VERSION: 2.11.5
+
+jobs:
+  build:
+    name: Build oschess-bridge.exe
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      exe: ${{ steps.exe.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag is on main
+        run: |
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::$GITHUB_REF_NAME is not on main: releases are made only from reviewed commits"
+            exit 1
+          fi
+      - name: The updater key and its public half agree
+        env:
+          HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          placeholder=false
+          if grep -q '"pubkey": "PLACEHOLDER' crates/app/tauri.conf.json; then placeholder=true; fi
+          if [ "$HAS_UPDATER_KEY" = true ] && [ "$placeholder" = true ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is set, but crates/app/tauri.conf.json still holds the placeholder public key, so no app would take this update (docs/release.md)"
+            exit 1
+          fi
+          if [ "$HAS_UPDATER_KEY" != true ] && [ "$placeholder" != true ]; then
+            echo "::warning::crates/app/tauri.conf.json holds an updater public key, but TAURI_SIGNING_PRIVATE_KEY is not set: this release gets no latest.json, and apps find no update in it"
+          fi
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - name: The tag names the app's version
+        id: version
+        run: |
+          version=$(cargo pkgid -p app | sed 's/.*[#@]//')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not name the app's version $version (crates/app/Cargo.toml)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked --root tools
+      - name: Build
+        working-directory: crates/app
+        # Renamed to mainBinaryName, oschess-bridge.exe; the installer comes
+        # later, around the signed executable.
+        run: ../../tools/bin/cargo-tauri.exe build --ci --no-bundle --target "$TARGET" -- --locked
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/oschess-bridge.exe" dist/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: exe
+        with:
+          name: exe-unsigned
+          path: dist/oschess-bridge.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tauri-cli
+          path: tools/bin/cargo-tauri.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # The executable is signed before the installer is built around it: an
+  # installer cannot be signed inside out, and Smart App Control blocks an
+  # unsigned program even when its installer is signed.
+  sign-exe:
+    name: Sign oschess-bridge.exe
+    needs: build
+    if: vars.SIGNPATH_ENABLED == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 70
+    permissions:
+      # SignPath reads the run's jobs and downloads the artifact with this token.
+      actions: read
+      contents: read
+    steps:
+      - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ needs.build.outputs.exe }}
+          wait-for-completion: true
+          # Time for the owner to approve the request in SignPath.
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: exe-signed
+          path: signed/oschess-bridge.exe
+          if-no-files-found: error
+
+  bundle:
+    name: Build the installer
+    needs: [build, sign-exe]
+    # After a signed executable, or after none when signing is off; never
+    # around an unsigned one when signing failed.
+    if: >-
+      !cancelled() && needs.build.result == 'success' &&
+      (needs.sign-exe.result == 'success' || needs.sign-exe.result == 'skipped')
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      installer: ${{ steps.installer.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tauri-cli
+          path: tools/bin
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.sign-exe.result == 'success' && 'exe-signed' || 'exe-unsigned' }}
+          path: target/${{ env.TARGET }}/release
+      - name: Bundle
+        working-directory: crates/app
+        run: ../../tools/bin/cargo-tauri.exe bundle --ci --bundles nsis --target "$TARGET"
+      - name: Stage
+        run: |
+          shopt -s nullglob
+          found=(target/"$TARGET"/release/bundle/nsis/*-setup.exe)
+          if [ "${#found[@]}" -ne 1 ]; then
+            echo "::error::expected one NSIS installer, found ${#found[@]}"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "${found[0]}" dist/oschess-bridge-setup.exe
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: installer
+        with:
+          name: installer-unsigned
+          path: dist/oschess-bridge-setup.exe
+          if-no-files-found: error
+
+  sign-installer:
+    name: Sign the installer
+    needs: bundle
+    if: vars.SIGNPATH_ENABLED == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 70
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ needs.bundle.outputs.installer }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-signed
+          path: signed/oschess-bridge-setup.exe
+          if-no-files-found: error
+
+  release:
+    name: Draft the release
+    needs: [build, sign-exe, bundle, sign-installer]
+    if: >-
+      !cancelled() && needs.bundle.result == 'success' &&
+      (needs.sign-installer.result == 'success' || needs.sign-installer.result == 'skipped')
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      # Creates the draft release and uploads its files.
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      EXE_SIGNED: ${{ needs.sign-exe.result == 'success' }}
+      INSTALLER_SIGNED: ${{ needs.sign-installer.result == 'success' }}
+      HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.sign-exe.result == 'success' && 'exe-signed' || 'exe-unsigned' }}
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.sign-installer.result == 'success' && 'installer-signed' || 'installer-unsigned' }}
+          path: dist
+      - name: Both files signed, or neither
+        run: |
+          if [ "$EXE_SIGNED" != "$INSTALLER_SIGNED" ]; then
+            echo "::error::one file is signed and the other is not (executable: $EXE_SIGNED, installer: $INSTALLER_SIGNED)"
+            exit 1
+          fi
+      - name: The signatures are valid
+        if: env.EXE_SIGNED == 'true'
+        shell: pwsh
+        run: |
+          foreach ($file in 'dist/oschess-bridge.exe', 'dist/oschess-bridge-setup.exe') {
+            $signature = Get-AuthenticodeSignature $file
+            if ($signature.Status -ne 'Valid') { throw "${file}: the signature is $($signature.Status)" }
+            Write-Output "${file}: signed by $($signature.SignerCertificate.Subject)"
+          }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: env.HAS_UPDATER_KEY == 'true'
+        with:
+          name: tauri-cli
+          path: tools/bin
+      - name: The updater's signature and latest.json
+        if: env.HAS_UPDATER_KEY == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # Over the installer as users download it, so after its Authenticode
+        # signature. The version goes into the signature: the app accepts an
+        # update only for the version it was signed as (requireSignedVersion).
+        run: |
+          tools/bin/cargo-tauri.exe signer sign --app-version "$VERSION" dist/oschess-bridge-setup.exe
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/oschess-bridge-setup.exe"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --rawfile signature dist/oschess-bridge-setup.exe.sig \
+            --arg url "$url" \
+            '{version: $version, notes: $notes, pub_date: $date,
+              platforms: {"windows-x86_64": {signature: $signature, url: $url}}}' \
+            > dist/latest.json
+          cat dist/latest.json
+      - name: Checksums and notes
+        run: |
+          (cd dist && sha256sum oschess-bridge-setup.exe oschess-bridge.exe > SHA256SUMS.txt)
+          {
+            echo "## Download"
+            echo
+            echo "\`oschess-bridge-setup.exe\` installs the bridge for your Windows user, without administrator rights; the [README](https://github.com/$GITHUB_REPOSITORY#install) shows each step. \`oschess-bridge.exe\` is the same app without the installer."
+            echo
+            if [ "$EXE_SIGNED" = true ]; then
+              echo "Both files are signed. Free code signing provided by SignPath.io, certificate by SignPath Foundation."
+            else
+              echo "Both files are **unsigned**: SmartScreen asks for «More info → Run anyway», and Smart App Control, where it is on, blocks them."
+            fi
+            echo
+            echo "| File | SHA-256 |"
+            echo "|---|---|"
+            while read -r hash file; do
+              echo "| \`${file#\*}\` | \`$hash\` |"
+            done < dist/SHA256SUMS.txt
+          } > notes.md
+          cat notes.md
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft --verify-tag \
+            --title "oschess bridge $VERSION" \
+            --notes-file notes.md --generate-notes

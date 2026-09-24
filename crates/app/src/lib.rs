@@ -8,6 +8,7 @@ pub mod i18n;
 pub mod prefs;
 pub mod settings;
 pub mod status;
+pub mod updates;
 
 #[cfg(windows)]
 pub mod desktop;

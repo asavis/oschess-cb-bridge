@@ -5,6 +5,7 @@ mod commands;
 mod server;
 mod system;
 mod tray;
+mod updater;
 mod windows;
 
 use std::sync::Arc;
@@ -24,7 +25,8 @@ const AUTOSTART_ARG: &str = "--autostart";
 
 pub fn run() {
     let strings = Strings::new(Lang::from_langid(system::display_language()));
-    let app = tauri::Builder::default()
+    let context = tauri::generate_context!();
+    let mut builder = tauri::Builder::default()
         // First: a second start hands over to this one and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // A second start before this one finished starting has nothing to open yet.
@@ -36,7 +38,12 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    // Only with a real key in tauri.conf.json: the placeholder keeps updates off.
+    if let Some(updater) = updater::plugin(context.config()) {
+        builder = builder.plugin(updater);
+    }
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             commands::view,
             commands::open_oschess,
@@ -53,6 +60,7 @@ pub fn run() {
             commands::new_code,
             commands::set_port,
             commands::open_pairing,
+            commands::check_updates,
         ])
         // The plugins set up first, so a second start has handed over and
         // exited before this one touches the port.
@@ -69,10 +77,11 @@ pub fn run() {
                 commands::open_pairing_now(app.handle());
             }
             watch(app.handle().clone(), shared);
+            updater::start(app.handle());
             Ok(())
         })
         .on_window_event(windows::on_event)
-        .build(tauri::generate_context!());
+        .build(context);
     match app {
         Ok(app) => app.run(|_, event| {
             // Closing the last window keeps the bridge running in the tray;

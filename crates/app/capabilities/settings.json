@@ -11,6 +11,7 @@
     "allow-remove-database",
     "allow-set-autostart",
     "allow-set-auto-update",
+    "allow-check-updates",
     "allow-pairing-code",
     "allow-copy-code",
     "allow-new-code",

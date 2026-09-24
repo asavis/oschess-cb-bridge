@@ -13,7 +13,7 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
 use super::server::{self, Pairing};
-use super::{SharedState, shared, tray, windows};
+use super::{SharedState, shared, tray, updater, windows};
 use crate::prefs;
 use crate::settings::{self, Extra};
 use crate::status::View;
@@ -27,6 +27,8 @@ pub struct SettingsView {
     extras: Vec<Extra>,
     autostart: bool,
     auto_update: bool,
+    /// Whether this build looks for updates at all.
+    updates: bool,
 }
 
 type Answer<T> = Result<T, String>;
@@ -84,6 +86,7 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
         extras: settings::extras(&config),
         autostart: app.autolaunch().is_enabled().unwrap_or(false),
         auto_update: prefs::load(&dir).auto_update,
+        updates: updater::enabled(app),
     })
 }
 
@@ -133,6 +136,12 @@ pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
     prefs::save(&dir, &prefs::Prefs { auto_update: on })?;
     settings_view(&app)
+}
+
+/// Looks for an update now; the outcome comes as a notification.
+#[tauri::command]
+pub fn check_updates(app: AppHandle) {
+    updater::look_now(&app);
 }
 
 #[tauri::command]
