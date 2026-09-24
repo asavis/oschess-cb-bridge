@@ -183,10 +183,22 @@ so a title may contain commas. In the files examined:
   dates are stored). They are consistent with the last use and the date the
   database was added.
 
-**The order.** The reader keeps the entries in file order: the `2cbg` section
+**The order.** The file keeps the entries in its own order: the `2cbg` section
 first, then `Databases`. The window sorts by `Sort` and `SortDir0`–`SortDir7`.
-The reader returns these raw, but their meaning is **not decoded**, so the file
-order need not be the order on screen.
+- **`Sort` 6** (all `SortDir` 0) is the only setting seen, and ChessBase's default.
+  With it, the window orders by **a**, the icon number, largest first, and
+  entries with the same icon by title, last first, without regard to case.
+- **The evidence:** the owner's window, in its icon view and in its detail view
+  (whose columns show no sort mark), matched this order for all ten databases,
+  three of which share icon 0 (asavis/oschess-cb-bridge#20).
+- **Other settings are not decoded:** another `Sort`, any `SortDir` other than 0,
+  or a missing one. For them, `DbList::window_order` keeps the file order.
+
+**Items the window adds itself.** The window also lists ChessBase's clip database
+(`NoGames\ClipDBs\CBMain.cli`, format "CLI") and the ChessBase Cloud clip
+(`Cloud\<account>\cloudclip.cbcloud`, format "Cloud"). Neither is in
+`DBItems.cbini`, and neither is a database file the bridge reads, so the bridge
+does not list them.
 
 **Copies named after a computer.** `DBItems-<computer>.cbini` beside the file is
 a OneDrive sync-conflict copy. The same `-<computer>` suffix appears on unrelated

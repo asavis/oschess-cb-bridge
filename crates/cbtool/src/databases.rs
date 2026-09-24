@@ -23,7 +23,7 @@ pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     };
     println!("{:>3}  {:<6} {:<11} {:>10} {:>10}  name", "#", "format", "state", "listed", "records");
-    for (i, e) in list.entries.iter().enumerate() {
+    for (i, e) in list.window_order().into_iter().enumerate() {
         let path = dbitems::local_path(dir, &e.path);
         // Every file the database would be opened through is checked from its
         // metadata first; a database is opened only when all of them are here.

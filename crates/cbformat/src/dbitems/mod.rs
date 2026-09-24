@@ -11,6 +11,9 @@ use crate::v2::Date;
 use crate::{Error, Result};
 
 mod local;
+mod order;
+
+pub use order::SORT_BY_ICON;
 
 pub use local::local_path;
 
@@ -186,11 +189,11 @@ pub struct DbList {
     pub reference: Option<String>,
     /// The stored path of the database selected in the window (`Selected` in `Status`).
     pub selected: Option<String>,
-    /// The window's sort setting (`Sort` in `Status`), raw: its values are
-    /// not yet interpreted.
+    /// The window's sort setting (`Sort` in `Status`): [`SORT_BY_ICON`] is
+    /// decoded, and other values are kept raw.
     pub sort: Option<i32>,
     /// `SortDir0` to `SortDir7` in `Status`, raw: their values are not yet
-    /// interpreted. With `sort` they should give the order the window shows.
+    /// interpreted. [`DbList::window_order`] gives the order the window shows.
     pub sort_dir: [Option<u8>; 8],
 }
 

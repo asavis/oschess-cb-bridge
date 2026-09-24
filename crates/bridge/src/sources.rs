@@ -37,8 +37,10 @@ impl Listed {
 }
 
 impl Sources {
-    /// The databases ChessBase's window lists, in the file's order, named as
-    /// the window names them. `Ok(empty)` when there is no such list.
+    /// The databases ChessBase's window lists, in the order the window shows
+    /// them where that is decoded and in the file's order otherwise
+    /// (`DbList::window_order`), named as the window names them. `Ok(empty)`
+    /// when there is no such list.
     pub fn window(&self) -> Result<Vec<Listed>, String> {
         let Some(dir) = &self.chessbase else { return Ok(Vec::new()) };
         match std::fs::metadata(dir) {
@@ -57,7 +59,11 @@ impl Sources {
             );
         }
         let Some(list) = dbitems::read(dir).map_err(|e| e.to_string())? else { return Ok(Vec::new()) };
-        Ok(list.entries.into_iter().map(|e| Listed { path: dbitems::local_path(dir, &e.path), name: e.name }).collect())
+        Ok(list
+            .into_window_order()
+            .into_iter()
+            .map(|e| Listed { path: dbitems::local_path(dir, &e.path), name: e.name })
+            .collect())
     }
 
     /// The `databases` of `bridge.toml`, as written; empty when there is no file.
