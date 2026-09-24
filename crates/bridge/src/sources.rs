@@ -134,7 +134,7 @@ impl Read {
         changed |= self.paths.len() != before;
         for path in configured {
             let kept = self.paths.entry(path.clone()).or_default();
-            changed |= kept.update(signature(Some(path)), &path.display(), || expand(path));
+            changed |= kept.update(folder_signature(path), &path.display(), || expand(path));
         }
         changed
     }
@@ -189,6 +189,28 @@ fn signature(path: Option<&Path>) -> u64 {
     let mut hash = Hash::new();
     if let Some(path) = path {
         hash.write_file(path);
+    }
+    hash.finish()
+}
+
+/// [`signature`] of a configured path, and for a folder also the name, size
+/// and modification time of each database file in it. A folder's own time
+/// moves with the kernel's coarse clock, a few milliseconds a step, and its
+/// size rarely changes, so a database added right after a listing could leave
+/// both as they were and stay unseen until the folder changed again.
+fn folder_signature(path: &Path) -> u64 {
+    let mut hash = Hash::new();
+    hash.write_file(path);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|f| matches!(Format::of(f), Format::TwoCbh | Format::Cbh))
+            .collect();
+        files.sort();
+        for file in files {
+            hash.write(file.as_os_str().as_encoded_bytes());
+            hash.write_file(&file);
+        }
     }
     hash.finish()
 }

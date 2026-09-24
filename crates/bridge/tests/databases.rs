@@ -186,6 +186,27 @@ fn a_configured_folder_is_read_again_when_it_changes() {
     assert_eq!(names(&catalog), ["One", "Two"]);
 }
 
+/// A database added to a configured folder shows even when the folder's own
+/// size and time did not change, as happens within one tick of the kernel's
+/// coarse clock: the listing, not only the folder's time, decides. Unix only:
+/// resetting a folder's time needs a directory handle with timestamp-write
+/// access on Windows, which `File::open` does not give.
+#[cfg(unix)]
+#[test]
+fn a_database_added_within_one_clock_tick_shows() {
+    let root = Root::new("folder-tick");
+    database_at(&root.path("folder"), "One");
+    std::fs::write(root.path("bridge.toml"), format!("databases = ['{}']\n", root.path("folder").display())).unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    assert_eq!(names(&catalog), ["One"]);
+    let folder = std::fs::File::open(root.path("folder")).unwrap();
+    let before = folder.metadata().unwrap().modified().unwrap();
+    database_at(&root.path("folder"), "Two");
+    folder.set_modified(before).unwrap();
+    assert_eq!(folder.metadata().unwrap().modified().unwrap(), before);
+    assert_eq!(names(&catalog), ["One", "Two"]);
+}
+
 /// Damaged, empty or absent lists give no databases and no panic; a list that
 /// becomes damaged later keeps the databases it had.
 #[test]
