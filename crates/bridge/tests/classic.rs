@@ -28,6 +28,7 @@ fn start(paths: &[PathBuf], index_dir: &Path) -> u16 {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new(paths.to_vec()),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     };
     app.catalog.explorer.set_dir(index_dir.to_path_buf());
     let app = Arc::new(app);

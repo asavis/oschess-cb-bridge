@@ -115,6 +115,7 @@ mod tests {
             policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() },
             catalog: Catalog::new(databases),
             between_reads: None,
+            engine: crate::engine::Engine::none(),
         };
         Bridge { listeners, app: Arc::new(app), port, token: TOKEN.into(), link: String::new(), first_run: false }
     }

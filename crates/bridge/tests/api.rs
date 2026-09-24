@@ -57,6 +57,7 @@ fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sy
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new(paths),
         between_reads: hook,
+        engine: bridge::engine::Engine::none(),
     };
     let app = Arc::new(app);
     std::thread::spawn(move || server::serve(listeners, app));

@@ -1,5 +1,6 @@
 //! HTTP/1.1, as much of it as the bridge serves: requests without bodies, JSON
-//! responses, persistent connections.
+//! responses, persistent connections, and bodies of JSON lines streamed as
+//! chunks.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -134,6 +135,28 @@ impl Conn {
         }
     }
 
+    /// Writes `response`'s head, then the lines `body` produces as chunks of
+    /// `application/x-ndjson`, and closes the body when it returns. The
+    /// connection is not reused afterwards.
+    pub fn write_stream(&mut self, response: &Response, body: Stream) -> io::Result<()> {
+        let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
+        for (name, value) in &response.headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str(
+            "Content-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        );
+        self.stream.write_all(head.as_bytes())?;
+        self.stream.flush()?;
+        let mut chunks = Chunks { stream: &mut self.stream, failed: false };
+        body(&mut chunks);
+        if chunks.failed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the client left"));
+        }
+        self.stream.write_all(b"0\r\n\r\n")?;
+        self.stream.flush()
+    }
+
     pub fn write(&mut self, response: &Response, keep_alive: bool) -> io::Result<()> {
         let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
         for (name, value) in &response.headers {
@@ -153,21 +176,69 @@ impl Conn {
     }
 }
 
+/// Where a streamed body goes, one line at a time.
+pub trait Sink {
+    /// Writes `text` and a line end as one chunk; an error means the client left.
+    fn line(&mut self, text: &str) -> io::Result<()>;
+    /// Whether the client has closed the connection or a write failed.
+    fn gone(&mut self) -> bool;
+}
+
+/// A body produced while it is sent: see [`Conn::write_stream`].
+pub type Stream = Box<dyn FnOnce(&mut dyn Sink) + Send>;
+
+struct Chunks<'a> {
+    stream: &'a mut TcpStream,
+    failed: bool,
+}
+
+impl Sink for Chunks<'_> {
+    fn line(&mut self, text: &str) -> io::Result<()> {
+        let mut chunk = format!("{:x}\r\n", text.len() + 1).into_bytes();
+        chunk.extend_from_slice(text.as_bytes());
+        chunk.extend_from_slice(b"\n\r\n");
+        let written = self.stream.write_all(&chunk).and_then(|()| self.stream.flush());
+        self.failed |= written.is_err();
+        written
+    }
+
+    fn gone(&mut self) -> bool {
+        if self.failed || self.stream.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut byte = [0u8; 1];
+        // A closed connection reads as its end; a live one has nothing to read.
+        let gone = match self.stream.peek(&mut byte) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+        };
+        gone | self.stream.set_nonblocking(false).is_err()
+    }
+}
+
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: String,
     /// Budget held for the body until the response is written and dropped.
     pub hold: Option<crate::budget::Reservation>,
+    /// A body of JSON lines produced while it is sent, in place of `body`.
+    pub stream: Option<Stream>,
 }
 
 impl Response {
     pub fn json(status: u16, body: String) -> Self {
-        Response { status, headers: Vec::new(), body, hold: None }
+        Response { status, headers: Vec::new(), body, hold: None, stream: None }
     }
 
     pub fn empty(status: u16) -> Self {
-        Response { status, headers: Vec::new(), body: String::new(), hold: None }
+        Response { status, headers: Vec::new(), body: String::new(), hold: None, stream: None }
+    }
+
+    /// A response whose body `body` writes as lines while it is sent.
+    pub fn stream(status: u16, body: impl FnOnce(&mut dyn Sink) + Send + 'static) -> Self {
+        Response { status, headers: Vec::new(), body: String::new(), hold: None, stream: Some(Box::new(body)) }
     }
 
     /// Keeps `reservation` until the response is dropped, after its write.

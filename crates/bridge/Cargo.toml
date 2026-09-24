@@ -11,6 +11,13 @@ rust-version.workspace = true
 name = "oschess-bridge"
 path = "src/main.rs"
 
+# A scripted UCI engine for tests/engine.rs; never shipped.
+[[bin]]
+name = "fake-uci"
+path = "tests/fake-uci/fake_uci.rs"
+test = false
+doc = false
+
 [dependencies]
 cbformat = { version = "0.1.0", path = "../cbformat" }
 chesscore = { version = "0.1.0", path = "../chesscore" }
@@ -19,7 +26,14 @@ getrandom = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # The Documents known folder (documents.rs); already in the tree through same-file.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+# The engine's process priority and the machine's memory (engine.rs).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 [[example]]
 name = "classic_pairs"

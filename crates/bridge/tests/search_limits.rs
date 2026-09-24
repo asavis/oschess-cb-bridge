@@ -64,6 +64,7 @@ fn serve_sparse(name: &str, records: u64) -> Served {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new([path.clone()]),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     });
     let served = app.clone();
     std::thread::spawn(move || server::serve(listeners, served));

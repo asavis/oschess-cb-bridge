@@ -110,6 +110,7 @@ fn serve(classic: &Path, two: &Path, dir: &Path) -> Server {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new([classic.to_path_buf(), two.to_path_buf()]),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     };
     app.catalog.explorer.set_dir(dir.to_path_buf());
     let app = Arc::new(app);
