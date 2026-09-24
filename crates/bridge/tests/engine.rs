@@ -252,9 +252,8 @@ fn a_real_engine_analyses() {
     let lines = a.rest();
     assert!(lines.last().unwrap().starts_with(r#"{"bestmove":""#), "{lines:?}");
     for k in 1..=3 {
-        let deepest = format!(r#""depth":14,"#);
         let number = format!(r#""multipv":{k},"#);
-        assert!(lines.iter().any(|l| l.contains(&deepest) && l.contains(&number)), "{k}: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains(r#""depth":14,"#) && l.contains(&number)), "{k}: {lines:?}");
     }
     assert!(app.engine.name().unwrap().starts_with("Stockfish"), "{:?}", app.engine.name());
     // A search without a limit stops when its client leaves; the engine serves the next one.
