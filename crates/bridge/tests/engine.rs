@@ -1,0 +1,269 @@
+//! `/v1/engine/analyze` over real loopback connections, with the scripted
+//! engine of `tests/fake-uci` (#52).
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bridge::access::{DEFAULT_ORIGINS, Policy};
+use bridge::api::App;
+use bridge::catalog::Catalog;
+use bridge::engine::{Engine, EngineConfig};
+use bridge::server;
+
+const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+const ORIGIN: &str = "https://oschess.org";
+
+fn fake() -> EngineConfig {
+    EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(1), Some(16))
+}
+
+/// A server with `engine`, and the port it listens on.
+fn start(engine: Engine) -> (u16, Arc<App>) {
+    let listeners = server::bind(0).unwrap();
+    let port = listeners[0].local_addr().unwrap().port();
+    let app = Arc::new(App {
+        version: "test",
+        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
+        catalog: Catalog::new(Vec::new()),
+        between_reads: None,
+        engine,
+    });
+    let served = app.clone();
+    std::thread::spawn(move || server::serve(listeners, served));
+    (port, app)
+}
+
+/// An analysis being read: the response head, then its lines one by one.
+struct Analysis {
+    status: u16,
+    head: String,
+    reader: BufReader<TcpStream>,
+}
+
+impl Analysis {
+    fn open(port: u16, query: &str) -> Analysis {
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let raw = format!(
+            "GET /v1/engine/analyze?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n"
+        );
+        (&s).write_all(raw.as_bytes()).unwrap();
+        let mut reader = BufReader::new(s);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            head.push_str(&line);
+        }
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        Analysis { status, head, reader }
+    }
+
+    /// The next line of the chunked body; `None` at its end.
+    fn line(&mut self) -> Option<String> {
+        let mut size = String::new();
+        self.reader.read_line(&mut size).ok()?;
+        let size = usize::from_str_radix(size.trim(), 16).ok()?;
+        if size == 0 {
+            return None;
+        }
+        let mut chunk = vec![0; size + 2];
+        self.reader.read_exact(&mut chunk).ok()?;
+        assert!(chunk.ends_with(b"\n\r\n"), "{chunk:?}");
+        Some(String::from_utf8(chunk[..size - 1].to_vec()).unwrap())
+    }
+
+    /// Every line to the end of the body.
+    fn rest(&mut self) -> Vec<String> {
+        std::iter::from_fn(|| self.line()).collect()
+    }
+
+    /// The whole body of a response that is not streamed.
+    fn body(mut self) -> String {
+        let mut body = String::new();
+        let _ = self.reader.read_to_string(&mut body);
+        body
+    }
+}
+
+const BEST: &str = r#"{"bestmove":"e2e4"}"#;
+
+#[test]
+fn streams_the_lines_of_a_search_to_its_best_move() {
+    let (port, app) = start(Engine::new(fake()));
+    assert_eq!(app.engine.name().as_deref(), Some("fake-uci"));
+    let mut a = Analysis::open(port, "moves=e2e4+e7e5&multipv=2&depth=6&stream=tab1");
+    assert_eq!(a.status, 200);
+    assert!(a.head.contains("Content-Type: application/x-ndjson"), "{}", a.head);
+    assert!(a.head.contains("Transfer-Encoding: chunked"));
+    assert!(a.head.contains(&format!("Access-Control-Allow-Origin: {ORIGIN}")), "{}", a.head);
+    let lines = a.rest();
+    assert_eq!(lines.last().unwrap(), BEST, "{lines:?}");
+    // The deepest lines of both numbers are written before the best move.
+    for k in [1, 2] {
+        let deepest = format!(r#"{{"info":{{"depth":6,"seldepth":8,"multipv":{k},"score":{{"cp":{}}},"#, 10 * k);
+        assert!(lines.iter().any(|l| l.starts_with(&deepest)), "{k}: {lines:?}");
+    }
+    assert!(lines.iter().all(|l| !l.contains("searching")));
+    // The engine said its own name.
+    assert_eq!(app.engine.name().as_deref(), Some("Fake UCI 1.0"));
+}
+
+#[test]
+fn stops_the_engine_when_the_client_leaves() {
+    let (port, app) = start(Engine::new(fake()));
+    let mut a = Analysis::open(port, "stream=tab1");
+    assert!(a.line().unwrap().starts_with(r#"{"info":"#));
+    drop(a);
+    // The engine was stopped, not lost: the next analysis finds it free.
+    let mut b = Analysis::open(port, "depth=2&stream=tab1");
+    assert_eq!(b.rest().last().unwrap(), BEST);
+    assert!(app.engine.is_running());
+}
+
+#[test]
+fn a_newer_analysis_takes_the_engine() {
+    let (port, _app) = start(Engine::new(fake()));
+    // From another view: the first hears why it ended.
+    let mut first = Analysis::open(port, "stream=tab1");
+    assert!(first.line().is_some());
+    let mut second = Analysis::open(port, "depth=3&stream=tab2");
+    let ended = first.rest();
+    assert_eq!(ended.last().unwrap(), r#"{"superseded":true}"#, "{ended:?}");
+    assert_eq!(second.rest().last().unwrap(), BEST);
+    // From the same view: it just ends.
+    let mut first = Analysis::open(port, "stream=tab1");
+    assert!(first.line().is_some());
+    let mut second = Analysis::open(port, "moves=d2d4&depth=3&stream=tab1");
+    let ended = first.rest();
+    assert!(ended.iter().all(|l| l.starts_with(r#"{"info":"#)), "{ended:?}");
+    assert_eq!(second.rest().last().unwrap(), BEST);
+}
+
+#[test]
+fn a_crashed_engine_ends_the_stream_and_starts_again() {
+    let (port, _app) = start(Engine::new(fake()));
+    let mut a = Analysis::open(port, "moves=h2h3&stream=tab1");
+    let lines = a.rest();
+    assert!(lines.last().unwrap().starts_with(r#"{"error":{"code":"engine_exited""#), "{lines:?}");
+    let mut b = Analysis::open(port, "depth=2&stream=tab1");
+    assert_eq!(b.rest().last().unwrap(), BEST);
+}
+
+#[test]
+fn an_engine_that_ignores_stop_is_replaced() {
+    let (port, _app) = start(Engine::new(fake()));
+    let mut stubborn = Analysis::open(port, "moves=a2a3&stream=tab1");
+    assert!(stubborn.line().is_some());
+    let started = Instant::now();
+    let mut next = Analysis::open(port, "depth=2&stream=tab2");
+    assert_eq!(next.rest().last().unwrap(), BEST);
+    assert!(started.elapsed() >= Duration::from_secs(2), "the stop grace was not waited for");
+    assert_eq!(stubborn.rest().last().unwrap(), r#"{"superseded":true}"#);
+}
+
+#[test]
+fn a_quiet_search_repeats_its_last_lines() {
+    let (port, _app) = start(Engine::new(fake()));
+    let mut a = Analysis::open(port, "moves=b2b3&stream=tab1");
+    let first = a.line().unwrap();
+    let started = Instant::now();
+    assert_eq!(a.line().unwrap(), first);
+    assert!(started.elapsed() >= Duration::from_millis(1500), "{:?}", started.elapsed());
+}
+
+#[test]
+fn an_idle_engine_ends_its_process() {
+    let (port, app) = start(Engine::with_idle(fake(), Duration::from_millis(300)));
+    let mut a = Analysis::open(port, "depth=1");
+    assert_eq!(a.rest().last().unwrap(), BEST);
+    assert!(app.engine.is_running());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.engine.is_running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!app.engine.is_running(), "the idle engine still runs");
+}
+
+#[test]
+fn refuses_bad_input_and_a_missing_engine() {
+    let (port, _app) = start(Engine::new(fake()));
+    for (query, parameter) in [
+        ("moves=e2e5", "moves"),
+        ("moves=e2e4%0Aquit", "moves"),
+        ("fen=8%2F8%2F8%2F8%2F8%2F8%2F8%2F8+w+-+-+0+1", "fen"),
+        ("multipv=6", "multipv"),
+        ("multipv=x", "multipv"),
+        ("depth=0", "depth"),
+        ("depth=5&movetime=100", "movetime"),
+        ("stream=a%20b", "stream"),
+    ] {
+        let a = Analysis::open(port, query);
+        assert_eq!(a.status, 400, "{query}");
+        let body = a.body();
+        assert!(body.contains(&format!(r#""parameter":"{parameter}""#)), "{query}: {body}");
+    }
+    let (port, _app) = start(Engine::none());
+    let a = Analysis::open(port, "depth=1");
+    assert_eq!(a.status, 409);
+    assert!(a.body().contains(r#""code":"no_engine""#));
+}
+
+fn get(port: u16, path: &str, token: bool) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let auth = if token { format!("Authorization: Bearer {TOKEN}\r\n") } else { String::new() };
+    let raw =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Origin: {ORIGIN}\r\nConnection: close\r\n\r\n");
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn the_status_names_the_engine() {
+    let (port, _app) = start(Engine::new(fake()));
+    let status = get(port, "/v1/status", true);
+    assert!(status.contains(r#""engine":{"name":"fake-uci"}"#), "{status}");
+    let (port, _app) = start(Engine::none());
+    assert!(get(port, "/v1/status", true).contains(r#""engine":null"#));
+}
+
+#[test]
+fn the_token_is_required() {
+    let (port, _app) = start(Engine::new(fake()));
+    let out = get(port, "/v1/engine/analyze?depth=1", false);
+    assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+}
+
+/// With a real engine, which the tests do not carry:
+/// `BRIDGE_REAL_ENGINE=/path/to/stockfish cargo test -p bridge --test engine -- --ignored`.
+#[test]
+#[ignore = "needs BRIDGE_REAL_ENGINE"]
+fn a_real_engine_analyses() {
+    let path = std::env::var("BRIDGE_REAL_ENGINE").expect("BRIDGE_REAL_ENGINE names an engine");
+    let (port, app) = start(Engine::new(EngineConfig::new(path.into(), Some(2), Some(64))));
+    let mut a = Analysis::open(port, "moves=e2e4+e7e5+g1f3&multipv=3&depth=14&stream=real");
+    let lines = a.rest();
+    assert!(lines.last().unwrap().starts_with(r#"{"bestmove":""#), "{lines:?}");
+    for k in 1..=3 {
+        let deepest = format!(r#""depth":14,"#);
+        let number = format!(r#""multipv":{k},"#);
+        assert!(lines.iter().any(|l| l.contains(&deepest) && l.contains(&number)), "{k}: {lines:?}");
+    }
+    assert!(app.engine.name().unwrap().starts_with("Stockfish"), "{:?}", app.engine.name());
+    // A search without a limit stops when its client leaves; the engine serves the next one.
+    let mut b = Analysis::open(
+        port,
+        "fen=r1bqkbnr%2Fpppp1ppp%2F2n5%2F4p3%2F4P3%2F5N2%2FPPPP1PPP%2FRNBQKB1R+w+KQkq+-+2+3&stream=real",
+    );
+    assert!(b.line().unwrap().starts_with(r#"{"info":"#));
+    drop(b);
+    let mut c = Analysis::open(port, "depth=8&stream=real");
+    assert!(c.rest().last().unwrap().starts_with(r#"{"bestmove":""#));
+}

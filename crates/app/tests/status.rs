@@ -61,6 +61,7 @@ fn the_tray_follows_the_catalog() {
         policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: token.clone() },
         catalog: Catalog::with_sources(sources, Arc::new(System)),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     };
     let bridge = Bridge { listeners, app: Arc::new(app), port, token, link: String::new(), first_run: false };
     let background = Background::serve(bridge).unwrap();

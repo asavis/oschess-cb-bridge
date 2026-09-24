@@ -418,6 +418,7 @@ fn serve(db: &TempDb, dir: &Path) -> (u16, String) {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new([path.clone()]),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     };
     app.catalog.explorer.set_dir(dir.to_path_buf());
     let app = Arc::new(app);

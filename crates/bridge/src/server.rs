@@ -122,7 +122,7 @@ fn handle_connection(stream: TcpStream, app: &App) -> Conn {
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let mut conn = Conn::new(stream);
     loop {
-        let (response, keep_alive): (Response, bool) = match conn.read_request() {
+        let (mut response, keep_alive): (Response, bool) = match conn.read_request() {
             Ok(req) => (api::handle(app, &req), req.keep_alive),
             Err(Refusal { error: ReadError::Closed | ReadError::Dropped, .. }) => return conn,
             Err(Refusal { error: refused, origin }) => {
@@ -136,6 +136,10 @@ fn handle_connection(stream: TcpStream, app: &App) -> Conn {
                 (cors(response, app.policy.allowed_origin(origin.as_deref())), false)
             }
         };
+        if let Some(body) = response.stream.take() {
+            let _ = conn.write_stream(&response, body);
+            return conn;
+        }
         if conn.write(&response, keep_alive).is_err() || !keep_alive {
             return conn;
         }
@@ -163,6 +167,7 @@ mod tests {
             policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) },
             catalog: Catalog::new(Vec::new()),
             between_reads: None,
+            engine: crate::engine::Engine::none(),
         });
         let active = Arc::new(AtomicUsize::new(0));
         let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);

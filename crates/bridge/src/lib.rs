@@ -15,6 +15,7 @@ pub mod budget;
 pub mod catalog;
 pub mod config;
 pub mod documents;
+pub mod engine;
 pub mod explorer;
 pub mod fetch;
 pub mod http;

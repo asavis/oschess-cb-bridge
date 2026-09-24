@@ -201,7 +201,8 @@ most recently used streams; a forgotten stream starts afresh.
   "bridge": { "version": "0.4.0", "api": 1 },
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
   "download": { "present": 104857600, "total": 734003200 },
-  "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ]
+  "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ],
+  "engine": { "name": "Stockfish 19" }
 }
 ```
 
@@ -210,7 +211,10 @@ the bridge is too old; the app then offers the download link. `databases`
 counts the databases in each state. `download` is there while databases are
 being downloaded: the bytes on this computer and in all, over all of them.
 `indexing` is there while position indexes are checked or built (see
-`GET /v1/databases/{id}/explorer`).
+`GET /v1/databases/{id}/explorer`). `engine` names the engine the analysis
+board can use (see `GET /v1/engine/analyze`), or is `null` when `bridge.toml`
+names none. The name is the one the engine gave for itself, or its file's
+name until it has run once.
 
 ### `GET /v1/databases`
 
@@ -619,6 +623,60 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   "Position index", describes them. A file that is damaged or of another
   version is rebuilt. The Mega Database's index takes about 1.4 GB, and its
   build needs about 8 GB of temporary space there.
+
+### `GET /v1/engine/analyze`
+
+The engine's lines for one position, streamed while it searches (#13). The
+engine is the one `bridge.toml` names:
+
+```toml
+engine = 'C:\Program Files\Stockfish\stockfish.exe'
+engine_threads = 6   # optional; all processors but two by default
+engine_hash = 512    # optional, in MB; 512 by default, at most a quarter of the memory
+```
+
+| Parameter | |
+|---|---|
+| `fen` | The position, at most 128 bytes; the start position without it. It must be a legal standard position; Chess960 is not analysed. |
+| `moves` | UCI moves played from it, separated by spaces, at most 600. Castling is the king's two-square step (`e1g1`); the king taking its rook is accepted too. Every move must be legal. |
+| `multipv` | Lines to search, 1 to 5; 1 by default. |
+| `depth` | Search to this depth, 1 to 99, then name the best move. |
+| `movetime` | Search this many milliseconds, 1 to 600000, then name the best move. Only one of `depth` and `movetime`. |
+| `stream` | The client's view, at most 64 letters, digits, `-` and `_`, for example one browser tab. |
+
+Nothing else from the browser reaches the engine: the position goes to it as
+`chesscore` writes it after checking it, and `Threads` and `Hash` come from
+`bridge.toml`. A parameter out of bounds answers `400 bad_request` naming it;
+without an engine the answer is `409 no_engine`.
+
+The answer is `200` with `Content-Type: application/x-ndjson` and a chunked
+body: one JSON object per line, until the search ends.
+
+```
+{"info":{"depth":24,"seldepth":33,"multipv":1,"score":{"cp":31},"nodes":5210034,"nps":2605017,"time":2000,"pv":["e2e4","e7e5","g1f3"]}}
+{"info":{"depth":24,"seldepth":30,"multipv":2,"score":{"mate":-7},"bound":"upper","nodes":5210034,"nps":2605017,"time":2000,"pv":["d2d4","d7d5"]}}
+{"bestmove":"e2e4"}
+```
+
+- `info` is the newest line of each `multipv` number, written at most every
+  250 ms. Scores are from the side to move, in centipawns (`cp`) or moves to
+  mate (`mate`, negative when the side to move is mated). `bound` is `lower`
+  or `upper` when the score is only a bound. `seldepth`, `nodes`, `nps` and
+  `time` appear when the engine gave them.
+- With nothing new for two seconds, the last lines are written again, so a
+  long step of the search keeps the connection alive.
+- `bestmove` ends a search with `depth` or `movetime`. Without either, the
+  search goes on until the client closes the connection, which stops it.
+- `{"superseded":true}` ends the search when a newer request with another
+  `stream` took the engine. A newer request with the same `stream` ends it
+  without that line. The engine searches one position at a time.
+- `{"error":{"code":"engine_exited","message":…}}` ends it when the engine
+  stopped; the next request starts it again. `engine_failed` means it could
+  not be started or is not a UCI engine.
+
+`EventSource` cannot send the `Authorization` header, so a client reads the
+body from `fetch` as a stream. The engine runs at below-normal priority, starts
+with the first request and ends after ten minutes without one.
 
 ## Pairing
 

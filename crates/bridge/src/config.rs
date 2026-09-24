@@ -1,5 +1,5 @@
-//! `bridge.toml`: the port, extra origins, extra databases and the oschess
-//! site the pairing link opens. The bridge reads them when it starts, and the
+//! `bridge.toml`: the port, extra origins, extra databases, the oschess
+//! site the pairing link opens, and the engine the analysis board uses. The bridge reads them when it starts, and the
 //! databases again whenever the file changes.
 //!
 //! The file is a small subset of TOML — `key = value` lines, `#` comments,
@@ -23,11 +23,24 @@ pub struct Config {
     pub databases: Vec<PathBuf>,
     /// The oschess site the pairing link opens.
     pub web: String,
+    /// The UCI engine the analysis board uses, and its threads and hash table
+    /// in megabytes when not the defaults (`engine.rs`).
+    pub engine: Option<PathBuf>,
+    pub engine_threads: Option<u32>,
+    pub engine_hash: Option<u32>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { port: DEFAULT_PORT, origins: Vec::new(), databases: Vec::new(), web: DEFAULT_WEB.to_string() }
+        Config {
+            port: DEFAULT_PORT,
+            origins: Vec::new(),
+            databases: Vec::new(),
+            web: DEFAULT_WEB.to_string(),
+            engine: None,
+            engine_threads: None,
+            engine_hash: None,
+        }
     }
 }
 
@@ -49,6 +62,10 @@ databases = []
 # The oschess site the pairing link opens, one of the allowed origins, for
 # example \"https://staging.oschess.org\".
 # web = \"https://oschess.org\"
+
+# The UCI engine the analysis board uses, and optionally its threads and hash
+# table in megabytes; by default all processors but two and at most 512 MB.
+# For example engine = 'C:\\Program Files\\Stockfish\\stockfish.exe'
 ";
 
 /// Reads `path`, writing the default file first when there is none.
@@ -86,11 +103,21 @@ pub fn render(config: &Config) -> String {
     } else {
         format!("web = {}", quote(&config.web))
     };
-    TEMPLATE
+    let mut text = TEMPLATE
         .replace("port = 39581", &format!("port = {}", config.port))
         .replace("origins = []", &format!("origins = {origins}"))
         .replace("databases = []", &format!("databases = {databases}"))
-        .replace("# web = \"https://oschess.org\"", &web)
+        .replace("# web = \"https://oschess.org\"", &web);
+    if let Some(engine) = &config.engine {
+        text.push_str(&format!("engine = {}\n", quote(&engine.to_string_lossy())));
+    }
+    if let Some(n) = config.engine_threads {
+        text.push_str(&format!("engine_threads = {n}\n"));
+    }
+    if let Some(n) = config.engine_hash {
+        text.push_str(&format!("engine_hash = {n}\n"));
+    }
+    text
 }
 
 /// Writes `config` to `path` through a temporary file, so a reader never sees
@@ -151,7 +178,18 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ("origins", Value::List(v)) => config.origins = v,
             ("databases", Value::List(v)) => config.databases = v.into_iter().map(PathBuf::from).collect(),
             ("web", Value::Str(v)) => config.web = v,
-            ("port" | "origins" | "databases" | "web", _) => return Err(at("wrong type")),
+            ("engine", Value::Str(v)) => config.engine = Some(PathBuf::from(v)),
+            ("engine_threads", Value::Int(n)) => {
+                config.engine_threads =
+                    Some(u32::try_from(n).ok().filter(|&n| n > 0).ok_or_else(|| at("engine_threads out of range"))?)
+            }
+            ("engine_hash", Value::Int(n)) => {
+                config.engine_hash =
+                    Some(u32::try_from(n).ok().filter(|&n| n > 0).ok_or_else(|| at("engine_hash out of range"))?)
+            }
+            ("port" | "origins" | "databases" | "web" | "engine" | "engine_threads" | "engine_hash", _) => {
+                return Err(at("wrong type"));
+            }
             (k, _) => return Err(at(&format!("unknown key {k}"))),
         }
     }
@@ -271,6 +309,14 @@ mod tests {
         assert_eq!(c.databases, [PathBuf::from("C:\\Bases\\A # b.2cbh"), PathBuf::from("D:\\x\\\u{415}.2cbh")]);
         assert_eq!(c.web, DEFAULT_WEB);
         assert_eq!(parse("web = \"https://staging.oschess.org\"").unwrap().web, "https://staging.oschess.org");
+        let c = parse("engine = 'C:\\Engines\\sf.exe'\nengine_threads = 4\nengine_hash = 256\n").unwrap();
+        assert_eq!(
+            (c.engine, c.engine_threads, c.engine_hash),
+            (Some(PathBuf::from("C:\\Engines\\sf.exe")), Some(4), Some(256))
+        );
+        for bad in ["engine = 5", "engine_threads = 0", "engine_hash = -1", "engine_threads = 'x'"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -290,8 +336,12 @@ mod tests {
                     PathBuf::from("E:\\quote\" and\ttab"),
                 ],
                 web: "https://staging.oschess.org".into(),
+                engine: Some(PathBuf::from(r"C:\Program Files\ChessBase\Engines.x64\Stockfish 17.1\sf.exe")),
+                engine_threads: Some(6),
+                engine_hash: Some(1024),
             },
             Config { databases: vec![PathBuf::from("/home/me/bases")], ..Config::default() },
+            Config { engine: Some(PathBuf::from("/usr/games/stockfish")), ..Config::default() },
         ];
         for config in configs {
             let text = render(&config);

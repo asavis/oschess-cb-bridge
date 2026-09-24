@@ -43,6 +43,7 @@ fn an_exhausted_budget_answers_busy_until_it_is_returned() {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new([path.clone()]),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     };
     let app = Arc::new(app);
     std::thread::spawn(move || server::serve(listeners, app));

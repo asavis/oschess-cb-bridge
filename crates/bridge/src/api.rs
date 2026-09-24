@@ -10,6 +10,7 @@ use cbformat::v2::{Eco, RecordKind};
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
+use crate::engine::{Engine, Limit, Search};
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
@@ -73,6 +74,8 @@ pub struct App {
     /// Called between the two header reads that bracket serving a game; tests
     /// use it to change the files at exactly that moment.
     pub between_reads: Option<Box<dyn Fn() + Send + Sync>>,
+    /// The engine of `bridge.toml`, or none.
+    pub engine: Engine,
 }
 
 pub fn handle(app: &App, req: &Request) -> Response {
@@ -92,6 +95,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
         ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(e, req)),
         ["v1", "databases", id, "explorer"] => with_entry(app, id, |e| crate::explorer::route(app, e, req)),
+        ["v1", "engine", "analyze"] => analyze(app, req),
         _ => not_found(),
     }
 }
@@ -117,7 +121,11 @@ fn status(app: &App) -> Response {
         .num("unreadable", count(State::Unreadable))
         .done();
     let bridge = Obj::new().str("version", app.version).num("api", API_VERSION).done();
-    let mut body = Obj::new().raw("bridge", &bridge).raw("databases", &dbs);
+    let engine = match app.engine.name() {
+        Some(name) => Obj::new().str("name", &name).done(),
+        None => "null".to_string(),
+    };
+    let mut body = Obj::new().raw("bridge", &bridge).raw("databases", &dbs).raw("engine", &engine);
     // The downloads running or queued, together.
     let downloads: Vec<_> = entries.iter().filter_map(|e| e.progress()).collect();
     if !downloads.is_empty() {
@@ -133,6 +141,40 @@ fn status(app: &App) -> Response {
         body = body.raw("indexing", &json::array(items));
     }
     ok(body.done())
+}
+
+/// `GET /v1/engine/analyze`: the engine's lines for a position, streamed.
+fn analyze(app: &App, req: &Request) -> Response {
+    if !app.engine.is_configured() {
+        return error(409, "no_engine", "No engine is configured in the bridge");
+    }
+    let number = |name: &'static str, default: Option<u32>| -> Result<Option<u32>, Response> {
+        match req.param(name) {
+            None => Ok(default),
+            Some(v) => v.parse().map(Some).map_err(|_| bad_parameter(name, &format!("{name} is a whole number"))),
+        }
+    };
+    let multipv = match number("multipv", Some(1)) {
+        Ok(n) => n.unwrap_or(1),
+        Err(r) => return r,
+    };
+    let limit = match (number("depth", None), number("movetime", None)) {
+        (Err(r), _) | (_, Err(r)) => return r,
+        (Ok(None), Ok(None)) => Limit::Infinite,
+        (Ok(Some(d)), Ok(None)) => Limit::Depth(d),
+        (Ok(None), Ok(Some(t))) => Limit::MovetimeMs(t),
+        (Ok(Some(_)), Ok(Some(_))) => return bad_parameter("movetime", "Give depth or movetime, not both"),
+    };
+    let stream = req.param("stream").unwrap_or_default();
+    if stream.len() > 64 || !stream.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return bad_parameter("stream", "stream is at most 64 letters, digits, - and _");
+    }
+    let search = match Search::new(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit) {
+        Ok(search) => search,
+        Err((parameter, message)) => return bad_parameter(parameter, &message),
+    };
+    let (engine, stream) = (app.engine.clone(), stream.to_string());
+    Response::stream(200, move |sink| engine.analyze(&search, &stream, sink))
 }
 
 fn progress(present: u64, total: u64) -> String {

@@ -755,6 +755,7 @@ fn cloud_states_over_http() {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone()),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     };
     std::thread::spawn(move || server::serve(listeners, Arc::new(app)));
     let id = id_of(&db);
@@ -816,6 +817,7 @@ fn the_snapshot_shows_cloud_states() {
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone()),
         between_reads: None,
+        engine: bridge::engine::Engine::none(),
     });
     let bridge =
         Bridge { listeners, app: app.clone(), port, token: TOKEN.into(), link: String::new(), first_run: false };
