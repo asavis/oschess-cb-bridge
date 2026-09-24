@@ -12,6 +12,8 @@
     "allow-engines",
     "allow-choose-engine",
     "allow-pick-engine",
+    "allow-install-stockfish",
+    "allow-dismiss-stockfish-offer",
     "allow-set-autostart",
     "allow-set-auto-update",
     "allow-check-updates",

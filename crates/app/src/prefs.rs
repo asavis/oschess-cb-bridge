@@ -12,11 +12,14 @@ const FILE: &str = "app.json";
 pub struct Prefs {
     /// Install new versions of the bridge by themselves.
     pub auto_update: bool,
+    /// The bridge version whose Stockfish offer the user put off with
+    /// «Пізніше»; the next bridge version offers again.
+    pub stockfish_offer_dismissed: Option<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { auto_update: true }
+        Prefs { auto_update: true, stockfish_offer_dismissed: None }
     }
 }
 
@@ -39,9 +42,10 @@ mod tests {
     fn defaults_then_what_was_saved() {
         let dir = std::env::temp_dir().join(format!("bridge-app-prefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(load(&dir), Prefs { auto_update: true });
-        save(&dir, &Prefs { auto_update: false }).unwrap();
-        assert_eq!(load(&dir), Prefs { auto_update: false });
+        assert_eq!(load(&dir), Prefs { auto_update: true, stockfish_offer_dismissed: None });
+        let saved = Prefs { auto_update: false, stockfish_offer_dismissed: Some("0.2.0".into()) };
+        save(&dir, &saved).unwrap();
+        assert_eq!(load(&dir), saved);
         std::fs::write(dir.join(FILE), "{ not json").unwrap();
         assert_eq!(load(&dir), Prefs::default());
         std::fs::write(dir.join(FILE), "{\"other\": 1}").unwrap();

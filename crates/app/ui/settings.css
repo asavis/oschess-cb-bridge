@@ -65,3 +65,8 @@ h1 { font-size: 28px; font-weight: 600; line-height: 36px; margin: 0 0 16px; }
 .intro { margin: 0 0 16px; max-width: 640px; line-height: 1.45; }
 .row.engine { cursor: pointer; }
 .row.engine input { margin: 0 4px 0 2px; accent-color: var(--accent, #b85c1e); }
+
+/* The Stockfish offer: the approved mock's warm banner above the engines. */
+.cards.offer { background: var(--offer-bg, #fdeee2); border-color: var(--offer-border, #f3cfb1); }
+#install-progress { margin: 6px 2px 12px; }
+.btn.quiet { background: none; border-color: transparent; color: var(--accent-text); }

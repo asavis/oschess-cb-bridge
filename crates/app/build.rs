@@ -16,6 +16,8 @@ const COMMANDS: &[&str] = &[
     "engines",
     "choose_engine",
     "pick_engine",
+    "install_stockfish",
+    "dismiss_stockfish_offer",
     "set_autostart",
     "set_auto_update",
     "check_updates",
