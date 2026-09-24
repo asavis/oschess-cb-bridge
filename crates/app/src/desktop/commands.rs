@@ -1,10 +1,12 @@
 //! The commands the windows call. Each window's capability file allows only
 //! the ones it needs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use bridge::{config, token};
+use bridge::engines::{self, Roots};
+use bridge::{config, engine, token};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt;
@@ -29,6 +31,23 @@ pub struct SettingsView {
     auto_update: bool,
     /// Whether this build looks for updates at all.
     updates: bool,
+}
+
+/// What the engine section shows: the engines found and the one chosen.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnginesView {
+    /// The engine `bridge.toml` names, if any.
+    chosen: Option<String>,
+    found: Vec<FoundEngine>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FoundEngine {
+    name: String,
+    path: String,
+    source: &'static str,
 }
 
 type Answer<T> = Result<T, String>;
@@ -115,6 +134,62 @@ fn change_config(app: &AppHandle, change: impl FnOnce(&config::Config) -> config
     let path = shared(app).config_path()?;
     let next = change(&config::load_or_create(&path)?);
     config::save(&path, &next)
+}
+
+/// The engines on this computer and the chosen one. Reading the engine
+/// folders touches the disk, so it runs off the event loop.
+#[tauri::command]
+pub async fn engines(app: AppHandle) -> Answer<EnginesView> {
+    tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
+}
+
+fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
+    let config = config::load_or_create(&shared(app).config_path()?)?;
+    let found = engines::find(&Roots::system())
+        .into_iter()
+        .map(|f| FoundEngine { name: f.name, path: f.path.to_string_lossy().into_owned(), source: f.source })
+        .collect();
+    Ok(EnginesView { chosen: config.engine.map(|p| p.to_string_lossy().into_owned()), found })
+}
+
+/// One choice at a time: a slow probe cannot save its engine over a later one.
+static CHOOSING: Mutex<()> = Mutex::new(());
+
+/// Chooses the engine at `path` once it answers as a UCI engine. A file that
+/// does not is refused with the dictionary key of the message. The bridge
+/// follows `bridge.toml`, so the running engine stops and the new one serves
+/// the next analysis.
+#[tauri::command]
+pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> {
+    let program = PathBuf::from(path);
+    let config_path = shared(&app).config_path()?;
+    tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
+        let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
+        engine::probe(&program).map_err(|_| "settings.engine.refused".to_string())?;
+        let next = config::Config { engine: Some(program), ..config::load_or_create(&config_path)? };
+        config::save(&config_path, &next)
+    })
+    .await
+    .map_err(text)??;
+    tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
+}
+
+/// Asks for an engine's executable and chooses it; `None` when the user cancelled.
+#[tauri::command]
+pub async fn pick_engine(app: AppHandle) -> Answer<Option<EnginesView>> {
+    let strings = &shared(&app).strings;
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title(strings.get("settings.engine.pick"))
+        .add_filter(strings.get("settings.engine.filter"), &["exe"]);
+    if let Some(window) = app.get_webview_window(windows::SETTINGS) {
+        dialog = dialog.set_parent(&window);
+    }
+    let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_file()).await.map_err(text)?;
+    let Some(file) = picked else { return Ok(None) };
+    let path = file.into_path().map_err(text)?;
+    choose_engine(app, path.to_string_lossy().into_owned()).await.map(Some)
 }
 
 #[tauri::command]

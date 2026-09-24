@@ -191,7 +191,7 @@ impl<T> Kept<T> {
 }
 
 /// The size and modification time of the file or folder at `path`.
-fn signature(path: Option<&Path>) -> u64 {
+pub(crate) fn signature(path: Option<&Path>) -> u64 {
     let mut hash = Hash::new();
     if let Some(path) = path {
         hash.write_file(path);

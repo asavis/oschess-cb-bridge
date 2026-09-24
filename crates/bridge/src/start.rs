@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::access::{DEFAULT_ORIGINS, Policy};
 use crate::api::App;
 use crate::catalog::Catalog;
-use crate::engine::{Engine, EngineConfig};
+use crate::engine::Engine;
 use crate::fetch::System;
 use crate::sources::Sources;
 use crate::{config, documents, pairing, server, token};
@@ -92,7 +92,7 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
     let config_path = dir.join("bridge.toml");
     let sources = Sources {
         chessbase: documents::chessbase_folder(),
-        config: Some(config_path),
+        config: Some(config_path.clone()),
         fixed: options.databases.clone(),
     };
     let link = pairing::link(web, &token, config.port);
@@ -101,10 +101,8 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
         policy: Policy { port: config.port, origins, token: token.clone() },
         catalog: Catalog::with_sources(sources, Arc::new(System)),
         between_reads: None,
-        engine: match config.engine {
-            Some(program) => Engine::new(EngineConfig::new(program, config.engine_threads, config.engine_hash)),
-            None => Engine::none(),
-        },
+        // The engine follows bridge.toml, as the databases do.
+        engine: Engine::from_config_file(config_path),
     };
     app.catalog.explorer.set_dir(dir.join("index"));
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })

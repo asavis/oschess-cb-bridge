@@ -21,6 +21,8 @@ use chesscore::{Board, Move, Piece, Square};
 use crate::http::Sink;
 use crate::json::{self, Obj};
 
+/// How often an engine that follows `bridge.toml` looks at the file.
+pub const CONFIG_POLL: Duration = Duration::from_secs(1);
 /// How long the engine may sit unused before its process ends.
 pub const IDLE: Duration = Duration::from_secs(600);
 /// The most lines the browser may ask for.
@@ -206,9 +208,26 @@ fn standard_uci(board: &Board, mv: Move) -> String {
     mv.to_string()
 }
 
-/// The engine, or none when the configuration names none.
+/// The engine, or none when the configuration names none. One built from
+/// `bridge.toml` follows the file: a changed engine takes effect at the next
+/// analysis, as a changed list of databases does.
 #[derive(Clone)]
 pub struct Engine {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    idle: Duration,
+    /// The configuration file the engine follows; `None` for a fixed one.
+    file: Option<PathBuf>,
+    current: Mutex<Current>,
+}
+
+#[derive(Default)]
+struct Current {
+    /// The configuration file's signature when it was last read.
+    signature: Option<u64>,
+    config: Option<EngineConfig>,
     inner: Option<Arc<Inner>>,
 }
 
@@ -231,52 +250,95 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Engine {
     pub fn none() -> Self {
-        Engine { inner: None }
+        Self::fixed(None, IDLE)
     }
 
     pub fn new(config: EngineConfig) -> Self {
-        Self::with_idle(config, IDLE)
+        Self::fixed(Some(config), IDLE)
     }
 
     /// [`Engine::new`] whose process ends after `idle` without an analysis (tests).
     pub fn with_idle(config: EngineConfig, idle: Duration) -> Self {
-        let inner = Arc::new(Inner {
-            config,
-            idle,
-            turn: AtomicU64::new(0),
-            newest_stream: Mutex::new(String::new()),
-            name: Mutex::new(None),
-            slot: Mutex::new(None),
-        });
-        let reaper = Arc::downgrade(&inner);
-        let every = (idle / 4).clamp(Duration::from_millis(20), Duration::from_secs(30));
-        let _ = std::thread::Builder::new().name("bridge-engine-idle".into()).stack_size(crate::THREAD_STACK).spawn(
+        Self::fixed(Some(config), idle)
+    }
+
+    fn fixed(config: Option<EngineConfig>, idle: Duration) -> Self {
+        let inner = config.clone().map(|c| Inner::start(c, idle));
+        let current = Current { signature: None, config, inner };
+        Engine { shared: Arc::new(Shared { idle, file: None, current: Mutex::new(current) }) }
+    }
+
+    /// The engine the `bridge.toml` at `path` names, read again whenever the
+    /// file changes. A file that cannot be read or parsed keeps the engine it
+    /// named before. The file is looked at every [`CONFIG_POLL`] as well, so a
+    /// changed engine stops the running search at once, not at the next call.
+    pub fn from_config_file(path: PathBuf) -> Self {
+        Self::following(path, CONFIG_POLL)
+    }
+
+    /// [`Engine::from_config_file`] looking at the file every `poll` (tests).
+    pub fn following(path: PathBuf, poll: Duration) -> Self {
+        let engine = Engine { shared: Arc::new(Shared { idle: IDLE, file: Some(path), current: Mutex::default() }) };
+        engine.current();
+        let watched = Arc::downgrade(&engine.shared);
+        let _ = std::thread::Builder::new().name("bridge-engine-config".into()).stack_size(crate::THREAD_STACK).spawn(
             move || {
-                while let Some(inner) = reaper.upgrade() {
-                    inner.end_if_idle();
-                    drop(inner);
-                    std::thread::sleep(every);
+                while let Some(shared) = watched.upgrade() {
+                    Engine { shared }.current();
+                    std::thread::sleep(poll);
                 }
             },
         );
-        Engine { inner: Some(inner) }
+        engine
+    }
+
+    /// The engine now, after reading the configuration again if it changed.
+    /// A replaced engine's running search stops, and its process ends when
+    /// that search lets it go.
+    fn current(&self) -> Option<Arc<Inner>> {
+        let mut current = lock(&self.shared.current);
+        if let Some(path) = &self.shared.file {
+            let signature = crate::sources::signature(Some(path));
+            if current.signature != Some(signature) {
+                // Only a regular file is read: a pipe would block every caller
+                // on this lock. A failed read is tried again next time, even
+                // when the file itself did not change, as access may return.
+                let read = if path.is_file() {
+                    std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| crate::config::parse(&t))
+                } else {
+                    Err("not a regular file".to_string())
+                };
+                if let Ok(config) = read {
+                    current.signature = Some(signature);
+                    let next = config.engine.map(|p| EngineConfig::new(p, config.engine_threads, config.engine_hash));
+                    if next != current.config {
+                        if let Some(old) = current.inner.take() {
+                            old.turn.fetch_add(1, Ordering::SeqCst);
+                        }
+                        current.inner = next.clone().map(|c| Inner::start(c, self.shared.idle));
+                        current.config = next;
+                    }
+                }
+            }
+        }
+        current.inner.clone()
     }
 
     /// The engine's name for `/v1/status`: what it said in the handshake,
     /// else its file's name; `None` without an engine.
     pub fn name(&self) -> Option<String> {
-        let inner = self.inner.as_ref()?;
+        let inner = self.current()?;
         let said = lock(&inner.name).clone();
         Some(said.unwrap_or_else(|| file_stem(&inner.config.program)))
     }
 
     pub fn is_configured(&self) -> bool {
-        self.inner.is_some()
+        self.current().is_some()
     }
 
     /// Whether the engine's process is running (tests).
     pub fn is_running(&self) -> bool {
-        self.inner.as_ref().is_some_and(|i| i.slot.try_lock().map(|s| s.is_some()).unwrap_or(true))
+        self.current().is_some_and(|i| i.slot.try_lock().map(|s| s.is_some()).unwrap_or(true))
     }
 
     /// Runs `search` and writes its lines to `sink` until it ends, the client
@@ -284,7 +346,7 @@ impl Engine {
     /// client's view: a newer analysis from another one ends this one with
     /// `{"superseded":true}`, one from the same view ends it without a line.
     pub fn analyze(&self, search: &Search, stream: &str, sink: &mut dyn Sink) {
-        let Some(inner) = &self.inner else {
+        let Some(inner) = self.current() else {
             let _ = sink.line(&error_line("no_engine", "No engine is configured"));
             return;
         };
@@ -330,6 +392,29 @@ enum Outcome {
 }
 
 impl Inner {
+    fn start(config: EngineConfig, idle: Duration) -> Arc<Inner> {
+        let inner = Arc::new(Inner {
+            config,
+            idle,
+            turn: AtomicU64::new(0),
+            newest_stream: Mutex::new(String::new()),
+            name: Mutex::new(None),
+            slot: Mutex::new(None),
+        });
+        let reaper = Arc::downgrade(&inner);
+        let every = (idle / 4).clamp(Duration::from_millis(20), Duration::from_secs(30));
+        let _ = std::thread::Builder::new().name("bridge-engine-idle".into()).stack_size(crate::THREAD_STACK).spawn(
+            move || {
+                while let Some(inner) = reaper.upgrade() {
+                    inner.end_if_idle();
+                    drop(inner);
+                    std::thread::sleep(every);
+                }
+            },
+        );
+        inner
+    }
+
     fn superseded(&self, stream: &str, sink: &mut dyn Sink) {
         if *lock(&self.newest_stream) != stream {
             let _ = sink.line(r#"{"superseded":true}"#);
@@ -389,6 +474,13 @@ impl Inner {
             }
         }
     }
+}
+
+/// Whether `program` is a UCI engine: runs its handshake within the usual
+/// limits and ends it. The engine's name, or why it was refused.
+pub fn probe(program: &Path) -> Result<String, String> {
+    let config = EngineConfig { program: program.to_path_buf(), threads: 1, hash_mb: 16 };
+    Process::start(&config).map(|p| p.name.clone())
 }
 
 fn file_stem(path: &Path) -> String {
