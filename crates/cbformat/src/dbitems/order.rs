@@ -1,6 +1,6 @@
 //! The order ChessBase's database window shows its databases in.
 
-use std::cmp::Ordering;
+use std::cmp::Reverse;
 
 use super::{DbList, Entry};
 
@@ -18,30 +18,39 @@ impl Entry {
 impl DbList {
     /// The entries in the order the window shows them.
     ///
-    /// With `Sort` 6, the only setting seen, ChessBase orders by icon number,
-    /// largest first, and entries with the same icon by title, last first. The
-    /// window showed that order in its icon and detail views on the owner's
-    /// machine (asavis/oschess-cb-bridge#20). Any other setting keeps the file
-    /// order, since its meaning is not known.
+    /// With `Sort` 6 and every `SortDir` 0, the only setting seen, ChessBase
+    /// orders by icon number, largest first, and entries with the same icon by
+    /// title, last first. The window showed that order in its icon and detail
+    /// views on the owner's machine (asavis/oschess-cb-bridge#20). Any other
+    /// setting, a missing direction included, keeps the file order, since its
+    /// meaning is not known.
     pub fn window_order(&self) -> Vec<&Entry> {
         let mut entries: Vec<&Entry> = self.entries.iter().collect();
-        if self.sort == Some(SORT_BY_ICON) {
-            entries.sort_by(|a, b| by_icon(a, b));
+        if self.sorted_by_icon() {
+            // Each title is lowercased once, however long.
+            entries.sort_by_cached_key(|e| by_icon(e));
         }
         entries
     }
 
     /// [`Self::window_order`], taking the entries.
     pub fn into_window_order(mut self) -> Vec<Entry> {
-        if self.sort == Some(SORT_BY_ICON) {
-            self.entries.sort_by(by_icon);
+        if self.sorted_by_icon() {
+            self.entries.sort_by_cached_key(by_icon);
         }
         self.entries
     }
+
+    /// Whether the window is in the one order decoded: `Sort` 6 with every
+    /// `SortDir` present and 0.
+    fn sorted_by_icon(&self) -> bool {
+        self.sort == Some(SORT_BY_ICON) && self.sort_dir.iter().all(|d| *d == Some(0))
+    }
 }
 
-fn by_icon(a: &Entry, b: &Entry) -> Ordering {
-    b.icon().cmp(&a.icon()).then_with(|| b.name.to_lowercase().cmp(&a.name.to_lowercase()))
+/// Icon, then title without regard to case, both descending.
+fn by_icon(e: &Entry) -> (Reverse<i64>, Reverse<String>) {
+    (Reverse(e.icon()), Reverse(e.name.to_lowercase()))
 }
 
 #[cfg(test)]
@@ -78,8 +87,12 @@ mod tests {
             ("Anderssen [pgn]", 0),
             ("Tal (cbh)", 0),
         ];
-        let mut list =
-            DbList { entries: file.iter().map(|(n, i)| entry(n, *i)).collect(), sort: Some(6), ..DbList::default() };
+        let mut list = DbList {
+            entries: file.iter().map(|(n, i)| entry(n, *i)).collect(),
+            sort: Some(6),
+            sort_dir: [Some(0); 8],
+            ..DbList::default()
+        };
         let want = [
             "Openings",
             "Black repertoire",
@@ -103,8 +116,35 @@ mod tests {
     fn any_other_sort_keeps_the_file_order() {
         let entries = vec![entry("A", 1), entry("B", 9)];
         for sort in [None, Some(0), Some(5), Some(7)] {
-            let list = DbList { entries: entries.clone(), sort, ..DbList::default() };
+            let list = DbList { entries: entries.clone(), sort, sort_dir: [Some(0); 8], ..DbList::default() };
             assert_eq!(names(&list.window_order()), ["A", "B"], "{sort:?}");
         }
+    }
+
+    #[test]
+    fn sort_six_needs_every_direction_zero() {
+        let entries = vec![entry("A", 1), entry("B", 9)];
+        let decoded = DbList { entries: entries.clone(), sort: Some(6), sort_dir: [Some(0); 8], ..DbList::default() };
+        assert_eq!(names(&decoded.window_order()), ["B", "A"]);
+        for (slot, dir) in [(6, Some(1)), (6, Some(255)), (6, None), (0, Some(1)), (7, None)] {
+            let mut list = decoded.clone();
+            list.sort_dir[slot] = dir;
+            assert_eq!(names(&list.window_order()), ["A", "B"], "SortDir{slot} {dir:?}");
+            assert_eq!(list.into_window_order().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["A", "B"]);
+        }
+    }
+
+    #[test]
+    fn a_long_title_sorts_like_any_other() {
+        let long = format!("0006{}", "\u{3a3}".repeat(20_000));
+        let mut entries: Vec<Entry> = (0..200).map(|i| entry(&format!("{:04}", (i + 100) % 200), 0)).collect();
+        entries[100].name = long.clone();
+        let list = DbList { entries, sort: Some(6), sort_dir: [Some(0); 8], ..DbList::default() };
+        let order = list.window_order();
+        // Descending titles: "0199" first, and the long title between "0007" and "0006".
+        assert_eq!(order[0].name, "0199");
+        let at = order.iter().position(|e| e.name == long).unwrap();
+        assert_eq!(order[at - 1].name, "0007");
+        assert_eq!(order[at + 1].name, "0006");
     }
 }

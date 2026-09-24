@@ -37,8 +37,10 @@ impl Listed {
 }
 
 impl Sources {
-    /// The databases ChessBase's window lists, in the file's order, named as
-    /// the window names them. `Ok(empty)` when there is no such list.
+    /// The databases ChessBase's window lists, in the order the window shows
+    /// them where that is decoded and in the file's order otherwise
+    /// (`DbList::window_order`), named as the window names them. `Ok(empty)`
+    /// when there is no such list.
     pub fn window(&self) -> Result<Vec<Listed>, String> {
         let Some(dir) = &self.chessbase else { return Ok(Vec::new()) };
         match std::fs::metadata(dir) {

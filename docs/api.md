@@ -218,8 +218,11 @@ The databases of ChessBase's own database window, then those `bridge.toml`
 adds, then those given with `--database`, each once:
 
 - **The window's** are read from `DBItems.cbini` in `Documents\ChessBase`, in
-  the order the file stores them: 2CBH databases first, then the others. The
-  window can sort them differently on screen; that setting is not decoded.
+  the order the window shows them where its sort setting is decoded:
+  ChessBase's default (`Sort` 6 with every `SortDir` 0) orders them by icon,
+  largest first, then by title, last first (`docs/format-notes.md`). Under any
+  other setting they come in the order the file stores them: 2CBH databases
+  first, then the others.
 - **`bridge.toml`'s** follow in the order written. A folder gives the `.2cbh`
   and `.cbh` database files directly in it, by file name; a folder or a pipe
   named like one is not a database.

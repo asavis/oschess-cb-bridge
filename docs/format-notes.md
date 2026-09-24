@@ -191,8 +191,8 @@ first, then `Databases`. The window sorts by `Sort` and `SortDir0`–`SortDir7`.
 - **The evidence:** the owner's window, in its icon view and in its detail view
   (whose columns show no sort mark), matched this order for all ten databases,
   three of which share icon 0 (asavis/oschess-cb-bridge#20).
-- **Other `Sort` values** are **not decoded**. For them, `DbList::window_order`
-  keeps the file order.
+- **Other settings are not decoded:** another `Sort`, any `SortDir` other than 0,
+  or a missing one. For them, `DbList::window_order` keeps the file order.
 
 **Items the window adds itself.** The window also lists ChessBase's clip database
 (`NoGames\ClipDBs\CBMain.cli`, format "CLI") and the ChessBase Cloud clip
