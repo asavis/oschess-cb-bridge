@@ -22,7 +22,9 @@
 //!    record numbers of the whole result, page by page. A result that differs
 //!    is explained by names when it agrees once the records whose names differ
 //!    in a known way, in the fields the query reads, are left out.
-//! 4. Suggestions for each letter and field, compared the same way.
+//! 4. Suggestions for each letter and field, compared the same way: only the
+//!    names that differ in a known way in the suggested field are left out,
+//!    and a list may end sooner only where the bridge's limit cut it.
 //! 5. Explorer: the answers for sampled positions of the games' main lines,
 //!    field by field: counts, moves and the top games' numbers, ratings,
 //!    results and years must be equal; their names may differ only where the
@@ -54,7 +56,7 @@ mod json;
 mod names;
 
 use json::Json;
-use names::{ANNOTATOR, BLACK, EVENT, FIELDS, Names, WHITE, bit, suggestions_agree};
+use names::{ANNOTATOR, BLACK, EVENT, FIELDS, Names, WHITE, bit, exceptions, suggestion_fields, suggestions_agree};
 
 const TOKEN: &str = "classic-pairs-harness-token-0123456789abcdef";
 const DOC: &str = include_str!("../../../../docs/search-grammar.md");
@@ -529,8 +531,9 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
     println!("  of which refused the same way by both: {errors_equal}");
 
     // Suggestions: a name that differs in a known way in either copy is left
-    // out of both lists, and the rest must agree (`names::suggestions_agree`).
-    let mut differing: HashSet<String> = HashSet::new();
+    // out of both lists of its own suggestion field only, and the rest must
+    // agree (`names::suggestions_agree`).
+    let mut differing: [HashSet<String>; 5] = Default::default();
     for id in 1..=classic.record_count().min(two.record_count()) {
         let m = names.known_bits(id);
         if m == 0 {
@@ -540,21 +543,20 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
             let Ok(h) = db.header(id) else { continue };
             let Ok(n) = db.names(&h) else { continue };
             let player = |p: &Option<cbformat::v2::Player>| p.as_ref().map(|p| p.pgn()).unwrap_or_default();
-            if m & bit(WHITE) != 0 {
-                differing.insert(player(&n.white));
-            }
-            if m & bit(BLACK) != 0 {
-                differing.insert(player(&n.black));
-            }
-            if m & bit(EVENT) != 0 {
-                differing.insert(n.tournament.as_ref().map(|t| t.title.clone()).unwrap_or_default());
-            }
-            if m & bit(ANNOTATOR) != 0 {
-                differing.insert(n.annotator.clone().unwrap_or_default());
+            let values = [
+                player(&n.white),
+                player(&n.black),
+                n.tournament.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+                String::new(),
+                n.annotator.clone().unwrap_or_default(),
+            ];
+            for field in [WHITE, BLACK, EVENT, ANNOTATOR] {
+                if m & bit(field) != 0 {
+                    differing[field].insert(bridge::json::string(&values[field]));
+                }
             }
         }
     }
-    let differing: HashSet<String> = differing.into_iter().map(|n| bridge::json::string(&n)).collect();
     let mut suggestions = Tally::default();
     for field in ["player", "event", "annotator"] {
         for c in 'a'..='z' {
@@ -565,11 +567,8 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
                 suggestions.identical += 1;
                 continue;
             }
-            if suggestions_agree(&a, &b, &differing) {
-                *suggestions
-                    .by_names
-                    .entry(if field == "annotator" { "annotator" } else { "players/event" })
-                    .or_insert(0) += 1;
+            if suggestions_agree(&a, &b, &exceptions(&differing, suggestion_fields(field))) {
+                *suggestions.by_names.entry(field).or_insert(0) += 1;
             } else {
                 suggestions.unexplained += 1;
             }

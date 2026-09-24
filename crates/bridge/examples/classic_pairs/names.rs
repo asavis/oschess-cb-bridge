@@ -165,6 +165,24 @@ pub fn suggestions_agree(a: &[(String, u64)], b: &[(String, u64)], differing: &H
     }
 }
 
+/// The name fields whose known differences can explain a suggestion field's
+/// lists: both players for `player`, the event for `event` and the annotator
+/// for `annotator`.
+pub fn suggestion_fields(field: &str) -> u8 {
+    match field {
+        "player" => bit(WHITE) | bit(BLACK),
+        "event" => bit(EVENT),
+        "annotator" => bit(ANNOTATOR),
+        _ => 0,
+    }
+}
+
+/// The names that differ in a known way in the name fields of `fields`,
+/// from `differing`, which holds them per field.
+pub fn exceptions(differing: &[HashSet<String>; 5], fields: u8) -> HashSet<String> {
+    (0..5).filter(|&f| fields & bit(f) != 0).flat_map(|f| differing[f].iter().cloned()).collect()
+}
+
 /// The names of both copies, compared game by game.
 pub struct Names {
     per_record: Vec<[NameDiff; 5]>,
@@ -332,6 +350,23 @@ mod tests {
         assert!(suggestions_agree(&list(&with_known), &list(&full), &known));
         // The same shortfall in a list the limit did not cut is unexplained.
         assert!(!suggestions_agree(&list(&full[..SUGGESTION_LIMIT - 1]), &list(&full), &known));
+    }
+
+    #[test]
+    fn suggestion_exceptions_stay_in_their_field() {
+        // A white surname cut in the classic copy, and an annotator that reads
+        // the same as the cut surname in both copies.
+        let cut = format!("\"Alpha, {}\"", "B".repeat(22));
+        let mut differing: [HashSet<String>; 5] = Default::default();
+        differing[WHITE].insert(cut.clone());
+        differing[WHITE].insert(format!("\"Alpha, {}CDEFG\"", "B".repeat(22)));
+        let classic = [(cut.clone(), 1)];
+        // The player cut explains player suggestions, never annotator ones.
+        assert!(suggestions_agree(&classic, &[], &exceptions(&differing, suggestion_fields("player"))));
+        assert!(!suggestions_agree(&classic, &[], &exceptions(&differing, suggestion_fields("annotator"))));
+        assert!(!suggestions_agree(&classic, &[], &exceptions(&differing, suggestion_fields("event"))));
+        assert_eq!(suggestion_fields("player"), bit(WHITE) | bit(BLACK));
+        assert_eq!(suggestion_fields("annotator"), bit(ANNOTATOR));
     }
 
     #[test]
