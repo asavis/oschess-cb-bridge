@@ -5,7 +5,7 @@ use std::sync::{Condvar, Mutex};
 
 use cbformat::Error;
 use cbformat::pgn;
-use cbformat::v2::{Database, Eco, Record, RecordKind};
+use cbformat::v2::{Eco, RecordKind};
 
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;
@@ -15,6 +15,7 @@ use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
 use crate::search::query::Sort;
 use crate::search::{self, SearchError, Selection, SuggestField};
+use crate::store::{Head, Store, with_store};
 
 pub const API_VERSION: i64 = 1;
 pub const MAX_LIMIT: u32 = 500;
@@ -208,7 +209,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Some(s) if valid_stream(s) => Some(s),
         Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
     };
-    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
+    let (selection, sort) = match search::select(&*open.db, &open.indexes, req.param("q"), stream, sort_param) {
         Ok(found) => found,
         Err(e) => return search_error(entry, open.generation, e),
     };
@@ -223,7 +224,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
             } else {
                 // Numbers in the window, in ascending order; reversed for descending.
                 let first = if *descending { total - offset - u64::from(count) + 1 } else { offset + 1 } as u32;
-                window(&open.db, first, count).map(|mut rows| {
+                with_store!(&*open.db, db => window(db, first, count)).map(|mut rows| {
                     if *descending {
                         rows.reverse();
                     }
@@ -235,9 +236,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Selection::Numbers(numbers) => {
             let start = usize::try_from(offset).unwrap_or(usize::MAX).min(numbers.len());
             let end = start.saturating_add(limit as usize).min(numbers.len());
-            let mut names = Names::new(&open.db);
-            let rows =
-                numbers[start..end].iter().map(|&n| open.db.record(n).and_then(|r| row(&mut names, &r))).collect();
+            let rows = with_store!(&*open.db, db => rows_of(db, &numbers[start..end]));
             (numbers.len() as u64, rows)
         }
     };
@@ -275,7 +274,7 @@ fn suggest(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
-    let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
+    let list = match search::suggest(&*open.db, &open.indexes, field, prefix, limit) {
         Ok(list) => list,
         Err(e) => return search_error(entry, open.generation, e),
     };
@@ -313,11 +312,17 @@ fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
 }
 
 /// Rows `first..first + count` in one header read.
-fn window(db: &Database, first: u32, count: u32) -> cbformat::Result<Vec<String>> {
+fn window<S: Store>(db: &S, first: u32, count: u32) -> cbformat::Result<Vec<String>> {
     // `first + count` itself may not fit when the window ends at `u32::MAX`.
     let records = db.records(first, first + (count - 1))?;
     let mut names = Names::new(db);
     records.iter().map(|r| row(&mut names, r)).collect()
+}
+
+/// The rows of the records `numbers`, in that order.
+fn rows_of<S: Store>(db: &S, numbers: &[u32]) -> cbformat::Result<Vec<String>> {
+    let mut names = Names::new(db);
+    numbers.iter().map(|&n| db.record(n).and_then(|r| row(&mut names, &r))).collect()
 }
 
 /// The longest text, in characters, a list row carries in one field. Longer
@@ -334,25 +339,45 @@ pub(crate) fn clip(text: String) -> String {
 
 /// Entity names for one window, each looked up once: rows of a tournament
 /// share their players and event, and one entity can be up to a megabyte.
-struct Names<'a> {
-    db: &'a Database,
+struct Names<'a, S: Store> {
+    db: &'a S,
     players: HashMap<i64, String>,
     tournaments: HashMap<i64, (String, String)>,
+    /// Where annotators are not players.
+    annotators: HashMap<i64, String>,
     titles: HashMap<i64, String>,
 }
 
-impl<'a> Names<'a> {
-    fn new(db: &'a Database) -> Self {
-        Names { db, players: HashMap::new(), tournaments: HashMap::new(), titles: HashMap::new() }
+impl<'a, S: Store> Names<'a, S> {
+    fn new(db: &'a S) -> Self {
+        Names {
+            db,
+            players: HashMap::new(),
+            tournaments: HashMap::new(),
+            annotators: HashMap::new(),
+            titles: HashMap::new(),
+        }
     }
 
     fn player(&mut self, id: i64) -> cbformat::Result<String> {
         if let Some(name) = self.players.get(&id) {
             return Ok(name.clone());
         }
-        let name =
-            clip(self.db.entities().player_within(id, search::MAX_NAME_RECORD)?.map(|p| p.pgn()).unwrap_or_default());
+        let name = clip(self.db.player(id)?.map(|p| p.pgn()).unwrap_or_default());
         self.players.insert(id, name.clone());
+        Ok(name)
+    }
+
+    /// An annotator or author: a player where annotators are players.
+    fn annotator(&mut self, id: i64) -> cbformat::Result<String> {
+        if S::ANNOTATORS_ARE_PLAYERS {
+            return self.player(id);
+        }
+        if let Some(name) = self.annotators.get(&id) {
+            return Ok(name.clone());
+        }
+        let name = clip(self.db.annotator(id)?.unwrap_or_default());
+        self.annotators.insert(id, name.clone());
         Ok(name)
     }
 
@@ -361,22 +386,18 @@ impl<'a> Names<'a> {
         if let Some(t) = self.tournaments.get(&id) {
             return Ok(t.clone());
         }
-        let t = self
-            .db
-            .entities()
-            .tournament_within(id, search::MAX_NAME_RECORD)?
-            .map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
+        let t = self.db.tournament(id)?.map_or_else(Default::default, |t| (clip(t.title), clip(t.place)));
         self.tournaments.insert(id, t.clone());
         Ok(t)
     }
 
-    /// A guiding text's or an analysis's title, from its game tag.
-    fn title(&mut self, id: i64) -> cbformat::Result<String> {
-        if let Some(t) = self.titles.get(&id) {
+    /// A guiding text's or an analysis's title, by its key ([`Head::other`]).
+    fn title(&mut self, key: i64) -> cbformat::Result<String> {
+        if let Some(t) = self.titles.get(&key) {
             return Ok(t.clone());
         }
-        let t = clip(self.db.entities().title_within(id, search::MAX_NAME_RECORD)?.unwrap_or_default());
-        self.titles.insert(id, t.clone());
+        let t = clip(self.db.title(key)?.unwrap_or_default());
+        self.titles.insert(key, t.clone());
         Ok(t)
     }
 }
@@ -384,7 +405,7 @@ impl<'a> Names<'a> {
 /// One list row. Guiding texts and analyses have header layouts of their own
 /// (only the first eight bytes are shared with games): their row carries the
 /// title in `event` and the author in `annotator`, and no game fields.
-fn row(names: &mut Names<'_>, r: &Record) -> cbformat::Result<String> {
+fn row<S: Store>(names: &mut Names<'_, S>, r: &S::Head) -> cbformat::Result<String> {
     let base = Obj::new().num("number", r.id());
     let other = |base: Obj, kind: &str, title: String, author: String| {
         base.str("kind", kind)
@@ -404,26 +425,28 @@ fn row(names: &mut Names<'_>, r: &Record) -> cbformat::Result<String> {
             .done()
     };
     match r.kind() {
-        RecordKind::Text => Ok(other(base, "text", names.title(r.text_title())?, names.player(r.text_author())?)),
-        RecordKind::Analysis => {
-            Ok(other(base, "analysis", names.title(r.analysis_title())?, names.player(r.analysis_author())?))
+        kind @ (RecordKind::Text | RecordKind::Analysis) => {
+            let (title, author) = r.other().unwrap_or((-1, -1));
+            let kind = if kind == RecordKind::Text { "text" } else { "analysis" };
+            Ok(other(base, kind, names.title(title)?, names.annotator(author)?))
         }
         RecordKind::Unknown(_) => Ok(other(base, "unknown", String::new(), String::new())),
         RecordKind::Game => {
             let (event, site) = names.tournament(r.tournament())?;
-            let round = match (r.round(), r.subround()) {
+            let round = match r.round() {
                 (n, _) if n <= 0 => String::new(),
                 (n, s) if s <= 0 => n.to_string(),
                 (n, s) => format!("{n}({s})"),
             };
             let flags =
                 Obj::new().bool("deleted", r.is_deleted()).bool("chess960", matches!(r.eco(), Eco::Chess960(_))).done();
+            let (white_elo, black_elo) = r.elo();
             Ok(base
                 .str("kind", "game")
                 .str("white", &names.player(r.white())?)
-                .num("whiteElo", r.white_elo().max(0))
+                .num("whiteElo", white_elo.max(0))
                 .str("black", &names.player(r.black())?)
-                .num("blackElo", r.black_elo().max(0))
+                .num("blackElo", black_elo.max(0))
                 .str("result", r.result().pgn())
                 .num("moves", r.move_count().max(0))
                 .str("eco", &r.eco().pgn().unwrap_or_default())
@@ -431,10 +454,43 @@ fn row(names: &mut Names<'_>, r: &Record) -> cbformat::Result<String> {
                 .str("site", &site)
                 .str("date", &r.played_date().pgn())
                 .str("round", &round)
-                .str("annotator", &names.player(r.annotator())?)
+                .str("annotator", &names.annotator(r.annotator())?)
                 .raw("flags", &flags)
                 .done())
         }
+    }
+}
+
+/// One reading of a game.
+enum Attempt {
+    NotFound,
+    NotAGame,
+    /// The header changed while the game was read, or could not be read.
+    Changed,
+    Rendered(cbformat::Result<pgn::Rendered>),
+}
+
+/// Reads game `number` of `db` as PGN between two reads of its header. The
+/// move and annotation records are both read between them, so a change to
+/// either is detected the same way.
+fn attempt<S: Store>(app: &App, db: &S, number: u32, options: &pgn::Options) -> Attempt {
+    if number > db.record_count() {
+        return Attempt::NotFound;
+    }
+    let Ok(before) = db.record(number) else { return Attempt::Changed };
+    if !matches!(before.kind(), RecordKind::Game) {
+        return Attempt::NotAGame;
+    }
+    let rendered = {
+        let _render = RENDERS.enter();
+        db.render(&before, options)
+    };
+    if let Some(hook) = &app.between_reads {
+        hook();
+    }
+    match db.record(number).is_ok_and(|after| after.bytes() == before.bytes()) {
+        true => Attempt::Rendered(rendered),
+        false => Attempt::Changed,
     }
 }
 
@@ -447,30 +503,15 @@ fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
             Ok(open) => open,
             Err(state) => return unavailable(state),
         };
-        if number > open.db.record_count() {
-            return not_found();
-        }
-        let before = match open.db.record(number) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let rendered = match with_store!(&*open.db, db => attempt(app, db, number, &options)) {
+            Attempt::NotFound => return not_found(),
+            Attempt::NotAGame => {
+                return error(422, "not_a_game", "Guiding texts and analyses are not served as PGN");
+            }
+            Attempt::Changed => continue,
+            Attempt::Rendered(rendered) => rendered,
         };
-        if !matches!(before.kind(), RecordKind::Game) {
-            return error(422, "not_a_game", "Guiding texts and analyses are not served as PGN");
-        }
-        // The move and annotation records are both read between the two
-        // header reads, so a change to either is detected the same way.
-        let rendered = {
-            let _render = RENDERS.enter();
-            open.db.moves_of_within(&before, MAX_GAME_BYTES).and_then(|data| {
-                let annotations = open.db.annotations_of_within(&before, MAX_GAME_BYTES)?;
-                pgn::game_from(&open.db, &before, &data.moves()?, annotations.as_ref(), &options)
-            })
-        };
-        if let Some(hook) = &app.between_reads {
-            hook();
-        }
-        let same_header = open.db.record(number).is_ok_and(|after| after.bytes() == before.bytes());
-        if !same_header || entry.generation() != Some(open.generation) {
+        if entry.generation() != Some(open.generation) {
             continue;
         }
         return match rendered {

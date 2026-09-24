@@ -2,10 +2,12 @@
 
 use std::io::Write;
 
-use cbformat::v2::{Eco, Record};
+use cbformat::v2::Eco;
+
+use crate::store::Head;
 
 /// A record's date as it appears in PGN, `YYYY.MM.DD` with `?` for unknown parts.
-pub fn date_text(r: &Record) -> [u8; 10] {
+pub fn date_text(r: &impl Head) -> [u8; 10] {
     let d = r.played_date();
     let mut out = *b"????.??.??";
     let mut put = |at: usize, width: usize, v: u32| {
@@ -24,7 +26,7 @@ pub fn date_text(r: &Record) -> [u8; 10] {
 }
 
 /// A record's ECO code, `A00`..`E99`, when it has one.
-pub fn eco_text(r: &Record) -> Option<[u8; 3]> {
+pub fn eco_text(r: &impl Head) -> Option<[u8; 3]> {
     match r.eco() {
         Eco::Code { code, .. } => {
             Some([b'A' + (code / 100) as u8, b'0' + (code / 10 % 10) as u8, b'0' + (code % 10) as u8])
@@ -34,10 +36,10 @@ pub fn eco_text(r: &Record) -> Option<[u8; 3]> {
 }
 
 /// A record's round as the list shows it: `5`, `5(2)`, or empty.
-pub fn round_text<'a>(r: &Record, buf: &'a mut [u8; 16]) -> &'a str {
+pub fn round_text<'a>(r: &impl Head, buf: &'a mut [u8; 16]) -> &'a str {
     let len = {
         let mut w = &mut buf[..];
-        let _ = match (r.round(), r.subround()) {
+        let _ = match r.round() {
             (n, _) if n <= 0 => Ok(()),
             (n, s) if s <= 0 => write!(w, "{n}"),
             (n, s) => write!(w, "{n}({s})"),

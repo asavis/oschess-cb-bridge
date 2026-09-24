@@ -5,12 +5,12 @@
 //! reading of the description rather than against itself. [`Builder`] writes
 //! the files. Built only with the `fixture` feature.
 
-use std::path::PathBuf;
-
 use chesscore::{Board, CastleSide, Color, Move, Piece, Square};
 
 use crate::cbh::tables;
-use crate::fixture::TempDb;
+
+mod builder;
+pub use builder::Builder;
 
 /// One item of a move tree in stored order: a move in UCI (`e2e4`, `e7e8q`),
 /// `--` for a null move, `O-O` / `O-O-O` for castling; [`Tok::Var`] before a
@@ -300,95 +300,4 @@ pub fn annotation_record(id: u32, items: &[(i32, u8, &[u8])]) -> Vec<u8> {
     let size = (r.len() as u32).to_be_bytes();
     r[10..14].copy_from_slice(&size);
     r
-}
-
-/// Builds a classic database: game records, their move and annotation
-/// records in the order added, and one player, tournament, annotator and
-/// source.
-pub struct Builder {
-    records: Vec<[u8; 46]>,
-    cbg: Vec<u8>,
-    cba: Vec<u8>,
-    players: Vec<Vec<u8>>,
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        let mut cbg = vec![0u8; 26];
-        cbg[1] = 26;
-        let players = vec![b"Morphy".to_vec(), b"Anderssen".to_vec()];
-        Builder { records: Vec::new(), cbg, cba: vec![0u8; 26], players }
-    }
-}
-
-impl Builder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Appends a game, won by white between players 0 and 1, with move
-    /// record `rec`, and returns its header record for further changes.
-    pub fn game(&mut self, rec: &[u8]) -> &mut [u8; 46] {
-        let mut h = [0u8; 46];
-        h[0] = 1;
-        h[1..5].copy_from_slice(&(self.cbg.len() as u32).to_be_bytes());
-        h[0x0c..0x0f].copy_from_slice(&[0, 0, 1]);
-        h[0x1b] = 2;
-        self.cbg.extend(rec);
-        self.records.push(h);
-        self.records.last_mut().unwrap()
-    }
-
-    /// Gives the last game added the annotation record `rec`.
-    pub fn annotations(&mut self, rec: &[u8]) -> &mut Self {
-        let at = (self.cba.len() as u32).to_be_bytes();
-        self.records.last_mut().expect("a game first")[5..9].copy_from_slice(&at);
-        self.cba.extend(rec);
-        self
-    }
-
-    /// Replaces player `id`'s raw 30-byte last-name field contents.
-    pub fn player_name(&mut self, id: usize, raw: &[u8]) -> &mut Self {
-        self.players[id] = raw.to_vec();
-        self
-    }
-
-    /// Writes `db.cbh` and its companions to a new temporary directory.
-    pub fn write(&self, name: &str) -> TempDb {
-        let dir = std::env::temp_dir().join(format!("cbformat-cbh-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut cbh = vec![0u8; 46];
-        cbh[1..6].copy_from_slice(&[0, 44, 0, 46, 1]);
-        cbh[6..10].copy_from_slice(&(self.records.len() as u32 + 1).to_be_bytes());
-        for r in &self.records {
-            cbh.extend(r);
-        }
-        let mut cbg = self.cbg.clone();
-        let size = (cbg.len() as u32).to_be_bytes();
-        cbg[2..6].copy_from_slice(&size);
-        let entity = |data: usize, recs: &[Vec<u8>]| {
-            let mut f = Vec::new();
-            for v in [recs.len() as i32, 0, 1_234_567_890, data as i32, -1, recs.len() as i32, 0] {
-                f.extend(v.to_le_bytes());
-            }
-            for r in recs {
-                f.extend((-1i32).to_le_bytes());
-                f.extend((-1i32).to_le_bytes());
-                f.push(0);
-                let mut d = r.clone();
-                d.resize(data, 0);
-                f.extend(d);
-            }
-            f
-        };
-        let path = |ext: &str| -> PathBuf { dir.join(format!("db{ext}")) };
-        std::fs::write(path(".cbh"), cbh).unwrap();
-        std::fs::write(path(".cbg"), cbg).unwrap();
-        std::fs::write(path(".cba"), &self.cba).unwrap();
-        std::fs::write(path(".cbp"), entity(58, &self.players)).unwrap();
-        std::fs::write(path(".cbt"), entity(90, &[b"Paris".to_vec()])).unwrap();
-        std::fs::write(path(".cbc"), entity(53, &[Vec::new()])).unwrap();
-        std::fs::write(path(".cbs"), entity(59, &[Vec::new()])).unwrap();
-        TempDb::at(dir)
-    }
 }

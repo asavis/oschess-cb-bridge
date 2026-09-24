@@ -44,10 +44,10 @@ target/release/cbtool bridge --database "path/to/Database.2cbh"   # the same bri
 ```
 
 `cbtool info`, `verify` and `pgn` also take a classic database
-(`Database.cbh`). The bridge does not serve classic databases yet: it lists
-them as `unsupported` until #25 is complete. `--lang` chooses the language of
-comments stored in several languages, in order of preference; English is the
-default.
+(`Database.cbh`), and the bridge serves one like a 2CBH database
+([docs/api.md](docs/api.md#classic-databases)). `--lang` chooses the language
+of comments stored in several languages, in order of preference; English is
+the default.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
@@ -68,7 +68,10 @@ in the data folder's `index` folder: the games, results, moves and notable
 games of every position the games reach in their first 40 plies. For the Mega
 Database it takes some five minutes and 1.4 GB. `cargo run --release -p bridge
 --example index_oracle -- <db.2cbh> <index dir>` builds one and checks it
-against a brute-force count, printing numbers only.
+against a brute-force count, printing numbers only. `cargo run --release -p
+bridge --example classic_pairs -- <scratch dir> <a.cbh> <a.2cbh> …` serves the
+classic and the 2CBH copy of each database given and compares their lists,
+searches, sorts, suggestions and explorer answers, printing counts only.
 
 It serves the databases ChessBase's database window shows, read from
 `DBItems.cbini` in `Documents\ChessBase`. The Documents folder is the one

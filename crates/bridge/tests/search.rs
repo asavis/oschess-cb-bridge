@@ -5,30 +5,14 @@
 use std::collections::HashMap;
 
 use bridge::search::{self, Indexes, SearchError, Selection, SuggestField};
+use bridge::store::Any;
+use cbformat::cbh;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::v2::Database;
 
-const DOC: &str = include_str!("../../../docs/search-grammar.md");
-
-/// The non-blank lines of the document's fenced block tagged `tag`.
-fn block(tag: &str) -> Vec<&'static str> {
-    block_in(DOC, tag)
-}
-
-/// The non-blank lines of `doc`'s fenced block tagged `tag`, with `\n` or
-/// `\r\n` line ends: a Windows checkout may convert them.
-fn block_in<'a>(doc: &'a str, tag: &str) -> Vec<&'a str> {
-    let fence = format!("```{tag}");
-    let open = doc
-        .match_indices(&fence)
-        .map(|(at, _)| at + fence.len())
-        .find(|&end| doc[end..].starts_with('\n') || doc[end..].starts_with("\r\n"))
-        .unwrap_or_else(|| panic!("no {tag} block"));
-    let start = open + doc[open..].find('\n').unwrap() + 1;
-    let end = start + doc[start..].find("```").unwrap();
-    doc[start..end].lines().filter(|l| !l.trim().is_empty()).collect()
-}
+mod common;
+use common::{DOC, block, block_in, classic_fixture, fixture, lid, put};
 
 #[test]
 fn blocks_read_the_same_with_crlf_line_ends() {
@@ -38,152 +22,8 @@ fn blocks_read_the_same_with_crlf_line_ends() {
     }
 }
 
-/// Entity ids by name, in order of first use; id 0 is the empty name.
-#[derive(Default)]
-struct Names(Vec<String>);
-
-impl Names {
-    fn id(&mut self, name: &str) -> i64 {
-        if name == "-" {
-            return 0;
-        }
-        if self.0.is_empty() {
-            self.0.push(String::new());
-        }
-        let at = self.0.iter().position(|n| n == name).unwrap_or_else(|| {
-            self.0.push(name.to_string());
-            self.0.len() - 1
-        });
-        at as i64
-    }
-}
-
-fn container(size: usize, record: &[u8]) -> Vec<u8> {
-    if record.is_empty() {
-        return vec![0; size];
-    }
-    let mut c = (record.len() as i32).to_le_bytes().to_vec();
-    c.extend(record);
-    assert!(c.len() <= size);
-    c.resize(size, 0);
-    c
-}
-
-fn string(s: &str) -> Vec<u8> {
-    let mut v = (s.len() as i32).to_le_bytes().to_vec();
-    v.extend(s.as_bytes());
-    v
-}
-
-/// A `.2lid` with the six entity types, holding players (type 0), tournaments
-/// (type 1) and the game tags that carry titles (type 5).
-fn lid(players: &[String], tournaments: &[String], titles: &[String]) -> Vec<u8> {
-    let tables: [Vec<Vec<u8>>; 6] = [
-        players
-            .iter()
-            .map(|name| {
-                let (last, first) = name.split_once(", ").unwrap_or((name, ""));
-                [string(last), string(first)].concat()
-            })
-            .collect(),
-        tournaments.iter().map(|t| [string(""), string(t), vec![0; 4]].concat()).collect(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        // One title, in language 0.
-        titles.iter().map(|t| [1i32.to_le_bytes().to_vec(), 0i32.to_le_bytes().to_vec(), string(t)].concat()).collect(),
-    ];
-    let count = tables.iter().map(Vec::len).max().unwrap_or(0).max(1);
-    // Containers big enough for the longest record.
-    let size = tables.iter().flatten().map(|r| r.len() + 4).max().unwrap_or(0).max(64).next_multiple_of(8);
-    let mut d = Vec::new();
-    d.extend(184i32.to_be_bytes());
-    d.extend(6i32.to_be_bytes());
-    for _ in &tables {
-        d.extend((size as i32).to_be_bytes());
-        d.extend((count as i64).to_be_bytes());
-        d.extend((-1i64).to_be_bytes());
-    }
-    d.resize(184, 0);
-    for id in 0..count {
-        for table in &tables {
-            d.extend(container(size, table.get(id).map_or(&[][..], Vec::as_slice)));
-        }
-    }
-    d
-}
-
-fn put(rec: &mut [u8; 192], at: usize, bytes: &[u8]) {
-    rec[at..at + bytes.len()].copy_from_slice(bytes);
-}
-
-/// The fixture of the document, written to a temporary directory, plus `extra`
-/// rows in the same form. A guiding text or an analysis takes its title from
-/// the event column and its author from the annotator column, and stores them
-/// in its own header layout.
-fn fixture(name: &str, extra: &[&str]) -> TempDb {
-    let (mut players, mut tournaments, mut titles) = (Names::default(), Names::default(), Names::default());
-    let mut b = Builder::new();
-    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
-    let rows = block("fixture").into_iter().filter(|l| !l.starts_with('#')).chain(extra.iter().copied());
-    for (i, line) in rows.enumerate() {
-        let f: Vec<&str> = line.split('|').map(str::trim).collect();
-        assert_eq!(f[0].parse::<usize>().unwrap(), i + 1, "fixture rows are numbered in order");
-        let rec = b.game(e4);
-        let (white, black, annotator) = (players.id(f[2]), players.id(f[3]), players.id(f[12]));
-        let ids: &[(usize, i64)] = match f[1] {
-            "text" => {
-                rec[0] |= 2;
-                &[(0x20, annotator), (0x28, titles.id(f[4]))]
-            }
-            "analysis" => {
-                rec[2] = 2;
-                &[(0x18, titles.id(f[4])), (0x28, annotator)]
-            }
-            kind => {
-                if kind == "deleted" {
-                    rec[0] |= 0x80;
-                }
-                &[(0x18, white), (0x20, black), (0x28, tournaments.id(f[4])), (0x30, annotator)]
-            }
-        };
-        for &(at, id) in ids {
-            put(rec, at, &id.to_le_bytes());
-        }
-        if f[1] == "text" || f[1] == "analysis" {
-            continue;
-        }
-        let date: Vec<i32> = f[5].split('.').map(|p| p.parse().unwrap_or(0)).collect();
-        put(rec, 0xbc, &((date[0] << 9) | (date[1] << 5) | date[2]).to_le_bytes());
-        let (round, sub): (i16, i16) = match f[6] {
-            "-" => (0, 0),
-            r => match r.split_once('(') {
-                Some((r, s)) => (r.parse().unwrap(), s.trim_end_matches(')').parse().unwrap()),
-                None => (r.parse().unwrap(), 0),
-            },
-        };
-        put(rec, 0x5a, &round.to_le_bytes());
-        put(rec, 0x5c, &sub.to_le_bytes());
-        rec[0x58] = match f[7] {
-            "0-1" => 0,
-            "1/2-1/2" => 1,
-            "1-0" => 2,
-            _ => 3,
-        };
-        let eco = match f[8].as_bytes() {
-            [l, d1, d2] => (u16::from(l - b'A') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0') + 1) * 128,
-            _ => 0,
-        };
-        put(rec, 0x80, &eco.to_le_bytes());
-        put(rec, 0x8a, &f[9].parse::<i16>().unwrap().to_le_bytes());
-        put(rec, 0x60, &f[10].parse::<i16>().unwrap().to_le_bytes());
-        put(rec, 0x70, &f[11].parse::<i16>().unwrap().to_le_bytes());
-    }
-    b.lid(lid(&players.0, &tournaments.0, &titles.0));
-    b.write(name)
-}
-
-fn numbers(db: &Database, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
+fn numbers<'a>(db: impl Into<Any<'a>>, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
+    let db = db.into();
     match search::select(db, idx, Some(q), None, None) {
         Ok((Selection::All { descending }, _)) => {
             let all = 1..=db.record_count();
@@ -195,18 +35,16 @@ fn numbers(db: &Database, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
     }
 }
 
-#[test]
-fn the_conformance_corpus_holds() {
-    let f = fixture("search-corpus", &[]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
-    let idx = Indexes::default();
+/// The lines of the corpus whose result on `db` is not the one written.
+fn corpus_failures<'a>(db: impl Into<Any<'a>>, idx: &Indexes) -> Vec<String> {
+    let db = db.into();
     let lines = block("corpus");
     assert!(lines.len() > 50, "the corpus was read");
     let mut failures = Vec::new();
     for line in lines {
         let (q, want) = line.rsplit_once("=>").unwrap();
         let (q, want) = (q.trim(), want.trim());
-        let got = match numbers(&db, &idx, q) {
+        let got = match numbers(db, idx, q) {
             Ok(v) if v.is_empty() => "none".to_string(),
             Ok(v) => v.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),
             Err(qualifier) => format!("unsupported {qualifier}"),
@@ -215,6 +53,25 @@ fn the_conformance_corpus_holds() {
             failures.push(format!("{q:?}: want {want}, got {got}"));
         }
     }
+    failures
+}
+
+#[test]
+fn the_conformance_corpus_holds() {
+    let f = fixture("search-corpus", &[]);
+    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let failures = corpus_failures(&db, &Indexes::default());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The same records written in the classic format give the same results:
+/// its guiding text keeps its title in its text record, and its annotators
+/// are a table of their own.
+#[test]
+fn the_conformance_corpus_holds_on_a_classic_copy() {
+    let f = classic_fixture("search-corpus-classic", &[]);
+    let db = cbh::Database::open(f.dir().join("db.cbh")).unwrap();
+    let failures = corpus_failures(&db, &Indexes::default());
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -288,8 +145,8 @@ fn texts_and_analyses_by_their_own_layout() {
 }
 
 /// Suggestions as (name, games) pairs.
-fn suggested(
-    db: &Database,
+fn suggested<'a>(
+    db: impl Into<Any<'a>>,
     idx: &Indexes,
     field: SuggestField,
     prefix: &str,
@@ -497,4 +354,54 @@ fn only_the_same_stream_supersedes() {
     drop(held);
     assert!(matches!(named.join().unwrap(), Err(SearchError::Superseded)));
     assert!(unnamed.join().unwrap().is_ok());
+}
+
+/// Suggestions, name searches and name sorts agree between a 2CBH and a
+/// classic copy of the fixture with more guiding texts, whose titles and
+/// authors the two formats keep in different places.
+#[test]
+fn classic_and_2cbh_copies_agree() {
+    let extra = [
+        "11 | text | - | - | Aaa survey | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm",
+        "12 | game | Tal, Mikhail | Morphy, Paul | Aaa survey | 1960.05.07 | 3 | 1-0 | A00 | 12 | 2700 | 0 | Tal, Mikhail",
+        "13 | text | - | - | Zugzwang | ????.??.?? | - | * | - | 0 | 0 | 0 | -",
+    ];
+    let (f2, fc) = (fixture("search-pair-2cbh", &extra), classic_fixture("search-pair-cbh", &extra));
+    let two = Database::open(f2.dir().join("db.2cbh")).unwrap();
+    let classic = cbh::Database::open(fc.dir().join("db.cbh")).unwrap();
+    let (i2, ic) = (Indexes::default(), Indexes::default());
+    for field in [SuggestField::Player, SuggestField::Event, SuggestField::Annotator] {
+        for prefix in ["", "a", "c", "l", "m", "mik", "n", "p", "r", "s", "st", "t", "w", "z"] {
+            let (a, b) = (suggested(&two, &i2, field, prefix, 20), suggested(&classic, &ic, field, prefix, 20));
+            assert_eq!(a.unwrap(), b.unwrap(), "{field:?} {prefix:?}");
+        }
+    }
+    let queries = [
+        "survey",
+        "zugzwang",
+        "event:survey",
+        "annotator:steinitz",
+        "annotator:tal",
+        "steinitz",
+        "tal",
+        "-annotator:nimzo",
+        "result:1-0 tal",
+        "sort:tournament",
+        "sort:tournament-desc",
+        "sort:annotator",
+        "sort:annotator-desc",
+        "sort:white",
+        "sort:black-desc",
+        "sort:date",
+        "sort:round",
+        "sort:eco-desc",
+        "player:tal sort:tournament",
+    ];
+    for q in queries {
+        assert_eq!(numbers(&two, &i2, q), numbers(&classic, &ic, q), "{q}");
+    }
+    assert_eq!(numbers(&classic, &ic, "event:survey").unwrap(), [11, 12]);
+    assert_eq!(numbers(&classic, &ic, "annotator:steinitz").unwrap(), [11]);
+    assert_eq!(numbers(&classic, &ic, "sort:tournament").unwrap()[..3], [11, 12, 8], "titles sort among tournaments");
+    assert_eq!(suggested(&classic, &ic, SuggestField::Annotator, "t", 20).unwrap(), [("Tal, Mikhail".into(), 2)]);
 }

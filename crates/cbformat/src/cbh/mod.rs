@@ -23,13 +23,16 @@ mod moves;
 mod pieces;
 mod record;
 pub(crate) mod tables;
+mod text;
 mod wide;
+mod window;
 
 use bytes::{be_u16, be_u24};
 pub use decode::{MAX_VARIATION_DEPTH, start_as_played, walk};
 pub use entities::Entities;
 pub use moves::GameMoves;
 pub use record::{RECORD_SIZE, Record};
+pub use window::MoveWindow;
 
 /// The extensions of every file of the classic format: the ones the reader
 /// uses, and the optional ones ChessBase adds or rebuilds (media manifest,
@@ -156,22 +159,40 @@ impl Database {
         }
     }
 
-    /// The move record a game header points at: its 4-byte head names its size.
+    /// The move record a game header points at, or a guiding text's text
+    /// record: its 4-byte head names its size.
     pub fn moves_of(&self, record: &Record) -> Result<MoveData<'static>> {
+        self.moves_of_within(record, usize::MAX)
+    }
+
+    /// [`Database::moves_of`], refusing before it is read a record larger than
+    /// `limit` bytes.
+    pub fn moves_of_within(&self, record: &Record, limit: usize) -> Result<MoveData<'static>> {
+        let (at, size) = self.move_extent(record)?;
+        if size > limit {
+            return Err(Error::Format(format!("move record at {at:#x}: {size} bytes, over the limit of {limit}")));
+        }
+        Ok(MoveData { bytes: Cow::Owned(self.moves.read(at, size)?) })
+    }
+
+    /// Where the `.cbg` record of `record` is and its size, from its head.
+    fn move_extent(&self, record: &Record) -> Result<(u64, usize)> {
         let at = self.offsets(record)?.0;
         let bad = |what: &str| Error::Format(format!("move record at {at:#x}: {what}"));
         let file_len = self.moves.len()?;
         if at < MIN_FILE_HEADER || at + 4 > file_len {
             return Err(bad("offset out of range"));
         }
-        let size = be_u24(&self.moves.read(at, 4)?, 1) as u64;
+        let mut head = [0u8; 4];
+        self.moves.read_into(at, &mut head)?;
+        let size = be_u24(&head, 1) as u64;
         if size < 4 {
             return Err(bad(&format!("size {size} is smaller than the record's head")));
         }
         if at + size > file_len {
             return Err(bad("runs past end of file"));
         }
-        Ok(MoveData { bytes: Cow::Owned(self.moves.read(at, size as usize)?) })
+        Ok((at, size as usize))
     }
 
     /// Whether the database has a `.cba` file.
@@ -210,6 +231,22 @@ impl Database {
             return Err(bad(&format!("{size} bytes, over the limit of {limit}")));
         }
         annotations::parse(&file.read(at, size)?, record.id()).map(Some)
+    }
+
+    /// Reads the header records from `first` into `buf`, as many as it holds
+    /// ([`RECORD_SIZE`] bytes each) up to the last record, in one read, and
+    /// returns how many it read: none when `first` is 0 or past the end. It
+    /// allocates nothing, as [`crate::v2::Database::read_records`];
+    /// [`Record::from_bytes`] makes the records.
+    pub fn read_records(&self, first: u32, buf: &mut [u8]) -> Result<u32> {
+        if first == 0 || first > self.records {
+            return Ok(0);
+        }
+        let fits = u32::try_from(buf.len() / RECORD_SIZE).unwrap_or(u32::MAX);
+        let count = fits.min(self.records - first + 1);
+        let bytes = count as usize * RECORD_SIZE;
+        self.headers.read_into(u64::from(first) * RECORD_SIZE as u64, &mut buf[..bytes])?;
+        Ok(count)
     }
 
     /// Records `first..=last`, clamped to the database and to

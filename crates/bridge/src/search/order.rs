@@ -3,20 +3,25 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use cbformat::v2::{Database, Eco, Record, RecordKind};
+use cbformat::v2::Eco;
 
 use super::SearchError;
 use super::memory::{Held, Hold, Refused};
+use super::names::NameTable;
 use super::query::{Sort, SortKey};
 use super::scan::{Control, scan};
+use crate::store::{Head, Store};
 
-/// The ranks a key needs besides the record: players' name order, and the
-/// joint name order of tournaments and of the titles of guiding texts and
-/// analyses.
+/// The ranks a key needs besides the record: players' and annotators' name
+/// orders (one where annotators are players), and the joint name order of
+/// tournaments and of the titles of guiding texts and analyses, with the
+/// table where a title's key finds its id.
 pub struct Ranks<'a> {
     pub players: Option<&'a [u32]>,
+    pub annotators: Option<&'a [u32]>,
     pub tournaments: Option<&'a [u32]>,
     pub titles: Option<&'a [u32]>,
+    pub title_table: Option<&'a NameTable>,
 }
 
 /// Results in PGN string order: `*`, `0-0`, `0-1`, `1-0`, `1/2-1/2`.
@@ -34,22 +39,16 @@ fn result_rank(pgn: &str) -> u32 {
 /// are 0, so they come first ascending and last descending. A guiding text or
 /// an analysis has its own layout: it sorts by its title as the tournament and
 /// by its author as the annotator, and has no other key.
-fn key(r: &Record, key: SortKey, ranks: &Ranks<'_>) -> u32 {
+fn key(r: &impl Head, key: SortKey, ranks: &Ranks<'_>) -> u32 {
     // An empty name has rank 0, and so has a missing one.
     let rank = |table: Option<&[u32]>, id: i64| {
         usize::try_from(id).ok().and_then(|i| table.and_then(|t| t.get(i))).copied().unwrap_or(0)
     };
-    let other = match r.kind() {
-        RecordKind::Game => None,
-        RecordKind::Text => Some((r.text_title(), r.text_author())),
-        RecordKind::Analysis => Some((r.analysis_title(), r.analysis_author())),
-        RecordKind::Unknown(_) => Some((-1, -1)),
-    };
-    if let Some((title, author)) = other {
+    if let Some((title, author)) = r.other() {
         return match key {
             SortKey::Number => r.id(),
-            SortKey::Tournament => rank(ranks.titles, title),
-            SortKey::Annotator => rank(ranks.players, author),
+            SortKey::Tournament => rank(ranks.titles, ranks.title_table.map_or(title, |t| t.slot(title))),
+            SortKey::Annotator => rank(ranks.annotators, author),
             _ => 0,
         };
     }
@@ -57,10 +56,10 @@ fn key(r: &Record, key: SortKey, ranks: &Ranks<'_>) -> u32 {
         SortKey::Number => r.id(),
         SortKey::White => rank(ranks.players, r.white()),
         SortKey::Black => rank(ranks.players, r.black()),
-        SortKey::Annotator => rank(ranks.players, r.annotator()),
+        SortKey::Annotator => rank(ranks.annotators, r.annotator()),
         SortKey::Tournament => rank(ranks.tournaments, r.tournament()),
-        SortKey::WhiteElo => r.white_elo().max(0) as u32,
-        SortKey::BlackElo => r.black_elo().max(0) as u32,
+        SortKey::WhiteElo => r.elo().0.max(0) as u32,
+        SortKey::BlackElo => r.elo().1.max(0) as u32,
         SortKey::Result => result_rank(r.result().pgn()),
         SortKey::Moves => r.move_count().max(0) as u32,
         // The code as shown; ChessBase's hidden sub-code does not order it.
@@ -70,7 +69,7 @@ fn key(r: &Record, key: SortKey, ranks: &Ranks<'_>) -> u32 {
         },
         SortKey::Date => (r.played_date().0 & 0x1f_ffff) as u32,
         // A sub-round is shown only with a round.
-        SortKey::Round => match (r.round(), r.subround()) {
+        SortKey::Round => match r.round() {
             (n, _) if n <= 0 => 0,
             (n, s) => ((n as u32) << 16) | s.max(0) as u32,
         },
@@ -87,7 +86,12 @@ pub fn build_bytes(records: u32) -> usize {
 /// directions. Each worker sorts its own range, and the ranges are merged.
 /// The memory is reserved before anything is allocated, and the order keeps
 /// what it holds.
-pub fn build(db: &Database, ctl: &Control<'_>, sort: Sort, ranks: &Ranks<'_>) -> Result<Held<Vec<u32>>, SearchError> {
+pub fn build<S: Store>(
+    db: &S,
+    ctl: &Control<'_>,
+    sort: Sort,
+    ranks: &Ranks<'_>,
+) -> Result<Held<Vec<u32>>, SearchError> {
     let total = db.record_count() as usize;
     let mut hold = Hold::reserve(build_bytes(db.record_count()))?;
     let flip = if sort.descending { u32::MAX } else { 0 };

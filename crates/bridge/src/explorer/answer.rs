@@ -4,14 +4,13 @@
 use chesscore::{Board, Move, Piece};
 
 use cbformat::pgn::san;
-use cbformat::v2::Database;
 
 use crate::api::{App, clip};
 use crate::catalog::Entry;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
-use crate::search::MAX_NAME_RECORD;
+use crate::store::{Any, Head, Store, with_store};
 
 use super::file::Bad;
 use super::format::{Counts, MAX_PLY, Stats, TOP_GAMES, unpack_move};
@@ -82,7 +81,8 @@ fn counts(o: Obj, c: &Counts) -> Obj {
 
 /// The answer for `board`: its counts, its moves most played first, and its
 /// notable games, best rated first.
-pub fn render(db: &Database, board: &Board, stats: Option<Stats>, loaded: &Loaded) -> String {
+pub fn render<'a>(db: impl Into<Any<'a>>, board: &Board, stats: Option<Stats>, loaded: &Loaded) -> String {
+    let db = db.into();
     let stats = stats.unwrap_or_default();
     let moves = stats.moves.iter().filter_map(|(code, c)| {
         let mv = unpack_move(board, *code).filter(|&mv| board.is_legal(mv))?;
@@ -91,7 +91,7 @@ pub fn render(db: &Database, board: &Board, stats: Option<Stats>, loaded: &Loade
     let mut top: Vec<(u16, u32, std::sync::Arc<str>)> = stats
         .top
         .iter()
-        .filter_map(|&n| loaded.game(n, || top_game(db, n)).map(|(elo, json)| (elo, n, json)))
+        .filter_map(|&n| loaded.game(n, || with_store!(db, db => top_game(db, n))).map(|(elo, json)| (elo, n, json)))
         .collect();
     top.sort_unstable_by_key(|t| std::cmp::Reverse((t.0, t.1)));
     top.dedup_by_key(|t| t.1);
@@ -122,19 +122,18 @@ fn uci(board: &Board, mv: Move) -> String {
 }
 
 /// Game `number`'s rating, for ranking, and its entry in `topGames`.
-fn top_game(db: &Database, number: u32) -> Option<(u16, String)> {
+fn top_game<S: Store>(db: &S, number: u32) -> Option<(u16, String)> {
     let r = db.record(number).ok()?;
-    let e = db.entities();
-    let name = |id: i64| e.player_within(id, MAX_NAME_RECORD).ok().flatten().map(|p| clip(p.pgn())).unwrap_or_default();
-    let event =
-        e.tournament_within(r.tournament(), MAX_NAME_RECORD).ok().flatten().map(|t| clip(t.title)).unwrap_or_default();
+    let name = |id: i64| db.player(id).ok().flatten().map(|p| clip(p.pgn())).unwrap_or_default();
+    let event = db.tournament(r.tournament()).ok().flatten().map(|t| clip(t.title)).unwrap_or_default();
     let year = r.played_date().year();
+    let (white_elo, black_elo) = r.elo();
     let o = Obj::new()
         .num("number", i64::from(number))
         .str("white", &name(r.white()))
         .str("black", &name(r.black()))
-        .num("whiteElo", i64::from(r.white_elo().max(0)))
-        .num("blackElo", i64::from(r.black_elo().max(0)))
+        .num("whiteElo", i64::from(white_elo.max(0)))
+        .num("blackElo", i64::from(black_elo.max(0)))
         .str("result", r.result().pgn());
     let o = if year == 0 { o.raw("year", "null") } else { o.num("year", i64::from(year)) };
     Some((average_elo(&r), o.str("event", &event).done()))
