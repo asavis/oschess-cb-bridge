@@ -201,6 +201,73 @@ is there. It is opened only when none of them is offline. Through WSL, a non-emp
 no blocks allocated is reported as possibly cloud-only. That heuristic has not
 been confirmed, because no placeholder was available.
 
+## Position index (the bridge's own files)
+
+Not a ChessBase format: the files the bridge writes for
+`GET /v1/databases/{id}/explorer` (`docs/api.md`), one per database in the
+data folder's `index` folder, `<id>.idx` for the full index and
+`<id>.delta.idx` for games appended since. Integers are little-endian.
+
+- **Key.** A position is its Polyglot key (`chesscore::Board::hash`), which
+  adds an en passant square only when a capture is possible. Chess960 games
+  are left out, since the key names a castling right by its side, not by its
+  rook.
+- **What a game adds.** Each position of its main line from the start to
+  ply 40, once however often it is reached, with the move played from it up to
+  ply 40; a position reached again adds only the move from its first visit. A null move or damaged moves end the line there; the position before
+  them counts, and no move from it. A position reached by one game only beyond
+  ply 20 is dropped from a full index; a delta keeps every position.
+- **Header** (128 bytes):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 8 | magic `OSCBIDX\0` |
+  | 8 | 4 | format version, 1 |
+  | 12 | 4 | header length, 128 |
+  | 16 | 1 | kind: 0 full, 1 delta |
+  | 17 | 1 | depth in plies, 40 |
+  | 18 | 1 | pruning ply, 20; 255 keeps everything |
+  | 20 | 4 | first record indexed |
+  | 24 | 4 | last record indexed |
+  | 32 | 8 | the database's generation when built |
+  | 40 | 8 | the digest of header records 1 to the last one indexed |
+  | 48 | 8 | games indexed |
+  | 56 | 8 | positions |
+  | 64 | 4 | blocks |
+  | 72 | 8 | offset of the block table |
+  | 80 | 4 | CRC-32 of the block table |
+  | 88 | 8 | file length |
+  | 124 | 4 | CRC-32 of bytes 0-123 |
+
+- **Blocks** follow the header back to back, positions in ascending key order,
+  up to 4,096 a block. A block holds its keys, 12 bytes each (the key, then the
+  record's offset in the block's data, 4 bytes), then the records.
+- **A record** is unsigned LEB128 numbers:
+  - the games, white wins, draws and black wins;
+  - the number of moves, then each move as 2 bytes (from square, to square,
+    and for a pawn reaching the last rank the promotion piece, queen, rook,
+    bishop or knight as 0-3, in bits 0-5, 6-11 and 12-13; castling is the king
+    moving onto its rook) followed by its four counts;
+  - the number of notable games, then their numbers, the highest average
+    rating first, then the latest.
+- **The block table** ends the file: for each block its first key, offset (8
+  bytes each), number of keys, data length and the CRC-32 of its keys and data
+  together (4 bytes each), 28 bytes a block.
+- **Checks.** On opening: the header's CRC, the file's length, the table's
+  CRC, and blocks that follow each other, in key order. On each lookup, the
+  CRC of the block read. Any failure rebuilds the index.
+- **Deciding what to build.** An index whose generation is the database's is
+  current. Otherwise, when the digest of the header records it covers is
+  unchanged, the database only grew: a delta over the new records is built, or
+  the full index again when they exceed a tenth of those indexed. Any other
+  change rebuilds it.
+- **The build.** Workers turn their share of the games into 16-byte entries:
+  the key, the game number (30 bits) with its result (2), and the move (14),
+  ply (6) and average rating (12). Each worker sorts its entries within its
+  share of the search memory budget and writes them as runs. The runs are then
+  merged, 256 at a time, and each position's entries are added up into its
+  record as the merge passes them.
+
 # The classic format (`.cbh`)
 
 `cbformat::cbh` reads the previous ChessBase format, the `.cbh` family, from

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 cbformat = { version = "0.1.0", path = "../cbformat" }
+chesscore = { version = "0.1.0", path = "../chesscore" }
 # The pairing token: the standard library has no public API for operating-system randomness.
 getrandom = "0.3"
 

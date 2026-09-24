@@ -77,15 +77,27 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// Runs jobs one after another on a background thread, which starts when a
 /// job arrives and ends when none is left.
-#[derive(Default)]
 pub struct Serial {
     /// The jobs waiting, and whether a thread runs them.
     queue: Mutex<(VecDeque<Job>, bool)>,
     /// Starting a thread fails, for tests.
     refuse: AtomicBool,
+    /// What the jobs do, for the thread's name and messages.
+    label: &'static str,
+}
+
+impl Default for Serial {
+    fn default() -> Serial {
+        Serial::labelled("download")
+    }
 }
 
 impl Serial {
+    /// A queue whose thread and messages are named `label`.
+    pub fn labelled(label: &'static str) -> Serial {
+        Serial { queue: Mutex::default(), refuse: AtomicBool::new(false), label }
+    }
+
     /// Queues `job`, starting the thread when none runs. When the thread
     /// cannot start, `job` is dropped unrun and `false` returned: nothing is
     /// left waiting for a thread that does not exist.
@@ -99,7 +111,7 @@ impl Serial {
         let started = if self.refuse.load(Ordering::Relaxed) {
             Err(std::io::Error::other("refused for a test"))
         } else {
-            std::thread::Builder::new().name("download".into()).spawn(move || me.run()).map(drop)
+            std::thread::Builder::new().name(self.label.into()).spawn(move || me.run()).map(drop)
         };
         match started {
             Ok(()) => {
@@ -107,7 +119,7 @@ impl Serial {
                 true
             }
             Err(e) => {
-                eprintln!("oschess-bridge: cannot start a download thread: {e}");
+                eprintln!("oschess-bridge: cannot start a {} thread: {e}", self.label);
                 // No thread runs, so this is the only job queued.
                 let job = queue.0.pop_back();
                 drop(queue);
@@ -140,7 +152,7 @@ impl Serial {
             };
             // A panicking job must not end the thread.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                eprintln!("oschess-bridge: a download failed with a bug");
+                eprintln!("oschess-bridge: a {} job failed with a bug", self.label);
             }
         }
     }

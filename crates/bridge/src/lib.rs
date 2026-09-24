@@ -8,6 +8,7 @@ pub mod budget;
 pub mod catalog;
 pub mod config;
 pub mod documents;
+pub mod explorer;
 pub mod fetch;
 pub mod http;
 pub mod json;

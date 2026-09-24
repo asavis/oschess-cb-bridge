@@ -100,16 +100,18 @@ with them.
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
-| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading` |
+| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer, `state: "indexing"` with `progress` while its position index is built |
 | 409 | `superseded` | A newer search (`q`) on the same database replaced this one while it ran; the page shows the newer answer |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
+| 422 | `unsupported` | The explorer's position or variant is Chess960, which the position index does not hold; `variant` names it |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
+| 503 | `index_unavailable` | The position index could not be built; the message says why, and the next request after a minute tries again |
 | 503 | `busy` | Too many open connections, too many large answers being sent at once, or search memory taken by other searches; `Retry-After: 1` |
 
 ## Database identity and generations
@@ -195,7 +197,8 @@ most recently used streams; a forgotten stream starts afresh.
 {
   "bridge": { "version": "0.4.0", "api": 1 },
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
-  "download": { "present": 104857600, "total": 734003200 }
+  "download": { "present": 104857600, "total": 734003200 },
+  "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ]
 }
 ```
 
@@ -203,6 +206,8 @@ The web app calls it first. `api` below the version it was written for means
 the bridge is too old; the app then offers the download link. `databases`
 counts the databases in each state. `download` is there while databases are
 being downloaded: the bytes on this computer and in all, over all of them.
+`indexing` is there while position indexes are checked or built (see
+`GET /v1/databases/{id}/explorer`).
 
 ### `GET /v1/databases`
 
@@ -408,24 +413,75 @@ role (either colour for `player`); guiding texts and analyses are not counted,
 and entities with the same name are counted together. Most games first, then
 alphabetical.
 
-### `GET /v1/databases/{id}/explorer` (planned, #24)
+### `GET /v1/databases/{id}/explorer`
+
+For a position: the games in the database that reached it in their first 40
+plies, their results, the moves played from it, and its notable games. The
+reference tab of the oschess analysis panel shows it like its Lichess tabs.
 
 | Parameter | Meaning |
 |---|---|
-| `fen` | The position, in FEN |
-| `variant` | `standard` (default) or `chess960`; Chess960 is answered `unsupported` in the first index |
+| `fen` | The position, in FEN; required |
+| `variant` | `standard` (the default); any other value is answered `422 unsupported` |
 
 ```json
 {
-  "generation": "g1b2c3d4",
-  "state": "ready",
-  "moves": [ { "uci": "e2e4", "games": 5012345, "white": 1700000, "draws": 2100000, "black": 1212345 } ],
-  "topGames": [ { "number": 1234, "white": "Carlsen, Magnus", "whiteElo": 2882, "black": "…", "blackElo": 2800, "result": "1-0", "year": 2014 } ]
+  "generation": "0a1b2c3d4e5f6071",
+  "games": 5012345, "white": 1700000, "draws": 2100000, "black": 1212345,
+  "moves": [ { "uci": "e2e4", "san": "e4", "games": 2305000, "white": 810000, "draws": 950000, "black": 545000 } ],
+  "topGames": [ { "number": 1234, "white": "…", "black": "…", "whiteElo": 2882, "blackElo": 2800, "result": "1-0", "year": 2014, "event": "…" } ],
+  "index": { "records": 11966514, "games": 11959813, "maxPly": 40 }
 }
 ```
 
-`state` is `ready`, `building` (with `progress` from 0 to 1) or `unsupported`.
-Castling is written the standard way, `e1g1` and `e1c1`.
+- **Counts.** `games` counts the games that reached the position; `white`,
+  `draws` and `black` count those that ended so. A game without a result
+  counts in `games` only. A game is counted once however often it reaches the
+  position.
+- **Moves** are the moves played from the position, most played first, with
+  the same counts. Their `games` can add up to less than the position's: games
+  that ended there, or reached it at the index's last ply, played no move from
+  it within the index. `uci` writes castling the standard way, `e1g1` and
+  `e1c1`; `san` is the move in SAN.
+- **`topGames`**: up to 12 games that reached the position, the highest
+  average rating first (the known rating when only one is), then the latest.
+  Names are cut at 200 characters as in list rows; `year` is `null` when the
+  date has none.
+- **What is indexed.** The positions of each game's main line from its start to
+  ply 40, and the moves played from them up to ply 40: standard chess only,
+  from the standard start or a set-up position, without deleted games, guiding
+  texts or analyses. A position reached by only one game beyond ply 20 is left
+  out. A position the index does not hold is answered with zero counts and
+  empty lists. `index` says how far the index goes: the last record it covers,
+  the games it holds, and its depth.
+- **Chess960 is not indexed.** The Polyglot key the index uses names a
+  castling right by its side, not by its rook, so two Chess960 positions that
+  differ only in which rook may castle share a key. A FEN whose castling
+  rights name rook files (Shredder-FEN, such as `4k3/8/8/8/8/8/8/4KR1R w F -`)
+  or whose castling needs Chess960 rules is answered `422 unsupported` with
+  `variant: "chess960"`, and so is `variant=chess960`.
+- **Building.** The first request for a database's positions starts building
+  its index in the background: on at most half of the search workers, within
+  the search memory budget, which it never takes from searches, and one
+  database at a time. Until the index is ready, requests are answered
+  `409 database_unavailable` with `state: "indexing"` and
+  `progress: {"phase", "done", "total"}`; the phases are `checking` (records),
+  `reading` (records) and `merging` (entries). `/v1/status` lists the builds
+  under `indexing`. A build that fails is answered `503 index_unavailable` for
+  a minute, and the next request tries again.
+- **Changes.** The index belongs to the database's generation. When the
+  database changes, the next request checks it again: if games were only
+  appended (the header records the index covers are unchanged), a small delta
+  over the new games is built and answered together with the index; otherwise,
+  or when the new games exceed a tenth of the indexed records, the whole index
+  is rebuilt. A delta keeps every position, so a position whose one game beyond
+  ply 20 was left out of the full index is counted without it until the next
+  full rebuild.
+- **Storage.** Index files live in the data folder's `index` folder, one per
+  database (`<id>.idx`, and `<id>.delta.idx`); `docs/format-notes.md`,
+  "Position index", describes them. A file that is damaged or of another
+  version is rebuilt. The Mega Database's index takes about 1.4 GB, and its
+  build needs about 8 GB of temporary space there.
 
 ## Pairing
 

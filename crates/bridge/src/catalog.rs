@@ -308,6 +308,8 @@ fn generation_of(path: &Path, cloud: &dyn Cloud) -> Files {
 }
 
 pub struct Catalog {
+    /// The position indexes of the databases, and the queue that builds them.
+    pub explorer: crate::explorer::Registry,
     sources: Sources,
     shared: Arc<Shared>,
     listing: Mutex<Listing>,
@@ -334,7 +336,13 @@ impl Catalog {
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
         let shared = Arc::new(Shared { cloud, downloads: Arc::default() });
         let listing = Listing { read: Read::default(), entries: Vec::new() };
-        let catalog = Catalog { sources, shared, listing: Mutex::new(listing), after_read: Mutex::new(None) };
+        let catalog = Catalog {
+            explorer: crate::explorer::Registry::default(),
+            sources,
+            shared,
+            listing: Mutex::new(listing),
+            after_read: Mutex::new(None),
+        };
         catalog.refresh(true);
         catalog
     }
