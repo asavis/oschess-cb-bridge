@@ -92,19 +92,37 @@ function engineRow(name, detail, path, chosen) {
   radio.type = 'radio';
   radio.name = 'engine';
   radio.checked = path === chosen;
-  radio.addEventListener('change', () => chooseEngine(call('choose_engine', { path })));
+  radio.addEventListener('change', () => chooseEngine(() => call('choose_engine', { path })));
   const text = el('div', 'text', el('div', null, name), el('div', 'cap12 path', detail));
   text.lastChild.title = detail;
   return el('label', 'row engine', radio, text);
 }
 
-// A refused engine names the dictionary key of its message; the list is read again.
-function chooseEngine(promise) {
+// One choice at a time: the controls wait while an engine is checked, so a
+// slower answer never replaces a later choice. A refused engine names the
+// dictionary key of its message; the list is read again.
+let choosing = false;
+
+function chooseEngine(start) {
+  if (choosing) return;
+  choosing = true;
+  enginesBusy(true);
   notice(t('settings.engine.checking'));
-  return promise.then((view) => view && renderEngines(view), (message) => {
-    notice(t(String(message)));
-    act(call('engines').then(renderEngines));
-  });
+  start()
+    .then((view) => view && renderEngines(view), (message) => {
+      notice(t(String(message)));
+      return call('engines').then(renderEngines);
+    })
+    .catch((message) => notice(t('settings.error', { message })))
+    .finally(() => {
+      choosing = false;
+      enginesBusy(false);
+    });
+}
+
+function enginesBusy(busy) {
+  for (const input of document.querySelectorAll('#engines input')) input.disabled = busy;
+  document.getElementById('pick-engine').disabled = busy;
 }
 
 function toggle(id, onNow) {
@@ -115,7 +133,7 @@ function toggle(id, onNow) {
 function wire() {
   document.getElementById('add-folder').addEventListener('click', () =>
     act(call('add_folder').then((settings) => settings && renderSettings(settings))));
-  document.getElementById('pick-engine').addEventListener('click', () => chooseEngine(call('pick_engine')));
+  document.getElementById('pick-engine').addEventListener('click', () => chooseEngine(() => call('pick_engine')));
   document.getElementById('autostart').addEventListener('click', () =>
     act(call('set_autostart', { on: !current.autostart }).then(renderSettings)));
   document.getElementById('auto-update').addEventListener('click', () =>

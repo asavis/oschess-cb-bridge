@@ -21,6 +21,8 @@ use chesscore::{Board, Move, Piece, Square};
 use crate::http::Sink;
 use crate::json::{self, Obj};
 
+/// How often an engine that follows `bridge.toml` looks at the file.
+pub const CONFIG_POLL: Duration = Duration::from_secs(1);
 /// How long the engine may sit unused before its process ends.
 pub const IDLE: Duration = Duration::from_secs(600);
 /// The most lines the browser may ask for.
@@ -268,10 +270,25 @@ impl Engine {
 
     /// The engine the `bridge.toml` at `path` names, read again whenever the
     /// file changes. A file that cannot be read or parsed keeps the engine it
-    /// named before.
+    /// named before. The file is looked at every [`CONFIG_POLL`] as well, so a
+    /// changed engine stops the running search at once, not at the next call.
     pub fn from_config_file(path: PathBuf) -> Self {
+        Self::following(path, CONFIG_POLL)
+    }
+
+    /// [`Engine::from_config_file`] looking at the file every `poll` (tests).
+    pub fn following(path: PathBuf, poll: Duration) -> Self {
         let engine = Engine { shared: Arc::new(Shared { idle: IDLE, file: Some(path), current: Mutex::default() }) };
         engine.current();
+        let watched = Arc::downgrade(&engine.shared);
+        let _ = std::thread::Builder::new().name("bridge-engine-config".into()).stack_size(crate::THREAD_STACK).spawn(
+            move || {
+                while let Some(shared) = watched.upgrade() {
+                    Engine { shared }.current();
+                    std::thread::sleep(poll);
+                }
+            },
+        );
         engine
     }
 
@@ -283,10 +300,16 @@ impl Engine {
         if let Some(path) = &self.shared.file {
             let signature = crate::sources::signature(Some(path));
             if current.signature != Some(signature) {
-                current.signature = Some(signature);
-                let read =
-                    std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| crate::config::parse(&t));
+                // Only a regular file is read: a pipe would block every caller
+                // on this lock. A failed read is tried again next time, even
+                // when the file itself did not change, as access may return.
+                let read = if path.is_file() {
+                    std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| crate::config::parse(&t))
+                } else {
+                    Err("not a regular file".to_string())
+                };
                 if let Ok(config) = read {
+                    current.signature = Some(signature);
                     let next = config.engine.map(|p| EngineConfig::new(p, config.engine_threads, config.engine_hash));
                     if next != current.config {
                         if let Some(old) = current.inner.take() {

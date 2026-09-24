@@ -83,6 +83,19 @@ impl Analysis {
         std::iter::from_fn(|| self.line()).collect()
     }
 
+    /// The lines to the end of the body, or `None` if it goes on past `limit`.
+    fn rest_within(&mut self, limit: Duration) -> Option<Vec<String>> {
+        let deadline = Instant::now() + limit;
+        let mut lines = Vec::new();
+        while Instant::now() < deadline {
+            match self.line() {
+                Some(line) => lines.push(line),
+                None => return Some(lines),
+            }
+        }
+        None
+    }
+
     /// The whole body of a response that is not streamed.
     fn body(mut self) -> String {
         let mut body = String::new();
@@ -291,6 +304,17 @@ fn a_real_engine_analyses() {
     }
 }
 
+/// A copy of the fake engine under another file name, so that two engines differ.
+fn fake_copy(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-uci"), &path).unwrap();
+    path
+}
+
+fn engine_line(path: &std::path::Path) -> String {
+    format!("port = 39581\nengine = '{}'\nengine_threads = 1\nengine_hash = 16\n", path.display())
+}
+
 #[test]
 fn the_engine_follows_bridge_toml() {
     let dir = std::env::temp_dir().join(format!("bridge-follow-{}", std::process::id()));
@@ -302,27 +326,63 @@ fn the_engine_follows_bridge_toml() {
         std::thread::sleep(Duration::from_millis(20));
     };
     write("port = 39581\n");
-    let (port, app) = start(Engine::from_config_file(toml.clone()));
+    let (port, app) = start(Engine::following(toml.clone(), Duration::from_millis(50)));
     assert!(!app.engine.is_configured());
-    write(&format!(
-        "port = 39581\nengine = '{}'\nengine_threads = 1\nengine_hash = 16\n",
-        env!("CARGO_BIN_EXE_fake-uci")
-    ));
-    assert_eq!(app.engine.name().as_deref(), Some("fake-uci"));
+    let first = fake_copy(&dir, "engine-a");
+    write(&engine_line(&first));
+    assert_eq!(app.engine.name().as_deref(), Some("engine-a"));
     let mut a = Analysis::open(port, "depth=2");
     assert_eq!(a.rest().last().unwrap(), BEST);
-    // A running search stops when the engine is replaced or removed.
+
+    // Choosing another engine stops the running search by itself: nothing
+    // calls the engine between the change and the search's end.
     let mut running = Analysis::open(port, "stream=tab1");
     assert!(running.line().is_some());
+    let second = fake_copy(&dir, "engine-b");
+    write(&engine_line(&second));
+    let ended = running.rest_within(Duration::from_secs(3)).expect("the old search ran on");
+    assert!(ended.iter().all(|l| l.starts_with(r#"{"info":"#) || l == r#"{"superseded":true}"#), "{ended:?}");
+    assert_eq!(app.engine.name().as_deref(), Some("engine-b"));
+
+    // No engine at all, then a file that no longer parses keeps the engine it named.
     write("port = 39581\n");
     assert!(!app.engine.is_configured());
-    let ended = running.rest();
-    assert!(ended.iter().all(|l| l.starts_with(r#"{"info":"#) || l == r#"{"superseded":true}"#), "{ended:?}");
-    // A file that no longer parses keeps the engine it named.
-    write(&format!("engine = '{}'\n", env!("CARGO_BIN_EXE_fake-uci")));
+    write(&engine_line(&first));
     assert!(app.engine.is_configured());
     write("engine = \n");
-    assert!(app.engine.is_configured());
+    assert_eq!(app.engine.name().as_deref(), Some("engine-a"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A read that fails is tried again even when the file did not change, and a
+/// pipe in the file's place is never read, so nothing waits on it.
+#[cfg(unix)]
+#[test]
+fn a_failed_read_is_tried_again_and_a_pipe_is_never_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("bridge-reread-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml = dir.join("bridge.toml");
+    let first = fake_copy(&dir, "engine-a");
+    let second = fake_copy(&dir, "engine-b");
+    std::fs::write(&toml, engine_line(&first)).unwrap();
+    let engine = Engine::following(toml.clone(), Duration::from_secs(3600));
+    assert_eq!(engine.name().as_deref(), Some("engine-a"));
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&toml, engine_line(&second)).unwrap();
+    std::fs::set_permissions(&toml, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Skipped when the tests run as root, who reads the file anyway.
+    if std::fs::read(&toml).is_err() {
+        assert_eq!(engine.name().as_deref(), Some("engine-a"));
+    }
+    std::fs::set_permissions(&toml, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(engine.name().as_deref(), Some("engine-b"));
+
+    std::fs::remove_file(&toml).unwrap();
+    assert!(std::process::Command::new("mkfifo").arg(&toml).status().unwrap().success());
+    let asked = Instant::now();
+    assert_eq!(engine.name().as_deref(), Some("engine-b"));
+    assert!(asked.elapsed() < Duration::from_secs(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

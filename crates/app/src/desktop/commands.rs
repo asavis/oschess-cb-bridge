@@ -2,6 +2,7 @@
 //! the ones it needs.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use bridge::engines::{self, Roots};
@@ -151,18 +152,25 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     Ok(EnginesView { chosen: config.engine.map(|p| p.to_string_lossy().into_owned()), found })
 }
 
+/// One choice at a time: a slow probe cannot save its engine over a later one.
+static CHOOSING: Mutex<()> = Mutex::new(());
+
 /// Chooses the engine at `path` once it answers as a UCI engine. A file that
 /// does not is refused with the dictionary key of the message. The bridge
-/// takes the new engine at its next analysis, reading `bridge.toml` again.
+/// follows `bridge.toml`, so the running engine stops and the new one serves
+/// the next analysis.
 #[tauri::command]
 pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> {
     let program = PathBuf::from(path);
-    let probed = program.clone();
-    tauri::async_runtime::spawn_blocking(move || engine::probe(&probed))
-        .await
-        .map_err(text)?
-        .map_err(|_| "settings.engine.refused".to_string())?;
-    change_config(&app, |c| config::Config { engine: Some(program.clone()), ..c.clone() })?;
+    let config_path = shared(&app).config_path()?;
+    tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
+        let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
+        engine::probe(&program).map_err(|_| "settings.engine.refused".to_string())?;
+        let next = config::Config { engine: Some(program), ..config::load_or_create(&config_path)? };
+        config::save(&config_path, &next)
+    })
+    .await
+    .map_err(text)??;
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
