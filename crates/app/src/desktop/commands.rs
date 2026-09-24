@@ -6,9 +6,10 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use bridge::engines::{self, Roots};
+use bridge::stockfish::{self, Build, Progress};
 use bridge::{config, engine, token};
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
@@ -16,6 +17,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use super::server::{self, Pairing};
 use super::{SharedState, shared, tray, updater, windows};
+use crate::choices::Choices;
 use crate::prefs;
 use crate::settings::{self, Extra};
 use crate::status::View;
@@ -33,13 +35,34 @@ pub struct SettingsView {
     updates: bool,
 }
 
-/// What the engine section shows: the engines found and the one chosen.
+/// What the engine section shows: the engines found and the one chosen, the
+/// official build the bridge can install, and whether to offer it instead.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnginesView {
     /// The engine `bridge.toml` names, if any.
     chosen: Option<String>,
     found: Vec<FoundEngine>,
+    install: Installable,
+    /// The chosen engine's name when it is an older Stockfish and the offer
+    /// was not put off for this bridge version.
+    offer_for: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Installable {
+    version: &'static str,
+    megabytes: u64,
+}
+
+/// An installation's progress, for the settings window.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallProgress {
+    phase: &'static str,
+    done: u64,
+    total: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,6 +71,9 @@ struct FoundEngine {
     name: String,
     path: String,
     source: &'static str,
+    /// For a build the bridge installed: its version, whose licence the
+    /// window can open.
+    version: Option<String>,
 }
 
 type Answer<T> = Result<T, String>;
@@ -144,16 +170,110 @@ pub async fn engines(app: AppHandle) -> Answer<EnginesView> {
 }
 
 fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
-    let config = config::load_or_create(&shared(app).config_path()?)?;
-    let found = engines::find(&Roots::system())
+    let shared = shared(app);
+    let config = config::load_or_create(&shared.config_path()?)?;
+    let data = shared.dir()?;
+    let roots = Roots { bridge_data: Some(data.clone()), ..Roots::system() };
+    let found: Vec<FoundEngine> = engines::find(&roots)
         .into_iter()
-        .map(|f| FoundEngine { name: f.name, path: f.path.to_string_lossy().into_owned(), source: f.source })
+        .map(|f| {
+            let version = (f.source == engines::BRIDGE)
+                .then(|| f.path.parent()?.file_name()?.to_str()?.strip_prefix("stockfish-").map(str::to_string))
+                .flatten();
+            FoundEngine { name: f.name, path: f.path.to_string_lossy().into_owned(), source: f.source, version }
+        })
         .collect();
-    Ok(EnginesView { chosen: config.engine.map(|p| p.to_string_lossy().into_owned()), found })
+    let build = Build::for_arch(stockfish::machine_arch());
+    let chosen = config.engine.map(|p| p.to_string_lossy().into_owned());
+    // The chosen engine's name as found, else its file's name.
+    let chosen_name = chosen.as_ref().map(|path| {
+        found
+            .iter()
+            .find(|f| &f.path == path)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(".exe").to_string())
+    });
+    // An installed pinned build is in the list already: nothing to offer.
+    let dismissed = stockfish::is_installed(&data, build)
+        || prefs::load(&data).stockfish_offer_dismissed.as_deref() == Some(env!("CARGO_PKG_VERSION"));
+    let offer_for = match (&chosen, &chosen_name) {
+        (Some(path), Some(name)) if !dismissed && stockfish::offer(Some((Path::new(path), name))).is_some() => {
+            Some(name.clone())
+        }
+        _ => None,
+    };
+    Ok(EnginesView {
+        chosen,
+        found,
+        install: Installable { version: build.version, megabytes: build.megabytes() },
+        offer_for,
+    })
+}
+
+/// One installation at a time.
+static INSTALLING: Mutex<()> = Mutex::new(());
+
+/// Installs the official Stockfish pinned in this release, then chooses it.
+/// The progress goes to the settings window as `stockfish-progress` events.
+/// A failure answers why, in English, for the window to show. The download
+/// holds no lock another choice waits on: only the probe and the save do.
+#[tauri::command]
+pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
+    let data = shared(&app).dir()?;
+    let config_path = shared(&app).config_path()?;
+    let window = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
+        let Ok(_installing) = INSTALLING.try_lock() else {
+            return Err("Stockfish is being installed already".into());
+        };
+        let ticket = CHOICES.ticket();
+        let build = Build::for_arch(stockfish::machine_arch());
+        let exe = stockfish::install(&data, build, &stockfish::System, &mut |progress| {
+            let (phase, done, total) = match progress {
+                Progress::Downloading { done, total } => ("downloading", done, total),
+                Progress::Checking => ("checking", 0, 0),
+                Progress::Unpacking => ("unpacking", 0, 0),
+            };
+            let _ = window.emit_to(windows::SETTINGS, "stockfish-progress", InstallProgress { phase, done, total });
+        })?;
+        let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
+        engine::probe(&exe)?;
+        // A choice made while the download ran stands; the build stays listed.
+        CHOICES.choose_if_current(ticket, &config_path, exe).map(|_| ())
+    })
+    .await
+    .map_err(text)??;
+    tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
+}
+
+/// Opens the licence of the Stockfish `version` the bridge installed. Only a
+/// version is taken from the window; the path is the bridge's own.
+#[tauri::command]
+pub fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
+    if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return Err("not a Stockfish version".into());
+    }
+    let licence = shared(&app).dir()?.join("engines").join(format!("stockfish-{version}")).join(stockfish::LICENCE);
+    if !licence.is_file() {
+        return Err(format!("{} is missing", licence.display()));
+    }
+    app.opener().open_path(licence.to_string_lossy(), None::<&str>).map_err(text)
+}
+
+/// Puts off the Stockfish offer until the next bridge version.
+#[tauri::command]
+pub async fn dismiss_stockfish_offer(app: AppHandle) -> Answer<EnginesView> {
+    let dir = shared(&app).dir()?;
+    let prefs = prefs::Prefs { stockfish_offer_dismissed: Some(env!("CARGO_PKG_VERSION").into()), ..prefs::load(&dir) };
+    prefs::save(&dir, &prefs)?;
+    tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
 /// One choice at a time: a slow probe cannot save its engine over a later one.
 static CHOOSING: Mutex<()> = Mutex::new(());
+/// The choices saved, so that an installation that ends later does not
+/// replace a choice made while it ran.
+static CHOICES: Choices = Choices::new();
 
 /// Chooses the engine at `path` once it answers as a UCI engine. A file that
 /// does not is refused with the dictionary key of the message. The bridge
@@ -166,8 +286,7 @@ pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> 
     tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
         let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
         engine::probe(&program).map_err(|_| "settings.engine.refused".to_string())?;
-        let next = config::Config { engine: Some(program), ..config::load_or_create(&config_path)? };
-        config::save(&config_path, &next)
+        CHOICES.choose(&config_path, program)
     })
     .await
     .map_err(text)??;
@@ -209,7 +328,7 @@ pub fn switch_autostart(app: &AppHandle, on: bool) -> Answer<()> {
 #[tauri::command]
 pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
-    prefs::save(&dir, &prefs::Prefs { auto_update: on })?;
+    prefs::save(&dir, &prefs::Prefs { auto_update: on, ..prefs::load(&dir) })?;
     settings_view(&app)
 }
 

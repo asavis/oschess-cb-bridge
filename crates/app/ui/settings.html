@@ -45,6 +45,16 @@
     <section id="engine" hidden>
       <h1 data-i18n="settings.engine.title">Рушій</h1>
       <p class="intro" data-i18n="settings.engine.intro"></p>
+      <div class="cards offer" id="engine-offer" hidden>
+        <div class="row top" data-icon="download">
+          <div class="text">
+            <div id="offer-title"></div>
+            <div class="cap12" id="offer-hint"></div>
+          </div>
+          <button class="btn accent" id="offer-update" data-i18n="settings.engine.offer.update"></button>
+          <button class="btn quiet" id="offer-later" data-i18n="settings.engine.offer.later"></button>
+        </div>
+      </div>
       <div class="cards" id="engine-none" hidden>
         <div class="row top" data-icon="alert">
           <div class="text">
@@ -52,7 +62,12 @@
             <div class="cap12" data-i18n="settings.engine.none.hint"></div>
           </div>
         </div>
+        <div class="row">
+          <div class="text"><div class="cap12" id="install-hint"></div></div>
+          <button class="btn accent" id="install-stockfish" data-i18n="settings.engine.install"></button>
+        </div>
       </div>
+      <div class="cap12" id="install-progress" hidden></div>
       <div class="group">
         <div class="lbl" data-i18n="settings.engine.found.title"></div>
         <div class="cap12" data-i18n="settings.engine.found.hint"></div>

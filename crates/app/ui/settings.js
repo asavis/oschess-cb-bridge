@@ -3,6 +3,7 @@
 'use strict';
 
 let current = null;
+let engines = null;
 
 async function main() {
   await loadWords();
@@ -78,7 +79,20 @@ function renderSettings(settings) {
 
 // The engines found, one of them chosen; an engine chosen by its file comes first.
 function renderEngines(view) {
-  const rows = view.found.map((f) => engineRow(f.name, `${t('settings.engine.from', { source: f.source })} · ${f.path}`, f.path, view.chosen));
+  engines = view;
+  document.getElementById('install-hint').textContent =
+    t('settings.engine.installHint', { version: view.install.version, mb: view.install.megabytes });
+  const offer = document.getElementById('engine-offer');
+  offer.hidden = !view.offerFor;
+  if (view.offerFor) {
+    document.getElementById('offer-title').textContent = t('settings.engine.offer.title', { version: view.install.version });
+    document.getElementById('offer-hint').textContent =
+      t('settings.engine.offer.hint', { current: view.offerFor, mb: view.install.megabytes });
+  }
+  const rows = view.found.map((f) => {
+    const origin = f.source === 'bridge' ? t('settings.engine.installedByBridge') : t('settings.engine.from', { source: f.source });
+    return engineRow(f.name, `${origin} · ${f.path}`, f.path, view.chosen, f.version);
+  });
   if (view.chosen && !view.found.some((f) => f.path === view.chosen)) {
     const name = view.chosen.split(/[\\/]/).pop();
     rows.unshift(engineRow(name, view.chosen, view.chosen, view.chosen));
@@ -87,7 +101,7 @@ function renderEngines(view) {
   document.getElementById('engine-none').hidden = rows.length > 0;
 }
 
-function engineRow(name, detail, path, chosen) {
+function engineRow(name, detail, path, chosen, version) {
   const radio = el('input');
   radio.type = 'radio';
   radio.name = 'engine';
@@ -95,7 +109,16 @@ function engineRow(name, detail, path, chosen) {
   radio.addEventListener('change', () => chooseEngine(() => call('choose_engine', { path })));
   const text = el('div', 'text', el('div', null, name), el('div', 'cap12 path', detail));
   text.lastChild.title = detail;
-  return el('label', 'row engine', radio, text);
+  // A build the bridge installed carries its licence beside it.
+  let licence = null;
+  if (version) {
+    licence = el('button', 'btn quiet', t('settings.engine.licence'));
+    licence.addEventListener('click', (e) => {
+      e.preventDefault();
+      act(call('open_stockfish_licence', { version }));
+    });
+  }
+  return el('label', 'row engine', radio, text, licence);
 }
 
 // One choice at a time: the controls wait while an engine is checked, so a
@@ -122,7 +145,35 @@ function chooseEngine(start) {
 
 function enginesBusy(busy) {
   for (const input of document.querySelectorAll('#engines input')) input.disabled = busy;
-  document.getElementById('pick-engine').disabled = busy;
+  for (const id of ['pick-engine', 'install-stockfish', 'offer-update', 'offer-later']) {
+    document.getElementById(id).disabled = busy;
+  }
+}
+
+// Installs the pinned Stockfish, showing its progress, then chooses it. A
+// failure shows why; the choice stays as it was.
+function installStockfish() {
+  if (choosing) return;
+  choosing = true;
+  enginesBusy(true);
+  const line = document.getElementById('install-progress');
+  line.textContent = t('settings.engine.progress.downloading', { done: 0, total: engines ? engines.install.megabytes : 0 });
+  line.hidden = false;
+  call('install_stockfish')
+    .then(renderEngines, (message) => notice(t('settings.engine.installFailed', { message: String(message) })))
+    .finally(() => {
+      choosing = false;
+      enginesBusy(false);
+      line.hidden = true;
+    });
+}
+
+function showInstallProgress(progress) {
+  const line = document.getElementById('install-progress');
+  const mb = (bytes) => Math.round(bytes / 1048576);
+  line.textContent = progress.phase === 'downloading'
+    ? t('settings.engine.progress.downloading', { done: mb(progress.done), total: mb(progress.total) })
+    : t(`settings.engine.progress.${progress.phase}`);
 }
 
 function toggle(id, onNow) {
@@ -134,6 +185,10 @@ function wire() {
   document.getElementById('add-folder').addEventListener('click', () =>
     act(call('add_folder').then((settings) => settings && renderSettings(settings))));
   document.getElementById('pick-engine').addEventListener('click', () => chooseEngine(() => call('pick_engine')));
+  document.getElementById('install-stockfish').addEventListener('click', installStockfish);
+  document.getElementById('offer-update').addEventListener('click', installStockfish);
+  document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
+  on('stockfish-progress', showInstallProgress);
   document.getElementById('autostart').addEventListener('click', () =>
     act(call('set_autostart', { on: !current.autostart }).then(renderSettings)));
   document.getElementById('auto-update').addEventListener('click', () =>
