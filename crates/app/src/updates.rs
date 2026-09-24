@@ -10,6 +10,7 @@
 //! [docs/release.md]: https://github.com/asavis/oschess-cb-bridge/blob/main/docs/release.md
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use serde_json::Value;
 
@@ -21,55 +22,55 @@ const NOTE: &str = "updating-to";
 
 /// The updater's public key in the `updater` section of the plugins'
 /// configuration, when it is a real one; `None` when there is no section or
-/// no key, or the key is the placeholder or anything else that is not a key.
+/// no key, or the key is the placeholder or anything else the updater could
+/// not use. Surrounding white space is dropped, and the app hands the updater
+/// this value, never the raw one.
 pub fn public_key(updater: Option<&Value>) -> Option<&str> {
     let key = updater?.get("pubkey")?.as_str()?.trim();
     is_public_key(key).then_some(key)
 }
 
-/// Whether `key` is what `tauri signer generate` prints as the public key: a
-/// minisign public key file in base64, whose second line is, in base64 again,
-/// an Ed25519 key: `Ed`, an 8-byte key id and the 32 bytes of the key.
+/// Whether the updater accepts `key`: it is decoded exactly as
+/// tauri-plugin-updater decodes it before checking a signature, standard
+/// base64 and then a minisign public key (an algorithm, an 8-byte key id and
+/// the 32 bytes of an Ed25519 key), and it opens with an untrusted comment, as
+/// `tauri signer generate` writes it.
 fn is_public_key(key: &str) -> bool {
-    let Some(text) = base64(key).and_then(|bytes| String::from_utf8(bytes).ok()) else { return false };
-    let mut lines = text.lines();
-    let comment = lines.next().is_some_and(|line| line.starts_with("untrusted comment:"));
-    let key = lines.next().and_then(|line| base64(line.trim()));
-    comment && key.is_some_and(|k| k.len() == 42 && k.starts_with(b"Ed"))
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(key) else { return false };
+    let Ok(text) = String::from_utf8(bytes) else { return false };
+    text.lines().next().is_some_and(|line| line.starts_with("untrusted comment:"))
+        && minisign_verify::PublicKey::decode(&text).is_ok()
 }
 
-/// Standard padded base64; `None` for anything else.
-fn base64(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
-        return None;
+/// One look for updates at a time. An automatic look skips while another
+/// runs; a look on request waits for the running one and then looks itself,
+/// so the user always hears the outcome of the look they asked for.
+pub struct Gate(Mutex<()>);
+
+impl Default for Gate {
+    fn default() -> Gate {
+        Gate::new()
     }
-    let digit = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32)
-    };
-    let (groups, _) = bytes.as_chunks::<4>();
-    let last = groups.len() - 1;
-    let mut out = Vec::with_capacity(groups.len() * 3);
-    for (i, group) in groups.iter().enumerate() {
-        let pad = group.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 || (pad > 0 && i != last) {
-            return None;
-        }
-        let mut n = 0u32;
-        for &c in &group[..4 - pad] {
-            n = n << 6 | digit(c)?;
-        }
-        n <<= 6 * pad as u32;
-        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+}
+
+impl Gate {
+    pub const fn new() -> Gate {
+        Gate(Mutex::new(()))
     }
-    Some(out)
+
+    /// Enters the gate for a look, `asked` or automatic; `None` when an
+    /// automatic look should skip. The look runs while the guard lives.
+    pub fn enter(&self, asked: bool) -> Option<MutexGuard<'_, ()>> {
+        if asked {
+            return Some(self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+        match self.0.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        }
+    }
 }
 
 /// Whether an update may be installed now: no database is downloading or
@@ -130,18 +131,6 @@ mod tests {
         serde_json::json!({ "pubkey": pubkey, "endpoints": ["https://example.org/latest.json"] })
     }
 
-    #[test]
-    fn base64_decodes_what_it_should_and_nothing_else() {
-        for bytes in [&b"f"[..], b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0, 255, 128, 1]] {
-            assert_eq!(base64(&encode(bytes)).as_deref(), Some(bytes), "{bytes:?}");
-        }
-        assert_eq!(encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64("Zm9vYg=="), Some(b"foob".to_vec()));
-        for bad in ["", "Zm9", "Zm9vY===", "Zg==Zm9v", "Z=9v", "Zm9v YmFy", "Zm9v\nYmFy", "Zm9-", "Zm9vYmFy="] {
-            assert_eq!(base64(bad), None, "{bad:?}");
-        }
-    }
-
     /// With the placeholder that ships until the owner has a key, this build
     /// registers no updater and never looks for updates: the app starts as
     /// before. A key put in its place must be one, or this fails. The release
@@ -173,15 +162,50 @@ mod tests {
         assert_eq!(public_key(Some(&updater(&format!("  {good}\n")))), Some(good.as_str()), "surrounding space");
 
         let short = tauri_key(&ed25519()[..41]);
-        let other_algorithm = tauri_key(&[&b"ED"[..], &ed25519()[2..]].concat());
         let no_comment = encode(format!("{}\n", encode(&ed25519())).as_bytes());
         let bare_line = encode(&ed25519());
-        for bad in ["", "REPLACE-ME", &short, &other_algorithm, &no_comment, &bare_line, &good[1..]] {
+        for bad in ["", "REPLACE-ME", &short, &no_comment, &bare_line, &good[1..]] {
+            assert_eq!(public_key(Some(&updater(bad))), None, "{bad:?}");
+        }
+        // What the updater's own decoding refuses is refused here too:
+        // non-zero padding bits in the outer base64, and space around the key
+        // line inside it.
+        let padded = {
+            let text = format!("untrusted comment: minisign public key: 1A2B3C4D5E6F\n{}\n", encode(&ed25519()));
+            assert_ne!(text.len() % 3, 0, "the outer base64 ends in padding");
+            encode(text.as_bytes())
+        };
+        assert_eq!(public_key(Some(&updater(&padded))), Some(padded.as_str()));
+        let last = padded.trim_end_matches('=').len() - 1;
+        let mut loose = padded.clone().into_bytes();
+        loose[last] += 1;
+        let loose = String::from_utf8(loose).unwrap();
+        let spaced = encode(format!("untrusted comment: minisign\n {} \n", encode(&ed25519())).as_bytes());
+        for bad in [&loose, &spaced] {
             assert_eq!(public_key(Some(&updater(bad))), None, "{bad:?}");
         }
         assert_eq!(public_key(None), None);
         assert_eq!(public_key(Some(&serde_json::json!({ "endpoints": [] }))), None);
         assert_eq!(public_key(Some(&serde_json::json!({ "pubkey": 7 }))), None);
+    }
+
+    #[test]
+    fn a_look_on_request_waits_and_an_automatic_one_skips() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        static GATE: Gate = Gate::new();
+        let running = GATE.enter(false).expect("the first look enters");
+        assert!(GATE.enter(false).is_none(), "an automatic look skips while one runs");
+        let (tx, rx) = mpsc::channel();
+        let asked = std::thread::spawn(move || {
+            let _look = GATE.enter(true).expect("a look on request always runs");
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "it waits for the running look");
+        drop(running);
+        rx.recv_timeout(Duration::from_secs(10)).expect("then it runs");
+        asked.join().unwrap();
+        assert!(GATE.enter(false).is_some(), "and the gate is free again");
     }
 
     #[test]

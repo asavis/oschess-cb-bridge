@@ -4,7 +4,6 @@
 //! once and installs when the bridge is idle: its installer runs without a
 //! window, replaces the app and starts it again, and the new start says so.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tauri::plugin::TauriPlugin;
@@ -20,15 +19,15 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// How often a downloaded update asks again whether the bridge is idle.
 const IDLE_POLL: Duration = Duration::from_secs(30);
 
-/// Set while a look or an install runs, so that a look on request does not
-/// start a second one.
-static BUSY: AtomicBool = AtomicBool::new(false);
+/// One look or install at a time; a look on request waits for a running one.
+static GATE: updates::Gate = updates::Gate::new();
 
 /// The updater plugin, when `config` holds a real key; `None` keeps the
-/// updater out, and nothing looks for updates.
+/// updater out, and nothing looks for updates. The plugin gets the key as
+/// checked, without surrounding space, never the raw configuration value.
 pub fn plugin<R: Runtime>(config: &tauri::Config) -> Option<TauriPlugin<R, tauri_plugin_updater::Config>> {
-    updates::public_key(config.plugins.0.get("updater"))?;
-    Some(tauri_plugin_updater::Builder::new().build())
+    let key = updates::public_key(config.plugins.0.get("updater"))?;
+    Some(tauri_plugin_updater::Builder::new().pubkey(key).build())
 }
 
 /// Whether this build looks for updates: its configuration holds a real key.
@@ -73,13 +72,12 @@ pub fn look_now(app: &AppHandle) {
 }
 
 /// Looks for a newer version and installs it. `asked`: the user asked, so the
-/// outcome is told whatever it is; otherwise only the new start speaks.
+/// outcome is told whatever it is, after any look already running; otherwise
+/// only the new start speaks, and a look already running makes this one skip.
 fn look(app: &AppHandle, asked: bool) {
-    if BUSY.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let Some(running) = GATE.enter(asked) else { return };
     let outcome = look_and_install(app, asked);
-    BUSY.store(false, Ordering::SeqCst);
+    drop(running);
     if let Err(e) = outcome {
         eprintln!("oschess bridge: update: {e}");
         if asked {
