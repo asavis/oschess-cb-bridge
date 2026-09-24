@@ -86,7 +86,7 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
         return command("raw", &[("type", format!("{code:02x}")), ("data", raw)]);
     }
     let byte = |i: usize| data.get(i).copied().unwrap_or_default();
-    let int = |i: usize| data.get(i..i + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let int = |i: usize| data.get(i..i + 4).map_or(0, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     // An `int` length at `i` and that many bytes: the text and where the
     // next field starts.
     let text = |i: usize| -> (String, usize) {
@@ -120,9 +120,9 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
         }
         (0x24, _) => match timing::time_control(data, false) {
             Some(stages) => {
+                // Keys are letters only: the stages are A, B and C.
                 let mut fields = Vec::new();
-                for (k, st) in stages.iter().enumerate().filter(|(_, st)| **st != timing::Stage::default()) {
-                    let n = k + 1;
+                for (st, n) in stages.iter().zip(['A', 'B', 'C']).filter(|(st, _)| **st != timing::Stage::default()) {
                     fields.push((format!("kind{n}"), st.kind.to_string()));
                     fields.push((format!("initial{n}"), seconds(st.initial)));
                     fields.push((format!("increment{n}"), seconds(st.increment)));
@@ -141,7 +141,8 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
                 "training",
                 &[
                     ("variant", byte(2).to_string()),
-                    ("seconds", int(6).to_string()),
+                    // A negative time allowed means nothing; the data keeps it.
+                    ("seconds", Some(int(6)).filter(|s| *s >= 0).map(|s| s.to_string()).unwrap_or_default()),
                     ("points", u16::from_le_bytes([byte(10), byte(11)]).to_string()),
                     ("data", raw),
                 ],
@@ -286,11 +287,14 @@ pub(super) fn graphic(a: &Annotation) -> Option<String> {
     Some(format!("[%cb{name} data={}]", base64url(&data)))
 }
 
-/// Hundredths of a second as seconds, with two decimals only when needed.
+/// Hundredths of a second as seconds, with two decimals only when needed;
+/// a negative value keeps its sign.
 fn seconds(hundredths: i32) -> String {
-    match hundredths % 100 {
-        0 => (hundredths / 100).to_string(),
-        _ => format!("{}.{:02}", hundredths / 100, (hundredths % 100).abs()),
+    let sign = if hundredths < 0 { "-" } else { "" };
+    let abs = hundredths.unsigned_abs();
+    match abs % 100 {
+        0 => format!("{sign}{}", abs / 100),
+        f => format!("{sign}{}.{f:02}", abs / 100),
     }
 }
 
@@ -343,6 +347,45 @@ mod tests {
         assert_eq!(base64url(b"fo"), "Zm8");
         assert_eq!(base64url(b"foo"), "Zm9v");
         assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
+    }
+
+    #[test]
+    fn times_keep_their_sign() {
+        let cases = [
+            (0, "0"),
+            (125, "1.25"),
+            (-1, "-0.01"),
+            (-25, "-0.25"),
+            (-99, "-0.99"),
+            (-100, "-1"),
+            (-125, "-1.25"),
+            (i32::MAX, "21474836.47"),
+            (i32::MIN, "-21474836.48"),
+        ];
+        for (hundredths, want) in cases {
+            assert_eq!(seconds(hundredths), want, "{hundredths}");
+        }
+    }
+
+    #[test]
+    fn scores_and_times_as_pgn() {
+        let cases = [
+            (0, "[%eval 0.00]"),
+            (-1, "[%eval -0.01]"),
+            (-25, "[%eval -0.25]"),
+            (-99, "[%eval -0.99]"),
+            (-100, "[%eval -1.00]"),
+            (-125, "[%eval -1.25]"),
+            (i16::MAX, "[%eval 327.67]"),
+            (i16::MIN, "[%eval -327.68]"),
+        ];
+        for (cp, want) in cases {
+            assert_eq!(eval(Score::Centipawns(cp)), want, "{cp}");
+        }
+        assert_eq!(eval(Score::Mate(-3)), "[%eval #-3]");
+        assert_eq!(eval(Score::Mate(i16::MIN)), "[%eval #-32768]");
+        assert_eq!(emt((0, 0, 0)), "[%emt 0:00:00]");
+        assert_eq!(emt((255, 59, 59)), "[%emt 255:59:59]");
     }
 
     #[test]

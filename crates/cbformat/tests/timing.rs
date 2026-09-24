@@ -126,6 +126,34 @@ fn engine_evaluations_time_spent_and_time_control() {
         assert_eq!(timing::time_control(&bad, false), None);
     }
     assert_eq!(timing::time_control(&d, true), None, "classic is not decoded");
+    // A negative time means nothing in a time control: such a record is not
+    // decoded, and its data stays raw. The extremes of an `int` are read.
+    for negative in [-1, -25, -99, -100, -125, i32::MIN] {
+        assert_eq!(timing::time_control(&control(&[(125, negative, 40, 1)]), false), None, "increment {negative}");
+        assert_eq!(timing::time_control(&control(&[(negative, 0, 1000, 0)]), false), None, "initial {negative}");
+    }
+    let max = timing::time_control(&control(&[(i32::MAX, i32::MAX, u16::MAX, 3)]), false).unwrap();
+    assert_eq!(max[0], Stage { initial: i32::MAX, increment: i32::MAX, moves: u16::MAX, kind: 3 });
+}
+
+#[test]
+fn every_time_the_bridge_writes() {
+    // A negative increment: the time control stays raw, never a positive time.
+    let content = annotations(&[
+        (-1, vec![other(0x24, &control(&[(125, -25, 40, 1)]))]),
+        (0, vec![other(0x07, &[0, 59, 59, 255])]),
+        (1, vec![other(0x24, &control(&[(i32::MAX, 1, u16::MAX, 3)]))]),
+    ]);
+    let mut b = Builder::new();
+    let moves = three_moves(&mut b);
+    let a = b.annotations(&content);
+    b.annotated_game(moves, a);
+    let db = b.write("timing-extremes");
+    let full = render(&db, true);
+    assert!(full.starts_with("{[%cbraw type=24;data="), "{full}");
+    assert!(!full.contains("0.25"), "{full}");
+    assert!(full.contains("1. e4 {[%emt 255:59:59]}"), "{full}");
+    assert!(full.contains("[%cbtimecontrol kindA=3;initialA=21474836.47;incrementA=0.01;movesA=65535;data="), "{full}");
 }
 
 /// 1. e4 e5 2. Nf3
@@ -166,7 +194,7 @@ fn both_forms_write_the_evaluations_and_the_full_form_the_moves_scores() {
     assert_eq!(render(&db, false), "{[%evp 0,3,15,32,-29997,32767]} 1. e4 e5 2. Nf3");
     let full = render(&db, true);
     assert!(full.starts_with("{[%evp 0,3,15,32,-29997,32767]} {[%cbraw type=26;data="), "the data is kept: {full}");
-    assert!(full.contains("[%cbtimecontrol kind1=3;initial1=7200;increment1=30;moves1=1000;data="), "{full}");
+    assert!(full.contains("[%cbtimecontrol kindA=3;initialA=7200;incrementA=30;movesA=1000;data="), "{full}");
     // Each main-line move takes its entry; a move's own evaluation (type 21)
     // wins over the main line's; the time spent follows.
     assert!(full.contains("1. e4 {[%eval 0.32] [%emt 0:00:12]} {[%cbraw type=07;data=AAwAAA]}"), "{full}");

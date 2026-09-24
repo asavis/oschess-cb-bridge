@@ -108,7 +108,9 @@ pub struct Stage {
 }
 
 /// A type-`24` record, 2CBH only: `01`, three 11-byte stages (`int` initial
-/// time, `int` increment, `short` moves, a kind byte) and an `int` 0.
+/// time, `int` increment, `short` moves, a kind byte) and an `int` 0. A
+/// negative time means nothing in a time control, so a record holding one is
+/// not decoded.
 pub fn time_control(data: &[u8], classic: bool) -> Option<[Stage; 3]> {
     let d: &[u8; 38] = data.try_into().ok().filter(|_| !classic)?;
     if d[0] != 1 || d[34..] != [0; 4] {
@@ -119,5 +121,6 @@ pub fn time_control(data: &[u8], classic: bool) -> Option<[Stage; 3]> {
         let int = |i: usize| i32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
         Stage { initial: int(0), increment: int(4), moves: u16::from_le_bytes([s[8], s[9]]), kind: s[10] }
     };
-    Some([stage(0), stage(1), stage(2)])
+    let stages = [stage(0), stage(1), stage(2)];
+    stages.iter().all(|s| s.initial >= 0 && s.increment >= 0).then_some(stages)
 }

@@ -221,7 +221,9 @@ rest of the game) and a kind byte:
 - 5 no time;
 - 2, in one Mega record, **unknown**.
 
-All 21,073 records in the Mega read this way and end in `00 00 00 00`. Every
+No record in the Mega holds a negative time. Since a negative time means
+nothing in a time control, a record holding one is not decoded, and keeps its
+data. All 21,073 records in the Mega read this way and end in `00 00 00 00`. Every
 time is a whole number of seconds in the 21,063 records checked for it, one
 per game. The classic layout has no
 paired example and is not decoded.

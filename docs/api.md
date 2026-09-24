@@ -511,8 +511,8 @@ Nothing the bridge reads is left out of the full form
 | `[%cbcolour …]` | `23` variation colour | none |
 | `[%cblink …]` | `1c` web link | `url`, `caption` |
 | `[%cbvideo …]` | `20` video | `language` (a number), `caption` |
-| `[%cbtraining …]` | `09` training question | `variant`, `seconds`, `points` |
-| `[%cbtimecontrol …]` | `24` time control, 2CBH | per stage `n` of up to three, a stage all zero left out: `kind<n>` (0 the rest of the game, 1 a stage of `moves<n>` moves, 3 the rest of the game with an increment, 5 no time, 2 unknown), `initial<n>` and `increment<n>` in seconds, `moves<n>` (1000 for the rest of the game) |
+| `[%cbtraining …]` | `09` training question | `variant`, `seconds` (left out when negative), `points` |
+| `[%cbtimecontrol …]` | `24` time control, 2CBH | per stage `A`, `B` and `C`, a stage all zero left out: `kindA` (0 the rest of the game, 1 a stage of `movesA` moves, 3 the rest of the game with an increment, 5 no time, 2 unknown), `initialA` and `incrementA` in seconds, `movesA` (1000 for the rest of the game); likewise `…B` and `…C`. A record holding a negative time is written as `[%cbraw]` |
 | `[%cbraw type=<hex>;data=…]` | any other type, and in a classic database every type but texts, symbols, squares, arrows, quotations and medals, whose layouts there are not decoded | `type`, two hex digits |
 | `[%cbrest type=<hex>;data=…]` | the bytes of the record after a type of unknown layout, in the game comment; the game is `incomplete` | `type` |
 
