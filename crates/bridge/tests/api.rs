@@ -732,15 +732,27 @@ fn a_change_to_the_annotations_during_the_read_is_retried() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
-/// An annotation on a move the game does not have is a damaged record.
+/// An annotation past the last move is served after the main line's last
+/// move; one in a game without moves is a damaged record.
 #[test]
-fn an_annotation_on_no_move_is_an_unreadable_game() {
+fn an_annotation_past_the_end_is_served_and_one_on_no_move_is_an_unreadable_game() {
     let content = annotations(&[(2, vec![text(false, language::ENGLISH, "past the end")])]);
-    let db = annotated_database("api-annotation-no-move", &content);
+    let db = annotated_database("api-annotation-past-end", &content);
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 200, "{}", g.body);
+    assert!(g.body.contains("1. e4 e5 {past the end}"), "{}", g.body);
+    assert!(g.body.ends_with(r#""annotations":"complete"}"#), "{}", g.body);
+
+    let mut b = Builder::new();
+    let none = b.moves(1, &[MOVES, END_OF_LINE]);
+    let a = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "on no move")])]));
+    b.annotated_game(none, a);
+    let db = b.write("api-annotation-no-move");
     let r = start(&db, vec![], None);
     let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
     assert_eq!(g.status, 422, "{}", g.body);
-    assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("position 2"), "{}", g.body);
+    assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("position 0"), "{}", g.body);
 }
 
 #[test]

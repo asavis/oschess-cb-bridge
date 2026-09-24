@@ -417,7 +417,7 @@ One game as PGN.
 
 | Field | Meaning |
 |---|---|
-| `pgn` | The game, with its variations and its annotations: comments in `{}`, symbols as NAGs, coloured squares and arrows as `[%csl ...]` and `[%cal ...]` (green, yellow and red; ChessBase's other colours are left out). Annotation types PGN has no form for (training questions, clocks, game quotations, medals and the like) are left out |
+| `pgn` | The game, with its variations and its annotations: comments in `{}`, symbols as NAGs, coloured squares and arrows as `[%csl ...]` and `[%cal ...]` (green, yellow and red; ChessBase's other colours are left out). Annotation types PGN has no form for (training questions, clocks, game quotations, medals and the like) are left out. An annotation stored past the game's last move follows the main line's last move, its texts after that move |
 | `annotations` | `none` when the game has no annotations or the database no annotation file; `complete` when every annotation was read; `incomplete` when an annotation of unknown layout stopped decoding, and the PGN then has the annotations before it |
 | `unreadableAnnotation` | With `incomplete`: the annotation type code, a number |
 

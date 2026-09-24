@@ -15,16 +15,30 @@ use crate::view::PositionOrder;
 /// its texts are written in.
 pub(super) struct Commentary<'a> {
     by_position: BTreeMap<i32, Vec<&'a Annotation>>,
+    /// The annotations past the game's last move, by position: they follow
+    /// the main line's last move.
+    past_end: Vec<Vec<&'a Annotation>>,
+    /// The main line's last move in stored order.
+    last: Option<u32>,
     language: Option<u16>,
     order: PositionOrder,
 }
 
 impl<'a> Commentary<'a> {
-    pub(super) fn new(annotations: &'a GameAnnotations, order: PositionOrder, options: &Options) -> Self {
+    /// The annotations of a game with `moves` moves whose main line ends at
+    /// the stored move `last`.
+    pub(super) fn new(
+        annotations: &'a GameAnnotations,
+        order: PositionOrder,
+        options: &Options,
+        moves: u32,
+        last: Option<u32>,
+    ) -> Self {
         let mut by_position: BTreeMap<i32, Vec<&Annotation>> = BTreeMap::new();
         for b in &annotations.blocks {
             by_position.entry(b.position).or_default().extend(&b.annotations);
         }
+        let past_end = by_position.split_off(&i32::try_from(moves).unwrap_or(i32::MAX)).into_values().collect();
         let languages: Vec<u16> = annotations
             .blocks
             .iter()
@@ -43,7 +57,7 @@ impl<'a> Commentary<'a> {
             .chain([language::ENGLISH])
             .find(|l| languages.contains(l))
             .or(languages.first().copied());
-        Commentary { by_position, language, order }
+        Commentary { by_position, past_end, last, language, order }
     }
 
     /// The annotations at the move `at`, in this game's numbering.
@@ -90,8 +104,15 @@ impl Notes for Commentary<'_> {
     }
 
     fn after(&mut self, at: At, out: &mut String) -> bool {
-        let Some(anns) = self.at(at) else { return false };
-        for a in anns {
+        let own = self.at(at).map_or(&[][..], Vec::as_slice);
+        // Past the last move, every text follows the main line's last move,
+        // those meant to precede a move included.
+        let past_end = if self.last == Some(at.stored) { &self.past_end[..] } else { &[] };
+        if own.is_empty() && past_end.is_empty() {
+            return false;
+        }
+        let all: Vec<&Annotation> = own.iter().chain(past_end.iter().flatten()).copied().collect();
+        for a in &all {
             if let Annotation::Symbols { on_move, on_position, prefix } = a {
                 for nag in [on_move, on_position, prefix] {
                     if *nag != 0 {
@@ -101,8 +122,12 @@ impl Notes for Commentary<'_> {
                 }
             }
         }
-        let mut parts = graphics(anns);
-        parts.extend(self.texts(anns, false));
+        let mut parts = graphics(&all);
+        parts.extend(self.texts(own, false));
+        for anns in past_end {
+            parts.extend(self.texts(anns, true));
+            parts.extend(self.texts(anns, false));
+        }
         comment(out, &parts, " ", "")
     }
 }

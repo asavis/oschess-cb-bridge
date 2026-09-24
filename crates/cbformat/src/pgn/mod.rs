@@ -94,10 +94,11 @@ fn write_tree(
     let mut out = String::with_capacity(tree.text_len());
     match annotations.filter(|a| !a.is_empty()) {
         Some(a) => {
-            // An annotation on a move the game does not have is damage, not
-            // something to drop quietly.
+            // An annotation past the last move follows the main line's last
+            // move; in a game without moves it is damage, not something to
+            // drop quietly.
             a.check_positions(stats.total_plies)?;
-            let mut commentary = Commentary::new(a, order, options);
+            let mut commentary = Commentary::new(a, order, options, stats.total_plies, tree.last_main_move());
             commentary.game_comment(&mut out);
             emit(&tree, &mut commentary, &mut out);
         }

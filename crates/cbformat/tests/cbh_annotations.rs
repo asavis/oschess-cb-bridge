@@ -197,12 +197,36 @@ fn damaged_records_are_errors() {
 }
 
 #[test]
+fn annotations_past_the_last_move_follow_the_main_line_last_move() {
+    // The last stored move, 2. e5, is in a variation; the main line ends at 3. d4.
+    let items: Vec<(i32, u8, &[u8])> = vec![
+        (4, 0x02, b"\x00\x2alast"),
+        (11, 0x82, b"\x00\x2abefore"),
+        (11, 0x03, &[1]),
+        (11, 0x04, &[2, 29]),
+        (12, 0x02, b"\x00\x2aafter"),
+        (0x7f_ffff, 0x02, b"\x00\x2afar away"),
+    ];
+    let (_f, db) = db("past-end", &documented(), &items);
+    let (text, status) = movetext(&db, &Options::default());
+    assert_eq!(
+        text,
+        "1. e4 c5 (1... c6 2. d4) (1... Nf6 2. e5) 2. Nf3 d6 (2... Nc6 3. Bb5) \
+         3. d4 $1 {[%csl Gd5] last before after far away}"
+    );
+    assert_eq!(status, AnnotationStatus::Complete);
+}
+
+#[test]
 fn annotations_on_no_move_are_damage() {
-    for position in [1, 5, 0x7f_ffff] {
-        let (_f, db) = db(&format!("past-{position}"), &one_move(), &[(position, 0x02, b"\x00\x2anote")]);
+    let none = move_record(0, None, None, &encode(&Board::startpos(), &[E], 0, false));
+    for (what, moves, position) in [("below the game", one_move(), -2), ("no moves", none.clone(), 0)] {
+        let (_f, db) = db(&format!("no-move-{position}"), &moves, &[(position, 0x02, b"\x00\x2anote")]);
         let err = pgn::classic_game_with(&db, 1, &Options::default()).unwrap_err();
-        assert!(err.to_string().contains("past the last"), "{err}");
+        assert!(err.to_string().contains("position"), "{what}: {err}");
     }
+    let (_f, db) = db("no-moves-game", &none, &[(-1, 0x02, b"\x00\x2agame")]);
+    assert_eq!(movetext(&db, &Options::default()).0, "{game}");
 }
 
 /// Every single-byte change and every truncation of a record is an error or a

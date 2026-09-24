@@ -154,18 +154,19 @@ impl GameAnnotations {
         }
     }
 
-    /// Checks that every position, the one where decoding stopped included,
-    /// is the game (−1) or one of its `moves` moves (all lines counted, as
-    /// [`crate::replay::TreeStats::total_plies`]). An annotation on no move
-    /// would otherwise be dropped from the PGN without a trace.
-    pub fn check_positions(&self, moves: u32) -> Result<()> {
+    /// Checks every position, the one where decoding stopped included,
+    /// against the game's `moves` moves (all lines counted, as
+    /// [`crate::replay::TreeStats::total_plies`]), and says how many
+    /// annotations lie past the last of them. The PGN writes those after the
+    /// main line's last move (asavis/oschess-cb-bridge#38). A game without
+    /// moves has no move to take them, so there any position but the game's
+    /// (−1) is an error: the annotation would otherwise vanish without a trace.
+    pub fn check_positions(&self, moves: u32) -> Result<usize> {
         let positions = self.blocks.iter().map(|b| b.position).chain(self.stopped_at.map(|u| u.position));
-        match positions.filter(|&p| p >= 0).max() {
-            Some(p) if p as u32 >= moves => {
-                Err(Error::Format(format!("annotations at position {p}, past the last of the game's {moves} moves")))
-            }
-            _ => Ok(()),
+        if let Some(p) = positions.filter(|&p| p >= 0).max().filter(|_| moves == 0) {
+            return Err(Error::Format(format!("annotations at position {p}, in a game without moves")));
         }
+        Ok(self.blocks.iter().filter(|b| i64::from(b.position) >= i64::from(moves)).map(|b| b.annotations.len()).sum())
     }
 
     /// No annotation at all, and nothing left undecoded.

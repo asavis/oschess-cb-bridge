@@ -104,10 +104,12 @@ and that many bytes. 22 in the Mega.
 **unknown**.
 
 **Positions** follow the description: PGN order, with each alternative right
-after the move it replaces. No annotation in any database examined names a
-position past the last move. Two symbol annotations in the Mega sit on
-position −1, the game as a whole; PGN has no place for a NAG before the first
-move, so they are not written.
+after the move it replaces. No annotation in any 2CBH database examined names a
+position past the last move. The reader writes one after the main line's last
+move, as for the classic format (below); only in a game without moves is it
+damage. Two symbol annotations in the Mega sit on position −1, the game as a
+whole; PGN has no place for a NAG before the first move, so they are not
+written.
 
 **Text languages** in the Mega: 798,578 English, 783,156 "any language" (7),
 320,588 German, then French, Spanish, Portuguese, Dutch, Italian, Polish and
@@ -308,8 +310,9 @@ The reader was checked against:
   positions and 157 null moves, equal the 2CBH Mega's first 4,964;
 - 245 databases that exist only in `.cbh` (40,635 games, 31,196 of them from
   set-up positions, 1,628 guiding texts, 6,854 null moves, 30,485 annotated
-  games): 243 verify with no failure. One is damaged (below), and one holds
-  two games with annotations past their last move (below).
+  games): 244 verify with no failure. One is damaged (below), and one holds
+  two games with annotations past their last move (below), which `verify`
+  counts.
 
 ## Findings
 
@@ -404,10 +407,14 @@ writer handles both formats alike.
 - **Checks.** The head's game id equals the game, and its count and size
   equal the record's contents, in every record of every database examined.
   The reader treats a mismatch, an annotation running past the record, a
-  position below −1 and a square out of range as damage. So is a position past
-  the last move, as for 2CBH: two set-up games of one classic-only database
-  have such annotations (positions 52 and 16, in games of 51 and 11 moves), and
-  both are reported as errors.
+  position below −1 and a square out of range as damage.
+- **Past the last move.** Two set-up games of one classic-only database have
+  annotations past their last move (positions 52 and 16, in games of 51 and 11
+  moves), and ChessBase opens both. The reader writes such an annotation after
+  the main line's last move, whatever its kind, and a text meant to precede a
+  move follows it there; the game is served in full, and `cbtool verify`
+  counts the games and the annotations moved. 2CBH is read the same way. In a
+  game without moves there is no move to take them, so there it stays damage.
 - **Record size.** A record's head may claim up to 4 GiB. The largest record
   in the 252 classic databases examined is about 45 KB, so a record over
   16 MiB (`cbh::MAX_ANNOTATION_RECORD`) is refused before it is read, as 2CBH

@@ -50,6 +50,16 @@ impl TreeBuilder {
     pub(super) fn text_len(&self) -> usize {
         self.sans.len() + 4 * self.nodes.len()
     }
+
+    /// The main line's last move in stored order, when the game has a move.
+    pub(super) fn last_main_move(&self) -> Option<u32> {
+        let mut n = 0;
+        while self.nodes[n as usize].first_child != NONE {
+            n = self.nodes[n as usize].first_child;
+        }
+        // Node 0 is the root; the moves are numbered from 1 as they were played.
+        n.checked_sub(1)
+    }
 }
 
 impl TreeVisitor for TreeBuilder {
