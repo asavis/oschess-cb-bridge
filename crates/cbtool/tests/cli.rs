@@ -297,6 +297,44 @@ fn classic_annotations_export_and_verify() {
     }
 }
 
+/// A stem that holds a 2CBH and a classic copy of a database: exporting either
+/// never overwrites a file of the other, by name or through a hard link.
+#[test]
+fn export_never_overwrites_the_twin_of_the_other_format() {
+    use cbformat::fixture_cbh::{Builder as ClassicBuilder, Tok, encode, move_record};
+    let f = fixture("twin");
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = ClassicBuilder::new();
+    b.game(&e4);
+    let classic = b.write("cli-twin-classic");
+    for ext in ["cbh", "cbg", "cba", "cbp", "cbt", "cbc", "cbs"] {
+        std::fs::copy(classic.dir().join(format!("db.{ext}")), f.dir().join(format!("db.{ext}"))).unwrap();
+    }
+    let before = snapshot(f.dir());
+    std::fs::hard_link(f.dir().join("db.cbg"), f.dir().join("twin.pgn")).unwrap();
+    let cases = [
+        ("db.2cbh", "db.cbh"),
+        ("db.2cbh", "db.cbg"),
+        ("db.2cbh", "db.cbp"),
+        ("db.2cbh", "twin.pgn"),
+        ("db.cbh", "db.2cbh"),
+        ("db.cbh", "db.2cbg"),
+        ("db.cbh", "db.2lid"),
+    ];
+    for (input, out) in cases {
+        let r = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("pgn")
+            .arg(f.dir().join(input))
+            .arg("--out")
+            .arg(f.dir().join(out))
+            .output()
+            .unwrap();
+        assert!(!r.status.success(), "{input} --out {out} accepted");
+        assert!(String::from_utf8_lossy(&r.stderr).contains("refusing"), "{input} --out {out}");
+        assert_eq!(snapshot(f.dir()), before, "{input} --out {out} changed a file");
+    }
+}
+
 /// Every file of a classic database and those beside it are refused as the
 /// export's output, by name and through a hard link, and none changes: the
 /// media manifest `.cbm`, a search booster, the settings among them.

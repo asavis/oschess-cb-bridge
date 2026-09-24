@@ -65,12 +65,15 @@ impl Base {
         }
     }
 
-    /// The paths of every file of the database, whether or not each exists.
+    /// The paths of every file of the database and of those beside it, in
+    /// both formats, whether or not each exists: a stem may hold a 2CBH and a
+    /// classic copy of one database, and an export must overwrite neither.
     pub fn file_paths(&self) -> Vec<PathBuf> {
-        match self {
-            Base::TwoCbh(db) => db.file_paths(),
-            Base::Cbh(db) => db.file_paths(),
-        }
+        let extensions = v2::EXTENSIONS.iter().chain(&v2::BESIDE).chain(&cbh::EXTENSIONS).chain(&cbh::BESIDE);
+        let mut paths = crate::v2::file::with_extensions(self.stem(), extensions);
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Number of records, including deleted games and guiding texts.
