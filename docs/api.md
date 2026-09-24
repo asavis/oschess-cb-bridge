@@ -123,7 +123,10 @@ with them.
   sees the database's files change (sizes or modification times). Responses
   that depend on the contents carry the generation they were read at. A client
   that sees it change in the middle of paging through a list starts the list
-  again.
+  again. The files are those the bridge reads: `.2cbh`, `.2cbg`, `.2cba`,
+  `.2lid`, `.2lgd` and `.2lcd` of a 2CBH database; `.cbh`, `.cbg`, `.cba`, `.cbp`,
+  `.cbt`, `.cbc`, `.cbs` and, when present, `.cbj` of a classic one (see
+  [Classic databases](#classic-databases)).
 
 ## Consistency
 
@@ -261,7 +264,7 @@ adds, then those given with `--database`, each once:
 |---|---|
 | `name` | The name ChessBase's window shows: the title it keeps for the database, else the file name without extension. A database that is not in the window has its file name without extension |
 | `format` | `2cbh`, `cbh` or `pgn`; another value is possible later |
-| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: `.cbh` until the bridge renders its games, `.pgn`, which the oschess Library imports itself, and any other); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one) |
+| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: `.pgn`, which the oschess Library imports itself, and any other); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one) |
 | `records` | Games, guiding texts and analyses; present when `ready` |
 | `generation` | See above; present when `ready` |
 | `size` | The bytes of the database's files; present when `cloudOnly` or `downloading` |
@@ -291,6 +294,35 @@ the database `cloudOnly` again, and the next request for its games downloads
 it. A service that keeps a file marked after all of it was read leaves the
 database `cloudOnly`; the bridge logs that, and downloads again only when its
 games are requested again.
+
+#### Classic databases
+
+A classic database (`format: "cbh"`, ChessBase's format before the 2CBH one)
+is served like a 2CBH one: its list, searches, sorts, suggestions, games and
+position index answer as a 2CBH copy of the same content answers, apart from
+what the format stores otherwise:
+
+- **Its files.** The bridge reads `.cbh`, `.cbg`, `.cba`, the entity files
+  `.cbp`, `.cbt`, `.cbc` and `.cbs`, and `.cbj` when the move or annotation
+  file is over 4 GiB. These make up its generation, count for its `size`, and
+  decide whether it is `cloudOnly`; the search boosters and other files
+  ChessBase adds beside them are neither read nor downloaded. A `.cbh` file
+  without the files it needs is `unreadable`.
+- **Names are cut** at the classic fields' widths: a player's last name at 30
+  bytes and first name at 20, a tournament's title at 40 and place at 30, an
+  annotator at 45. A name longer in the 2CBH copy is cut in the classic one,
+  and a character that no single-byte code page holds may be stored in
+  another form.
+- **An annotator is one text**, kept in a table of its own rather than as a
+  player, and often written `First Last`. Rows, `annotator:` searches, the
+  `annotator` sort and annotator suggestions use it as stored; an annotator
+  written `Last, First` offers its first name to suggestions, as a player
+  does.
+- **A guiding text** keeps its titles, one per language, in its own record:
+  its row shows the first that is not blank, and its author is its annotator.
+  The format has no analyses.
+- **`moves`** is at most 255, as the header stores it; the game's PGN has
+  every move.
 
 ### `GET /v1/databases/{id}/games`
 
@@ -346,7 +378,7 @@ and has no other key.
 | `total` | Rows matching `q` (all records without `q`) |
 | `number` | The record's number in the database, from 1, as ChessBase numbers it |
 | `kind` | `game`, `text` (a guiding text) or `analysis` |
-| `white`, `black`, `event`, `site`, `annotator` | As in the PGN tags; empty when unknown. Names are `Last, First` |
+| `white`, `black`, `event`, `site`, `annotator` | As in the PGN tags; empty when unknown. Names are `Last, First`; a classic database's annotator is as stored |
 | `whiteElo`, `blackElo` | 0 when unknown |
 | `result` | `1-0`, `0-1`, `1/2-1/2` or `*` |
 | `moves` | Full moves of the main line, as the header stores it |

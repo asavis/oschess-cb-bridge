@@ -68,6 +68,15 @@ impl EntityFile {
     }
 }
 
+/// One of the entity files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entity {
+    Player,
+    Tournament,
+    Annotator,
+    Source,
+}
+
 /// The entity files of a classic database.
 pub struct Entities {
     players: EntityFile,
@@ -90,6 +99,20 @@ impl Entities {
     /// annotators, sources.
     pub fn counts(&self) -> [u64; 4] {
         [self.players.count, self.tournaments.count, self.annotators.count, self.sources.count]
+    }
+
+    /// The stored data of entity `id`, which [`Self::player`] and the others
+    /// decode, or `None` for an id past the file or a deleted record. A
+    /// name's bytes up to its terminating zero are its length in the field,
+    /// whatever its encoding.
+    pub fn data(&self, entity: Entity, id: u32) -> Result<Option<Vec<u8>>> {
+        match entity {
+            Entity::Player => &self.players,
+            Entity::Tournament => &self.tournaments,
+            Entity::Annotator => &self.annotators,
+            Entity::Source => &self.sources,
+        }
+        .data(id)
     }
 
     pub fn player(&self, id: u32) -> Result<Option<Player>> {

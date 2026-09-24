@@ -17,6 +17,11 @@ pub struct Record {
 }
 
 impl Record {
+    /// The record `id` whose 46 bytes are `b`, as [`super::Database::read_records`]
+    /// reads them.
+    pub fn from_bytes(id: u32, b: &[u8; RECORD_SIZE]) -> Record {
+        Record { id, b: *b }
+    }
     pub fn id(&self) -> u32 {
         self.id
     }

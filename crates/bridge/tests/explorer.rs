@@ -15,7 +15,9 @@ use bridge::explorer::format::{Counts, pack_move};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
 use bridge::server;
+use cbformat::cbh;
 use cbformat::fixture::{Builder, TempDb, lid_header, sq};
+use cbformat::fixture_cbh::{self, Tok, encode, move_record, start_position};
 use cbformat::movetable::{self, Captured, CastleSide, Color, END_OF_LINE, MOVES, MoveWord, Piece};
 use cbformat::v2::Database;
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
@@ -116,6 +118,62 @@ fn database(name: &str) -> TempDb {
     b.write(name)
 }
 
+/// A classic game of `ucis` with `result` and ratings, as [`game`] writes a
+/// 2CBH one; its record, for further changes.
+fn classic_game<'a>(b: &'a mut fixture_cbh::Builder, ucis: &str, result: u8, elo: (u16, u16)) -> &'a mut [u8; 46] {
+    let mut board = Board::startpos();
+    let mut toks = Vec::new();
+    for uci in ucis.split_whitespace() {
+        let mv: Move = uci.parse().unwrap();
+        let castles =
+            board.piece_at(mv.from).map(|p| p.0) == Some(CPiece::King) && mv.from.file().abs_diff(mv.to.file()) == 2;
+        toks.push(match castles {
+            true if mv.to.file() == 6 => "O-O".to_string(),
+            true => "O-O-O".to_string(),
+            false => uci.to_string(),
+        });
+        let mut played = mv;
+        if castles {
+            played.to = chesscore::Square::new(if mv.to.file() == 6 { 7 } else { 0 }, mv.from.rank());
+        }
+        board.play_checked(played).unwrap();
+    }
+    let mut stream: Vec<Tok<'_>> = toks.iter().map(|t| Tok::Mv(t)).collect();
+    stream.push(Tok::End);
+    let rec = b.game(&move_record(0, None, None, &encode(&Board::startpos(), &stream, 0, false)));
+    rec[0x1b] = result;
+    rec[0x1f..0x21].copy_from_slice(&elo.0.to_be_bytes());
+    rec[0x21..0x23].copy_from_slice(&elo.1.to_be_bytes());
+    rec
+}
+
+/// The games of [`database`] in the classic format.
+fn classic_database(name: &str) -> TempDb {
+    let mut b = fixture_cbh::Builder::new();
+    classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6", 2, (2400, 2300));
+    classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1b5", 1, (2600, 2600));
+    classic_game(&mut b, "g1f3 b8c6 e2e4 e7e5", 0, (0, 2100));
+    classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1", 2, (1500, 1500));
+    classic_game(&mut b, "e2e4", 2, (2800, 2800))[0] |= 0x80;
+    // Chess960 from the standard arrangement: start 518.
+    let start = Board::chess960(518).unwrap();
+    let names: Vec<String> = (0..64u8).map(|i| format!("{}{}", (b'a' + i % 8) as char, i / 8 + 1)).collect();
+    let pieces: Vec<(&str, CPiece, CColor)> =
+        names.iter().filter_map(|n| start.piece_at(n.parse().unwrap()).map(|(p, c)| (n.as_str(), p, c))).collect();
+    let mut extra = [0u8; 8];
+    extra[6..8].copy_from_slice(&518u16.to_be_bytes());
+    let stream = encode(&start, &[Tok::Mv("e2e4"), Tok::End], 10, false);
+    let position = start_position(&pieces, false, 0x0f, 0);
+    b.game(&move_record(0x4a, Some(&position), Some(&extra), &stream))[0x1b] = 2;
+    classic_game(
+        &mut b,
+        "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7 e1g1 d5c3 c1c3 e6e5 d1c2 e5e4 f3d2 d7f6 f1e1 c8f5",
+        1,
+        (2200, 2200),
+    );
+    b.write(name)
+}
+
 fn key_after(ucis: &str) -> u64 {
     let mut b = Board::startpos();
     for u in ucis.split_whitespace() {
@@ -162,6 +220,93 @@ fn positions_moves_results_and_transpositions() {
     assert!(idx.lookup(key_after(line7)).unwrap().is_some(), "ply 20 is kept");
     assert!(idx.lookup(key_after(&format!("{line7} e1g1"))).unwrap().is_none(), "ply 21 alone is dropped");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A classic copy of the games gives the same index: every position of their
+/// main lines has the same counts, moves and top games.
+#[test]
+fn a_classic_copy_is_indexed_the_same() {
+    let (two_db, classic_db) = (database("explorer-pair-2cbh"), classic_database("explorer-pair-cbh"));
+    let (two_dir, classic_dir) = (index_dir("pair-2cbh"), index_dir("pair-cbh"));
+    let two = prepared(&two_db, &two_dir);
+    let d = cbh::Database::open(classic_db.dir().join("db.cbh")).unwrap();
+    let classic = explorer::prepare(&d, 1, &classic_dir, "db", &Progress::default()).unwrap();
+    assert_eq!((classic.records(), classic.games()), (two.records(), two.games()));
+    assert_eq!(classic.lookup(key_after("")).unwrap().unwrap().counts.games, 5);
+    let lines = [
+        "e2e4 e7e5 g1f3 b8c6 f1b5",
+        "g1f3 b8c6 e2e4 e7e5",
+        "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1",
+        "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7 e1g1",
+    ];
+    let mut compared = 0;
+    for line in lines {
+        let plies: Vec<&str> = line.split_whitespace().collect();
+        for n in 0..=plies.len() {
+            let key = key_after(&plies[..n].join(" "));
+            assert_eq!(classic.lookup(key).unwrap(), two.lookup(key).unwrap(), "{n} plies of {line}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 40);
+    std::fs::remove_dir_all(&two_dir).unwrap();
+    std::fs::remove_dir_all(&classic_dir).unwrap();
+}
+
+/// The game of a move record just over the index's limit is left out and
+/// one at the limit is indexed, in both formats, whether the record is read
+/// from a run's window or on its own: a hole after it in the move file makes
+/// the run's span too large for the window's buffer.
+#[test]
+fn the_move_record_limit_holds_on_both_reading_paths() {
+    use bridge::explorer::source::MAX_MOVE_RECORD;
+    for format in ["2cbh", "cbh"] {
+        for over in [0, 1] {
+            for hole in [0usize, 128] {
+                let name = format!("explorer-limit-{format}-{over}-{hole}");
+                let db = if format == "2cbh" {
+                    let mut b = Builder::new();
+                    let mut words = vec![MOVES, movetable::encode(e4_word()).unwrap(), END_OF_LINE];
+                    // Content of the limit, or one word over it.
+                    words.resize(MAX_MOVE_RECORD / 2 + over, 0);
+                    let at = b.moves(1, &words);
+                    b.game(at);
+                    b.write(&name)
+                } else {
+                    let mut b = fixture_cbh::Builder::new();
+                    let mut stream = encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false);
+                    // A whole record of the limit, or one byte over it.
+                    stream.resize(MAX_MOVE_RECORD - 4 + over, 0);
+                    b.game(&move_record(0, None, None, &stream));
+                    b.write(&name)
+                };
+                let moves = db.dir().join(if format == "2cbh" { "db.2cbg" } else { "db.cbg" });
+                let mut file = std::fs::OpenOptions::new().append(true).open(&moves).unwrap();
+                file.write_all(&vec![0; hole]).unwrap();
+                drop(file);
+                let dir = index_dir(&name);
+                let progress = Progress::default();
+                let base = cbformat::view::Base::open(db.dir().join(format!("db.{format}"))).unwrap();
+                let loaded = explorer::prepare(&base, 1, &dir, "db", &progress).unwrap();
+                let skipped = progress.skipped.load(std::sync::atomic::Ordering::Relaxed);
+                let want = if over == 1 { (0, 1) } else { (1, 0) };
+                assert_eq!((loaded.games(), skipped), want, "{format}, {over} over the limit, hole {hole}");
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+    }
+}
+
+/// White's 1.e4.
+fn e4_word() -> MoveWord {
+    MoveWord::Normal {
+        color: Color::White,
+        piece: Piece::Pawn,
+        from: sq("e2"),
+        to: sq("e4"),
+        captured: Captured::Nothing,
+        promotion: None,
+    }
 }
 
 trait MoveCount {

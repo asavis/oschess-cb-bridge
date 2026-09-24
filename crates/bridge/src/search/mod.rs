@@ -23,12 +23,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use cbformat::v2::Database;
-
 use memory::{Allowance, Cancel, Evict, Held, Hold, Refused, Streams};
 use names::{BitSet, Groups, Kind, NameTable, joint_ranks};
 use query::{Field, Query, Sort, SortKey};
 use scan::Control;
+
+use crate::store::{Any, Head, Store, with_store};
 
 /// Searches whose results are kept for paging.
 const KEPT_RESULTS: usize = 4;
@@ -45,11 +45,15 @@ pub type Numbers = Arc<Held<Vec<u32>>>;
 pub struct Indexes {
     players: Slot<NameTable>,
     tournaments: Slot<NameTable>,
+    /// Where annotators are not players.
+    annotators: Slot<NameTable>,
     titles: Slot<NameTable>,
     player_ranks: Slot<Held<Vec<Vec<u32>>>>,
+    annotator_ranks: Slot<Held<Vec<Vec<u32>>>>,
     /// Tournaments and titles in one name order: `[tournaments, titles]`.
     event_ranks: Slot<Held<Vec<Vec<u32>>>>,
     player_groups: Slot<Held<Groups>>,
+    annotator_groups: Slot<Held<Groups>>,
     tournament_groups: Slot<Held<Groups>>,
     orders: Mutex<HashMap<Sort, Arc<OrderSlot>>>,
     counts: Slot<Held<suggest::Counts>>,
@@ -96,27 +100,70 @@ impl Indexes {
         &self.gate
     }
 
-    pub(super) fn names(&self, db: &Database, kind: Kind, cancel: &Cancel) -> Result<Arc<NameTable>, SearchError> {
+    /// The names of `kind`; where annotators are players, their table is the
+    /// players' one.
+    pub(super) fn names<S: Store>(&self, db: &S, kind: Kind, cancel: &Cancel) -> Result<Arc<NameTable>, SearchError> {
+        let kind = if kind == Kind::Annotators && S::ANNOTATORS_ARE_PLAYERS { Kind::Players } else { kind };
         let slot = match kind {
             Kind::Players => &self.players,
             Kind::Tournaments => &self.tournaments,
+            Kind::Annotators => &self.annotators,
             Kind::Titles => &self.titles,
         };
-        cached(slot, || NameTable::load(db, kind, cancel))
+        cached(slot, || {
+            let keys = match kind == Kind::Titles && S::TITLES_BY_RECORD {
+                true => Some(self.title_keys(db, cancel)?),
+                false => None,
+            };
+            NameTable::load(db, kind, keys, cancel)
+        })
+    }
+
+    /// The numbers of the records with a title of their own, in order, for a
+    /// format that keeps titles with their records: one pass over the headers.
+    fn title_keys<S: Store>(&self, db: &S, cancel: &Cancel) -> Result<Held<Vec<u32>>, SearchError> {
+        let ctl = Control { cancel, scanned: &self.scanned };
+        let found = Mutex::new(Hold::default());
+        let parts = scan::scan(
+            db,
+            &ctl,
+            |_| Ok((Vec::new(), Allowance::new(&found))),
+            |(numbers, allow), r| {
+                if r.other().is_some_and(|(key, _)| key >= 0) {
+                    push_u32(numbers, r.id(), allow)?;
+                }
+                Ok(())
+            },
+            |_| {},
+        )?;
+        let total: usize = parts.iter().map(|p| p.0.len()).sum();
+        let hold = Hold::reserve(total * 4)?;
+        let mut keys: Vec<u32> = Vec::new();
+        keys.try_reserve_exact(total).map_err(|_| Refused::Busy)?;
+        parts.iter().for_each(|p| keys.extend_from_slice(&p.0));
+        Ok(Held::new(keys, hold))
     }
 
     /// Every record number in `sort` order.
-    fn order(&self, db: &Database, ctl: &Control<'_>, sort: Sort) -> Result<Numbers, SearchError> {
+    fn order<S: Store>(&self, db: &S, ctl: &Control<'_>, sort: Sort) -> Result<Numbers, SearchError> {
         let slot = self.orders.lock().unwrap_or_else(|e| e.into_inner()).entry(sort).or_default().clone();
         cached(&slot, || {
             // Refused before any name is read when the order itself cannot fit.
             if order::build_bytes(db.record_count()) > memory::budget() {
                 return Err(SearchError::TooLarge);
             }
+            let player_ranks =
+                || cached(&self.player_ranks, || joint_ranks(&[&*self.names(db, Kind::Players, ctl.cancel)?]));
             let players = match sort.key {
-                SortKey::White | SortKey::Black | SortKey::Annotator => {
-                    Some(cached(&self.player_ranks, || joint_ranks(&[&*self.names(db, Kind::Players, ctl.cancel)?]))?)
-                }
+                SortKey::White | SortKey::Black => Some(player_ranks()?),
+                SortKey::Annotator if S::ANNOTATORS_ARE_PLAYERS => Some(player_ranks()?),
+                _ => None,
+            };
+            let annotators = match sort.key {
+                SortKey::Annotator if S::ANNOTATORS_ARE_PLAYERS => players.clone(),
+                SortKey::Annotator => Some(cached(&self.annotator_ranks, || {
+                    joint_ranks(&[&*self.names(db, Kind::Annotators, ctl.cancel)?])
+                })?),
                 _ => None,
             };
             let events = match sort.key {
@@ -126,10 +173,17 @@ impl Indexes {
                 })?),
                 _ => None,
             };
+            // Where a title's key is not its id, the table that maps them.
+            let title_table = match sort.key {
+                SortKey::Tournament if S::TITLES_BY_RECORD => Some(self.names(db, Kind::Titles, ctl.cancel)?),
+                _ => None,
+            };
             let ranks = order::Ranks {
                 players: players.as_deref().map(|p| p[0].as_slice()),
+                annotators: annotators.as_deref().map(|a| a[0].as_slice()),
                 tournaments: events.as_deref().map(|e| e[0].as_slice()),
                 titles: events.as_deref().map(|e| e[1].as_slice()),
+                title_table: title_table.as_deref(),
             };
             order::build(db, ctl, sort, &ranks)
         })
@@ -154,11 +208,14 @@ impl Evict for Indexes {
         }
         clear(&self.counts);
         clear(&self.player_ranks);
+        clear(&self.annotator_ranks);
         clear(&self.event_ranks);
         clear(&self.player_groups);
+        clear(&self.annotator_groups);
         clear(&self.tournament_groups);
         clear(&self.players);
         clear(&self.tournaments);
+        clear(&self.annotators);
         clear(&self.titles);
     }
 }
@@ -203,8 +260,18 @@ impl From<Refused> for SearchError {
 /// `sort:` token, else by number; and that order. A request that carries a `q`,
 /// even an empty one, and names a `stream` supersedes the search still running
 /// in that stream on the same database; without a stream nothing is superseded.
-pub fn select(
-    db: &Database,
+pub fn select<'a>(
+    db: impl Into<Any<'a>>,
+    idx: &Indexes,
+    q: Option<&str>,
+    stream: Option<&str>,
+    sort_param: Option<Sort>,
+) -> Result<(Selection, Sort), SearchError> {
+    with_store!(db, db => select_in(db, idx, q, stream, sort_param))
+}
+
+fn select_in<S: Store>(
+    db: &S,
     idx: &Indexes,
     q: Option<&str>,
     stream: Option<&str>,
@@ -253,8 +320,8 @@ fn push_u32(v: &mut Vec<u32>, x: u32, allow: &mut Allowance<'_>) -> Result<(), R
     Ok(())
 }
 
-fn search(
-    db: &Database,
+fn search<S: Store>(
+    db: &S,
     idx: &Indexes,
     ctl: &Control<'_>,
     query: &Query,
@@ -262,12 +329,22 @@ fn search(
 ) -> Result<Held<Vec<u32>>, SearchError> {
     let uses = |fields: &[Field]| query.terms.iter().any(|t| fields.contains(&t.field));
     let load = |used: bool, kind| if used { idx.names(db, kind, ctl.cancel).map(Some) } else { Ok(None) };
-    let players =
-        load(uses(&[Field::Text, Field::White, Field::Black, Field::Player, Field::Annotator]), Kind::Players)?;
+    let people = uses(&[Field::Text, Field::White, Field::Black, Field::Player]);
+    let annotated = uses(&[Field::Text, Field::Annotator]);
+    let players = load(people || (annotated && S::ANNOTATORS_ARE_PLAYERS), Kind::Players)?;
+    let annotators = match S::ANNOTATORS_ARE_PLAYERS {
+        true => players.clone(),
+        false => load(annotated, Kind::Annotators)?,
+    };
     let events = uses(&[Field::Text, Field::Event]);
     let (tournaments, titles) = (load(events, Kind::Tournaments)?, load(events, Kind::Titles)?);
-    let tables =
-        scan::Tables { players: players.as_deref(), tournaments: tournaments.as_deref(), titles: titles.as_deref() };
+    let tables = scan::Tables {
+        players: players.as_deref(),
+        annotators: annotators.as_deref(),
+        annotators_are_players: S::ANNOTATORS_ARE_PLAYERS,
+        tournaments: tournaments.as_deref(),
+        titles: titles.as_deref(),
+    };
     let sets = Mutex::new(Hold::default());
     let matcher = scan::Matcher::new(query, &tables, &mut Allowance::new(&sets))?;
     let found = Mutex::new(Hold::default());

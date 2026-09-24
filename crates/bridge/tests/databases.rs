@@ -18,7 +18,9 @@ use bridge::fetch::Cloud;
 use bridge::server;
 use bridge::sources::Sources;
 use cbformat::fixture::{Builder, DbItems, TempDb, quiet};
+use cbformat::fixture_cbh::{self, Tok, encode, move_record};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
+use chesscore::Board;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
@@ -124,12 +126,10 @@ fn the_window_comes_first_then_bridge_toml_then_the_command_line() {
     let catalog = Catalog::with_sources(sources, Arc::new(bridge::fetch::System));
 
     // 2CBH entries first in the file, as ChessBase writes them; an empty
-    // title shows the file name.
+    // title shows the file name. `Old.cbh` is a classic header file without
+    // the other files of its database.
     assert_eq!(names(&catalog), ["Beta (2cbh)", "Alpha", "Gone", "Games", "Delta", "Gamma", "Old", "Cli"]);
-    assert_eq!(
-        states(&catalog),
-        ["ready", "ready", "missing", "unsupported", "ready", "ready", "unsupported", "ready"]
-    );
+    assert_eq!(states(&catalog), ["ready", "ready", "missing", "unsupported", "ready", "ready", "unreadable", "ready"]);
     let entries = catalog.entries();
     assert_eq!(entries[0].id, id_of(&b));
     assert!(catalog.get(&id_of(&d)).is_some());
@@ -304,6 +304,64 @@ impl Cloud for FakeCloud {
         self.running.fetch_sub(1, Ordering::SeqCst);
         result
     }
+}
+
+/// The files of a classic database that the bridge reads and that the
+/// builder writes: all but `.cbj`.
+const CLASSIC: [&str; 7] = ["cbh", "cbg", "cba", "cbp", "cbt", "cbc", "cbs"];
+
+/// A one-game classic database written under `dir` as `stem.cbh` and its
+/// companions.
+fn classic_at(dir: &Path, stem: &str) -> PathBuf {
+    let mut b = fixture_cbh::Builder::new();
+    b.game(&move_record(0, None, None, &encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false)));
+    let unique = dir.to_string_lossy().replace(['/', '\\', ':'], "-");
+    let db = b.write(&format!("databases{unique}-{stem}"));
+    std::fs::create_dir_all(dir).unwrap();
+    for ext in CLASSIC {
+        std::fs::copy(db.dir().join(format!("db.{ext}")), dir.join(format!("{stem}.{ext}"))).unwrap();
+    }
+    dir.join(format!("{stem}.cbh"))
+}
+
+/// Sets the modification time of `path`, as a program saving it would.
+fn touch(path: &Path, seconds: u64) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)).unwrap();
+}
+
+/// A classic database follows the files it reads: one of them kept in the
+/// cloud makes it cloud-only, and downloading reads only that one; a change
+/// to any of them, or a `.cbj` added, is a new generation. A file it never
+/// reads, such as a search booster, counts for neither.
+#[test]
+fn a_classic_database_follows_the_files_it_reads() {
+    let root = Root::new("classic");
+    let db = classic_at(&root.path("bases"), "Old");
+    std::fs::write(db.with_extension("cbtt"), b"booster").unwrap();
+    let cloud = Arc::new(FakeCloud::with_files([db.with_extension("cbc"), db.with_extension("cbtt")], false));
+    root.window(&[(&db, "")]);
+    let catalog = Catalog::with_sources(root.sources(), cloud.clone());
+    let entry = catalog.get(&id_of(&db)).unwrap();
+    assert_eq!(entry.format.name(), "cbh");
+    assert_eq!(states(&catalog), ["cloudOnly"]);
+    let files: Vec<PathBuf> = CLASSIC.iter().map(|ext| db.with_extension(ext)).collect();
+    assert_eq!(entry.size(), size_of(&files));
+    assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+    wait_for(&entry, State::Ready);
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1, "the annotators' file only");
+    assert_eq!(entry.open().unwrap().db.record_count(), 1);
+
+    let generation = entry.generation().unwrap();
+    touch(&db.with_extension("cbtt"), 1_000_000_000);
+    assert_eq!(entry.generation(), Some(generation), "a booster changed");
+    touch(&db.with_extension("cbc"), 1_000_000_000);
+    let changed = entry.generation().unwrap();
+    assert_ne!(changed, generation, "an entity file changed");
+    std::fs::write(db.with_extension("cbj"), [0u8; 32]).unwrap();
+    assert_ne!(entry.generation(), Some(changed), "a .cbj added");
+    let open = entry.open().unwrap();
+    assert_eq!((open.generation, open.db.record_count()), (entry.generation().unwrap(), 1));
 }
 
 fn files_of(db: &Path) -> Vec<PathBuf> {

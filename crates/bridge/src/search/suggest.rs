@@ -4,13 +4,14 @@ use std::cmp::Ordering as Order;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cbformat::v2::{Database, RecordKind};
+use cbformat::v2::RecordKind;
 
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
 use super::names::{BitSet, Groups, Kind, NO_GROUP, NameTable, groups};
 use super::query::MAX_VALUE_CHARS;
 use super::scan::{self, Control};
 use super::{Indexes, SearchError, cached};
+use crate::store::{Head, Store};
 
 /// How many games have each name identity as a player, annotator and tournament.
 pub(super) struct Counts {
@@ -19,21 +20,22 @@ pub(super) struct Counts {
     tournaments: Vec<u32>,
 }
 
-fn counts(
-    db: &Database,
+fn counts<S: Store>(
+    db: &S,
     ctl: &Control<'_>,
     players: &Groups,
+    annotators: &Groups,
     tournaments: &Groups,
 ) -> Result<Held<Counts>, SearchError> {
-    let (np, nt) = (players.first_id.len(), tournaments.first_id.len());
-    let hold = Hold::reserve((2 * np + nt) * 4)?;
+    let (np, na, nt) = (players.first_id.len(), annotators.first_id.len(), tournaments.first_id.len());
+    let hold = Hold::reserve((np + na + nt) * 4)?;
     let zeros = |n: usize| -> Result<Vec<AtomicU32>, Refused> {
         let mut v = Vec::new();
         v.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
         v.extend((0..n).map(|_| AtomicU32::new(0)));
         Ok(v)
     };
-    let (p, a, t) = (zeros(np)?, zeros(np)?, zeros(nt)?);
+    let (p, a, t) = (zeros(np)?, zeros(na)?, zeros(nt)?);
     let group =
         |g: &Groups, id: i64| usize::try_from(id).ok().and_then(|i| g.of_id.get(i)).copied().filter(|&x| x != NO_GROUP);
     let bump = |v: &[AtomicU32], g: Option<u32>| {
@@ -53,7 +55,7 @@ fn counts(
                 if b != w {
                     bump(&p, b);
                 }
-                bump(&a, group(players, r.annotator()));
+                bump(&a, group(annotators, r.annotator()));
                 bump(&t, group(tournaments, r.tournament()));
             }
             Ok(())
@@ -88,8 +90,18 @@ fn searchable(name: &str) -> bool {
 /// does, for people), with their game counts: most games first, then by name.
 /// Only the best `limit` are kept while the names are looked through, and the
 /// copies returned hold their bytes in the budget.
-pub fn suggest(
-    db: &Database,
+pub fn suggest<'a>(
+    db: impl Into<crate::store::Any<'a>>,
+    idx: &Indexes,
+    field: SuggestField,
+    prefix: &str,
+    limit: usize,
+) -> Result<Held<Vec<Suggestion>>, SearchError> {
+    crate::store::with_store!(db, db => suggest_in(db, idx, field, prefix, limit))
+}
+
+fn suggest_in<S: Store>(
+    db: &S,
     idx: &Indexes,
     field: SuggestField,
     prefix: &str,
@@ -98,13 +110,18 @@ pub fn suggest(
     let never = Cancel::never();
     let ctl = Control { cancel: &never, scanned: &idx.scanned };
     let players = idx.names(db, Kind::Players, &never)?;
+    let annotators = idx.names(db, Kind::Annotators, &never)?;
     let tournaments = idx.names(db, Kind::Tournaments, &never)?;
     let player_groups = cached(&idx.player_groups, || groups(&players))?;
+    let annotator_groups = match S::ANNOTATORS_ARE_PLAYERS {
+        true => player_groups.clone(),
+        false => cached(&idx.annotator_groups, || groups(&annotators))?,
+    };
     let tournament_groups = cached(&idx.tournament_groups, || groups(&tournaments))?;
-    let counts = cached(&idx.counts, || counts(db, &ctl, &player_groups, &tournament_groups))?;
+    let counts = cached(&idx.counts, || counts(db, &ctl, &player_groups, &annotator_groups, &tournament_groups))?;
     let (table, groups, games): (&NameTable, &Groups, &[u32]) = match field {
         SuggestField::Player => (&players, &player_groups, &counts.players),
-        SuggestField::Annotator => (&players, &player_groups, &counts.annotators),
+        SuggestField::Annotator => (&annotators, &annotator_groups, &counts.annotators),
         SuggestField::Event => (&tournaments, &tournament_groups, &counts.tournaments),
     };
     let people = matches!(field, SuggestField::Player | SuggestField::Annotator);

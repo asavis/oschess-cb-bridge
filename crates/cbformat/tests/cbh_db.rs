@@ -76,6 +76,75 @@ fn batches_read_what_single_reads_read() {
     assert!(db.records(51, 60).unwrap().is_empty());
 }
 
+/// Headers and move records read into the caller's buffers are the ones read
+/// on their own; a record over the limit is refused before it is read.
+#[test]
+fn buffered_reads_read_what_single_reads_read() {
+    let mut b = builder(30);
+    b.text(&[(0, b"Openings")]);
+    for g in 0..9 {
+        b.game(&game(&["d2d4", "d7d5", "c2c4"][..1 + g % 3]));
+    }
+    let f = b.write("buffered");
+    let db = Database::open(f.base()).unwrap();
+    assert_eq!(db.record_count(), 40);
+    let mut buf = vec![0u8; 7 * cbformat::cbh::RECORD_SIZE + 3];
+    let mut first = 1;
+    while first <= 40 {
+        let n = db.read_records(first, &mut buf).unwrap();
+        assert_eq!(n, 7.min(41 - first));
+        let records: Vec<_> = buf[..n as usize * 46]
+            .as_chunks::<46>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, b)| cbformat::cbh::Record::from_bytes(first + i as u32, b))
+            .collect();
+        for r in &records {
+            assert_eq!(r.bytes(), db.record(r.id()).unwrap().bytes());
+        }
+        let next = db.record(first + n).ok();
+        let mut moves = Vec::with_capacity(1 << 10);
+        let window = db.read_move_window(&records, next.as_ref(), &mut moves).unwrap().expect("a window");
+        for r in &records {
+            let whole = db.moves_of(r).unwrap();
+            assert_eq!(db.moves_in(window, &moves, r, 64).unwrap().unwrap().bytes(), whole.bytes());
+            let size = whole.bytes().len();
+            assert!(db.moves_in(window, &moves, r, size - 1).unwrap().is_err(), "over the limit in the window");
+            let mut one = Vec::with_capacity(64);
+            assert_eq!(db.read_moves_into(r, 64, &mut one).unwrap().bytes(), whole.bytes());
+            assert_eq!(db.moves_of_within(r, 64).unwrap().bytes(), whole.bytes());
+        }
+        first += n;
+    }
+    assert_eq!(db.read_records(0, &mut buf).unwrap(), 0);
+    assert_eq!(db.read_records(41, &mut buf).unwrap(), 0);
+    // A window larger than the buffer is not read; a record over the limit
+    // or the buffer is refused.
+    let records = db.records(1, 40).unwrap();
+    assert!(db.read_move_window(&records, None, &mut Vec::with_capacity(8)).unwrap().is_none());
+    let r = db.record(4).unwrap();
+    let size = db.moves_of(&r).unwrap().bytes().len();
+    assert!(db.moves_of_within(&r, size - 1).is_err());
+    assert!(db.read_moves_into(&r, size - 1, &mut Vec::with_capacity(64)).is_err());
+    assert!(db.read_moves_into(&r, 64, &mut Vec::with_capacity(size - 1)).is_err());
+}
+
+/// A guiding text's title is in its `.cbg` record: the first that is not blank.
+#[test]
+fn guiding_text_titles() {
+    let mut b = builder(1);
+    b.text(&[(0, b""), (1, b"Er\xf6ffnungen"), (0, b"Openings")]);
+    b.text(&[]);
+    let f = b.write("titles");
+    let db = Database::open(f.base()).unwrap();
+    let title = |id: u32| db.text_title(&db.record(id).unwrap(), 1 << 10).unwrap();
+    assert_eq!(db.record(2).unwrap().kind(), RecordKind::Text);
+    assert_eq!((title(1), title(2), title(3)), (String::new(), "Eröffnungen".to_string(), String::new()));
+    // Read up to the limit only: a title past it reads as none.
+    assert_eq!(db.text_title(&db.record(2).unwrap(), 12).unwrap(), "");
+}
+
 /// Damaged files give errors when opened or read, never panics.
 #[test]
 fn damaged_files_are_refused() {
@@ -172,6 +241,10 @@ fn a_move_file_over_4_gib_is_read_through_cbj() {
     cbformat::cbh::walk(&db.moves_of(&r).unwrap().moves().unwrap(), &mut Count(&mut n)).unwrap();
     assert_eq!(n, 1);
     assert_eq!(db.batch(1, 1).unwrap().moves_of(&r).unwrap().bytes(), rec);
+    // A window cannot be placed by the 32-bit offsets; a read on its own can.
+    let mut buf = Vec::with_capacity(1 << 10);
+    assert!(db.read_move_window(&[r], None, &mut buf).unwrap().is_none());
+    assert_eq!(db.read_moves_into(&r, 1 << 10, &mut buf).unwrap().bytes(), rec);
     assert!(cbformat::pgn::classic_game(&db, 1).unwrap().contains("\n1. e4 0-1"));
 
     // Offsets that do not agree with `.cbh` are damage.

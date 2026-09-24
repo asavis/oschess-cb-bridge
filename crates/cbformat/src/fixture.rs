@@ -70,7 +70,7 @@ impl TempDb {
     }
 
     /// Takes ownership of `dir`, which is removed on drop.
-    pub(crate) fn at(dir: PathBuf) -> TempDb {
+    pub fn at(dir: PathBuf) -> TempDb {
         TempDb { dir }
     }
 }

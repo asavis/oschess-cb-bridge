@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cbformat::v2::{Database, EXTENSIONS};
+use cbformat::view::Base;
 
 use crate::fetch::{Cloud, Progress, Serial, System};
 use crate::search::Indexes;
@@ -71,7 +71,7 @@ impl State {
 /// A database that is open, with the generation it was opened at.
 #[derive(Clone)]
 pub struct Opened {
-    pub db: Arc<Database>,
+    pub db: Arc<Base>,
     pub generation: u64,
     /// Sort orders, names and searches built for this generation.
     pub indexes: Arc<Indexes>,
@@ -161,7 +161,7 @@ impl Entry {
         if self.removed.load(Ordering::Relaxed) {
             return Err(State::Missing);
         }
-        if self.format != Format::TwoCbh {
+        if !matches!(self.format, Format::TwoCbh | Format::Cbh) {
             return Err(if self.path.exists() { State::Unsupported } else { State::Missing });
         }
         let files = self.files();
@@ -181,7 +181,7 @@ impl Entry {
         if let Some(open) = slot.as_ref().filter(|o| o.generation == generation) {
             return Ok(open.clone());
         }
-        let db = Database::open(&self.path).map_err(|_| State::Unreadable)?;
+        let db = Base::open(&self.path).map_err(|_| State::Unreadable)?;
         let open = Opened { db: Arc::new(db), generation, indexes: Indexes::shared() };
         *slot = Some(open.clone());
         Ok(open)
@@ -231,8 +231,8 @@ impl Entry {
         }
         self.held.kept.store(false, Ordering::Relaxed);
         let cloud_files: Vec<PathBuf> = files.present.into_iter().filter(|f| f.2).map(|f| f.0).collect();
-        let (held, cloud, path, name) =
-            (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone());
+        let (held, cloud, path, name, format) =
+            (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone(), self.format);
         // Ends the download however the job ends, and also when it is
         // dropped unrun because no thread could start.
         let done = Done(Arc::clone(&held));
@@ -242,7 +242,7 @@ impl Entry {
                 eprintln!("oschess-bridge: downloading {name} failed: {e}");
                 return;
             }
-            let after = generation_of(&path, &*cloud);
+            let after = generation_of(&path, format, &*cloud);
             let kept: Vec<&PathBuf> =
                 after.present.iter().filter(|f| f.2 && cloud_files.contains(&f.0)).map(|f| &f.0).collect();
             if !kept.is_empty() {
@@ -262,7 +262,7 @@ impl Entry {
     }
 
     fn files(&self) -> Files {
-        generation_of(&self.path, &*self.shared.cloud)
+        generation_of(&self.path, self.format, &*self.shared.cloud)
     }
 }
 
@@ -279,13 +279,23 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The metadata of the 2CBH database at `path`: its generation and files.
-/// Metadata only, following links: nothing is opened.
-fn generation_of(path: &Path, cloud: &dyn Cloud) -> Files {
+/// The files of a classic database whose content the bridge serves, the
+/// header file first: headers, moves and texts, annotations, the four entity
+/// files, and the 64-bit offsets ChessBase adds for files over 4 GiB. The
+/// search boosters and other optional files are neither read nor downloaded.
+const CBH_FILES: [&str; 8] = [".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj"];
+
+/// The metadata of the database at `path`, of `format`: its generation and
+/// files. Metadata only, following links: nothing is opened.
+fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let stem = path.with_extension("");
     let mut hash = Hash::new();
     let mut files = Files { generation: None, present: Vec::new(), irregular: false };
-    for ext in EXTENSIONS {
+    let extensions: &[&str] = match format {
+        Format::Cbh => &CBH_FILES,
+        _ => &cbformat::v2::EXTENSIONS,
+    };
+    for &ext in extensions {
         let mut path = stem.clone().into_os_string();
         path.push(ext);
         let path = PathBuf::from(path);
@@ -299,7 +309,7 @@ fn generation_of(path: &Path, cloud: &dyn Cloud) -> Files {
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
             }
-            Err(_) if ext == ".2cbh" => return files,
+            Err(_) if ext == extensions[0] => return files,
             Err(_) => hash.write(&[0xff]),
         }
     }

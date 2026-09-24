@@ -1,15 +1,15 @@
-//! The names of a database's players, tournaments and titles (the game tags
-//! of guiding texts and analyses), read once per database generation in full:
+//! The names of a database's players, tournaments, annotators and titles (of
+//! guiding texts and analyses), read once per database generation in full:
 //! substring matching for search, ranks for sorting, identities for
 //! suggestions. Their memory is reserved in the search budget as it grows.
 
 use std::sync::Mutex;
 
-use cbformat::v2::{Database, GAME_TAG, PLAYER, TOURNAMENT};
-
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
 use super::workers::{self, threads};
+pub use crate::store::Kind;
+use crate::store::Store;
 
 /// Ids of a type read in one worker's go.
 const IDS_PER_WORKER_MIN: usize = 4096;
@@ -22,14 +22,6 @@ pub const MAX_NAME_RECORD: usize = 4 << 10;
 /// Each name worker's workspace for one record, decoded and lowercased,
 /// reserved in the budget before the worker starts.
 const NAME_WORKSPACE: usize = 64 << 10;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Players,
-    Tournaments,
-    /// Titles of guiding texts and analyses.
-    Titles,
-}
 
 /// The names of consecutive ids, one after another in two strings: as shown
 /// ("Last, First" for players) and in lower case.
@@ -66,18 +58,59 @@ pub struct NameTable {
     /// Ids per chunk; the last chunk may hold fewer.
     per: usize,
     chunks: Vec<Chunk>,
+    /// For titles found by record ([`Store::TITLES_BY_RECORD`]): the record
+    /// numbers in order, each title's key; a title's id is its position.
+    keys: Option<Held<Vec<u32>>>,
     _hold: Hold,
 }
 
+/// A name as shown, and a person's first name in lower case.
+type Named = (String, String);
+
 impl NameTable {
-    pub fn load(db: &Database, kind: Kind, cancel: &Cancel) -> Result<NameTable, SearchError> {
-        let e = db.entities();
-        let typ = match kind {
-            Kind::Players => PLAYER,
-            Kind::Tournaments => TOURNAMENT,
-            Kind::Titles => GAME_TAG,
+    /// The names of `kind`, by entity id; for titles found by record, of the
+    /// records `keys` numbers, by position.
+    pub fn load<S: Store>(
+        db: &S,
+        kind: Kind,
+        keys: Option<Held<Vec<u32>>>,
+        cancel: &Cancel,
+    ) -> Result<NameTable, SearchError> {
+        let count = match &keys {
+            Some(keys) => keys.len(),
+            None => usize::try_from(db.name_count(kind)).unwrap_or(usize::MAX),
         };
-        let count = usize::try_from(e.stored_count(typ)).unwrap_or(usize::MAX);
+        let name = |id: usize| -> cbformat::Result<Named> {
+            let id = match &keys {
+                Some(keys) => i64::from(keys[id]),
+                None => id as i64,
+            };
+            Ok(match kind {
+                Kind::Players => match db.player(id)? {
+                    Some(p) => (p.pgn(), p.first.to_lowercase()),
+                    None => (String::new(), String::new()),
+                },
+                Kind::Tournaments => (db.tournament(id)?.map(|t| t.title).unwrap_or_default(), String::new()),
+                // An annotator of its own is one text; written as "Last,
+                // First", what follows the comma is its first name.
+                Kind::Annotators => {
+                    let name = db.annotator(id)?.unwrap_or_default();
+                    let first = name.split_once(", ").map(|(_, first)| first.to_lowercase()).unwrap_or_default();
+                    (name, first)
+                }
+                Kind::Titles => (db.title(id)?.unwrap_or_default(), String::new()),
+            })
+        };
+        let (per, chunks, hold) = NameTable::read(count, &name, cancel)?;
+        Ok(NameTable { len: count, per, chunks, keys, _hold: hold })
+    }
+
+    /// Reads the names of ids `0..count` on the workers.
+    fn read(
+        count: usize,
+        name: &(dyn Fn(usize) -> cbformat::Result<Named> + Sync),
+        cancel: &Cancel,
+    ) -> Result<(usize, Vec<Chunk>, Hold), SearchError> {
         if count > u32::MAX as usize {
             return Err(Refused::TooLarge.into());
         }
@@ -105,17 +138,7 @@ impl NameTable {
                 if (id - first) % IDS_PER_CHECK == 0 && (w.stopped() || cancel.is_cancelled()) {
                     return Err(SearchError::Superseded);
                 }
-                let (name, first_name) = match kind {
-                    Kind::Players => match e.player_within(id as i64, MAX_NAME_RECORD)? {
-                        Some(p) => (p.pgn(), p.first.to_lowercase()),
-                        None => (String::new(), String::new()),
-                    },
-                    Kind::Tournaments => (
-                        e.tournament_within(id as i64, MAX_NAME_RECORD)?.map(|t| t.title).unwrap_or_default(),
-                        String::new(),
-                    ),
-                    Kind::Titles => (e.title_within(id as i64, MAX_NAME_RECORD)?.unwrap_or_default(), String::new()),
-                };
+                let (name, first_name) = name(id)?;
                 let lower = name.to_lowercase();
                 // The first name ends the name ("Last, First"); a comma inside
                 // the last name does not move it.
@@ -133,11 +156,20 @@ impl NameTable {
         })?;
         let per = count.div_ceil(chunks.len()).max(1);
         let hold = shared.into_inner().unwrap_or_else(|e| e.into_inner());
-        Ok(NameTable { len: count, per, chunks, _hold: hold })
+        Ok((per, chunks, hold))
     }
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The id of the name whose key is `key`: the key itself, or for titles
+    /// found by record the record's position among the keys; -1 for none.
+    pub fn slot(&self, key: i64) -> i64 {
+        match &self.keys {
+            None => key,
+            Some(keys) => u32::try_from(key).ok().and_then(|k| keys.binary_search(&k).ok()).map_or(-1, |i| i as i64),
+        }
     }
 
     fn chunk(&self, id: usize) -> (&Chunk, usize) {
@@ -309,7 +341,7 @@ mod tests {
             c.lower_ends.push(c.lower.len() as u32);
             c.given.push(0);
         }
-        NameTable { len: names.len(), per: names.len().max(1), chunks: vec![c], _hold: Hold::default() }
+        NameTable { len: names.len(), per: names.len().max(1), chunks: vec![c], keys: None, _hold: Hold::default() }
     }
 
     #[test]

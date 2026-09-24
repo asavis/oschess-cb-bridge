@@ -340,8 +340,28 @@ The reader was checked against:
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut
   at its width (63 in the user database, 32 in the partial Mega).
+- **Name fields keep their terminating zero.** In the 251 classic databases
+  examined no last name fills its 30 bytes and no first name its 20: the
+  longest hold 29 and 19 bytes. Tournament titles hold at most 39 of their
+  40 bytes (5,355 do), except in the user database ChessBase converted from
+  2CBH, where 15 fill all 40. A cut is measured in the bytes the field
+  stores, not in the text read from them: a Windows-1252 byte reads as up to
+  three bytes of UTF-8. A name cut in UTF-8 ends before a character that
+  would cross the end: a first name of ten two-byte characters keeps nine.
 - **2CBH analyses** are stored as ordinary games in a converted classic
   database (5 in the partial Mega); their move trees are the same.
+- **Guiding texts** keep their titles, one per language, at the head of their
+  own `.cbg` record, where 2CBH names a title as a game tag entity. Of the
+  1,628 texts in the classic-only databases, none names a tournament in its
+  header; 297 name an annotator and 339 a source. The bridge shows a text's
+  first title that is not blank, whatever its language, and its annotator as
+  its author (`cbh::Database::text_title`).
+- **Annotators** are a table of their own (`.cbc`), one text each, where 2CBH
+  names a player and shows it as `Last, First`. In the user database, 290 of
+  the 291 games the 2CBH copy annotates carry the same words in another order
+  in the classic copy (`First Last`), and one is equal; two Mega updates have
+  2 such games each. The bridge searches, sorts and suggests the classic copy
+  by its own annotator text, as stored.
 - **Damage.** One old database fails on 3 of its 385 games: a game whose moves
   stop without an end marker, a game whose record head gives size 0 (it starts
   where the previous game's record ends), and a deleted game whose record

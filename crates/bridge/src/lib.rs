@@ -26,4 +26,5 @@ pub mod server;
 pub mod snapshot;
 pub mod sources;
 pub mod start;
+pub mod store;
 pub mod token;
