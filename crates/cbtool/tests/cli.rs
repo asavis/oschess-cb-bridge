@@ -252,34 +252,40 @@ fn verify_and_info_read_classic_databases() {
 }
 
 /// A classic database exports and verifies its annotations like a 2CBH one: a
-/// comment on a move the game has is written, one on no move fails both, and
-/// the export never writes over one of the database's own files.
+/// comment on a move the game has is written, one past the last move follows
+/// that move and is counted, one in a game without moves fails both, and the
+/// export never writes over one of the database's own files.
 #[test]
 fn classic_annotations_export_and_verify() {
     use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
     let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let none = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::End], 0, false));
     let mut b = Builder::new();
     b.game(&e4);
     b.annotations(&annotation_record(1, &[(0, 0x02, b"\x00\x2afine"), (0, 0x03, &[1])]));
     b.game(&e4);
-    b.annotations(&annotation_record(2, &[(1, 0x02, b"\x00\x2aon no move")]));
+    b.annotations(&annotation_record(2, &[(1, 0x02, b"\x00\x2apast the end"), (3, 0x03, &[2])]));
     b.game(&e4);
+    b.game(&none);
+    b.annotations(&annotation_record(4, &[(0, 0x02, b"\x00\x2aon no move")]));
     let f = b.write("cli-classic-annotations");
     let db = f.dir().join("db.cbh");
     let verify = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(&db).output().unwrap();
     let text = String::from_utf8_lossy(&verify.stdout);
     assert_eq!(verify.status.code(), Some(1), "{text}");
-    assert!(text.contains("annotated          2") && text.contains("incomplete       0"), "{text}");
-    assert!(text.contains("failures           1") && text.contains("game 2: annotations:"), "{text}");
+    assert!(text.contains("annotated          3") && text.contains("incomplete       0"), "{text}");
+    assert!(text.contains("past the end     1 (2 annotations moved to the last move)"), "{text}");
+    assert!(text.contains("failures           1") && text.contains("game 4: annotations:"), "{text}");
 
     let out = f.dir().join("games.pgn");
     let export =
         Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("pgn").arg(&db).arg("--out").arg(&out).output().unwrap();
     assert!(!export.status.success());
-    assert!(String::from_utf8_lossy(&export.stderr).contains("game 2:"), "{}", String::from_utf8_lossy(&export.stderr));
+    assert!(String::from_utf8_lossy(&export.stderr).contains("game 4:"), "{}", String::from_utf8_lossy(&export.stderr));
     let pgn = std::fs::read_to_string(&out).unwrap();
     assert!(pgn.contains("[White \"Morphy\"]") && pgn.contains("[Event \"Paris\"]"), "{pgn}");
     assert!(pgn.contains("1. e4 $1 {fine} 1-0") && pgn.contains("\n1. e4 1-0"), "{pgn}");
+    assert!(pgn.contains("1. e4 $2 {past the end} 1-0"), "{pgn}");
 
     let one = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("pgn").arg(f.base()).arg("3").output().unwrap();
     assert!(one.status.success(), "{}", String::from_utf8_lossy(&one.stderr));
@@ -444,26 +450,32 @@ fn verify_bounds_the_memory_of_hostile_nesting() {
     assert!(text.contains("failures           1") && text.contains("nested deeper than 1024"), "{text}");
 }
 
-/// An annotation on a move the game does not have fails `verify` and the
-/// export of that game, instead of vanishing from the PGN.
+/// An annotation past the last move follows that move and is counted by
+/// `verify`; one in a game without moves fails `verify` and the export of
+/// that game, instead of vanishing from the PGN.
 #[test]
-fn annotations_on_no_move_fail_verify_and_export() {
+fn annotations_past_the_end_are_moved_and_on_no_move_fail() {
     let mut b = Builder::new();
     let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    let none = b.moves(1, &[movetable::MOVES, movetable::END_OF_LINE]);
     let good = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "fine")])]));
-    let bad = b.annotations(&annotations(&[(1, vec![text(false, language::ENGLISH, "on no move")])]));
+    let past = b.annotations(&annotations(&[(1, vec![text(false, language::ENGLISH, "past the end")])]));
+    let bad = b.annotations(&annotations(&[(0, vec![text(false, language::ENGLISH, "on no move")])]));
     b.annotated_game(e4, good);
-    b.annotated_game(e4, bad);
+    b.annotated_game(e4, past);
+    b.annotated_game(none, bad);
     let f = b.write("cbtool-no-move");
     let verify =
         Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(f.dir().join("db.2cbh")).output().unwrap();
     let text = String::from_utf8_lossy(&verify.stdout);
     assert_eq!(verify.status.code(), Some(1), "{text}");
-    assert!(text.contains("annotated          2") && text.contains("failures           1"), "{text}");
-    assert!(text.contains("game 2: annotations:") && text.contains("position 1"), "{text}");
+    assert!(text.contains("annotated          3") && text.contains("failures           1"), "{text}");
+    assert!(text.contains("past the end     1 (1 annotations moved to the last move)"), "{text}");
+    assert!(text.contains("game 3: annotations:") && text.contains("position 0"), "{text}");
     let out = f.dir().join("games.pgn");
     let export = pgn(f.dir(), &out);
     assert!(!export.status.success());
-    assert!(String::from_utf8_lossy(&export.stderr).contains("game 2:"), "{}", String::from_utf8_lossy(&export.stderr));
-    assert!(std::fs::read_to_string(&out).unwrap().contains("1. e4 {fine} 1-0"));
+    assert!(String::from_utf8_lossy(&export.stderr).contains("game 3:"), "{}", String::from_utf8_lossy(&export.stderr));
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(written.contains("1. e4 {fine} 1-0") && written.contains("1. e4 {past the end} 1-0"), "{written}");
 }

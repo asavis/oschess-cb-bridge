@@ -102,7 +102,7 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
     match batch.annotations_of(&r) {
         Ok(Some(a)) if !a.is_empty() => {
             s.annotated += 1;
-            if let Err(e) = a.check_positions(plies) {
+            if let Err(e) = a.check_positions(plies).map(|n| s.count_past_end(n)) {
                 fail(s, format!("annotations: {e}"));
             }
         }

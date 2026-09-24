@@ -93,6 +93,9 @@ pub(crate) struct Stats {
     en_passant: u64,
     annotated: u64,
     annotations_incomplete: u64,
+    /// Games with annotations past their last move, and those annotations.
+    past_end_games: u64,
+    past_end: u64,
     failures: u64,
 }
 
@@ -113,7 +116,17 @@ impl Stats {
         self.en_passant += o.en_passant;
         self.annotated += o.annotated;
         self.annotations_incomplete += o.annotations_incomplete;
+        self.past_end_games += o.past_end_games;
+        self.past_end += o.past_end;
         self.failures += o.failures;
+    }
+
+    /// Counts a game with `n` annotations past its last move, when it has any.
+    fn count_past_end(&mut self, n: usize) {
+        if n > 0 {
+            self.past_end_games += 1;
+            self.past_end += n as u64;
+        }
     }
 }
 
@@ -197,7 +210,7 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
     match batch.annotations_of(&r) {
         Ok(Some(a)) if !a.is_empty() => {
             s.annotated += 1;
-            if let Err(e) = a.check_positions(plies) {
+            if let Err(e) = a.check_positions(plies).map(|n| s.count_past_end(n)) {
                 fail(s, format!("annotations: {e}"));
             } else if let Some(u) = a.stopped_at {
                 s.annotations_incomplete += 1;
@@ -276,6 +289,10 @@ fn report(
         Some(true) => {
             println!("annotated          {}", stats.annotated);
             println!("  incomplete       {}", stats.annotations_incomplete);
+            println!(
+                "  past the end     {} ({} annotations moved to the last move)",
+                stats.past_end_games, stats.past_end
+            );
         }
         Some(false) => println!("annotated          no annotation file"),
         None => {}
