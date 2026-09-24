@@ -27,8 +27,9 @@ pub enum NameDiff {
     /// Characters that Windows-1252 lacks are stored in some other form; the
     /// others are equal.
     CodePage,
-    /// Cut at the classic field's width (characters Windows-1252 lacks may
-    /// be stored in another form before the cut).
+    /// Cut where the classic field ends: at its width, or its width less a
+    /// terminating zero (characters Windows-1252 lacks may be stored in
+    /// another form before the cut).
     Cut,
     /// The same words in another order: only an annotator, which the classic
     /// format keeps as one text (`First Last` for `Last, First`).
@@ -59,16 +60,25 @@ fn text(classic: &str, two: &str, width: usize) -> NameDiff {
     }
     let (c, t): (Vec<char>, Vec<char>) = (classic.chars().collect(), two.chars().collect());
     let held = c.len() <= t.len() && c.iter().zip(&t).all(|(a, b)| a == b || !cp1252(*b));
-    if held && c.len() == t.len() {
+    if !held {
+        return NameDiff::Other;
+    }
+    if c.len() == t.len() {
         return NameDiff::CodePage;
     }
-    // A field cut at its width holds about `width` bytes: one a character in
-    // Windows-1252, or UTF-8 less an incomplete last character.
-    let full = |bytes: usize| (width.saturating_sub(3)..=width).contains(&bytes);
-    if held && (full(c.len()) || full(classic.len())) {
-        return NameDiff::Cut;
-    }
-    NameDiff::Other
+    // A cut exhausts the field. ChessBase keeps a name's terminating zero in
+    // its field, which then holds `width - 1` bytes, and its converter from
+    // 2CBH fills tournament titles to the last byte. A cut holds that many
+    // bytes: characters, one byte each, in Windows-1252; in UTF-8 that many
+    // bytes, or fewer only when the next character would have crossed the
+    // end. A shorter prefix of a name that fits is missing data, not a cut.
+    let next = t[c.len()].len_utf8();
+    let fills = |capacity: usize| {
+        (c.len() == capacity && c.iter().all(|&x| cp1252(x)))
+            || classic.len() == capacity
+            || (classic.len() < capacity && classic.len() + next > capacity)
+    };
+    if fills(width - 1) || fills(width) { NameDiff::Cut } else { NameDiff::Other }
 }
 
 fn words(t: &str) -> Vec<String> {
@@ -159,5 +169,51 @@ impl Names {
             .filter(|((f, d), _)| !known(FIELDS.iter().position(|x| x == f).unwrap(), *d))
             .map(|(_, n)| n)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cut_exhausts_the_field() {
+        let long = "Abcdefghijklmnopqrstuvwxyzabcdefgh";
+        assert_eq!(long.len(), 34);
+        // A 34-byte name in a 30-byte field: cut at 30 bytes, or at 29 when
+        // the field keeps its terminating zero.
+        assert_eq!(text(&long[..30], long, 30), NameDiff::Cut);
+        assert_eq!(text(&long[..29], long, 30), NameDiff::Cut);
+        // A 30-byte name held as its 27-byte prefix: missing data.
+        assert_eq!(text(&long[..27], &long[..30], 30), NameDiff::Other);
+        assert!(!known(WHITE, text(&long[..27], &long[..30], 30)));
+        // Two bytes short of the width, with an ASCII character next.
+        assert_eq!(text(&long[..28], long, 30), NameDiff::Other);
+    }
+
+    #[test]
+    fn a_character_across_the_end_is_dropped() {
+        // 28 bytes, then a two-byte character that would end at byte 30 of
+        // a field that keeps its terminating zero.
+        let two = format!("{}ébc", "x".repeat(28));
+        assert_eq!(text(&"x".repeat(28), &two, 30), NameDiff::Cut);
+        // Nine two-byte characters of ten in a 20-byte field (19 and a zero).
+        let cyrillic = "ЖЖЖЖЖЖЖЖЖЖ";
+        assert_eq!(text(&cyrillic[..18], cyrillic, 20), NameDiff::Cut);
+        // Windows-1252 holds `é` in one byte: 30 characters fill the field.
+        assert_eq!(text(&format!("{}éb", "x".repeat(28)), &format!("{two}d"), 30), NameDiff::Cut);
+        // A three-byte character after 27 bytes crosses byte 29; after 26
+        // bytes it would have fitted either way.
+        let euro = |n: usize| format!("{}€€", "x".repeat(n));
+        assert_eq!(text(&"x".repeat(27), &euro(27), 30), NameDiff::Cut);
+        assert_eq!(text(&"x".repeat(26), &euro(26), 30), NameDiff::Other);
+    }
+
+    #[test]
+    fn code_pages_and_word_order() {
+        assert_eq!(text("Lód?", "Łódź", 30), NameDiff::CodePage);
+        assert_eq!(text("Lodz", "Łódź", 30), NameDiff::Other, "ó is in Windows-1252");
+        assert_eq!(annotator("Paul Morphy", "Morphy, Paul"), NameDiff::WordOrder);
+        assert!(known(ANNOTATOR, NameDiff::WordOrder) && !known(WHITE, NameDiff::WordOrder));
     }
 }

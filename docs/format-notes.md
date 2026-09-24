@@ -340,6 +340,13 @@ The reader was checked against:
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut
   at its width (63 in the user database, 32 in the partial Mega).
+- **Name fields keep their terminating zero.** In the 251 classic databases
+  examined no last name fills its 30 bytes and no first name its 20: the
+  longest hold 29 and 19 bytes. Tournament titles hold at most 39 of their
+  40 bytes (5,355 do), except in the user database ChessBase converted from
+  2CBH, where 15 fill all 40. A name cut in UTF-8 ends before a character
+  that would cross the end: a first name of ten two-byte characters keeps
+  nine.
 - **2CBH analyses** are stored as ordinary games in a converted classic
   database (5 in the partial Mega); their move trees are the same.
 - **Guiding texts** keep their titles, one per language, at the head of their
