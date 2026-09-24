@@ -57,7 +57,11 @@ impl Sources {
             );
         }
         let Some(list) = dbitems::read(dir).map_err(|e| e.to_string())? else { return Ok(Vec::new()) };
-        Ok(list.entries.into_iter().map(|e| Listed { path: dbitems::local_path(dir, &e.path), name: e.name }).collect())
+        Ok(list
+            .into_window_order()
+            .into_iter()
+            .map(|e| Listed { path: dbitems::local_path(dir, &e.path), name: e.name })
+            .collect())
     }
 
     /// The `databases` of `bridge.toml`, as written; empty when there is no file.
