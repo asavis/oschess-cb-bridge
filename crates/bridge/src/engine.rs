@@ -8,11 +8,11 @@
 //! engine, each checked here; `Threads` and `Hash` come from the configuration.
 
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -51,8 +51,11 @@ const PACE: Duration = Duration::from_millis(250);
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
 /// How often a search looks at its client and at newer analyses.
 const POLL: Duration = Duration::from_millis(50);
-/// The longest line the engine may write; longer ones are cut.
+/// The longest line the engine may write; longer ones are dropped whole.
 const MAX_LINE: usize = 64 << 10;
+/// Lines of the engine waiting to be read; past them the engine waits on its
+/// own output, so a flood of output holds the engine rather than memory.
+const QUEUED_LINES: usize = 256;
 
 /// The engine the configuration names, with its settings resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,7 +187,8 @@ impl Search {
 /// position moves the king two squares. Either form is accepted.
 fn castling_as_king_takes_rook(board: &Board, mv: Move) -> Move {
     let king = matches!(board.piece_at(mv.from), Some((Piece::King, c)) if c == board.side_to_move());
-    if king && mv.from.rank() == mv.to.rank() && mv.from.file().abs_diff(mv.to.file()) == 2 {
+    // A promotion suffix stays on the move, for `play_checked` to refuse.
+    if king && mv.promotion.is_none() && mv.from.rank() == mv.to.rank() && mv.from.file().abs_diff(mv.to.file()) == 2 {
         let file = if mv.to.file() > mv.from.file() { 7 } else { 0 };
         return Move::new(mv.from, Square::new(file, mv.from.rank()), None);
     }
@@ -427,22 +431,11 @@ impl Process {
             let _ = child.wait();
             return Err("The engine's input and output are not available".into());
         };
-        let (tx, lines) = mpsc::channel();
-        let _ = std::thread::Builder::new().name("bridge-engine-out".into()).stack_size(crate::THREAD_STACK).spawn(
-            move || {
-                let mut reader = BufReader::new(stdout);
-                let mut buf = Vec::new();
-                // Ends when the process closes its output or the receiver is gone.
-                while matches!(reader.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
-                    buf.truncate(MAX_LINE);
-                    let line = String::from_utf8_lossy(&buf).trim_end().to_string();
-                    buf.clear();
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            },
-        );
+        let (tx, lines) = mpsc::sync_channel(QUEUED_LINES);
+        let _ = std::thread::Builder::new()
+            .name("bridge-engine-out".into())
+            .stack_size(crate::THREAD_STACK)
+            .spawn(move || forward_lines(stdout, &tx));
         let mut p = Process { child, stdin, lines, name: file_stem(&config.program), multipv: 1, used: Instant::now() };
         if p.send("uci").is_err() {
             return Err("The engine closed its input".into());
@@ -518,6 +511,46 @@ impl Drop for Process {
     }
 }
 
+/// Sends `output` line by line until it ends or nobody receives. A line longer
+/// than [`MAX_LINE`] is read past and dropped whole, never kept; at most
+/// [`QUEUED_LINES`] wait, after which this waits, and with it the engine.
+fn forward_lines(output: impl Read, tx: &SyncSender<String>) {
+    let mut reader = BufReader::with_capacity(8 << 10, output);
+    let mut line = Vec::new();
+    let mut overlong = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok([]) => {
+                // The last line may have no line end.
+                if !overlong && !line.is_empty() {
+                    let _ = tx.send(String::from_utf8_lossy(&line).trim_end().to_string());
+                }
+                return;
+            }
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        let end = available.iter().position(|&b| b == b'\n');
+        let part = &available[..end.unwrap_or(available.len())];
+        if !overlong && line.len() + part.len() <= MAX_LINE {
+            line.extend_from_slice(part);
+        } else {
+            overlong = true;
+            line.clear();
+        }
+        let used = part.len() + usize::from(end.is_some());
+        reader.consume(used);
+        if end.is_some() {
+            if !overlong && tx.send(String::from_utf8_lossy(&line).trim_end().to_string()).is_err() {
+                return;
+            }
+            line.clear();
+            overlong = false;
+        }
+    }
+}
+
 /// The best move of a `bestmove` line.
 fn bestmove(line: &str) -> Option<String> {
     let mut t = line.split_whitespace();
@@ -534,8 +567,9 @@ fn is_uci_move(s: &str) -> bool {
         && b.get(4).is_none_or(|p| b"qrbn".contains(p))
 }
 
-/// An `info` line with a score and a line as `{"info": ...}`, with its line
-/// number; `None` for any other line.
+/// An `info` line with a depth and a score as `{"info": ...}`, with its line
+/// number; `None` for any other line. The line of moves may be empty: in a
+/// position already decided, the engine gives the score alone.
 fn info_json(line: &str) -> Option<(u32, String)> {
     let mut t = line.split_whitespace().peekable();
     if t.next()? != "info" {
@@ -578,7 +612,7 @@ fn info_json(line: &str) -> Option<(u32, String)> {
         }
     }
     let (depth, (kind, value)) = (depth?, score?);
-    if pv.is_empty() || !(1..=i64::from(MAX_MULTIPV)).contains(&i64::from(multipv)) {
+    if !(1..=MAX_MULTIPV).contains(&multipv) {
         return None;
     }
     let mut info = Obj::new().num("depth", depth);
@@ -664,6 +698,11 @@ mod tests {
         let refused =
             |fen: Option<&str>, moves: &str, multipv, limit| Search::new(fen, moves, multipv, limit).unwrap_err().0;
         assert_eq!(refused(None, "e2e5", 1, Limit::Infinite), "moves");
+        // A king never promotes, castling or not.
+        let castles = Some("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        for mv in ["e1g1q", "e1c1n", "e1h1q"] {
+            assert_eq!(refused(castles, mv, 1, Limit::Infinite), "moves", "{mv}");
+        }
         assert_eq!(refused(None, "e2e4\nquit", 1, Limit::Infinite), "moves");
         assert_eq!(refused(None, "e2e4 quit", 1, Limit::Infinite), "moves");
         assert_eq!(refused(Some("8/8/8/8/8/8/8/8 w - - 0 1"), "", 1, Limit::Infinite), "fen");
@@ -696,16 +735,40 @@ mod tests {
         for line in [
             "info string NNUE evaluation using nn.nnue",
             "info depth 5 currmove e2e4 currmovenumber 1",
-            "info depth 5 score cp 10",
             "info depth 5 multipv 9 score cp 10 pv e2e4",
             "bestmove e2e4",
             "info depth 5 score wdl 1 2 3 pv e2e4",
         ] {
             assert_eq!(info_json(line), None, "{line}");
         }
+        // A decided position: mate or stalemate on the board, with no moves.
+        let (_, json) = info_json("info depth 0 score mate 0").unwrap();
+        assert_eq!(json, r#"{"info":{"depth":0,"multipv":1,"score":{"mate":0},"pv":[]}}"#);
+        let (_, json) = info_json("info depth 0 score cp 0").unwrap();
+        assert_eq!(json, r#"{"info":{"depth":0,"multipv":1,"score":{"cp":0},"pv":[]}}"#);
         assert_eq!(bestmove("bestmove e2e4 ponder e7e5").as_deref(), Some("e2e4"));
         assert_eq!(bestmove("bestmove (none)").as_deref(), Some("(none)"));
         assert_eq!(bestmove("info depth 1"), None);
+    }
+
+    #[test]
+    fn keeps_no_overlong_line_and_waits_when_the_queue_is_full() {
+        let mut output = b"id name x\n".to_vec();
+        output.extend(std::iter::repeat_n(b'z', 3 * MAX_LINE));
+        output.extend(b"\nuciok\n");
+        output.extend(std::iter::repeat_n(b'y', MAX_LINE));
+        output.extend(b"\nlast");
+        let (tx, rx) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || forward_lines(&output[..], &tx));
+        // The queue holds one line; the reader waits for the rest to be taken.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!reader.is_finished());
+        let lines: Vec<String> = rx.iter().collect();
+        reader.join().unwrap();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[..2], ["id name x", "uciok"]);
+        assert_eq!(lines[2].len(), MAX_LINE);
+        assert_eq!(lines[3], "last");
     }
 
     #[test]

@@ -265,4 +265,13 @@ fn a_real_engine_analyses() {
     drop(b);
     let mut c = Analysis::open(port, "depth=8&stream=real");
     assert!(c.rest().last().unwrap().starts_with(r#"{"bestmove":""#));
+    // A decided position keeps its score, with no moves to give.
+    for (fen, score) in [
+        ("7k%2F6Q1%2F5K2%2F8%2F8%2F8%2F8%2F8+b+-+-+0+1", r#""score":{"mate":0}"#),
+        ("7k%2F5Q2%2F6K1%2F8%2F8%2F8%2F8%2F8+b+-+-+0+1", r#""score":{"cp":0}"#),
+    ] {
+        let lines = Analysis::open(port, &format!("fen={fen}&depth=1&stream=real")).rest();
+        assert!(lines.iter().any(|l| l.contains(score) && l.contains(r#""pv":[]"#)), "{fen}: {lines:?}");
+        assert_eq!(lines.last().unwrap(), r#"{"bestmove":"(none)"}"#);
+    }
 }

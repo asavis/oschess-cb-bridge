@@ -662,7 +662,9 @@ body: one JSON object per line, until the search ends.
   250 ms. Scores are from the side to move, in centipawns (`cp`) or moves to
   mate (`mate`, negative when the side to move is mated). `bound` is `lower`
   or `upper` when the score is only a bound. `seldepth`, `nodes`, `nps` and
-  `time` appear when the engine gave them.
+  `time` appear when the engine gave them. In a position already decided,
+  mate or stalemate on the board, the engine gives a depth 0 score with an
+  empty `pv`, and the best move is `(none)`.
 - With nothing new for two seconds, the last lines are written again, so a
   long step of the search keeps the connection alive.
 - `bestmove` ends a search with `depth` or `movetime`. Without either, the
