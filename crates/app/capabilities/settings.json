@@ -1,6 +1,6 @@
 {
   "identifier": "settings",
-  "description": "The settings window: the databases and folders, autostart, updates, the pairing code and the port.",
+  "description": "The settings window: the databases and folders, the engine, autostart, updates, the pairing code and the port.",
   "windows": ["settings"],
   "permissions": [
     "core:event:allow-listen",
@@ -9,6 +9,9 @@
     "allow-settings",
     "allow-add-folder",
     "allow-remove-database",
+    "allow-engines",
+    "allow-choose-engine",
+    "allow-pick-engine",
     "allow-set-autostart",
     "allow-set-auto-update",
     "allow-check-updates",

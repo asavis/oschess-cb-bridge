@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::Catalog;
-use bridge::engine::{Engine, EngineConfig};
+use bridge::engine::{self, Engine, EngineConfig};
 use bridge::server;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
@@ -289,4 +289,51 @@ fn a_real_engine_analyses() {
         assert!(lines.iter().any(|l| l.contains(score) && l.contains(r#""pv":[]"#)), "{fen}: {lines:?}");
         assert_eq!(lines.last().unwrap(), r#"{"bestmove":"(none)"}"#);
     }
+}
+
+#[test]
+fn the_engine_follows_bridge_toml() {
+    let dir = std::env::temp_dir().join(format!("bridge-follow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml = dir.join("bridge.toml");
+    let write = |text: &str| {
+        std::fs::write(&toml, text).unwrap();
+        // The signature includes the modification time; let it move on coarse clocks.
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    write("port = 39581\n");
+    let (port, app) = start(Engine::from_config_file(toml.clone()));
+    assert!(!app.engine.is_configured());
+    write(&format!(
+        "port = 39581\nengine = '{}'\nengine_threads = 1\nengine_hash = 16\n",
+        env!("CARGO_BIN_EXE_fake-uci")
+    ));
+    assert_eq!(app.engine.name().as_deref(), Some("fake-uci"));
+    let mut a = Analysis::open(port, "depth=2");
+    assert_eq!(a.rest().last().unwrap(), BEST);
+    // A running search stops when the engine is replaced or removed.
+    let mut running = Analysis::open(port, "stream=tab1");
+    assert!(running.line().is_some());
+    write("port = 39581\n");
+    assert!(!app.engine.is_configured());
+    let ended = running.rest();
+    assert!(ended.iter().all(|l| l.starts_with(r#"{"info":"#) || l == r#"{"superseded":true}"#), "{ended:?}");
+    // A file that no longer parses keeps the engine it named.
+    write(&format!("engine = '{}'\n", env!("CARGO_BIN_EXE_fake-uci")));
+    assert!(app.engine.is_configured());
+    write("engine = \n");
+    assert!(app.engine.is_configured());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_probe_accepts_only_a_uci_engine() {
+    assert_eq!(engine::probe(env!("CARGO_BIN_EXE_fake-uci").as_ref()).as_deref(), Ok("Fake UCI 1.0"));
+    let dir = std::env::temp_dir().join(format!("bridge-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = dir.join("notes.txt");
+    std::fs::write(&text, "not an engine").unwrap();
+    assert!(engine::probe(&text).is_err());
+    assert!(engine::probe(&dir.join("missing.exe")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

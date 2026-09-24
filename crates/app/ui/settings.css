@@ -60,3 +60,8 @@ h1 { font-size: 28px; font-weight: 600; line-height: 36px; margin: 0 0 16px; }
 .link { color: var(--accent-text); }
 .notice { position: fixed; right: 24px; bottom: 20px; margin: 0; padding: 10px 14px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); box-shadow: 0 8px 16px rgba(0, 0, 0, .14); }
 .row > .bar { width: 120px; flex: none; }
+
+/* The engine section: a sentence under the title, and each engine a radio row. */
+.intro { margin: 0 0 16px; max-width: 640px; line-height: 1.45; }
+.row.engine { cursor: pointer; }
+.row.engine input { margin: 0 4px 0 2px; accent-color: var(--accent, #b85c1e); }

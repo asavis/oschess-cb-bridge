@@ -1,5 +1,5 @@
-// The settings window: the databases oschess sees and the extra folders, then
-// autostart, updates, the pairing code and the port.
+// The settings window: the databases oschess sees and the extra folders, the
+// engine, then autostart, updates, the pairing code and the port.
 'use strict';
 
 let current = null;
@@ -10,6 +10,7 @@ async function main() {
     node.prepend(icon(node.dataset.icon, node.classList.contains('row') ? 20 : 16));
   }
   document.getElementById('add-folder').prepend(icon('folderPlus'));
+  document.getElementById('pick-engine').prepend(icon('folder'));
   document.getElementById('copy-code').prepend(icon('copy'));
   document.getElementById('code-warning').prepend(icon('alert', 13, 2));
   for (const nav of document.querySelectorAll('.nav')) nav.addEventListener('click', () => show(nav.dataset.section));
@@ -19,11 +20,12 @@ async function main() {
   renderServed(await call('view'));
   on('view', renderServed);
   renderSettings(await call('settings'));
+  act(call('engines').then(renderEngines));
 }
 
 // `code` opens the general section with the pairing code shown.
 function show(section) {
-  const name = section === 'code' ? 'general' : section === 'general' ? 'general' : 'databases';
+  const name = section === 'code' ? 'general' : ['engine', 'general'].includes(section) ? section : 'databases';
   for (const node of document.querySelectorAll('main > section')) node.hidden = node.id !== name;
   for (const nav of document.querySelectorAll('.nav')) {
     if (nav.dataset.section === name) nav.setAttribute('aria-current', 'page');
@@ -74,6 +76,37 @@ function renderSettings(settings) {
   document.getElementById('folders').replaceChildren(...rows);
 }
 
+// The engines found, one of them chosen; an engine chosen by its file comes first.
+function renderEngines(view) {
+  const rows = view.found.map((f) => engineRow(f.name, `${t('settings.engine.from', { source: f.source })} · ${f.path}`, f.path, view.chosen));
+  if (view.chosen && !view.found.some((f) => f.path === view.chosen)) {
+    const name = view.chosen.split(/[\\/]/).pop();
+    rows.unshift(engineRow(name, view.chosen, view.chosen, view.chosen));
+  }
+  document.getElementById('engines').replaceChildren(...rows);
+  document.getElementById('engine-none').hidden = rows.length > 0;
+}
+
+function engineRow(name, detail, path, chosen) {
+  const radio = el('input');
+  radio.type = 'radio';
+  radio.name = 'engine';
+  radio.checked = path === chosen;
+  radio.addEventListener('change', () => chooseEngine(call('choose_engine', { path })));
+  const text = el('div', 'text', el('div', null, name), el('div', 'cap12 path', detail));
+  text.lastChild.title = detail;
+  return el('label', 'row engine', radio, text);
+}
+
+// A refused engine names the dictionary key of its message; the list is read again.
+function chooseEngine(promise) {
+  notice(t('settings.engine.checking'));
+  return promise.then((view) => view && renderEngines(view), (message) => {
+    notice(t(String(message)));
+    act(call('engines').then(renderEngines));
+  });
+}
+
 function toggle(id, onNow) {
   document.getElementById(id).setAttribute('aria-checked', String(onNow));
   document.getElementById(`${id}-state`).textContent = onNow ? t('settings.on') : t('settings.off');
@@ -82,6 +115,7 @@ function toggle(id, onNow) {
 function wire() {
   document.getElementById('add-folder').addEventListener('click', () =>
     act(call('add_folder').then((settings) => settings && renderSettings(settings))));
+  document.getElementById('pick-engine').addEventListener('click', () => chooseEngine(call('pick_engine')));
   document.getElementById('autostart').addEventListener('click', () =>
     act(call('set_autostart', { on: !current.autostart }).then(renderSettings)));
   document.getElementById('auto-update').addEventListener('click', () =>
