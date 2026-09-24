@@ -1,14 +1,14 @@
 # oschess-cb-bridge
 
-Read chess databases in the ChessBase 2 format (`.2cbh`, `.2cbg`, `.2lid`, …,
-written by ChessBase 17 and later) with open-source code, on the machine that
-holds them.
+Read ChessBase chess databases with open-source code, on the machine that
+holds them: the ChessBase 2 format (`.2cbh`, `.2cbg`, `.2lid`, …, written by
+ChessBase 17 and later) and the classic format (`.cbh`, `.cbg`, `.cba`, …).
 
 The repository is a Cargo workspace:
 
 | Crate | What it is |
 |---|---|
-| [`cbformat`](crates/cbformat) | A reader library: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. |
+| [`cbformat`](crates/cbformat) | A reader library for both formats: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. `view::Base` reads either format the same way. |
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, and `bridge` to run the bridge in a console. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 | [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
@@ -43,8 +43,11 @@ target/release/oschess-bridge --database "path/to/Database.2cbh" --show-token
 target/release/cbtool bridge --database "path/to/Database.2cbh"   # the same bridge
 ```
 
-`--lang` chooses the language of comments stored in several languages, in
-order of preference; English is the default.
+`cbtool info`, `verify` and `pgn` also take a classic database
+(`Database.cbh`). The bridge does not serve classic databases yet: it lists
+them as `unsupported` until #25 is complete. `--lang` chooses the language of
+comments stored in several languages, in order of preference; English is the
+default.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
@@ -68,7 +71,8 @@ folders of databases listed under `databases` in `bridge.toml`, and
 database kept only in the cloud is not read while it is listed; opening it in
 oschess downloads it first ([docs/api.md](docs/api.md#cloud-only-databases)).
 
-A database path may name the `.2cbh` file or the common stem of its files.
+A database path may name the `.2cbh` or `.cbh` file, or the common stem of its
+files, which is read as 2CBH when a `.2cbh` file has it.
 Databases are opened read-only and read with positional reads; nothing is
 written, and nothing leaves the machine except what the bridge serves to the
 oschess page on this computer.

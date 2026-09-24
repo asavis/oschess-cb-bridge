@@ -1,7 +1,8 @@
 //! Readers for ChessBase database files.
 //!
 //! [`v2`] reads the `.2cbh` family written by ChessBase 17 and later, and
-//! [`cbh`] the classic `.cbh` family.
+//! [`cbh`] the classic `.cbh` family; [`view::Base`] reads either the same
+//! way, and [`pgn`] writes games of both.
 //! [`dbitems`] reads the list of databases ChessBase's database window shows.
 //! [`replay`] plays decoded moves on a [`chesscore::Board`], checking each
 //! move word against the position.
@@ -19,6 +20,7 @@ pub mod movetable;
 pub mod pgn;
 pub mod replay;
 pub mod v2;
+pub mod view;
 
 #[derive(Debug)]
 pub enum Error {

@@ -285,11 +285,30 @@ pub fn move_record(flags: u8, start: Option<&[u8]>, extra: Option<&[u8]>, stream
     r
 }
 
-/// Builds a classic database: game records, their move records in the order
-/// added, and one player, tournament, annotator and source.
+/// A `.cba` record for game `id`: each item a position, a type and its data.
+pub fn annotation_record(id: u32, items: &[(i32, u8, &[u8])]) -> Vec<u8> {
+    let mut r = id.to_be_bytes()[1..].to_vec();
+    r.extend([1, 0, 0x0e, 0x0e]);
+    r.extend(&(items.len() as u32 + 1).to_be_bytes()[1..]);
+    r.extend([0; 4]);
+    for (position, t, data) in items {
+        r.extend(&position.to_be_bytes()[1..]);
+        r.push(*t);
+        r.extend((data.len() as u16 + 6).to_be_bytes());
+        r.extend(*data);
+    }
+    let size = (r.len() as u32).to_be_bytes();
+    r[10..14].copy_from_slice(&size);
+    r
+}
+
+/// Builds a classic database: game records, their move and annotation
+/// records in the order added, and one player, tournament, annotator and
+/// source.
 pub struct Builder {
     records: Vec<[u8; 46]>,
     cbg: Vec<u8>,
+    cba: Vec<u8>,
     players: Vec<Vec<u8>>,
 }
 
@@ -297,7 +316,8 @@ impl Default for Builder {
     fn default() -> Self {
         let mut cbg = vec![0u8; 26];
         cbg[1] = 26;
-        Builder { records: Vec::new(), cbg, players: vec![b"Morphy".to_vec(), b"Anderssen".to_vec()] }
+        let players = vec![b"Morphy".to_vec(), b"Anderssen".to_vec()];
+        Builder { records: Vec::new(), cbg, cba: vec![0u8; 26], players }
     }
 }
 
@@ -317,6 +337,14 @@ impl Builder {
         self.cbg.extend(rec);
         self.records.push(h);
         self.records.last_mut().unwrap()
+    }
+
+    /// Gives the last game added the annotation record `rec`.
+    pub fn annotations(&mut self, rec: &[u8]) -> &mut Self {
+        let at = (self.cba.len() as u32).to_be_bytes();
+        self.records.last_mut().expect("a game first")[5..9].copy_from_slice(&at);
+        self.cba.extend(rec);
+        self
     }
 
     /// Replaces player `id`'s raw 30-byte last-name field contents.
@@ -356,7 +384,7 @@ impl Builder {
         let path = |ext: &str| -> PathBuf { dir.join(format!("db{ext}")) };
         std::fs::write(path(".cbh"), cbh).unwrap();
         std::fs::write(path(".cbg"), cbg).unwrap();
-        std::fs::write(path(".cba"), vec![0u8; 26]).unwrap();
+        std::fs::write(path(".cba"), &self.cba).unwrap();
         std::fs::write(path(".cbp"), entity(58, &self.players)).unwrap();
         std::fs::write(path(".cbt"), entity(90, &[b"Paris".to_vec()])).unwrap();
         std::fs::write(path(".cbc"), entity(53, &[Vec::new()])).unwrap();

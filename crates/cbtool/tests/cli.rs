@@ -35,11 +35,15 @@ fn fixture_with(name: &str, games: usize, player_name: Option<&[u8]>) -> TempDb 
     b.write(&format!("cbtool-{name}"))
 }
 
+/// The contents of the database's files, and of those beside it that exist.
 fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    ["db.2cbh", "db.2cbg", "db.2lid", "db.2cba"]
-        .iter()
-        .map(|f| (f.to_string(), std::fs::read(dir.join(f)).unwrap()))
-        .collect()
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("db."))
+        .collect();
+    names.sort();
+    names.into_iter().map(|f| (f.clone(), std::fs::read(dir.join(&f)).unwrap())).collect()
 }
 
 fn pgn(dir: &Path, out: &Path) -> std::process::Output {
@@ -66,8 +70,10 @@ fn export_works() {
 #[test]
 fn export_refuses_to_overwrite_the_database() {
     let f = fixture("refuse");
+    std::fs::write(f.dir().join("db.ini"), "[settings]").unwrap();
     let before = snapshot(f.dir());
     std::fs::hard_link(f.dir().join("db.2cbg"), f.dir().join("export.pgn")).unwrap();
+    std::fs::hard_link(f.dir().join("db.ini"), f.dir().join("settings.pgn")).unwrap();
     let targets = [
         f.dir().join("db.2cbg"),
         f.dir().join("db.2cbh"),
@@ -75,6 +81,8 @@ fn export_refuses_to_overwrite_the_database() {
         f.dir().join("db.2cba"),
         f.dir().join(".").join("db.2cbg"),
         f.dir().join("export.pgn"),
+        f.dir().join("db.ini"),
+        f.dir().join("settings.pgn"),
     ];
     for out in targets {
         let r = pgn(f.dir(), &out);
@@ -241,6 +249,175 @@ fn verify_and_info_read_classic_databases() {
         assert!(v.contains(line), "{v}");
     }
     assert!(run("info").contains("players        2"));
+}
+
+/// A classic database exports and verifies its annotations like a 2CBH one: a
+/// comment on a move the game has is written, one on no move fails both, and
+/// the export never writes over one of the database's own files.
+#[test]
+fn classic_annotations_export_and_verify() {
+    use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = Builder::new();
+    b.game(&e4);
+    b.annotations(&annotation_record(1, &[(0, 0x02, b"\x00\x2afine"), (0, 0x03, &[1])]));
+    b.game(&e4);
+    b.annotations(&annotation_record(2, &[(1, 0x02, b"\x00\x2aon no move")]));
+    b.game(&e4);
+    let f = b.write("cli-classic-annotations");
+    let db = f.dir().join("db.cbh");
+    let verify = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(&db).output().unwrap();
+    let text = String::from_utf8_lossy(&verify.stdout);
+    assert_eq!(verify.status.code(), Some(1), "{text}");
+    assert!(text.contains("annotated          2") && text.contains("incomplete       0"), "{text}");
+    assert!(text.contains("failures           1") && text.contains("game 2: annotations:"), "{text}");
+
+    let out = f.dir().join("games.pgn");
+    let export =
+        Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("pgn").arg(&db).arg("--out").arg(&out).output().unwrap();
+    assert!(!export.status.success());
+    assert!(String::from_utf8_lossy(&export.stderr).contains("game 2:"), "{}", String::from_utf8_lossy(&export.stderr));
+    let pgn = std::fs::read_to_string(&out).unwrap();
+    assert!(pgn.contains("[White \"Morphy\"]") && pgn.contains("[Event \"Paris\"]"), "{pgn}");
+    assert!(pgn.contains("1. e4 $1 {fine} 1-0") && pgn.contains("\n1. e4 1-0"), "{pgn}");
+
+    let one = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("pgn").arg(f.base()).arg("3").output().unwrap();
+    assert!(one.status.success(), "{}", String::from_utf8_lossy(&one.stderr));
+    assert!(String::from_utf8_lossy(&one.stdout).ends_with("\n1. e4 1-0\n\n"));
+
+    for file in ["db.cbh", "db.cbg", "db.cba", "db.cbp"] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("pgn")
+            .arg(&db)
+            .arg("--out")
+            .arg(f.dir().join(file))
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("refusing"), "{file}");
+    }
+}
+
+/// A stem that holds a 2CBH and a classic copy of a database: exporting either
+/// never overwrites a file of the other, by name or through a hard link.
+#[test]
+fn export_never_overwrites_the_twin_of_the_other_format() {
+    use cbformat::fixture_cbh::{Builder as ClassicBuilder, Tok, encode, move_record};
+    let f = fixture("twin");
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = ClassicBuilder::new();
+    b.game(&e4);
+    let classic = b.write("cli-twin-classic");
+    for ext in ["cbh", "cbg", "cba", "cbp", "cbt", "cbc", "cbs"] {
+        std::fs::copy(classic.dir().join(format!("db.{ext}")), f.dir().join(format!("db.{ext}"))).unwrap();
+    }
+    let before = snapshot(f.dir());
+    std::fs::hard_link(f.dir().join("db.cbg"), f.dir().join("twin.pgn")).unwrap();
+    let cases = [
+        ("db.2cbh", "db.cbh"),
+        ("db.2cbh", "db.cbg"),
+        ("db.2cbh", "db.cbp"),
+        ("db.2cbh", "twin.pgn"),
+        ("db.cbh", "db.2cbh"),
+        ("db.cbh", "db.2cbg"),
+        ("db.cbh", "db.2lid"),
+    ];
+    for (input, out) in cases {
+        let r = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("pgn")
+            .arg(f.dir().join(input))
+            .arg("--out")
+            .arg(f.dir().join(out))
+            .output()
+            .unwrap();
+        assert!(!r.status.success(), "{input} --out {out} accepted");
+        assert!(String::from_utf8_lossy(&r.stderr).contains("refusing"), "{input} --out {out}");
+        assert_eq!(snapshot(f.dir()), before, "{input} --out {out} changed a file");
+    }
+}
+
+/// Every file of a classic database and those beside it are refused as the
+/// export's output, by name and through a hard link, and none changes: the
+/// media manifest `.cbm`, a search booster, the settings among them.
+#[test]
+fn classic_export_refuses_every_companion() {
+    use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = Builder::new();
+    b.game(&e4);
+    let f = b.write("cli-classic-companions");
+    for extra in ["db.cbm", "db.cit", "db.cbgi", "db.flags", "db.ini", "db.cko"] {
+        std::fs::write(f.dir().join(extra), extra.as_bytes()).unwrap();
+    }
+    let before = snapshot(f.dir());
+    std::fs::hard_link(f.dir().join("db.cbm"), f.dir().join("media.pgn")).unwrap();
+    std::fs::hard_link(f.dir().join("db.cba"), f.dir().join("notes.pgn")).unwrap();
+    let names = ["db.cbm", "db.cit", "db.cbgi", "db.flags", "db.ini", "db.cko", "db.cbj", "media.pgn", "notes.pgn"];
+    for name in names {
+        let out = f.dir().join(name);
+        let existed = out.exists();
+        let r = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("pgn")
+            .arg(f.dir().join("db.cbh"))
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .unwrap();
+        if existed {
+            assert!(!r.status.success(), "accepted {name}");
+            assert!(String::from_utf8_lossy(&r.stderr).contains("refusing"), "{name}");
+        } else {
+            // A companion that does not exist yet is nothing to overwrite.
+            assert!(r.status.success(), "{name}: {}", String::from_utf8_lossy(&r.stderr));
+            std::fs::remove_file(&out).unwrap();
+        }
+        assert_eq!(snapshot(f.dir()), before, "input changed by --out {name}");
+    }
+}
+
+/// An annotation record whose head claims a gigabyte, in a sparse `.cba`
+/// that long, is refused before it is read: `verify` and `pgn` report the game
+/// within a 256 MiB address space instead of aborting.
+#[cfg(unix)]
+#[test]
+fn a_huge_annotation_record_is_refused_before_it_is_read() {
+    use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let claimed: u32 = 0x4000_0000;
+    let mut head = vec![0, 0, 1, 1, 0, 0x0e, 0x0e, 0, 0, 1];
+    head.extend(claimed.to_be_bytes());
+    let mut b = Builder::new();
+    b.game(&e4);
+    b.annotations(&head);
+    b.game(&e4);
+    let f = b.write("cli-classic-huge-annotations");
+    std::fs::File::options()
+        .write(true)
+        .open(f.dir().join("db.cba"))
+        .unwrap()
+        .set_len(26 + u64::from(claimed))
+        .unwrap();
+    let run = |args: &[&str]| {
+        Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -v 262144 && exec \"$0\" \"$@\"")
+            .arg(env!("CARGO_BIN_EXE_cbtool"))
+            .args(args)
+            .env("CBTOOL_THREADS", "2")
+            .output()
+            .unwrap()
+    };
+    let db = f.dir().join("db.cbh");
+    let db = db.to_str().unwrap();
+    let verify = run(&["verify", db]);
+    let text = String::from_utf8_lossy(&verify.stdout);
+    assert_eq!(verify.status.code(), Some(1), "{text}{}", String::from_utf8_lossy(&verify.stderr));
+    assert!(text.contains("failures           1") && text.contains("game 1: annotations:"), "{text}");
+    assert!(text.contains("over the limit"), "{text}");
+    let pgn = run(&["pgn", db]);
+    let err = String::from_utf8_lossy(&pgn.stderr);
+    assert_eq!(pgn.status.code(), Some(1), "{err}");
+    assert!(err.contains("game 1:") && err.contains("over the limit"), "{err}");
+    assert!(String::from_utf8_lossy(&pgn.stdout).contains("\n1. e4 1-0"), "game 2 is exported");
 }
 
 /// The review's hostile classic record, a million nested variations in one

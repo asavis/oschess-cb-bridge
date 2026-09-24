@@ -176,7 +176,7 @@ impl GameAnnotations {
 
 /// UTF-8 when the bytes are valid UTF-8, else Windows-1252: nothing in the
 /// record says which.
-pub(super) fn decode_text(b: &[u8]) -> String {
+pub(crate) fn decode_text(b: &[u8]) -> String {
     match std::str::from_utf8(b) {
         Ok(s) => s.to_owned(),
         Err(_) => b.iter().map(|&c| cp1252(c)).collect(),

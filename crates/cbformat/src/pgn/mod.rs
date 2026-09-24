@@ -1,14 +1,23 @@
 //! PGN output: standard algebraic notation, a game's full move tree and its
 //! annotations.
 
+mod classic;
 mod comments;
 mod san;
 mod tree;
 
+pub use classic::{classic_game, classic_game_from, classic_game_with};
+
 pub use san::san;
 
-use crate::replay::{self, start_board};
-use crate::v2::{Database, GameAnnotations, GameMoves, Record, RecordKind, Start, language};
+use chesscore::Board;
+
+use crate::replay::{self, TreeStats, start_board};
+use crate::v2::{
+    Database, Date, Eco, GameAnnotations, GameMoves, GameResult, Player, Record, RecordKind, Start, Tournament,
+    language,
+};
+use crate::view::PositionOrder;
 use crate::{Error, Result};
 use comments::Commentary;
 use tree::{Bare, TreeBuilder, emit};
@@ -67,17 +76,28 @@ pub fn movetext_annotated(moves: &GameMoves<'_>, annotations: &GameAnnotations, 
 }
 
 fn write_movetext(moves: &GameMoves<'_>, annotations: Option<&GameAnnotations>, options: &Options) -> Result<String> {
+    write_tree(|tree| replay::walk(moves, tree), annotations, PositionOrder::Pgn, options)
+}
+
+/// The movetext of the tree `walk` plays, with its annotations numbered in
+/// `order`.
+fn write_tree(
+    walk: impl FnOnce(&mut TreeBuilder) -> Result<TreeStats>,
+    annotations: Option<&GameAnnotations>,
+    order: PositionOrder,
+    options: &Options,
+) -> Result<String> {
     let mut tree = TreeBuilder::new();
     // walk() checks every move and the tree's shape, so a damaged record is an
     // error here exactly as it is in `cbtool verify`.
-    let stats = replay::walk(moves, &mut tree)?;
+    let stats = walk(&mut tree)?;
     let mut out = String::with_capacity(tree.text_len());
     match annotations.filter(|a| !a.is_empty()) {
         Some(a) => {
             // An annotation on a move the game does not have is damage, not
             // something to drop quietly.
             a.check_positions(stats.total_plies)?;
-            let mut commentary = Commentary::new(a, options);
+            let mut commentary = Commentary::new(a, order, options);
             commentary.game_comment(&mut out);
             emit(&tree, &mut commentary, &mut out);
         }
@@ -134,47 +154,81 @@ pub fn game_from(
     }
     let e = db.entities();
     let t = e.tournament(r.tournament())?;
-    let name = |pid| -> Result<String> {
-        Ok(e.player(pid)?.map(|p| p.pgn()).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into()))
+    let name = |pid| -> Result<Option<Player>> { e.player(pid) };
+    let start = moves.start()?;
+    let tags = Tags {
+        tournament: t,
+        date: r.played_date(),
+        round: (i32::from(r.round()), i32::from(r.subround())),
+        white: name(r.white())?,
+        black: name(r.black())?,
+        result: r.result(),
+        elo: (i32::from(r.white_elo()), i32::from(r.black_elo())),
+        eco: r.eco(),
+        start: (start != Start::Standard).then(|| start_board(&start)).transpose()?,
+        chess960: moves.is_chess960(),
     };
+    let text = write_movetext(moves, annotations, options)?;
+    Ok(finish(&tags, &text, annotations))
+}
+
+/// The tag roster of a game, from either format.
+struct Tags {
+    tournament: Option<Tournament>,
+    date: Date,
+    /// Round and sub-round, 0 when unknown.
+    round: (i32, i32),
+    white: Option<Player>,
+    black: Option<Player>,
+    result: GameResult,
+    /// Ratings, 0 or less when unknown.
+    elo: (i32, i32),
+    eco: Eco,
+    /// The start position, for a game not from the standard one.
+    start: Option<Board>,
+    chess960: bool,
+}
+
+/// The whole PGN record: tags, movetext and result, and how much of the
+/// annotations it holds.
+fn finish(tags: &Tags, text: &str, annotations: Option<&GameAnnotations>) -> Rendered {
+    let t = tags.tournament.as_ref();
+    let name = |p: &Option<Player>| p.as_ref().map(|p| p.pgn()).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into());
     let mut out = String::new();
-    tag(&mut out, "Event", t.as_ref().map(|t| t.title.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
-    tag(&mut out, "Site", t.as_ref().map(|t| t.place.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
-    tag(&mut out, "Date", &r.played_date().pgn());
-    let round = match (r.round(), r.subround()) {
+    tag(&mut out, "Event", t.map(|t| t.title.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
+    tag(&mut out, "Site", t.map(|t| t.place.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
+    tag(&mut out, "Date", &tags.date.pgn());
+    let round = match tags.round {
         (0, _) => "?".to_string(),
         (n, 0) => n.to_string(),
         (n, s) => format!("{n}({s})"),
     };
     tag(&mut out, "Round", &round);
-    tag(&mut out, "White", &name(r.white())?);
-    tag(&mut out, "Black", &name(r.black())?);
-    tag(&mut out, "Result", r.result().pgn());
-    if r.white_elo() > 0 {
-        tag(&mut out, "WhiteElo", &r.white_elo().to_string());
+    tag(&mut out, "White", &name(&tags.white));
+    tag(&mut out, "Black", &name(&tags.black));
+    tag(&mut out, "Result", tags.result.pgn());
+    if tags.elo.0 > 0 {
+        tag(&mut out, "WhiteElo", &tags.elo.0.to_string());
     }
-    if r.black_elo() > 0 {
-        tag(&mut out, "BlackElo", &r.black_elo().to_string());
+    if tags.elo.1 > 0 {
+        tag(&mut out, "BlackElo", &tags.elo.1.to_string());
     }
-    if let Some(eco) = r.eco().pgn() {
+    if let Some(eco) = tags.eco.pgn() {
         tag(&mut out, "ECO", &eco);
     }
-    let start = moves.start()?;
-    if start != Start::Standard {
-        let board = start_board(&start)?;
-        if moves.is_chess960() {
+    if let Some(board) = &tags.start {
+        if tags.chess960 {
             tag(&mut out, "Variant", "Chess960");
         }
         tag(&mut out, "SetUp", "1");
         tag(&mut out, "FEN", &format!("{board}"));
     }
     out.push('\n');
-    let text = write_movetext(moves, annotations, options)?;
     if !text.is_empty() {
-        out.push_str(&text);
+        out.push_str(text);
         out.push(' ');
     }
-    out.push_str(r.result().pgn());
+    out.push_str(tags.result.pgn());
     out.push('\n');
     let status = match annotations.filter(|a| !a.is_empty()) {
         None => AnnotationStatus::None,
@@ -183,5 +237,5 @@ pub fn game_from(
             None => AnnotationStatus::Complete,
         },
     };
-    Ok(Rendered { pgn: out, annotations: status })
+    Rendered { pgn: out, annotations: status }
 }

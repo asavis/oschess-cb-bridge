@@ -1,5 +1,5 @@
-//! `cbtool`: inspect, verify and export ChessBase 2CBH databases; inspect
-//! and verify classic CBH ones; run the bridge in a console.
+//! `cbtool`: inspect, verify and export ChessBase databases, 2CBH and
+//! classic CBH; run the bridge in a console.
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -14,19 +14,21 @@ use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::pgn::{AnnotationStatus, Options};
 use cbformat::replay::walk_tree;
 use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
+use cbformat::view::{self, Base};
 
 mod classic;
 
 const USAGE: &str = "usage:
   cbtool info   <db>
   cbtool verify <db> [--limit N]           decode and replay every game and analysis
-                                           (<db> may be a classic .cbh database)
   cbtool pgn    <db> [--out FILE] [--lang LANGS] [ID...]
                                            export games as PGN (all games when no ids)
   cbtool databases <dir>                   the databases ChessBase's database window lists
                                            (dir: the ChessBase documents folder)
   cbtool bridge [--database <path>]... [--show-token] [--new-token]
                                            run the oschess bridge in this console
+
+<db> is a 2CBH (.2cbh) or classic (.cbh) database.
 
 --lang takes ISO 639-1 codes in order of preference, comma-separated, for the
 language of comments (default: English, else the first a game has).
@@ -61,7 +63,7 @@ fn main() -> ExitCode {
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn info(path: &str) -> AnyResult<bool> {
-    if classic::is_classic(path) {
+    if view::format_of(Path::new(path)) == view::Format::Cbh {
         return classic::info(path);
     }
     let db = Database::open(path)?;
@@ -213,7 +215,7 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
         [] => None,
         _ => return Err(USAGE.into()),
     };
-    if classic::is_classic(path) {
+    if view::format_of(Path::new(path)) == view::Format::Cbh {
         return classic::verify(path, limit);
     }
     let db = Database::open(path)?;
@@ -290,7 +292,7 @@ fn report(
 /// Refuses an output path that is one of the database's own files, by name or
 /// through any alias such as a hard link: creating it would truncate the input
 /// while it is being read.
-fn refuse_database_file(out: &Path, db: &Database) -> AnyResult<()> {
+fn refuse_database_file(out: &Path, db: &Base) -> AnyResult<()> {
     if !out.exists() {
         return Ok(());
     }
@@ -303,7 +305,7 @@ fn refuse_database_file(out: &Path, db: &Database) -> AnyResult<()> {
 }
 
 fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
-    let db = Database::open(path)?;
+    let db = Base::open(path)?;
     let mut out_path = None;
     let mut options = Options::default();
     let mut ids = Vec::new();
@@ -336,11 +338,11 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
 /// The id of every game, from headers read [`cbformat::v2::MAX_BATCH_RECORDS`]
 /// at a time. A failed read fails the export: a database damaged or truncated
 /// under it must not give a silently incomplete one.
-fn game_ids(db: &Database) -> cbformat::Result<Vec<u32>> {
+fn game_ids(db: &Base) -> cbformat::Result<Vec<u32>> {
     let mut ids = Vec::new();
     let mut first = 1;
     loop {
-        let records = db.records(first, db.record_count())?;
+        let records = db.headers(first, db.record_count())?;
         let Some(last) = records.last() else { break };
         ids.extend(records.iter().filter(|r| r.kind() == RecordKind::Game).map(|r| r.id()));
         let Some(next) = last.id().checked_add(1) else { break };
@@ -365,27 +367,20 @@ struct Rendered<'db> {
     text: String,
     errors: Vec<(usize, String, bool)>,
     /// The records around the last one rendered, read together.
-    batch: Option<Batch<'db>>,
+    batch: Option<view::Batch<'db>>,
 }
 
 /// Records read together when rendering; ids outside the batch start a new one.
 const RENDER_BATCH: u32 = 1_024;
 
 impl<'db> Rendered<'db> {
-    fn game(&mut self, db: &'db Database, id: u32, options: &Options) {
+    fn game(&mut self, db: &'db Base, id: u32, options: &Options) {
         if !self.batch.as_ref().is_some_and(|b| b.ids().contains(&id)) {
             self.batch = db.batch(id, id.saturating_add(RENDER_BATCH - 1)).ok();
         }
         let rendered = match &self.batch {
-            Some(batch) => batch.record(id).and_then(|r| {
-                if r.kind() != RecordKind::Game {
-                    return cbformat::pgn::game_with(db, id, options);
-                }
-                let data = batch.moves_of(&r)?;
-                let annotations = batch.annotations_of(&r)?;
-                cbformat::pgn::game_from(db, &r, &data.moves()?, annotations.as_ref(), options)
-            }),
-            None => cbformat::pgn::game_with(db, id, options),
+            Some(batch) => batch.pgn(id, options),
+            None => db.pgn(id, options),
         };
         match rendered {
             Ok(game) => {

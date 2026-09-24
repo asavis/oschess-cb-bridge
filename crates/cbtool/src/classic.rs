@@ -1,7 +1,6 @@
 //! `info` and `verify` for classic (`.cbh`) databases, with the same output
-//! as for 2CBH ones.
+//! as for 2CBH ones, annotations included.
 
-use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -12,21 +11,6 @@ use cbformat::v2::{RecordKind, Start};
 use chesscore::{Board, Move, Piece};
 
 use super::{AnyResult, RUN, Stats, report, run_ids, run_workers, threads};
-
-/// Whether `path` names a classic database: a `.cbh` file, or a bare stem
-/// with a `.cbh` file and no `.2cbh` one.
-pub(crate) fn is_classic(path: &str) -> bool {
-    let p = Path::new(path);
-    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cbh")) {
-        return true;
-    }
-    let with = |ext: &str| {
-        let mut s = p.as_os_str().to_owned();
-        s.push(ext);
-        std::path::PathBuf::from(s)
-    };
-    !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("2cbh")) && with(".cbh").exists() && !with(".2cbh").exists()
-}
 
 pub(crate) fn info(path: &str) -> AnyResult<bool> {
     let db = Database::open(path)?;
@@ -105,12 +89,25 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
     if matches!(game.start(), Ok(Start::Setup(_))) {
         s.setups += 1;
     }
-    match cbh::walk(&game, &mut Counter(s)) {
+    let plies = match cbh::walk(&game, &mut Counter(s)) {
         Ok(t) => {
             s.main_plies += u64::from(t.main_line_plies);
             s.total_plies += u64::from(t.total_plies);
+            t.total_plies
         }
-        Err(e) => fail(s, e.to_string()),
+        Err(e) => return fail(s, e.to_string()),
+    };
+    // Every annotation type has its size, so a classic record is never left
+    // incomplete: it decodes, or it is damaged.
+    match batch.annotations_of(&r) {
+        Ok(Some(a)) if !a.is_empty() => {
+            s.annotated += 1;
+            if let Err(e) = a.check_positions(plies) {
+                fail(s, format!("annotations: {e}"));
+            }
+        }
+        Ok(_) => {}
+        Err(e) => fail(s, format!("annotations: {e}")),
     }
 }
 
@@ -135,5 +132,5 @@ pub(crate) fn verify(path: &str, limit: Option<u32>) -> AnyResult<bool> {
         });
     }
     let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
-    Ok(report(n, started, &stats, failures, None))
+    Ok(report(n, started, &stats, failures, Some(db.has_annotations())))
 }

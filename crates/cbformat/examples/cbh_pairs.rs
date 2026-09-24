@@ -1,13 +1,14 @@
 //! Compares a classic database with its 2CBH twin, game by game: the header
-//! fields both formats store, the names of players and tournaments, and the
+//! fields both formats store, the names of players and tournaments, the
 //! whole move tree (every move of every line, in stored order, with the
-//! branch and resume points). Prints counts and game ids only, never game
-//! contents.
+//! branch and resume points), and the PGN of each game with its annotations,
+//! byte for byte. Prints counts and game ids only, never game contents.
 //!
-//! cargo run --release -p cbformat --example cbh_pairs -- <db.cbh> <db.2cbh>
+//! cargo run --release -p cbformat --example cbh_pairs -- <db.cbh> <db.2cbh> [--lang CODES]
 
 use chesscore::{Board, Move};
 
+use cbformat::pgn::{self, Options};
 use cbformat::replay::{TreeVisitor, walk};
 use cbformat::{cbh, v2};
 
@@ -52,7 +53,11 @@ impl Diff {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [old, new] = args.as_slice() else { return Err("usage: cbh_pairs <db.cbh> <db.2cbh>".into()) };
+    let (old, new, options) = match args.as_slice() {
+        [old, new] => (old, new, Options::default()),
+        [old, new, flag, codes] if flag == "--lang" => (old, new, Options::with_languages(codes.split(','))),
+        _ => return Err("usage: cbh_pairs <db.cbh> <db.2cbh> [--lang CODES]".into()),
+    };
     let a = cbh::Database::open(old)?;
     let b = v2::Database::open(new)?;
     println!("records            {} / {}", a.record_count(), b.record_count());
@@ -63,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut trees, mut starts, mut errors_a, mut errors_b, mut compared) =
         (Diff::default(), Diff::default(), Diff::default(), Diff::default(), 0u64);
     let (ea, eb) = (a.entities(), b.entities());
+    let mut pgn = PgnDiffs::default();
     for id in 1..=n {
         let (ra, rb) = (a.record(id)?, b.record(id)?);
         // A guiding text has no players, result or date to compare, and a
@@ -106,17 +112,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tb.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
             tb.as_ref().map(|t| t.place.clone()).unwrap_or_default(),
         ];
+        let mut name_exception = false;
         for (i, (d, ok)) in header.iter_mut().zip(checks).enumerate() {
             // An analysis record's entity fields are not a game's.
             if !ok && !(analysis && i >= 7) {
                 if i >= 7 && !single_byte(&texts_b[i - 7]) {
                     unrepresentable += 1;
+                    name_exception = true;
                 } else if i >= 7 && !texts_a[i - 7].is_empty() && texts_b[i - 7].starts_with(&texts_a[i - 7]) {
                     truncated += 1;
+                    name_exception = true;
                 } else {
                     d.add(id);
                 }
             }
+        }
+        if ra.kind() == v2::RecordKind::Game && rb.kind() == v2::RecordKind::Game {
+            pgn.compare(id, pgn::classic_game_with(&a, id, &options), pgn::game_with(&b, id, &options), name_exception);
         }
         if ra.kind() != v2::RecordKind::Game {
             continue;
@@ -164,5 +176,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, d) in names.iter().zip(&header) {
         show(&format!("{name} differs"), d);
     }
+    println!("PGN compared       {}", pgn.compared);
+    println!("PGN identical      {}", pgn.identical);
+    println!("PGN tags differ by a known name exception only: {}", pgn.names_only);
+    show("PGN tags differ", &pgn.tags);
+    show("PGN moves differ", &pgn.movetext);
+    show("PGN in comments", &pgn.comments);
+    show("PGN in NAGs", &pgn.nags);
+    show("annotation status", &pgn.status);
+    show("PGN cbh error", &pgn.errors_a);
+    show("PGN 2cbh error", &pgn.errors_b);
     Ok(())
+}
+
+/// The PGN comparison. A movetext that differs is also counted by where the
+/// first difference lies: inside a comment, or at a NAG.
+#[derive(Default)]
+struct PgnDiffs {
+    compared: u64,
+    identical: u64,
+    names_only: u64,
+    tags: Diff,
+    movetext: Diff,
+    comments: Diff,
+    nags: Diff,
+    status: Diff,
+    errors_a: Diff,
+    errors_b: Diff,
+}
+
+impl PgnDiffs {
+    fn compare(
+        &mut self,
+        id: u32,
+        a: cbformat::Result<pgn::Rendered>,
+        b: cbformat::Result<pgn::Rendered>,
+        name_exception: bool,
+    ) {
+        let (a, b) = match (a, b) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(_), Ok(_)) => return self.errors_a.add(id),
+            (Ok(_), Err(_)) => return self.errors_b.add(id),
+            (Err(_), Err(_)) => {
+                self.errors_a.add(id);
+                return self.errors_b.add(id);
+            }
+        };
+        self.compared += 1;
+        if a.annotations != b.annotations {
+            self.status.add(id);
+        }
+        if a.pgn == b.pgn {
+            self.identical += 1;
+            return;
+        }
+        let split = |s: &str| s.split_once("\n\n").map(|(t, m)| (t.to_string(), m.to_string())).unwrap_or_default();
+        let ((tags_a, moves_a), (tags_b, moves_b)) = (split(&a.pgn), split(&b.pgn));
+        if moves_a != moves_b {
+            self.movetext.add(id);
+            match first_difference(&moves_a, &moves_b) {
+                Where::Comment => self.comments.add(id),
+                Where::Nag => self.nags.add(id),
+                Where::Moves => {}
+            }
+        } else if tags_a != tags_b {
+            if name_exception { self.names_only += 1 } else { self.tags.add(id) }
+        }
+    }
+}
+
+/// Where two movetexts first differ.
+#[derive(Debug, PartialEq, Eq)]
+enum Where {
+    Comment,
+    Nag,
+    Moves,
+}
+
+/// Where `a` and `b` first differ: inside a comment, at a NAG, or elsewhere.
+/// Works on bytes, so a difference inside a multi-byte character is found at
+/// that character.
+fn first_difference(a: &str, b: &str) -> Where {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let at = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    let before = &a[..at];
+    let open = before.iter().filter(|&&c| c == b'{').count();
+    let close = before.iter().filter(|&&c| c == b'}').count();
+    if open > close {
+        Where::Comment
+    } else if before.ends_with(b"$") || a[at..].starts_with(b"$") || b[at..].starts_with(b"$") {
+        Where::Nag
+    } else {
+        Where::Moves
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differences_are_placed() {
+        assert_eq!(first_difference("1. e4 {a} e5", "1. e4 {b} e5"), Where::Comment);
+        assert_eq!(first_difference("1. e4 $1 e5", "1. e4 $2 e5"), Where::Nag);
+        assert_eq!(first_difference("1. e4 $1 e5", "1. e4 e5"), Where::Nag);
+        assert_eq!(first_difference("1. e4 e5", "1. e4 $1 e5"), Where::Nag);
+        assert_eq!(first_difference("1. e4 e5", "1. d4 e5"), Where::Moves);
+        assert_eq!(first_difference("1. e4", "1. e4 e5"), Where::Moves);
+        assert_eq!(first_difference("1. e4 e5", "1. e4"), Where::Moves);
+    }
+
+    #[test]
+    fn a_difference_inside_a_multi_byte_character() {
+        // é and ê share their first UTF-8 byte.
+        assert_eq!(first_difference("1. e4 {caf\u{e9}} e5", "1. e4 {caf\u{ea}} e5"), Where::Comment);
+        assert_eq!(first_difference("1. e4 {\u{e9}} e5", "1. e4 {\u{1f600}} e5"), Where::Comment);
+        assert_eq!(first_difference("\u{e9}", "\u{ea}"), Where::Moves);
+    }
 }
