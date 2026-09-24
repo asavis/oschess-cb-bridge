@@ -121,6 +121,8 @@
   "settings.engine.offer.hint": "{current} is chosen now. The official build from GitHub, ≈ {mb} MB, is checked against its checksum. The engine is updated only with your consent.",
   "settings.engine.offer.update": "Update",
   "settings.engine.offer.later": "Later",
+  "settings.engine.installedByBridge": "installed by the bridge",
+  "settings.engine.licence": "Licence (GPL)",
 
   "settings.general.title": "General",
   "settings.autostart.title": "Start with Windows",

@@ -58,6 +58,7 @@ pub fn run() {
             commands::pick_engine,
             commands::install_stockfish,
             commands::dismiss_stockfish_offer,
+            commands::open_stockfish_licence,
             commands::set_autostart,
             commands::set_auto_update,
             commands::pairing_code,

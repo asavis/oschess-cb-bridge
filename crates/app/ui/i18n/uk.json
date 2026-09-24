@@ -121,6 +121,8 @@
   "settings.engine.offer.hint": "Зараз вибрано {current}. Офіційна збірка з GitHub, ≈ {mb} МБ, перевіряється контрольною сумою. Рушій оновлюється лише за вашою згодою.",
   "settings.engine.offer.update": "Оновити",
   "settings.engine.offer.later": "Пізніше",
+  "settings.engine.installedByBridge": "встановлено мостом",
+  "settings.engine.licence": "Ліцензія (GPL)",
 
   "settings.general.title": "Загальне",
   "settings.autostart.title": "Запускати з Windows",

@@ -89,7 +89,10 @@ function renderEngines(view) {
     document.getElementById('offer-hint').textContent =
       t('settings.engine.offer.hint', { current: view.offerFor, mb: view.install.megabytes });
   }
-  const rows = view.found.map((f) => engineRow(f.name, `${t('settings.engine.from', { source: f.source })} · ${f.path}`, f.path, view.chosen));
+  const rows = view.found.map((f) => {
+    const origin = f.source === 'bridge' ? t('settings.engine.installedByBridge') : t('settings.engine.from', { source: f.source });
+    return engineRow(f.name, `${origin} · ${f.path}`, f.path, view.chosen, f.version);
+  });
   if (view.chosen && !view.found.some((f) => f.path === view.chosen)) {
     const name = view.chosen.split(/[\\/]/).pop();
     rows.unshift(engineRow(name, view.chosen, view.chosen, view.chosen));
@@ -98,7 +101,7 @@ function renderEngines(view) {
   document.getElementById('engine-none').hidden = rows.length > 0;
 }
 
-function engineRow(name, detail, path, chosen) {
+function engineRow(name, detail, path, chosen, version) {
   const radio = el('input');
   radio.type = 'radio';
   radio.name = 'engine';
@@ -106,7 +109,16 @@ function engineRow(name, detail, path, chosen) {
   radio.addEventListener('change', () => chooseEngine(() => call('choose_engine', { path })));
   const text = el('div', 'text', el('div', null, name), el('div', 'cap12 path', detail));
   text.lastChild.title = detail;
-  return el('label', 'row engine', radio, text);
+  // A build the bridge installed carries its licence beside it.
+  let licence = null;
+  if (version) {
+    licence = el('button', 'btn quiet', t('settings.engine.licence'));
+    licence.addEventListener('click', (e) => {
+      e.preventDefault();
+      act(call('open_stockfish_licence', { version }));
+    });
+  }
+  return el('label', 'row engine', radio, text, licence);
 }
 
 // One choice at a time: the controls wait while an engine is checked, so a

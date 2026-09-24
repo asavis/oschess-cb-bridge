@@ -120,21 +120,32 @@ pub enum Progress {
 
 /// How the files arrive: the system's own tools on Windows, stand-ins in tests.
 pub trait Transport: Sync {
-    /// Downloads `url` to `to`.
-    fn download(&self, url: &str, to: &Path) -> Result<(), String>;
+    /// Downloads `url` to `to`, refusing more than `max_size` bytes.
+    fn download(&self, url: &str, to: &Path, max_size: u64) -> Result<(), String>;
     /// Unpacks `members` of the zip archive `zip` under `to`, keeping their paths.
     fn extract(&self, zip: &Path, members: &[String], to: &Path) -> Result<(), String>;
 }
 
+/// Whether `build` is installed in the data folder `data`: its executable and
+/// its licence are there.
+pub fn is_installed(data: &Path, build: &Build) -> bool {
+    build.installed(data).is_file() && build.dir(data).join(LICENCE).is_file()
+}
+
 /// Installs `build` into the data folder `data` and returns its executable.
-/// A download that does not match the pinned size and digest is deleted and
-/// refused; a failed step leaves no partial installation behind.
+/// An installed build is kept as it is, with nothing downloaded. A download
+/// that does not match the pinned size and digest is deleted and refused. The
+/// new installation replaces a partial one only once it is complete, and a
+/// failed step never removes what was there before.
 pub fn install(
     data: &Path,
     build: &Build,
     transport: &dyn Transport,
     progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<PathBuf, String> {
+    if is_installed(data, build) {
+        return Ok(build.installed(data));
+    }
     let engines = data.join("engines");
     std::fs::create_dir_all(&engines).map_err(|e| format!("{}: {e}", engines.display()))?;
     let zip = engines.join(format!(".download-{}", build.asset));
@@ -147,12 +158,16 @@ pub fn install(
     let result = (|| {
         download_with_progress(transport, build, &zip, progress)?;
         progress(Progress::Checking);
+        // The length first: a wrong one is refused before any hashing.
         let size = std::fs::metadata(&zip).map_err(|e| e.to_string())?.len();
+        if size != build.size {
+            return Err(format!("The download does not match the pinned build: {size} bytes, expected {}", build.size));
+        }
         let digest = sha256::hex(&sha256::file(&zip).map_err(|e| e.to_string())?);
-        if size != build.size || digest != build.sha256 {
+        if digest != build.sha256 {
             return Err(format!(
-                "The download does not match the pinned build: {size} bytes, SHA-256 {digest}; expected {} bytes, {}",
-                build.size, build.sha256
+                "The download does not match the pinned build: SHA-256 {digest}, expected {}",
+                build.sha256
             ));
         }
         progress(Progress::Unpacking);
@@ -165,19 +180,35 @@ pub fn install(
                 return Err(format!("The archive has no stockfish/{name}"));
             }
         }
-        let dir = build.dir(data);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for name in [build.exe, LICENCE] {
-            let moved = std::fs::rename(staging.join("stockfish").join(name), dir.join(name));
-            if let Err(e) = moved {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(format!("{}: {e}", dir.join(name).display()));
-            }
-        }
+        commit(&staging.join("stockfish"), &build.dir(data))?;
         Ok(build.installed(data))
     })();
     clean();
     result
+}
+
+/// Puts the unpacked folder `from` in place of `dir`: by renaming, so that a
+/// reader sees the old folder or the complete new one. A folder already at
+/// `dir`, a partial earlier installation, is moved aside first and restored
+/// if the new one cannot take its place; it is removed only after that.
+fn commit(from: &Path, dir: &Path) -> Result<(), String> {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("stockfish");
+    let aside = dir.with_file_name(format!(".previous-{name}"));
+    let _ = std::fs::remove_dir_all(&aside);
+    let had = dir.exists();
+    if had {
+        std::fs::rename(dir, &aside).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    if let Err(e) = std::fs::rename(from, dir) {
+        if had {
+            let _ = std::fs::rename(&aside, dir);
+        }
+        return Err(format!("{}: {e}", dir.display()));
+    }
+    if had {
+        let _ = std::fs::remove_dir_all(&aside);
+    }
+    Ok(())
 }
 
 /// Downloads while reporting the file's growing size every quarter second.
@@ -191,7 +222,7 @@ fn download_with_progress(
     std::thread::scope(|scope| {
         let url = build.url();
         let downloading = scope.spawn(move || {
-            let result = transport.download(&url, zip);
+            let result = transport.download(&url, zip, build.size);
             let _ = done_tx.send(());
             result
         });
@@ -232,9 +263,13 @@ fn stockfish_major(text: &str) -> Option<u32> {
 pub struct System;
 
 impl Transport for System {
-    fn download(&self, url: &str, to: &Path) -> Result<(), String> {
+    fn download(&self, url: &str, to: &Path, max_filesize: u64) -> Result<(), String> {
         let status = system_tool("curl.exe")?
             .args(["--fail", "--location", "--silent", "--show-error", "--proto", "=https", "--proto-redir", "=https"])
+            // Bounded: no more than the pinned size, and a transfer that
+            // stalls below 1 kB/s for a minute, or runs over half an hour, ends.
+            .args(["--max-filesize", &max_filesize.to_string()])
+            .args(["--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60", "--max-time", "1800"])
             .arg("--output")
             .arg(to)
             .arg(url)
@@ -285,8 +320,9 @@ mod tests {
     }
 
     impl Transport for Fake {
-        fn download(&self, url: &str, to: &Path) -> Result<(), String> {
+        fn download(&self, url: &str, to: &Path, max_size: u64) -> Result<(), String> {
             self.asked.lock().unwrap().push(url.to_string());
+            assert_eq!(max_size, TEST_BUILD.size);
             std::fs::write(to, &self.archive).map_err(|e| e.to_string())
         }
 
@@ -363,6 +399,38 @@ mod tests {
             assert!(!TEST_BUILD.dir(&dir).exists());
             assert_eq!(std::fs::read_dir(dir.join("engines")).unwrap().count(), 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_an_installed_build_and_never_loses_one_to_a_failed_reinstall() {
+        let dir = data("again");
+        let good = fake(b"hello world");
+        let exe = install(&dir, &TEST_BUILD, &good, &mut |_| {}).unwrap();
+        // Installed: nothing is downloaded again.
+        assert_eq!(install(&dir, &TEST_BUILD, &good, &mut |_| {}).unwrap(), exe);
+        assert_eq!(good.asked.lock().unwrap().len(), 1);
+
+        // A partial installation (the licence gone) is replaced whole, and a
+        // failed replacement leaves it as it was.
+        let folder = TEST_BUILD.dir(&dir);
+        std::fs::remove_file(folder.join(LICENCE)).unwrap();
+        std::fs::write(folder.join("marker"), b"mine").unwrap();
+        let error = install(&dir, &TEST_BUILD, &fake(b"hello World"), &mut |_| {}).unwrap_err();
+        assert!(error.contains("SHA-256"), "{error}");
+        assert_eq!(std::fs::read(folder.join("marker")).unwrap(), b"mine", "the earlier folder is untouched");
+        assert!(folder.join("stockfish-test.exe").is_file());
+        install(&dir, &TEST_BUILD, &good, &mut |_| {}).unwrap();
+        assert!(is_installed(&dir, &TEST_BUILD));
+        assert!(!folder.join("marker").exists(), "the complete installation replaced the partial one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_a_wrong_length_before_hashing() {
+        let dir = data("length");
+        let error = install(&dir, &TEST_BUILD, &fake(b"hello world, longer"), &mut |_| {}).unwrap_err();
+        assert!(error.contains("19 bytes, expected 11"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

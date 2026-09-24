@@ -70,6 +70,9 @@ struct FoundEngine {
     name: String,
     path: String,
     source: &'static str,
+    /// For a build the bridge installed: its version, whose licence the
+    /// window can open.
+    version: Option<String>,
 }
 
 type Answer<T> = Result<T, String>;
@@ -168,9 +171,16 @@ pub async fn engines(app: AppHandle) -> Answer<EnginesView> {
 fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     let shared = shared(app);
     let config = config::load_or_create(&shared.config_path()?)?;
-    let found: Vec<FoundEngine> = engines::find(&Roots::system())
+    let data = shared.dir()?;
+    let roots = Roots { bridge_data: Some(data.clone()), ..Roots::system() };
+    let found: Vec<FoundEngine> = engines::find(&roots)
         .into_iter()
-        .map(|f| FoundEngine { name: f.name, path: f.path.to_string_lossy().into_owned(), source: f.source })
+        .map(|f| {
+            let version = (f.source == engines::BRIDGE)
+                .then(|| f.path.parent()?.file_name()?.to_str()?.strip_prefix("stockfish-").map(str::to_string))
+                .flatten();
+            FoundEngine { name: f.name, path: f.path.to_string_lossy().into_owned(), source: f.source, version }
+        })
         .collect();
     let build = Build::for_arch(stockfish::machine_arch());
     let chosen = config.engine.map(|p| p.to_string_lossy().into_owned());
@@ -182,7 +192,9 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
             .map(|f| f.name.clone())
             .unwrap_or_else(|| path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(".exe").to_string())
     });
-    let dismissed = prefs::load(&shared.dir()?).stockfish_offer_dismissed.as_deref() == Some(env!("CARGO_PKG_VERSION"));
+    // An installed pinned build is in the list already: nothing to offer.
+    let dismissed = stockfish::is_installed(&data, build)
+        || prefs::load(&data).stockfish_offer_dismissed.as_deref() == Some(env!("CARGO_PKG_VERSION"));
     let offer_for = match (&chosen, &chosen_name) {
         (Some(path), Some(name)) if !dismissed && stockfish::offer(Some((Path::new(path), name))).is_some() => {
             Some(name.clone())
@@ -197,16 +209,22 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     })
 }
 
+/// One installation at a time.
+static INSTALLING: Mutex<()> = Mutex::new(());
+
 /// Installs the official Stockfish pinned in this release, then chooses it.
 /// The progress goes to the settings window as `stockfish-progress` events.
-/// A failure answers why, in English, for the window to show.
+/// A failure answers why, in English, for the window to show. The download
+/// holds no lock another choice waits on: only the probe and the save do.
 #[tauri::command]
 pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
     let data = shared(&app).dir()?;
     let config_path = shared(&app).config_path()?;
     let window = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
-        let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
+        let Ok(_installing) = INSTALLING.try_lock() else {
+            return Err("Stockfish is being installed already".into());
+        };
         let build = Build::for_arch(stockfish::machine_arch());
         let exe = stockfish::install(&data, build, &stockfish::System, &mut |progress| {
             let (phase, done, total) = match progress {
@@ -216,6 +234,7 @@ pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
             };
             let _ = window.emit_to(windows::SETTINGS, "stockfish-progress", InstallProgress { phase, done, total });
         })?;
+        let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
         engine::probe(&exe)?;
         let next = config::Config { engine: Some(exe), ..config::load_or_create(&config_path)? };
         config::save(&config_path, &next)
@@ -223,6 +242,20 @@ pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
     .await
     .map_err(text)??;
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
+}
+
+/// Opens the licence of the Stockfish `version` the bridge installed. Only a
+/// version is taken from the window; the path is the bridge's own.
+#[tauri::command]
+pub fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
+    if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return Err("not a Stockfish version".into());
+    }
+    let licence = shared(&app).dir()?.join("engines").join(format!("stockfish-{version}")).join(stockfish::LICENCE);
+    if !licence.is_file() {
+        return Err(format!("{} is missing", licence.display()));
+    }
+    app.opener().open_path(licence.to_string_lossy(), None::<&str>).map_err(text)
 }
 
 /// Puts off the Stockfish offer until the next bridge version.
