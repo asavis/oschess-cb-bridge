@@ -19,15 +19,21 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 
 fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    try_get(port, path).expect("the bridge answers")
+}
+
+/// [`get`], or `None` when the connection is refused or cut: during a start,
+/// the port may belong to another test's bridge that has just ended.
+fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let raw = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
     );
-    s.write_all(raw.as_bytes()).unwrap();
+    s.write_all(raw.as_bytes()).ok()?;
     let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split(' ').nth(1).unwrap().parse().unwrap();
-    (status, out)
+    s.read_to_string(&mut out).ok()?;
+    let status = out.split(' ').nth(1)?.parse().ok()?;
+    Some((status, out))
 }
 
 /// One game, then `records - 1` headers that are a hole in the file.
@@ -185,8 +191,8 @@ impl Limited {
             if self.child.try_wait().unwrap().is_some() {
                 return false;
             }
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                let listed = get(self.port, "/v1/databases").1.contains(&format!(r#""id":"{}""#, self.id));
+            if let Some((_, body)) = try_get(self.port, "/v1/databases") {
+                let listed = body.contains(&format!(r#""id":"{}""#, self.id));
                 return listed && self.child.try_wait().unwrap().is_none();
             }
             std::thread::sleep(Duration::from_millis(20));

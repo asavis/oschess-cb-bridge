@@ -16,16 +16,19 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 const START: &str = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR%20w%20KQkq%20-%200%201";
 
-fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+/// A request's status and whole answer, or `None` when the connection is
+/// refused or cut: during a start, the port may belong to another test's
+/// bridge that has just ended.
+fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let raw = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
     );
-    s.write_all(raw.as_bytes()).unwrap();
+    s.write_all(raw.as_bytes()).ok()?;
     let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    let status = out.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (status, out)
+    s.read_to_string(&mut out).ok()?;
+    let status = out.split(' ').nth(1)?.parse().ok()?;
+    Some((status, out))
 }
 
 /// The bridge as a separate process under an address-space limit of
@@ -75,8 +78,8 @@ impl Limited {
             if self.child.try_wait().unwrap().is_some() {
                 return false;
             }
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                let listed = get(self.port, "/v1/databases").1.contains(&format!(r#""id":"{}""#, self.id));
+            if let Some((_, body)) = try_get(self.port, "/v1/databases") {
+                let listed = body.contains(&format!(r#""id":"{}""#, self.id));
                 return listed && self.child.try_wait().unwrap().is_none();
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -88,7 +91,10 @@ impl Limited {
     fn explore(&mut self) -> String {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let (status, out) = get(self.port, &format!("/v1/databases/{}/explorer?fen={START}", self.id));
+            let answer = try_get(self.port, &format!("/v1/databases/{}/explorer?fen={START}", self.id));
+            let Some((status, out)) = answer else {
+                panic!("the bridge stopped answering; it ended: {:?}", self.child.try_wait().unwrap());
+            };
             if status == 200 {
                 return out;
             }
