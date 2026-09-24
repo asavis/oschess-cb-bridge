@@ -43,9 +43,11 @@ target/release/oschess-bridge --database "path/to/Database.2cbh" --show-token
 target/release/cbtool bridge --database "path/to/Database.2cbh"   # the same bridge
 ```
 
-Each command also takes a classic database (`Database.cbh`). `--lang` chooses
-the language of comments stored in several languages, in order of preference;
-English is the default.
+`cbtool info`, `verify` and `pgn` also take a classic database
+(`Database.cbh`). The bridge does not serve classic databases yet: it lists
+them as `unsupported` until #25 is complete. `--lang` chooses the language of
+comments stored in several languages, in order of preference; English is the
+default.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
