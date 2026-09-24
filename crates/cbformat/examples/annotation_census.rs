@@ -197,7 +197,7 @@ fn main() {
                                         }
                                         0x05
                                     }
-                                    Annotation::Other(t) => *t,
+                                    Annotation::Other { code, .. } => *code,
                                 };
                                 *c.types.entry(code).or_default() += 1;
                             }

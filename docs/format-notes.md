@@ -74,15 +74,67 @@ are **unknown**.
 and 32 on the move; 8, 10-19, 32-44, 130-138 and 146 (novelty) on the position;
 140-145 as the prefix.
 
-**Game quotation** (`13`):
+**Game quotation** (`13`), `v2::Quotation`:
 
+- The header's six strings are white's last and first name, black's last and
+  first name, the site and the event, each a length byte that counts a
+  terminating zero.
+- In the 35 bytes after them:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | `int` | the date, as a game header's |
+  | 4 | 1 | the event's type: bit `0x20` blitz, `0x40` rapid, `0x80` correspondence |
+  | 6 | 1 | the event's nation |
+  | 10 | 1 | the number of rounds |
+  | 28, 30 | `short` | white's and black's rating |
+  | 32 | `short` | the ECO, as a game header's |
+  | 34 | 1 | the result: 0 black won, 1 draw, 2 white won |
+
+  In the 44 bytes after those, the round is byte 8 and the subround byte 9, a
+  signed byte. The other bytes are **unknown**.
+
+  The evidence is ChessBase's own PGN export of `MegaBase2026-Update41`, which
+  writes each of its 1,671 quotations as text. Read this way, the fields
+  reproduce that text exactly for all 1,671 (below). The ECO has no place in
+  that text, but decodes to a valid code in all 126,638 quotations of the Mega.
 - The two rating-list names after the `01 00 01 00 00` markers are an `int`
   length and that many bytes, not the length-byte strings of the header.
 - Of the 29 bytes before the move count, byte 26 is 1 for a quoted game from
   the standard position. It is 0, once in the Mega, for a set-up start: 64 bytes
   follow, one per square file by file (1 king, 2 queen, 3 knight, 4 bishop,
   5 rook, 6 pawn, +8 for black, 0 empty), then 11 bytes that are **unknown**,
-  then the last two of the 29.
+  then the last two of the 29. A set-up quotation's moves are therefore left in
+  its data.
+- **Moves**, 5 bytes each:
+  - the origin square is in the low six bits of the first byte, numbered file by
+    file from 0, with bit 6 set on a promotion;
+  - the destination is in the low six bits of the second byte, and on a
+    promotion its top two bits name the piece: 0 queen, 1 knight, 2 bishop,
+    3 rook;
+  - the other three bytes are 0 in all 1,220,770 moves of the Mega.
+
+  Castling is the king's move. In the Mega, 15,137 quotations have moves
+  (15,121 with mode 2, 15 with mode 1, 1 from a set-up position). Read this way,
+  all 15,136 from the standard position replay as legal games. No other piece
+  mapping does, and the flag falls on a pawn reaching its last rank every time.
+- **ChessBase's own PGN** writes a quotation as a comment on its move. All
+  1,671 in Update41 follow `Quotation::chessbase_text`:
+  - the result: `1-0`, `0-1`, or `1/2` for a draw;
+  - both players as `Last,F (Elo)`: the first name's initial, the whole last
+    name when there is no first name, and no parentheses when the rating is 0;
+  - the event, trimmed, then:
+    - the site, unless the event holds it;
+    - `blitz` or `rapid` for such an event, unless the event names it;
+    - the year, unless the text so far holds it;
+    - `(round)`, `(round.subround)`, or `[subround]` for a correspondence
+      event's board.
+
+    A negative subround shows as its 16-bit two's complement, as ChessBase does.
+
+**Medals** (`22`): the `int` of medal bits. ChessBase's own PGN writes it as
+`[%mdl <bits>]` (4 in 271 and 8 in 5 of Update41's medals), first in the
+comment of its move.
 
 **Training** (`09`): the third byte of the header is the variant.
 
@@ -431,6 +483,24 @@ writer handles both formats alike.
   in the 252 classic databases examined is about 45 KB, so a record over
   16 MiB (`cbh::MAX_ANNOTATION_RECORD`) is refused before it is read, as 2CBH
   records over 64 MiB are.
+- **Game quotations** (`13`) have a header of their own layout. Everything is
+  big-endian, and each string is a length byte, the text and a zero:
+  - the data's size, the mode, and two **unknown** bytes;
+  - white and black, each one `last,first` string;
+  - white's rating, black's rating and the ECO;
+  - the event and the site;
+  - the date `int`, the type (as a `short`), the nation `short`, two
+    **unknown** bytes and the number of rounds;
+  - the subround, the round and the result, one byte each;
+  - then bytes that are **unknown**.
+
+  The classic copy of Update41 decodes to the same fields as its 2CBH copy in
+  all 1,671 quotations: the PGN of the two copies is identical. None of its
+  quotations holds moves, so the moves of a classic quotation are not known, and
+  they stay in its data.
+- **Medals** (`22`) are the same `int` as in 2CBH, big-endian.
+- **Other types** are written only as their data (`[%cbraw]`) in the full
+  form. Their classic layouts are not decoded.
 
 ## Reader rules
 

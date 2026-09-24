@@ -497,7 +497,12 @@ fn attempt<S: Store>(app: &App, db: &S, number: u32, options: &pgn::Options) -> 
 fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
     let Some(number) = number.parse::<u32>().ok().filter(|&n| n > 0) else { return not_found() };
     // Languages ChessBase has no number for are passed over; English is the default.
-    let options = pgn::Options::with_languages(req.param("lang").unwrap_or("en").split(','));
+    let mut options = pgn::Options::with_languages(req.param("lang").unwrap_or("en").split(','));
+    options.full = match req.param("annotations") {
+        None | Some("reading") => false,
+        Some("full") => true,
+        Some(_) => return bad_parameter("annotations", "annotations must be reading or full"),
+    };
     for _ in 0..GAME_ATTEMPTS {
         let open = match entry.open_to_read() {
             Ok(open) => open,

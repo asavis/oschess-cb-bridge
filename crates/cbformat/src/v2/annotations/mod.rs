@@ -10,10 +10,12 @@ use crate::movetable::Sq;
 use crate::{Error, Result};
 
 mod layout;
+mod quote;
 #[cfg(test)]
 mod tests;
 
 use layout::annotation;
+pub use quote::{Quotation, QuotedPlayer};
 
 /// The tag of an annotation record's frame.
 pub const ANNOTATION_TAG: u16 = 0x2000;
@@ -29,6 +31,9 @@ pub struct GameAnnotations {
     /// Set when a type of unknown layout ended the decoding: nothing after it
     /// could be located.
     pub stopped_at: Option<Unknown>,
+    /// The record's bytes after the type code of [`Self::stopped_at`], which
+    /// could not be decoded; empty when decoding reached the end.
+    pub undecoded: Vec<u8>,
 }
 
 /// The annotations attached to one position. Their order is meaningful.
@@ -63,8 +68,12 @@ pub enum Annotation {
     },
     Squares(Vec<Square>),
     Arrows(Vec<Arrow>),
-    /// A type of known layout that PGN output leaves out, by its type code.
-    Other(u16),
+    /// A type of known layout that the reading form of the PGN leaves out:
+    /// its type code and its data, the bytes after the type as stored.
+    Other {
+        code: u16,
+        data: Vec<u8>,
+    },
 }
 
 /// A coloured square. Colours are ChessBase's numbers (2 green, 3 yellow,
@@ -141,11 +150,18 @@ impl GameAnnotations {
             let mut annotations = Vec::with_capacity(count as usize);
             for _ in 0..count {
                 let type_code = r.u16()?;
+                let start = r.i;
                 match annotation(&mut r, type_code)? {
-                    Some(a) => annotations.push(a),
+                    Some(mut a) => {
+                        if let Annotation::Other { data, .. } = &mut a {
+                            *data = content[start..r.i].to_vec();
+                        }
+                        annotations.push(a);
+                    }
                     None => {
                         out.blocks.push(Block { position, annotations });
                         out.stopped_at = Some(Unknown { position, type_code });
+                        out.undecoded = content[start..].to_vec();
                         return Ok(out);
                     }
                 }

@@ -1,10 +1,14 @@
 //! A game's annotations as PGN: comments, NAGs and `[%csl]` / `[%cal]`
 //! graphics, placed by position in the numbering of the game's format: PGN
-//! order for 2CBH, stored order for the classic format.
+//! order for 2CBH, stored order for the classic format. The reading form
+//! writes one language and game quotations as ChessBase writes them; the full
+//! form (asavis/oschess-cb-bridge#42) writes every text as its own comment led
+//! by `[%lang]`, and every other annotation as a command (`commands.rs`).
 
 use std::collections::BTreeMap;
 
 use super::Options;
+use super::commands;
 use super::san::{file_char, rank_char};
 use super::tree::{At, Notes};
 use crate::movetable::Sq;
@@ -22,6 +26,9 @@ pub(super) struct Commentary<'a> {
     last: Option<u32>,
     language: Option<u16>,
     order: PositionOrder,
+    full: bool,
+    /// For the full form: the type that ended decoding and the bytes after it.
+    undecoded: Option<(u16, &'a [u8])>,
 }
 
 impl<'a> Commentary<'a> {
@@ -57,7 +64,8 @@ impl<'a> Commentary<'a> {
             .chain([language::ENGLISH])
             .find(|l| languages.contains(l))
             .or(languages.first().copied());
-        Commentary { by_position, past_end, last, language, order }
+        let undecoded = annotations.stopped_at.map(|u| (u.type_code, annotations.undecoded.as_slice()));
+        Commentary { by_position, past_end, last, language, order, full: options.full, undecoded }
     }
 
     /// The annotations at the move `at`, in this game's numbering.
@@ -69,14 +77,75 @@ impl<'a> Commentary<'a> {
         self.by_position.get(&(position as i32))
     }
 
-    /// The comment on the game as a whole, before the first move: its texts
-    /// and graphics. Says whether it wrote one.
+    /// The comment on the game as a whole, before the first move: its texts,
+    /// graphics and quotations, and in the full form its commands and the
+    /// record's undecoded rest. Says whether it wrote one.
     pub(super) fn game_comment(&self, out: &mut String) -> bool {
-        let Some(anns) = self.by_position.get(&GAME_POSITION) else { return false };
-        let mut parts = graphics(anns);
+        let anns = self.by_position.get(&GAME_POSITION).map_or(&[][..], Vec::as_slice);
+        if self.full {
+            let mut wrote = comment(out, &graphics(anns), "", " ");
+            for t in self.tagged(anns, None) {
+                wrote |= comment(out, &[t], "", " ");
+            }
+            let mut cmds = self.commands(anns);
+            cmds.extend(self.undecoded.map(|(t, d)| commands::rest(t, d)));
+            return comment(out, &cmds, "", " ") || wrote;
+        }
+        let mut parts = self.medals(anns);
+        parts.extend(graphics(anns));
         parts.extend(self.texts(anns, true));
         parts.extend(self.texts(anns, false));
+        parts.extend(self.quotes(anns));
         comment(out, &parts, "", " ")
+    }
+
+    /// The full form's texts in stored order, each a comment of its own:
+    /// `[%lang xx] text`, cleaned for PGN, followed by `[%cbtext]` with the
+    /// original when the comment cannot hold it as it is. Those before the
+    /// move, those after it, or (`None`) all.
+    fn tagged(&self, anns: &[&Annotation], before: Option<bool>) -> Vec<String> {
+        let mut out = Vec::new();
+        for a in anns {
+            let Annotation::Text { before: b, language: l, text } = a else { continue };
+            if before.is_some_and(|x| x != *b) {
+                continue;
+            }
+            let t = clean(text);
+            if !t.is_empty() {
+                out.push(format!("[%lang {}] {t}", commands::language_code(*l)));
+            }
+            if commands::text_needs_original(*b, text, &t) {
+                out.push(commands::text(*l, *b, t.is_empty(), text));
+            }
+        }
+        out
+    }
+
+    /// The full form's commands: every annotation that is not a text, with
+    /// all its data; symbols and graphics are shown by NAGs and `[%csl]` /
+    /// `[%cal]` as well.
+    fn commands(&self, anns: &[&Annotation]) -> Vec<String> {
+        anns.iter()
+            .filter_map(|a| match a {
+                Annotation::Other { code, data } => Some(commands::for_other(*code, data, self.order)),
+                a => commands::graphic(a),
+            })
+            .collect()
+    }
+
+    /// The reading form's medals, `[%mdl]` as ChessBase writes them.
+    fn medals(&self, anns: &[&Annotation]) -> Vec<String> {
+        anns.iter()
+            .filter_map(|a| match a {
+                Annotation::Other { code, data } => commands::medal(*code, data, self.order),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reading form's game quotations, as ChessBase writes them.
+    fn quotes(&self, anns: &[&Annotation]) -> Vec<String> {
+        anns.iter().filter_map(|a| commands::quotation_text(a, self.order)).map(|q| clean(&q)).collect()
     }
 
     fn texts(&self, anns: &[&Annotation], before: bool) -> Option<String> {
@@ -99,6 +168,13 @@ impl<'a> Commentary<'a> {
 impl Notes for Commentary<'_> {
     fn before(&mut self, at: At, out: &mut String) -> bool {
         let Some(anns) = self.at(at) else { return false };
+        if self.full {
+            let mut wrote = false;
+            for t in self.tagged(anns, Some(true)) {
+                wrote |= comment(out, &[t], "", " ");
+            }
+            return wrote;
+        }
         let text: Vec<String> = self.texts(anns, true).into_iter().collect();
         comment(out, &text, "", " ")
     }
@@ -122,12 +198,25 @@ impl Notes for Commentary<'_> {
                 }
             }
         }
-        let mut parts = graphics(&all);
+        if self.full {
+            let mut wrote = comment(out, &graphics(&all), " ", "");
+            let mut texts = self.tagged(own, Some(false));
+            for anns in past_end {
+                texts.extend(self.tagged(anns, None));
+            }
+            for t in texts {
+                wrote |= comment(out, &[t], " ", "");
+            }
+            return comment(out, &self.commands(&all), " ", "") || wrote;
+        }
+        let mut parts = self.medals(&all);
+        parts.extend(graphics(&all));
         parts.extend(self.texts(own, false));
         for anns in past_end {
             parts.extend(self.texts(anns, true));
             parts.extend(self.texts(anns, false));
         }
+        parts.extend(self.quotes(&all));
         comment(out, &parts, " ", "")
     }
 }

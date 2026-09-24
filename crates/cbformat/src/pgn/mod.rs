@@ -2,12 +2,14 @@
 //! annotations.
 
 mod classic;
+mod commands;
 mod comments;
 mod san;
 mod tree;
 
 pub use classic::{classic_game, classic_game_from, classic_game_with};
 
+pub use commands::language_code;
 pub use san::san;
 
 use chesscore::Board;
@@ -30,13 +32,17 @@ pub struct Options {
     /// English, else in the first language stored; texts meant for any
     /// language are always written.
     pub languages: Vec<u16>,
+    /// The full form (asavis/oschess-cb-bridge#42): every text in every
+    /// language as its own comment led by `[%lang]`, and every annotation the
+    /// reading form leaves out as a `[%cb…]` command. `docs/api.md` lists them.
+    pub full: bool,
 }
 
 impl Options {
     /// Options preferring the ISO 639-1 languages `codes`, in order; codes
     /// ChessBase has no number for are passed over.
     pub fn with_languages<'a>(codes: impl IntoIterator<Item = &'a str>) -> Self {
-        Options { languages: codes.into_iter().filter_map(language::from_iso).collect() }
+        Options { languages: codes.into_iter().filter_map(language::from_iso).collect(), full: false }
     }
 }
 
@@ -45,8 +51,9 @@ impl Options {
 pub enum AnnotationStatus {
     /// The game has no annotations, or the database has no annotation file.
     None,
-    /// Every annotation was decoded. Types PGN has no form for (training,
-    /// clocks, game quotations and the like) are left out by design.
+    /// Every annotation was decoded. The reading form leaves out the types
+    /// PGN has no form for (training, clocks and the like) by design; the
+    /// full form keeps them as commands.
     Complete,
     /// A type of unknown layout ended decoding: annotations stored after it
     /// are missing.

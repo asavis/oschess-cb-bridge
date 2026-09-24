@@ -46,55 +46,55 @@ pub(super) fn annotation(r: &mut Reader<'_>, t: u16) -> Result<Option<Annotation
         0x15 => {
             let n = r.len()?;
             r.skip(n)?;
-            Annotation::Other(t)
+            other(t)
         }
         // Time spent, unknown 08, clocks, medals, variation colour, video
         // stream time; 27 is ours (docs/format-notes.md).
         0x07 | 0x08 | 0x16 | 0x17 | 0x22 | 0x23 | 0x25 => {
             r.skip(4)?;
-            Annotation::Other(t)
+            other(t)
         }
         0x27 => {
             r.skip(2)?;
-            Annotation::Other(t)
+            other(t)
         }
         // Pawn structure, critical position.
         0x14 | 0x18 => {
             r.skip(1)?;
-            Annotation::Other(t)
+            other(t)
         }
         0x21 => {
             r.skip(6)?;
-            Annotation::Other(t)
+            other(t)
         }
         0x24 => {
             r.skip(38)?;
-            Annotation::Other(t)
+            other(t)
         }
         0x26 => {
             r.expect_one()?;
             let n = r.len()?;
             r.skip(n)?;
-            Annotation::Other(t)
+            other(t)
         }
         0x09 => {
             if !training(r)? {
                 return Ok(None);
             }
-            Annotation::Other(t)
+            other(t)
         }
         0x13 => {
             if !quotation(r)? {
                 return Ok(None);
             }
-            Annotation::Other(t)
+            other(t)
         }
         // Video: 01 00, a language, a length and that many bytes.
         0x20 => {
             r.skip(4)?;
             let n = r.len()?;
             r.skip(n)?;
-            Annotation::Other(t)
+            other(t)
         }
         0x1c => {
             r.expect_one()?;
@@ -102,7 +102,7 @@ pub(super) fn annotation(r: &mut Reader<'_>, t: u16) -> Result<Option<Annotation
                 let n = r.len()?;
                 r.skip(n)?;
             }
-            Annotation::Other(t)
+            other(t)
         }
         _ => return Ok(None),
     }))
@@ -175,6 +175,11 @@ fn quotation(r: &mut Reader<'_>) -> Result<bool> {
     r.skip(moves.checked_mul(5).ok_or_else(|| r.bad("quotation move count"))?)?;
     r.skip(4)?;
     Ok(true)
+}
+
+/// A type left out of the reading form; the parser fills in its data.
+fn other(code: u16) -> Annotation {
+    Annotation::Other { code, data: Vec::new() }
 }
 
 /// A square numbered from 1, file by file (`a1` 1, `a2` 2, `b1` 9).

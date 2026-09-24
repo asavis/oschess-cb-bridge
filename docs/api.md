@@ -407,7 +407,8 @@ One game as PGN.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `lang` | `en` | Comma-separated ISO 639-1 language preference for annotation text, for example `uk,de`. ChessBase stores comments in English, German, French, Spanish, Italian, Dutch, Portuguese, Polish and Greek; other codes are passed over. A game's texts are written in the first preferred language it has, else in English, else in the first language stored, and texts stored for any language always |
+| `lang` | `en` | Comma-separated ISO 639-1 language preference for annotation text, for example `uk,de`. ChessBase stores comments in English, German, French, Spanish, Italian, Dutch, Portuguese, Polish and Greek; other codes are passed over. In the reading form, a game's texts are written in the first preferred language it has, else in English, else in the first language stored, and texts stored for any language always |
+| `annotations` | `reading` | `reading` writes the PGN for reading, in one language. `full` writes every annotation the bridge reads, below; any other value is `400 bad_request` |
 
 ```json
 {
@@ -420,12 +421,80 @@ One game as PGN.
 
 | Field | Meaning |
 |---|---|
-| `pgn` | The game, with its variations and its annotations: comments in `{}`, symbols as NAGs, coloured squares and arrows as `[%csl ...]` and `[%cal ...]` (green, yellow and red; ChessBase's other colours are left out). Annotation types PGN has no form for (training questions, clocks, game quotations, medals and the like) are left out. An annotation stored past the game's last move follows the main line's last move, its texts after that move |
+| `pgn` | The game, with its variations and its annotations: comments in `{}`, symbols as NAGs, coloured squares and arrows as `[%csl ...]` and `[%cal ...]` (green, yellow and red; ChessBase's other colours are left out). Game quotations and medals are written as ChessBase's own export writes them (below). In the reading form, the other types PGN has no form for (training questions, clocks, evaluations and the like) are left out; the full form keeps them. An annotation stored past the game's last move follows the main line's last move, its texts after that move |
 | `annotations` | `none` when the game has no annotations or the database no annotation file; `complete` when every annotation was read; `incomplete` when an annotation of unknown layout stopped decoding, and the PGN then has the annotations before it |
 | `unreadableAnnotation` | With `incomplete`: the annotation type code, a number |
 
 A guiding text or an analysis is answered `422 not_a_game`, and a game whose
-records are damaged `422 unreadable_game`. Deleted games are served.
+records are damaged `422 unreadable_game`. Deleted games are served. Both forms
+are held to the same answer limit.
+
+#### Both forms
+
+- **Game quotations** (type `13`) are a comment on their move, as ChessBase
+  writes them: the result (`1-0`, `0-1` or `1/2`), both players as
+  `Last,F (Elo)`, the event with its site unless the event names it, `blitz` or
+  `rapid` for such an event unless it names it, the year unless the event names
+  it, and the round as `(round)` or `(round.subround)`, or a correspondence
+  board as `[board]`.
+- **Medals** (type `22`) are `[%mdl <bits>]`, as ChessBase writes them: the
+  `int` of medal bits. The reading form writes them first in the comment of
+  their move, and the full form among the move's commands.
+
+#### The full form
+
+Nothing the bridge reads is left out of the full form
+(asavis/oschess-cb-bridge#42). What it adds to the reading form:
+
+- **Texts:** every text in every language, each as its own comment led by
+  `[%lang xx]`, in stored order; a text before a move stays before it. `xx` is
+  the ISO 639-1 code where ChessBase names the language, `any` for a text meant
+  for every language, `cb-<nation>` for a classic text whose nation names no
+  such language, and `cb-l<number>` for another 2CBH language number. The
+  visible comment is cleaned for PGN as in the reading form: braces become
+  parentheses, and line breaks, control characters and runs of spaces become
+  one space. When that changes the text, when the text is empty or all
+  whitespace, when it holds `[%`, or when it is meant to precede its move, a
+  comment `[%cbtext lang=xx;value=…]` follows the visible one with the original
+  value, percent-encoded, and `before=1` for a text before its move. When
+  cleaning leaves nothing to show, the `[%cbtext]` stands in the text's place
+  with `alone=1`. `value` is always written, even when empty. A reader takes a
+  `[%cbtext]` without `alone` as the value of the visible comment right before
+  it.
+- **Symbols and graphics** are shown as in the reading form, NAGs and
+  `[%csl]`/`[%cal]`, and each annotation is also a command that keeps what they
+  cannot: `[%cbsymbols]` with the three NAG slots (move, position, prefix),
+  including symbols on the game as a whole, where no NAG can stand, and
+  `[%cbsquares]`/`[%cbarrows]` with every mark of every colour. ChessBase's
+  colours 7, 8 and 9 have no `[%csl]`/`[%cal]` letter.
+- **Commands** for every annotation that is not a text, in one comment after
+  the move's texts, in stored order. Each is `[%cb<name> key=value;…]`, except
+  `[%mdl]`. Keys are ASCII letters, values are UTF-8 percent-encoded with
+  everything outside `A-Z a-z 0-9 - . _ ~` escaped, empty values are left out
+  (except a `[%cbtext]` value), and a reader keeps and ignores a key it does
+  not know. Every command but `[%cbtext]` and `[%mdl]` carries `data` in
+  base64url without padding: the annotation's bytes after its type, or for
+  symbols and graphics the layout below. A later decoder loses nothing.
+
+| Command | Type | Keys besides `data` |
+|---|---|---|
+| `[%cbsymbols …]` | `03` symbols | none: `data` is the three NAG slots, move, position and prefix, 0 for none |
+| `[%cbsquares …]` | `04` coloured squares | none: `data` is the (colour, square) pairs, squares numbered from 1 file by file (`a1` 1, `a2` 2, `b1` 9) |
+| `[%cbarrows …]` | `05` arrows | none: `data` is the (colour, from, to) triples, numbered the same way |
+| `[%cbquote …]` | `13` game quotation | `result` (`1-0`, `0-1`, `1/2-1/2`, `*`), `white` and `black` as `Last, First`, `whiteElo`, `blackElo`, `event`, `site`, `date` (`YYYY.MM.DD`, `??` unknown), `round`, `subround`, `eco`, and `moves`, the quoted moves as SAN movetext, for a 2CBH quotation from the standard position whose moves replay |
+| `[%mdl <bits>]` | `22` medals | written as ChessBase writes it, the whole annotation |
+| `[%cbcritical …]` | `18` critical position | `phase` (`opening`, `middlegame`, `endgame`), `value` |
+| `[%cbpawns …]` | `14` pawn structure | `value` |
+| `[%cbpath …]` | `15` piece path | none |
+| `[%cbcolour …]` | `23` variation colour | none |
+| `[%cblink …]` | `1c` web link | `url`, `caption` |
+| `[%cbvideo …]` | `20` video | `language` (a number), `caption` |
+| `[%cbtraining …]` | `09` training question | `variant`, `seconds`, `points` |
+| `[%cbraw type=<hex>;data=…]` | any other type, and in a classic database every type but texts, symbols, squares, arrows, quotations and medals, whose layouts there are not decoded | `type`, two hex digits |
+| `[%cbrest type=<hex>;data=…]` | the bytes of the record after a type of unknown layout, in the game comment; the game is `incomplete` | `type` |
+
+Evaluations (`26`), clocks (`16`, `17`) and time spent (`07`) are
+`[%cbraw …]` for now.
 
 ### `GET /v1/databases/{id}/suggest`
 
