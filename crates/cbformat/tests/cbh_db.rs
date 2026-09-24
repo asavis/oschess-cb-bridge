@@ -108,7 +108,9 @@ fn buffered_reads_read_what_single_reads_read() {
         let window = db.read_move_window(&records, next.as_ref(), &mut moves).unwrap().expect("a window");
         for r in &records {
             let whole = db.moves_of(r).unwrap();
-            assert_eq!(db.moves_in(window, &moves, r).unwrap().unwrap().bytes(), whole.bytes());
+            assert_eq!(db.moves_in(window, &moves, r, 64).unwrap().unwrap().bytes(), whole.bytes());
+            let size = whole.bytes().len();
+            assert!(db.moves_in(window, &moves, r, size - 1).unwrap().is_err(), "over the limit in the window");
             let mut one = Vec::with_capacity(64);
             assert_eq!(db.read_moves_into(r, 64, &mut one).unwrap().bytes(), whole.bytes());
             assert_eq!(db.moves_of_within(r, 64).unwrap().bytes(), whole.bytes());

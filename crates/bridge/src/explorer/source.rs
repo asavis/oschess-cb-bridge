@@ -122,7 +122,9 @@ trait Games: Store {
     fn run_of(records: &mut Records) -> &mut Vec<Self::Head>;
     /// Reads the move records of `run` into `buf` at once, when they fit.
     fn window(&self, run: &[Self::Head], next: Option<&Self::Head>, buf: &mut Vec<u8>) -> Result<Option<Self::Window>>;
-    /// The move record of `r` from the window `buf` holds, when it is there.
+    /// The move record of `r` from the window `buf` holds, when it is there,
+    /// refused as [`Games::read_moves`] refuses it when over
+    /// [`MAX_MOVE_RECORD`].
     fn moves_in<'a>(&self, window: Self::Window, buf: &'a [u8], r: &Self::Head) -> Option<Result<Self::Moves<'a>>>;
     /// Reads the move record of `r` into `buf`, within [`MAX_MOVE_RECORD`].
     fn read_moves<'a>(&self, r: &Self::Head, buf: &'a mut Vec<u8>) -> Result<Self::Moves<'a>>;
@@ -141,7 +143,7 @@ impl Games for v2::Database {
         self.read_move_window(run, next, buf)
     }
     fn moves_in<'a>(&self, window: v2::MoveWindow, buf: &'a [u8], r: &Record) -> Option<Result<MoveData<'a>>> {
-        v2::Database::moves_in(self, window, buf, r)
+        v2::Database::moves_in(self, window, buf, r, MAX_MOVE_RECORD)
     }
     fn read_moves<'a>(&self, r: &Record, buf: &'a mut Vec<u8>) -> Result<MoveData<'a>> {
         self.read_moves_into(r, MAX_MOVE_RECORD, buf)
@@ -171,7 +173,7 @@ impl Games for cbh::Database {
         buf: &'a [u8],
         r: &cbh::Record,
     ) -> Option<Result<cbh::MoveData<'a>>> {
-        cbh::Database::moves_in(self, window, buf, r)
+        cbh::Database::moves_in(self, window, buf, r, MAX_MOVE_RECORD)
     }
     fn read_moves<'a>(&self, r: &cbh::Record, buf: &'a mut Vec<u8>) -> Result<cbh::MoveData<'a>> {
         self.read_moves_into(r, MAX_MOVE_RECORD, buf)

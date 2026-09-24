@@ -70,8 +70,9 @@ Database it takes some five minutes and 1.4 GB. `cargo run --release -p bridge
 --example index_oracle -- <db.2cbh> <index dir>` builds one and checks it
 against a brute-force count, printing numbers only. `cargo run --release -p
 bridge --example classic_pairs -- <scratch dir> <a.cbh> <a.2cbh> …` serves the
-classic and the 2CBH copy of each database given and compares their lists,
-searches, sorts, suggestions and explorer answers, printing counts only.
+classic and the 2CBH copy of each database given and compares their rows,
+searches, sorts, suggestions and explorer answers field by field, printing
+counts only; it fails on any difference the classic format does not explain.
 
 It serves the databases ChessBase's database window shows, read from
 `DBItems.cbini` in `Documents\ChessBase`. The Documents folder is the one

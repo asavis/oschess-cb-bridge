@@ -253,6 +253,62 @@ fn a_classic_copy_is_indexed_the_same() {
     std::fs::remove_dir_all(&classic_dir).unwrap();
 }
 
+/// The game of a move record just over the index's limit is left out and
+/// one at the limit is indexed, in both formats, whether the record is read
+/// from a run's window or on its own: a hole after it in the move file makes
+/// the run's span too large for the window's buffer.
+#[test]
+fn the_move_record_limit_holds_on_both_reading_paths() {
+    use bridge::explorer::source::MAX_MOVE_RECORD;
+    for format in ["2cbh", "cbh"] {
+        for over in [0, 1] {
+            for hole in [0usize, 128] {
+                let name = format!("explorer-limit-{format}-{over}-{hole}");
+                let db = if format == "2cbh" {
+                    let mut b = Builder::new();
+                    let mut words = vec![MOVES, movetable::encode(e4_word()).unwrap(), END_OF_LINE];
+                    // Content of the limit, or one word over it.
+                    words.resize(MAX_MOVE_RECORD / 2 + over, 0);
+                    let at = b.moves(1, &words);
+                    b.game(at);
+                    b.write(&name)
+                } else {
+                    let mut b = fixture_cbh::Builder::new();
+                    let mut stream = encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false);
+                    // A whole record of the limit, or one byte over it.
+                    stream.resize(MAX_MOVE_RECORD - 4 + over, 0);
+                    b.game(&move_record(0, None, None, &stream));
+                    b.write(&name)
+                };
+                let moves = db.dir().join(if format == "2cbh" { "db.2cbg" } else { "db.cbg" });
+                let mut file = std::fs::OpenOptions::new().append(true).open(&moves).unwrap();
+                file.write_all(&vec![0; hole]).unwrap();
+                drop(file);
+                let dir = index_dir(&name);
+                let progress = Progress::default();
+                let base = cbformat::view::Base::open(db.dir().join(format!("db.{format}"))).unwrap();
+                let loaded = explorer::prepare(&base, 1, &dir, "db", &progress).unwrap();
+                let skipped = progress.skipped.load(std::sync::atomic::Ordering::Relaxed);
+                let want = if over == 1 { (0, 1) } else { (1, 0) };
+                assert_eq!((loaded.games(), skipped), want, "{format}, {over} over the limit, hole {hole}");
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+    }
+}
+
+/// White's 1.e4.
+fn e4_word() -> MoveWord {
+    MoveWord::Normal {
+        color: Color::White,
+        piece: Piece::Pawn,
+        from: sq("e2"),
+        to: sq("e4"),
+        captured: Captured::Nothing,
+        promotion: None,
+    }
+}
+
 trait MoveCount {
     fn lookup_move(&self, uci: &str) -> Option<u64>;
 }

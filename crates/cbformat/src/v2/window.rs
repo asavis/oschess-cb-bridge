@@ -45,8 +45,16 @@ impl Database {
     }
 
     /// The move record of `record` from `window`, which `buf` holds, or `None`
-    /// when the record does not lie wholly inside it.
-    pub fn moves_in<'a>(&self, window: MoveWindow, buf: &'a [u8], record: &Record) -> Option<Result<MoveData<'a>>> {
+    /// when the record does not lie wholly inside it. A record whose content
+    /// or spare area exceeds `limit` bytes is refused, as
+    /// [`Database::read_moves_into`] refuses it, however the window holds it.
+    pub fn moves_in<'a>(
+        &self,
+        window: MoveWindow,
+        buf: &'a [u8],
+        record: &Record,
+        limit: usize,
+    ) -> Option<Result<MoveData<'a>>> {
         let offset = record.moves_offset();
         let bytes = buf.get(..window.len)?;
         let rel = u64::try_from(offset).ok()?.checked_sub(window.at).and_then(|r| usize::try_from(r).ok())?;
@@ -56,6 +64,10 @@ impl Database {
         let (a, b) = frame_sizes(&bytes[rel..], offset).ok()?;
         if rel + FRAME_HEADER + a + b + 8 > bytes.len() {
             return None;
+        }
+        if a > limit || b > limit {
+            let what = format!("move record of {} bytes, over the {limit}-byte limit", a.max(b));
+            return Some(Err(Error::Format(format!("record at {offset:#x}: {what}"))));
         }
         Some(
             parse_frame(&bytes[rel..], offset, true)

@@ -310,7 +310,9 @@ what the format stores otherwise:
   without the files it needs is `unreadable`.
 - **Names are cut** at the classic fields' widths: a player's last name at 30
   bytes and first name at 20, a tournament's title at 40 and place at 30, an
-  annotator at 45. A name longer in the 2CBH copy is cut in the classic one.
+  annotator at 45. A name longer in the 2CBH copy is cut in the classic one,
+  and a character that no single-byte code page holds may be stored in
+  another form.
 - **An annotator is one text**, kept in a table of its own rather than as a
   player, and often written `First Last`. Rows, `annotator:` searches, the
   `annotator` sort and annotator suggestions use it as stored; an annotator

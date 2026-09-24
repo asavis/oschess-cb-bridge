@@ -49,8 +49,16 @@ impl Database {
     }
 
     /// The move record of `record` from `window`, which `buf` holds, or `None`
-    /// when the record does not lie wholly inside it.
-    pub fn moves_in<'a>(&self, window: MoveWindow, buf: &'a [u8], record: &Record) -> Option<Result<MoveData<'a>>> {
+    /// when the record does not lie wholly inside it. A record larger than
+    /// `limit` bytes is refused, as [`Database::read_moves_into`] refuses it,
+    /// however the window holds it.
+    pub fn moves_in<'a>(
+        &self,
+        window: MoveWindow,
+        buf: &'a [u8],
+        record: &Record,
+        limit: usize,
+    ) -> Option<Result<MoveData<'a>>> {
         if self.wide.is_some() {
             return None;
         }
@@ -66,6 +74,10 @@ impl Database {
             return Some(Err(Error::Format(what)));
         }
         let whole = bytes.get(rel..rel + size)?;
+        if size > limit {
+            let what = format!("move record at {offset:#x}: {size} bytes, over the {limit}-byte limit");
+            return Some(Err(Error::Format(what)));
+        }
         Some(Ok(MoveData { bytes: Cow::Borrowed(whole) }))
     }
 

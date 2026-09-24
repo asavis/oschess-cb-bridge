@@ -8,21 +8,29 @@
 //!
 //! For each pair:
 //!
-//! 1. Names: each game's players, tournament and annotator in the two copies,
-//!    counted equal, cut to the classic field's width, the same words in
-//!    another order, or otherwise different.
-//! 2. Lists: for each query of a fixed list — the conformance corpus of
+//! 1. Names: each game's players, tournament, site and annotator in the two
+//!    copies, each equal or one of the differences the classic format
+//!    explains, a closed list (`names::NameDiff`): characters Windows-1252
+//!    lacks stored in another form, a cut at the classic field's width, and
+//!    for an annotator the same words in another order. Any other difference
+//!    fails the pair.
+//! 2. Rows: every record's row, field by field; a name field may differ only
+//!    where the record's name differs in a known way.
+//! 3. Lists: for each query of a fixed list — the conformance corpus of
 //!    `docs/search-grammar.md`, every sort key both ways, and player, event
 //!    and annotator queries for the names the 2CBH copy suggests most — the
 //!    record numbers of the whole result, page by page. A result that differs
 //!    is explained by names when it agrees once the records whose names differ
-//!    between the copies, in the fields the query reads, are left out.
-//! 3. Suggestions for each letter and field, compared the same way.
-//! 4. Explorer: the answers for sampled positions of the games' main lines:
-//!    identical, differing in the top games' names only, or different.
+//!    in a known way, in the fields the query reads, are left out.
+//! 4. Suggestions for each letter and field, compared the same way.
+//! 5. Explorer: the answers for sampled positions of the games' main lines,
+//!    field by field: counts, moves and the top games' numbers, ratings,
+//!    results and years must be equal; their names may differ only where the
+//!    game's names differ in a known way.
 //!
 //! Nothing a database holds is printed: no name, no game, only counts. The
-//! scratch directory receives the position indexes.
+//! scratch directory receives the position indexes. The exit status is 1 when
+//! any pair has a difference nothing explains.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -42,8 +50,14 @@ use cbformat::v2::RecordKind;
 use cbformat::view::Base;
 use chesscore::{Board, Move};
 
+mod json;
+mod names;
+
+use json::Json;
+use names::{ANNOTATOR, BLACK, EVENT, FIELDS, Names, WHITE, bit};
+
 const TOKEN: &str = "classic-pairs-harness-token-0123456789abcdef";
-const DOC: &str = include_str!("../../../docs/search-grammar.md");
+const DOC: &str = include_str!("../../../../docs/search-grammar.md");
 const POSITIONS: usize = 200;
 const SORT_KEYS: [&str; 12] = [
     "number",
@@ -59,12 +73,6 @@ const SORT_KEYS: [&str; 12] = [
     "round",
     "annotator",
 ];
-
-/// Name fields, as bits.
-const WHITE: u8 = 1;
-const BLACK: u8 = 2;
-const EVENT: u8 = 4;
-const ANNOTATOR: u8 = 8;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -84,96 +92,6 @@ fn main() {
     if failed {
         std::process::exit(1);
     }
-}
-
-/// How one field of one game compares between the copies.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum NameDiff {
-    Equal,
-    /// The classic name is the 2CBH one cut to the field's width.
-    Cut,
-    /// The same words in another order ("First Last" for "Last, First").
-    WordOrder,
-    Other,
-}
-
-fn words(t: &str) -> Vec<String> {
-    let mut w: Vec<String> =
-        t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
-    w.sort();
-    w
-}
-
-fn diff(classic: &str, two: &str) -> NameDiff {
-    if classic == two {
-        NameDiff::Equal
-    } else if !classic.is_empty() && two.starts_with(classic) {
-        NameDiff::Cut
-    } else if !classic.is_empty() && words(classic) == words(two) {
-        NameDiff::WordOrder
-    } else {
-        NameDiff::Other
-    }
-}
-
-/// A player compared by its two parts, each cut on its own.
-fn player_diff(classic: Option<&cbformat::v2::Player>, two: Option<&cbformat::v2::Player>) -> NameDiff {
-    let (c, t) = (classic.map(|p| p.pgn()).unwrap_or_default(), two.map(|p| p.pgn()).unwrap_or_default());
-    if c == t {
-        return NameDiff::Equal;
-    }
-    if let (Some(c), Some(t)) = (classic, two)
-        && t.last.starts_with(&c.last)
-        && t.first.starts_with(&c.first)
-    {
-        return NameDiff::Cut;
-    }
-    diff(&c, &t)
-}
-
-/// Per record, the name fields that differ between the copies; and the counts
-/// per field and kind of difference.
-fn name_diffs(classic: &Base, two: &Base) -> (Vec<u8>, BTreeMap<(&'static str, NameDiff), u64>, u64) {
-    let n = classic.record_count().min(two.record_count());
-    let mut masks = vec![0u8; n as usize + 1];
-    let mut counts = BTreeMap::new();
-    let mut kinds = 0;
-    for id in 1..=n {
-        let (Ok(a), Ok(b)) = (classic.header(id), two.header(id)) else {
-            kinds += 1;
-            continue;
-        };
-        if a.kind() != b.kind() {
-            kinds += 1;
-            masks[id as usize] = WHITE | BLACK | EVENT | ANNOTATOR;
-            continue;
-        }
-        if a.kind() != RecordKind::Game {
-            continue;
-        }
-        let (Ok(na), Ok(nb)) = (classic.names(&a), two.names(&b)) else {
-            masks[id as usize] = WHITE | BLACK | EVENT | ANNOTATOR;
-            continue;
-        };
-        let title = |t: &Option<cbformat::v2::Tournament>| t.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-        let fields = [
-            ("white", WHITE, player_diff(na.white.as_ref(), nb.white.as_ref())),
-            ("black", BLACK, player_diff(na.black.as_ref(), nb.black.as_ref())),
-            ("event", EVENT, diff(&title(&na.tournament), &title(&nb.tournament))),
-            (
-                "annotator",
-                ANNOTATOR,
-                diff(&na.annotator.clone().unwrap_or_default(), &nb.annotator.clone().unwrap_or_default()),
-            ),
-        ];
-        for (name, bit, d) in fields {
-            if d != NameDiff::Equal {
-                masks[id as usize] |= bit;
-                *counts.entry((name, d)).or_insert(0u64) += 1;
-            }
-        }
-    }
-    (masks, counts, kinds)
 }
 
 struct Server {
@@ -275,20 +193,20 @@ fn fields_read(q: &str) -> u8 {
     let mut mask = 0;
     for t in &parsed.terms {
         mask |= match t.field {
-            Field::Text => WHITE | BLACK | EVENT | ANNOTATOR,
-            Field::White => WHITE,
-            Field::Black => BLACK,
-            Field::Player => WHITE | BLACK,
-            Field::Event => EVENT,
-            Field::Annotator => ANNOTATOR,
+            Field::Text => bit(WHITE) | bit(BLACK) | bit(EVENT) | bit(ANNOTATOR),
+            Field::White => bit(WHITE),
+            Field::Black => bit(BLACK),
+            Field::Player => bit(WHITE) | bit(BLACK),
+            Field::Event => bit(EVENT),
+            Field::Annotator => bit(ANNOTATOR),
             _ => 0,
         };
     }
     mask | match parsed.sort.map(|s| s.key) {
-        Some(SortKey::White) => WHITE,
-        Some(SortKey::Black) => BLACK,
-        Some(SortKey::Tournament) => EVENT,
-        Some(SortKey::Annotator) => ANNOTATOR,
+        Some(SortKey::White) => bit(WHITE),
+        Some(SortKey::Black) => bit(BLACK),
+        Some(SortKey::Tournament) => bit(EVENT),
+        Some(SortKey::Annotator) => bit(ANNOTATOR),
         _ => 0,
     }
 }
@@ -304,21 +222,21 @@ struct Tally {
 
 fn field_label(bits: u8) -> &'static str {
     match bits {
-        ANNOTATOR => "annotator",
-        b if b & ANNOTATOR == 0 => "players/event",
+        b if b == bit(ANNOTATOR) => "annotator",
+        b if b & bit(ANNOTATOR) == 0 => "players/event",
         _ => "players/event+annotator",
     }
 }
 
 /// Compares two results of the query `q`.
-fn judge(tally: &mut Tally, masks: &[u8], q: &str, a: &[u32], b: &[u32]) {
+fn judge(tally: &mut Tally, names: &Names, q: &str, a: &[u32], b: &[u32]) {
     tally.total += 1;
     if a == b {
         tally.identical += 1;
         return;
     }
     let read = fields_read(q);
-    let mask = |n: u32| masks.get(n as usize).copied().unwrap_or(0xff) & read;
+    let mask = |n: u32| names.known_bits(n) & read;
     let keep = |v: &[u32]| v.iter().copied().filter(|&n| mask(n) == 0).collect::<Vec<_>>();
     if read != 0 && keep(a) == keep(b) {
         let bits = a.iter().chain(b).fold(0, |acc, &n| acc | mask(n));
@@ -457,25 +375,91 @@ fn explorer(port: u16, id: &str, fen: &str) -> (u16, String) {
     }
 }
 
-/// An explorer answer without its generation, split into its counts and
-/// moves, and its top games; with the top games' numbers.
-fn parts(body: &str) -> (String, String, Vec<u64>) {
-    let body = match body.find("\"generation\":\"") {
-        Some(at) => {
-            let end = body[at + 14..].find('"').map_or(body.len(), |e| at + 14 + e + 1);
-            format!("{}{}", &body[..at], &body[end..])
+/// How two answers compare.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Verdict {
+    Identical,
+    /// Differ in name fields only, each where the record's name differs in a
+    /// known way.
+    Names,
+    Different,
+}
+
+/// Compares two JSON objects member by member: `skip` is left out, `names`
+/// may differ where record `number`'s names differ in a known way, and every
+/// other member must be equal.
+fn members(a: &Json, b: &Json, number: Option<u32>, names: &Names, skip: &[&str], fields: &[(&str, usize)]) -> Verdict {
+    let (Json::Obj(a), Json::Obj(b)) = (a, b) else { return Verdict::Different };
+    if a.len() != b.len() {
+        return Verdict::Different;
+    }
+    let mut verdict = Verdict::Identical;
+    for ((ka, va), (kb, vb)) in a.iter().zip(b) {
+        if ka != kb {
+            return Verdict::Different;
         }
-        None => body.to_string(),
-    };
-    let (before, top) = match body.find("\"topGames\":") {
-        Some(at) => {
-            let end = body.find("\"index\":").unwrap_or(body.len());
-            (format!("{}{}", &body[..at], &body[end..]), body[at..end].to_string())
+        if skip.contains(&ka.as_str()) || va == vb {
+            continue;
         }
-        None => (body.clone(), String::new()),
+        match (fields.iter().find(|(k, _)| k == ka), number) {
+            (Some(&(_, field)), Some(n)) if names.explains(n, field) => verdict = verdict.max(Verdict::Names),
+            _ => return Verdict::Different,
+        }
+    }
+    verdict
+}
+
+/// The number member of a row or a top game.
+fn number_of(v: &Json) -> Option<u32> {
+    match v.get("number") {
+        Some(Json::Num(n)) => n.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Compares two explorer answers: the generation is left out, the top games
+/// are compared one by one, and everything else must be equal.
+fn judge_answer(a: &Json, b: &Json, names: &Names) -> Verdict {
+    let top = |v: &Json| match v.get("topGames") {
+        Some(Json::Arr(items)) => Some(items.clone()),
+        _ => None,
     };
-    let numbers = numbers_after(&top, "\"number\":");
-    (before, top, numbers)
+    let (Some(ta), Some(tb)) = (top(a), top(b)) else { return Verdict::Different };
+    let mut verdict = members(a, b, None, names, &["generation", "topGames"], &[]);
+    if ta.len() != tb.len() {
+        return Verdict::Different;
+    }
+    let fields = [("white", WHITE), ("black", BLACK), ("event", EVENT)];
+    for (x, y) in ta.iter().zip(&tb) {
+        let n = number_of(x);
+        if n.is_none() || n != number_of(y) {
+            return Verdict::Different;
+        }
+        verdict = verdict.max(members(x, y, n, names, &[], &fields));
+    }
+    verdict
+}
+
+/// Every record's row, in number order, as JSON; the error answer otherwise.
+fn rows(port: u16, id: &str) -> Result<Vec<Json>, (u16, String)> {
+    let mut out = Vec::new();
+    loop {
+        let (status, body) = get(port, &format!("/v1/databases/{id}/games?offset={}&limit=500", out.len()));
+        if status != 200 {
+            return Err((status, body));
+        }
+        let Some(page) = json::parse(&body) else { return Err((status, "not JSON".into())) };
+        let total = match page.get("total") {
+            Some(Json::Num(n)) => n.parse::<usize>().unwrap_or(0),
+            _ => 0,
+        };
+        let Some(Json::Arr(items)) = page.get("rows") else { return Err((status, "no rows".into())) };
+        let empty = items.is_empty();
+        out.extend(items.iter().cloned());
+        if out.len() >= total || empty {
+            return Ok(out);
+        }
+    }
 }
 
 fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
@@ -488,21 +472,48 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
     };
     println!("records: classic {}, 2cbh {}", classic.record_count(), two.record_count());
     let started = Instant::now();
-    let (masks, counts, kinds) = name_diffs(&classic, &two);
-    let described: Vec<String> = counts.iter().map(|((f, d), n)| format!("{f} {d:?} {n}")).collect();
-    println!("name differences (games): [{}]; record kinds differing: {kinds}", described.join(", "));
+    let names = Names::compare(&classic, &two);
+    let described: Vec<String> = names.counts.iter().map(|((f, d), n)| format!("{f} {d:?} {n}")).collect();
+    println!(
+        "name differences (games): [{}]; of no known kind: {}; record kinds differing: {}",
+        described.join(", "),
+        names.unknown(),
+        names.kinds
+    );
 
     let s = serve(classic_path, two_path, dir);
-    let (sa, sb) = (get(s.port, "/v1/databases"), get(s.port, "/v1/databases"));
-    let ready = sa.1.matches("\"state\":\"ready\"").count();
-    let cbh_ready = sb.1.contains("\"format\":\"cbh\",\"state\":\"ready\"");
+    let (_, listed) = get(s.port, "/v1/databases");
+    let ready = listed.matches("\"state\":\"ready\"").count();
+    let cbh_ready = listed.contains("\"format\":\"cbh\",\"state\":\"ready\"");
     println!("databases ready: {ready} of 2; classic listed as cbh and ready: {cbh_ready}");
+
+    let mut row_tally = Tally::default();
+    let name_fields: Vec<(&str, usize)> = FIELDS.iter().enumerate().map(|(i, f)| (*f, i)).collect();
+    match (rows(s.port, &s.classic), rows(s.port, &s.two)) {
+        (Ok(a), Ok(b)) if a.len() == b.len() => {
+            for (x, y) in a.iter().zip(&b) {
+                row_tally.total += 1;
+                let n = number_of(x);
+                match if n.is_some() && n == number_of(y) {
+                    members(x, y, n, &names, &[], &name_fields)
+                } else {
+                    Verdict::Different
+                } {
+                    Verdict::Identical => row_tally.identical += 1,
+                    Verdict::Names => *row_tally.by_names.entry("names").or_insert(0) += 1,
+                    Verdict::Different => row_tally.unexplained += 1,
+                }
+            }
+        }
+        _ => row_tally.unexplained += 1,
+    }
+    print_tally("rows", &row_tally);
 
     let mut lists = Tally::default();
     let mut errors_equal = 0u64;
     for q in queries(&s) {
         match (list(s.port, &s.classic, &q), list(s.port, &s.two, &q)) {
-            (Ok(a), Ok(b)) => judge(&mut lists, &masks, &q, &a, &b),
+            (Ok(a), Ok(b)) => judge(&mut lists, &names, &q, &a, &b),
             (Err(a), Err(b)) if a == b => {
                 lists.total += 1;
                 lists.identical += 1;
@@ -517,11 +528,11 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
     print_tally("lists", &lists);
     println!("  of which refused the same way by both: {errors_equal}");
 
-    // Suggestions: a name that differs in either copy is left out of both
-    // lists, and the rest must agree as far as both reach.
+    // Suggestions: a name that differs in a known way in either copy is left
+    // out of both lists, and the rest must agree as far as both reach.
     let mut differing: HashSet<String> = HashSet::new();
     for id in 1..=classic.record_count().min(two.record_count()) {
-        let m = masks[id as usize];
+        let m = names.known_bits(id);
         if m == 0 {
             continue;
         }
@@ -529,16 +540,16 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
             let Ok(h) = db.header(id) else { continue };
             let Ok(n) = db.names(&h) else { continue };
             let player = |p: &Option<cbformat::v2::Player>| p.as_ref().map(|p| p.pgn()).unwrap_or_default();
-            if m & WHITE != 0 {
+            if m & bit(WHITE) != 0 {
                 differing.insert(player(&n.white));
             }
-            if m & BLACK != 0 {
+            if m & bit(BLACK) != 0 {
                 differing.insert(player(&n.black));
             }
-            if m & EVENT != 0 {
+            if m & bit(EVENT) != 0 {
                 differing.insert(n.tournament.as_ref().map(|t| t.title.clone()).unwrap_or_default());
             }
-            if m & ANNOTATOR != 0 {
+            if m & bit(ANNOTATOR) != 0 {
                 differing.insert(n.annotator.clone().unwrap_or_default());
             }
         }
@@ -576,24 +587,36 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
     for fen in &fens {
         let (a, b) = (explorer(s.port, &s.classic, fen), explorer(s.port, &s.two, fen));
         positions.total += 1;
+        let (Some(ja), Some(jb)) = (json::parse(&a.1), json::parse(&b.1)) else {
+            positions.unexplained += 1;
+            continue;
+        };
         if a.0 != 200 || b.0 != 200 {
             positions.unexplained += 1;
             continue;
         }
-        let (pa, pb) = (parts(&a.1), parts(&b.1));
-        if !numbers_after(&pb.0, "\"games\":").first().is_some_and(|&g| g == 0) {
+        if jb.get("games").is_some_and(|g| *g != Json::Num("0".into())) {
             with_games += 1;
         }
-        if pa == pb {
-            positions.identical += 1;
-        } else if pa.0 == pb.0 && pa.2 == pb.2 {
-            *positions.by_names.entry("top games' names").or_insert(0) += 1;
-        } else {
-            positions.unexplained += 1;
+        match judge_answer(&ja, &jb, &names) {
+            Verdict::Identical => positions.identical += 1,
+            Verdict::Names => *positions.by_names.entry("top games' names").or_insert(0) += 1,
+            Verdict::Different => positions.unexplained += 1,
         }
     }
     print_tally("explorer positions", &positions);
     println!("  positions with games in the 2cbh index: {with_games}");
     println!("time: {:.1} s", started.elapsed().as_secs_f64());
-    lists.unexplained == 0 && suggestions.unexplained == 0 && positions.unexplained == 0 && kinds == 0
+    let passed = [
+        row_tally.unexplained,
+        lists.unexplained,
+        suggestions.unexplained,
+        positions.unexplained,
+        names.unknown(),
+        names.kinds,
+    ]
+    .iter()
+    .all(|&n| n == 0);
+    println!("pair: {}", if passed { "pass" } else { "FAIL" });
+    passed
 }
