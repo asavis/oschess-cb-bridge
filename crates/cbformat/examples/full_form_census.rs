@@ -87,6 +87,7 @@ fn code_of(name: &str) -> Option<&'static str> {
         "cblink" => "1c",
         "cbvideo" => "20",
         "cbtraining" => "09",
+        "cbtimecontrol" => "24",
         _ => return None,
     })
 }

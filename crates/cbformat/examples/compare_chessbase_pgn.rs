@@ -16,7 +16,9 @@
 //! - **Languages.** ChessBase writes a comment in every language it has; the
 //!   reading form writes one. The comments must equal our full form's texts,
 //!   every language joined, with the game quotations as ChessBase writes them.
-//! - **Evaluations** (type `26`), which ChessBase writes as `[%evp …]`.
+//!
+//! Evaluations (type `26`) are compared too: both forms write them as
+//! ChessBase does, `[%evp …]` in a comment of its own before the first move.
 //!
 //! ChessBase starts its export with a UTF-8 byte-order mark, which is skipped.
 //!
@@ -328,7 +330,8 @@ fn texts_of(full: &str, keep: impl Fn(&str) -> bool) -> BTreeMap<usize, String> 
     let order = pgn_order(&nodes);
     let mut out = BTreeMap::new();
     for (i, &n) in order.iter().enumerate() {
-        let mut texts = Vec::new();
+        // The evaluations' own comment, as ChessBase writes it.
+        let mut texts: Vec<String> = nodes[n].raw.iter().filter(|b| b.starts_with("[%evp ")).cloned().collect();
         // ChessBase writes medals first.
         for body in &nodes[n].raw {
             for m in body.split("[%mdl ").skip(1) {
@@ -378,18 +381,6 @@ fn unbase64url(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-/// A comment of ChessBase's without its `[%evp …]` evaluations.
-fn without_evaluations(t: &str) -> String {
-    let mut out = String::new();
-    let mut rest = t;
-    while let Some(at) = rest.find("[%evp") {
-        out.push_str(&rest[..at]);
-        rest = rest[at..].split_once(']').map_or("", |x| x.1);
-    }
-    out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Whether every move that differs is ChessBase naming the origin of a move
@@ -531,10 +522,6 @@ fn main() {
             for k in keys {
                 let (o, t) = (all.get(&k).cloned().unwrap_or_default(), theirs_c.get(&k).cloned().unwrap_or_default());
                 if o == t {
-                    continue;
-                }
-                if t.contains("[%evp") && without_evaluations(&t) == o {
-                    kind = kind.map(|_| "comments: evaluations as [%evp] (part 2)");
                     continue;
                 }
                 kind = None;

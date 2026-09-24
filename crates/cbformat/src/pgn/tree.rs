@@ -51,14 +51,16 @@ impl TreeBuilder {
         self.sans.len() + 4 * self.nodes.len()
     }
 
-    /// The main line's last move in stored order, when the game has a move.
-    pub(super) fn last_main_move(&self) -> Option<u32> {
-        let mut n = 0;
-        while self.nodes[n as usize].first_child != NONE {
+    /// The main line's moves in stored order, first to last.
+    pub(super) fn main_line(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut n = self.nodes[0].first_child;
+        while n != NONE {
+            // Node 0 is the root; the moves are numbered from 1 as they were played.
+            out.push(n - 1);
             n = self.nodes[n as usize].first_child;
         }
-        // Node 0 is the root; the moves are numbered from 1 as they were played.
-        n.checked_sub(1)
+        out
     }
 }
 

@@ -5,6 +5,7 @@
 use chesscore::{Board, Move, Piece, Square};
 
 use crate::movetable::Sq;
+use crate::v2::timing::{self, Evaluation, Score};
 use crate::v2::{self, Annotation, Arrow, Quotation, language};
 use crate::view::PositionOrder;
 
@@ -117,6 +118,22 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
             let lang = u16::from_le_bytes([byte(2), byte(3)]);
             command("video", &[("language", lang.to_string()), ("caption", text(4).0), ("data", raw)])
         }
+        (0x24, _) => match timing::time_control(data, false) {
+            Some(stages) => {
+                let mut fields = Vec::new();
+                for (k, st) in stages.iter().enumerate().filter(|(_, st)| **st != timing::Stage::default()) {
+                    let n = k + 1;
+                    fields.push((format!("kind{n}"), st.kind.to_string()));
+                    fields.push((format!("initial{n}"), seconds(st.initial)));
+                    fields.push((format!("increment{n}"), seconds(st.increment)));
+                    fields.push((format!("moves{n}"), st.moves.to_string()));
+                }
+                fields.push(("data".into(), raw));
+                let borrowed: Vec<(&str, String)> = fields.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                command("timecontrol", &borrowed)
+            }
+            None => command("raw", &[("type", format!("{code:02x}")), ("data", raw)]),
+        },
         (0x09, _) => {
             // The variant in the header's third byte, then the time allowed
             // and the points.
@@ -267,6 +284,40 @@ pub(super) fn graphic(a: &Annotation) -> Option<String> {
         _ => return None,
     };
     Some(format!("[%cb{name} data={}]", base64url(&data)))
+}
+
+/// Hundredths of a second as seconds, with two decimals only when needed.
+fn seconds(hundredths: i32) -> String {
+    match hundredths % 100 {
+        0 => (hundredths / 100).to_string(),
+        _ => format!("{}.{:02}", hundredths / 100, (hundredths % 100).abs()),
+    }
+}
+
+/// `[%eval …]` as oschess and Lichess read it: pawns with two decimals, or
+/// `#n` for a mate in `n` moves, from White's point of view.
+pub(super) fn eval(score: Score) -> String {
+    match score {
+        Score::Centipawns(cp) => {
+            let sign = if cp < 0 { "-" } else { "" };
+            let abs = cp.unsigned_abs();
+            format!("[%eval {sign}{}.{:02}]", abs / 100, abs % 100)
+        }
+        Score::Mate(n) => format!("[%eval #{n}]"),
+    }
+}
+
+/// `[%emt h:mm:ss]`, the time spent on a move.
+pub(super) fn emt((h, m, s): (u8, u8, u8)) -> String {
+    format!("[%emt {h}:{m:02}:{s:02}]")
+}
+
+/// `[%evp …]` as ChessBase's own PGN writes a game's evaluations: the first
+/// and last index, then each entry's value.
+pub(super) fn evp(entries: &[Evaluation]) -> Option<String> {
+    let last = entries.len().checked_sub(1)?;
+    let values: Vec<String> = entries.iter().map(|e| e.profile_value().to_string()).collect();
+    Some(format!("[%evp 0,{last},{}]", values.join(",")))
 }
 
 /// `[%cbrest]`: the bytes of a record after a type of unknown layout.

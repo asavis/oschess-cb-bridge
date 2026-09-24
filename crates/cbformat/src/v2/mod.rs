@@ -24,7 +24,7 @@ mod window;
 pub(crate) use annotations::decode_text as annotations_text;
 pub use annotations::{
     ANNOTATION_TAG, Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Quotation, QuotedPlayer, Square, Unknown,
-    language,
+    language, timing,
 };
 use bytes::{le_i16, le_i64};
 pub use entities::{Entities, GAME_TAG, PLAYER, Player, SOURCE, TEAM, TOURNAMENT, Tournament};

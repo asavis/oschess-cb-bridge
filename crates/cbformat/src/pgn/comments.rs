@@ -4,6 +4,8 @@
 //! writes one language and game quotations as ChessBase writes them; the full
 //! form (asavis/oschess-cb-bridge#42) writes every text as its own comment led
 //! by `[%lang]`, and every other annotation as a command (`commands.rs`).
+//! Both forms write the main line's evaluations as ChessBase does,
+//! `[%evp]`; the full form also writes each move's `[%eval]` and `[%emt]`.
 
 use std::collections::BTreeMap;
 
@@ -12,6 +14,7 @@ use super::commands;
 use super::san::{file_char, rank_char};
 use super::tree::{At, Notes};
 use crate::movetable::Sq;
+use crate::v2::timing::{self, Score};
 use crate::v2::{Annotation, GAME_POSITION, GameAnnotations, language};
 use crate::view::PositionOrder;
 
@@ -29,18 +32,23 @@ pub(super) struct Commentary<'a> {
     full: bool,
     /// For the full form: the type that ended decoding and the bytes after it.
     undecoded: Option<(u16, &'a [u8])>,
+    /// The game's evaluations as `[%evp]`, and each main-line move's score
+    /// from them, by the move's stored index.
+    evp: Option<String>,
+    scores: BTreeMap<u32, Score>,
 }
 
 impl<'a> Commentary<'a> {
-    /// The annotations of a game with `moves` moves whose main line ends at
-    /// the stored move `last`.
+    /// The annotations of a game with `moves` moves, whose main line is the
+    /// stored moves `main_line`.
     pub(super) fn new(
         annotations: &'a GameAnnotations,
         order: PositionOrder,
         options: &Options,
         moves: u32,
-        last: Option<u32>,
+        main_line: &[u32],
     ) -> Self {
+        let last = main_line.last().copied();
         let mut by_position: BTreeMap<i32, Vec<&Annotation>> = BTreeMap::new();
         for b in &annotations.blocks {
             by_position.entry(b.position).or_default().extend(&b.annotations);
@@ -65,7 +73,19 @@ impl<'a> Commentary<'a> {
             .find(|l| languages.contains(l))
             .or(languages.first().copied());
         let undecoded = annotations.stopped_at.map(|u| (u.type_code, annotations.undecoded.as_slice()));
-        Commentary { by_position, past_end, last, language, order, full: options.full, undecoded }
+        // Type 26 on the game: entry `k` is the position after the main
+        // line's ply `k`, the first the start position.
+        let evaluations = by_position.get(&GAME_POSITION).into_iter().flatten().find_map(|a| match a {
+            Annotation::Other { code: 0x26, data } => timing::evaluations(data, order == PositionOrder::Stored),
+            _ => None,
+        });
+        let evp = evaluations.as_deref().and_then(commands::evp);
+        let scores = main_line
+            .iter()
+            .enumerate()
+            .filter_map(|(k, &stored)| Some((stored, evaluations.as_ref()?.get(k + 1)?.score()?)))
+            .collect();
+        Commentary { by_position, past_end, last, language, order, full: options.full, undecoded, evp, scores }
     }
 
     /// The annotations at the move `at`, in this game's numbering.
@@ -82,8 +102,10 @@ impl<'a> Commentary<'a> {
     /// record's undecoded rest. Says whether it wrote one.
     pub(super) fn game_comment(&self, out: &mut String) -> bool {
         let anns = self.by_position.get(&GAME_POSITION).map_or(&[][..], Vec::as_slice);
+        // A comment of its own, first, as ChessBase writes it.
+        let evp = self.evp.as_ref().is_some_and(|e| comment(out, std::slice::from_ref(e), "", " "));
         if self.full {
-            let mut wrote = comment(out, &graphics(anns), "", " ");
+            let mut wrote = comment(out, &graphics(anns), "", " ") || evp;
             for t in self.tagged(anns, None) {
                 wrote |= comment(out, &[t], "", " ");
             }
@@ -96,7 +118,24 @@ impl<'a> Commentary<'a> {
         parts.extend(self.texts(anns, true));
         parts.extend(self.texts(anns, false));
         parts.extend(self.quotes(anns));
-        comment(out, &parts, "", " ")
+        comment(out, &parts, "", " ") || evp
+    }
+
+    /// The full form's engine score and time spent for the move `at`: its own
+    /// evaluation (type 21), else the main line's (type 26), and its own time
+    /// spent (type 07).
+    fn timing(&self, at: At, own: &[&Annotation]) -> Vec<String> {
+        let classic = self.order == PositionOrder::Stored;
+        let own_score = own.iter().find_map(|a| match a {
+            Annotation::Other { code: 0x21, data } => timing::engine_evaluation(data, classic),
+            _ => None,
+        });
+        let score = own_score.or_else(|| self.scores.get(&at.stored).copied());
+        let spent = own.iter().find_map(|a| match a {
+            Annotation::Other { code: 0x07, data } => timing::time_spent(data, classic),
+            _ => None,
+        });
+        score.map(commands::eval).into_iter().chain(spent.map(commands::emt)).collect()
     }
 
     /// The full form's texts in stored order, each a comment of its own:
@@ -184,7 +223,8 @@ impl Notes for Commentary<'_> {
         // Past the last move, every text follows the main line's last move,
         // those meant to precede a move included.
         let past_end = if self.last == Some(at.stored) { &self.past_end[..] } else { &[] };
-        if own.is_empty() && past_end.is_empty() {
+        let timing = if self.full { self.timing(at, own) } else { Vec::new() };
+        if own.is_empty() && past_end.is_empty() && timing.is_empty() {
             return false;
         }
         let all: Vec<&Annotation> = own.iter().chain(past_end.iter().flatten()).copied().collect();
@@ -199,7 +239,8 @@ impl Notes for Commentary<'_> {
             }
         }
         if self.full {
-            let mut wrote = comment(out, &graphics(&all), " ", "");
+            let mut wrote = comment(out, &timing, " ", "");
+            wrote |= comment(out, &graphics(&all), " ", "");
             let mut texts = self.tagged(own, Some(false));
             for anns in past_end {
                 texts.extend(self.tagged(anns, None));
