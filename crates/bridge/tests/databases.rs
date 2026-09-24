@@ -188,7 +188,10 @@ fn a_configured_folder_is_read_again_when_it_changes() {
 
 /// A database added to a configured folder shows even when the folder's own
 /// size and time did not change, as happens within one tick of the kernel's
-/// coarse clock: the listing, not only the folder's time, decides.
+/// coarse clock: the listing, not only the folder's time, decides. Unix only:
+/// resetting a folder's time needs a directory handle with timestamp-write
+/// access on Windows, which `File::open` does not give.
+#[cfg(unix)]
 #[test]
 fn a_database_added_within_one_clock_tick_shows() {
     let root = Root::new("folder-tick");
