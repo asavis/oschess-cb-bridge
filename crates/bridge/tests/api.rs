@@ -11,7 +11,7 @@ use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, annotations, arrows, lid_header, quiet, squares, symbols, text};
-use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
+use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Piece};
 use cbformat::v2::language;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
@@ -858,6 +858,28 @@ fn a_first_name_counts_for_every_entity_of_a_shown_name() {
             );
         }
     }
+}
+
+/// A game whose variations nest as deep as the reader allows is served on a
+/// connection thread, whose stack is `bridge::THREAD_STACK`: the move tree and
+/// its PGN keep their depth on the heap.
+#[test]
+fn the_deepest_variations_are_served_on_a_connection_thread() {
+    use cbformat::replay::MAX_VARIATION_DEPTH;
+    let mut b = Builder::new();
+    // Each group opens one more level of nesting.
+    let mut words = vec![MOVES];
+    for _ in 0..MAX_VARIATION_DEPTH {
+        words.extend([NULL_MOVE, ALTERNATIVE, END_OF_LINE, NULL_MOVE]);
+    }
+    words.push(END_OF_LINE);
+    let at = b.moves(1, &words);
+    b.game(at);
+    let db = b.write("api-deep-variations");
+    let r = start(&db, vec![], None);
+    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    assert_eq!(g.status, 200, "{}", g.body);
+    assert_eq!(g.body.matches('(').count(), MAX_VARIATION_DEPTH, "{}", &g.body[..200.min(g.body.len())]);
 }
 
 #[test]

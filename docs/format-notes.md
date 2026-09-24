@@ -201,6 +201,84 @@ is there. It is opened only when none of them is offline. Through WSL, a non-emp
 no blocks allocated is reported as possibly cloud-only. That heuristic has not
 been confirmed, because no placeholder was available.
 
+## Position index (the bridge's own files)
+
+Not a ChessBase format: the files the bridge writes for
+`GET /v1/databases/{id}/explorer` (`docs/api.md`), one per database in the
+data folder's `index` folder, `<id>.idx`. Integers are little-endian.
+
+- **Key.** A position is its Polyglot key (`chesscore::Board::hash`), which
+  adds an en passant square only when a capture is possible. Chess960 games
+  are left out, since the key names a castling right by its side, not by its
+  rook.
+- **What a game adds.** Each position of its main line from the start to
+  ply 40, once however often it is reached, with the move played from it up to
+  ply 40; a position reached again adds only the move from its first visit.
+  A null move or damaged moves end the line there; the position before them
+  counts, and no move from it. A game whose move record is over 2 MiB, or
+  cannot be read, adds nothing. A position reached by one game only beyond
+  ply 20 is dropped.
+- **Header** (128 bytes):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 8 | magic `OSCBIDX\0` |
+  | 8 | 4 | format version, 1 |
+  | 12 | 4 | header length, 128 |
+  | 17 | 1 | depth in plies, 40 |
+  | 18 | 1 | pruning ply, 20 |
+  | 20 | 4 | first record indexed |
+  | 24 | 4 | last record indexed |
+  | 32 | 8 | the database's generation when built |
+  | 48 | 8 | games indexed |
+  | 56 | 8 | positions |
+  | 64 | 4 | blocks |
+  | 72 | 8 | offset of the block table |
+  | 80 | 4 | CRC-32 of the block table |
+  | 88 | 8 | file length |
+  | 124 | 4 | CRC-32 of bytes 0-123 |
+
+  The other bytes are zero.
+
+- **Blocks** follow the header back to back, positions in ascending key order,
+  up to 4,096 a block, and a block ends once its records reach 1 MiB. A block holds its keys, 12 bytes each (the key, then the
+  record's offset in the block's data, 4 bytes), then the records.
+- **A record** is unsigned LEB128 numbers:
+  - the games, white wins, draws and black wins;
+  - the number of moves, then each move as 2 bytes (from square, to square,
+    and for a pawn reaching the last rank the promotion piece, queen, rook,
+    bishop or knight as 0-3, in bits 0-5, 6-11 and 12-13; castling is the king
+    moving onto its rook) followed by its four counts;
+  - the number of notable games, then their numbers, the highest average
+    rating first, then the latest.
+- **The block table** ends the file: for each block its first key, offset (8
+  bytes each), number of keys, data length and the CRC-32 of its keys and data
+  together (4 bytes each), 28 bytes a block.
+- **Checks.** On opening, before anything is allocated from the header's
+  counts: the header's CRC, and counts that fit the file (the table between
+  its offset and the end of the file; 1 to 4,096 keys a block; for every key
+  12 bytes and a record of at least 6 before the table). Then the table's CRC,
+  and blocks that follow each other, in key order, with at most 4,096 keys and
+  a little over 1 MiB of records each. On each lookup, the CRC of the block
+  read. Any failure rebuilds the index. The table is held within the search
+  memory budget while the index is open.
+- **Deciding what to build.** An index built at the database's generation is
+  current; any other is rebuilt.
+- **The build.** Workers read the header records and the move records of 2,048
+  games at a time into buffers reserved in the search budget, about 3 MiB a
+  worker: the run's move records at once when they fit a 2 MiB window of
+  `.2cbg`, else one record of at most 2 MiB at a time; never `.2cba`. They
+  turn their share of the games into 16-byte entries:
+  the key, the game number (30 bits) with its result (2), and the move (14),
+  ply (6) and average rating (12). Each worker sorts its entries within its
+  share of the search memory budget and writes them as runs. The runs are then
+  merged, each run with a 64 KiB read buffer: in passes of as many runs as half
+  the budget holds, at most 256, until the final merge can take all that are
+  left beside the writer's 6 MiB. That final merge adds up each position's
+  entries into its record as it passes them. Half the budget is at least
+  8 MiB, which holds the writer and 30 runs; a smaller share fails the build
+  as too large rather than waiting for memory the build holds itself.
+
 # The classic format (`.cbh`)
 
 `cbformat::cbh` reads the previous ChessBase format, the `.cbh` family, from

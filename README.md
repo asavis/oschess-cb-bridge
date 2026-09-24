@@ -62,6 +62,14 @@ workers that all searches share, one per core and at most 16;
 `OSCHESS_BRIDGE_THREADS` sets another number. Their memory stays within 1 GiB,
 or `OSCHESS_BRIDGE_SEARCH_MIB` ([docs/api.md](docs/api.md#search-memory)).
 
+The first request for a database's positions builds its position index in the
+background, on half of those workers and within the same memory, and keeps it
+in the data folder's `index` folder: the games, results, moves and notable
+games of every position the games reach in their first 40 plies. For the Mega
+Database it takes some five minutes and 1.4 GB. `cargo run --release -p bridge
+--example index_oracle -- <db.2cbh> <index dir>` builds one and checks it
+against a brute-force count, printing numbers only.
+
 It serves the databases ChessBase's database window shows, read from
 `DBItems.cbini` in `Documents\ChessBase`. The Documents folder is the one
 Windows reports, wherever it has been moved; `OSCHESS_BRIDGE_DOCUMENTS` names

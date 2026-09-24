@@ -5,6 +5,7 @@
 
 mod compare;
 mod fields;
+pub mod gate;
 pub mod memory;
 mod names;
 mod order;
@@ -59,6 +60,8 @@ pub struct Indexes {
     streams: Streams,
     /// Records read by all passes, for tests and diagnostics.
     scanned: AtomicU64,
+    /// Where tests hold searches on this database.
+    gate: gate::Gate,
 }
 
 /// The value in `slot`, built by `build` the first time. Concurrent callers
@@ -86,6 +89,11 @@ impl Indexes {
     /// Records read by all passes over this database so far.
     pub fn scanned(&self) -> u64 {
         self.scanned.load(Ordering::Relaxed)
+    }
+
+    /// Where tests hold searches on this database.
+    pub fn gate(&self) -> &gate::Gate {
+        &self.gate
     }
 
     pub(super) fn names(&self, db: &Database, kind: Kind, cancel: &Cancel) -> Result<Arc<NameTable>, SearchError> {
@@ -206,6 +214,7 @@ pub fn select(
         (Some(_), Some(stream)) => idx.streams.newest(stream),
         _ => Cancel::never(),
     };
+    idx.gate.enter();
     let q = q.unwrap_or("");
     let query = query::parse(q).map_err(|u| SearchError::Unsupported(u.0))?;
     let sort = sort_param.or(query.sort).unwrap_or(Sort::DEFAULT);

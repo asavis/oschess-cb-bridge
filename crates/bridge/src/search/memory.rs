@@ -51,6 +51,26 @@ impl Hold {
         Ok(hold)
     }
 
+    /// Reserves `bytes` without evicting what searches retained: background
+    /// work such as a position index yields to searches, and is refused
+    /// `Busy` rather than taking their memory.
+    pub fn reserve_quietly(bytes: usize) -> Result<Hold, Refused> {
+        let mut hold = Hold(0);
+        hold.grow_quietly(bytes)?;
+        Ok(hold)
+    }
+
+    /// Reserves `more` bytes on top of those held, as [`Hold::reserve_quietly`]
+    /// does: never evicting.
+    pub fn grow_quietly(&mut self, more: usize) -> Result<(), Refused> {
+        let total = self.0.checked_add(more).filter(|&t| t <= budget()).ok_or(Refused::TooLarge)?;
+        if !take(more) {
+            return Err(Refused::Busy);
+        }
+        self.0 = total;
+        Ok(())
+    }
+
     /// Reserves `more` bytes on top of those held.
     pub fn grow(&mut self, more: usize) -> Result<(), Refused> {
         let total = self.0.checked_add(more).filter(|&t| t <= budget()).ok_or(Refused::TooLarge)?;
@@ -252,6 +272,24 @@ mod tests {
             assert_eq!(shared.lock().unwrap().bytes(), step());
         }
         assert_eq!(shared.lock().unwrap().bytes(), 10, "the unused part is given back");
+    }
+
+    #[test]
+    fn a_quiet_reservation_never_evicts() {
+        struct Flag(std::sync::atomic::AtomicBool);
+        impl Evict for Flag {
+            fn evict(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = Arc::new(Flag(std::sync::atomic::AtomicBool::new(false)));
+        let weak: Weak<dyn Evict> = Arc::downgrade(&(Arc::clone(&flag) as Arc<dyn Evict>));
+        register(weak);
+        assert_eq!(Hold::reserve_quietly(budget() + 1).unwrap_err(), Refused::TooLarge);
+        let h = Hold::reserve_quietly(4096).unwrap();
+        assert_eq!(h.bytes(), 4096);
+        drop(h);
+        assert!(!flag.0.load(Ordering::SeqCst), "nothing was evicted");
     }
 
     #[test]

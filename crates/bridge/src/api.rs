@@ -90,6 +90,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(e, req)),
         ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
         ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(e, req)),
+        ["v1", "databases", id, "explorer"] => with_entry(app, id, |e| crate::explorer::route(app, e, req)),
         _ => not_found(),
     }
 }
@@ -121,6 +122,14 @@ fn status(app: &App) -> Response {
     if !downloads.is_empty() {
         let (present, total) = downloads.iter().fold((0, 0), |(p, t), d| (p + d.present(), t + d.total));
         body = body.raw("download", &progress(present, total));
+    }
+    // The position indexes being checked or built.
+    let building = app.catalog.explorer.building();
+    if !building.is_empty() {
+        let items = building.iter().map(|(id, phase, done, total)| {
+            Obj::new().str("id", id).str("phase", phase).num("done", *done as i64).num("total", *total as i64).done()
+        });
+        body = body.raw("indexing", &json::array(items));
     }
     ok(body.done())
 }
@@ -316,7 +325,7 @@ fn window(db: &Database, first: u32, count: u32) -> cbformat::Result<Vec<String>
 /// rows this bounds a window to a few megabytes, whatever an entity holds.
 pub const MAX_FIELD_CHARS: usize = 200;
 
-fn clip(text: String) -> String {
+pub(crate) fn clip(text: String) -> String {
     match text.char_indices().nth(MAX_FIELD_CHARS) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text,

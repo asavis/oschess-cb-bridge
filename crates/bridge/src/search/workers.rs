@@ -141,13 +141,16 @@ pub fn run<T: Send>(
         }
         for index in 0..count {
             let worker = Worker { index, count, stop: &stop, workspace };
-            let spawned = std::thread::Builder::new().name("bridge-search".into()).spawn_scoped(s, move || {
-                let result = task(&worker);
-                if result.is_err() {
-                    worker.stop.store(true, Ordering::Relaxed);
-                }
-                result
-            });
+            let spawned = std::thread::Builder::new()
+                .name("bridge-search".into())
+                .stack_size(crate::THREAD_STACK)
+                .spawn_scoped(s, move || {
+                    let result = task(&worker);
+                    if result.is_err() {
+                        worker.stop.store(true, Ordering::Relaxed);
+                    }
+                    result
+                });
             match spawned {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {

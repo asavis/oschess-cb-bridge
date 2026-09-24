@@ -101,6 +101,7 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
         catalog: Catalog::with_sources(sources, Arc::new(System)),
         between_reads: None,
     };
+    app.catalog.explorer.set_dir(dir.join("index"));
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
 }
 
