@@ -17,6 +17,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use super::server::{self, Pairing};
 use super::{SharedState, shared, tray, updater, windows};
+use crate::choices::Choices;
 use crate::prefs;
 use crate::settings::{self, Extra};
 use crate::status::View;
@@ -225,6 +226,7 @@ pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
         let Ok(_installing) = INSTALLING.try_lock() else {
             return Err("Stockfish is being installed already".into());
         };
+        let ticket = CHOICES.ticket();
         let build = Build::for_arch(stockfish::machine_arch());
         let exe = stockfish::install(&data, build, &stockfish::System, &mut |progress| {
             let (phase, done, total) = match progress {
@@ -236,8 +238,8 @@ pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
         })?;
         let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
         engine::probe(&exe)?;
-        let next = config::Config { engine: Some(exe), ..config::load_or_create(&config_path)? };
-        config::save(&config_path, &next)
+        // A choice made while the download ran stands; the build stays listed.
+        CHOICES.choose_if_current(ticket, &config_path, exe).map(|_| ())
     })
     .await
     .map_err(text)??;
@@ -269,6 +271,9 @@ pub async fn dismiss_stockfish_offer(app: AppHandle) -> Answer<EnginesView> {
 
 /// One choice at a time: a slow probe cannot save its engine over a later one.
 static CHOOSING: Mutex<()> = Mutex::new(());
+/// The choices saved, so that an installation that ends later does not
+/// replace a choice made while it ran.
+static CHOICES: Choices = Choices::new();
 
 /// Chooses the engine at `path` once it answers as a UCI engine. A file that
 /// does not is refused with the dictionary key of the message. The bridge
@@ -281,8 +286,7 @@ pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> 
     tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
         let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
         engine::probe(&program).map_err(|_| "settings.engine.refused".to_string())?;
-        let next = config::Config { engine: Some(program), ..config::load_or_create(&config_path)? };
-        config::save(&config_path, &next)
+        CHOICES.choose(&config_path, program)
     })
     .await
     .map_err(text)??;
