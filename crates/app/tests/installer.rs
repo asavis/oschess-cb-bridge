@@ -33,7 +33,7 @@ fn a_real_uninstall_removes_the_autostart_entries_and_an_update_keeps_them() {
     ] {
         assert!(body.contains(&format!("DeleteRegValue HKCU \"{key}\" \"${{PRODUCTNAME}}\"")), "{key}");
     }
-    // The updater runs the old uninstaller with /UPDATE, and the setting stays.
+    // An uninstaller run with /UPDATE keeps the setting.
     let guard = body.find("${If} $UpdateMode <> 1").expect("guarded by the update mode");
     assert!(body.find("DeleteRegValue").is_some_and(|at| at > guard));
     assert!(body.contains("${EndIf}"));
