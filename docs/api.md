@@ -450,8 +450,9 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
 - **What is indexed.** The positions of each game's main line from its start to
   ply 40, and the moves played from them up to ply 40: standard chess only,
   from the standard start or a set-up position, without deleted games, guiding
-  texts or analyses. A position reached by only one game beyond ply 20 is left
-  out. A position the index does not hold is answered with zero counts and
+  texts or analyses. A game whose move record is over 2 MiB, the limit
+  `games/{number}` serves, or cannot be read, is left out. A position reached
+  by only one game beyond ply 20 is left out. A position the index does not hold is answered with zero counts and
   empty lists. `index` says how far the index goes: the last record it covers,
   the games it holds, and its depth.
 - **Chess960 is not indexed.** The Polyglot key the index uses names a
@@ -462,23 +463,23 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   `variant: "chess960"`, and so is `variant=chess960`.
 - **Building.** The first request for a database's positions starts building
   its index in the background: on at most half of the search workers, within
-  the search memory budget, which it never takes from searches, and one
-  database at a time. Until the index is ready, requests are answered
+  the search memory budget, which it never takes from searches (it waits for
+  memory searches hold), and one database at a time. It reads move records
+  only, a few megabytes at a time, never annotations. Until the index is ready, requests are answered
   `409 database_unavailable` with `state: "indexing"` and
   `progress: {"phase", "done", "total"}`; the phases are `checking` (records),
   `reading` (records) and `merging` (entries). `/v1/status` lists the builds
   under `indexing`. A build that fails is answered `503 index_unavailable` for
   a minute, and the next request tries again.
-- **Changes.** The index belongs to the database's generation. When the
-  database changes, the next request checks it again: if games were only
-  appended (the header records the index covers are unchanged), a small delta
-  over the new games is built and answered together with the index; otherwise,
-  or when the new games exceed a tenth of the indexed records, the whole index
-  is rebuilt. A delta keeps every position, so a position whose one game beyond
-  ply 20 was left out of the full index is counted without it until the next
-  full rebuild.
+- **Changes.** The index belongs to the database's generation, and a change to
+  the database rebuilds its index, about 5 minutes for the Mega Database.
+  Until the new index is ready the answer is `409` with `state: "indexing"`:
+  an index is never answered for another generation than its own. Updating an
+  index from the games appended to a database is a possible later
+  optimisation, only if its results can be shown equal to a build from
+  nothing.
 - **Storage.** Index files live in the data folder's `index` folder, one per
-  database (`<id>.idx`, and `<id>.delta.idx`); `docs/format-notes.md`,
+  database (`<id>.idx`); `docs/format-notes.md`,
   "Position index", describes them. A file that is damaged or of another
   version is rebuilt. The Mega Database's index takes about 1.4 GB, and its
   build needs about 8 GB of temporary space there.

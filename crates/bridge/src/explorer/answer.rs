@@ -13,6 +13,7 @@ use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
 use crate::search::MAX_NAME_RECORD;
 
+use super::file::Bad;
 use super::format::{Counts, MAX_PLY, Stats, TOP_GAMES, unpack_move};
 use super::runs::Progress;
 use super::source::average_elo;
@@ -42,6 +43,7 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     match app.catalog.explorer.index(shared, &open) {
         Lookup::Ready(loaded) => match loaded.lookup(board.hash()) {
             Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
+            Err(Bad::Busy) => error(503, "busy", "The search memory is taken by searches; retry"),
             Err(_) => {
                 app.catalog.explorer.forget(&entry.id);
                 error_with(409, "database_unavailable", "The position index is being rebuilt", |o| {

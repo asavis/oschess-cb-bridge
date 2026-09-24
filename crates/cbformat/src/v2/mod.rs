@@ -19,6 +19,7 @@ pub(crate) mod file;
 mod frame;
 mod moves;
 mod record;
+mod window;
 
 pub(crate) use annotations::decode_text as annotations_text;
 pub use annotations::{
@@ -31,6 +32,7 @@ pub use frame::checksum;
 use frame::{FRAME_HEADER, MAX_FRAME_PART, frame_sizes, parse_frame};
 pub use moves::{GameMoves, Setup, Start, Token};
 pub use record::{Date, Eco, GameResult, Record, RecordKind};
+pub use window::MoveWindow;
 
 pub const HEADER_RECORD_SIZE: usize = 192;
 

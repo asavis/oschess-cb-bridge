@@ -195,47 +195,61 @@ fn a_damaged_index_is_refused_and_rebuilt() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[test]
-fn appended_games_go_to_a_delta_and_edits_rebuild() {
-    let dir = index_dir("delta");
+/// Five games of 1.e4 e5, then `extra` games; the first game's first move is
+/// `first`, which must be a two-square pawn step so that every version of the
+/// database has move records of equal length.
+fn five(name: &str, first: &str, extra: &[&str]) -> TempDb {
     let mut b = Builder::new();
-    for _ in 0..5 {
+    game(&mut b, &format!("{first} e7e5"), 2, (2000, 2000));
+    for _ in 0..4 {
         game(&mut b, "e2e4 e7e5", 2, (2000, 2000));
     }
-    let db = b.write("explorer-delta");
+    for ucis in extra {
+        game(&mut b, ucis, 1, (2500, 2500));
+    }
+    b.write(name)
+}
+
+#[test]
+fn any_change_rebuilds_the_whole_index() {
+    let dir = index_dir("rebuild");
+    let db = five("explorer-rebuild", "e2e4", &[]);
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let first = explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap();
-    assert!(first.delta.is_none());
-    drop((first, d));
-    // Two games appended: the first five records are unchanged.
-    game(&mut b, "d2d4 d7d5", 0, (2500, 2500));
-    game(&mut b, "e2e4 c7c5", 1, (2500, 2500));
-    let db = b.write("explorer-delta");
-    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let second = explorer::prepare(&d, 2, &dir, "db", &Progress::default()).unwrap();
-    assert!(second.delta.is_some(), "appended games make a delta");
-    let start = second.lookup(key_after("")).unwrap().unwrap();
-    assert_eq!(start.counts, Counts { games: 7, white: 5, draws: 1, black: 1 });
-    assert_eq!(start.lookup_move("e2e4"), Some(6));
-    assert_eq!(second.records(), 7);
-    drop((second, d));
-    // An earlier game changed: the full index is built again.
-    let db = {
-        let mut b2 = Builder::new();
-        game(&mut b2, "c2c4", 2, (2000, 2000));
-        for _ in 0..4 {
-            game(&mut b2, "e2e4 e7e5", 2, (2000, 2000));
-        }
-        game(&mut b2, "d2d4 d7d5", 0, (2500, 2500));
-        game(&mut b2, "e2e4 c7c5", 1, (2500, 2500));
-        game(&mut b2, "e2e4 c7c5", 1, (2500, 2500));
-        b2.write("explorer-delta")
-    };
-    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let third = explorer::prepare(&d, 3, &dir, "db", &Progress::default()).unwrap();
-    assert!(third.delta.is_none(), "an edit rebuilds the full index");
-    assert_eq!(third.lookup(key_after("")).unwrap().unwrap().counts.games, 8);
-    std::fs::remove_dir_all(&dir).unwrap();
+    let progress = Progress::default();
+    let first = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
+    assert_eq!(progress.phase(), "merging", "built");
+    assert_eq!(first.lookup(key_after("")).unwrap().unwrap().lookup_move("e2e4"), Some(5));
+    drop(first);
+    // The same generation: the file on disk is used.
+    let progress = Progress::default();
+    let again = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
+    assert_eq!(progress.phase(), "checking", "not built again");
+    drop((again, d));
+    // Only a move changed, 1.e4 to 1.d4 in a record of the same length: every
+    // header record is as before, and the new generation rebuilds it all.
+    let headers = std::fs::read(db.dir().join("db.2cbh")).unwrap();
+    let db2 = five("explorer-rebuild", "d2d4", &[]);
+    assert_eq!(headers, std::fs::read(db2.dir().join("db.2cbh")).unwrap(), "the header records are unchanged");
+    let d = Database::open(db2.dir().join("db.2cbh")).unwrap();
+    let progress = Progress::default();
+    let moved = explorer::prepare(&d, 2, &dir, "db", &progress).unwrap();
+    assert_eq!(progress.phase(), "merging", "built again");
+    let start = moved.lookup(key_after("")).unwrap().unwrap();
+    assert_eq!((start.lookup_move("e2e4"), start.lookup_move("d2d4")), (Some(4), Some(1)));
+    drop((moved, d));
+    // Games appended: built again whole, equal to a build from nothing.
+    let db3 = five("explorer-rebuild", "d2d4", &["e2e4 c7c5", "c2c4"]);
+    let d = Database::open(db3.dir().join("db.2cbh")).unwrap();
+    let grown = explorer::prepare(&d, 3, &dir, "db", &Progress::default()).unwrap();
+    let cold_dir = index_dir("rebuild-cold");
+    let cold = explorer::prepare(&d, 3, &cold_dir, "db", &Progress::default()).unwrap();
+    for ucis in ["", "e2e4", "e2e4 c7c5", "c2c4", "d2d4 e7e5"] {
+        assert_eq!(grown.lookup(key_after(ucis)).unwrap(), cold.lookup(key_after(ucis)).unwrap(), "{ucis}");
+    }
+    assert_eq!(grown.lookup(key_after("")).unwrap().unwrap().counts, Counts { games: 7, white: 5, draws: 2, black: 0 });
+    for dir in [dir, cold_dir] {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -313,6 +327,28 @@ fn the_endpoint_builds_then_answers() {
         (200, true),
         "{body}"
     );
+    // A changed database is never answered from the index of its former
+    // generation: the first request after the change starts a rebuild.
+    let _grown = {
+        std::thread::sleep(Duration::from_millis(20));
+        let mut b = Builder::new();
+        game(&mut b, "e2e4 e7e5 g1f3 b8c6", 2, (2400, 2300));
+        b.lid(lid_header(1024, 1));
+        b.write("explorer-http")
+    };
+    let (status, body) = get(port, &url(start));
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(r#""state":"indexing""#), "{body}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        let (status, body) = get(port, &url(start));
+        if status == 200 {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "the index was not rebuilt");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(body.contains(r#""games":1,"white":1,"draws":0,"black":0"#), "{body}");
     // Chess960: the two positions a Polyglot key cannot tell apart.
     for fen in ["4k3/8/8/8/8/8/8/4KR1R w F - 0 1", "4k3/8/8/8/8/8/8/4KR1R w H - 0 1"] {
         let (status, body) = get(port, &url(fen));

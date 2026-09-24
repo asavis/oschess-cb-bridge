@@ -2,8 +2,8 @@
 //! (`docs/api.md`): for each position reached in the first plies of a
 //! database's games, the games through it, their results, the moves played
 //! from it and its notable games. An index is built in the background the
-//! first time it is asked for, kept on disk in the bridge's data folder, and
-//! extended by a small delta when games are appended to the database.
+//! first time it is asked for and kept on disk in the bridge's data folder;
+//! a change to the database rebuilds it.
 
 mod answer;
 mod build;
@@ -25,19 +25,17 @@ use crate::fetch::Serial;
 
 use build::Plan;
 use file::{Bad, IndexFile};
-use format::{MAX_PLY, NO_PRUNING, PRUNE_PLY, Stats};
+use format::{MAX_PLY, PRUNE_PLY, Stats};
 use runs::Progress;
 use source::Source;
 
 /// How long a failed build is reported before the next request tries again.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
-/// The index of one database: the full index and the delta of games appended
-/// since, both of the generation they were checked at.
+/// The index of one database, at the generation it was built for.
 pub struct Loaded {
     pub generation: u64,
     pub base: IndexFile,
-    pub delta: Option<IndexFile>,
     /// Notable games already rendered, by number: their rating and JSON.
     games: Mutex<HashMap<u32, (u16, Arc<str>)>>,
 }
@@ -46,8 +44,8 @@ pub struct Loaded {
 const RENDERED_GAMES: usize = 1 << 16;
 
 impl Loaded {
-    pub fn new(generation: u64, base: IndexFile, delta: Option<IndexFile>) -> Loaded {
-        Loaded { generation, base, delta, games: Mutex::default() }
+    pub fn new(generation: u64, base: IndexFile) -> Loaded {
+        Loaded { generation, base, games: Mutex::default() }
     }
 
     /// Game `number`'s rating and rendered JSON, from the cache or `make`.
@@ -65,37 +63,18 @@ impl Loaded {
         Some(value)
     }
 
-    /// The position `key` over the full index and the delta together.
+    /// The position `key`.
     pub fn lookup(&self, key: u64) -> Result<Option<Stats>, Bad> {
-        let base = self.base.lookup(key)?;
-        let delta = match &self.delta {
-            Some(d) => d.lookup(key)?,
-            None => None,
-        };
-        Ok(match (base, delta) {
-            (Some(mut a), Some(b)) => {
-                a.counts.merge(&b.counts);
-                for (code, c) in b.moves {
-                    match a.moves.iter_mut().find(|m| m.0 == code) {
-                        Some(m) => m.1.merge(&c),
-                        None => a.moves.push((code, c)),
-                    }
-                }
-                a.moves.sort_unstable_by(|x, y| y.1.games.cmp(&x.1.games).then(x.0.cmp(&y.0)));
-                a.top.extend(b.top);
-                Some(a)
-            }
-            (a, b) => a.or(b),
-        })
+        self.base.lookup(key)
     }
 
     /// The last record the index covers.
     pub fn records(&self) -> u32 {
-        self.delta.as_ref().map_or(self.base.header.last_record, |d| d.header.last_record)
+        self.base.header.last_record
     }
 
     pub fn games(&self) -> u64 {
-        self.base.header.games + self.delta.as_ref().map_or(0, |d| d.header.games)
+        self.base.header.games
     }
 }
 
@@ -179,15 +158,12 @@ impl Registry {
     }
 
     /// Drops the index of `id` after a read found it damaged, and deletes its
-    /// files, so the next request rebuilds it.
+    /// file, so the next request rebuilds it.
     pub fn forget(&self, id: &str) {
         let state = self.state(id);
         let mut s = lock(&state);
         if let State::Ready(l) = &*s {
             let _ = std::fs::remove_file(&l.base.path);
-            if let Some(d) = &l.delta {
-                let _ = std::fs::remove_file(&d.path);
-            }
         }
         *s = State::Idle;
     }
@@ -211,69 +187,38 @@ impl Registry {
     }
 }
 
-/// The index files of database `id` in `dir`.
-pub fn paths(dir: &Path, id: &str) -> (PathBuf, PathBuf, PathBuf) {
-    (dir.join(format!("{id}.idx")), dir.join(format!("{id}.delta.idx")), dir.join(format!("{id}.build")))
+/// The index file of database `id` in `dir`, and the folder its build uses.
+pub fn paths(dir: &Path, id: &str) -> (PathBuf, PathBuf) {
+    (dir.join(format!("{id}.idx")), dir.join(format!("{id}.build")))
 }
 
-/// Checks the index files of `id` against the database and builds what is
-/// missing: nothing when they are current, a delta when games were only
-/// appended, else the full index.
+/// The index of `id` for the database at `generation`: the file kept on disk
+/// when it was built at that generation, else a full build. Any change to the
+/// database changes its generation and so rebuilds its index; an index is
+/// never answered for another generation than its own.
 pub fn prepare(db: &dyn Source, generation: u64, dir: &Path, id: &str, progress: &Progress) -> Result<Loaded, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let (base_path, delta_path, work) = paths(dir, id);
+    let (path, work) = paths(dir, id);
     let count = db.records();
     progress.start("checking", u64::from(count));
-    if let Ok(base) = IndexFile::open(&base_path)
-        && base.header.kind == 0
-        && base.header.max_ply == MAX_PLY
-        && base.header.prune_ply == PRUNE_PLY
-        && base.header.last_record <= count
-    {
-        let last = base.header.last_record;
-        let same = base.header.generation == generation && last == count;
-        if same || db.digest(last).map_err(|e| e.to_string())? == base.header.digest {
-            if last == count {
-                let _ = std::fs::remove_file(&delta_path);
-                return Ok(Loaded::new(generation, base, None));
-            }
-            if let Ok(delta) = IndexFile::open(&delta_path)
-                && delta.header.kind == 1
-                && delta.header.generation == generation
-                && delta.header.first_record == last + 1
-                && delta.header.last_record == count
-            {
-                return Ok(Loaded::new(generation, base, Some(delta)));
-            }
-            // A delta for up to a tenth of the indexed records; beyond that
-            // the full index is rebuilt.
-            if count - last <= (last / 10).max(1000) {
-                let plan = Plan {
-                    kind: 1,
-                    first: last + 1,
-                    last: count,
-                    prune_ply: NO_PRUNING,
-                    generation,
-                    digest: db.digest(count).map_err(|e| e.to_string())?,
-                };
-                build::build(db, &plan, &work, &delta_path, progress).map_err(|e| format!("{e:?}"))?;
-                let delta = IndexFile::open(&delta_path).map_err(|e| format!("{e:?}"))?;
-                return Ok(Loaded::new(generation, base, Some(delta)));
-            }
+    match IndexFile::open(&path) {
+        Ok(file)
+            if file.header.generation == generation
+                && file.header.max_ply == MAX_PLY
+                && file.header.prune_ply == PRUNE_PLY
+                && file.header.first_record == 1
+                && file.header.last_record == count =>
+        {
+            return Ok(Loaded::new(generation, file));
         }
+        Err(Bad::Busy) => return Err("the search memory is taken by searches; retry".into()),
+        // Absent, damaged, or of another generation: built afresh.
+        _ => {}
     }
-    let _ = std::fs::remove_file(&delta_path);
-    let plan = Plan {
-        kind: 0,
-        first: 1,
-        last: count,
-        prune_ply: PRUNE_PLY,
-        generation,
-        digest: db.digest(count).map_err(|e| e.to_string())?,
-    };
-    build::build(db, &plan, &work, &base_path, progress).map_err(|e| format!("{e:?}"))?;
-    let base = IndexFile::open(&base_path).map_err(|e| format!("{e:?}"))?;
-    Ok(Loaded::new(generation, base, None))
+    let plan = Plan { first: 1, last: count, prune_ply: PRUNE_PLY, generation };
+    build::build(db, &plan, &work, &path, progress).map_err(|e| format!("{e:?}"))?;
+    let file = IndexFile::open(&path).map_err(|e| format!("{e:?}"))?;
+    Ok(Loaded::new(generation, file))
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

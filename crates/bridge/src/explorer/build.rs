@@ -9,20 +9,24 @@ use std::sync::atomic::Ordering;
 
 use crate::search::SearchError;
 
-use super::format::{BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, crc32};
+use super::format::{
+    BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, crc32,
+};
 use super::runs::{self, Entry, Progress, io};
 use super::source::Source;
 
-/// What to build: records `first..=last`, pruned or not, and the facts the
-/// header records.
+/// What to build: records `first..=last` of the database at `generation`,
+/// with single-game positions beyond `prune_ply` dropped.
 pub struct Plan {
-    pub kind: u8,
     pub first: u32,
     pub last: u32,
     pub prune_ply: u8,
     pub generation: u64,
-    pub digest: u64,
 }
+
+/// The writer's memory: its output buffer, a block's keys and records, and the
+/// table of blocks.
+const WRITER_BYTES: usize = (1 << 20) + BLOCK_KEYS * 12 + super::format::MAX_BLOCK_DATA + (4 << 20);
 
 /// Builds the index of `plan` into `target`, through a temporary file renamed
 /// at the end; the runs go to `work`, which is emptied afterwards.
@@ -56,6 +60,7 @@ fn build_in(
     progress.start("merging", entries);
     let runs = runs::reduce(runs, work, progress)?;
     let partial = temporary(target);
+    let _writer_memory = runs::reserve(WRITER_BYTES, progress)?;
     let mut writer = Writer::create(&partial)?;
     let mut agg = Aggregate::default();
     // Every game indexed starts with its ply-0 position, once.
@@ -80,13 +85,11 @@ fn build_in(
         agg.emit(plan.prune_ply, &mut writer)?;
     }
     let header = Header {
-        kind: plan.kind,
         max_ply: MAX_PLY,
         prune_ply: plan.prune_ply,
         first_record: plan.first,
         last_record: plan.last,
         generation: plan.generation,
-        digest: plan.digest,
         games,
         keys: 0,
         blocks: 0,
@@ -209,7 +212,7 @@ impl Writer {
         self.data.extend_from_slice(&self.record);
         self.in_block += 1;
         self.total_keys += 1;
-        if self.in_block == BLOCK_KEYS {
+        if self.in_block == BLOCK_KEYS || self.data.len() >= BLOCK_DATA {
             self.flush_block()?;
         }
         Ok(())

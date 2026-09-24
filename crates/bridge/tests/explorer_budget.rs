@@ -45,6 +45,8 @@ fn a_build_waits_for_memory_and_never_evicts() {
     assert!(!flag.0.load(Ordering::SeqCst), "nothing searches kept was evicted");
     assert_eq!(loaded.games(), 50);
     release.join().unwrap();
-    assert_eq!(held(), 0, "the build returned what it reserved");
+    assert!(held() > 0, "the open index holds its table of blocks");
+    drop(loaded);
+    assert_eq!(held(), 0, "the build returned what it reserved, and the index its table");
     std::fs::remove_dir_all(&dir).unwrap();
 }

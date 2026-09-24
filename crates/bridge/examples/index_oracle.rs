@@ -170,6 +170,10 @@ fn main() {
     let size = std::fs::metadata(&loaded.base.path).map(|m| m.len()).unwrap_or(0);
     println!("records {n}");
     println!("games indexed {}", loaded.games());
+    println!(
+        "games left out (move record unreadable or over 2 MiB) {}",
+        progress.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    );
     println!("entries (game, position) {}", progress.total.load(std::sync::atomic::Ordering::Relaxed));
     println!("distinct positions {}", progress.positions.load(std::sync::atomic::Ordering::Relaxed));
     println!("positions kept {}", loaded.base.header.keys);

@@ -10,6 +10,14 @@ pub const VERSION: u32 = 1;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
+/// A block ends once its records reach this size, so a lookup reads little
+/// whatever a position holds.
+pub const BLOCK_DATA: usize = 1 << 20;
+/// The most a block's records can take: [`BLOCK_DATA`], plus the record that
+/// passed it, which is at most 218 moves and 12 games of varints.
+pub const MAX_BLOCK_DATA: usize = BLOCK_DATA + (16 << 10);
+/// The fewest bytes a record takes: four counts, no moves, no games.
+pub const MIN_RECORD: usize = 6;
 /// A key and the offset of its record in the block's data.
 pub const KEY_ENTRY: usize = 12;
 /// A block in the table: first key, offset, key count, data length, CRC.
@@ -21,14 +29,9 @@ pub const TOP_GAMES: usize = 12;
 pub const MAX_PLY: u8 = 40;
 /// A position reached by one game only is dropped beyond this ply.
 pub const PRUNE_PLY: u8 = 20;
-/// `prune_ply` of an index that keeps every position (a delta).
-pub const NO_PRUNING: u8 = u8::MAX;
-
 /// What the index was built from and how.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
-    /// 0 for a full index, 1 for a delta over records appended since.
-    pub kind: u8,
     pub max_ply: u8,
     pub prune_ply: u8,
     /// Records `first_record..=last_record` are indexed.
@@ -36,8 +39,6 @@ pub struct Header {
     pub last_record: u32,
     /// The database's generation when the index was built.
     pub generation: u64,
-    /// The digest of header records `1..=last_record` (see `digest`).
-    pub digest: u64,
     pub games: u64,
     pub keys: u64,
     pub blocks: u32,
@@ -52,13 +53,11 @@ impl Header {
         b[0..8].copy_from_slice(&MAGIC);
         b[8..12].copy_from_slice(&VERSION.to_le_bytes());
         b[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
-        b[16] = self.kind;
         b[17] = self.max_ply;
         b[18] = self.prune_ply;
         b[20..24].copy_from_slice(&self.first_record.to_le_bytes());
         b[24..28].copy_from_slice(&self.last_record.to_le_bytes());
         b[32..40].copy_from_slice(&self.generation.to_le_bytes());
-        b[40..48].copy_from_slice(&self.digest.to_le_bytes());
         b[48..56].copy_from_slice(&self.games.to_le_bytes());
         b[56..64].copy_from_slice(&self.keys.to_le_bytes());
         b[64..68].copy_from_slice(&self.blocks.to_le_bytes());
@@ -79,13 +78,11 @@ impl Header {
             return None;
         }
         Some(Header {
-            kind: b[16],
             max_ply: b[17],
             prune_ply: b[18],
             first_record: u32_at(b, 20),
             last_record: u32_at(b, 24),
             generation: u64_at(b, 32),
-            digest: u64_at(b, 40),
             games: u64_at(b, 48),
             keys: u64_at(b, 56),
             blocks: u32_at(b, 64),
@@ -360,13 +357,11 @@ mod tests {
         assert_eq!(Stats::decode(&b), Some(s));
         assert_eq!(Stats::decode(&b[..b.len() - 1]), None, "a cut record is refused");
         let h = Header {
-            kind: 0,
             max_ply: MAX_PLY,
             prune_ply: PRUNE_PLY,
             first_record: 1,
             last_record: 99,
             generation: 5,
-            digest: 6,
             games: 90,
             keys: 1000,
             blocks: 1,

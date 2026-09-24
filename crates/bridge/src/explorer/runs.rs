@@ -16,7 +16,7 @@ use crate::search::memory::{Cancel, Hold, Refused};
 use crate::search::workers::{self, threads};
 
 use super::format::Outcome;
-use super::source::{Line, Source};
+use super::source::{Line, Source, Workspace};
 
 /// One game passing through one position, in 16 bytes: the key, the game and
 /// its outcome, and the move, ply and rating.
@@ -93,6 +93,8 @@ pub struct Progress {
     pub total: AtomicU64,
     /// Distinct positions merged so far, kept or dropped.
     pub positions: AtomicU64,
+    /// Games left out because their moves could not be read.
+    pub skipped: AtomicU64,
     pub stop: AtomicBool,
 }
 
@@ -154,11 +156,17 @@ pub fn write_runs(
         return Err(SearchError::TooLarge);
     }
     let total = u64::from(last - first + 1);
-    let want = threads().div_ceil(2).max(1).min(total.div_ceil(4096) as usize).max(1);
+    // Half the workers at most, and no more than half the budget holds with
+    // their entries and read buffers, so that searches keep the rest.
+    let want = threads().div_ceil(2).min(total.div_ceil(4096) as usize).max(1);
     let per_worker = run_bytes(want);
+    let fit = crate::search::memory::budget() / 2 / (per_worker + Workspace::BYTES);
+    let want = want.min(fit).max(1);
     let runs = workers::run(want, 0, &Cancel::never(), |w| {
-        let hold = reserve(per_worker, progress)?;
-        let capacity = hold.bytes() / std::mem::size_of::<Entry>();
+        // The entries, and the buffers games are read into, reserved first.
+        let hold = reserve(per_worker + Workspace::BYTES, progress)?;
+        let mut work = Workspace::new().ok_or(Refused::Busy)?;
+        let capacity = per_worker / std::mem::size_of::<Entry>();
         let mut buf: Vec<Entry> = Vec::new();
         buf.try_reserve_exact(capacity).map_err(|_| Refused::Busy)?;
         let per = total.div_ceil(w.count as u64);
@@ -172,7 +180,7 @@ pub fn write_runs(
                 return Err(SearchError::Superseded);
             }
             let end = (next + 4095).min(hi);
-            source.lines(next as u32, end as u32, max_ply, &mut |line: &Line| {
+            source.lines(next as u32, end as u32, max_ply, &mut work, &mut |line: &Line| {
                 if failed.is_some() {
                     return;
                 }
@@ -193,7 +201,8 @@ pub fn write_runs(
             return Err(e);
         }
         flush(&mut buf, dir, w.index, &mut runs)?;
-        drop(hold);
+        progress.skipped.fetch_add(work.skipped, Ordering::Relaxed);
+        drop((buf, work, hold));
         Ok(runs)
     })?;
     Ok(runs.into_iter().flatten().collect())
