@@ -344,9 +344,10 @@ The reader was checked against:
   examined no last name fills its 30 bytes and no first name its 20: the
   longest hold 29 and 19 bytes. Tournament titles hold at most 39 of their
   40 bytes (5,355 do), except in the user database ChessBase converted from
-  2CBH, where 15 fill all 40. A name cut in UTF-8 ends before a character
-  that would cross the end: a first name of ten two-byte characters keeps
-  nine.
+  2CBH, where 15 fill all 40. A cut is measured in the bytes the field
+  stores, not in the text read from them: a Windows-1252 byte reads as up to
+  three bytes of UTF-8. A name cut in UTF-8 ends before a character that
+  would cross the end: a first name of ten two-byte characters keeps nine.
 - **2CBH analyses** are stored as ordinary games in a converted classic
   database (5 in the partial Mega); their move trees are the same.
 - **Guiding texts** keep their titles, one per language, at the head of their

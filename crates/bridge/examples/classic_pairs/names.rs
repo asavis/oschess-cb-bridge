@@ -3,9 +3,11 @@
 //! ([`NameDiff`]); any other is a failure.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
+use cbformat::cbh::Entity;
 use cbformat::v2::{Player, RecordKind};
-use cbformat::view::Base;
+use cbformat::view::{Base, Header};
 
 /// The name fields of a game, by index.
 pub const FIELDS: [&str; 5] = ["white", "black", "event", "site", "annotator"];
@@ -53,8 +55,10 @@ fn cp1252(c: char) -> bool {
     n < 0x80 || (0xa0..=0xff).contains(&n) || "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ".contains(c)
 }
 
-/// How a classic text field of `width` bytes holds the 2CBH text `two`.
-fn text(classic: &str, two: &str, width: usize) -> NameDiff {
+/// How a classic text field of `width` bytes, which stores `stored` bytes
+/// before its terminating zero and reads as `classic`, holds the 2CBH text
+/// `two`.
+fn text(classic: &str, stored: usize, two: &str, width: usize) -> NameDiff {
     if classic == two {
         return NameDiff::Equal;
     }
@@ -68,17 +72,50 @@ fn text(classic: &str, two: &str, width: usize) -> NameDiff {
     }
     // A cut exhausts the field. ChessBase keeps a name's terminating zero in
     // its field, which then holds `width - 1` bytes, and its converter from
-    // 2CBH fills tournament titles to the last byte. A cut holds that many
-    // bytes: characters, one byte each, in Windows-1252; in UTF-8 that many
-    // bytes, or fewer only when the next character would have crossed the
-    // end. A shorter prefix of a name that fits is missing data, not a cut.
+    // 2CBH fills tournament titles to the last byte. A cut stores that many
+    // bytes, counted as stored and not as decoded. Only a field that holds
+    // UTF-8 may stop short of it, when the next character's bytes would have
+    // crossed the end: Windows-1252 stores every character in one byte, and
+    // a field of ASCII alone does not show which encoding it has. A shorter
+    // prefix of a name that fits is missing data, not a cut.
+    let utf8 = !classic.is_ascii() && classic.len() <= stored;
     let next = t[c.len()].len_utf8();
-    let fills = |capacity: usize| {
-        (c.len() == capacity && c.iter().all(|&x| cp1252(x)))
-            || classic.len() == capacity
-            || (classic.len() < capacity && classic.len() + next > capacity)
-    };
+    let fills = |capacity: usize| stored == capacity || (utf8 && stored < capacity && stored + next > capacity);
     if fills(width - 1) || fills(width) { NameDiff::Cut } else { NameDiff::Other }
+}
+
+/// The bytes the classic fields of a game store before their terminating
+/// zeros, in the order of [`FIELDS`], a player's last name before the first:
+/// white, black, event, site, annotator.
+struct Stored {
+    white: [usize; 2],
+    black: [usize; 2],
+    event: usize,
+    site: usize,
+    annotator: usize,
+}
+
+impl Stored {
+    fn of(classic: &Base, header: &Header) -> Option<Stored> {
+        let (Base::Cbh(db), Header::Cbh(r)) = (classic, header) else { return None };
+        let e = db.entities();
+        let data = |entity, id| e.data(entity, id).ok().flatten();
+        let len = |d: &Option<Vec<u8>>, range: Range<usize>| {
+            d.as_ref().and_then(|d| d.get(range)).map_or(0, |f| f.iter().position(|&b| b == 0).unwrap_or(f.len()))
+        };
+        let player = |id| {
+            let d = data(Entity::Player, id);
+            [len(&d, 0..30), len(&d, 30..50)]
+        };
+        let tournament = data(Entity::Tournament, r.tournament());
+        Some(Stored {
+            white: player(r.white()),
+            black: player(r.black()),
+            event: len(&tournament, 0..40),
+            site: len(&tournament, 40..70),
+            annotator: len(&data(Entity::Annotator, r.annotator()), 0..45),
+        })
+    }
 }
 
 fn words(t: &str) -> Vec<String> {
@@ -88,16 +125,17 @@ fn words(t: &str) -> Vec<String> {
     w
 }
 
-/// A player compared by its last name (30 bytes) and first name (20).
-fn player(classic: Option<&Player>, two: Option<&Player>) -> NameDiff {
+/// A player compared by its last name (30 bytes) and first name (20), whose
+/// classic fields store `stored` bytes.
+fn player(classic: Option<&Player>, stored: [usize; 2], two: Option<&Player>) -> NameDiff {
     let part = |p: Option<&Player>, first: bool| p.map(|p| if first { &p.first } else { &p.last }).cloned();
-    let last = text(&part(classic, false).unwrap_or_default(), &part(two, false).unwrap_or_default(), 30);
-    let first = text(&part(classic, true).unwrap_or_default(), &part(two, true).unwrap_or_default(), 20);
+    let last = text(&part(classic, false).unwrap_or_default(), stored[0], &part(two, false).unwrap_or_default(), 30);
+    let first = text(&part(classic, true).unwrap_or_default(), stored[1], &part(two, true).unwrap_or_default(), 20);
     last.max(first)
 }
 
-fn annotator(classic: &str, two: &str) -> NameDiff {
-    match text(classic, two, 45) {
+fn annotator(classic: &str, stored: usize, two: &str) -> NameDiff {
+    match text(classic, stored, two, 45) {
         NameDiff::Other if !classic.is_empty() && words(classic) == words(two) => NameDiff::WordOrder,
         d => d,
     }
@@ -129,18 +167,19 @@ impl Names {
             if a.kind() != RecordKind::Game {
                 continue;
             }
-            let (Ok(na), Ok(nb)) = (classic.names(&a), two.names(&b)) else {
+            let (Ok(na), Ok(nb), Some(st)) = (classic.names(&a), two.names(&b), Stored::of(classic, &a)) else {
                 names.kinds += 1;
                 continue;
             };
             let title = |t: &Option<cbformat::v2::Tournament>| t.as_ref().map(|t| t.title.clone()).unwrap_or_default();
             let place = |t: &Option<cbformat::v2::Tournament>| t.as_ref().map(|t| t.place.clone()).unwrap_or_default();
             let mut diffs = [NameDiff::Equal; 5];
-            diffs[WHITE] = player(na.white.as_ref(), nb.white.as_ref());
-            diffs[BLACK] = player(na.black.as_ref(), nb.black.as_ref());
-            diffs[EVENT] = text(&title(&na.tournament), &title(&nb.tournament), 40);
-            diffs[SITE] = text(&place(&na.tournament), &place(&nb.tournament), 30);
-            diffs[ANNOTATOR] = annotator(&na.annotator.unwrap_or_default(), &nb.annotator.unwrap_or_default());
+            diffs[WHITE] = player(na.white.as_ref(), st.white, nb.white.as_ref());
+            diffs[BLACK] = player(na.black.as_ref(), st.black, nb.black.as_ref());
+            diffs[EVENT] = text(&title(&na.tournament), st.event, &title(&nb.tournament), 40);
+            diffs[SITE] = text(&place(&na.tournament), st.site, &place(&nb.tournament), 30);
+            diffs[ANNOTATOR] =
+                annotator(&na.annotator.unwrap_or_default(), st.annotator, &nb.annotator.unwrap_or_default());
             for (field, d) in diffs.iter().enumerate() {
                 if *d != NameDiff::Equal {
                     *names.counts.entry((FIELDS[field], *d)).or_insert(0) += 1;
@@ -176,44 +215,79 @@ impl Names {
 mod tests {
     use super::*;
 
+    /// [`text`] for a field that stores `classic` in UTF-8.
+    fn utf8(classic: &str, two: &str, width: usize) -> NameDiff {
+        text(classic, classic.len(), two, width)
+    }
+
+    /// [`text`] for a field that stores `classic` in Windows-1252.
+    fn cp(classic: &str, two: &str, width: usize) -> NameDiff {
+        text(classic, classic.chars().count(), two, width)
+    }
+
     #[test]
     fn a_cut_exhausts_the_field() {
         let long = "Abcdefghijklmnopqrstuvwxyzabcdefgh";
         assert_eq!(long.len(), 34);
         // A 34-byte name in a 30-byte field: cut at 30 bytes, or at 29 when
         // the field keeps its terminating zero.
-        assert_eq!(text(&long[..30], long, 30), NameDiff::Cut);
-        assert_eq!(text(&long[..29], long, 30), NameDiff::Cut);
+        assert_eq!(utf8(&long[..30], long, 30), NameDiff::Cut);
+        assert_eq!(utf8(&long[..29], long, 30), NameDiff::Cut);
         // A 30-byte name held as its 27-byte prefix: missing data.
-        assert_eq!(text(&long[..27], &long[..30], 30), NameDiff::Other);
-        assert!(!known(WHITE, text(&long[..27], &long[..30], 30)));
+        assert_eq!(utf8(&long[..27], &long[..30], 30), NameDiff::Other);
+        assert!(!known(WHITE, utf8(&long[..27], &long[..30], 30)));
         // Two bytes short of the width, with an ASCII character next.
-        assert_eq!(text(&long[..28], long, 30), NameDiff::Other);
+        assert_eq!(utf8(&long[..28], long, 30), NameDiff::Other);
+        // ASCII does not show its encoding, so a character that would cross
+        // the end in UTF-8 and fit in Windows-1252 does not explain a field
+        // that stops short.
+        assert_eq!(utf8(&long[..28], &format!("{}éb", &long[..28]), 30), NameDiff::Other);
+    }
+
+    #[test]
+    fn a_cut_counts_the_bytes_stored() {
+        // `A` and 15 `é`: 16 bytes in Windows-1252, 31 in UTF-8.
+        let two = format!("A{}", "é".repeat(15));
+        let short = format!("A{}", "é".repeat(14));
+        // 15 bytes in Windows-1252 leave room for the last `é`: missing data,
+        // though the text reads as 29 bytes of UTF-8.
+        assert_eq!(short.len(), 29);
+        assert_eq!(cp(&short, &two, 30), NameDiff::Other);
+        // The same text stored as 29 bytes of UTF-8 fills the field.
+        assert_eq!(utf8(&short, &two, 30), NameDiff::Cut);
+        // The whole name fits in Windows-1252.
+        assert_eq!(cp(&two, &two, 30), NameDiff::Equal);
+        // Windows-1252 holds `é` in one byte: 30 characters fill the field.
+        let x = |n: usize| "x".repeat(n);
+        assert_eq!(cp(&format!("{}éb", x(28)), &format!("{}ébcd", x(28)), 30), NameDiff::Cut);
     }
 
     #[test]
     fn a_character_across_the_end_is_dropped() {
-        // 28 bytes, then a two-byte character that would end at byte 30 of
-        // a field that keeps its terminating zero.
-        let two = format!("{}ébc", "x".repeat(28));
-        assert_eq!(text(&"x".repeat(28), &two, 30), NameDiff::Cut);
+        let x = |n: usize| "x".repeat(n);
+        // 28 bytes of UTF-8, then a two-byte character that would end at byte
+        // 30 of a field that keeps its terminating zero.
+        let two = format!("é{}éb", x(26));
+        assert_eq!(utf8(&two[..28], &two, 30), NameDiff::Cut);
+        // In Windows-1252 the same text is 27 bytes, and the `é` fits.
+        assert_eq!(cp(&two[..28], &two, 30), NameDiff::Other);
         // Nine two-byte characters of ten in a 20-byte field (19 and a zero).
         let cyrillic = "ЖЖЖЖЖЖЖЖЖЖ";
-        assert_eq!(text(&cyrillic[..18], cyrillic, 20), NameDiff::Cut);
-        // Windows-1252 holds `é` in one byte: 30 characters fill the field.
-        assert_eq!(text(&format!("{}éb", "x".repeat(28)), &format!("{two}d"), 30), NameDiff::Cut);
+        assert_eq!(utf8(&cyrillic[..18], cyrillic, 20), NameDiff::Cut);
         // A three-byte character after 27 bytes crosses byte 29; after 26
         // bytes it would have fitted either way.
-        let euro = |n: usize| format!("{}€€", "x".repeat(n));
-        assert_eq!(text(&"x".repeat(27), &euro(27), 30), NameDiff::Cut);
-        assert_eq!(text(&"x".repeat(26), &euro(26), 30), NameDiff::Other);
+        let euro = |n: usize| format!("é{}€€", x(n - 2));
+        assert_eq!(utf8(&euro(27)[..27], &euro(27), 30), NameDiff::Cut);
+        assert_eq!(utf8(&euro(26)[..26], &euro(26), 30), NameDiff::Other);
+        // Part of that character stored up to byte 29 is dropped when read.
+        assert_eq!(text(&euro(27)[..27], 29, &euro(27), 30), NameDiff::Cut);
     }
 
     #[test]
     fn code_pages_and_word_order() {
-        assert_eq!(text("Lód?", "Łódź", 30), NameDiff::CodePage);
-        assert_eq!(text("Lodz", "Łódź", 30), NameDiff::Other, "ó is in Windows-1252");
-        assert_eq!(annotator("Paul Morphy", "Morphy, Paul"), NameDiff::WordOrder);
+        assert_eq!(cp("Lód?", "Łódź", 30), NameDiff::CodePage);
+        assert_eq!(cp("Lodz", "Łódź", 30), NameDiff::Other, "ó is in Windows-1252");
+        assert_eq!(annotator("Paul Morphy", 11, "Morphy, Paul"), NameDiff::WordOrder);
         assert!(known(ANNOTATOR, NameDiff::WordOrder) && !known(WHITE, NameDiff::WordOrder));
     }
 }

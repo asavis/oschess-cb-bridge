@@ -29,7 +29,7 @@ mod window;
 
 use bytes::{be_u16, be_u24};
 pub use decode::{MAX_VARIATION_DEPTH, start_as_played, walk};
-pub use entities::Entities;
+pub use entities::{Entities, Entity};
 pub use moves::GameMoves;
 pub use record::{RECORD_SIZE, Record};
 pub use window::MoveWindow;
