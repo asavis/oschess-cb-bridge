@@ -166,14 +166,12 @@ impl Record {
 }
 
 /// The ECO field of a game record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Eco {
+    #[default]
     None,
     /// `code` 0-499 is A00-E99; `sub` is ChessBase's sub-code.
-    Code {
-        code: u16,
-        sub: u8,
-    },
+    Code { code: u16, sub: u8 },
     /// A Chess960 start position, 0-959.
     Chess960(u16),
     /// A value that is none of the above.
@@ -201,7 +199,7 @@ impl Eco {
 }
 
 /// A packed ChessBase date; any part may be 0, meaning unknown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Date(pub i32);
 
 impl Date {

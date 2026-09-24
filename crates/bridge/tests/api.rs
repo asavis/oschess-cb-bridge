@@ -709,6 +709,51 @@ fn an_oversized_annotation_record_is_refused() {
     assert_eq!(get(r.port, &format!("/v1/databases/{}/games/2", r.id), "").status, 200);
 }
 
+/// The full form (#42): every language as its own comment, and every
+/// annotation the reading form leaves out as a command; `annotations` takes
+/// `reading`, the default, or `full`.
+#[test]
+fn the_full_form_keeps_every_language_and_annotation() {
+    let mut evaluations = 0x26u16.to_le_bytes().to_vec();
+    evaluations.extend([&[1u8][..], &6i32.to_le_bytes(), &1u16.to_le_bytes(), &[20, 0, 12, 0]].concat());
+    let content = annotations(&[
+        (-1, vec![evaluations]),
+        (0, vec![text(false, language::ENGLISH, "centre"), text(false, language::GERMAN, "Zentrum")]),
+    ]);
+    let db = annotated_database("api-full-form", &content);
+    let r = start(&db, vec![], None);
+    let game = |q: &str| get(r.port, &format!("/v1/databases/{}/games/1{q}", r.id), "");
+    let full = game("?annotations=full");
+    assert_eq!(full.status, 200, "{}", full.body);
+    assert!(full.body.contains("{[%lang en] centre} {[%lang de] Zentrum}"), "{}", full.body);
+    assert!(full.body.contains("{[%cbraw type=26;data=AQYAAAABABQADAA]} 1. e4"), "{}", full.body);
+    for q in ["", "?annotations=reading"] {
+        let g = game(q);
+        assert!(
+            g.body.contains("1. e4 {centre}") && !g.body.contains("[%lang") && !g.body.contains("[%cb"),
+            "{q}: {}",
+            g.body
+        );
+    }
+    let bad = game("?annotations=all");
+    assert!(bad.status == 400 && bad.body.contains(r#""parameter":"annotations""#), "{}", bad.body);
+}
+
+/// The full form is held to the answer limit the reading form is.
+#[test]
+fn a_full_form_over_the_answer_limit_is_refused() {
+    // 400,000 pawn-structure annotations: 1.2 MB stored, under the record
+    // limit, and about 11 MB as commands.
+    let pawns: Vec<Vec<u8>> = (0..400_000).map(|_| vec![0x14, 0, 5]).collect();
+    let db = annotated_database("api-full-limit", &annotations(&[(0, pawns)]));
+    let r = start(&db, vec![], None);
+    let game = |q: &str| get(r.port, &format!("/v1/databases/{}/games/1{q}", r.id), "");
+    assert_eq!(game("").status, 200);
+    let full = game("?annotations=full");
+    assert_eq!(full.status, 422, "{}", &full.body[..full.body.len().min(300)]);
+    assert!(full.body.contains(r#""code":"unreadable_game""#) && full.body.contains("limit"), "{}", full.body);
+}
+
 /// A save that rewrites the annotation record during the read is detected
 /// like one that rewrites the moves: the read is retried.
 #[test]

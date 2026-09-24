@@ -116,7 +116,7 @@ fn annotation(t: u8, d: &[u8]) -> std::result::Result<Annotation, &'static str> 
             Annotation::Arrows(v)
         }
         // Every other type has its size, so it is skipped whatever its layout.
-        _ => Annotation::Other(u16::from(t)),
+        _ => Annotation::Other { code: u16::from(t), data: d.to_vec() },
     })
 }
 

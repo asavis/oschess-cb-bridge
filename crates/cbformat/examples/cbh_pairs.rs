@@ -4,7 +4,12 @@
 //! branch and resume points), and the PGN of each game with its annotations,
 //! byte for byte. Prints counts and game ids only, never game contents.
 //!
-//! cargo run --release -p cbformat --example cbh_pairs -- <db.cbh> <db.2cbh> [--lang CODES]
+//! With `--full` the PGN is the full form (asavis/oschess-cb-bridge#42), whose
+//! `[%cb…]` commands differ between the formats by design, since the classic
+//! layouts are kept as their data: they are left out of the comparison, and
+//! everything else must be identical.
+//!
+//! cargo run --release -p cbformat --example cbh_pairs -- <db.cbh> <db.2cbh> [--lang CODES] [--full]
 
 use chesscore::{Board, Move};
 
@@ -53,11 +58,17 @@ impl Diff {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (old, new, options) = match args.as_slice() {
-        [old, new] => (old, new, Options::default()),
-        [old, new, flag, codes] if flag == "--lang" => (old, new, Options::with_languages(codes.split(','))),
-        _ => return Err("usage: cbh_pairs <db.cbh> <db.2cbh> [--lang CODES]".into()),
-    };
+    let usage = "usage: cbh_pairs <db.cbh> <db.2cbh> [--lang CODES] [--full]";
+    let [old, new, flags @ ..] = args.as_slice() else { return Err(usage.into()) };
+    let mut options = Options::default();
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--lang" => options.languages = Options::with_languages(it.next().ok_or(usage)?.split(',')).languages,
+            "--full" => options.full = true,
+            _ => return Err(usage.into()),
+        }
+    }
     let a = cbh::Database::open(old)?;
     let b = v2::Database::open(new)?;
     println!("records            {} / {}", a.record_count(), b.record_count());
@@ -191,6 +202,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The PGN comparison. A movetext that differs is also counted by where the
 /// first difference lies: inside a comment, or at a NAG.
+/// The PGN without its `[%cb…]` commands, which the classic format keeps as
+/// its own data; a comment left empty goes too.
+fn without_cb_commands(mut r: pgn::Rendered) -> pgn::Rendered {
+    let mut out = String::with_capacity(r.pgn.len());
+    let mut rest = r.pgn.as_str();
+    while let Some(at) = rest.find("[%cb") {
+        out.push_str(&rest[..at]);
+        rest = rest[at..].split_once(']').map_or("", |x| x.1);
+    }
+    out.push_str(rest);
+    r.pgn = out.replace("{ }", "{}").replace(" {}", "").replace("{} ", "");
+    r
+}
+
 #[derive(Default)]
 struct PgnDiffs {
     compared: u64,
@@ -226,6 +251,7 @@ impl PgnDiffs {
         if a.annotations != b.annotations {
             self.status.add(id);
         }
+        let (a, b) = (without_cb_commands(a), without_cb_commands(b));
         if a.pgn == b.pgn {
             self.identical += 1;
             return;

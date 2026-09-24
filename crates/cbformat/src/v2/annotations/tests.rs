@@ -86,7 +86,12 @@ fn known_types_are_skipped_by_layout() {
     let b = &a.blocks[0].annotations;
     assert_eq!(
         b[..4],
-        [Annotation::Other(0x18), Annotation::Other(0x22), Annotation::Other(0x27), Annotation::Other(0x26)]
+        [
+            Annotation::Other { code: 0x18, data: vec![1] },
+            Annotation::Other { code: 0x22, data: vec![1, 2, 3, 4] },
+            Annotation::Other { code: 0x27, data: vec![1, 0] },
+            Annotation::Other { code: 0x26, data: vec![1, 2, 0, 0, 0, 9, 9] },
+        ]
     );
     assert_eq!(b[4], Annotation::Text { before: false, language: 0, text: "after".into() });
 }
