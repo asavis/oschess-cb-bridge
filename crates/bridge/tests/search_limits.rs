@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
+use bridge::search::Indexes;
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
@@ -64,17 +65,15 @@ fn serve_sparse(name: &str, records: u64) -> Served {
 }
 
 impl Served {
-    /// Starts `query` on its own connection, and returns once its scan has read
-    /// headers.
-    fn start(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
-        let indexes = self.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes;
-        let before = indexes.scanned();
+    /// The indexes searches on this database use, where a test holds them.
+    fn indexes(&self) -> Arc<Indexes> {
+        self.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes
+    }
+
+    /// Sends `query` on its own connection.
+    fn send(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
         let (port, path) = (self.port, format!("/v1/databases/{}/games?{query}", self.id));
-        let running = std::thread::spawn(move || get(port, &path));
-        while indexes.scanned() == before && !running.is_finished() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        running
+        std::thread::spawn(move || get(port, &path))
     }
 
     fn get(&self, query: &str) -> (u16, String) {
@@ -82,14 +81,21 @@ impl Served {
     }
 }
 
+/// How long a test waits for a search to be held.
+const ARRIVAL: Duration = Duration::from_secs(30);
+
 /// A search with `q` in a stream makes the one still running in the same
 /// stream answer `409 superseded`, and the newer one is served.
 #[test]
 fn a_superseded_search_answers_409() {
-    let s = serve_sparse("limits-superseded", 8_000_000);
-    let first = s.start("q=needle&stream=tab-1");
+    let s = serve_sparse("limits-superseded", 100_000);
+    let indexes = s.indexes();
+    let held = indexes.gate().hold(1);
+    let first = s.send("q=needle&stream=tab-1");
+    assert!(held.arrived(1, ARRIVAL));
     let (status, out) = s.get("q=other&stream=tab-1");
     assert_eq!(status, 200, "{out}");
+    drop(held);
     let (status, out) = first.join().unwrap();
     assert_eq!(status, 409, "{out}");
     assert!(out.contains(r#""code":"superseded""#), "{out}");
@@ -98,21 +104,30 @@ fn a_superseded_search_answers_409() {
 /// Clearing the search box is a new query too: an empty `q=` supersedes.
 #[test]
 fn an_empty_q_supersedes_the_running_search() {
-    let s = serve_sparse("limits-empty-q", 8_000_000);
-    let first = s.start("q=needle&stream=tab-1");
+    let s = serve_sparse("limits-empty-q", 100_000);
+    let indexes = s.indexes();
+    let held = indexes.gate().hold(1);
+    let first = s.send("q=needle&stream=tab-1");
+    assert!(held.arrived(1, ARRIVAL));
     let (status, out) = s.get("q=&stream=tab-1");
     assert_eq!(status, 200, "{out}");
+    drop(held);
     assert_eq!(first.join().unwrap().0, 409);
 }
 
 /// Another stream, another origin or no stream at all never stops a search.
 #[test]
 fn other_streams_do_not_supersede() {
-    let s = serve_sparse("limits-streams", 8_000_000);
-    let first = s.start("q=needle&stream=oschess-tab");
-    let second = s.start("q=other&stream=staging-tab");
+    let s = serve_sparse("limits-streams", 100_000);
+    let indexes = s.indexes();
+    let held = indexes.gate().hold(2);
+    let first = s.send("q=needle&stream=oschess-tab");
+    assert!(held.arrived(1, ARRIVAL));
+    let second = s.send("q=other&stream=staging-tab");
+    assert!(held.arrived(2, ARRIVAL));
     let (status, out) = s.get("q=third");
     assert_eq!(status, 200, "{out}");
+    drop(held);
     assert_eq!(first.join().unwrap().0, 200);
     assert_eq!(second.join().unwrap().0, 200);
     for bad in ["", "has%20space", "x%2Fy"] {

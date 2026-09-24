@@ -481,22 +481,20 @@ fn suggestions_keep_the_best_of_many() {
 #[cfg(unix)]
 #[test]
 fn only_the_same_stream_supersedes() {
-    const RECORDS: u64 = 8_000_000;
-    let f = sparse("search-streams", RECORDS);
+    let f = sparse("search-streams", 100_000);
     let db = std::sync::Arc::new(Database::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
+    let held = idx.gate().hold(2);
     let run = |q: &'static str, stream: Option<&'static str>| {
         let (db1, idx1) = (db.clone(), idx.clone());
-        let before = idx.scanned();
-        let running = std::thread::spawn(move || search::select(&db1, &idx1, Some(q), stream, None).map(|_| ()));
-        while idx.scanned() == before && !running.is_finished() {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        running
+        std::thread::spawn(move || search::select(&db1, &idx1, Some(q), stream, None).map(|_| ()))
     };
     let named = run("needle", Some("tab"));
+    assert!(held.arrived(1, std::time::Duration::from_secs(30)));
     let unnamed = run("pin", None);
+    assert!(held.arrived(2, std::time::Duration::from_secs(30)));
     assert!(search::select(&db, &idx, Some(""), Some("tab"), None).is_ok(), "an empty q");
+    drop(held);
     assert!(matches!(named.join().unwrap(), Err(SearchError::Superseded)));
     assert!(unnamed.join().unwrap().is_ok());
 }
