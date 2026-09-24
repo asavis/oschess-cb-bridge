@@ -50,20 +50,21 @@ const BUSY_LAST_LOOK: Duration = Duration::from_millis(5);
 pub fn serve(listeners: Vec<TcpListener>, app: Arc<App>) -> io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     let (busy, refused) = mpsc::sync_channel::<(TcpStream, Instant)>(BUSY_QUEUE);
+    let thread = |name: &str| std::thread::Builder::new().name(name.into()).stack_size(crate::THREAD_STACK);
     std::thread::scope(|scope| {
         let refuser = app.clone();
-        scope.spawn(move || {
+        thread("bridge-busy").spawn_scoped(scope, move || {
             for (stream, accepted) in refused {
                 refuse_busy(stream, accepted, &refuser);
             }
-        });
+        })?;
         for listener in listeners {
             let (app, active, busy) = (app.clone(), active.clone(), busy.clone());
-            scope.spawn(move || accept(listener, app, active, busy));
+            thread("bridge-accept").spawn_scoped(scope, move || accept(listener, app, active, busy))?;
         }
         drop(busy);
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
 fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: SyncSender<(TcpStream, Instant)>) {
@@ -77,13 +78,14 @@ fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: 
         }
         let guard = Active(active.clone());
         let app = app.clone();
-        let spawned = std::thread::Builder::new().name("bridge-conn".into()).spawn(move || {
-            let conn = handle_connection(stream, &app);
-            // The slot is free before the socket closes: a client that has
-            // seen its connection end may open another at once and be served.
-            drop(guard);
-            drop(conn);
-        });
+        let spawned =
+            std::thread::Builder::new().name("bridge-conn".into()).stack_size(crate::THREAD_STACK).spawn(move || {
+                let conn = handle_connection(stream, &app);
+                // The slot is free before the socket closes: a client that has
+                // seen its connection end may open another at once and be served.
+                drop(guard);
+                drop(conn);
+            });
         // A failed spawn drops the closure, and with it the guard and the stream.
         drop(spawned);
     }

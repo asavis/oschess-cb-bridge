@@ -91,8 +91,10 @@ fn e4(b: &mut Builder) -> i64 {
     b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE])
 }
 
-/// Annotation records that span 128 MiB of a sparse `.2cba`: the index never
-/// reads annotations, so the build stays within a 96 MiB address space.
+/// Annotation records that span 240 MiB of a sparse `.2cba`, which a batch
+/// read of the database (at most 256 MiB) would take whole: the index never
+/// reads annotations, so the build stays within a 256 MiB address space, well
+/// clear of what the bridge itself takes (about 90 MB).
 #[test]
 fn a_huge_annotation_file_is_never_read() {
     let mut b = Builder::new();
@@ -103,19 +105,19 @@ fn a_huge_annotation_file_is_never_read() {
     }
     let db: TempDb = b.write("explorer-limits-annotations");
     let cba = db.dir().join("db.2cba");
-    std::fs::OpenOptions::new().write(true).open(&cba).unwrap().set_len(128 << 20).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&cba).unwrap().set_len(240 << 20).unwrap();
     // Game 2's annotation record claims to lie near the end of the file.
     let cbh = db.dir().join("db.2cbh");
     let mut headers = std::fs::read(&cbh).unwrap();
-    headers[2 * 192 + 0x10..2 * 192 + 0x18].copy_from_slice(&((128i64 << 20) - 64).to_le_bytes());
+    headers[2 * 192 + 0x10..2 * 192 + 0x18].copy_from_slice(&((240i64 << 20) - 64).to_le_bytes());
     std::fs::write(&cbh, headers).unwrap();
-    let mut bridge = Limited::start(&cbh, &db.dir().join("home"), 96 << 10);
+    let mut bridge = Limited::start(&cbh, &db.dir().join("home"), 256 << 10);
     let out = bridge.explore();
     assert!(out.contains(r#""games":50,"white":50"#), "{out}");
 }
 
 /// A move record of 5 MiB, over the 2 MiB the index reads: its game is left
-/// out, and the build of the others completes within a 96 MiB address space.
+/// out, and the others are indexed.
 #[test]
 fn a_move_record_over_the_limit_leaves_its_game_out() {
     let mut b = Builder::new();
@@ -128,7 +130,7 @@ fn a_move_record_over_the_limit_leaves_its_game_out() {
     }
     let db = b.write("explorer-limits-moves");
     let cbh = db.dir().join("db.2cbh");
-    let mut bridge = Limited::start(&cbh, &db.dir().join("home"), 96 << 10);
+    let mut bridge = Limited::start(&cbh, &db.dir().join("home"), 256 << 10);
     let out = bridge.explore();
     assert!(out.contains(r#""games":20,"white":20"#), "{out}");
     assert!(!out.contains(r#""uci":"d2d4""#), "{out}");

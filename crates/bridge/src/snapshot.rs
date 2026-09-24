@@ -71,7 +71,7 @@ impl Background {
         let Bridge { listeners, app, port, .. } = bridge;
         let stopped = Arc::new(Mutex::new(None));
         let (served, record) = (app.clone(), stopped.clone());
-        std::thread::Builder::new().name("bridge-server".into()).spawn(move || {
+        std::thread::Builder::new().name("bridge-server".into()).stack_size(crate::THREAD_STACK).spawn(move || {
             let reason = match server::serve(listeners, served) {
                 Ok(()) => "the server stopped".to_string(),
                 Err(e) => e.to_string(),

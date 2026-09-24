@@ -111,7 +111,11 @@ impl Serial {
         let started = if self.refuse.load(Ordering::Relaxed) {
             Err(std::io::Error::other("refused for a test"))
         } else {
-            std::thread::Builder::new().name(self.label.into()).spawn(move || me.run()).map(drop)
+            std::thread::Builder::new()
+                .name(self.label.into())
+                .stack_size(crate::THREAD_STACK)
+                .spawn(move || me.run())
+                .map(drop)
         };
         match started {
             Ok(()) => {
