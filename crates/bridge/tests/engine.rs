@@ -178,6 +178,21 @@ fn a_quiet_search_repeats_its_last_lines() {
 }
 
 #[test]
+fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
+    let dir = std::env::temp_dir().join(format!("bridge-chatty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let chatty = dir.join(format!("fake-uci-chatty{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-uci"), &chatty).unwrap();
+    let (port, _app) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
+    let started = Instant::now();
+    let lines = Analysis::open(port, "depth=1").rest();
+    assert!(lines.last().unwrap().starts_with(r#"{"error":{"code":"engine_failed""#), "{lines:?}");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(7), "the handshake took {took:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_idle_engine_ends_its_process() {
     let (port, app) = start(Engine::with_idle(fake(), Duration::from_millis(300)));
     let mut a = Analysis::open(port, "depth=1");

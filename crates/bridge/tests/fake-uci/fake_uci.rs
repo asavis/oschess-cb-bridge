@@ -4,7 +4,9 @@
 //!
 //! The moves of a position steer it: with `h2h3` among them it exits when it
 //! is told to search; with `a2a3` it ignores `stop`; with `b2b3` it writes one
-//! line and then nothing until it is stopped.
+//! line and then nothing until it is stopped. Started under a name containing
+//! `chatty`, it answers `uci` with eight seconds of `id name` lines before
+//! `uciok`.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -33,6 +35,12 @@ fn main() {
                 let words: Vec<&str> = command.split_whitespace().collect();
                 match words.as_slice() {
                     ["uci"] => {
+                        if std::env::args().next().is_some_and(|name| name.contains("chatty")) {
+                            let until = Instant::now() + Duration::from_secs(8);
+                            while Instant::now() < until {
+                                say(&format!("id name {}Engine", " ".repeat(60_000)));
+                            }
+                        }
                         say("id name Fake UCI 1.0");
                         say("id author the bridge's tests");
                         say("option name MultiPV type spin default 1 min 1 max 500");

@@ -442,7 +442,11 @@ impl Process {
         }
         let deadline = Instant::now() + HANDSHAKE;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
+            // The deadline holds however much the engine writes: a line already
+            // queued is not taken once it has passed.
+            let Some(left) = until(deadline) else {
+                return Err("The file is not a UCI engine: it did not answer uciok in time".into());
+            };
             match p.lines.recv_timeout(left) {
                 Ok(line) if line == "uciok" => break,
                 Ok(line) => {
@@ -474,8 +478,7 @@ impl Process {
     fn wait_for(&mut self, word: &str, within: Duration) -> Option<String> {
         let deadline = Instant::now() + within;
         loop {
-            let left = deadline.checked_duration_since(Instant::now())?;
-            let line = self.lines.recv_timeout(left).ok()?;
+            let line = self.lines.recv_timeout(until(deadline)?).ok()?;
             if line == word || line.strip_prefix(word).is_some_and(|rest| rest.starts_with(' ')) {
                 return Some(line);
             }
@@ -549,6 +552,12 @@ fn forward_lines(output: impl Read, tx: &SyncSender<String>) {
             overlong = false;
         }
     }
+}
+
+/// The time left before `deadline`; `None` once it has passed, so that a
+/// receive with a zero timeout never takes a queued line late.
+fn until(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())
 }
 
 /// The best move of a `bestmove` line.
