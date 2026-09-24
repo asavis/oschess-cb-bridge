@@ -310,6 +310,10 @@ writer handles both formats alike.
   the last move, as for 2CBH: two set-up games of one classic-only database
   have such annotations (positions 52 and 16, in games of 51 and 11 moves), and
   both are reported as errors.
+- **Record size.** A record's head may claim up to 4 GiB. The largest record
+  in the 252 classic databases examined is about 45 KB, so a record over
+  16 MiB (`cbh::MAX_ANNOTATION_RECORD`) is refused before it is read, as 2CBH
+  records over 64 MiB are.
 
 ## Reader rules
 

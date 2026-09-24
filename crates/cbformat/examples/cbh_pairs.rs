@@ -234,15 +234,63 @@ impl PgnDiffs {
         let ((tags_a, moves_a), (tags_b, moves_b)) = (split(&a.pgn), split(&b.pgn));
         if moves_a != moves_b {
             self.movetext.add(id);
-            let at = moves_a.bytes().zip(moves_b.bytes()).position(|(x, y)| x != y).unwrap_or(moves_a.len());
-            let before = &moves_a[..at.min(moves_a.len())];
-            if before.matches('{').count() > before.matches('}').count() {
-                self.comments.add(id);
-            } else if before.ends_with('$') || before.ends_with(" $") || moves_a[at..].starts_with('$') {
-                self.nags.add(id);
+            match first_difference(&moves_a, &moves_b) {
+                Where::Comment => self.comments.add(id),
+                Where::Nag => self.nags.add(id),
+                Where::Moves => {}
             }
         } else if tags_a != tags_b {
             if name_exception { self.names_only += 1 } else { self.tags.add(id) }
         }
+    }
+}
+
+/// Where two movetexts first differ.
+#[derive(Debug, PartialEq, Eq)]
+enum Where {
+    Comment,
+    Nag,
+    Moves,
+}
+
+/// Where `a` and `b` first differ: inside a comment, at a NAG, or elsewhere.
+/// Works on bytes, so a difference inside a multi-byte character is found at
+/// that character.
+fn first_difference(a: &str, b: &str) -> Where {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let at = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    let before = &a[..at];
+    let open = before.iter().filter(|&&c| c == b'{').count();
+    let close = before.iter().filter(|&&c| c == b'}').count();
+    if open > close {
+        Where::Comment
+    } else if before.ends_with(b"$") || a[at..].starts_with(b"$") || b[at..].starts_with(b"$") {
+        Where::Nag
+    } else {
+        Where::Moves
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn differences_are_placed() {
+        assert_eq!(first_difference("1. e4 {a} e5", "1. e4 {b} e5"), Where::Comment);
+        assert_eq!(first_difference("1. e4 $1 e5", "1. e4 $2 e5"), Where::Nag);
+        assert_eq!(first_difference("1. e4 $1 e5", "1. e4 e5"), Where::Nag);
+        assert_eq!(first_difference("1. e4 e5", "1. e4 $1 e5"), Where::Nag);
+        assert_eq!(first_difference("1. e4 e5", "1. d4 e5"), Where::Moves);
+        assert_eq!(first_difference("1. e4", "1. e4 e5"), Where::Moves);
+        assert_eq!(first_difference("1. e4 e5", "1. e4"), Where::Moves);
+    }
+
+    #[test]
+    fn a_difference_inside_a_multi_byte_character() {
+        // é and ê share their first UTF-8 byte.
+        assert_eq!(first_difference("1. e4 {caf\u{e9}} e5", "1. e4 {caf\u{ea}} e5"), Where::Comment);
+        assert_eq!(first_difference("1. e4 {\u{e9}} e5", "1. e4 {\u{1f600}} e5"), Where::Comment);
+        assert_eq!(first_difference("\u{e9}", "\u{ea}"), Where::Moves);
     }
 }

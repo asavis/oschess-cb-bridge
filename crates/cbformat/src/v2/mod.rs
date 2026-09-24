@@ -36,6 +36,10 @@ pub const HEADER_RECORD_SIZE: usize = 192;
 
 /// The extensions of the files that make up a database.
 pub const EXTENSIONS: [&str; 6] = [".2cbh", ".2cbg", ".2cba", ".2lid", ".2lgd", ".2lcd"];
+/// Files that sit beside a database under its name without being needed to
+/// read it: its settings and the opening key files. An export must not
+/// overwrite them either.
+pub const BESIDE: [&str; 3] = [".ini", ".cko", ".cpo"];
 /// Largest span of `.2cbg` read for one batch; a batch whose moves lie wider
 /// apart reads each move record on its own.
 const MAX_BATCH_SPAN: u64 = 256 << 20;
@@ -97,16 +101,10 @@ impl Database {
         &self.stem
     }
 
-    /// The paths of every file of the database, whether or not each exists.
+    /// The paths of every file of the database and of the files beside it
+    /// ([`BESIDE`]), whether or not each exists.
     pub fn file_paths(&self) -> Vec<PathBuf> {
-        EXTENSIONS
-            .iter()
-            .map(|ext| {
-                let mut s = self.stem.clone().into_os_string();
-                s.push(ext);
-                PathBuf::from(s)
-            })
-            .collect()
+        file::with_extensions(&self.stem, EXTENSIONS.iter().chain(&BESIDE))
     }
 
     /// Number of records, including deleted games, texts and analyses.

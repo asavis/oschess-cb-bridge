@@ -1,7 +1,7 @@
 //! Database files read at positions, never mapped.
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
@@ -32,6 +32,18 @@ impl DbFile {
         self.read_into(offset, &mut buf)?;
         Ok(buf)
     }
+}
+
+/// The paths `stem` takes with each of `extensions` appended.
+pub(crate) fn with_extensions<'a>(stem: &Path, extensions: impl IntoIterator<Item = &'a &'a str>) -> Vec<PathBuf> {
+    extensions
+        .into_iter()
+        .map(|ext| {
+            let mut s = stem.as_os_str().to_owned();
+            s.push(ext);
+            PathBuf::from(s)
+        })
+        .collect()
 }
 
 #[cfg(unix)]

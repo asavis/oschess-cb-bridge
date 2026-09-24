@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::v2::file::DbFile;
+use crate::v2::file::{self, DbFile};
 use crate::v2::{GameAnnotations, MAX_BATCH_RECORDS};
 use crate::{Error, Result};
 
@@ -31,10 +31,22 @@ pub use entities::Entities;
 pub use moves::GameMoves;
 pub use record::{RECORD_SIZE, Record};
 
-/// The extensions of the files a classic database is made of that the reader
-/// uses or that must not be overwritten by an export.
-pub const EXTENSIONS: [&str; 12] =
-    [".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj", ".cbe", ".cbl", ".cbtt", ".flags"];
+/// The extensions of every file of the classic format: the ones the reader
+/// uses, and the optional ones ChessBase adds or rebuilds (media manifest,
+/// search boosters and the like).
+pub const EXTENSIONS: [&str; 19] = [
+    ".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj", ".cbe", ".cbl", ".cbtt", ".flags", ".cbm", ".cit",
+    ".cib", ".cit2", ".cib2", ".cbb", ".cbgi",
+];
+/// Files that sit beside a classic database under its name without being part
+/// of the format: settings, icon, and the opening key files. An export must
+/// not overwrite them either.
+pub const BESIDE: [&str; 13] =
+    [".ini", ".ico", ".pgi", ".ckn", ".cko", ".ck1", ".ck2", ".ck3", ".cpn", ".cpo", ".cp1", ".cp2", ".cp3"];
+/// Largest annotation record read. The largest in the databases examined is
+/// about 45 KB; a record's head may claim up to 4 GiB, which would otherwise
+/// be allocated before the record is found to be damaged.
+pub const MAX_ANNOTATION_RECORD: usize = 16 << 20;
 /// The smallest file header of `.cbg` and `.cba`, where the first record may
 /// start: 26 bytes, or 10 in databases made by old versions.
 const MIN_FILE_HEADER: u64 = 10;
@@ -104,16 +116,10 @@ impl Database {
         &self.stem
     }
 
-    /// The paths of every file of the database, whether or not each exists.
+    /// The paths of every file of the database and of the files beside it
+    /// ([`BESIDE`]), whether or not each exists.
     pub fn file_paths(&self) -> Vec<PathBuf> {
-        EXTENSIONS
-            .iter()
-            .map(|ext| {
-                let mut s = self.stem.clone().into_os_string();
-                s.push(ext);
-                PathBuf::from(s)
-            })
-            .collect()
+        file::with_extensions(&self.stem, EXTENSIONS.iter().chain(&BESIDE))
     }
 
     /// Number of records, including deleted games and guiding texts.
@@ -175,14 +181,17 @@ impl Database {
 
     /// The annotations of a game, or `None` when the database has no `.cba`
     /// file. A game without annotations has an empty set. Positions count the
-    /// moves in stored order ([`annotations`]).
+    /// moves in stored order ([`annotations`]). A record over
+    /// [`MAX_ANNOTATION_RECORD`] is refused before it is read.
     pub fn annotations_of(&self, record: &Record) -> Result<Option<GameAnnotations>> {
-        self.annotations_of_within(record, usize::MAX)
+        self.annotations_of_within(record, MAX_ANNOTATION_RECORD)
     }
 
     /// [`Database::annotations_of`], refusing before it is read an annotation
-    /// record larger than `limit` bytes.
+    /// record larger than `limit` bytes, and never reading one larger than
+    /// [`MAX_ANNOTATION_RECORD`].
     pub fn annotations_of_within(&self, record: &Record, limit: usize) -> Result<Option<GameAnnotations>> {
+        let limit = limit.min(MAX_ANNOTATION_RECORD);
         let Some(file) = &self.annotations else { return Ok(None) };
         let at = self.offsets(record)?.1;
         if at == 0 {

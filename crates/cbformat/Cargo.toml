@@ -23,3 +23,8 @@ cozy-chess = "0.3"
 [[example]]
 name = "compare_chessbase_pgn"
 test = true
+
+# Its comparison of movetexts has unit tests, which `cargo test` runs.
+[[example]]
+name = "cbh_pairs"
+test = true
