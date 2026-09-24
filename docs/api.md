@@ -447,18 +447,37 @@ Nothing the bridge reads is left out of the full form
   `[%lang xx]`, in stored order; a text before a move stays before it. `xx` is
   the ISO 639-1 code where ChessBase names the language, `any` for a text meant
   for every language, `cb-<nation>` for a classic text whose nation names no
-  such language, and `cb-l<number>` for another 2CBH language number. Braces and
-  line breaks in a text become parentheses and spaces, as in the reading form.
-- **Commands** for every other annotation of a move, in one comment after its
-  texts, in stored order. Each is `[%cb<name> key=value;…]`. Keys are ASCII
-  letters, values are UTF-8 percent-encoded with everything outside
-  `A-Z a-z 0-9 - . _ ~` escaped, empty values are left out, and a reader keeps
-  and ignores a key it does not know. Every command carries `data`, the
-  annotation's bytes after its type, in base64url without padding, so that a
-  later decoder loses nothing.
+  such language, and `cb-l<number>` for another 2CBH language number. The
+  visible comment is cleaned for PGN as in the reading form: braces become
+  parentheses, and line breaks, control characters and runs of spaces become
+  one space. When that changes the text, when the text is empty or all
+  whitespace, when it holds `[%`, or when it is meant to precede its move, a
+  comment `[%cbtext lang=xx;value=…]` follows the visible one with the original
+  value, percent-encoded, and `before=1` for a text before its move. When
+  cleaning leaves nothing to show, the `[%cbtext]` stands in the text's place
+  with `alone=1`. `value` is always written, even when empty. A reader takes a
+  `[%cbtext]` without `alone` as the value of the visible comment right before
+  it.
+- **Symbols and graphics** are shown as in the reading form, NAGs and
+  `[%csl]`/`[%cal]`, and each annotation is also a command that keeps what they
+  cannot: `[%cbsymbols]` with the three NAG slots (move, position, prefix),
+  including symbols on the game as a whole, where no NAG can stand, and
+  `[%cbsquares]`/`[%cbarrows]` with every mark of every colour. ChessBase's
+  colours 7, 8 and 9 have no `[%csl]`/`[%cal]` letter.
+- **Commands** for every annotation that is not a text, in one comment after
+  the move's texts, in stored order. Each is `[%cb<name> key=value;…]`, except
+  `[%mdl]`. Keys are ASCII letters, values are UTF-8 percent-encoded with
+  everything outside `A-Z a-z 0-9 - . _ ~` escaped, empty values are left out
+  (except a `[%cbtext]` value), and a reader keeps and ignores a key it does
+  not know. Every command but `[%cbtext]` and `[%mdl]` carries `data` in
+  base64url without padding: the annotation's bytes after its type, or for
+  symbols and graphics the layout below. A later decoder loses nothing.
 
 | Command | Type | Keys besides `data` |
 |---|---|---|
+| `[%cbsymbols …]` | `03` symbols | none: `data` is the three NAG slots, move, position and prefix, 0 for none |
+| `[%cbsquares …]` | `04` coloured squares | none: `data` is the (colour, square) pairs, squares numbered from 1 file by file (`a1` 1, `a2` 2, `b1` 9) |
+| `[%cbarrows …]` | `05` arrows | none: `data` is the (colour, from, to) triples, numbered the same way |
 | `[%cbquote …]` | `13` game quotation | `result` (`1-0`, `0-1`, `1/2-1/2`, `*`), `white` and `black` as `Last, First`, `whiteElo`, `blackElo`, `event`, `site`, `date` (`YYYY.MM.DD`, `??` unknown), `round`, `subround`, `eco`, and `moves`, the quoted moves as SAN movetext, for a 2CBH quotation from the standard position whose moves replay |
 | `[%mdl <bits>]` | `22` medals | written as ChessBase writes it, the whole annotation |
 | `[%cbcritical …]` | `18` critical position | `phase` (`opening`, `middlegame`, `endgame`), `value` |

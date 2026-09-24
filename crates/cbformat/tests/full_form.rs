@@ -171,8 +171,9 @@ fn every_language_is_a_comment_of_its_own() {
     let (full, status) = render(&db, true);
     assert_eq!(
         full,
-        "{[%lang any] A classic} {[%lang en] before} 1. e4 $1 {[%csl Gd5][%cal Rg1f3]} {[%lang en] centre} \
-         {[%lang de] Zentrum} 1... e5 {[%lang cb-l9] other number}"
+        "{[%lang any] A classic} {[%lang en] before} {[%cbtext lang=en;before=1;value=before]} 1. e4 $1 \
+         {[%csl Gd5][%cal Rg1f3]} {[%lang en] centre} {[%lang de] Zentrum} \
+         {[%cbsymbols data=AQAA] [%cbsquares data=Ah0] [%cbarrows data=BDEr]} 1... e5 {[%lang cb-l9] other number}"
     );
     assert_eq!(status, AnnotationStatus::Complete);
     let (reading, _) = render(&db, false);
@@ -357,7 +358,10 @@ fn annotations_past_the_end_follow_the_last_move_in_the_full_form() {
         (2, vec![text(true, language::GERMAN, "danach"), other(0x22, &[8, 0, 0, 0])]),
     ]);
     let db = one_game("full-past-end", &two_moves(), &content);
-    assert_eq!(render(&db, true).0, "1. e4 e5 {[%lang en] last} {[%lang de] danach} {[%mdl 8]}");
+    assert_eq!(
+        render(&db, true).0,
+        "1. e4 e5 {[%lang en] last} {[%lang de] danach} {[%cbtext lang=de;before=1;value=danach]} {[%mdl 8]}"
+    );
     assert_eq!(render(&db, false).0, "1. e4 e5 {[%mdl 8] last}");
 }
 
@@ -394,4 +398,94 @@ fn a_classic_game_keeps_its_languages_quotations_and_data() {
     assert!(full.contains("date=1858.12.20;round=7;eco=A20;data=") && !full.contains("moves="), "{full}");
     // Classic layouts other than the quotation's are kept as their data.
     assert!(full.ends_with("[%mdl 4] [%cbraw type=18;data=Ag]}"), "{full}");
+}
+
+/// Percent-decoding, as a reader of the full form does it.
+fn unpercent(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// The texts a reader recovers from a full form, in order: a `[%cbtext]`
+/// replaces the visible comment right before it, or stands alone.
+fn recovered_texts(full: &str) -> Vec<(String, bool, String)> {
+    let mut out: Vec<(String, bool, String)> = Vec::new();
+    let mut last_visible = false;
+    for body in full.split('{').skip(1).map(|c| c.split('}').next().unwrap()) {
+        if let Some(rest) = body.strip_prefix("[%lang ") {
+            let (code, text) = rest.split_once("] ").unwrap();
+            out.push((code.to_string(), false, text.to_string()));
+            last_visible = true;
+            continue;
+        }
+        if let Some(rest) = body.strip_prefix("[%cbtext ") {
+            let fields: Vec<(&str, &str)> =
+                rest.trim_end_matches(']').split(';').map(|f| f.split_once('=').unwrap()).collect();
+            let get = |k: &str| fields.iter().find(|f| f.0 == k).map(|f| unpercent(f.1));
+            let text = (get("lang").unwrap(), get("before").as_deref() == Some("1"), get("value").unwrap());
+            match out.last_mut().filter(|_| last_visible && get("alone").is_none()) {
+                Some(visible) => *visible = text,
+                None => out.push(text),
+            }
+        }
+        last_visible = false;
+    }
+    out
+}
+
+#[test]
+fn a_text_is_recovered_byte_for_byte() {
+    let originals = ["A{B}\nC", "A(B) C", "", "  \t ", "Київ — \u{e024} ok", "  padded  ", "see [%csl Ge4]", "plain"];
+    let mut blocks: Vec<(i32, Vec<Vec<u8>>)> =
+        originals.iter().map(|t| (0, vec![text(false, language::ENGLISH, t)])).collect();
+    blocks.push((1, vec![text(true, language::GERMAN, "vor e5"), text(false, language::GERMAN, "")]));
+    let db = one_game("full-text-values", &two_moves(), &annotations(&blocks));
+    let (full, _) = render(&db, true);
+    let mut want: Vec<(String, bool, String)> =
+        originals.iter().map(|t| ("en".to_string(), false, t.to_string())).collect();
+    want.push(("de".into(), true, "vor e5".into()));
+    want.push(("de".into(), false, String::new()));
+    assert_eq!(recovered_texts(&full), want, "{full}");
+    // Two texts that clean to the same comment stay apart.
+    assert!(
+        full.contains("{[%lang en] A(B) C} {[%cbtext lang=en;value=A%7BB%7D%0AC]} {[%lang en] A(B) C} {[%cbtext lang=en;alone=1;value=]}"),
+        "{full}"
+    );
+    // A text that needs nothing has no command.
+    assert!(full.contains("{[%lang en] plain} 1... e5") || full.contains("{[%lang en] plain} {[%lang"), "{full}");
+    // The reading form is unchanged.
+    let (reading, _) = render(&db, false);
+    assert!(reading.starts_with("1. e4 {A(B) C A(B) C Київ"), "{reading}");
+}
+
+#[test]
+fn every_colour_and_game_symbols_are_kept() {
+    let content = annotations(&[
+        (-1, vec![symbols(1, 10, 140), squares(&[(7, "a1")])]),
+        (0, vec![squares(&[(2, "e4"), (7, "d5")]), arrows(&[(8, "b1", "c3")]), symbols(0, 14, 0)]),
+    ]);
+    let db = one_game("full-colours", &two_moves(), &content);
+    let (full, _) = render(&db, true);
+    // The game comment: no NAG can stand before the first move, and colour 7
+    // has no [%csl] letter; both are commands.
+    assert!(full.starts_with("{[%cbsymbols data=AQqM] [%cbsquares data=BwE]} 1. e4 $14"), "{full}");
+    // The move: green e4 shown, every colour kept, the position symbol in its slot.
+    // e4 is 36 (5th file, 4th rank: 4 · 8 + 3 + 1), d5 29, b1 9, c3 19.
+    assert!(
+        full.contains("{[%csl Ge4]} {[%cbsquares data=AiQHHQ] [%cbarrows data=CAkT] [%cbsymbols data=AA4A]}"),
+        "{full}"
+    );
+    let (reading, _) = render(&db, false);
+    assert_eq!(reading, "1. e4 $14 {[%csl Ge4]} 1... e5");
 }

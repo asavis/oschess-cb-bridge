@@ -99,26 +99,36 @@ impl<'a> Commentary<'a> {
         comment(out, &parts, "", " ")
     }
 
-    /// The full form's texts, each `[%lang xx] text`, in stored order: those
-    /// before the move, those after it, or (`None`) all.
+    /// The full form's texts in stored order, each a comment of its own:
+    /// `[%lang xx] text`, cleaned for PGN, followed by `[%cbtext]` with the
+    /// original when the comment cannot hold it as it is. Those before the
+    /// move, those after it, or (`None`) all.
     fn tagged(&self, anns: &[&Annotation], before: Option<bool>) -> Vec<String> {
-        anns.iter()
-            .filter_map(|a| match a {
-                Annotation::Text { before: b, language: l, text } if before.is_none_or(|x| x == *b) => {
-                    let t = clean(text);
-                    (!t.is_empty()).then(|| format!("[%lang {}] {t}", commands::language_code(*l)))
-                }
-                _ => None,
-            })
-            .collect()
+        let mut out = Vec::new();
+        for a in anns {
+            let Annotation::Text { before: b, language: l, text } = a else { continue };
+            if before.is_some_and(|x| x != *b) {
+                continue;
+            }
+            let t = clean(text);
+            if !t.is_empty() {
+                out.push(format!("[%lang {}] {t}", commands::language_code(*l)));
+            }
+            if commands::text_needs_original(*b, text, &t) {
+                out.push(commands::text(*l, *b, t.is_empty(), text));
+            }
+        }
+        out
     }
 
-    /// The full form's commands for the annotations the reading form leaves out.
+    /// The full form's commands: every annotation that is not a text, with
+    /// all its data; symbols and graphics are shown by NAGs and `[%csl]` /
+    /// `[%cal]` as well.
     fn commands(&self, anns: &[&Annotation]) -> Vec<String> {
         anns.iter()
             .filter_map(|a| match a {
                 Annotation::Other { code, data } => Some(commands::for_other(*code, data, self.order)),
-                _ => None,
+                a => commands::graphic(a),
             })
             .collect()
     }

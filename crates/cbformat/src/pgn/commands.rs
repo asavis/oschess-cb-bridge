@@ -4,14 +4,15 @@
 
 use chesscore::{Board, Move, Piece, Square};
 
-use crate::v2::{Annotation, Quotation, language};
+use crate::movetable::Sq;
+use crate::v2::{self, Annotation, Arrow, Quotation, language};
 use crate::view::PositionOrder;
 
 /// The `[%lang]` code of a ChessBase language number: ISO 639-1 where there is
 /// one, `any` for a text meant for every language, `cb-<nation>` for a classic
 /// text's nation that names no language ChessBase writes, and `cb-l<number>`
 /// for another 2CBH number.
-pub(super) fn language_code(l: u16) -> String {
+pub fn language_code(l: u16) -> String {
     let iso = match l {
         language::ENGLISH => "en",
         language::GERMAN => "de",
@@ -229,6 +230,43 @@ pub(super) fn medal(code: u16, data: &[u8], order: PositionOrder) -> Option<Stri
         PositionOrder::Stored => u32::from_be_bytes(b),
     };
     Some(format!("[%mdl {bits}]"))
+}
+
+/// `[%cbtext …]`: a text's original value, which the visible `[%lang]`
+/// comment cannot hold as it is: a text that cleaning for PGN changes, an
+/// empty one, or one meant to precede its move. It follows the text's visible
+/// comment, or stands in its place with `alone=1` when cleaning leaves nothing
+/// to show. `value` is always written, empty or not.
+pub(super) fn text(language: u16, before: bool, alone: bool, value: &str) -> String {
+    let before = if before { "before=1;" } else { "" };
+    let alone = if alone { "alone=1;" } else { "" };
+    format!("[%cbtext lang={};{before}{alone}value={}]", percent(&language_code(language)), percent(value))
+}
+
+/// Whether a text needs [`text`] beside its visible comment: a reader could
+/// not tell its placement, its value, or its text from a command.
+pub(super) fn text_needs_original(before: bool, value: &str, cleaned: &str) -> bool {
+    before || value.is_empty() || value != cleaned || value.contains("[%")
+}
+
+/// `[%cbsymbols]`, `[%cbsquares]` and `[%cbarrows]`: the annotations the NAGs
+/// and `[%csl]`/`[%cal]` show, with every slot and every colour. `data` is the
+/// three NAG slots (move, position, prefix), or the (colour, square) pairs and
+/// (colour, from, to) triples, squares numbered from 1 file by file, as both
+/// formats store them.
+pub(super) fn graphic(a: &Annotation) -> Option<String> {
+    let cb = |sq: Sq| (sq % 8) * 8 + sq / 8 + 1;
+    let (name, data): (&str, Vec<u8>) = match a {
+        Annotation::Symbols { on_move, on_position, prefix } => ("symbols", vec![*on_move, *on_position, *prefix]),
+        Annotation::Squares(v) => {
+            ("squares", v.iter().flat_map(|&v2::Square { colour, square }| [colour, cb(square)]).collect())
+        }
+        Annotation::Arrows(v) => {
+            ("arrows", v.iter().flat_map(|&Arrow { colour, from, to }| [colour, cb(from), cb(to)]).collect())
+        }
+        _ => return None,
+    };
+    Some(format!("[%cb{name} data={}]", base64url(&data)))
 }
 
 /// `[%cbrest]`: the bytes of a record after a type of unknown layout.

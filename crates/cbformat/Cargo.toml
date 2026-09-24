@@ -28,3 +28,7 @@ test = true
 [[example]]
 name = "cbh_pairs"
 test = true
+
+[[example]]
+name = "full_form_census"
+test = true
