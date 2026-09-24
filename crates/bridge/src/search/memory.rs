@@ -55,13 +55,20 @@ impl Hold {
     /// work such as a position index yields to searches, and is refused
     /// `Busy` rather than taking their memory.
     pub fn reserve_quietly(bytes: usize) -> Result<Hold, Refused> {
-        if bytes > budget() {
-            return Err(Refused::TooLarge);
-        }
-        if !take(bytes) {
+        let mut hold = Hold(0);
+        hold.grow_quietly(bytes)?;
+        Ok(hold)
+    }
+
+    /// Reserves `more` bytes on top of those held, as [`Hold::reserve_quietly`]
+    /// does: never evicting.
+    pub fn grow_quietly(&mut self, more: usize) -> Result<(), Refused> {
+        let total = self.0.checked_add(more).filter(|&t| t <= budget()).ok_or(Refused::TooLarge)?;
+        if !take(more) {
             return Err(Refused::Busy);
         }
-        Ok(Hold(bytes))
+        self.0 = total;
+        Ok(())
     }
 
     /// Reserves `more` bytes on top of those held.

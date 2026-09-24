@@ -133,6 +133,36 @@ pub fn reserve(bytes: usize, progress: &Progress) -> Result<Hold, SearchError> {
     }
 }
 
+/// What a build may use.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// The most the build holds in the search budget at once: half of it, so
+    /// that searches keep the rest.
+    pub share: usize,
+    /// At most this many entries in a run, below what a worker's memory
+    /// holds; tests use it to make many runs from few games.
+    pub run_entries: Option<usize>,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { share: crate::search::memory::budget() / 2, run_entries: None }
+    }
+}
+
+/// The fan-ins of a build's merges within `share` bytes: an intermediate merge
+/// holds a read buffer per run and one write buffer; the final one a read
+/// buffer per run beside the `writer`'s bytes. `TooLarge` when either could
+/// not take two runs.
+pub fn fan_ins(share: usize, writer: usize) -> Result<(usize, usize), SearchError> {
+    let middle = (share / RUN_BUFFER).saturating_sub(1).min(FAN_IN);
+    let last = (share.saturating_sub(writer) / RUN_BUFFER).min(FAN_IN);
+    if middle < 2 || last < 2 {
+        return Err(SearchError::TooLarge);
+    }
+    Ok((middle, last))
+}
+
 /// The memory of one worker's entries: a quarter of the budget shared by the
 /// workers, from 4 MiB to 64 MiB.
 fn run_bytes(workers: usize) -> usize {
@@ -148,6 +178,7 @@ pub fn write_runs(
     max_ply: u8,
     dir: &Path,
     progress: &Progress,
+    limits: &Limits,
 ) -> Result<Vec<Run>, SearchError> {
     if last < first {
         return Ok(Vec::new());
@@ -160,13 +191,17 @@ pub fn write_runs(
     // their entries and read buffers, so that searches keep the rest.
     let want = threads().div_ceil(2).min(total.div_ceil(4096) as usize).max(1);
     let per_worker = run_bytes(want);
-    let fit = crate::search::memory::budget() / 2 / (per_worker + Workspace::BYTES);
+    let fit = limits.share / (per_worker + Workspace::BYTES);
+    if fit == 0 {
+        return Err(SearchError::TooLarge);
+    }
     let want = want.min(fit).max(1);
     let runs = workers::run(want, 0, &Cancel::never(), |w| {
         // The entries, and the buffers games are read into, reserved first.
         let hold = reserve(per_worker + Workspace::BYTES, progress)?;
         let mut work = Workspace::new().ok_or(Refused::Busy)?;
-        let capacity = per_worker / std::mem::size_of::<Entry>();
+        let capacity =
+            (per_worker / std::mem::size_of::<Entry>()).min(limits.run_entries.unwrap_or(usize::MAX)).max(64);
         let mut buf: Vec<Entry> = Vec::new();
         buf.try_reserve_exact(capacity).map_err(|_| Refused::Busy)?;
         let per = total.div_ceil(w.count as u64);
@@ -281,12 +316,19 @@ pub fn merge(
     Ok(())
 }
 
-/// Merges groups of runs into longer runs until at most [`FAN_IN`] remain.
-pub fn reduce(mut runs: Vec<Run>, dir: &Path, progress: &Progress) -> Result<Vec<Run>, SearchError> {
+/// Merges groups of at most `middle` runs into longer runs until at most
+/// `last` remain, each group's buffers reserved before it is merged.
+pub fn reduce(
+    mut runs: Vec<Run>,
+    dir: &Path,
+    progress: &Progress,
+    (middle, last): (usize, usize),
+) -> Result<Vec<Run>, SearchError> {
     let mut level = 0;
-    while runs.len() > FAN_IN {
+    while runs.len() > last.max(1) {
         let mut next = Vec::new();
-        for (n, group) in runs.chunks(FAN_IN).enumerate() {
+        for (n, group) in runs.chunks(middle.max(2)).enumerate() {
+            let _out_buffer = reserve(RUN_BUFFER, progress)?;
             let path = dir.join(format!("merged-{level}-{n}"));
             let mut out = BufWriter::with_capacity(RUN_BUFFER, File::create(&path).map_err(|e| io(&path, e))?);
             let mut entries = 0u64;
@@ -330,7 +372,7 @@ mod tests {
             flush(&mut buf, &dir, r, &mut runs).unwrap();
         }
         let progress = Progress::default();
-        let runs = reduce(runs, &dir, &progress).unwrap();
+        let runs = reduce(runs, &dir, &progress, (FAN_IN, FAN_IN)).unwrap();
         assert!(runs.len() <= FAN_IN);
         let mut keys = Vec::new();
         merge(&runs, &progress, |e| {

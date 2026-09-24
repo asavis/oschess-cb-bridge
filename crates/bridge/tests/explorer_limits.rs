@@ -38,30 +38,50 @@ struct Limited {
 }
 
 impl Limited {
+    /// Starts the bridge on a port found free, again on another port when a
+    /// bridge of another test took that one first (see `serves`).
     fn start(path: &Path, home: &Path, limit_kib: u64) -> Limited {
         std::fs::create_dir_all(home).unwrap();
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-        std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
         std::fs::write(home.join("token"), TOKEN).unwrap();
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("ulimit -v {limit_kib} && exec \"$0\" --database \"$1\""))
-            .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
-            .arg(path)
-            .env("OSCHESS_BRIDGE_HOME", home)
-            .env("OSCHESS_BRIDGE_SEARCH_MIB", "16")
-            .env("OSCHESS_BRIDGE_THREADS", "4")
-            .env("MALLOC_ARENA_MAX", "2")
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let limited = Limited { child, port, id: id_of(path) };
+        for _ in 0..10 {
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+            std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
+            let child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("ulimit -v {limit_kib} && exec \"$0\" --database \"$1\""))
+                .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
+                .arg(path)
+                .env("OSCHESS_BRIDGE_HOME", home)
+                .env("OSCHESS_BRIDGE_SEARCH_MIB", "16")
+                .env("OSCHESS_BRIDGE_THREADS", "4")
+                .env("MALLOC_ARENA_MAX", "2")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut limited = Limited { child, port, id: id_of(path) };
+            if limited.serves() {
+                return limited;
+            }
+        }
+        panic!("the bridge did not start");
+    }
+
+    /// Whether this bridge runs and serves its database, waiting for it to
+    /// start: a bridge that could not bind its port ends, and the port may
+    /// then be another test's bridge.
+    fn serves(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "the bridge did not start");
+        while Instant::now() < deadline {
+            if self.child.try_wait().unwrap().is_some() {
+                return false;
+            }
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                let listed = get(self.port, "/v1/databases").1.contains(&format!(r#""id":"{}""#, self.id));
+                return listed && self.child.try_wait().unwrap().is_none();
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        limited
+        false
     }
 
     /// The explorer's answer for the start position once the index is built.

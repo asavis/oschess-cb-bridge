@@ -132,30 +132,51 @@ struct Limited {
 }
 
 impl Limited {
+    /// Starts the bridge on a port found free. Another test's bridge may take
+    /// that port first, and this one then fails to bind and ends: the bridge
+    /// counts as started only while it runs and lists this database, and
+    /// otherwise starts again on another port.
     fn start(path: &Path, home: &Path, env: &[(&str, &str)]) -> Limited {
         std::fs::create_dir_all(home).unwrap();
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-        std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
         std::fs::write(home.join("token"), TOKEN).unwrap();
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("ulimit -v 262144 && exec \"$0\" --database \"$1\"")
-            .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
-            .arg(path)
-            .env("OSCHESS_BRIDGE_HOME", home)
-            .env("MALLOC_ARENA_MAX", "2")
-            .stdout(std::process::Stdio::null());
-        for (k, v) in env {
-            command.env(k, v);
+        let id = id_of(path);
+        for _ in 0..10 {
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+            std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg("ulimit -v 262144 && exec \"$0\" --database \"$1\"")
+                .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
+                .arg(path)
+                .env("OSCHESS_BRIDGE_HOME", home)
+                .env("MALLOC_ARENA_MAX", "2")
+                .stdout(std::process::Stdio::null());
+            for (k, v) in env {
+                command.env(k, v);
+            }
+            let mut limited = Limited { child: command.spawn().unwrap(), port, id: id.clone() };
+            if limited.serves() {
+                return limited;
+            }
         }
-        let limited = Limited { child: command.spawn().unwrap(), port, id: id_of(path) };
+        panic!("the bridge did not start");
+    }
+
+    /// Whether this bridge runs and serves its database, waiting for it to start.
+    fn serves(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "the bridge did not start");
+        while Instant::now() < deadline {
+            if self.child.try_wait().unwrap().is_some() {
+                return false;
+            }
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                let listed = get(self.port, "/v1/databases").1.contains(&format!(r#""id":"{}""#, self.id));
+                return listed && self.child.try_wait().unwrap().is_none();
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        limited
+        false
     }
 }
 

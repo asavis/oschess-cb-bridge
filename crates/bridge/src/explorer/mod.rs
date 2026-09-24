@@ -9,24 +9,27 @@ mod answer;
 mod build;
 pub mod file;
 pub mod format;
+pub mod rendered;
 pub mod runs;
 pub mod source;
 
 pub use answer::{render, route};
+pub use build::WRITER_BYTES;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::catalog::{Entry, Opened};
 use crate::fetch::Serial;
+use crate::search::SearchError;
 
 use build::Plan;
 use file::{Bad, IndexFile};
 use format::{MAX_PLY, PRUNE_PLY, Stats};
-use runs::Progress;
+use runs::{Limits, Progress};
 use source::Source;
 
 /// How long a failed build is reported before the next request tries again.
@@ -36,31 +39,27 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 pub struct Loaded {
     pub generation: u64,
     pub base: IndexFile,
-    /// Notable games already rendered, by number: their rating and JSON.
-    games: Mutex<HashMap<u32, (u16, Arc<str>)>>,
+    /// This index's key in the cache of rendered games, unique in the process.
+    id: u64,
 }
-
-/// Notable games kept rendered: some 200 bytes each.
-const RENDERED_GAMES: usize = 1 << 16;
 
 impl Loaded {
     pub fn new(generation: u64, base: IndexFile) -> Loaded {
-        Loaded { generation, base, games: Mutex::default() }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Loaded { generation, base, id: NEXT.fetch_add(1, Ordering::Relaxed) }
     }
 
-    /// Game `number`'s rating and rendered JSON, from the cache or `make`.
-    pub fn game(&self, number: u32, make: impl FnOnce() -> Option<(u16, String)>) -> Option<(u16, Arc<str>)> {
-        if let Some(hit) = lock(&self.games).get(&number) {
-            return Some(hit.clone());
+    /// Game `number`'s rating and rendered JSON, from the cache of rendered
+    /// games or `make`.
+    pub fn game(&self, number: u32, make: impl FnOnce() -> Option<(u16, String)>) -> Option<rendered::Game> {
+        let cache = rendered::cache();
+        if let Some(hit) = cache.get((self.id, number)) {
+            return Some(hit);
         }
         let (elo, json) = make()?;
-        let value = (elo, Arc::<str>::from(json));
-        let mut games = lock(&self.games);
-        if games.len() >= RENDERED_GAMES {
-            games.clear();
-        }
-        games.insert(number, value.clone());
-        Some(value)
+        let game = (elo, Arc::<str>::from(json));
+        cache.put((self.id, number), &game);
+        Some(game)
     }
 
     /// The position `key`.
@@ -197,6 +196,18 @@ pub fn paths(dir: &Path, id: &str) -> (PathBuf, PathBuf) {
 /// database changes its generation and so rebuilds its index; an index is
 /// never answered for another generation than its own.
 pub fn prepare(db: &dyn Source, generation: u64, dir: &Path, id: &str, progress: &Progress) -> Result<Loaded, String> {
+    prepare_with(db, generation, dir, id, progress, &Limits::default())
+}
+
+/// [`prepare`] within `limits`, which tests and tools set.
+pub fn prepare_with(
+    db: &dyn Source,
+    generation: u64,
+    dir: &Path,
+    id: &str,
+    progress: &Progress,
+    limits: &Limits,
+) -> Result<Loaded, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (path, work) = paths(dir, id);
     let count = db.records();
@@ -216,9 +227,20 @@ pub fn prepare(db: &dyn Source, generation: u64, dir: &Path, id: &str, progress:
         _ => {}
     }
     let plan = Plan { first: 1, last: count, prune_ply: PRUNE_PLY, generation };
-    build::build(db, &plan, &work, &path, progress).map_err(|e| format!("{e:?}"))?;
+    build::build_with(db, &plan, &work, &path, progress, limits).map_err(describe)?;
     let file = IndexFile::open(&path).map_err(|e| format!("{e:?}"))?;
     Ok(Loaded::new(generation, file))
+}
+
+/// Why a build failed, for its log line and its `503 index_unavailable`.
+fn describe(e: SearchError) -> String {
+    match e {
+        SearchError::TooLarge => "the search memory budget is too small to build this index".into(),
+        SearchError::Busy => "the search memory stayed taken by searches; retry".into(),
+        SearchError::Superseded => "the build was stopped".into(),
+        SearchError::Read(e) => e.to_string(),
+        SearchError::Unsupported(q) => q,
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

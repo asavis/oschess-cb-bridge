@@ -12,7 +12,7 @@ use crate::search::SearchError;
 use super::format::{
     BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, crc32,
 };
-use super::runs::{self, Entry, Progress, io};
+use super::runs::{self, Entry, Limits, Progress, io};
 use super::source::Source;
 
 /// What to build: records `first..=last` of the database at `generation`,
@@ -26,20 +26,21 @@ pub struct Plan {
 
 /// The writer's memory: its output buffer, a block's keys and records, and the
 /// table of blocks.
-const WRITER_BYTES: usize = (1 << 20) + BLOCK_KEYS * 12 + super::format::MAX_BLOCK_DATA + (4 << 20);
+pub const WRITER_BYTES: usize = (1 << 20) + BLOCK_KEYS * 12 + super::format::MAX_BLOCK_DATA + (4 << 20);
 
 /// Builds the index of `plan` into `target`, through a temporary file renamed
 /// at the end; the runs go to `work`, which is emptied afterwards.
-pub fn build(
+pub fn build_with(
     source: &dyn Source,
     plan: &Plan,
     work: &Path,
     target: &Path,
     progress: &Progress,
+    limits: &Limits,
 ) -> Result<Header, SearchError> {
     let _ = std::fs::remove_dir_all(work);
     std::fs::create_dir_all(work).map_err(|e| io(work, e))?;
-    let result = build_in(source, plan, work, target, progress);
+    let result = build_in(source, plan, work, target, progress, limits);
     let _ = std::fs::remove_dir_all(work);
     if result.is_err() {
         let _ = std::fs::remove_file(temporary(target));
@@ -53,12 +54,16 @@ fn build_in(
     work: &Path,
     target: &Path,
     progress: &Progress,
+    limits: &Limits,
 ) -> Result<Header, SearchError> {
+    // The merges fit the build's share with the writer's memory, so a merge
+    // never waits for what the same build holds.
+    let fan_ins = runs::fan_ins(limits.share, WRITER_BYTES)?;
     progress.start("reading", u64::from(plan.last.saturating_sub(plan.first) + 1));
-    let runs = runs::write_runs(source, plan.first, plan.last, MAX_PLY, work, progress)?;
+    let runs = runs::write_runs(source, plan.first, plan.last, MAX_PLY, work, progress, limits)?;
     let entries: u64 = runs.iter().map(|r| r.entries).sum();
     progress.start("merging", entries);
-    let runs = runs::reduce(runs, work, progress)?;
+    let runs = runs::reduce(runs, work, progress, fan_ins)?;
     let partial = temporary(target);
     let _writer_memory = runs::reserve(WRITER_BYTES, progress)?;
     let mut writer = Writer::create(&partial)?;

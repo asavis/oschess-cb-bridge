@@ -463,9 +463,12 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   `variant: "chess960"`, and so is `variant=chess960`.
 - **Building.** The first request for a database's positions starts building
   its index in the background: on at most half of the search workers, within
-  the search memory budget, which it never takes from searches (it waits for
-  memory searches hold), and one database at a time. It reads move records
-  only, a few megabytes at a time, never annotations. Until the index is ready, requests are answered
+  half of the search memory budget, which it never takes from searches (it
+  waits for memory searches hold), and one database at a time. It reads move
+  records only, a few megabytes at a time, never annotations. The notable
+  games rendered for answers are kept for all databases together, within the
+  budget (a 64th of it, at most 8 MiB), and searches that need the memory
+  drop them. Until the index is ready, requests are answered
   `409 database_unavailable` with `state: "indexing"` and
   `progress: {"phase", "done", "total"}`; the phases are `checking` (records),
   `reading` (records) and `merging` (entries). `/v1/status` lists the builds

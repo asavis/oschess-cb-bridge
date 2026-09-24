@@ -272,8 +272,12 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   the key, the game number (30 bits) with its result (2), and the move (14),
   ply (6) and average rating (12). Each worker sorts its entries within its
   share of the search memory budget and writes them as runs. The runs are then
-  merged, 256 at a time, and each position's entries are added up into its
-  record as the merge passes them.
+  merged, each run with a 64 KiB read buffer: in passes of as many runs as half
+  the budget holds, at most 256, until the final merge can take all that are
+  left beside the writer's 6 MiB. That final merge adds up each position's
+  entries into its record as it passes them. Half the budget is at least
+  8 MiB, which holds the writer and 30 runs; a smaller share fails the build
+  as too large rather than waiting for memory the build holds itself.
 
 # The classic format (`.cbh`)
 
