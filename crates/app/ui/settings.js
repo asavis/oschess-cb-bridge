@@ -53,6 +53,10 @@ function renderSettings(settings) {
   current = settings;
   document.getElementById('version').textContent = t('settings.version', { version: settings.version });
   document.getElementById('version-title').textContent = t('settings.versionRow.title', { version: settings.version });
+  // A build without a real updater key does not look for updates.
+  document.getElementById('version-hint').textContent =
+    settings.updates ? t('settings.versionRow.hint') : t('settings.versionRow.off');
+  document.getElementById('check-updates').disabled = !settings.updates;
   document.getElementById('port-title').textContent = t('settings.port.title', { port: settings.port });
   toggle('autostart', settings.autostart);
   toggle('auto-update', settings.autoUpdate);
@@ -82,6 +86,9 @@ function wire() {
     act(call('set_autostart', { on: !current.autostart }).then(renderSettings)));
   document.getElementById('auto-update').addEventListener('click', () =>
     act(call('set_auto_update', { on: !current.autoUpdate }).then(renderSettings)));
+  // The outcome comes as a Windows notification.
+  document.getElementById('check-updates').addEventListener('click', () =>
+    act(call('check_updates').then(() => notice(t('settings.versionRow.checking')))));
 
   document.getElementById('show-code').addEventListener('click', () =>
     revealCode(document.getElementById('code-line').hidden));

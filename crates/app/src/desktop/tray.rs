@@ -7,7 +7,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt;
 
-use super::{commands, shared, windows};
+use super::{commands, shared, updater, windows};
 use crate::i18n::Strings;
 use crate::status::{Theme, View, icon_file, icon_size};
 
@@ -69,8 +69,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             &item("code", "menu.code")?,
             &PredefinedMenuItem::separator(app)?,
             &tick,
-            // Updates come with the installer (#23, part 2b).
-            &MenuItem::with_id(app, "update", strings.get("menu.update"), false, None::<&str>)?,
+            // Only a build with a real updater key looks for updates.
+            &MenuItem::with_id(app, "update", strings.get("menu.update"), updater::enabled(app), None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &item("quit", "menu.quit")?,
         ],
@@ -125,6 +125,7 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
             let on = !app.autolaunch().is_enabled().unwrap_or(false);
             let _ = commands::switch_autostart(app, on);
         }
+        "update" => updater::look_now(app),
         "quit" => app.exit(0),
         _ => {}
     }

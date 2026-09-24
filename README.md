@@ -12,7 +12,60 @@ The repository is a Cargo workspace:
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, and `bridge` to run the bridge in a console. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 | [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
-| [`app`](crates/app) | The bridge for Windows as a tray app built with [Tauri 2](https://tauri.app): the bridge's state in the tray, a status flyout, settings and a first-run window. Windows only; elsewhere it builds as a stub. |
+| [`app`](crates/app) | The bridge for Windows as a tray app built with [Tauri 2](https://tauri.app): the bridge's state in the tray, a status flyout, settings and a first-run window. Released as `oschess-bridge.exe` and its installer. Windows only; elsewhere it builds as a stub. |
+
+## Install
+
+The bridge runs on Windows 10 and 11. Your databases stay on your computer:
+the bridge serves them only to the oschess page in a browser on the same
+computer.
+
+1. Open the [latest release](https://github.com/asavis/oschess-cb-bridge/releases/latest)
+   and download `oschess-bridge-setup.exe`. Your browser may warn that the file
+   is not commonly downloaded; keep it. The release notes give its SHA-256,
+   which `Get-FileHash .\oschess-bridge-setup.exe` in PowerShell prints too.
+2. Run it. While releases are unsigned, Windows SmartScreen says «Windows
+   protected your PC»: choose **More info**, then **Run anyway**. Where Smart
+   App Control is on (Windows 11, Windows Security → App & browser control),
+   Windows blocks unsigned programs outright and offers no way past it; such
+   a computer needs a signed release. The release notes say whether a release
+   is signed.
+3. The installer needs no administrator: it installs for your Windows user
+   into `%LOCALAPPDATA%\oschess bridge`, in Ukrainian or English after the
+   Windows display language. Choose **Next** through its pages and
+   **Install**; if Windows lacks Microsoft's WebView2 runtime, the installer
+   downloads it first. On the last page leave «Run oschess bridge» ticked and
+   choose **Finish**.
+4. The bridge starts in the tray, as the oschess mark by the clock. The «The
+   bridge is installed» window opens, and so does your default browser, on the
+   oschess Library with the pairing link.
+5. The browser asks whether oschess may access devices on your local network.
+   Choose **Allow**: the bridge is on your own computer, and this lets the page
+   reach it. The Library's ChessBase section connects, and the tray mark's
+   tooltip says how many databases are ready.
+
+If you chose **Block**, or take the permission back later, the ChessBase
+section says so. Allow it again in the site's settings (the icon to the left of
+the address → Site settings → Local network access), and the page connects
+without pairing again. If the page did not open or did not connect, the
+«The bridge is installed» window shows the pairing code: in oschess, open the
+Library → ChessBase → «Paste the code by hand».
+
+Browsers: Chrome and Microsoft Edge 142 or later. Firefox has not been tried
+yet.
+
+Right-click the tray mark for the menu: open oschess, the settings, the pairing
+code, «Start with Windows» (off until you tick it), checking for updates, and
+quitting. Updates install by themselves while the bridge is idle, unless
+«Update automatically» is off in the settings; a version whose settings say
+«This build does not check for updates» is replaced by running the next
+installer by hand. To remove the bridge, use
+Settings → Apps → Installed apps → oschess bridge → Uninstall; its data folder,
+`%APPDATA%\oschess-bridge`, with the pairing code and the settings, stays.
+
+The release also has `oschess-bridge.exe`, the same app without the installer.
+Updates come as the installer, so they install the bridge for your user as
+above.
 
 ## Status
 
@@ -97,19 +150,61 @@ are ready; amber while one opens or downloads, or when one cannot be opened or
 is not found; red when the bridge cannot serve at all, such as with its port
 in use. The tooltip says which. A click opens a flyout with the state and the
 databases, and the right-click menu opens oschess, the settings (extra database
-folders, the port, the pairing code, starting with Windows) or quits. The
+folders, the port, the pairing code, starting with Windows, updates), checks
+for updates or quits. The
 windows are plain HTML, CSS and JavaScript in `crates/app/ui`, in Ukrainian or
 English after the Windows display language; `crates/app/icons/generate.py`
 draws the tray marks and the app icon from the logo.
 
 The app builds on Windows only. On Linux, `scripts/clippy-windows.sh` checks
 it for `x86_64-pc-windows-gnu` (`rustup target add x86_64-pc-windows-gnu`)
-without linking. The installer and updates come next (#23).
+without linking.
+
+A version tag builds the release: `oschess-bridge.exe`, its per-user NSIS
+installer and their SHA-256, as a draft for the owner to publish
+([docs/release.md](docs/release.md)). The app's updater reads the newest
+release's `latest.json` and installs only an installer signed with the key in
+`crates/app/tauri.conf.json`; while that key is a placeholder, the app does
+not look for updates.
 
 ## Contributing
 
 See [CLAUDE.md](CLAUDE.md) for the repository rules, including the
 cross-model review every change goes through.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org). Until SignPath
+Foundation accepts this project, releases are unsigned; the release notes say
+whether a release is signed.
+
+What is signed: only this repository's own `oschess-bridge.exe` and its
+installer, as `.github/workflows/release.yml` builds them on GitHub's runners
+from a version tag on `main`. Every release is published by the owner after
+checking it ([docs/release.md](docs/release.md)).
+
+Roles:
+
+- Committers and reviewers: [@asavis](https://github.com/asavis), the owner,
+  and the owner's two automated contributors,
+  [@oschess-claude-bot](https://github.com/oschess-claude-bot) (Claude) and
+  [@oschess-codex-bot](https://github.com/oschess-codex-bot) (Codex). A
+  change written by one of the two is reviewed by the other before it is
+  merged ([docs/review.md](docs/review.md)).
+- Approvers: [@asavis](https://github.com/asavis), who approves every signing
+  request.
+
+Privacy: the bridge sends no information about you, your computer or your
+databases anywhere. It opens your databases read-only and serves them only to
+the oschess page in a browser on the same computer, over the loopback address
+`127.0.0.1`, and only to a browser that holds the pairing code. Beyond this
+computer it connects only to GitHub, to look for a new release of the bridge
+and download it; that request carries nothing about you or your databases, and
+«Update automatically» in the settings turns the automatic looks off. The
+installer downloads Microsoft's WebView2 runtime from Microsoft when Windows
+lacks it, and opening a database kept only in the cloud makes Windows download
+its files from your cloud storage, as opening them in any program does.
 
 ## Legal
 

@@ -15,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "remove_database",
     "set_autostart",
     "set_auto_update",
+    "check_updates",
     "pairing_code",
     "copy_code",
     "new_code",
