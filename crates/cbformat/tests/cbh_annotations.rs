@@ -139,7 +139,9 @@ fn every_type_is_skipped_by_its_size() {
         vec![(-1, 0x26, &[0, 1, 0, 20, 0, 30]), (0, 0x18, &[2]), (0, 0x7e, &[9, 9, 9]), (0, 0x02, b"\x00\x2akept")];
     let (_f, db) = db("skipped", &one_move(), &items);
     let (text, status) = movetext(&db, &Options::default());
-    assert_eq!(text, "1. e4 {kept}");
+    // The type-26 bytes are a valid classic record of one evaluation, 30
+    // centipawns at depth 20, which both forms write as ChessBase does.
+    assert_eq!(text, "{[%evp 0,0,30]} 1. e4 {kept}");
     assert_eq!(status, AnnotationStatus::Complete, "a classic record is never incomplete");
 }
 

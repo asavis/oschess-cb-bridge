@@ -151,6 +151,83 @@ and that many bytes. 26 in the Mega.
 **Video** (`20`): `01 00`, a `short` that is likely a language, an `int` length
 and that many bytes. 22 in the Mega.
 
+**Evaluations** (`26`), `v2::timing::evaluations`: on position −1,
+`01`, an `int` length, a `short` count, then per entry a `short` value, a
+depth byte and a flag byte (0 centipawns, 1 mate, `ff` none; 2 and `20` occur
+18 times in the Mega and are **unknown**).
+- **Entry `k` is the position after the main line's ply `k`,** the first the
+  start position. The count is the main line's plies plus one in 13,487 of the
+  Mega's 26,548 records, and other counts occur where moves were added or
+  removed later. In the games that end in checkmate, the last entry is a mate
+  with value 0 (596 games), the one before it a mate in 1 (845), and the one
+  before that a mate in 2, 4, 6…, in plies.
+- **Values are from White's point of view.** The last large evaluation's sign
+  agrees with the result in 11,655 of 12,754 decisive games. A mate's value
+  counts **plies**, positive when White mates and negative when Black does.
+- **ChessBase's own PGN** writes the entries as `[%evp 0,<count−1>,<values>]`
+  in a comment of its own before the first move:
+  - centipawns as they are;
+  - a mate in `n` plies as `30000 − n`;
+  - no evaluation as 32767.
+
+  The 10 games of Update41 with evaluations match number for number: 897
+  centipawns, 101 none and 6 mates, none of them negative. A negative mate is
+  written by symmetry (`−30000 − n`), and mate 0 and the unknown flags as
+  32767.
+- The classic layout is a big-endian `short` count, then each entry as the same
+  32-bit value, big-endian: flag, depth, then the value's high and low bytes.
+  All 325 records of the six paired databases equal their 2CBH twins read this
+  way.
+- One Mega game also holds ten type-`26` records on moves. They are kept only
+  as data.
+
+**Computer evaluation** (`21`), `v2::timing::engine_evaluation`: on a move,
+three `short`s: the value, its kind and a depth.
+- Kind 0 is centipawns (12,009 in the Mega) and kind 1 moves to mate (216);
+  kinds 3 (23) and 32 (1) are **unknown**. The depth is 0 in 9,475, and holds
+  the absolute value in 772.
+- Values are from White's point of view: the last large one's sign agrees with
+  the result in 148 of 172 decisive games, whichever side has just moved.
+- A mate counts **moves**: in the 49 kind-1 annotations of games that end in
+  checkmate, the sign always names the winner, and the value equals the moves
+  left in 27, the plies left in 13. In 6 of those, the two are the same.
+- No paired database holds one, so the classic layout is not decoded.
+
+**Time spent** (`07`), `v2::timing::time_spent`: four bytes on a move,
+**unknown** (0 in 889,661 of 899,160), then seconds, minutes and hours.
+- Seconds cover 0-59, minutes are rarely above 9, and hours are 0 in all but
+  1,323.
+- Summed over one side's moves, the time spent stays within the time control's
+  budget in 229 of 236 checks (118 games, both sides). Read with the bytes the
+  other way round, it exceeds the budget in 222.
+- The classic layout has no paired example and is not decoded.
+
+**Clocks** (`16`, `17`): on position −1, an `int` in hundredths of a second,
+one per player. Of the 28,643 Mega games holding both, 3,497 hold the same value in both. The time
+control, minus a side's time spent, gives that side's clock within 2 seconds in
+33 of 236 checks and within a minute in 171. So they are close to the clock at
+the end of the game, but not exactly. Without an export by ChessBase to
+confirm them, they are not written as `[%clk]`. The classic clocks are the
+same `int`, big-endian, in all 6 paired records.
+
+**Time control** (`24`), `v2::timing::time_control`: `01`, three stages of
+**11** bytes, then an `int` 0: 38 bytes. The description has 12-byte stages,
+which do not add up to 38. Each stage is an `int` initial time and an `int`
+increment in hundredths of a second, a `short` number of moves (1000 for the
+rest of the game) and a kind byte:
+- 0 the rest of the game;
+- 1 a stage of that many moves;
+- 3 the rest of the game with an increment;
+- 5 no time;
+- 2, in one Mega record, **unknown**.
+
+No record in the Mega holds a negative time. Since a negative time means
+nothing in a time control, a record holding one is not decoded, and keeps its
+data. All 21,073 records in the Mega read this way and end in `00 00 00 00`. Every
+time is a whole number of seconds in the 21,063 records checked for it, one
+per game. The classic layout has no
+paired example and is not decoded.
+
 **Type `27`**: not in the description. Two bytes, always on a move: the short
 1 in all 25 samples of the updates; 28 occur in the Mega. Its meaning is
 **unknown**.
@@ -499,6 +576,8 @@ writer handles both formats alike.
   quotations holds moves, so the moves of a classic quotation are not known, and
   they stay in its data.
 - **Medals** (`22`) are the same `int` as in 2CBH, big-endian.
+- **Evaluations** (`26`) and **clocks** (`16`, `17`) have the classic layouts
+  in the 2CBH section above, which the pairs confirm.
 - **Other types** are written only as their data (`[%cbraw]`) in the full
   form. Their classic layouts are not decoded.
 

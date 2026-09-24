@@ -489,3 +489,185 @@ fn every_colour_and_game_symbols_are_kept() {
     let (reading, _) = render(&db, false);
     assert_eq!(reading, "1. e4 $14 {[%csl Ge4]} 1... e5");
 }
+
+/// Every `[%name body]` command in a full form.
+fn commands_in(full: &str) -> Vec<(String, String)> {
+    full.split("[%")
+        .skip(1)
+        .map(|c| {
+            let c = c.split(']').next().unwrap();
+            let (name, body) = c.split_once(' ').unwrap_or((c, ""));
+            (name.to_string(), body.to_string())
+        })
+        .collect()
+}
+
+/// Whether a value keeps to the escaping rule: unreserved characters, and
+/// every other byte as `%` and two upper-case hex digits.
+fn escaped(v: &str) -> bool {
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = |x: Option<&u8>| x.is_some_and(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(c));
+                if !(hex(b.get(i + 1)) && hex(b.get(i + 2))) {
+                    return false;
+                }
+                i += 3;
+            }
+            c if c.is_ascii_alphanumeric() || b"-._~".contains(&c) => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Whether a command keeps to its grammar: `cb` commands `key=value;…` with
+/// keys of letters only and escaped values, the others their own forms.
+fn conforms(name: &str, body: &str) -> bool {
+    let signed = |s: &str| digits(s.strip_prefix('-').unwrap_or(s));
+    match name {
+        n if n.starts_with("cb") => body.split(';').all(|f| match f.split_once('=') {
+            Some((k, v)) => !k.is_empty() && k.bytes().all(|c| c.is_ascii_alphabetic()) && escaped(v),
+            None => false,
+        }),
+        "lang" => {
+            body == "any"
+                || (body.len() == 2 && body.bytes().all(|c| c.is_ascii_lowercase()))
+                || body.strip_prefix("cb-").is_some_and(|n| digits(n.strip_prefix('l').unwrap_or(n)))
+        }
+        "mdl" => digits(body),
+        "evp" => body.split(',').all(signed) && body.split(',').count() >= 3,
+        "eval" => match body.strip_prefix('#') {
+            Some(m) => signed(m),
+            None => body.split_once('.').is_some_and(|(i, f)| signed(i) && f.len() == 2 && digits(f)),
+        },
+        "emt" => {
+            let p: Vec<&str> = body.split(':').collect();
+            p.len() == 3 && digits(p[0]) && p[1..].iter().all(|x| x.len() == 2 && digits(x))
+        }
+        "csl" | "cal" => body.split(',').all(|m| m.len() >= 3 && b"GYR".contains(&m.as_bytes()[0])),
+        _ => false,
+    }
+}
+
+#[test]
+fn every_command_keeps_to_its_grammar() {
+    let evaluations = [&[1u8][..], &int(10), &2u16.to_le_bytes(), &[20, 0, 18, 0], &[253, 255, 1, 1]].concat();
+    let mut stages = vec![1u8];
+    for (initial, increment, moves, kind) in [(540_000i32, 3000i32, 40u16, 1u8), (180_025, 3000, 1000, 3), (0, 0, 0, 0)]
+    {
+        stages.extend([&initial.to_le_bytes()[..], &increment.to_le_bytes(), &moves.to_le_bytes(), &[kind]].concat());
+    }
+    stages.extend([0; 4]);
+    let (url, caption) = ("https://example.org/a;b=c", "Caption ]} ; = % é");
+    let link = [&[1u8][..], &int(url.len()), url.as_bytes(), &int(caption.len()), caption.as_bytes()].concat();
+    let caption_v = "Vidé]";
+    let video = [&[1u8, 0, 0, 0][..], &int(caption_v.len()), caption_v.as_bytes()].concat();
+    let training = [&[1u8, 1, 1, 0, 0, 0][..], &int(30), &5u16.to_le_bytes(), &[0; 8], &[0]].concat();
+    let quote = quote_2cbh(&Spec {
+        moves: &[[sq("e2"), sq("e4")], [sq("e7"), sq("e5")]],
+        event: "Café; [a=b] 100%",
+        ..Spec::default()
+    });
+    let content = annotations(&[
+        (
+            -1,
+            vec![
+                text(false, language::ANY, "A classic"),
+                symbols(1, 10, 140),
+                squares(&[(7, "a1")]),
+                other(0x26, &evaluations),
+                other(0x24, &stages),
+                other(0x16, &[0x10, 0x27, 0, 0]),
+            ],
+        ),
+        (
+            0,
+            vec![
+                text(true, language::GERMAN, "vor"),
+                text(false, 9, "A{B}\nC"),
+                symbols(1, 14, 0),
+                squares(&[(2, "e4")]),
+                arrows(&[(8, "b1", "c3"), (4, "g1", "f3")]),
+                other(0x13, &quote),
+                other(0x22, &[4, 0, 0, 0]),
+                other(0x18, &[2]),
+                other(0x14, &[5]),
+                other(0x15, &[&int(2)[..], &[7, 8]].concat()),
+                other(0x23, &[1, 2, 3, 4]),
+                other(0x1c, &link),
+                other(0x20, &video),
+                other(0x09, &training),
+                other(0x07, &[0, 12, 1, 0]),
+                other(0x21, &[0x06, 0xff, 0, 0, 0x18, 0]),
+            ],
+        ),
+    ]);
+    let all = one_game("grammar-all", &two_moves(), &content);
+    let (full_all, status) = render(&all, true);
+    assert_eq!(status, AnnotationStatus::Complete, "every synthetic annotation decodes: {full_all}");
+    let rest = one_game("grammar-rest", &two_moves(), &annotations(&[(0, vec![vec![0x1a, 0, 9, 8, 7]])]));
+    let moves = move_record(0, None, None, &encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let quote_classic = quote_classic(&Spec::default());
+    let items: Vec<(i32, u8, &[u8])> = vec![(0, 0x13, &quote_classic), (0, 0x18, &[2]), (0, 0x02, b"\x00\x91Nation")];
+    let mut b = fixture_cbh::Builder::new();
+    b.game(&moves);
+    b.annotations(&annotation_record(1, &items));
+    let f = b.write("grammar-classic");
+    let classic = cbformat::cbh::Database::open(f.base()).unwrap();
+    let classic_full = pgn::classic_game_with(&classic, 1, &Options { full: true, ..Options::default() }).unwrap().pgn;
+
+    let outputs = [full_all, render(&rest, true).0, classic_full];
+    let mut seen = std::collections::BTreeSet::new();
+    for full in &outputs {
+        for (name, body) in commands_in(full) {
+            assert!(conforms(&name, &body), "[%{name} {body}] in {full}");
+            seen.insert(name);
+        }
+    }
+    let every = [
+        "cbarrows",
+        "cbcolour",
+        "cbcritical",
+        "cblink",
+        "cbpath",
+        "cbpawns",
+        "cbquote",
+        "cbraw",
+        "cbrest",
+        "cbsquares",
+        "cbsymbols",
+        "cbtext",
+        "cbtimecontrol",
+        "cbtraining",
+        "cbvideo",
+        "cal",
+        "csl",
+        "emt",
+        "eval",
+        "evp",
+        "lang",
+        "mdl",
+    ];
+    let missing: Vec<&&str> = every.iter().filter(|n| !seen.contains(**n)).collect();
+    assert!(missing.is_empty(), "not rendered: {missing:?}");
+    // The grammar check itself rejects what it must.
+    for (name, body) in [
+        ("cbtimecontrol", "kind1=3"),
+        ("cbtext", "lang=en;value=a b"),
+        ("cbraw", "type=24;data=a;b"),
+        ("cbraw", "type"),
+        ("eval", "0.2"),
+        ("emt", "0:0:05"),
+        ("evp", "0,1"),
+        ("other", "x"),
+    ] {
+        assert!(!conforms(name, body), "[%{name} {body}]");
+    }
+}

@@ -13,6 +13,7 @@ mod layout;
 mod quote;
 #[cfg(test)]
 mod tests;
+pub mod timing;
 
 use layout::annotation;
 pub use quote::{Quotation, QuotedPlayer};

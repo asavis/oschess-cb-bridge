@@ -440,6 +440,17 @@ are held to the same answer limit.
 - **Medals** (type `22`) are `[%mdl <bits>]`, as ChessBase writes them: the
   `int` of medal bits. The reading form writes them first in the comment of
   their move, and the full form among the move's commands.
+- **The main line's evaluations** (type `26`) are `[%evp 0,<last>,<values>]`
+  in a comment of its own before the first move, as ChessBase writes them. It
+  holds one value per position of the main line, the start position first:
+  - centipawns from White's point of view;
+  - a mate in `n` plies as `30000 − n`, negated when Black mates;
+  - 32767 for no evaluation.
+
+  ChessBase's own export of a weekly update matches these values in all its
+  games with evaluations. That export holds no negative mate, mate on the board
+  or entry of an unknown kind. A negative mate is written by symmetry, and mate
+  on the board and the unknown kinds as 32767.
 
 #### The full form
 
@@ -467,6 +478,17 @@ Nothing the bridge reads is left out of the full form
   including symbols on the game as a whole, where no NAG can stand, and
   `[%cbsquares]`/`[%cbarrows]` with every mark of every colour. ChessBase's
   colours 7, 8 and 9 have no `[%csl]`/`[%cal]` letter.
+- **Engine scores and times** of each move, as `[%eval …]` and `[%emt …]` in a
+  comment right after the move and its NAGs:
+  - `[%eval]` is in pawns with two decimals, or `#n` for a mate in `n` moves,
+    from White's point of view, as oschess and Lichess read it;
+  - the move's own engine evaluation (type `21`) comes first, else the main
+    line's evaluation of the position after the move (type `26`);
+  - a mate on the board and the unknown kinds give no `[%eval]`;
+  - `[%emt h:mm:ss]` is the time spent on the move (type `07`).
+
+  Both come from 2CBH only; the classic layouts of types `07` and `21` are not
+  confirmed. The annotations' data stays in their commands.
 - **Commands** for every annotation that is not a text, in one comment after
   the move's texts, in stored order. Each is `[%cb<name> key=value;…]`, except
   `[%mdl]`. Keys are ASCII letters, values are UTF-8 percent-encoded with
@@ -489,12 +511,19 @@ Nothing the bridge reads is left out of the full form
 | `[%cbcolour …]` | `23` variation colour | none |
 | `[%cblink …]` | `1c` web link | `url`, `caption` |
 | `[%cbvideo …]` | `20` video | `language` (a number), `caption` |
-| `[%cbtraining …]` | `09` training question | `variant`, `seconds`, `points` |
+| `[%cbtraining …]` | `09` training question | `variant`, `seconds` (left out when negative), `points` |
+| `[%cbtimecontrol …]` | `24` time control, 2CBH | per stage `A`, `B` and `C`, a stage all zero left out: `kindA` (0 the rest of the game, 1 a stage of `movesA` moves, 3 the rest of the game with an increment, 5 no time, 2 unknown), `initialA` and `incrementA` in seconds, `movesA` (1000 for the rest of the game); likewise `…B` and `…C`. A record holding a negative time is written as `[%cbraw]` |
 | `[%cbraw type=<hex>;data=…]` | any other type, and in a classic database every type but texts, symbols, squares, arrows, quotations and medals, whose layouts there are not decoded | `type`, two hex digits |
 | `[%cbrest type=<hex>;data=…]` | the bytes of the record after a type of unknown layout, in the game comment; the game is `incomplete` | `type` |
 
-Evaluations (`26`), clocks (`16`, `17`) and time spent (`07`) are
-`[%cbraw …]` for now.
+These types are `[%cbraw …]`, their data kept whole:
+- evaluations (`26`) and engine evaluations (`21`): they are also written as
+  `[%evp]` and `[%eval]` above;
+- time spent (`07`): also written as `[%emt]`;
+- the clocks (`16`, `17`): they hold one `int` per player for the game as a
+  whole, in hundredths of a second, not a clock per move. ChessBase's own
+  export of them is not available to confirm what they mean, so they are not
+  written as `[%clk]`.
 
 ### `GET /v1/databases/{id}/suggest`
 

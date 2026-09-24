@@ -105,7 +105,7 @@ fn write_tree(
             // move; in a game without moves it is damage, not something to
             // drop quietly.
             a.check_positions(stats.total_plies)?;
-            let mut commentary = Commentary::new(a, order, options, stats.total_plies, tree.last_main_move());
+            let mut commentary = Commentary::new(a, order, options, stats.total_plies, &tree.main_line());
             commentary.game_comment(&mut out);
             emit(&tree, &mut commentary, &mut out);
         }
