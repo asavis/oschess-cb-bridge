@@ -92,11 +92,15 @@ pub fn open_oschess(app: AppHandle) {
     open_oschess_now(&app);
 }
 
-/// Opens the oschess Library's ChessBase section, where the paired browser
-/// connects by itself.
+/// Opens the oschess Library's ChessBase section with the pairing link, as
+/// the first-run window does (#76): a browser the bridge has not paired yet
+/// (another browser, another profile, or after «New code») pairs with nothing
+/// to copy, and a paired one reconnects as before. The page reads the link's
+/// fragment before anything renders and never sends it to a server.
 pub fn open_oschess_now(app: &AppHandle) {
     windows::hide_flyout(app);
-    let _ = app.opener().open_url(shared(app).section_url(), None::<&str>);
+    let url = shared(app).pairing().map(|p| p.link).unwrap_or_else(|_| shared(app).section_url());
+    let _ = app.opener().open_url(url, None::<&str>);
 }
 
 /// Asynchronous, like every command that may open a window: a synchronous
