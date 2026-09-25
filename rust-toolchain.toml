@@ -1,0 +1,8 @@
+# The toolchain every build uses: local checks, CI and releases (#64). Bumping
+# it is a pull request of its own, which also fixes the lints the new version
+# brings. The declared minimum, `rust-version` in Cargo.toml, is checked by CI.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-msvc"]

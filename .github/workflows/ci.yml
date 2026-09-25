@@ -28,23 +28,33 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Toolchain
+        # The version, components and targets rust-toolchain.toml names.
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          rustup toolchain install
+          rustc --version
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Declared minimum Rust
+        # Cargo.toml's rust-version stays true.
+        if: runner.os == 'Linux'
+        run: |
+          minimum=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$minimum" --profile minimal
+          cargo "+$minimum" check --workspace --all-targets --locked
       - name: Release build
         run: cargo build --release --locked
       - name: Upload the Windows executable
         # The build of main, for trying it on Windows before a release.
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: oschess-bridge-windows
           path: target/release/oschess-bridge.exe

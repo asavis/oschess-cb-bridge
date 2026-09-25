@@ -65,8 +65,9 @@ jobs:
           fi
       - name: Toolchain
         run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
-          rustup default stable
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
       - name: The tag names the app's version
         id: version
         run: |
@@ -152,8 +153,9 @@ jobs:
           persist-credentials: false
       - name: Toolchain
         run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
-          rustup default stable
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tauri-cli
