@@ -8,8 +8,10 @@ writes, next to this script:
 - tray/<theme>-<state>-<size>.png: the tray mark for a light or dark taskbar,
   ready, attention or problem, at 16, 20, 24 and 32 px (100 % to 200 %). The
   logo's own colour is the state. At tray sizes the logo's lines are thinner
-  than a pixel, so the mark is drawn half a pixel heavier: outlined with a
-  40-unit round-joined stroke in the logo's 1254-unit box, the same shape;
+  than a pixel, so the mark is drawn heavier, the same shape: outlined with a
+  40-unit round-joined stroke in the logo's 1254-unit box at 32 px, and with a
+  stroke of 0.84 px at 16, 20 and 24 px, moved there by the fraction of a
+  pixel that lands the most of its lines on whole pixels (#74);
 - icon.ico and icon.png: the logo on a light rounded tile, the app's icon.
 
 The outputs are committed; run this again only when the logo or a colour
@@ -25,6 +27,9 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOX = 1254.0
 TRAY_STROKE = 40.0
+# At these sizes the mark is drawn with a stroke of twice this many pixels,
+# and aligned to the pixel grid (#74).
+TRAY_ALIGNED_GROW = {16: 0.42, 20: 0.42, 24: 0.42}
 
 # Tray mark colours by taskbar theme; each keeps a contrast of 3:1 or more.
 TRAY = {
@@ -157,6 +162,26 @@ def coverage(size, polys, scale, dx, dy, grow=0.0, samples=8):
     return cov
 
 
+def aligned(size, polys, grow):
+    """The coverage at `size` with a stroke of `2 * grow` pixels, moved by the
+    quarter-pixel offset, within half a pixel, whose ink is the most
+    concentrated in whole pixels: the sum of squared coverage over the sum of
+    coverage, highest. The search uses 4 samples a pixel, the result 8."""
+    scale = size / BOX
+    steps = [i / 4 - 0.5 for i in range(5)]
+
+    def sharpness(cov):
+        flat = [min(1.0, c) for row in cov for c in row]
+        ink = sum(flat)
+        return sum(c * c for c in flat) / ink if ink else 0.0
+
+    best = max(
+        ((dx, dy) for dx in steps for dy in steps),
+        key=lambda o: sharpness(coverage(size, polys, scale, o[0], o[1], grow=grow, samples=4)),
+    )
+    return coverage(size, polys, scale, best[0], best[1], grow=grow)
+
+
 def rgb(hex_colour):
     h = hex_colour.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
@@ -240,8 +265,11 @@ def main():
     polys = subpaths(path_data())
     os.makedirs(os.path.join(HERE, "tray"), exist_ok=True)
     for size in TRAY_SIZES:
-        scale = size / BOX
-        cov = coverage(size, polys, scale, 0, 0, grow=TRAY_STROKE / 2 * scale)
+        if size in TRAY_ALIGNED_GROW:
+            cov = aligned(size, polys, TRAY_ALIGNED_GROW[size])
+        else:
+            scale = size / BOX
+            cov = coverage(size, polys, scale, 0, 0, grow=TRAY_STROKE / 2 * scale)
         for theme, states in TRAY.items():
             for state, colour in states.items():
                 with open(os.path.join(HERE, "tray", f"{theme}-{state}-{size}.png"), "wb") as f:
