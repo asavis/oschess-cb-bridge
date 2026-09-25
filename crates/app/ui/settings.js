@@ -121,22 +121,28 @@ function engineRow(name, detail, path, chosen, version) {
   return el('label', 'row engine', radio, text, licence);
 }
 
-// One choice at a time: the controls wait while an engine is checked, so a
-// slower answer never replaces a later choice. A refused engine names the
-// dictionary key of its message; the list is read again.
+// One choice at a time: the controls wait from the file dialog until the
+// engine is checked, so a slower answer never replaces a later choice. A
+// refused engine names the dictionary key of its message; the list is read
+// again.
 let choosing = false;
 
-function chooseEngine(path) {
+// `path` gives the engine to check, or nothing (a closed file dialog).
+function choose(path) {
   if (choosing) return;
   choosing = true;
   enginesBusy(true);
-  // #73: starting an engine can take seconds; the section says so until it answers.
   const line = document.getElementById('engine-checking');
-  line.hidden = false;
-  call('choose_engine', { path })
-    .then(renderEngines, (message) => {
-      notice(t(String(message)));
-      return call('engines').then(renderEngines);
+  Promise.resolve()
+    .then(path)
+    .then((chosen) => {
+      if (!chosen) return;
+      // #73: starting an engine can take seconds; the section says so until it answers.
+      line.hidden = false;
+      return call('choose_engine', { path: chosen }).then(renderEngines, (message) => {
+        notice(t(String(message)));
+        return call('engines').then(renderEngines);
+      });
     })
     .catch((message) => notice(t('settings.error', { message })))
     .finally(() => {
@@ -146,10 +152,13 @@ function chooseEngine(path) {
     });
 }
 
+function chooseEngine(path) {
+  choose(() => path);
+}
+
 // The file dialog first; the engine is checked only once one is chosen.
 function pickEngine() {
-  if (choosing) return;
-  act(call('pick_engine').then((path) => path && chooseEngine(path)));
+  choose(() => call('pick_engine'));
 }
 
 function enginesBusy(busy) {
