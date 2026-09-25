@@ -35,6 +35,15 @@ pub const MAX_GAME_RESPONSE: usize = 8 << 20;
 /// [`MAX_FIELD_CHARS`] characters, each character at most six bytes escaped,
 /// plus the keys and numbers.
 const MAX_ROW_BYTES: usize = 9 * MAX_FIELD_CHARS * 6 + 512;
+/// The most plies of a main line a row carries (#81): what an oschess player
+/// tree indexes.
+pub const MAX_LINE_PLIES: u8 = 60;
+/// An upper bound for a row's `line`: a SAN is at most 7 characters (`exd8=Q+`,
+/// `Qh4xe1#`), each followed by a space, plus the key.
+const MAX_LINE_BYTES: usize = MAX_LINE_PLIES as usize * 8 + 16;
+/// The move buffer of a window with lines: one move record at a time, within
+/// [`MAX_GAME_BYTES`] and its frame.
+const LINE_BUFFER_BYTES: usize = MAX_GAME_BYTES + 64;
 /// Games rendered at once; the others wait. With [`MAX_GAME_BYTES`] this keeps
 /// rendering within a few hundred megabytes whatever the requests.
 const MAX_RENDERS: usize = 4;
@@ -259,6 +268,11 @@ fn games(entry: &Entry, req: &Request) -> Response {
             None => return bad_parameter("sort", "unknown sort key"),
         },
     };
+    let line = match req.param("line").map(str::parse::<u8>) {
+        None => None,
+        Some(Ok(n)) if (1..=MAX_LINE_PLIES).contains(&n) => Some(n),
+        Some(_) => return bad_parameter("line", "line must be between 1 and 60"),
+    };
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
@@ -273,7 +287,12 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Err(e) => return search_error(entry, open.generation, e),
     };
     // Reserved before the rows are built and held until the answer is written.
-    let Some(hold) = budget::reserve(limit as usize * MAX_ROW_BYTES) else { return busy() };
+    let size = match line {
+        None => limit as usize * MAX_ROW_BYTES,
+        Some(_) => limit as usize * (MAX_ROW_BYTES + MAX_LINE_BYTES) + LINE_BUFFER_BYTES,
+    };
+    let Some(hold) = budget::reserve(size) else { return busy() };
+    let Some(mut lines) = Lines::new(line) else { return busy() };
     let (total, rows) = match &selection {
         Selection::All { descending } => {
             let total = u64::from(open.db.record_count());
@@ -283,7 +302,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
             } else {
                 // Numbers in the window, in ascending order; reversed for descending.
                 let first = if *descending { total - offset - u64::from(count) + 1 } else { offset + 1 } as u32;
-                with_store!(&*open.db, db => window(db, first, count)).map(|mut rows| {
+                with_store!(&*open.db, db => window(db, first, count, &mut lines)).map(|mut rows| {
                     if *descending {
                         rows.reverse();
                     }
@@ -295,7 +314,7 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Selection::Numbers(numbers) => {
             let start = usize::try_from(offset).unwrap_or(usize::MAX).min(numbers.len());
             let end = start.saturating_add(limit as usize).min(numbers.len());
-            let rows = with_store!(&*open.db, db => rows_of(db, &numbers[start..end]));
+            let rows = with_store!(&*open.db, db => rows_of(db, &numbers[start..end], &mut lines));
             (numbers.len() as u64, rows)
         }
     };
@@ -371,17 +390,35 @@ fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
 }
 
 /// Rows `first..first + count` in one header read.
-fn window<S: Store>(db: &S, first: u32, count: u32) -> cbformat::Result<Vec<String>> {
+fn window<S: Store>(db: &S, first: u32, count: u32, lines: &mut Option<Lines>) -> cbformat::Result<Vec<String>> {
     // `first + count` itself may not fit when the window ends at `u32::MAX`.
     let records = db.records(first, first + (count - 1))?;
     let mut names = Names::new(db);
-    records.iter().map(|r| row(&mut names, r)).collect()
+    records.iter().map(|r| row(&mut names, lines, r)).collect()
 }
 
 /// The rows of the records `numbers`, in that order.
-fn rows_of<S: Store>(db: &S, numbers: &[u32]) -> cbformat::Result<Vec<String>> {
+fn rows_of<S: Store>(db: &S, numbers: &[u32], lines: &mut Option<Lines>) -> cbformat::Result<Vec<String>> {
     let mut names = Names::new(db);
-    numbers.iter().map(|&n| db.record(n).and_then(|r| row(&mut names, &r))).collect()
+    numbers.iter().map(|&n| db.record(n).and_then(|r| row(&mut names, lines, &r))).collect()
+}
+
+/// The `line` a window's game rows carry, and the buffer their move records
+/// are read into, one at a time.
+struct Lines {
+    plies: u8,
+    buf: Vec<u8>,
+}
+
+impl Lines {
+    /// `Some(None)` for a window without lines; `None` when the buffer
+    /// cannot be had.
+    fn new(plies: Option<u8>) -> Option<Option<Lines>> {
+        let Some(plies) = plies else { return Some(None) };
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(LINE_BUFFER_BYTES).ok()?;
+        Some(Some(Lines { plies, buf }))
+    }
 }
 
 /// The longest text, in characters, a list row carries in one field. Longer
@@ -464,7 +501,7 @@ impl<'a, S: Store> Names<'a, S> {
 /// One list row. Guiding texts and analyses have header layouts of their own
 /// (only the first eight bytes are shared with games): their row carries the
 /// title in `event` and the author in `annotator`, and no game fields.
-fn row<S: Store>(names: &mut Names<'_, S>, r: &S::Head) -> cbformat::Result<String> {
+fn row<S: Store>(names: &mut Names<'_, S>, lines: &mut Option<Lines>, r: &S::Head) -> cbformat::Result<String> {
     let base = Obj::new().num("number", r.id());
     let other = |base: Obj, kind: &str, title: String, author: String| {
         base.str("kind", kind)
@@ -500,7 +537,7 @@ fn row<S: Store>(names: &mut Names<'_, S>, r: &S::Head) -> cbformat::Result<Stri
             let flags =
                 Obj::new().bool("deleted", r.is_deleted()).bool("chess960", matches!(r.eco(), Eco::Chess960(_))).done();
             let (white_elo, black_elo) = r.elo();
-            Ok(base
+            let row = base
                 .str("kind", "game")
                 .str("white", &names.player(r.white())?)
                 .num("whiteElo", white_elo.max(0))
@@ -514,8 +551,15 @@ fn row<S: Store>(names: &mut Names<'_, S>, r: &S::Head) -> cbformat::Result<Stri
                 .str("date", &r.played_date().pgn())
                 .str("round", &round)
                 .str("annotator", &names.annotator(r.annotator())?)
-                .raw("flags", &flags)
-                .done())
+                .raw("flags", &flags);
+            Ok(match lines {
+                None => row,
+                Some(lines) => match names.db.main_line(r, lines.plies, &mut lines.buf)? {
+                    Some(line) => row.str("line", &line),
+                    None => row.raw("line", "null"),
+                },
+            }
+            .done())
         }
     }
 }

@@ -346,6 +346,7 @@ One window of the database's records, sorted and optionally searched.
 | `sort` | `number` | `<key>`, `<key>-asc` or `<key>-desc`; keys below. It wins over a `sort:` token in `q`; an unknown key is `400 bad_request` |
 | `q` | | A search in the Library search grammar ([search-grammar.md](search-grammar.md)); `total` then counts the matches |
 | `stream` | | The client's name for this list, which lets a newer search replace an older one ([Cancellation](#cancellation)); an invalid name is `400 bad_request` |
+| `line` | | Plies of each game's main line to add to its row, 1 to 60 (below); any other value is `400 bad_request`. Without it, rows are as shown |
 
 Sort keys: `number`, `white`, `black`, `whiteElo`, `blackElo`, `result`,
 `moves`, `eco`, `tournament` (alias `event`), `date`, `round`, `annotator` —
@@ -402,6 +403,19 @@ and has no other key.
 A row for a guiding text or an analysis has `kind: "text"` or `"analysis"`,
 its title in `event`, its author in `annotator`, `result: "*"`, and empty game
 fields.
+
+With `line`, every game row ends with one more field (#81), so that one window
+brings its games' openings, for example to build a player's opening tree:
+
+| Field | Meaning |
+|---|---|
+| `line` | The first `line` plies of the main line in SAN, one space between moves, as `GET /v1/databases/{id}/games/{number}` writes them: `"e4 e5 Nf3 Nc6 Bb5"`. It is shorter when the game is, and ends at a null move and before a move that cannot be read. It is `null` when the game does not start from the standard position (a set-up position or Chess960) and when its moves cannot be read at all; such a game never fails the window |
+
+Rows of guiding texts and analyses have no `line`. The lines are read after
+the search and the sort, only for the window's games, and like the rows they
+are as stored at the moment they were read ([Consistency](#consistency)). A
+bridge older than this field ignores the parameter: a game row without `line`
+tells the client so.
 
 Text fields in a row are cut at 200 characters and then end with `…`; the
 game's PGN has them in full. A window therefore stays small however long a

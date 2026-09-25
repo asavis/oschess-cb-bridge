@@ -9,9 +9,11 @@
 //! own `.cbg` record.
 
 use cbformat::pgn::{self, Options, Rendered};
-use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Tournament};
+use cbformat::replay::{self, TreeVisitor};
+use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
 use cbformat::view::Base;
-use cbformat::{Result, cbh};
+use cbformat::{Error, Result, cbh};
+use chesscore::{Board, Move};
 
 use crate::api::MAX_GAME_BYTES;
 use crate::search::MAX_NAME_RECORD;
@@ -86,6 +88,13 @@ pub trait Store: Sync {
     /// Game `r` as PGN, refusing a move or annotation record larger than
     /// [`MAX_GAME_BYTES`] before it is read.
     fn render(&self, r: &Self::Head, options: &Options) -> Result<Rendered>;
+    /// The first `plies` plies of game `r`'s main line in SAN, as
+    /// [`Store::render`] writes them, separated by single spaces (#81). The
+    /// move record is read into `buf`, whose capacity bounds it as
+    /// [`MAX_GAME_BYTES`] does. `None` when the game does not start from the
+    /// standard position or its moves cannot be decoded; the line ends at a
+    /// null move and before damage. Only a failed read is an error.
+    fn main_line(&self, r: &Self::Head, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>>;
 }
 
 impl Head for v2::Record {
@@ -186,6 +195,26 @@ impl Store for v2::Database {
         let data = self.moves_of_within(r, MAX_GAME_BYTES)?;
         let annotations = self.annotations_of_within(r, MAX_GAME_BYTES)?;
         pgn::game_from(self, r, &data.moves()?, annotations.as_ref(), options)
+    }
+    fn main_line(&self, r: &v2::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
+        let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
+            Ok(data) => data,
+            Err(e @ Error::Io(..)) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let Ok(moves) = data.moves() else { return Ok(None) };
+        if moves.is_chess960() || !matches!(moves.start(), Ok(Start::Standard)) {
+            return Ok(None);
+        }
+        let mut board = Board::startpos();
+        let mut line = SanLine::default();
+        for word in moves.main_line().take(usize::from(plies)) {
+            let before = board.clone();
+            // A null move or damage ends the line.
+            let Ok(Some(mv)) = replay::play(&mut board, word) else { break };
+            line.push(&before, mv);
+        }
+        Ok(Some(line.text))
     }
 }
 
@@ -295,6 +324,69 @@ impl Store for cbh::Database {
         let data = self.moves_of_within(r, MAX_GAME_BYTES)?;
         let annotations = self.annotations_of_within(r, MAX_GAME_BYTES)?;
         pgn::classic_game_from(self, r, &data.moves()?, annotations.as_ref(), options)
+    }
+    fn main_line(&self, r: &cbh::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
+        let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
+            Ok(data) => data,
+            Err(e @ Error::Io(..)) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let Ok(moves) = data.moves() else { return Ok(None) };
+        if moves.is_chess960() || !matches!(moves.start(), Ok(Start::Standard)) {
+            return Ok(None);
+        }
+        // The compact encoding names a move by the position it is played in,
+        // so the tree is walked; the main line comes first in it. Damage ends
+        // the walk after the moves before it.
+        let mut main = ClassicLine { plies, line: SanLine::default(), pending: None, done: false };
+        let _ = cbh::walk(&moves, &mut main);
+        Ok(Some(main.line.text))
+    }
+}
+
+/// A main line's SAN, one space between moves.
+#[derive(Default)]
+struct SanLine {
+    text: String,
+    plies: u8,
+}
+
+impl SanLine {
+    fn push(&mut self, before: &Board, mv: Move) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        self.text.push_str(&pgn::san(before, mv));
+        self.plies += 1;
+    }
+}
+
+/// The main line of a classic game's tree walk, as far as `plies`.
+struct ClassicLine {
+    plies: u8,
+    line: SanLine,
+    /// A main-line move announced and not yet played: it counts once it is,
+    /// as an illegal move is reported before it is found to be one.
+    pending: Option<(Board, Move)>,
+    /// The line ended: at `plies`, a null move, or the first move off it.
+    done: bool,
+}
+
+impl TreeVisitor for ClassicLine {
+    fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool) {
+        if self.done {
+            return;
+        }
+        match mv.filter(|_| main_line && self.line.plies < self.plies) {
+            Some(mv) => self.pending = Some((before.clone(), mv)),
+            None => self.done = true,
+        }
+    }
+
+    fn played(&mut self, _after: &Board) {
+        if let Some((before, mv)) = self.pending.take() {
+            self.line.push(&before, mv);
+        }
     }
 }
 
