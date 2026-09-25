@@ -81,9 +81,10 @@ The reader decodes every game of a Mega Database 2026 — 11,964,285 games and
 963 million plies, including Chess960 games, set-up positions, variations and
 null moves — with every move checked for legality and for the piece it
 captures, in about 20 seconds on a desktop. Annotations are decoded for all
-423,390 annotated games of that database: comments, symbols, coloured squares
-and arrows go into the PGN, and every other annotation type is read by its
-layout and left out.
+423,390 annotated games of that database. Comments, symbols, coloured squares
+and arrows go into the PGN for reading; the full PGN form
+(`annotations=full`, [docs/api.md](docs/api.md)) also keeps every other
+annotation type, such as training questions, clocks and evaluations.
 
 The format is undocumented by its vendor. This reader is written from the
 reverse-engineered description in the
@@ -183,9 +184,8 @@ without linking.
 A version tag builds the release: `oschess-bridge.exe`, its per-user NSIS
 installer and their SHA-256, as a draft for the owner to publish
 ([docs/release.md](docs/release.md)). The app's updater reads the newest
-release's `latest.json` and installs only an installer signed with the key in
-`crates/app/tauri.conf.json`; while that key is a placeholder, the app does
-not look for updates.
+release's `latest.json` and installs only an installer signed with the updater
+key, whose public half is in `crates/app/tauri.conf.json`.
 
 ## Contributing
 

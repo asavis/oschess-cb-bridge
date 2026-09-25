@@ -10,7 +10,7 @@ publishes the draft.
 | `oschess-bridge-setup.exe` | The per-user NSIS installer: no administrator, `%LOCALAPPDATA%\oschess bridge`, Ukrainian or English. |
 | `oschess-bridge.exe` | The same app without the installer. |
 | `SHA256SUMS.txt` | The SHA-256 of both; the release notes list them too. |
-| `latest.json`, `oschess-bridge-setup.exe.sig` | Only once the updater key exists: what installed apps read to update themselves. |
+| `latest.json`, `oschess-bridge-setup.exe.sig` | What installed apps read to update themselves; made only while the updater secret is set (see [The updater key](#the-updater-key)). |
 
 The workflow runs on GitHub's hosted Windows runners, the one exception to the
 own-runners rule in [CLAUDE.md](../CLAUDE.md), because SignPath requires every
@@ -27,7 +27,7 @@ jobs, in order:
 4. **sign-installer**: SignPath signs the installer, once signing is on.
 5. **release**: checks that both files are signed or neither and that the
    signatures are valid, signs the installer for the updater and writes
-   `latest.json` once the updater key exists, computes the SHA-256, and
+   `latest.json` while the updater secret is set, computes the SHA-256, and
    creates the draft with the files, the checksums and notes generated from
    the merged pull requests.
 
@@ -53,8 +53,9 @@ last, over the installer as users download it.
 3. Follow the run under Actions → release. With signing on, approve both
    signing requests in SignPath; each job waits an hour for its approval.
 4. Check the draft before publishing it:
-   - It has both `.exe` files and `SHA256SUMS.txt`, and with the updater key
-     also `latest.json` naming the tag's version and `oschess-bridge-setup.exe.sig`.
+   - It has both `.exe` files and `SHA256SUMS.txt`, and while the updater
+     secret is set also `latest.json` naming the tag's version and
+     `oschess-bridge-setup.exe.sig`.
    - The downloaded files match their SHA-256
      (`Get-FileHash .\oschess-bridge-setup.exe`).
    - When signed: both files' Properties → Digital Signatures show the
@@ -125,12 +126,29 @@ uninstall the signed release on Windows 11 with Smart App Control on; if Smart
 App Control blocks one of those, signing them belongs in the bundle job, in a
 pull request of its own.
 
-## Switching on updates
+## The updater key
 
 The updater installs only an installer signed with the updater key, a key of
-its own, separate from the code signing certificate.
+its own, separate from the code signing certificate. It has been in place since
+#51:
 
-1. On your own computer, never in CI or in this repository, generate it:
+- Its public half is `plugins.updater.pubkey` in
+  `crates/app/tauri.conf.json`. `cargo test -p app` fails if that value is
+  neither a public key nor the `PLACEHOLDER` text of the builds before #51,
+  which the test still accepts and which turns updates off; the build job
+  below catches the placeholder when the secret is set.
+- Its private half and password are the secrets `TAURI_SIGNING_PRIVATE_KEY`
+  and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The build job fails when the
+  secret is set but `tauri.conf.json` holds the `PLACEHOLDER` text again, and
+  warns in the opposite case.
+- The owner keeps the private key and its password where they cannot be lost.
+  Installed apps take updates only signed with this key: without it they can
+  never be updated again, and everyone has to install the bridge by hand.
+
+To change the key:
+
+1. On your own computer, never in CI or in this repository, generate a new
+   one:
 
    ```
    npx @tauri-apps/cli signer generate -w oschess-bridge-updater.key
@@ -139,28 +157,22 @@ its own, separate from the code signing certificate.
    It asks for a password and writes the private key to
    `oschess-bridge-updater.key` and the public key to
    `oschess-bridge-updater.key.pub`.
-2. Add the secrets `TAURI_SIGNING_PRIVATE_KEY`, the private key file's
-   content, and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, its password.
-3. In a pull request, replace the `PLACEHOLDER` text of `plugins.updater.pubkey`
-   in `crates/app/tauri.conf.json` with the public key file's content.
-   `cargo test -p app` fails if it is not a public key.
-4. Keep the private key and its password where they cannot be lost. Installed
-   apps take updates only signed with this key: without it they can never be
-   updated again, and everyone has to install the bridge by hand. To change the
-   key, publish a release signed with the old key that carries the new public
-   key, and only then change the secrets.
+2. In a pull request, put the new public key file's content in
+   `plugins.updater.pubkey`, and publish a release of it, still signed with
+   the old key: installed apps take it, and with it the new public key.
+3. Only then replace the secrets with the new private key and its password.
 
-Do this before the first release that people install: a build with the
-placeholder never looks for updates, so its users install the next version by
-hand. The build job fails when the secret is set but the placeholder is still
-in `tauri.conf.json`, and warns in the opposite case.
+A build from before #51 carries the placeholder and never looks for updates,
+so its users install the next version by hand.
 
-With the key in place, the app reads
+The app reads
 `https://github.com/asavis/oschess-cb-bridge/releases/latest/download/latest.json`
 a minute after it starts and every six hours while «Update automatically» is
 on, and whenever the user asks from the menu or the settings. It downloads a
 newer version's installer and checks its signature and the version signed into
-it (`requireSignedVersion`). Once no database is downloading or opening, it
-runs the installer without a window. The installer replaces the app and starts
-it again, and the new start shows «Міст оновлено до X». A draft is never the
-latest release, so nothing updates before the owner publishes.
+it (`requireSignedVersion`). Once the bridge is idle, it runs the installer
+without a window: no database is downloading or opening, no position index is
+being built, no Stockfish is being installed, and no analysis began less than
+five minutes ago. The installer replaces the app and starts it again, and the
+new start shows «Міст оновлено до X». A draft is never the latest release, so
+nothing updates before the owner publishes.

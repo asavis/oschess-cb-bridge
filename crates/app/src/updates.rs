@@ -3,9 +3,10 @@
 //!
 //! The updater reads the `latest.json` of this repository's newest GitHub
 //! release and installs only an installer signed with the key whose public
-//! half is `plugins.updater.pubkey` in `tauri.conf.json`. Until the owner puts
-//! the real key there ([docs/release.md]), that value is a placeholder, and the
-//! app neither registers the updater nor looks for updates.
+//! half is `plugins.updater.pubkey` in `tauri.conf.json` ([docs/release.md]).
+//! A value that is no public key, such as the `PLACEHOLDER` text of the builds
+//! before #51, turns updates off: the app neither registers the updater nor
+//! looks for updates.
 //!
 //! [docs/release.md]: https://github.com/asavis/oschess-cb-bridge/blob/main/docs/release.md
 
@@ -136,10 +137,10 @@ mod tests {
         serde_json::json!({ "pubkey": pubkey, "endpoints": ["https://example.org/latest.json"] })
     }
 
-    /// With the placeholder that ships until the owner has a key, this build
-    /// registers no updater and never looks for updates: the app starts as
-    /// before. A key put in its place must be one, or this fails. The release
-    /// workflow tells the two apart by the same `PLACEHOLDER` prefix.
+    /// A shipped value that does not start with `PLACEHOLDER` must be a public
+    /// key, or this fails. The `PLACEHOLDER` text of the builds before #51 still
+    /// passes: with it, a build registers no updater and never looks for
+    /// updates. The release workflow tells the two apart by the same prefix.
     #[test]
     fn the_shipped_configuration_decides() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");

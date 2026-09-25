@@ -1,6 +1,6 @@
 //! Starting the bridge, shared by `oschess-bridge`, `cbtool bridge` and the
-//! Windows application to come: the settings, the port, the pairing token and the
-//! databases served.
+//! Windows application (`crates/app`): the settings, the port, the pairing
+//! token and the databases served.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

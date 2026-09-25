@@ -1,6 +1,6 @@
 [package]
 name = "cbtool"
-description = "Inspect, verify and export ChessBase 2 (.2cbh) chess databases, and run the oschess bridge in a console"
+description = "Inspect, verify and export ChessBase chess databases (.2cbh and classic .cbh), and run the oschess bridge in a console"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
