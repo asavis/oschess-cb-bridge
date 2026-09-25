@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use chesscore::{Board, Move, Piece, Square};
@@ -37,6 +37,10 @@ pub const MAX_MOVES: usize = 600;
 pub const MAX_FEN: usize = 128;
 /// The hash table when the configuration names none, before the memory cap.
 pub const DEFAULT_HASH_MB: u32 = 512;
+/// The smallest hash table an analysis may ask for.
+pub const MIN_HASH_MB: u32 = 16;
+/// The largest hash table an analysis may ask for, on any computer.
+pub const MAX_HASH_MB: u32 = 32_768;
 
 /// How long the engine may take to answer `uci` with `uciok`.
 const HANDSHAKE: Duration = Duration::from_secs(5);
@@ -70,10 +74,13 @@ pub struct EngineConfig {
 impl EngineConfig {
     /// `program` with `threads` and `hash_mb` where given, else the defaults:
     /// all logical processors but two, and [`DEFAULT_HASH_MB`] capped at a
-    /// quarter of the physical memory.
+    /// quarter of the physical memory. Either is kept within this computer's
+    /// [`limits`], so the engine starts, and an analysis naming neither runs,
+    /// with the defaults `/v1/status` reports.
     pub fn new(program: PathBuf, threads: Option<u32>, hash_mb: Option<u32>) -> Self {
-        let threads = threads.unwrap_or_else(default_threads).max(1);
-        let hash_mb = hash_mb.unwrap_or_else(default_hash_mb).max(1);
+        let limits = limits();
+        let threads = threads.unwrap_or_else(default_threads).clamp(1, limits.max_threads);
+        let hash_mb = hash_mb.unwrap_or_else(default_hash_mb).clamp(1, limits.max_hash_mb);
         EngineConfig { program, threads, hash_mb }
     }
 }
@@ -106,7 +113,35 @@ fn physical_memory_mb() -> Option<u64> {
     Some(kb >> 10)
 }
 
-/// What an analysis searches: a checked position and how long.
+/// What an analysis on this computer may ask the engine for (#58).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_threads: u32,
+    pub max_hash_mb: u32,
+}
+
+/// This computer's [`Limits`]: its logical processors, and the largest power
+/// of two at or below half its physical memory, from [`MIN_HASH_MB`] to
+/// [`MAX_HASH_MB`].
+pub fn limits() -> Limits {
+    static LIMITS: OnceLock<Limits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Limits {
+            max_threads: u32::try_from(threads).unwrap_or(u32::MAX).max(1),
+            max_hash_mb: max_hash_mb(physical_memory_mb()),
+        }
+    })
+}
+
+fn max_hash_mb(total_mb: Option<u64>) -> u32 {
+    let half = total_mb.map_or(u64::from(DEFAULT_HASH_MB), |t| t / 2);
+    let half = half.clamp(u64::from(MIN_HASH_MB), u64::from(MAX_HASH_MB));
+    1 << (u64::BITS - 1 - half.leading_zeros())
+}
+
+/// What an analysis searches: a checked position, how long, and the engine's
+/// `Threads` and `Hash` when the client names them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Search {
     /// The position as the engine is told it: a FEN written by `chesscore`, or
@@ -114,6 +149,8 @@ pub struct Search {
     position: String,
     pub multipv: u32,
     pub limit: Limit,
+    pub threads: Option<u32>,
+    pub hash_mb: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +210,26 @@ impl Search {
             position.push(' ');
             position.push_str(&uci);
         }
-        Ok(Search { position, multipv, limit })
+        Ok(Search { position, multipv, limit, threads: None, hash_mb: None })
+    }
+
+    /// This search with the engine's `Threads` and `Hash` as the client asks,
+    /// within `limits`; one left out keeps the configured default.
+    pub fn with_resources(
+        mut self,
+        threads: Option<u32>,
+        hash_mb: Option<u32>,
+        limits: Limits,
+    ) -> Result<Search, (&'static str, String)> {
+        if threads.is_some_and(|t| !(1..=limits.max_threads).contains(&t)) {
+            return Err(("threads", format!("threads is 1 to {}", limits.max_threads)));
+        }
+        if hash_mb.is_some_and(|h| !(MIN_HASH_MB..=limits.max_hash_mb).contains(&h)) {
+            return Err(("hash", format!("hash is {MIN_HASH_MB} to {} MB", limits.max_hash_mb)));
+        }
+        self.threads = threads;
+        self.hash_mb = hash_mb;
+        Ok(self)
     }
 
     fn go(&self) -> String {
@@ -332,6 +388,12 @@ impl Engine {
         Some(said.unwrap_or_else(|| file_stem(&inner.config.program)))
     }
 
+    /// The configured `Threads` and `Hash` for `/v1/status`, which an analysis
+    /// naming none uses; `None` without an engine.
+    pub fn defaults(&self) -> Option<(u32, u32)> {
+        self.current().map(|i| (i.config.threads, i.config.hash_mb))
+    }
+
     pub fn is_configured(&self) -> bool {
         self.current().is_some()
     }
@@ -433,7 +495,16 @@ impl Inner {
             let _ = sink.line(&error_line("engine_exited", "The engine stopped"));
             Outcome::Lost
         };
+        let threads = search.threads.unwrap_or(self.config.threads);
+        let hash_mb = search.hash_mb.unwrap_or(self.config.hash_mb);
         let mut setup = Vec::new();
+        // Stockfish takes both between searches; a new Hash clears its table.
+        if p.threads != threads {
+            setup.push(format!("setoption name Threads value {threads}"));
+        }
+        if p.hash_mb != hash_mb {
+            setup.push(format!("setoption name Hash value {hash_mb}"));
+        }
         if p.multipv != search.multipv {
             setup.push(format!("setoption name MultiPV value {}", search.multipv));
         }
@@ -442,7 +513,7 @@ impl Inner {
         if setup.iter().any(|c| p.send(c).is_err()) || p.wait_for("readyok", READY).is_none() {
             return exited(sink);
         }
-        p.multipv = search.multipv;
+        (p.threads, p.hash_mb, p.multipv) = (threads, hash_mb, search.multipv);
         if p.send(&search.go()).is_err() {
             return exited(sink);
         }
@@ -498,6 +569,9 @@ struct Process {
     stdin: ChildStdin,
     lines: Receiver<String>,
     name: String,
+    /// The `Threads`, `Hash` and `MultiPV` the engine was last set to.
+    threads: u32,
+    hash_mb: u32,
     multipv: u32,
     used: Instant,
 }
@@ -528,7 +602,16 @@ impl Process {
             .name("bridge-engine-out".into())
             .stack_size(crate::THREAD_STACK)
             .spawn(move || forward_lines(stdout, &tx));
-        let mut p = Process { child, stdin, lines, name: file_stem(&config.program), multipv: 1, used: Instant::now() };
+        let mut p = Process {
+            child,
+            stdin,
+            lines,
+            name: file_stem(&config.program),
+            threads: config.threads,
+            hash_mb: config.hash_mb,
+            multipv: 1,
+            used: Instant::now(),
+        };
         if p.send("uci").is_err() {
             return Err("The engine closed its input".into());
         }
@@ -779,6 +862,39 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_largest_hash_is_a_power_of_two_within_half_the_memory() {
+        assert_eq!(max_hash_mb(Some(16 * 1024)), 8192);
+        assert_eq!(max_hash_mb(Some(12 * 1024)), 4096);
+        assert_eq!(max_hash_mb(Some(1024 * 1024)), MAX_HASH_MB);
+        assert_eq!(max_hash_mb(Some(8)), MIN_HASH_MB);
+        assert_eq!(max_hash_mb(None), DEFAULT_HASH_MB);
+        let l = limits();
+        assert!(l.max_threads >= 1 && l.max_hash_mb.is_power_of_two());
+    }
+
+    #[test]
+    fn configured_threads_and_hash_are_kept_within_the_limits() {
+        let l = limits();
+        let c = EngineConfig::new("sf".into(), Some(u32::MAX), Some(u32::MAX));
+        assert_eq!((c.threads, c.hash_mb), (l.max_threads, l.max_hash_mb));
+        let c = EngineConfig::new("sf".into(), None, None);
+        assert!(c.threads <= l.max_threads && c.hash_mb <= l.max_hash_mb);
+    }
+
+    #[test]
+    fn a_search_takes_threads_and_hash_within_the_limits() {
+        let limits = Limits { max_threads: 8, max_hash_mb: 1024 };
+        let s = || Search::new(None, "", 1, Limit::Depth(1)).unwrap();
+        let ok = s().with_resources(Some(8), Some(1024), limits).unwrap();
+        assert_eq!((ok.threads, ok.hash_mb), (Some(8), Some(1024)));
+        assert_eq!(s().with_resources(None, None, limits).unwrap(), s());
+        assert_eq!(s().with_resources(Some(9), None, limits).unwrap_err().0, "threads");
+        assert_eq!(s().with_resources(Some(0), None, limits).unwrap_err().0, "threads");
+        assert_eq!(s().with_resources(None, Some(2048), limits).unwrap_err().0, "hash");
+        assert_eq!(s().with_resources(None, Some(8), limits).unwrap_err().0, "hash");
+    }
 
     #[test]
     fn checks_the_position_and_writes_it_for_the_engine() {

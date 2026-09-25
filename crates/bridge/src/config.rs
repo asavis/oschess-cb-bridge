@@ -63,8 +63,10 @@ databases = []
 # example \"https://staging.oschess.org\".
 # web = \"https://oschess.org\"
 
-# The UCI engine the analysis board uses, and optionally its threads and hash
-# table in megabytes; by default all processors but two and at most 512 MB.
+# The UCI engine the analysis board uses. oschess's engine panel sets its
+# threads and hash table for each analysis; engine_threads and engine_hash (MB)
+# are what it uses when oschess names none, by default all processors but two
+# and at most 512 MB.
 # For example engine = 'C:\\Program Files\\Stockfish\\stockfish.exe'
 ";
 
