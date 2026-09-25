@@ -3,7 +3,7 @@
 
 use cbformat::fixture::{self, TempDb, quiet, text};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
-use cbformat::game::{RecordKind, Start, language};
+use cbformat::game::{Date, Eco, GameResult, Head, RecordKind, Start, language};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, Options};
 use cbformat::replay::TreeVisitor;
@@ -131,6 +131,75 @@ fn names_and_header_fields() {
     assert!(old.names(&other).is_err());
     assert!(old.moves_of(&other).is_err());
     assert!(old.annotations_of(&other).is_err());
+}
+
+/// One mapping per format (#66): the same header fields, stored once in a
+/// 2CBH record and once in a classic one, read the same through [`Head`].
+#[test]
+fn every_header_field_reads_the_same_in_both_formats() {
+    let date: u32 = (2019 << 9) | (7 << 5) | 21;
+    // ECO B42/3, round 7(2), ratings 2710 and 2695, 41 moves, a draw.
+    let (eco, round, sub, elo, moves, result) = (43u16 * 128 + 3, 7u8, 2u8, (2710u16, 2695u16), 41u8, 1u8);
+
+    let mut b = fixture::Builder::new();
+    let m = b.moves(1, &[movetable::MOVES, quiet(W, Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    let r = b.game(m);
+    r[0x58] = result;
+    r[0x5a..0x5c].copy_from_slice(&i16::from(round).to_le_bytes());
+    r[0x5c..0x5e].copy_from_slice(&i16::from(sub).to_le_bytes());
+    r[0x60..0x62].copy_from_slice(&elo.0.to_le_bytes());
+    r[0x70..0x72].copy_from_slice(&elo.1.to_le_bytes());
+    r[0x80..0x82].copy_from_slice(&eco.to_le_bytes());
+    r[0x8a..0x8c].copy_from_slice(&i16::from(moves).to_le_bytes());
+    r[0xbc..0xc0].copy_from_slice(&date.to_le_bytes());
+    let f2 = b.write("view-2cbh-fields");
+
+    use Tok::{End as E, Mv as M};
+    let mut b = fixture_cbh::Builder::new();
+    let r = b.game(&move_record(0, None, None, &encode(&Board::startpos(), &[M("e2e4"), E], 0, false)));
+    r[0x1b] = result;
+    r[0x1d] = round;
+    r[0x1e] = sub;
+    r[0x1f..0x21].copy_from_slice(&elo.0.to_be_bytes());
+    r[0x21..0x23].copy_from_slice(&elo.1.to_be_bytes());
+    r[0x23..0x25].copy_from_slice(&eco.to_be_bytes());
+    r[0x2d] = moves;
+    r[0x18..0x1b].copy_from_slice(&date.to_be_bytes()[1..]);
+    let f1 = b.write("view-cbh-fields");
+
+    let fields = |h: Header| {
+        (
+            h.id(),
+            h.kind(),
+            h.is_deleted(),
+            h.other(),
+            h.result(),
+            h.eco(),
+            h.played_date(),
+            h.round(),
+            h.elo(),
+            h.move_count(),
+        )
+    };
+    let new = Base::open(f2.base()).unwrap();
+    let old = Base::open(f1.dir().join("db.cbh")).unwrap();
+    let two_cbh = fields(new.header(1).unwrap());
+    assert_eq!(two_cbh, fields(old.header(1).unwrap()));
+    assert_eq!(
+        two_cbh,
+        (
+            1,
+            RecordKind::Game,
+            false,
+            None,
+            GameResult::Draw,
+            Eco::Code { code: 42, sub: 3 },
+            Date(date as i32),
+            (7, 2),
+            (2710, 2695),
+            41
+        )
+    );
 }
 
 #[test]

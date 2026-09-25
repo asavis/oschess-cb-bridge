@@ -37,8 +37,8 @@ impl Line {
 /// Records read at a time.
 pub const RECORDS: usize = 2048;
 /// The largest move record's content indexed, as `GET .../games/{number}`
-/// serves (`crate::api::MAX_GAME_BYTES`). A larger one leaves its game out.
-pub const MAX_MOVE_RECORD: usize = crate::api::MAX_GAME_BYTES;
+/// serves (`crate::store::MAX_GAME_BYTES`). A larger one leaves its game out.
+pub const MAX_MOVE_RECORD: usize = crate::store::MAX_GAME_BYTES;
 /// The frame around a record's content and spare area.
 const FRAME_BYTES: usize = 64;
 /// The move buffer: a run's move records back to back when they fit, else one

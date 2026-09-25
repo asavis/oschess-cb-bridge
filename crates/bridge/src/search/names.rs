@@ -15,10 +15,6 @@ use crate::store::Store;
 const IDS_PER_WORKER_MIN: usize = 4096;
 /// Ids read between two cancellation checks.
 const IDS_PER_CHECK: usize = 1024;
-/// The longest entity record read for a name, in bytes. Real names are a few
-/// dozen bytes; a longer record, which only a damaged or hostile file holds,
-/// reads as an empty name, and none is ever read whole.
-pub const MAX_NAME_RECORD: usize = 4 << 10;
 /// Each name worker's workspace for one record, decoded and lowercased,
 /// reserved in the budget before the worker starts.
 const NAME_WORKSPACE: usize = 64 << 10;

@@ -1,5 +1,5 @@
 //! The database formats as the bridge reads them: [`Store`] over a format's
-//! database and [`Head`] over its header records, for search, sort,
+//! database and [`Head`], `cbformat`'s, over its header records, for search, sort,
 //! suggestions, the game list and the position index, and [`Any`] for a
 //! database of any format.
 //!
@@ -9,7 +9,8 @@
 //! own `.cbg` record. A PGN file holds games only, with annotators apart from
 //! players, and its games are served as the file writes them.
 
-use cbformat::game::{Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
+pub use cbformat::game::Head;
+use cbformat::game::{Player, Start, Tournament};
 use cbformat::pgn::{self, Options, Rendered};
 use cbformat::pgnfile::lex::Lexer;
 use cbformat::pgnfile::line::{LineEnd, main_line};
@@ -19,8 +20,15 @@ use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 use chesscore::{Board, Move};
 
-use crate::api::MAX_GAME_BYTES;
-use crate::search::MAX_NAME_RECORD;
+/// The largest move or annotation record, content or spare area, served as
+/// PGN. The largest record of any kind in a Mega Database is about 1.2 MB, a
+/// guiding text; a record near the reader's 64 MiB limit would take gigabytes
+/// to render.
+pub const MAX_GAME_BYTES: usize = 2 << 20;
+/// The longest entity record read for a name, in bytes. Real names are a few
+/// dozen bytes; a longer record, which only a damaged or hostile file holds,
+/// reads as an empty name, and none is ever read whole.
+pub const MAX_NAME_RECORD: usize = 4 << 10;
 
 /// The names a table holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,33 +40,6 @@ pub enum Kind {
     Annotators,
     /// Titles of guiding texts and analyses.
     Titles,
-}
-
-/// A header record: a game, a guiding text or an analysis. Entity ids are
-/// those of the database's tables ([`Kind`]).
-pub trait Head: Copy + Send + Sync {
-    fn id(&self) -> u32;
-    fn kind(&self) -> RecordKind;
-    fn is_deleted(&self) -> bool;
-    fn white(&self) -> i64;
-    fn black(&self) -> i64;
-    fn tournament(&self) -> i64;
-    /// A game's annotator, among [`Kind::Annotators`].
-    fn annotator(&self) -> i64;
-    /// For a record that is not a game, its title's key ([`Store::title`])
-    /// and its author, among [`Kind::Annotators`]; -1 where it has none.
-    /// Guiding texts and analyses have header layouts of their own.
-    fn other(&self) -> Option<(i64, i64)>;
-    fn result(&self) -> GameResult;
-    fn eco(&self) -> Eco;
-    fn played_date(&self) -> Date;
-    /// Round and sub-round; 0 or less when there is none.
-    fn round(&self) -> (i32, i32);
-    /// White's and black's ratings; 0 or less when unknown.
-    fn elo(&self) -> (i32, i32);
-    fn move_count(&self) -> i32;
-    /// The record as stored.
-    fn bytes(&self) -> &[u8];
 }
 
 /// A database of one format.
@@ -99,59 +80,6 @@ pub trait Store: Sync {
     /// standard position or its moves cannot be decoded; the line ends at a
     /// null move and before damage. Only a failed read is an error.
     fn main_line(&self, r: &Self::Head, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>>;
-}
-
-impl Head for v2::Record {
-    fn id(&self) -> u32 {
-        v2::Record::id(self)
-    }
-    fn kind(&self) -> RecordKind {
-        v2::Record::kind(self)
-    }
-    fn is_deleted(&self) -> bool {
-        v2::Record::is_deleted(self)
-    }
-    fn white(&self) -> i64 {
-        v2::Record::white(self)
-    }
-    fn black(&self) -> i64 {
-        v2::Record::black(self)
-    }
-    fn tournament(&self) -> i64 {
-        v2::Record::tournament(self)
-    }
-    fn annotator(&self) -> i64 {
-        v2::Record::annotator(self)
-    }
-    fn other(&self) -> Option<(i64, i64)> {
-        match v2::Record::kind(self) {
-            RecordKind::Game => None,
-            RecordKind::Text => Some((self.text_title(), self.text_author())),
-            RecordKind::Analysis => Some((self.analysis_title(), self.analysis_author())),
-            RecordKind::Unknown(_) => Some((-1, -1)),
-        }
-    }
-    fn result(&self) -> GameResult {
-        v2::Record::result(self)
-    }
-    fn eco(&self) -> Eco {
-        v2::Record::eco(self)
-    }
-    fn played_date(&self) -> Date {
-        v2::Record::played_date(self)
-    }
-    fn round(&self) -> (i32, i32) {
-        (i32::from(v2::Record::round(self)), i32::from(self.subround()))
-    }
-    fn elo(&self) -> (i32, i32) {
-        (i32::from(self.white_elo()), i32::from(self.black_elo()))
-    }
-    fn move_count(&self) -> i32 {
-        i32::from(v2::Record::move_count(self))
-    }
-    fn bytes(&self) -> &[u8] {
-        v2::Record::bytes(self)
-    }
 }
 
 impl Store for v2::Database {
@@ -214,60 +142,6 @@ impl Store for v2::Database {
         let mut prefix = LinePrefix::new(plies);
         let walked = replay::walk(&moves, &mut prefix);
         Ok(prefix.finish(walked.is_ok()))
-    }
-}
-
-impl Head for cbh::Record {
-    fn id(&self) -> u32 {
-        cbh::Record::id(self)
-    }
-    fn kind(&self) -> RecordKind {
-        cbh::Record::kind(self)
-    }
-    fn is_deleted(&self) -> bool {
-        cbh::Record::is_deleted(self)
-    }
-    fn white(&self) -> i64 {
-        i64::from(cbh::Record::white(self))
-    }
-    fn black(&self) -> i64 {
-        i64::from(cbh::Record::black(self))
-    }
-    fn tournament(&self) -> i64 {
-        i64::from(cbh::Record::tournament(self))
-    }
-    fn annotator(&self) -> i64 {
-        i64::from(cbh::Record::annotator(self))
-    }
-    /// A guiding text's title is in its `.cbg` record: its key is the text's
-    /// number. The format has no analyses.
-    fn other(&self) -> Option<(i64, i64)> {
-        match cbh::Record::kind(self) {
-            RecordKind::Game => None,
-            RecordKind::Text => Some((i64::from(self.id()), i64::from(cbh::Record::annotator(self)))),
-            _ => Some((-1, -1)),
-        }
-    }
-    fn result(&self) -> GameResult {
-        cbh::Record::result(self)
-    }
-    fn eco(&self) -> Eco {
-        cbh::Record::eco(self)
-    }
-    fn played_date(&self) -> Date {
-        cbh::Record::played_date(self)
-    }
-    fn round(&self) -> (i32, i32) {
-        (i32::from(cbh::Record::round(self)), i32::from(self.subround()))
-    }
-    fn elo(&self) -> (i32, i32) {
-        (i32::from(self.white_elo()), i32::from(self.black_elo()))
-    }
-    fn move_count(&self) -> i32 {
-        i32::from(cbh::Record::move_count(self))
-    }
-    fn bytes(&self) -> &[u8] {
-        cbh::Record::bytes(self)
     }
 }
 
@@ -405,56 +279,6 @@ impl TreeVisitor for LinePrefix {
 
     fn stopped(&self) -> bool {
         self.done
-    }
-}
-
-impl Head for pgnfile::Record {
-    fn id(&self) -> u32 {
-        pgnfile::Record::id(self)
-    }
-    fn kind(&self) -> RecordKind {
-        RecordKind::Game
-    }
-    fn is_deleted(&self) -> bool {
-        false
-    }
-    fn white(&self) -> i64 {
-        pgnfile::Record::white(self)
-    }
-    fn black(&self) -> i64 {
-        pgnfile::Record::black(self)
-    }
-    fn tournament(&self) -> i64 {
-        pgnfile::Record::tournament(self)
-    }
-    fn annotator(&self) -> i64 {
-        pgnfile::Record::annotator(self)
-    }
-    fn other(&self) -> Option<(i64, i64)> {
-        None
-    }
-    fn result(&self) -> GameResult {
-        pgnfile::Record::result(self)
-    }
-    fn eco(&self) -> Eco {
-        pgnfile::Record::eco(self)
-    }
-    fn played_date(&self) -> Date {
-        pgnfile::Record::played_date(self)
-    }
-    fn round(&self) -> (i32, i32) {
-        let (round, sub) = pgnfile::Record::round(self);
-        (i32::from(round), i32::from(sub))
-    }
-    fn elo(&self) -> (i32, i32) {
-        let (white, black) = pgnfile::Record::elo(self);
-        (i32::from(white), i32::from(black))
-    }
-    fn move_count(&self) -> i32 {
-        i32::from(pgnfile::Record::move_count(self))
-    }
-    fn bytes(&self) -> &[u8] {
-        pgnfile::Record::bytes(self)
     }
 }
 

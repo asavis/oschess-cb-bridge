@@ -9,11 +9,12 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
-use bridge::api::{App, MAX_GAME_BYTES};
+use bridge::api::App;
 use bridge::catalog::{Catalog, State, id_of};
 use bridge::search::{self, Indexes, SearchError, Selection};
 use bridge::server;
 use bridge::store::Any;
+use bridge::store::MAX_GAME_BYTES;
 use cbformat::codepage::CodePage;
 use cbformat::fixture::pgn_file;
 use cbformat::pgnfile;

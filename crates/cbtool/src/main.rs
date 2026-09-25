@@ -11,7 +11,7 @@ use std::time::Instant;
 
 mod databases;
 
-use cbformat::game::{RecordKind, Start};
+use cbformat::game::{Head, RecordKind, Start};
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::pgn::{AnnotationStatus, Options};
 use cbformat::replay::walk_tree;

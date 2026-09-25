@@ -14,7 +14,6 @@ mod sort;
 mod suggest;
 pub mod workers;
 
-pub use names::MAX_NAME_RECORD;
 pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
 

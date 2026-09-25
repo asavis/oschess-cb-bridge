@@ -3,7 +3,7 @@
 
 use super::HEADER_RECORD_SIZE;
 use super::bytes::{le_i16, le_i32, le_i64, le_u16, le_u32};
-use crate::game::{Date, Eco, GameResult, RecordKind};
+use crate::game::{Date, Eco, GameResult, Head, RecordKind};
 
 /// A 192-byte `.2cbh` record.
 #[derive(Clone, Copy)]
@@ -115,6 +115,59 @@ impl Record {
     }
     pub fn played_date(&self) -> Date {
         Date(le_i32(&self.b, 0xbc))
+    }
+}
+
+impl Head for Record {
+    fn id(&self) -> u32 {
+        Record::id(self)
+    }
+    fn kind(&self) -> RecordKind {
+        Record::kind(self)
+    }
+    fn is_deleted(&self) -> bool {
+        Record::is_deleted(self)
+    }
+    fn white(&self) -> i64 {
+        Record::white(self)
+    }
+    fn black(&self) -> i64 {
+        Record::black(self)
+    }
+    fn tournament(&self) -> i64 {
+        Record::tournament(self)
+    }
+    fn annotator(&self) -> i64 {
+        Record::annotator(self)
+    }
+    fn other(&self) -> Option<(i64, i64)> {
+        match Record::kind(self) {
+            RecordKind::Game => None,
+            RecordKind::Text => Some((self.text_title(), self.text_author())),
+            RecordKind::Analysis => Some((self.analysis_title(), self.analysis_author())),
+            RecordKind::Unknown(_) => Some((-1, -1)),
+        }
+    }
+    fn result(&self) -> GameResult {
+        Record::result(self)
+    }
+    fn eco(&self) -> Eco {
+        Record::eco(self)
+    }
+    fn played_date(&self) -> Date {
+        Record::played_date(self)
+    }
+    fn round(&self) -> (i32, i32) {
+        (i32::from(Record::round(self)), i32::from(self.subround()))
+    }
+    fn elo(&self) -> (i32, i32) {
+        (i32::from(self.white_elo()), i32::from(self.black_elo()))
+    }
+    fn move_count(&self) -> i32 {
+        i32::from(Record::move_count(self))
+    }
+    fn bytes(&self) -> &[u8] {
+        Record::bytes(self)
     }
 }
 

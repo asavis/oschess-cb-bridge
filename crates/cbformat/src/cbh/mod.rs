@@ -41,6 +41,12 @@ pub const EXTENSIONS: [&str; 19] = [
     ".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj", ".cbe", ".cbl", ".cbtt", ".flags", ".cbm", ".cit",
     ".cib", ".cit2", ".cib2", ".cbb", ".cbgi",
 ];
+/// The files the reader opens, the header file first: headers, moves and
+/// texts, annotations, the four entity files, and the 64-bit offsets ChessBase
+/// adds for files over 4 GiB (#66). [`Database::open`] opens no other, and in
+/// a debug build it stops at a file not listed here, so that a reader change
+/// updates this list. The bridge follows these files to see a database change.
+pub const READ: [&str; 8] = [".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj"];
 /// Files that sit beside a classic database under its name without being part
 /// of the format: settings, icon, and the opening key files. An export must
 /// not overwrite them either.
@@ -83,6 +89,7 @@ impl Database {
             path.to_owned()
         };
         let with = |ext: &str| {
+            debug_assert!(READ.contains(&ext), "the classic reader opens {ext}, which cbh::READ does not list");
             let mut s = stem.clone().into_os_string();
             s.push(ext);
             PathBuf::from(s)

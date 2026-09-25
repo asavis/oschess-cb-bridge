@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use cbformat::game::{Annotation, RecordKind};
+use cbformat::game::{Annotation, Head, RecordKind};
 use cbformat::pgn::{self, Options};
 use cbformat::view::{Base, Format};
 

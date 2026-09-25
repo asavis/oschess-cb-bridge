@@ -11,7 +11,7 @@
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::game::{Date, Eco, GameAnnotations, GameResult, Player, RecordKind, Start, Tournament};
+use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Player, RecordKind, Start, Tournament};
 use crate::pgn::{self, Options, Rendered};
 use crate::replay::{self, TreeStats, TreeVisitor};
 use crate::v2;
@@ -219,17 +219,27 @@ fn pgn_text(db: &pgnfile::Database, r: &pgnfile::Record) -> Result<Rendered> {
     Ok(Rendered { pgn: db.text(r, pgnfile::MAX_TEXT)?, annotations: pgn::AnnotationStatus::Complete })
 }
 
-/// The format of the database `path` names; see [`Base::open`].
+impl Format {
+    /// The format whose file `path` names by its extension, in any case:
+    /// `.2cbh`, `.cbh` or `.pgn`; `None` for any other. The one test of a
+    /// path's format (#66): the bridge takes a path it does not recognise as
+    /// no database, and [`format_of`] guesses only for a bare stem.
+    pub fn of_extension(path: &Path) -> Option<Format> {
+        let ext = path.extension()?;
+        [(Format::TwoCbh, "2cbh"), (Format::Cbh, "cbh"), (Format::Pgn, "pgn")]
+            .into_iter()
+            .find(|(_, name)| ext.eq_ignore_ascii_case(name))
+            .map(|(format, _)| format)
+    }
+}
+
+/// The format of the database `path` names; see [`Base::open`]. A path
+/// without one of the extensions of [`Format::of_extension`] is taken as a
+/// database's stem: classic when only its `.cbh` file is there, else 2CBH,
+/// whose error then names what is missing.
 pub fn format_of(path: &Path) -> Format {
-    let has = |ext: &str| path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
-    if has("2cbh") {
-        return Format::TwoCbh;
-    }
-    if has("cbh") {
-        return Format::Cbh;
-    }
-    if has("pgn") {
-        return Format::Pgn;
+    if let Some(format) = Format::of_extension(path) {
+        return format;
     }
     let with = |ext: &str| {
         let mut s = path.as_os_str().to_owned();
@@ -243,7 +253,8 @@ fn other_format() -> Error {
     Error::Format("a header of one format given to a database of the other".into())
 }
 
-/// A header record of any format. Its fields are read as the 2CBH ones.
+/// A header record of any format. Its fields are the ones [`Head`] reads,
+/// each mapped by the record's own format.
 #[derive(Clone, Copy)]
 pub enum Header {
     TwoCbh(v2::Record),
@@ -251,74 +262,62 @@ pub enum Header {
     Pgn(pgnfile::Record),
 }
 
-impl Header {
-    pub fn id(&self) -> u32 {
-        match self {
-            Header::TwoCbh(r) => r.id(),
-            Header::Cbh(r) => r.id(),
-            Header::Pgn(r) => r.id(),
+/// `$body` for the record inside `$header`, whatever its format.
+macro_rules! each {
+    ($header:expr, $r:ident => $body:expr) => {
+        match $header {
+            Header::TwoCbh($r) => $body,
+            Header::Cbh($r) => $body,
+            Header::Pgn($r) => $body,
         }
+    };
+}
+
+impl Head for Header {
+    fn id(&self) -> u32 {
+        each!(self, r => Head::id(r))
     }
-    /// A PGN file holds games only.
-    pub fn kind(&self) -> RecordKind {
-        match self {
-            Header::TwoCbh(r) => r.kind(),
-            Header::Cbh(r) => r.kind(),
-            Header::Pgn(_) => RecordKind::Game,
-        }
+    fn kind(&self) -> RecordKind {
+        each!(self, r => Head::kind(r))
     }
-    pub fn is_deleted(&self) -> bool {
-        match self {
-            Header::TwoCbh(r) => r.is_deleted(),
-            Header::Cbh(r) => r.is_deleted(),
-            Header::Pgn(_) => false,
-        }
+    fn is_deleted(&self) -> bool {
+        each!(self, r => Head::is_deleted(r))
     }
-    pub fn result(&self) -> GameResult {
-        match self {
-            Header::TwoCbh(r) => r.result(),
-            Header::Cbh(r) => r.result(),
-            Header::Pgn(r) => r.result(),
-        }
+    fn white(&self) -> i64 {
+        each!(self, r => Head::white(r))
     }
-    pub fn eco(&self) -> Eco {
-        match self {
-            Header::TwoCbh(r) => r.eco(),
-            Header::Cbh(r) => r.eco(),
-            Header::Pgn(r) => r.eco(),
-        }
+    fn black(&self) -> i64 {
+        each!(self, r => Head::black(r))
     }
-    pub fn played_date(&self) -> Date {
-        match self {
-            Header::TwoCbh(r) => r.played_date(),
-            Header::Cbh(r) => r.played_date(),
-            Header::Pgn(r) => r.played_date(),
-        }
+    fn tournament(&self) -> i64 {
+        each!(self, r => Head::tournament(r))
     }
-    /// Round and sub-round; 0 when unknown.
-    pub fn round(&self) -> (i32, i32) {
-        match self {
-            Header::TwoCbh(r) => (i32::from(r.round()), i32::from(r.subround())),
-            Header::Cbh(r) => (i32::from(r.round()), i32::from(r.subround())),
-            Header::Pgn(r) => (i32::from(r.round().0), i32::from(r.round().1)),
-        }
+    fn annotator(&self) -> i64 {
+        each!(self, r => Head::annotator(r))
     }
-    /// White's and black's ratings; 0 when unknown.
-    pub fn elo(&self) -> (i32, i32) {
-        match self {
-            Header::TwoCbh(r) => (i32::from(r.white_elo()), i32::from(r.black_elo())),
-            Header::Cbh(r) => (i32::from(r.white_elo()), i32::from(r.black_elo())),
-            Header::Pgn(r) => (i32::from(r.elo().0), i32::from(r.elo().1)),
-        }
+    fn other(&self) -> Option<(i64, i64)> {
+        each!(self, r => Head::other(r))
     }
-    /// Moves in the main line, as the header stores them (the classic format
-    /// caps them at 255; a PGN file's are counted as written).
-    pub fn move_count(&self) -> i32 {
-        match self {
-            Header::TwoCbh(r) => i32::from(r.move_count()),
-            Header::Cbh(r) => i32::from(r.move_count()),
-            Header::Pgn(r) => i32::from(r.move_count()),
-        }
+    fn result(&self) -> GameResult {
+        each!(self, r => Head::result(r))
+    }
+    fn eco(&self) -> Eco {
+        each!(self, r => Head::eco(r))
+    }
+    fn played_date(&self) -> Date {
+        each!(self, r => Head::played_date(r))
+    }
+    fn round(&self) -> (i32, i32) {
+        each!(self, r => Head::round(r))
+    }
+    fn elo(&self) -> (i32, i32) {
+        each!(self, r => Head::elo(r))
+    }
+    fn move_count(&self) -> i32 {
+        each!(self, r => Head::move_count(r))
+    }
+    fn bytes(&self) -> &[u8] {
+        each!(self, r => Head::bytes(r))
     }
 }
 
