@@ -846,25 +846,35 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
     root.window(&[(&a, "Windowed")]);
     let home = root.path("home");
     std::fs::create_dir_all(&home).unwrap();
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-    std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oschess-bridge"))
-        .env("OSCHESS_BRIDGE_HOME", &home)
-        .env("OSCHESS_BRIDGE_DOCUMENTS", &root.0)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut out = child.stdout.take().unwrap();
+    // A port found free may be taken by another test's bridge before this one
+    // binds it; that bridge then ends at once, and starts again on another
+    // port (#63).
     let mut text = String::new();
-    let mut buf = [0u8; 256];
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !text.contains("Windowed") && Instant::now() < deadline {
-        match out.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+    for _ in 0..10 {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oschess-bridge"))
+            .env("OSCHESS_BRIDGE_HOME", &home)
+            .env("OSCHESS_BRIDGE_DOCUMENTS", &root.0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = child.stdout.take().unwrap();
+        text.clear();
+        let mut buf = [0u8; 256];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !text.contains("Windowed") && Instant::now() < deadline {
+            match out.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if !text.is_empty() {
+            break;
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
     assert!(text.contains(&format!("{} [ready] Windowed", id_of(&a))), "{text}");
 }

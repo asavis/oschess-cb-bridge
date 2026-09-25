@@ -1,6 +1,16 @@
 //! What the test files share: the fixture of `docs/search-grammar.md`,
 //! written as a 2CBH database and as a classic one with the same content.
 //! Each test file uses a part of it.
+//!
+//! The search memory budget (`search::memory`), the answer budget
+//! (`budget`) and the search workers (`search::workers`) are one per
+//! process, and `cargo test` runs the tests of a binary beside each other.
+//! So a test that asserts on their totals (`held()`, `taken()`) needs the
+//! process to itself (#63). `search_budget.rs` and `explorer_budget.rs` hold
+//! one such test each; the tests of `explorer_small_budget.rs` each run again
+//! in a child process of their own. A second test beside one of them must not
+//! reserve from those budgets, or it belongs in a binary of its own. Anywhere
+//! else, a test asserts on its own holds only.
 #![allow(dead_code)]
 
 use cbformat::fixture::{Builder, TempDb, quiet};

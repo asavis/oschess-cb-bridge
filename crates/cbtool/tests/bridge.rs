@@ -29,26 +29,37 @@ fn home(name: &str, port: Option<u16>) -> PathBuf {
 
 #[test]
 fn bridge_serves_in_the_console_and_prints_the_pairing_link() {
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let home = home("serve", Some(port));
-    let mut bridge = Running(
-        Command::new(env!("CARGO_BIN_EXE_cbtool"))
-            .args(["bridge", "--show-token", "--database", "missing.2cbh"])
-            .env("OSCHESS_BRIDGE_HOME", &home)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let mut lines = Vec::new();
-    for line in BufReader::new(bridge.0.stdout.take().unwrap()).lines() {
-        let line = line.unwrap();
-        let last = line.starts_with("pairing link: ");
-        lines.push(line);
-        if last {
+    // A port found free may be taken by another test's bridge before this one
+    // binds it; that bridge then ends printing nothing, and starts again on
+    // another port (asavis/oschess-cb-bridge#63).
+    let (mut port, mut home_dir, mut bridge, mut lines) = (0, PathBuf::new(), None, Vec::new());
+    for _ in 0..10 {
+        port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        home_dir = home("serve", Some(port));
+        let mut started = Running(
+            Command::new(env!("CARGO_BIN_EXE_cbtool"))
+                .args(["bridge", "--show-token", "--database", "missing.2cbh"])
+                .env("OSCHESS_BRIDGE_HOME", &home_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        lines.clear();
+        for line in BufReader::new(started.0.stdout.take().unwrap()).lines() {
+            let line = line.unwrap();
+            let last = line.starts_with("pairing link: ");
+            lines.push(line);
+            if last {
+                break;
+            }
+        }
+        if !lines.is_empty() {
+            bridge = Some(started);
             break;
         }
     }
+    let (home, bridge) = (home_dir, bridge);
     let link = lines.last().and_then(|l| l.strip_prefix("pairing link: ")).unwrap_or_else(|| panic!("{lines:?}"));
     let token = std::fs::read_to_string(home.join("token")).unwrap().trim().to_string();
     assert_eq!(link, format!("https://oschess.org/library?source=chessbase#cb-bridge={token}&port={port}"));
