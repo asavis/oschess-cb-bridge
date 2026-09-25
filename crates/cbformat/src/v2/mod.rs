@@ -32,7 +32,7 @@ use file::DbFile;
 pub use frame::checksum;
 use frame::{FRAME_HEADER, MAX_FRAME_PART, frame_sizes, parse_frame};
 pub use moves::{GameMoves, Setup, Start, Token};
-pub use record::{Date, Eco, GameResult, Record, RecordKind};
+pub use record::{Date, Eco, GameResult, ROUND_TEXT_BYTES, Record, RecordKind, round_text};
 pub use window::MoveWindow;
 
 pub const HEADER_RECORD_SIZE: usize = 192;

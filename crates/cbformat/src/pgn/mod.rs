@@ -206,12 +206,10 @@ fn finish(tags: &Tags, text: &str, annotations: Option<&GameAnnotations>) -> Ren
     tag(&mut out, "Event", t.map(|t| t.title.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
     tag(&mut out, "Site", t.map(|t| t.place.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
     tag(&mut out, "Date", &tags.date.pgn());
-    let round = match tags.round {
-        (0, _) => "?".to_string(),
-        (n, 0) => n.to_string(),
-        (n, s) => format!("{n}({s})"),
-    };
-    tag(&mut out, "Round", &round);
+    // The round as the game list shows it (#68); `?` where it shows none.
+    let mut buf = [0; crate::v2::ROUND_TEXT_BYTES];
+    let round = crate::v2::round_text(tags.round.0, tags.round.1, &mut buf);
+    tag(&mut out, "Round", if round.is_empty() { "?" } else { round });
     tag(&mut out, "White", &name(&tags.white));
     tag(&mut out, "Black", &name(&tags.black));
     tag(&mut out, "Result", tags.result.pgn());

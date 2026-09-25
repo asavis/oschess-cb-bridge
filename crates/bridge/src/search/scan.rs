@@ -3,10 +3,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cbformat::v2::HEADER_RECORD_SIZE;
+use cbformat::v2::{HEADER_RECORD_SIZE, ROUND_TEXT_BYTES, round_text};
 
 use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
-use super::fields::{date_text, eco_text, round_text};
 
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Refused};
@@ -246,13 +245,19 @@ impl Test {
             },
             Test::Event { tournaments, .. } => tournaments.contains_id(r.tournament()),
             Test::Result(result) => r.result().pgn() == result,
-            Test::Eco(cmps) => eco_text(r).is_some_and(|e| cmps.iter().all(|c| c.holds(&e))),
+            // The fields as the list shows them (#68).
+            Test::Eco(cmps) => r.eco().code_text().is_some_and(|e| cmps.iter().all(|c| c.holds(&e))),
             Test::Date { cmps, known } => {
-                let d = date_text(r);
+                let d = r.played_date().text();
                 !d[..(*known).min(10)].contains(&b'?') && cmps.iter().all(|c| c.holds(&d))
             }
-            Test::DateContains(needle) => std::str::from_utf8(&date_text(r)).is_ok_and(|d| d.contains(needle.as_str())),
-            Test::Round(needle) => round_text(r, &mut [0; 16]).contains(needle.as_str()),
+            Test::DateContains(needle) => {
+                std::str::from_utf8(&r.played_date().text()).is_ok_and(|d| d.contains(needle.as_str()))
+            }
+            Test::Round(needle) => {
+                let (round, sub) = r.round();
+                round_text(round, sub, &mut [0; ROUND_TEXT_BYTES]).contains(needle.as_str())
+            }
             Test::Moves(cmp) => cmp.holds(i64::from(r.move_count())),
             Test::Elo(cmp) => {
                 let (white, black) = r.elo();

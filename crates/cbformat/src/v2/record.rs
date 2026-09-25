@@ -189,12 +189,21 @@ impl Eco {
         }
     }
 
-    /// The PGN `ECO` tag value, for an opening code.
-    pub fn pgn(self) -> Option<String> {
+    /// The opening code, `A00`..`E99`, when the field holds one; the text the
+    /// game list shows, the search matches and the PGN `ECO` tag holds (#68).
+    /// Allocation-free, for searches over millions of records.
+    pub fn code_text(self) -> Option<[u8; 3]> {
         match self {
-            Eco::Code { code, .. } => Some(format!("{}{:02}", (b'A' + (code / 100) as u8) as char, code % 100)),
+            Eco::Code { code, .. } => {
+                Some([b'A' + (code / 100) as u8, b'0' + (code / 10 % 10) as u8, b'0' + (code % 10) as u8])
+            }
             _ => None,
         }
+    }
+
+    /// The PGN `ECO` tag value, for an opening code: [`Eco::code_text`].
+    pub fn pgn(self) -> Option<String> {
+        self.code_text().map(|t| t.iter().map(|&b| char::from(b)).collect())
     }
 }
 
@@ -212,11 +221,71 @@ impl Date {
     pub fn year(self) -> u16 {
         ((self.0 >> 9) & 0xfff) as u16
     }
-    /// The date as a PGN `Date` tag value.
-    pub fn pgn(self) -> String {
-        let part = |v: u32, w: usize| if v == 0 { "?".repeat(w) } else { format!("{v:0w$}") };
-        format!("{}.{}.{}", part(self.year() as u32, 4), part(self.month() as u32, 2), part(self.day() as u32, 2))
+    /// The date as PGN writes it, `YYYY.MM.DD` with `?` for an unknown part:
+    /// the text the game list shows, the search matches and the PGN `Date` tag
+    /// holds (#68). Allocation-free, for searches over millions of records.
+    pub fn text(self) -> [u8; 10] {
+        let mut out = *b"????.??.??";
+        let mut put = |at: usize, width: usize, v: u32| {
+            if v != 0 {
+                let mut v = v;
+                for i in (0..width).rev() {
+                    out[at + i] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                }
+            }
+        };
+        put(0, 4, u32::from(self.year()));
+        put(5, 2, u32::from(self.month()));
+        put(8, 2, u32::from(self.day()));
+        out
     }
+
+    /// The date as a PGN `Date` tag value: [`Date::text`].
+    pub fn pgn(self) -> String {
+        self.text().iter().map(|&b| char::from(b)).collect()
+    }
+}
+
+/// The longest [`round_text`]: two 10-digit numbers and the parentheses.
+pub const ROUND_TEXT_BYTES: usize = 22;
+
+/// A round and sub-round as the game list shows them, the search matches them
+/// and the PGN `Round` tag holds them (#68): `5`, `5(2)` with a sub-round, or
+/// empty when there is no round. A round of 0 or less is no round, and a
+/// sub-round of 0 or less no sub-round: 2CBH stores both signed, and a
+/// negative value is not a round. The PGN writer writes `?` for empty.
+/// Written into `buf`, without allocating.
+pub fn round_text(round: i32, sub: i32, buf: &mut [u8; ROUND_TEXT_BYTES]) -> &str {
+    let mut len = 0;
+    if round > 0 {
+        len = put_number(buf, len, round.unsigned_abs());
+        if sub > 0 {
+            buf[len] = b'(';
+            len = put_number(buf, len + 1, sub.unsigned_abs());
+            buf[len] = b')';
+            len += 1;
+        }
+    }
+    std::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// Writes `v` in decimal into `buf` at `at`; where it ends.
+fn put_number(buf: &mut [u8], at: usize, v: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let (mut v, mut n) = (v, 0);
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for (i, &d) in digits[..n].iter().rev().enumerate() {
+        buf[at + i] = d;
+    }
+    at + n
 }
 
 #[cfg(test)]
@@ -241,6 +310,19 @@ mod tests {
             assert_eq!(eco(v), Eco::Invalid(v), "{v}");
             assert_eq!(eco(v).pgn(), None);
         }
+    }
+
+    #[test]
+    fn round_text_shows_no_round_for_zero_or_less() {
+        let text = |n, s| round_text(n, s, &mut [0; ROUND_TEXT_BYTES]).to_string();
+        assert_eq!(text(5, 0), "5");
+        assert_eq!(text(5, 2), "5(2)");
+        assert_eq!(text(5, -1), "5");
+        assert_eq!(text(0, 3), "");
+        assert_eq!(text(-1, 0), "");
+        assert_eq!(text(i32::MIN, 5), "");
+        assert_eq!(text(i32::MAX, i32::MAX), "2147483647(2147483647)");
+        assert_eq!(text(i32::MAX, i32::MAX).len(), ROUND_TEXT_BYTES);
     }
 
     #[test]
