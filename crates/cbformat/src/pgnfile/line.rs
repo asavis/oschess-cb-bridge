@@ -45,7 +45,7 @@ pub fn main_line(text: &[u8], lexer: &mut Lexer, visit: &mut dyn FnMut(&Board, O
     };
     lexer.reset(0);
     lexer.feed(text, &mut walk);
-    lexer.finish(&mut walk);
+    lexer.finish(&mut walk, false);
     if let Some(end) = walk.end {
         return end;
     }

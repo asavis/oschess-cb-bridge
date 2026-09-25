@@ -363,9 +363,10 @@ of the same games answers, apart from what the format has otherwise:
   first move when it has none, and ends at its result or where the next
   game's tags start after its moves; a tag the game already has also starts
   the next game, and a comment between tags does not. A line ends at LF, CR
-  or both, and a tag pair may span lines. A comment left open ends where a
-  game's header starts: a line starting `[Event "` whose next line starts
-  with a tag.
+  or both, and a tag pair may span lines. A `{` comment ends at its `}`,
+  whatever it holds; one still open at the end of the file was left open by
+  mistake, and ends before its first line starting `[Event "`, from where the
+  file is read on (at most 64 times in a file).
 - **Fields.** A row's fields come from the tags. `White` and `Black` are
   players, split at the first comma into `Last, First`; `?`, `-` or nothing is
   no name. `Event` and `Site` are the tournament's title and place. `Date`,

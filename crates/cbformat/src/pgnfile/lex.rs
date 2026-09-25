@@ -8,13 +8,11 @@
 //! The lexer is lenient, as PGN in the wild needs, and nothing it reads is an
 //! error. A line ends at LF, CR or both. A tag pair may span lines between its
 //! tokens; a tag whose value is not closed on its line ends there, and one
-//! whose `]` is missing ends after its value. A comment left open is closed
-//! where a game's header starts: a line starting `[Event "` whose next line
-//! starts with a tag. A comment that quotes an `Event` line followed by its
-//! own text stays one comment. The header's first line is then read again as
-//! tokens, so every byte is read at most twice.
-
-use std::collections::VecDeque;
+//! whose `]` is missing ends after its value. A `{` comment ends at its `}`,
+//! whatever it holds. Only a comment still open at the end of the text is
+//! taken for one left open by mistake: [`Lexer::finish`] then ends it before
+//! its first line starting `[Event "`, where a game's header starts, and names
+//! that offset for the text to be read again from there.
 
 /// The longest tag value kept; the rest of a longer one is read and dropped.
 pub const MAX_TAG_VALUE: usize = 4 << 10;
@@ -22,9 +20,6 @@ pub const MAX_TAG_VALUE: usize = 4 << 10;
 pub const MAX_TAG_NAME: usize = 64;
 /// The longest symbol kept: enough for any move, move number or result.
 pub const MAX_SYMBOL: usize = 16;
-/// The longest `Event` line in a comment read ahead to tell a game's header,
-/// which ends a comment left open, from a line the comment quotes.
-pub const LOOKAHEAD: usize = 4 << 10;
 const EVENT_TAG: &[u8] = b"[Event \"";
 
 /// A movetext element.
@@ -70,17 +65,6 @@ enum State {
     TagClose,
     Symbol,
     Nag,
-}
-
-/// How much of a game's header a comment's lines have matched.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Probe {
-    /// Bytes of `[Event "` at the start of a line.
-    Event(usize),
-    /// On the rest of that line.
-    EventLine,
-    /// At the start of the next line.
-    NextLine,
 }
 
 /// A UTF-8 check, a byte at a time.
@@ -144,16 +128,15 @@ pub struct Lexer {
     utf8: Utf8,
     /// Where a tag's value closed, for a tag whose `]` is missing.
     value_end: u64,
-    /// A game's header seen in an open comment, where it starts, and the
-    /// comment's UTF-8 check before it.
-    probe: Option<Probe>,
+    /// Bytes of `[Event "` matched at the start of a line in the open
+    /// comment, and where that line starts.
+    probe: usize,
     probe_at: u64,
-    probe_utf8: Utf8,
-    /// The comment's bytes from `probe_at`, read again as tokens when they
-    /// start a game.
-    lookahead: Vec<u8>,
-    /// Bytes to read again, before any byte fed later.
-    queue: VecDeque<u8>,
+    /// The comment's UTF-8 check before that line.
+    header_utf8: Utf8,
+    /// The first such line of the open comment, with the comment's UTF-8
+    /// check before it: where the comment ends if it is never closed.
+    header: Option<(u64, Utf8)>,
 }
 
 impl Default for Lexer {
@@ -191,11 +174,10 @@ impl Lexer {
             symbol: Vec::with_capacity(MAX_SYMBOL),
             utf8: Utf8::NEW,
             value_end: 0,
-            probe: None,
+            probe: 0,
             probe_at: 0,
-            probe_utf8: Utf8::NEW,
-            lookahead: Vec::with_capacity(LOOKAHEAD + 1),
-            queue: VecDeque::with_capacity(LOOKAHEAD + 1),
+            header_utf8: Utf8::NEW,
+            header: None,
         }
     }
 
@@ -216,9 +198,8 @@ impl Lexer {
         self.value.clear();
         self.symbol.clear();
         self.utf8 = Utf8::NEW;
-        self.probe = None;
-        self.lookahead.clear();
-        self.queue.clear();
+        self.probe = 0;
+        self.header = None;
     }
 
     /// The offset of the next byte.
@@ -230,20 +211,19 @@ impl Lexer {
     pub fn feed(&mut self, bytes: &[u8], sink: &mut impl Sink) {
         for &b in bytes {
             self.step(b, sink);
-            while let Some(q) = self.queue.pop_front() {
-                self.step(q, sink);
-            }
         }
     }
 
-    /// Ends the text: an element still open ends with it.
-    pub fn finish(&mut self, sink: &mut impl Sink) {
-        // A comment left open before a game's header, at the end of the text.
-        while self.state == State::Comment && matches!(self.probe, Some(Probe::EventLine | Probe::NextLine)) {
-            self.recover(sink);
-            while let Some(q) = self.queue.pop_front() {
-                self.step(q, sink);
-            }
+    /// Ends the text: an element still open ends with it. With `resume`, a
+    /// comment still open that holds a line starting `[Event "` ends before
+    /// that line instead, and its offset is returned: the text from there is
+    /// then to be read again, by this lexer from [`Lexer::reset`] at it.
+    pub fn finish(&mut self, sink: &mut impl Sink, resume: bool) -> Option<u64> {
+        if let (State::Comment, Some((at, utf8)), true) = (self.state, self.header, resume) {
+            sink.movetext(self.start, at, self.depth, Token::Comment, utf8.valid());
+            self.state = State::Ground;
+            self.header = None;
+            return Some(at);
         }
         let (start, end, depth, valid) = (self.start, self.pos, self.depth, self.utf8.valid());
         match self.state {
@@ -258,8 +238,8 @@ impl Lexer {
             State::Ground | State::TagName | State::TagGap => {}
         }
         self.state = State::Ground;
-        self.probe = None;
-        self.lookahead.clear();
+        self.header = None;
+        None
     }
 
     fn step(&mut self, b: u8, sink: &mut impl Sink) {
@@ -324,7 +304,10 @@ impl Lexer {
                 }
             },
             State::TagValue => match b {
-                b'\\' => self.state = State::TagEscape,
+                b'\\' => {
+                    self.utf8.push(b);
+                    self.state = State::TagEscape;
+                }
                 b'"' => {
                     self.value_end = at + 1;
                     self.state = State::TagClose;
@@ -393,8 +376,8 @@ impl Lexer {
             }
             b'{' => {
                 self.begin(State::Comment, at, b);
-                self.probe = None;
-                self.lookahead.clear();
+                self.probe = 0;
+                self.header = None;
             }
             b';' => self.begin(State::LineComment, at, b),
             b'%' if starts_line => self.begin(State::Escape, at, b),
@@ -427,63 +410,26 @@ impl Lexer {
             self.utf8.push(b);
             sink.movetext(self.start, at + 1, self.depth, Token::Comment, self.utf8.valid());
             self.state = State::Ground;
-            self.probe = None;
-            self.lookahead.clear();
+            self.header = None;
             return;
         }
-        match self.probe {
-            // The rest of a CR LF, or a blank line.
-            Some(Probe::NextLine) if is_eol(b) => self.lookahead.push(b),
-            Some(Probe::NextLine) if b == b'[' => {
-                // Tags follow the `Event` line: the comment was left open.
-                self.lookahead.push(b);
-                self.recover(sink);
-                return;
-            }
-            Some(Probe::NextLine) => self.drop_probe(),
-            Some(Probe::EventLine) => {
-                self.lookahead.push(b);
-                if is_eol(b) {
-                    self.probe = Some(Probe::NextLine);
-                }
-            }
-            Some(Probe::Event(n)) if b == EVENT_TAG[n] => {
-                self.lookahead.push(b);
-                self.probe = Some(if n + 1 == EVENT_TAG.len() { Probe::EventLine } else { Probe::Event(n + 1) });
-            }
-            _ if starts_line && b == b'[' => {
-                self.probe = Some(Probe::Event(1));
+        // The first line of the comment that starts a game's header.
+        if self.header.is_none() {
+            if starts_line && b == EVENT_TAG[0] {
+                self.probe = 1;
                 self.probe_at = at;
-                self.probe_utf8 = self.utf8;
-                self.lookahead.clear();
-                self.lookahead.push(b);
+                self.header_utf8 = self.utf8;
+            } else if self.probe > 0 && b == EVENT_TAG[self.probe] {
+                self.probe += 1;
+                if self.probe == EVENT_TAG.len() {
+                    self.header = Some((self.probe_at, self.header_utf8));
+                    self.probe = 0;
+                }
+            } else {
+                self.probe = 0;
             }
-            _ => self.drop_probe(),
-        }
-        if self.lookahead.len() > LOOKAHEAD {
-            self.drop_probe();
         }
         self.utf8.push(b);
-    }
-
-    /// The lines read ahead are the comment's own.
-    fn drop_probe(&mut self) {
-        self.probe = None;
-        self.lookahead.clear();
-    }
-
-    /// Ends the open comment before the game's header it holds, and reads the
-    /// header's bytes again as tokens.
-    fn recover(&mut self, sink: &mut impl Sink) {
-        sink.movetext(self.start, self.probe_at, self.depth, Token::Comment, self.probe_utf8.valid());
-        self.state = State::Ground;
-        self.probe = None;
-        self.pos = self.probe_at;
-        self.line_start = true;
-        for &b in self.lookahead.iter().rev() {
-            self.queue.push_front(b);
-        }
-        self.lookahead.clear();
     }
 
     fn push_value(&mut self, b: u8) {
@@ -530,15 +476,25 @@ mod tests {
         }
     }
 
+    /// The tokens of `text`, read again from where a comment left open ends,
+    /// as a reader of a file does.
     fn lex_bytes(text: &[u8]) -> Vec<String> {
         let mut log = Log::default();
         let mut lexer = Lexer::new();
-        // Fed a byte at a time, as chunk boundaries may fall anywhere.
-        for b in text {
-            lexer.feed(std::slice::from_ref(b), &mut log);
+        let mut from = 0;
+        loop {
+            // Fed a byte at a time, as chunk boundaries may fall anywhere.
+            for b in &text[from..] {
+                lexer.feed(std::slice::from_ref(b), &mut log);
+            }
+            match lexer.finish(&mut log, true) {
+                Some(at) => {
+                    from = at as usize;
+                    lexer.reset(at);
+                }
+                None => return log.0,
+            }
         }
-        lexer.finish(&mut log);
-        log.0
     }
 
     fn lex(text: &str) -> Vec<String> {
@@ -596,26 +552,39 @@ mod tests {
     }
 
     #[test]
-    fn an_open_comment_ends_at_a_games_header() {
-        let got = lex("e4 {open\n[Event \"Next\"]\r\n[Site \"S\"]\nd4");
-        assert_eq!(got, ["0-2@0 e4", "3-9@0 {}", "9-23 [Event=Next]", "25-35 [Site=S]", "36-38@0 d4"]);
-        // At the end of the text, the Event line alone is enough.
-        assert_eq!(lex("{open\n[Event \"N\"]\n"), ["0-6@0 {}", "6-17 [Event=N]"]);
+    fn a_comment_open_at_the_end_ends_at_its_first_header() {
+        let got = lex("e4 {open\n[Event \"Next\"]\r\n[Site \"S\"]\nd4 {again\n[Event \"Third\"]");
+        let want = [
+            "0-2@0 e4",
+            "3-9@0 {}",
+            "9-23 [Event=Next]",
+            "25-35 [Site=S]",
+            "36-38@0 d4",
+            "39-46@0 {}",
+            "46-61 [Event=Third]",
+        ];
+        assert_eq!(got, want);
+        // Without `resume` the comment runs to the end.
+        let mut log = Log::default();
+        let mut lexer = Lexer::new();
+        lexer.feed(b"{open\n[Event \"N\"]", &mut log);
+        assert_eq!(lexer.finish(&mut log, false), None);
+        assert_eq!(log.0, ["0-17@0 {}"]);
+        // A comment open at the end with no header in it runs to the end.
+        assert_eq!(lex("e4 {open\n1. d4"), ["0-2@0 e4", "3-14@0 {}"]);
     }
 
     #[test]
-    fn a_comment_may_quote_an_event_line() {
-        // The quoted line is followed by the comment's own text.
+    fn a_closed_comment_keeps_whatever_it_holds() {
         let text = "1. e4 {quoted tag:\n[Event \"Example\"]\n} e5 2. Nf3 *";
         let got = lex(text);
-        assert_eq!(got[3], "6-38@0 {}");
-        assert_eq!(got.len(), 9, "{got:?}");
-        assert_eq!(lex("{a\n[Event \"E\"]\n1. e4}"), ["0-21@0 {}"]);
+        assert_eq!((got[3].as_str(), got.len()), ("6-38@0 {}", 9), "{got:?}");
+        // Quoted header lines, however many, stay the comment's.
+        let text = "1. e4 {quoted header:\n[Event \"Example\"]\n[Site \"Somewhere\"]\n} e5 2. Nf3 *";
+        let got = lex(text);
+        assert_eq!((got[3].as_str(), got.len()), ("6-60@0 {}", 9), "{got:?}");
         // Elsewhere in a comment a bracket is text.
         assert_eq!(lex("{x\n [Event \"y\"]}"), ["0-16@0 {}"]);
-        // An `Event` line longer than the lookahead is the comment's too.
-        let long = format!("{{a\n[Event \"{}\"]\n[Site \"S\"]}} e4", "x".repeat(LOOKAHEAD));
-        assert_eq!(lex(&long).len(), 2);
     }
 
     #[test]
@@ -649,11 +618,8 @@ mod tests {
     }
 
     #[test]
-    fn many_headers_in_open_comments_are_read_once() {
-        // Each recovery reads a header's two lines again, and no more.
-        let unit = "{\n[Event \"E\"]\n[Site \"S\"]\n";
-        let text = unit.repeat(1000);
-        let got = lex(&text);
-        assert_eq!(got.iter().filter(|t| t.contains("[Site=S]")).count(), 1000);
+    fn an_escape_is_checked_as_written() {
+        // `\xc3 \\ \xa9` is not UTF-8, though `\xc3\xa9` would be.
+        assert_eq!(lex_bytes(b"[Event \"\xc3\\\xa9\"]"), ["0-13 [Event=\u{fffd}\\\u{fffd}] !utf8"]);
     }
 }

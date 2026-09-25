@@ -225,3 +225,39 @@ fn many_games_are_read_in_parts() {
     assert_eq!(db.text(&last, 1 << 20).unwrap(), game.trim_end().to_string() + "\n");
     assert_eq!((db.players(), db.tournaments()), (2, 1));
 }
+
+#[test]
+fn comments_open_to_the_end_and_closed_comments() {
+    // A comment left open ends before the next game's header, and the games
+    // after it are read; the text is read again from there.
+    let text = "[Event \"A\"]\n\n1. e4 {never closed\n\n[Event \"B\"]\n[White \"W\"]\n\n1. d4 d5 *\n\n\
+                [Event \"C\"]\n\n1. c4 {again\n[Event \"D\"]\n\n1. Nf3 *\n";
+    let f = pgn_file("open-comments", text.as_bytes());
+    let db = built(&f, 1, CodePage::WESTERN);
+    assert_eq!(db.record_count(), 4);
+    let b = db.record(2).unwrap();
+    assert_eq!(db.player(b.white()).unwrap().unwrap().last, "W");
+    assert_eq!(b.move_count(), 1);
+    assert!(db.text(&db.record(1).unwrap(), 1 << 20).unwrap().trim_end().ends_with("{never closed"));
+    assert_eq!(db.record(4).unwrap().move_count(), 1);
+
+    // A closed comment keeps the header lines it quotes: one game.
+    let text =
+        "[Event \"Actual\"]\n\n1. e4 {quoted header:\n[Event \"Example\"]\n[Site \"Somewhere\"]\n} e5 2. Nf3 *\n";
+    let f = pgn_file("closed-comment", text.as_bytes());
+    let db = built(&f, 1, CodePage::WESTERN);
+    assert_eq!(db.record_count(), 1);
+    assert_eq!(db.record(1).unwrap().move_count(), 2);
+}
+
+#[test]
+fn an_escape_in_a_tag_counts_in_the_games_encoding() {
+    // `\xc3 \ \xa9` is not UTF-8: the game is read in the code page, its
+    // names as its served text.
+    let f = pgn_file("escape", b"[White \"\xc3\xa9\"]\n[Event \"\xc3\\\xa9\"]\n\n1. e4 *");
+    let db = built(&f, 1, CodePage::WESTERN);
+    let r = db.record(1).unwrap();
+    let name = db.player(r.white()).unwrap().unwrap().last;
+    assert_eq!(name, "\u{c3}\u{a9}");
+    assert!(db.text(&r, 1 << 20).unwrap().contains(&format!("[White \"{name}\"]")));
+}

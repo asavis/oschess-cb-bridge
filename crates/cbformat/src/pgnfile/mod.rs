@@ -60,6 +60,9 @@ pub const MAX_NAME: usize = lex::MAX_TAG_VALUE;
 pub const MAX_NAME_BYTES: usize = 256 << 20;
 /// Bytes of the PGN file read at a time while building.
 const CHUNK: usize = 1 << 20;
+/// How many comments left open a build ends before a game header they hold,
+/// each time reading the rest of the file again.
+const MAX_RESUMES: u32 = 64;
 /// The longest game text read where the caller sets no lower limit, as the
 /// other readers bound a record.
 pub const MAX_TEXT: usize = 64 << 20;
@@ -343,30 +346,45 @@ fn write_index(
     });
     let mut lexer = Lexer::new();
     let mut buf = vec![0u8; CHUNK];
-    let mut total: u64 = 0;
+    // Bytes read in all, for `read`, and the length of the text.
+    let (mut read_so_far, mut total) = (0u64, 0u64);
+    let mut resumes = 0;
     loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(Error::Io(pgn.to_path_buf(), e)),
-        };
-        let mut bytes = &buf[..n];
-        // A byte-order mark is no game's.
-        if total == 0 && bytes.starts_with(b"\xef\xbb\xbf") {
-            lexer = Lexer::at(3);
-            bytes = &bytes[3..];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::Io(pgn.to_path_buf(), e)),
+            };
+            let mut bytes = &buf[..n];
+            // A byte-order mark is no game's.
+            if lexer.position() == 0 && bytes.starts_with(b"\xef\xbb\xbf") {
+                lexer.reset(3);
+                bytes = &bytes[3..];
+            }
+            read_so_far += n as u64;
+            lexer.feed(bytes, &mut splitter);
+            if let Some(e) = failed.borrow_mut().take() {
+                return Err(e);
+            }
+            if !read(read_so_far) {
+                return Err(Error::Format("the index build was stopped".into()));
+            }
         }
-        total += n as u64;
-        lexer.feed(bytes, &mut splitter);
-        if let Some(e) = failed.borrow_mut().take() {
-            return Err(e);
-        }
-        if !read(total) {
-            return Err(Error::Format("the index build was stopped".into()));
+        total = total.max(lexer.position());
+        // A comment left open to the end ends before the first game header it
+        // holds, and the file is read again from there, a bounded number of
+        // times.
+        match lexer.finish(&mut splitter, resumes < MAX_RESUMES) {
+            Some(at) => {
+                resumes += 1;
+                lexer.reset(at);
+                file.seek(SeekFrom::Start(at)).map_err(io(pgn))?;
+            }
+            None => break,
         }
     }
-    lexer.finish(&mut splitter);
     splitter.finish();
     drop(splitter);
     if let Some(e) = failed.into_inner() {

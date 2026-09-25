@@ -368,9 +368,19 @@ mod tests {
             let body = text[g.start as usize..g.end as usize].to_string();
             games.push((body, g.plies, g.termination.map(|r| r.0)));
         });
+        // Read again from where a comment left open ends, as a build does.
         let mut lexer = Lexer::new();
-        lexer.feed(text.as_bytes(), &mut splitter);
-        lexer.finish(&mut splitter);
+        let mut from = 0;
+        loop {
+            lexer.feed(&text.as_bytes()[from..], &mut splitter);
+            match lexer.finish(&mut splitter, true) {
+                Some(at) => {
+                    from = at as usize;
+                    lexer.reset(at);
+                }
+                None => break,
+            }
+        }
         splitter.finish();
         games
     }
@@ -448,7 +458,7 @@ mod tests {
             let mut splitter = Splitter::new(|g: &Game| out.push(g.utf8));
             let mut lexer = Lexer::new();
             lexer.feed(bytes, &mut splitter);
-            lexer.finish(&mut splitter);
+            lexer.finish(&mut splitter, false);
             splitter.finish();
             out
         };
