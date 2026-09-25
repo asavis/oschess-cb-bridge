@@ -50,7 +50,10 @@ pub struct Database {
     pub state: State,
     /// Games, guiding texts and analyses, when the database is ready.
     pub records: Option<u32>,
-    /// The bytes of its files, while they are kept in the cloud or downloaded.
+    /// The generation it was opened at, when it is ready.
+    pub generation: Option<u64>,
+    /// The bytes of its files, while they are kept in the cloud or downloaded:
+    /// while it downloads, the bytes the download brings in all.
     pub size: Option<u64>,
     /// The bytes on this computer and in all, while it downloads; the bytes
     /// of a PGN file read and in all, while it opens.
@@ -60,22 +63,32 @@ pub struct Database {
 }
 
 impl Database {
-    fn of(entry: &Entry) -> Database {
-        let state = entry.state();
-        let records = if state == State::Ready { entry.open().ok().map(|o| o.db.record_count()) } else { None };
-        let size = matches!(state, State::CloudOnly | State::Downloading).then(|| entry.size());
+    /// The database as `GET /v1/databases`, `/v1/status` and the tray app all
+    /// show it (#67), from one look at its files: a ready one is opened once.
+    pub fn of(entry: &Entry) -> Database {
+        let (open, files_size) = entry.open_sized();
+        let (state, records, generation) = match open {
+            Ok(open) => (State::Ready, Some(open.db.record_count()), Some(open.generation)),
+            Err(state) => (state, None, None),
+        };
         let progress = match state {
             State::Downloading => entry.progress(),
             State::Opening => entry.opening(),
             _ => None,
         }
         .map(|p| (p.present(), p.total));
+        let size = match (state, progress) {
+            (State::Downloading, Some((_, total))) => Some(total),
+            (State::CloudOnly | State::Downloading, _) => files_size,
+            _ => None,
+        };
         Database {
             id: entry.id.clone(),
             name: entry.name.clone(),
             format: entry.format.name(),
             state,
             records,
+            generation,
             size,
             progress,
             listed: entry.listed(),
@@ -241,6 +254,7 @@ mod tests {
             format: "2cbh",
             state,
             records: None,
+            generation: None,
             size: None,
             progress: None,
             listed: true,
