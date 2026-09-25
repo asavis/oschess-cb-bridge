@@ -632,7 +632,17 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   database (`<id>.idx`); `docs/format-notes.md`,
   "Position index", describes them. A file that is damaged or of another
   version is rebuilt. The Mega Database's index takes about 1.4 GB, and its
-  build needs about 8 GB of temporary space there.
+  build needs about 8 GB of temporary space there (`<id>.build`,
+  `<id>.idx.partial`). When the bridge starts, after each change of the
+  database list, and at least once a minute while the list is asked for, the
+  folder is swept (#60):
+  - a build's leftovers go at once unless that build is running;
+  - the index of a database that has been off the list for ten minutes goes.
+    A database that is only missing, in the cloud or downloading is still on
+    the list and keeps its index. The wait keeps a list that loses a database
+    for a moment, as while ChessBase rewrites it, from costing a rebuild.
+
+  Nothing else in the folder is touched.
 
 ### `GET /v1/engine/analyze`
 

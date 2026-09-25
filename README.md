@@ -61,8 +61,11 @@ quitting. Updates install by themselves while the bridge is idle, unless
 «Update automatically» is off in the settings; a version whose settings say
 «This build does not check for updates» is replaced by running the next
 installer by hand. To remove the bridge, use
-Settings → Apps → Installed apps → oschess bridge → Uninstall; its data folder,
-`%APPDATA%\oschess-bridge`, with the pairing code and the settings, stays.
+Settings → Apps → Installed apps → oschess bridge → Uninstall. Its data folder,
+`%APPDATA%\oschess-bridge`, stays: the settings (`bridge.toml`), the pairing
+code, the position indexes (`index`, some 1.4 GB for the Mega Database) and any
+Stockfish the bridge installed (`engines`). Delete the folder by hand to remove
+them too.
 
 The release also has `oschess-bridge.exe`, the same app without the installer.
 Updates come as the installer, so they install the bridge for your user as

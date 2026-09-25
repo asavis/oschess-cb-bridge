@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cbformat::view::Base;
 
@@ -325,7 +326,14 @@ pub struct Catalog {
     listing: Mutex<Listing>,
     /// Called after the sources are read, before the list is rebuilt.
     after_read: Mutex<Option<Hook>>,
+    /// Whether the index folder is swept of what the list no longer uses
+    /// (#60), and when it last was.
+    sweeping: AtomicBool,
+    swept: Mutex<Option<Instant>>,
 }
+
+/// The longest the index folder goes unswept while the list is asked for.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 type Hook = Box<dyn Fn() + Send + Sync>;
 
@@ -352,6 +360,8 @@ impl Catalog {
             shared,
             listing: Mutex::new(listing),
             after_read: Mutex::new(None),
+            sweeping: AtomicBool::new(false),
+            swept: Mutex::new(None),
         };
         catalog.refresh(true);
         catalog
@@ -371,8 +381,36 @@ impl Catalog {
 
     /// The databases, the list read again first if its sources changed.
     pub fn entries(&self) -> Vec<Arc<Entry>> {
-        self.refresh(false);
-        lock(&self.listing).entries.clone()
+        let rebuilt = self.refresh(false);
+        let entries = lock(&self.listing).entries.clone();
+        self.sweep_if_due(&entries, rebuilt);
+        entries
+    }
+
+    /// Sweeps the index folder of what the list no longer uses (#60), now and
+    /// from now on: after each change of the list, and at least once a minute
+    /// while the list is asked for. The bridge calls it once it has its data
+    /// folder; tests call it once they have set theirs.
+    pub fn sweep_indexes(&self) {
+        self.sweeping.store(true, Ordering::Relaxed);
+        *lock(&self.swept) = None;
+        self.entries();
+    }
+
+    fn sweep_if_due(&self, entries: &[Arc<Entry>], rebuilt: bool) {
+        if !self.sweeping.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut swept = lock(&self.swept);
+        if !rebuilt && swept.is_some_and(|at| at.elapsed() < SWEEP_EVERY) {
+            return;
+        }
+        *swept = Some(Instant::now());
+        drop(swept);
+        // A database only missing, in the cloud or downloading is still on
+        // the list, and keeps its index.
+        let listed = entries.iter().filter(|e| e.listed()).map(|e| e.id.clone()).collect();
+        self.explorer.sweep(&listed);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Entry>> {
@@ -380,8 +418,9 @@ impl Catalog {
     }
 
     /// Reads again the sources that changed or failed last time
-    /// ([`Read`]), and rebuilds the list when any was read, or `always`.
-    fn refresh(&self, always: bool) {
+    /// ([`Read`]), and rebuilds the list when any was read, or `always`;
+    /// whether it did.
+    fn refresh(&self, always: bool) -> bool {
         let mut listing = lock(&self.listing);
         let changed = listing.read.update(&self.sources);
         if let Some(hook) = lock(&self.after_read).as_ref() {
@@ -391,6 +430,7 @@ impl Catalog {
             let listed = listing.read.listed(&self.sources);
             listing.entries = self.merge(&listing.entries, listed);
         }
+        changed || always
     }
 
     /// The new list: each database once, in order, keeping the entry (and its
