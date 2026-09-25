@@ -19,6 +19,7 @@ pub mod engine;
 pub mod engines;
 pub mod explorer;
 pub mod fetch;
+pub mod files;
 pub mod http;
 pub mod json;
 pub mod pairing;

@@ -44,18 +44,10 @@ pub fn replace(dir: &Path) -> io::Result<String> {
     getrandom::fill(&mut bytes).map_err(|e| io::Error::other(format!("no operating-system randomness: {e}")))?;
     let token = base64url(&bytes);
     std::fs::create_dir_all(dir)?;
-    write_private(&dir.join(TOKEN_FILE), token.as_bytes())?;
+    // Replaced whole: a stop halfway leaves the old token, never a cut one
+    // that would keep the bridge from starting (#62).
+    crate::files::write_private_atomic(&dir.join(TOKEN_FILE), token.as_bytes())?;
     Ok(token)
-}
-
-/// Writes `bytes` to a file only its owner can read. `%APPDATA%` is already
-/// private to the user on Windows; elsewhere the file is created mode 0600.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    io::Write::write_all(&mut options.open(path)?, bytes)
 }
 
 pub fn is_valid(token: &str) -> bool {
@@ -100,6 +92,15 @@ mod tests {
         let second = replace(&dir).unwrap();
         assert_ne!(second, first);
         assert_eq!(load_or_create(&dir).unwrap(), second);
+        // Replaced whole, still private, and nothing else left beside it (#62).
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, [TOKEN_FILE]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(TOKEN_FILE)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(dir.join(TOKEN_FILE), "short").unwrap();
         assert!(load_or_create(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);

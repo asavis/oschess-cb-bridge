@@ -33,8 +33,7 @@ impl Choices {
 
     /// Saves `engine` as the choice in the `bridge.toml` at `config_path`, now.
     pub fn choose(&self, config_path: &Path, engine: PathBuf) -> Result<(), String> {
-        let next = config::Config { engine: Some(engine), ..config::load_or_create(config_path)? };
-        config::save(config_path, &next)?;
+        config::update(config_path, |c| config::Config { engine: Some(engine), ..c.clone() })?;
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

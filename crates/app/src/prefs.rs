@@ -31,7 +31,10 @@ pub fn load(dir: &Path) -> Prefs {
 pub fn save(dir: &Path, prefs: &Prefs) -> Result<(), String> {
     let text = serde_json::to_string_pretty(prefs).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    std::fs::write(dir.join(FILE), text + "\n").map_err(|e| format!("{}: {e}", dir.join(FILE).display()))
+    // Replaced whole: a cut file would load as the defaults and silently turn
+    // automatic updates back on (#62).
+    bridge::files::write_atomic(&dir.join(FILE), (text + "\n").as_bytes())
+        .map_err(|e| format!("{}: {e}", dir.join(FILE).display()))
 }
 
 #[cfg(test)]
@@ -46,6 +49,9 @@ mod tests {
         let saved = Prefs { auto_update: false, stockfish_offer_dismissed: Some("0.2.0".into()) };
         save(&dir, &saved).unwrap();
         assert_eq!(load(&dir), saved);
+        // Replaced whole, with nothing left beside it (#62).
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, [FILE]);
         std::fs::write(dir.join(FILE), "{ not json").unwrap();
         assert_eq!(load(&dir), Prefs::default());
         std::fs::write(dir.join(FILE), "{\"other\": 1}").unwrap();

@@ -73,11 +73,33 @@ databases = []
 /// Reads `path`, writing the default file first when there is none.
 pub fn load_or_create(path: &Path) -> Result<Config, String> {
     if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
-        std::fs::write(path, TEMPLATE).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Under the lock of every change: a default file written beside a
+        // change would replace it (#62).
+        let _one = changing();
+        create(path)?;
     }
+    load(path)
+}
+
+/// The lock every write of `bridge.toml` in this process holds.
+fn changing() -> std::sync::MutexGuard<'static, ()> {
+    static CHANGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CHANGING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Writes the default file at `path` unless there is a file; the caller
+/// holds [`changing`].
+fn create(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    crate::files::write_atomic(path, TEMPLATE.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn load(path: &Path) -> Result<Config, String> {
     // A pipe would block the read.
     if !path.is_file() {
         return Err(format!("{}: not a regular file", path.display()));
@@ -125,9 +147,19 @@ pub fn render(config: &Config) -> String {
 /// Writes `config` to `path` through a temporary file, so a reader never sees
 /// half a file.
 pub fn save(path: &Path, config: &Config) -> Result<(), String> {
-    let temporary = path.with_extension("toml.new");
-    std::fs::write(&temporary, render(config)).map_err(|e| format!("{}: {e}", temporary.display()))?;
-    std::fs::rename(&temporary, path).map_err(|e| format!("{}: {e}", path.display()))
+    crate::files::write_atomic(path, render(config).as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Changes the `bridge.toml` at `path`: reads it, applies `change` and saves
+/// the result, holding the one lock every change in this process takes, so
+/// two changes at once, such as a folder added while an install chooses its
+/// engine, both land (#62). The saved settings.
+pub fn update(path: &Path, change: impl FnOnce(&Config) -> Config) -> Result<Config, String> {
+    let _one = changing();
+    create(path)?;
+    let next = change(&load(path)?);
+    save(path, &next)?;
+    Ok(next)
 }
 
 /// A string as a value: literal in single quotes when it can be, which keeps
@@ -360,7 +392,70 @@ mod tests {
         config.databases.push(PathBuf::from(r"C:\Bases"));
         save(&path, &config).unwrap();
         assert_eq!(load_or_create(&path).unwrap(), config);
-        assert!(!path.with_extension("toml.new").exists());
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["bridge.toml"], "no temporary file stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader that finds no file writes the default one under the lock of
+    /// every change, so a change made at the same moment is never replaced by
+    /// the defaults (#62).
+    #[test]
+    fn a_default_file_never_replaces_a_change() {
+        let dir = std::env::temp_dir().join(format!("bridge-config-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bridge.toml");
+        for i in 0..300 {
+            let _ = std::fs::remove_file(&path);
+            let engine = PathBuf::from(format!("/engines/{i}"));
+            let both = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    both.wait();
+                    load_or_create(&path).unwrap();
+                });
+                s.spawn(|| {
+                    both.wait();
+                    update(&path, |c| Config { engine: Some(engine.clone()), ..c.clone() }).unwrap();
+                });
+            });
+            assert_eq!(load_or_create(&path).unwrap().engine, Some(engine), "round {i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Folders added while engines are chosen, all at once: every change lands
+    /// (#62), as the settings window's folders and an install's engine do.
+    #[test]
+    fn changes_at_once_all_land() {
+        let dir = std::env::temp_dir().join(format!("bridge-config-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("bridge.toml");
+        const EACH: usize = 40;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..EACH {
+                    update(&path, |c| {
+                        let mut next = c.clone();
+                        next.databases.push(PathBuf::from(format!("/bases/{i}")));
+                        next
+                    })
+                    .unwrap();
+                }
+            });
+            s.spawn(|| {
+                for i in 0..EACH {
+                    update(&path, |c| Config { engine: Some(PathBuf::from(format!("/engines/{i}"))), ..c.clone() })
+                        .unwrap();
+                }
+            });
+        });
+        let config = load_or_create(&path).unwrap();
+        let expected: Vec<PathBuf> = (0..EACH).map(|i| PathBuf::from(format!("/bases/{i}"))).collect();
+        assert_eq!(config.databases, expected);
+        assert_eq!(config.engine, Some(PathBuf::from(format!("/engines/{}", EACH - 1))));
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["bridge.toml"], "no temporary file stays");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
