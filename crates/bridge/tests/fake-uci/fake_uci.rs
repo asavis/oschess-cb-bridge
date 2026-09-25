@@ -8,8 +8,8 @@
 //! `chatty`, it answers `uci` with eight seconds of `id name` lines before
 //! `uciok`.
 //!
-//! Its `nps` tells what it was set to (#58): `Threads` × 1 000 000 + `Hash` ×
-//! 1 000 + how many `Threads` and `Hash` options it has been sent.
+//! Its `nps` tells what it was set to (#58): `Threads` × 10⁹ + `Hash` × 10³ +
+//! how many `Threads` and `Hash` options it has been sent.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -98,7 +98,7 @@ fn main() {
                     *depth + 2,
                     10 * k,
                     *depth * 1000,
-                    threads * 1_000_000 + hash * 1_000 + resources_set,
+                    threads * 1_000_000_000 + hash * 1_000 + resources_set,
                     *depth * 20,
                 ));
             }

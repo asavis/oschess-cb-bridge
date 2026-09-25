@@ -74,10 +74,13 @@ pub struct EngineConfig {
 impl EngineConfig {
     /// `program` with `threads` and `hash_mb` where given, else the defaults:
     /// all logical processors but two, and [`DEFAULT_HASH_MB`] capped at a
-    /// quarter of the physical memory.
+    /// quarter of the physical memory. Either is kept within this computer's
+    /// [`limits`], so the engine starts, and an analysis naming neither runs,
+    /// with the defaults `/v1/status` reports.
     pub fn new(program: PathBuf, threads: Option<u32>, hash_mb: Option<u32>) -> Self {
-        let threads = threads.unwrap_or_else(default_threads).max(1);
-        let hash_mb = hash_mb.unwrap_or_else(default_hash_mb).max(1);
+        let limits = limits();
+        let threads = threads.unwrap_or_else(default_threads).clamp(1, limits.max_threads);
+        let hash_mb = hash_mb.unwrap_or_else(default_hash_mb).clamp(1, limits.max_hash_mb);
         EngineConfig { program, threads, hash_mb }
     }
 }
@@ -869,6 +872,15 @@ mod tests {
         assert_eq!(max_hash_mb(None), DEFAULT_HASH_MB);
         let l = limits();
         assert!(l.max_threads >= 1 && l.max_hash_mb.is_power_of_two());
+    }
+
+    #[test]
+    fn configured_threads_and_hash_are_kept_within_the_limits() {
+        let l = limits();
+        let c = EngineConfig::new("sf".into(), Some(u32::MAX), Some(u32::MAX));
+        assert_eq!((c.threads, c.hash_mb), (l.max_threads, l.max_hash_mb));
+        let c = EngineConfig::new("sf".into(), None, None);
+        assert!(c.threads <= l.max_threads && c.hash_mb <= l.max_hash_mb);
     }
 
     #[test]

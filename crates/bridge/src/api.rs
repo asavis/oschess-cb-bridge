@@ -124,8 +124,9 @@ fn status(app: &App) -> Response {
     let engine = match (app.engine.name(), app.engine.defaults()) {
         (Some(name), Some((threads, hash_mb))) => {
             let limits = engine::limits();
+            // The defaults are within the limits already (`EngineConfig::new`).
             let range = |default: u32, max: u32| {
-                Obj::new().num("default", i64::from(default.min(max))).num("max", i64::from(max)).done()
+                Obj::new().num("default", i64::from(default)).num("max", i64::from(max)).done()
             };
             Obj::new()
                 .str("name", &name)

@@ -131,7 +131,7 @@ fn streams_the_lines_of_a_search_to_its_best_move() {
 fn settings_of(lines: &[String]) -> (u64, u64, u64) {
     let line = lines.iter().rev().find(|l| l.contains(r#""nps":"#)).expect("an info line");
     let nps: u64 = line.split(r#""nps":"#).nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
-    (nps / 1_000_000, nps / 1_000 % 1_000, nps % 1_000)
+    (nps / 1_000_000_000, nps / 1_000 % 1_000_000, nps % 1_000)
 }
 
 #[test]
@@ -148,6 +148,28 @@ fn threads_and_hash_come_with_the_analysis_and_are_set_only_when_they_change() {
     assert_eq!(search("&threads=1&hash=64"), (1, 64, 3), "the same values set nothing");
     // Left out, a value goes back to the configured default.
     assert_eq!(search(""), (1, 16, 4));
+}
+
+#[test]
+fn configured_values_above_the_limits_start_and_stay_within_them() {
+    let limits = bridge::engine::limits();
+    let over = EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(u32::MAX), Some(u32::MAX));
+    let (port, _app) = start(Engine::new(over));
+    let status = get(port, "/v1/status", true);
+    let (threads, hash) = (u64::from(limits.max_threads), u64::from(limits.max_hash_mb));
+    assert!(status.contains(&format!(r#""threads":{{"default":{threads},"max":{threads}}}"#)), "{status}");
+    assert!(status.contains(&format!(r#""hash":{{"default":{hash},"max":{hash}}}"#)), "{status}");
+    let search = |extra: &str| {
+        let mut a = Analysis::open(port, &format!("depth=2&stream=tab1{extra}"));
+        assert_eq!(a.status, 200);
+        settings_of(&a.rest())
+    };
+    // The handshake already sets the limits, not the configured values.
+    assert_eq!(search(""), (threads, hash, 2));
+    // A computer whose limit is 1 thread or 16 MB has nothing to change there.
+    let changed = u64::from(threads != 1) + u64::from(hash != 16);
+    assert_eq!(search("&threads=1&hash=16"), (1, 16, 2 + changed));
+    assert_eq!(search(""), (threads, hash, 2 + 2 * changed), "back to the defaults within the limits");
 }
 
 #[test]
