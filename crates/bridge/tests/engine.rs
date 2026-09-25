@@ -11,6 +11,7 @@ use bridge::api::App;
 use bridge::catalog::Catalog;
 use bridge::engine::{self, Engine, EngineConfig};
 use bridge::server;
+use bridge::sources::Sources;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 const ORIGIN: &str = "https://oschess.org";
@@ -428,6 +429,46 @@ fn the_engine_follows_bridge_toml() {
     assert!(app.engine.is_configured());
     write("engine = \n");
     assert_eq!(app.engine.name().as_deref(), Some("engine-a"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The database list and the engine read `bridge.toml` alike (#70): a file
+/// that cannot be parsed keeps the databases and the engine read before, and
+/// the next good file sets both.
+#[test]
+fn a_broken_file_keeps_the_databases_and_the_engine() {
+    let dir = std::env::temp_dir().join(format!("bridge-broken-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml = dir.join("bridge.toml");
+    let (first, second) = (fake_copy(&dir, "engine-c"), fake_copy(&dir, "engine-d"));
+    let file = |engine: &std::path::Path, database: &str| {
+        format!("{}databases = ['{}']\n", engine_line(engine), dir.join(database).display())
+    };
+    // Each text replaces the file whole: the engine's first read runs in the
+    // background, and must not find a file cut short while it is written.
+    let replace = |text: &str| {
+        let part = dir.join("bridge.toml.part");
+        std::fs::write(&part, text).unwrap();
+        std::fs::rename(&part, &toml).unwrap();
+    };
+    replace(&file(&first, "Old.2cbh"));
+    let catalog = Catalog::with_sources(
+        Sources { config: Some(toml.clone()), ..Sources::default() },
+        Arc::new(bridge::fetch::System),
+    );
+    let engine = Engine::following(toml.clone(), Duration::from_secs(3600));
+    let names = || catalog.entries().iter().filter(|e| e.listed()).map(|e| e.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(), ["Old"]);
+    assert_eq!(engine.name().as_deref(), Some("engine-c"));
+
+    // Of another length than before, so its signature changes whatever the clock.
+    replace(&format!("{}databases = [unquoted, and more]\n", engine_line(&second)));
+    assert_eq!(names(), ["Old"], "a broken file keeps the databases");
+    assert_eq!(engine.name().as_deref(), Some("engine-c"), "and the engine");
+
+    replace(&file(&second, "New database.2cbh"));
+    assert_eq!(names(), ["New database"]);
+    assert_eq!(engine.name().as_deref(), Some("engine-d"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
