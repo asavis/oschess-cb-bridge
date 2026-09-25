@@ -602,8 +602,13 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   rights name rook files (Shredder-FEN, such as `4k3/8/8/8/8/8/8/4KR1R w F -`)
   or whose castling needs Chess960 rules is answered `422 unsupported` with
   `variant: "chess960"`, and so is `variant=chess960`.
-- **Building.** The first request for a database's positions starts building
-  its index in the background: on at most half of the search workers, within
+- **Building.** The first request for a database's positions is answered from
+  the index kept on disk when that index was built for the database as it is
+  now (see **Storage**): opening it reads its header and block table, and waits
+  for no build of another database. When the search memory has no room for
+  that table, the request is answered `503 busy` and the next one tries again.
+  Without such an index, the first request starts building it in the
+  background: on at most half of the search workers, within
   half of the search memory budget, which it never takes from searches (it
   waits for memory searches hold), and one database at a time. It reads move
   records only, a few megabytes at a time, never annotations. The notable
@@ -611,8 +616,9 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   budget (a 64th of it, at most 8 MiB), and searches that need the memory
   drop them. Until the index is ready, requests are answered
   `409 database_unavailable` with `state: "indexing"` and
-  `progress: {"phase", "done", "total"}`; the phases are `checking` (records),
-  `reading` (records) and `merging` (entries). `/v1/status` lists the builds
+  `progress: {"phase", "done", "total"}`, and only while a build runs or waits
+  to run; the phases are `checking` (records), `reading` (records) and
+  `merging` (entries). `/v1/status` lists the builds
   under `indexing`. A build that fails is answered `503 index_unavailable` for
   a minute, and the next request tries again.
 - **Changes.** The index belongs to the database's generation, and a change to

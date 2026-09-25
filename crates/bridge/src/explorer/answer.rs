@@ -42,7 +42,7 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     match app.catalog.explorer.index(shared, &open) {
         Lookup::Ready(loaded) => match loaded.lookup(board.hash()) {
             Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
-            Err(Bad::Busy) => error(503, "busy", "The search memory is taken by searches; retry"),
+            Err(Bad::Busy) => busy(),
             Err(_) => {
                 app.catalog.explorer.forget(&entry.id);
                 error_with(409, "database_unavailable", "The position index is being rebuilt", |o| {
@@ -54,7 +54,12 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Lookup::Failed(why) => {
             error(503, "index_unavailable", &format!("The position index could not be built: {why}"))
         }
+        Lookup::Busy => busy(),
     }
+}
+
+fn busy() -> Response {
+    error(503, "busy", "The search memory is taken by searches; retry")
 }
 
 fn unsupported() -> Response {
