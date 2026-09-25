@@ -8,7 +8,7 @@ use app::i18n::{Lang, Strings};
 use app::status::{Tray, View};
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
-use bridge::catalog::Catalog;
+use bridge::catalog::{Catalog, State};
 use bridge::config::{self, Config};
 use bridge::fetch::System;
 use bridge::server;
@@ -74,15 +74,15 @@ fn the_tray_follows_the_catalog() {
 
     list(&config_path, &[&good, &damaged]);
     let view = now();
-    let states: Vec<&str> = view.databases.iter().map(|d| d.state.as_str()).collect();
-    assert_eq!(states, ["ready", "unreadable"]);
+    let states: Vec<State> = view.databases.iter().map(|d| d.state).collect();
+    assert_eq!(states, [State::Ready, State::Unreadable]);
     assert_eq!((view.tray(), view.tooltip(&uk).as_str()), (Tray::Attention, "oschess міст — 1 база не відкривається"));
     assert_eq!(view.mark, "attention");
 
     list(&config_path, &[&good, &gone]);
     let view = now();
-    let states: Vec<&str> = view.databases.iter().map(|d| d.state.as_str()).collect();
-    assert_eq!(states, ["ready", "missing"], "the damaged database left the list and is not shown");
+    let states: Vec<State> = view.databases.iter().map(|d| d.state).collect();
+    assert_eq!(states, [State::Ready, State::Missing], "the damaged database left the list and is not shown");
     assert_eq!((view.tray(), view.tooltip(&uk).as_str()), (Tray::Attention, "oschess міст — 1 базу не знайдено"));
 
     list(&config_path, &[&good]);
