@@ -159,11 +159,10 @@ pub fn remove_database(app: AppHandle, path: String) -> Answer<SettingsView> {
     settings_view(&app)
 }
 
-/// Writes the settings `change` makes to `bridge.toml`.
+/// Writes the settings `change` makes to `bridge.toml`, under the lock every
+/// change of it takes (`config::update`).
 fn change_config(app: &AppHandle, change: impl FnOnce(&config::Config) -> config::Config) -> Answer<()> {
-    let path = shared(app).config_path()?;
-    let next = change(&config::load_or_create(&path)?);
-    config::save(&path, &next)
+    config::update(&shared(app).config_path()?, change).map(drop)
 }
 
 /// The engines on this computer and the chosen one. Reading the engine
