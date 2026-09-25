@@ -31,9 +31,12 @@ pub enum Token<'a> {
     Star,
     /// A `{…}` or `;` comment, or a `%` escape line.
     Comment,
-    /// A NAG, a period, a suffix, a parenthesis, or any other byte or run of
-    /// bytes.
+    /// A NAG, a period, a suffix, a parenthesis, or any other byte.
     Other,
+    /// Bytes read that make no element: a tag given up, or bytes above 0x7f
+    /// outside any token. They belong to the game around them, but are no
+    /// part of its moves.
+    Skipped,
 }
 
 /// What the lexer finds, with the byte offsets it spans in the text and
@@ -63,8 +66,8 @@ enum State {
     TagEscape,
     /// After a tag's value, before its `]`.
     TagClose,
-    /// A `{` comment or a `;` comment between a tag's tokens; the tag goes on
-    /// in [`Lexer::tag_resume`] after it.
+    /// A `{` comment, or a `;` comment or `%` escape line, between a tag's
+    /// tokens; the tag goes on in [`Lexer::tag_resume`] after it.
     TagComment,
     TagLineComment,
     Symbol,
@@ -130,8 +133,6 @@ pub struct Lexer {
     symbol: Vec<u8>,
     /// The UTF-8 check of the element being read.
     utf8: Utf8,
-    /// Where a tag's value closed, for a tag whose `]` is missing.
-    value_end: u64,
     /// The tag state a comment between a tag's tokens returns to.
     tag_resume: State,
     /// Bytes of `[Event "` matched at the start of a line in the open
@@ -179,7 +180,6 @@ impl Lexer {
             value: Vec::with_capacity(MAX_TAG_VALUE),
             symbol: Vec::with_capacity(MAX_SYMBOL),
             utf8: Utf8::NEW,
-            value_end: 0,
             tag_resume: State::TagGap,
             probe: 0,
             probe_at: 0,
@@ -236,16 +236,17 @@ impl Lexer {
         match self.state {
             State::Symbol => self.symbol_end(end, sink),
             State::Nag => sink.movetext(start, end, depth, Token::Other, true),
-            State::Junk => sink.movetext(start, end, depth, Token::Other, valid),
             State::Comment | State::LineComment | State::Escape => {
                 sink.movetext(start, end, depth, Token::Comment, valid)
             }
-            State::TagValue | State::TagEscape => self.tag_end(end, sink),
-            State::TagClose => self.tag_end(self.value_end, sink),
-            State::TagComment | State::TagLineComment if self.tag_resume == State::TagClose => {
-                self.tag_end(self.value_end, sink)
+            // A tag with its value ends with the text.
+            State::TagValue | State::TagEscape | State::TagClose => self.tag_end(end, sink),
+            State::TagComment | State::TagLineComment if self.tag_resume == State::TagClose => self.tag_end(end, sink),
+            // A tag without one is given up.
+            State::Junk | State::TagName | State::TagGap | State::TagComment | State::TagLineComment => {
+                sink.movetext(start, end, depth, Token::Skipped, valid)
             }
-            State::Ground | State::TagName | State::TagGap | State::TagComment | State::TagLineComment => {}
+            State::Ground => {}
         }
         self.state = State::Ground;
         self.header = None;
@@ -267,7 +268,7 @@ impl Lexer {
                 if b >= 0x80 {
                     self.utf8.push(b);
                 } else {
-                    sink.movetext(self.start, at, self.depth, Token::Other, self.utf8.valid());
+                    sink.movetext(self.start, at, self.depth, Token::Skipped, self.utf8.valid());
                     self.state = State::Ground;
                     self.ground(b, at, starts_line, sink);
                 }
@@ -281,49 +282,49 @@ impl Lexer {
                     self.utf8.push(b);
                 }
             }
-            State::TagName => match b {
-                _ if is_blank(b) && self.name.is_empty() => {}
-                _ if is_blank(b) => self.state = State::TagGap,
-                b'{' | b';' if !self.name.is_empty() => self.tag_comment(b, State::TagGap),
-                b'"' => {
-                    self.utf8.push(b);
-                    self.state = State::TagValue;
+            State::TagName => {
+                let resume = if self.name.is_empty() { State::TagName } else { State::TagGap };
+                if self.tag_gap(b, starts_line, resume) {
+                    return;
                 }
-                b']' => self.tag_end(at + 1, sink),
-                b if b.is_ascii_alphanumeric() || b == b'_' => {
-                    if self.name.len() < MAX_TAG_NAME {
-                        self.name.push(b);
+                match b {
+                    _ if is_blank(b) && self.name.is_empty() => {}
+                    _ if is_blank(b) => self.state = State::TagGap,
+                    b'"' => {
+                        self.utf8.push(b);
+                        self.state = State::TagValue;
                     }
+                    b']' => self.tag_end(at + 1, sink),
+                    b if b.is_ascii_alphanumeric() || b == b'_' => {
+                        if self.name.len() < MAX_TAG_NAME {
+                            self.name.push(b);
+                        }
+                    }
+                    // Not a tag after all, such as `[%clk 0:01]` outside a
+                    // comment.
+                    _ => self.give_up_tag(b, at, starts_line, sink),
                 }
-                // Not a tag after all, such as `[%clk 0:01]` outside a
-                // comment: nothing was reported, and the byte is read again.
-                _ => {
-                    self.state = State::Ground;
-                    self.ground(b, at, starts_line, sink);
+            }
+            State::TagGap => {
+                if self.tag_gap(b, starts_line, State::TagGap) {
+                    return;
                 }
-            },
-            State::TagGap => match b {
-                _ if is_blank(b) => {}
-                b'{' | b';' => self.tag_comment(b, State::TagGap),
-                b'"' => {
-                    self.utf8.push(b);
-                    self.state = State::TagValue;
+                match b {
+                    _ if is_blank(b) => {}
+                    b'"' => {
+                        self.utf8.push(b);
+                        self.state = State::TagValue;
+                    }
+                    b']' => self.tag_end(at + 1, sink),
+                    _ => self.give_up_tag(b, at, starts_line, sink),
                 }
-                b']' => self.tag_end(at + 1, sink),
-                _ => {
-                    self.state = State::Ground;
-                    self.ground(b, at, starts_line, sink);
-                }
-            },
+            }
             State::TagValue => match b {
                 b'\\' => {
                     self.utf8.push(b);
                     self.state = State::TagEscape;
                 }
-                b'"' => {
-                    self.value_end = at + 1;
-                    self.state = State::TagClose;
-                }
+                b'"' => self.state = State::TagClose,
                 // A value never spans lines: its closing quote is missing.
                 _ if is_eol(b) => self.tag_end(at, sink),
                 _ => {
@@ -339,17 +340,21 @@ impl Lexer {
                 self.push_value(b);
                 self.state = State::TagValue;
             }
-            State::TagClose => match b {
-                _ if is_blank(b) => {}
-                b'{' | b';' => self.tag_comment(b, State::TagClose),
-                b']' => self.tag_end(at + 1, sink),
-                // The `]` is missing: the tag ends after its value, and the
-                // byte is read again.
-                _ => {
-                    self.tag_end(self.value_end, sink);
-                    self.ground(b, at, starts_line, sink);
+            State::TagClose => {
+                if self.tag_gap(b, starts_line, State::TagClose) {
+                    return;
                 }
-            },
+                match b {
+                    _ if is_blank(b) => {}
+                    b']' => self.tag_end(at + 1, sink),
+                    // The `]` is missing: the tag ends with what was read of
+                    // it, and the byte is read again.
+                    _ => {
+                        self.tag_end(at, sink);
+                        self.ground(b, at, starts_line, sink);
+                    }
+                }
+            }
             // A comment between a tag's tokens: the tag goes on after it.
             State::TagComment => {
                 self.utf8.push(b);
@@ -384,12 +389,26 @@ impl Lexer {
         }
     }
 
-    /// Starts a comment, opened by `b`, between a tag's tokens; the tag goes
-    /// on in `resume` after it.
-    fn tag_comment(&mut self, b: u8, resume: State) {
+    /// Starts a comment or an escape line between a tag's tokens when `b`
+    /// opens one, the tag going on in `resume` after it; whether it did.
+    fn tag_gap(&mut self, b: u8, starts_line: bool, resume: State) -> bool {
+        self.state = match b {
+            b'{' => State::TagComment,
+            b';' => State::TagLineComment,
+            b'%' if starts_line => State::TagLineComment,
+            _ => return false,
+        };
         self.utf8.push(b);
         self.tag_resume = resume;
-        self.state = if b == b'{' { State::TagComment } else { State::TagLineComment };
+        true
+    }
+
+    /// A tag given up at `at`: what was read of it is skipped, and `b` is read
+    /// again.
+    fn give_up_tag(&mut self, b: u8, at: u64, starts_line: bool, sink: &mut impl Sink) {
+        sink.movetext(self.start, at, self.depth, Token::Skipped, self.utf8.valid());
+        self.state = State::Ground;
+        self.ground(b, at, starts_line, sink);
     }
 
     /// Starts an element at `at` in `state`, its UTF-8 check from `b`.
@@ -505,6 +524,7 @@ mod tests {
                 Token::Star => "*".into(),
                 Token::Comment => "{}".into(),
                 Token::Other => "~".into(),
+                Token::Skipped => "skip".into(),
             };
             let bad = if utf8 { "" } else { " !utf8" };
             self.0.push(format!("{start}-{end}@{depth} {what}{bad}"));
@@ -564,9 +584,9 @@ mod tests {
         assert_eq!(lex(r#"[Event "a \"b\" \\ c"]"#), [r#"0-22 [Event=a "b" \ c]"#]);
         // A value not closed on its line ends the tag there; a missing `]`
         // ends it after its value.
-        assert_eq!(lex("[Site \"x\n[Date \"y\" \n1."), ["0-8 [Site=x]", "9-18 [Date=y]", "20-21@0 1", "21-22@0 ~"]);
+        assert_eq!(lex("[Site \"x\n[Date \"y\" \n1."), ["0-8 [Site=x]", "9-20 [Date=y]", "20-21@0 1", "21-22@0 ~"]);
         // Not a tag: read again as movetext.
-        assert_eq!(lex("[%clk]"), ["1-2@0 ~", "2-5@0 clk", "5-6@0 ~"]);
+        assert_eq!(lex("[%clk]"), ["0-1@0 skip", "1-2@0 ~", "2-5@0 clk", "5-6@0 ~"]);
     }
 
     #[test]
@@ -575,8 +595,15 @@ mod tests {
         assert_eq!(lex("[White ;note\n\"Alpha\"]"), ["0-21 [White=Alpha]"]);
         assert_eq!(lex("[White \"Alpha\" {note}]"), ["0-22 [White=Alpha]"]);
         assert_eq!(lex("[White{a}{b}\"Alpha\"{c}]"), ["0-23 [White=Alpha]"]);
+        // Before the name too, and escape lines in any gap.
+        assert_eq!(lex("[ {note} White \"Alpha\"]"), ["0-23 [White=Alpha]"]);
+        assert_eq!(lex("[ ;note\nWhite \"Alpha\"]"), ["0-22 [White=Alpha]"]);
+        assert_eq!(lex("[\n%esc\nWhite\n%esc\n\"Alpha\"\n%esc\n]"), ["0-32 [White=Alpha]"]);
         // Their bytes count in the tag's UTF-8 check.
         assert_eq!(lex_bytes(b"[White {\xff} \"A\"]"), ["0-15 [White=A] !utf8"]);
+        // A tag given up, or ended by the text, keeps what it read.
+        assert_eq!(lex_bytes(b"[Event {\xff} broken"), ["0-11@0 skip !utf8", "11-17@0 broken"]);
+        assert_eq!(lex_bytes(b"[White \"A\" {\xff}"), ["0-14 [White=A] !utf8"]);
     }
 
     #[test]
@@ -642,8 +669,8 @@ mod tests {
                 "13-24 [Black=\u{fffd}] !utf8",
                 "25-28@0 {} !utf8",
                 "29-31@0 e4",
-                "32-35@0 ~",
-                "36-37@0 ~ !utf8",
+                "32-35@0 skip",
+                "36-37@0 skip !utf8",
             ]
         );
     }

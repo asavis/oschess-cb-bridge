@@ -261,3 +261,21 @@ fn an_escape_in_a_tag_counts_in_the_games_encoding() {
     assert_eq!(name, "\u{c3}\u{a9}");
     assert!(db.text(&r, 1 << 20).unwrap().contains(&format!("[White \"{name}\"]")));
 }
+
+#[test]
+fn names_follow_the_served_text_at_the_edges() {
+    // A tag given up, and a tag the file ends in with a comment after its
+    // value: the game's names are read as its text is served.
+    for (i, bytes) in
+        [&b"[White \"\xc3\xa9\"]\n[Event {\xff} broken]\n\n1. e4 *"[..], &b"[White \"\xc3\xa9\" {\xff}"[..]]
+            .into_iter()
+            .enumerate()
+    {
+        let f = pgn_file(&format!("edges-{i}"), bytes);
+        let db = built(&f, 1, CodePage::WESTERN);
+        let r = db.record(1).unwrap();
+        let name = db.player(r.white()).unwrap().unwrap().last;
+        let text = db.text(&r, 1 << 20).unwrap();
+        assert!(text.contains(&format!("[White \"{name}\"")), "{i}: {name} in {text:?}");
+    }
+}

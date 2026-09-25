@@ -363,7 +363,8 @@ of the same games answers, apart from what the format has otherwise:
   first move when it has none, and ends at its result or where the next
   game's tags start after its moves; a tag the game already has also starts
   the next game, and a comment between tags does not. A line ends at LF, CR
-  or both, and a tag pair may span lines, with comments between its tokens. A `{` comment ends at its `}`,
+  or both, and a tag pair may span lines, with comments and `%` escape lines
+  between any of its tokens. A `{` comment ends at its `}`,
   whatever it holds; one still open at the end of the file was left open by
   mistake, and ends before its first line starting `[Event "`, from where the
   file is read on (at most 64 times in a file).

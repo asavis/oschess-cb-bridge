@@ -148,7 +148,7 @@ impl Sink for Walk<'_> {
                 self.castled();
                 return;
             }
-            Token::Comment | Token::Other => return,
+            Token::Comment | Token::Other | Token::Skipped => return,
         };
         if s.iter().all(u8::is_ascii_digit) {
             return;

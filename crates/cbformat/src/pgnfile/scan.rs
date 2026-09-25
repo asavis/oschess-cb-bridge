@@ -196,9 +196,9 @@ impl<F: FnMut(&Game)> Sink for Splitter<F> {
             }
             self.start(start);
         }
-        // A comment may stand between tags: only moves and their marks
-        // start the movetext.
-        if token != Token::Comment {
+        // A comment may stand between tags, as may bytes that make no
+        // element: only moves and their marks start the movetext.
+        if !matches!(token, Token::Comment | Token::Skipped) {
             self.movetext = true;
         }
         self.game.end = end;
@@ -224,7 +224,7 @@ impl<F: FnMut(&Game)> Sink for Splitter<F> {
                     None => self.game.plies = self.game.plies.saturating_add(1),
                 }
             }
-            Token::Comment | Token::Other => {}
+            Token::Comment | Token::Other | Token::Skipped => {}
         }
     }
 }
@@ -449,10 +449,82 @@ mod tests {
         assert_eq!(one("[Event \"Synthetic\"]\n[White {note} \"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
         assert_eq!(one("[Event \"Synthetic\"]\n[White ;note\n\"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
         assert_eq!(one("[Event \"Synthetic\"]\n[White \"Alpha\" {note}]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
+        // Before a tag's name, and escape lines in its gaps.
+        assert_eq!(one("[Event \"Synthetic\"]\n[ {note} White \"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
+        assert_eq!(one("[Event \"Synthetic\"]\n[ ;note\nWhite \"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
+        assert_eq!(one("[Event \"S\"]\n[White\n%escape\n\"Alpha\"\n%escape\n]\n[Black \"B\"]\n\n1. e4 e5 *"), 2);
         // A tag pair across lines.
         assert_eq!(one("[Event \"A\"]\n[White\n\"Alpha\"]\n[Black \"Beta\"\n]\n\n1. e4 e5 *"), 2);
         // CR alone ends lines.
         assert_eq!(one("[Event \"Actual\"]\r\r1. e4 ; comment\re5 2. Nf3 *\r"), 3);
+    }
+
+    /// For every game of many generated texts, `Game::utf8` says whether the
+    /// game's own bytes are UTF-8, as the text served for it is decoded.
+    #[test]
+    fn a_games_utf8_flag_describes_its_span() {
+        const PIECES: [&[u8]; 28] = [
+            b"[",
+            b"]",
+            b"\"",
+            b"\\",
+            b"{",
+            b"}",
+            b";",
+            b"%",
+            b"\n",
+            b"\r",
+            b" ",
+            b"Event",
+            b"White",
+            b"Result",
+            b"0-0",
+            b"1-0",
+            b"*",
+            b"1.",
+            b"e4",
+            b"Nf3",
+            b"(",
+            b")",
+            b"$1",
+            b"\xc3\xa9",
+            b"\xff",
+            b"\xc3",
+            b"\xa9",
+            b"\xe2\x80\x94",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..20_000 {
+            let len = (next() % 40) as usize;
+            let text: Vec<u8> =
+                (0..len).flat_map(|_| PIECES[(next() % PIECES.len() as u64) as usize].to_vec()).collect();
+            let mut spans = Vec::new();
+            let mut splitter = Splitter::new(|g: &Game| spans.push((g.start as usize, g.end as usize, g.utf8)));
+            let mut lexer = Lexer::new();
+            let mut from = 0;
+            loop {
+                lexer.feed(&text[from..], &mut splitter);
+                match lexer.finish(&mut splitter, true) {
+                    Some(at) => {
+                        from = at as usize;
+                        lexer.reset(at);
+                    }
+                    None => break,
+                }
+            }
+            splitter.finish();
+            drop(splitter);
+            for (start, end, utf8) in spans {
+                let whole = std::str::from_utf8(&text[start..end]).is_ok();
+                assert_eq!(utf8, whole, "case {case}: {:?} game {start}..{end}", String::from_utf8_lossy(&text));
+            }
+        }
     }
 
     #[test]
@@ -468,6 +540,10 @@ mod tests {
         };
         assert_eq!(utf8(b"[White \"\xc3\xa9\"]\n\n1. e4 {\xc3\xa9} *\n"), [true]);
         assert_eq!(utf8(b"[White \"\xc3\xa9\"]\n\n1. e4 {\xff} *\n[White \"\xc3\xa9\"]\n\n1. e4 *"), [false, true]);
+        // What a tag given up read counts, and so does a comment a tag
+        // ended by the text holds.
+        assert_eq!(utf8(b"[White \"\xc3\xa9\"]\n[Event {\xff} broken]\n\n1. e4 *"), [false]);
+        assert_eq!(utf8(b"[White \"\xc3\xa9\" {\xff}"), [false]);
     }
 
     #[test]
