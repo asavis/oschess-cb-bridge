@@ -4,6 +4,7 @@
 //! after a crash or a power cut, finds the old file or the new one, never a
 //! part of either.
 
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,35 +22,49 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn write(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
-    let temporary = temporary(path);
+    let (temporary, mut file) = create_temporary(path, private)?;
     let written = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        if private {
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        }
-        #[cfg(not(unix))]
-        let _ = private;
-        let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)
     })();
+    // Only the file this call created is removed.
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     written
 }
 
-/// A name beside `path` that no other write in this process uses at the same
-/// time: `<name>.<process>.<count>.tmp`.
-fn temporary(path: &Path) -> PathBuf {
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(format!(".{}.{}.tmp", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
-    path.with_file_name(name)
+/// Temporary names tried before a write gives up.
+const TEMPORARY_ATTEMPTS: u32 = 64;
+
+/// Counts the temporary names this process has used.
+static COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Creates a temporary file beside `path`, `<name>.<process>.<count>.tmp`. A
+/// name already taken, as by a file left when a process of the same id was
+/// stopped before its rename, is passed over, never removed (#62).
+fn create_temporary(path: &Path, private: bool) -> io::Result<(PathBuf, File)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut attempts = 0;
+    loop {
+        let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(format!(".{}.{}.tmp", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
+        let candidate = path.with_file_name(name);
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts + 1 < TEMPORARY_ATTEMPTS => attempts += 1,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +96,28 @@ mod tests {
         let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         names.sort();
         assert_eq!(names, ["a folder", "settings.json"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Temporary files left by a process with this id that was stopped before
+    /// its rename are passed over and kept: the write takes the next name.
+    #[test]
+    fn a_left_temporary_file_is_passed_over_and_kept() {
+        let dir = std::env::temp_dir().join(format!("bridge-files-left-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        let next = COUNT.load(Ordering::Relaxed);
+        let left: Vec<PathBuf> =
+            (next..next + 3).map(|n| dir.join(format!("token.{}.{n}.tmp", std::process::id()))).collect();
+        for file in &left {
+            std::fs::write(file, b"left").unwrap();
+        }
+        write_private_atomic(&path, b"new token").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new token");
+        for file in &left {
+            assert_eq!(std::fs::read(file).unwrap(), b"left", "{} is kept", file.display());
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
