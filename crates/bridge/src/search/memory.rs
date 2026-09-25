@@ -253,18 +253,23 @@ impl Streams {
 mod tests {
     use super::*;
 
+    /// Only the test's own holds are asserted on: the budget's total is the
+    /// whole process's, and the tests of this binary run beside each other
+    /// (#63). That a hold returns its bytes is asserted by the budget test
+    /// binaries, which have the process to themselves.
     #[test]
     fn holds_grow_shrink_and_return() {
-        let before = held();
         assert_eq!(Hold::reserve(budget() + 1).unwrap_err(), Refused::TooLarge);
         let mut h = Hold::reserve(1000).unwrap();
         h.grow(24).unwrap();
         assert_eq!(h.bytes(), 1024);
         assert_eq!(h.grow(usize::MAX).unwrap_err(), Refused::TooLarge);
+        assert_eq!(h.bytes(), 1024, "a refused growth keeps what was held");
         h.shrink(10);
         assert_eq!(h.bytes(), 10);
+        h.shrink(20);
+        assert_eq!(h.bytes(), 10, "shrinking to more is nothing");
         drop(h);
-        assert_eq!(held(), before);
         let shared = Mutex::new(Hold::default());
         {
             let mut a = Allowance::new(&shared);
