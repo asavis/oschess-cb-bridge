@@ -105,6 +105,7 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
         engine: Engine::from_config_file(config_path),
     };
     app.catalog.explorer.set_dir(dir.join("index"));
+    app.catalog.sweep_indexes();
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
 }
 

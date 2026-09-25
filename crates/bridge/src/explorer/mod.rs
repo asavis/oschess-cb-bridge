@@ -17,7 +17,7 @@ pub mod source;
 pub use answer::{render, route};
 pub use build::WRITER_BYTES;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,12 @@ use source::Source;
 
 /// How long a failed build is reported before the next request tries again.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
+
+/// How long an index stays on disk after its database left the list (#60): a
+/// list that loses a database for a moment, as while ChessBase rewrites its
+/// list, must not cost a rebuild: minutes, and some 8 GB of temporary space
+/// for the Mega Database.
+pub const SWEEP_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The index of one database, at the generation it was built for.
 pub struct Loaded {
@@ -101,12 +107,40 @@ pub struct Registry {
     dir: Mutex<Option<PathBuf>>,
     states: Mutex<HashMap<String, Arc<Mutex<State>>>>,
     queue: Arc<Serial>,
+    /// Index files whose database is not on the list, and since when.
+    unlisted: Mutex<HashMap<String, Instant>>,
+    grace: Mutex<Duration>,
 }
 
 impl Default for Registry {
     fn default() -> Registry {
-        Registry { dir: Mutex::default(), states: Mutex::default(), queue: Arc::new(Serial::labelled("index")) }
+        Registry {
+            dir: Mutex::default(),
+            states: Mutex::default(),
+            queue: Arc::new(Serial::labelled("index")),
+            unlisted: Mutex::default(),
+            grace: Mutex::new(SWEEP_GRACE),
+        }
     }
+}
+
+/// What a file in the index folder is, by its name.
+enum Kept {
+    /// `<id>.idx`: a database's index.
+    Index,
+    /// `<id>.idx.partial` or the `<id>.build` folder: a build's work, which
+    /// only the build running for `<id>` uses.
+    Work,
+}
+
+/// The database id and kind of an index folder entry; `None` for anything
+/// the bridge did not write there, which is never touched.
+fn index_entry(name: &str) -> Option<(&str, Kept)> {
+    let (id, kind) = match name.strip_suffix(".idx") {
+        Some(id) => (id, Kept::Index),
+        None => (name.strip_suffix(".idx.partial").or_else(|| name.strip_suffix(".build"))?, Kept::Work),
+    };
+    (id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some((id, kind))
 }
 
 impl Registry {
@@ -173,6 +207,54 @@ impl Registry {
             *lock(&state) = State::Failed(Instant::now(), "the index thread could not start".into());
         }
         Lookup::Pending(progress)
+    }
+
+    /// Sets how long an index outlives its database's place on the list.
+    pub fn set_sweep_grace(&self, grace: Duration) {
+        *lock(&self.grace) = grace;
+    }
+
+    /// Removes from the index folder what no database on the list will use
+    /// (#60): the index of a database that has been off the list for
+    /// [`SWEEP_GRACE`] or longer, and a build's work left by a build that no
+    /// longer runs. The files of a database being built are never touched,
+    /// nor anything the bridge did not write.
+    pub fn sweep(&self, listed: &HashSet<String>) {
+        let Some(dir) = self.dir() else { return };
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let (now, grace) = (Instant::now(), *lock(&self.grace));
+        let mut unlisted = lock(&self.unlisted);
+        let mut still = HashSet::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some((id, kind)) = name.to_str().and_then(index_entry) else { continue };
+            // Held while the files go, so no build of `id` starts meanwhile.
+            let state = self.state(id);
+            let mut s = lock(&state);
+            if matches!(*s, State::Working(_)) {
+                continue;
+            }
+            let path = entry.path();
+            match kind {
+                Kept::Index if listed.contains(id) => {}
+                Kept::Index => {
+                    let since = *unlisted.entry(id.to_string()).or_insert(now);
+                    if now.duration_since(since) < grace || std::fs::remove_file(&path).is_err() {
+                        still.insert(id.to_string());
+                    } else {
+                        *s = State::Idle;
+                    }
+                }
+                Kept::Work if path.is_dir() => {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+                Kept::Work => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        // A database back on the list, or an index gone, starts afresh.
+        unlisted.retain(|id, _| still.contains(id));
     }
 
     /// Drops the index of `id` after a read found it damaged, and deletes its
@@ -329,6 +411,78 @@ mod tests {
         let Lookup::Ready(again) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!() };
         assert!(Arc::ptr_eq(&loaded, &again));
         drop((loaded, again));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The index folder is swept of what the list no longer uses (#60): the
+    /// index of a database off the list once the grace has passed, and a
+    /// build's leftovers at once. A listed database keeps its index even
+    /// while it is missing; a database being built keeps everything; files
+    /// the bridge did not write stay.
+    #[test]
+    fn the_index_folder_keeps_only_what_the_list_uses() {
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = PathBuf::from("/no/such/folder/Mega Database.2cbh");
+        let catalog = Catalog::new([missing.clone()]);
+        catalog.explorer.set_dir(dir.clone());
+        let listed = crate::catalog::id_of(&missing);
+        let (gone, building) = ("0123456789abcdef", "fedcba9876543210");
+        let touch = |name: &str| std::fs::write(dir.join(name), b"x").unwrap();
+        for name in [
+            format!("{listed}.idx"),
+            format!("{listed}.idx.partial"),
+            format!("{gone}.idx"),
+            format!("{gone}.idx.partial"),
+            format!("{building}.idx"),
+            format!("{building}.idx.partial"),
+            "notes.txt".into(),
+            "0123456789ABCDEF.idx".into(),
+            "short.idx".into(),
+        ] {
+            touch(&name);
+        }
+        for id in [gone, building, listed.as_str()] {
+            std::fs::create_dir_all(dir.join(format!("{id}.build")).join("runs")).unwrap();
+            std::fs::write(dir.join(format!("{id}.build")).join("runs").join("0"), b"run").unwrap();
+        }
+        *lock(&catalog.explorer.state(building)) = State::Working(Arc::new(Progress::default()));
+        let names = || {
+            let mut n: Vec<String> =
+                std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            n.sort();
+            n
+        };
+        let mut keep = vec![
+            format!("{listed}.idx"),
+            format!("{gone}.idx"),
+            format!("{building}.build"),
+            format!("{building}.idx"),
+            format!("{building}.idx.partial"),
+            "0123456789ABCDEF.idx".into(),
+            "notes.txt".into(),
+            "short.idx".into(),
+        ];
+        keep.sort();
+
+        // Within the grace, only the builds' leftovers go.
+        catalog.sweep_indexes();
+        assert_eq!(names(), keep);
+
+        // After it, the index of the database off the list goes too.
+        catalog.explorer.set_sweep_grace(Duration::ZERO);
+        catalog.sweep_indexes();
+        keep.retain(|n| n != &format!("{gone}.idx"));
+        assert_eq!(names(), keep);
+
+        // The build that ran ends: its leftovers go; its database, off the
+        // list, keeps its index until the grace has passed since now.
+        *lock(&catalog.explorer.state(building)) = State::Idle;
+        catalog.explorer.set_sweep_grace(SWEEP_GRACE);
+        catalog.sweep_indexes();
+        keep.retain(|n| !n.starts_with(&format!("{building}.build")) && n != &format!("{building}.idx.partial"));
+        assert_eq!(names(), keep);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
