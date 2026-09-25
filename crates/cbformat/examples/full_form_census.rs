@@ -11,8 +11,8 @@
 
 use std::collections::BTreeMap;
 
+use cbformat::game::{Annotation, RecordKind};
 use cbformat::pgn::{self, Options};
-use cbformat::v2::{Annotation, RecordKind};
 use cbformat::view::{Base, Format};
 
 /// One annotation, as the census compares it: its kind and its value.
@@ -145,7 +145,7 @@ fn recovered(pgn: &str, format: Format) -> Vec<Item> {
 }
 
 /// The annotations as decoded, in the census's terms.
-fn decoded(a: &cbformat::v2::GameAnnotations) -> Vec<Item> {
+fn decoded(a: &cbformat::game::GameAnnotations) -> Vec<Item> {
     let cb = |sq: u8| (sq % 8) * 8 + sq / 8 + 1;
     let mut out: Vec<Item> = Vec::new();
     for an in a.blocks.iter().flat_map(|b| &b.annotations) {

@@ -1,8 +1,8 @@
 //! Readers for ChessBase database files.
 //!
 //! [`v2`] reads the `.2cbh` family written by ChessBase 17 and later, and
-//! [`cbh`] the classic `.cbh` family; [`view::Base`] reads either the same
-//! way, and [`pgn`] writes games of both.
+//! [`cbh`] the classic `.cbh` family, both into the model of [`game`];
+//! [`view::Base`] reads either the same way, and [`pgn`] writes games of both.
 //! [`pgnfile`] reads a PGN file as a database, through an index it builds.
 //! [`dbitems`] reads the list of databases ChessBase's database window shows.
 //! [`replay`] plays decoded moves on a [`chesscore::Board`], checking each
@@ -14,10 +14,12 @@ use std::path::PathBuf;
 pub mod cbh;
 pub mod codepage;
 pub mod dbitems;
+pub(crate) mod file;
 #[cfg(feature = "fixture")]
 pub mod fixture;
 #[cfg(feature = "fixture")]
 pub mod fixture_cbh;
+pub mod game;
 pub mod movetable;
 pub mod pgn;
 pub mod pgnfile;

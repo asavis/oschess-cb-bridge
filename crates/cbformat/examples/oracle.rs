@@ -15,9 +15,10 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cbformat::game::{RecordKind, Start};
 use cbformat::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece};
 use cbformat::replay::{self, TreeVisitor};
-use cbformat::v2::{Database, GameMoves, RecordKind, Start, Token};
+use cbformat::v2::{Database, GameMoves, Token};
 use cbformat::view::{Format, format_of};
 use chesscore::{Board, CastleSide as Side, Color as CColor, Move, Piece as CPiece, squares};
 

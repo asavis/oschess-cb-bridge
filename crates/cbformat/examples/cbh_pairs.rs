@@ -85,14 +85,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A guiding text has no players, result or date to compare, and a
         // 2CBH analysis is stored as a game by the classic format.
         match (ra.kind(), rb.kind()) {
-            (v2::RecordKind::Text, v2::RecordKind::Text) => {
+            (cbformat::game::RecordKind::Text, cbformat::game::RecordKind::Text) => {
                 texts += 1;
                 continue;
             }
-            (v2::RecordKind::Game, v2::RecordKind::Analysis) => analyses += 1,
+            (cbformat::game::RecordKind::Game, cbformat::game::RecordKind::Analysis) => analyses += 1,
             _ => {}
         }
-        let analysis = rb.kind() == v2::RecordKind::Analysis;
+        let analysis = rb.kind() == cbformat::game::RecordKind::Analysis;
         let player_a = |pid| ea.player(pid).ok().flatten().map(|p| p.pgn());
         let player_b = |pid| eb.player(pid).ok().flatten().map(|p| p.pgn());
         let ta = ea.tournament(ra.tournament()).ok().flatten();
@@ -138,10 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        if ra.kind() == v2::RecordKind::Game && rb.kind() == v2::RecordKind::Game {
+        if ra.kind() == cbformat::game::RecordKind::Game && rb.kind() == cbformat::game::RecordKind::Game {
             pgn.compare(id, pgn::classic_game_with(&a, id, &options), pgn::game_with(&b, id, &options), name_exception);
         }
-        if ra.kind() != v2::RecordKind::Game {
+        if ra.kind() != cbformat::game::RecordKind::Game {
             continue;
         }
         let mut ev_a = Events::default();

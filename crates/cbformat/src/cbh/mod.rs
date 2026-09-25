@@ -11,8 +11,8 @@ use std::borrow::Cow;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::v2::file::{self, DbFile};
-use crate::v2::{GameAnnotations, MAX_BATCH_RECORDS};
+use crate::file::{self, DbFile};
+use crate::game::{GameAnnotations, MAX_BATCH_RECORDS};
 use crate::{Error, Result};
 
 pub mod annotations;

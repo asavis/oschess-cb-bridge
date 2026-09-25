@@ -11,8 +11,8 @@ use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, annotations, arrows, lid_header, quiet, squares, symbols, text};
+use cbformat::game::language;
 use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Piece};
-use cbformat::v2::language;
 
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 const ORIGIN: &str = "https://oschess.org";

@@ -4,8 +4,8 @@ use std::path::Path;
 use std::process::Command;
 
 use cbformat::fixture::{Builder, DbItems, TempDb, annotations, lid_header, quiet, text};
+use cbformat::game::language;
 use cbformat::movetable::{self, Color, Piece};
-use cbformat::v2::language;
 
 /// A one-game database (1.e4) with an empty entity file.
 fn fixture(name: &str) -> TempDb {

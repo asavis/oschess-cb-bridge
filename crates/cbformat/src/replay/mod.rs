@@ -6,8 +6,9 @@
 
 use chesscore::{Board, BoardBuilder, CastleSide as Side, Color as CColor, Move, Piece as CPiece, Square};
 
+use crate::game::{Setup, Start};
 use crate::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece};
-use crate::v2::{GameMoves, Setup, Start, Token};
+use crate::v2::{GameMoves, Token};
 use crate::{Error, Result};
 
 mod error;

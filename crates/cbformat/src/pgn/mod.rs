@@ -14,11 +14,9 @@ pub use san::{parse as parse_san, san};
 
 use chesscore::Board;
 
+use crate::game::{Date, Eco, GameAnnotations, GameResult, Player, RecordKind, Start, Tournament, language};
 use crate::replay::{self, TreeStats, start_board};
-use crate::v2::{
-    Database, Date, Eco, GameAnnotations, GameMoves, GameResult, Player, Record, RecordKind, Start, Tournament,
-    language,
-};
+use crate::v2::{Database, GameMoves, Record};
 use crate::view::PositionOrder;
 use crate::{Error, Result};
 use comments::Commentary;
@@ -207,8 +205,8 @@ fn finish(tags: &Tags, text: &str, annotations: Option<&GameAnnotations>) -> Ren
     tag(&mut out, "Site", t.map(|t| t.place.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
     tag(&mut out, "Date", &tags.date.pgn());
     // The round as the game list shows it (#68); `?` where it shows none.
-    let mut buf = [0; crate::v2::ROUND_TEXT_BYTES];
-    let round = crate::v2::round_text(tags.round.0, tags.round.1, &mut buf);
+    let mut buf = [0; crate::game::ROUND_TEXT_BYTES];
+    let round = crate::game::round_text(tags.round.0, tags.round.1, &mut buf);
     tag(&mut out, "Round", if round.is_empty() { "?" } else { round });
     tag(&mut out, "White", &name(&tags.white));
     tag(&mut out, "Black", &name(&tags.black));

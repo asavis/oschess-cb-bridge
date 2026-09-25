@@ -3,10 +3,11 @@
 
 use chesscore::{Board, Move};
 
+use cbformat::game::{GameResult, RecordKind};
 use cbformat::pgnfile::lex::{self, Lexer};
 use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor, start_board};
-use cbformat::v2::{self, GameResult, HEADER_RECORD_SIZE, MoveData, Record, RecordKind};
+use cbformat::v2::{self, HEADER_RECORD_SIZE, MoveData, Record};
 use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 

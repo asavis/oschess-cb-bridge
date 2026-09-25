@@ -26,8 +26,9 @@
 
 use std::collections::BTreeMap;
 
+use cbformat::game::{Quotation, RecordKind};
 use cbformat::pgn::{self, Options};
-use cbformat::v2::{Database, Quotation, RecordKind};
+use cbformat::v2::Database;
 use chesscore::{Board, Piece, attacks, squares};
 
 /// One move of a tree: its SAN without `!`/`?`, and what is attached to it.

@@ -13,8 +13,8 @@ use chesscore::{Board, CastleSide, Color as CColor, Move, Piece as CPiece, Squar
 use super::moves::{GameMoves, cb_square};
 use super::pieces::{KINDS, Pieces, to_cb};
 use super::tables;
+use crate::game::Start;
 use crate::replay::{MoveError, TreeStats, TreeVisitor, start_board};
-use crate::v2::Start;
 use crate::{Error, Result};
 
 /// Most variations open at once in a game, as for 2CBH games. Each open one

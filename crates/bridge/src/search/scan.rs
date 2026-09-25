@@ -3,7 +3,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cbformat::v2::{HEADER_RECORD_SIZE, ROUND_TEXT_BYTES, round_text};
+use cbformat::game::{ROUND_TEXT_BYTES, round_text};
+use cbformat::v2::HEADER_RECORD_SIZE;
 
 use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
 

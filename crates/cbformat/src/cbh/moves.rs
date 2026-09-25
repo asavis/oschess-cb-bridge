@@ -3,8 +3,8 @@
 use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 
 use super::bytes::{be_u16, be_u24};
+use crate::game::{Setup, Start};
 use crate::movetable::{Color, Piece, Sq, from_cb_square};
-use crate::v2::{Setup, Start};
 use crate::{Error, Result};
 
 /// Size of the explicit start position that bit 6 of the flags announces.

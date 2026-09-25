@@ -47,8 +47,8 @@ use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::format::MAX_PLY;
 use bridge::search::query::{self, Field, SortKey};
 use bridge::server;
+use cbformat::game::RecordKind;
 use cbformat::replay::TreeVisitor;
-use cbformat::v2::RecordKind;
 use cbformat::view::Base;
 use chesscore::{Board, Move};
 
@@ -543,7 +543,7 @@ fn compare(classic_path: &Path, two_path: &Path, dir: &Path) -> bool {
         for db in [&classic, &two] {
             let Ok(h) = db.header(id) else { continue };
             let Ok(n) = db.names(&h) else { continue };
-            let player = |p: &Option<cbformat::v2::Player>| p.as_ref().map(|p| p.pgn()).unwrap_or_default();
+            let player = |p: &Option<cbformat::game::Player>| p.as_ref().map(|p| p.pgn()).unwrap_or_default();
             let values = [
                 player(&n.white),
                 player(&n.black),

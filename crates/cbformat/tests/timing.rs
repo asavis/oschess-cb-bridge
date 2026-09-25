@@ -4,10 +4,10 @@
 
 use cbformat::fixture::{Builder, TempDb, annotations, quiet};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
+use cbformat::game::timing::{self, Evaluation, Score, Stage};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, Options};
 use cbformat::v2::Database;
-use cbformat::v2::timing::{self, Evaluation, Score, Stage};
 use chesscore::Board;
 
 /// Type-26 data in 2CBH layout from (value, depth, flag) entries.

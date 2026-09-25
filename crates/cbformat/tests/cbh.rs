@@ -3,8 +3,8 @@
 
 use cbformat::cbh::{self, GameMoves};
 use cbformat::fixture_cbh::{Tok, encode, move_record, start_position};
+use cbformat::game::Start;
 use cbformat::replay::{TreeStats, TreeVisitor};
-use cbformat::v2::Start;
 use chesscore::{Board, Color, Move, Piece};
 
 #[derive(Default)]

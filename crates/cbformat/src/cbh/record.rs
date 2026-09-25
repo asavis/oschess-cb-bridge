@@ -4,7 +4,7 @@
 //! date) decode to the `v2` types, so both formats read the same way.
 
 use super::bytes::{be_u16, be_u24, be_u32};
-use crate::v2::{Date, Eco, GameResult, RecordKind};
+use crate::game::{Date, Eco, GameResult, RecordKind};
 
 /// Size of a `.cbh` record, and of the file header before the first one.
 pub const RECORD_SIZE: usize = 46;

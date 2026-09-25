@@ -4,9 +4,9 @@
 
 use chesscore::{Board, Move, Piece, Square};
 
+use crate::game::timing::{self, Evaluation, Score};
+use crate::game::{Annotation, Arrow, Quotation, language};
 use crate::movetable::Sq;
-use crate::v2::timing::{self, Evaluation, Score};
-use crate::v2::{self, Annotation, Arrow, Quotation, language};
 use crate::view::PositionOrder;
 
 /// The `[%lang]` code of a ChessBase language number: ISO 639-1 where there is
@@ -91,7 +91,7 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
     // next field starts.
     let text = |i: usize| -> (String, usize) {
         let n = data.get(i..i + 4).map_or(0, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]).max(0) as usize);
-        let t = data.get(i + 4..i + 4 + n).map(crate::v2::annotations_text).unwrap_or_default();
+        let t = data.get(i + 4..i + 4 + n).map(crate::game::annotations_text).unwrap_or_default();
         (t, i + 4 + n)
     };
     match (code, data.len()) {
@@ -153,7 +153,7 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
 }
 
 fn quotation(q: &Quotation, raw: String) -> String {
-    let name = |p: &crate::v2::QuotedPlayer| {
+    let name = |p: &crate::game::QuotedPlayer| {
         let (last, first) = (p.last.trim(), p.first.trim());
         if first.is_empty() { last.to_string() } else { format!("{last}, {first}") }
     };
@@ -277,7 +277,7 @@ pub(super) fn graphic(a: &Annotation) -> Option<String> {
     let (name, data): (&str, Vec<u8>) = match a {
         Annotation::Symbols { on_move, on_position, prefix } => ("symbols", vec![*on_move, *on_position, *prefix]),
         Annotation::Squares(v) => {
-            ("squares", v.iter().flat_map(|&v2::Square { colour, square }| [colour, cb(square)]).collect())
+            ("squares", v.iter().flat_map(|&crate::game::Square { colour, square }| [colour, cb(square)]).collect())
         }
         Annotation::Arrows(v) => {
             ("arrows", v.iter().flat_map(|&Arrow { colour, from, to }| [colour, cb(from), cb(to)]).collect())

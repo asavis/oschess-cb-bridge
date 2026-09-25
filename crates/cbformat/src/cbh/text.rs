@@ -5,7 +5,7 @@
 use super::bytes::text;
 use super::{Database, Record};
 use crate::Result;
-use crate::v2::RecordKind;
+use crate::game::RecordKind;
 
 /// The bytes before the first title: flags, size, version and title count.
 const HEAD: usize = 8;

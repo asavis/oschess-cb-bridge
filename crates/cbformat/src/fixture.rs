@@ -291,7 +291,7 @@ pub fn annotations(blocks: &[(i32, Vec<Vec<u8>>)]) -> Vec<u8> {
 }
 
 /// A text annotation: after the move, or before it; `language` as in
-/// [`crate::v2::language`].
+/// [`crate::game::language`].
 pub fn text(before: bool, language: u16, text: &str) -> Vec<u8> {
     let mut v = (if before { 0x82u16 } else { 0x02 }).to_le_bytes().to_vec();
     v.extend([0, 0]);

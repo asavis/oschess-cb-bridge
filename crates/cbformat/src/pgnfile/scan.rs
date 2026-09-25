@@ -9,7 +9,7 @@
 //! outside games, such as a comment before the first tag, belongs to none.
 
 use super::lex::{Sink, Token};
-use crate::v2::Date;
+use crate::game::Date;
 
 /// The tags the reader looks at, in the order of [`Tags`].
 pub const TAG_NAMES: [&str; 14] = [
@@ -242,7 +242,7 @@ impl<F: FnMut(&Game)> Splitter<F> {
     }
 }
 
-/// A result as the header records store it ([`crate::v2::GameResult::from_field`]).
+/// A result as the header records store it ([`crate::game::GameResult::from_field`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResultCode(pub u8);
 
@@ -360,7 +360,7 @@ pub fn variant(value: &[u8]) -> Variant {
 mod tests {
     use super::super::lex::Lexer;
     use super::*;
-    use crate::v2::Eco;
+    use crate::game::Eco;
 
     fn split(text: &str) -> Vec<(String, u32, Option<u8>)> {
         let mut games = Vec::new();

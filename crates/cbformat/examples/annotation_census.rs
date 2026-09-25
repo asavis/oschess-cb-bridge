@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cbformat::game::{Annotation, GAME_POSITION, RecordKind};
 use cbformat::replay::{self, TreeVisitor};
-use cbformat::v2::{Annotation, Database, GAME_POSITION, RecordKind};
+use cbformat::v2::Database;
 use chesscore::{Board, Move, Square};
 
 #[derive(Default)]

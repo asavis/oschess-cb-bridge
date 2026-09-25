@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use super::bytes::{le_i32, text};
-use crate::v2::file::DbFile;
-use crate::v2::{Date, Player, Tournament};
+use crate::file::DbFile;
+use crate::game::{Date, Player, Tournament};
 use crate::{Error, Result};
 
 /// The fixed value at 0x08 of every entity file header.

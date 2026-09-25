@@ -4,7 +4,7 @@
 //! data, which the full PGN form carries whole.
 
 use super::decode_text;
-use crate::v2::{Date, Eco};
+use crate::game::{Date, Eco};
 
 /// A player of a quoted game.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -12,11 +12,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cbformat::codepage::CodePage;
+use cbformat::game::RecordKind;
 use cbformat::pgnfile::lex::Lexer;
 use cbformat::pgnfile::line::main_line;
 use cbformat::pgnfile::{self, MAX_TEXT};
 use cbformat::replay::{self, start_board};
-use cbformat::v2::{self, RecordKind};
+use cbformat::v2;
 use chesscore::Move;
 
 /// The main line of a 2CBH game, replayed from its move record.
@@ -68,10 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         let p = pdb.record(n)?;
-        let player = |p: Option<v2::Player>| p.map(|p| p.pgn()).unwrap_or_default();
+        let player = |p: Option<cbformat::game::Player>| p.map(|p| p.pgn()).unwrap_or_default();
         let tournament = e.tournament(r.tournament())?;
         let ptournament = pdb.tournament(p.tournament())?;
-        let text = |t: &Option<v2::Tournament>, place: bool| {
+        let text = |t: &Option<cbformat::game::Tournament>, place: bool| {
             t.as_ref().map(|t| if place { t.place.clone() } else { t.title.clone() }).unwrap_or_default()
         };
         let blank = |s: String| if matches!(s.trim(), "?" | "-") { String::new() } else { s.trim().to_string() };

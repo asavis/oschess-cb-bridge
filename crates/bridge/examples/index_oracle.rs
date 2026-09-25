@@ -21,8 +21,9 @@ use bridge::explorer::format::{Counts, MAX_PLY, PRUNE_PLY, pack_move};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::source::outcome;
 use bridge::explorer::{self, render};
+use cbformat::game::RecordKind;
 use cbformat::replay::{self, TreeVisitor};
-use cbformat::v2::{Database, MoveData, RecordKind};
+use cbformat::v2::{Database, MoveData};
 use chesscore::{Board, Move};
 
 /// A game's main-line positions to the index's depth, each once, with the

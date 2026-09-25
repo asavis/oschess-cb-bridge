@@ -74,7 +74,7 @@ are **unknown**.
 and 32 on the move; 8, 10-19, 32-44, 130-138 and 146 (novelty) on the position;
 140-145 as the prefix.
 
-**Game quotation** (`13`), `v2::Quotation`:
+**Game quotation** (`13`), `game::Quotation`:
 
 - The header's six strings are white's last and first name, black's last and
   first name, the site and the event, each a length byte that counts a
@@ -151,7 +151,7 @@ and that many bytes. 26 in the Mega.
 **Video** (`20`): `01 00`, a `short` that is likely a language, an `int` length
 and that many bytes. 22 in the Mega.
 
-**Evaluations** (`26`), `v2::timing::evaluations`: on position −1,
+**Evaluations** (`26`), `game::timing::evaluations`: on position −1,
 `01`, an `int` length, a `short` count, then per entry a `short` value, a
 depth byte and a flag byte (0 centipawns, 1 mate, `ff` none; 2 and `20` occur
 18 times in the Mega and are **unknown**).
@@ -181,7 +181,7 @@ depth byte and a flag byte (0 centipawns, 1 mate, `ff` none; 2 and `20` occur
 - One Mega game also holds ten type-`26` records on moves. They are kept only
   as data.
 
-**Computer evaluation** (`21`), `v2::timing::engine_evaluation`: on a move,
+**Computer evaluation** (`21`), `game::timing::engine_evaluation`: on a move,
 three `short`s: the value, its kind and a depth.
 - Kind 0 is centipawns (12,009 in the Mega) and kind 1 moves to mate (216);
   kinds 3 (23) and 32 (1) are **unknown**. The depth is 0 in 9,475, and holds
@@ -193,7 +193,7 @@ three `short`s: the value, its kind and a depth.
   left in 27, the plies left in 13. In 6 of those, the two are the same.
 - No paired database holds one, so the classic layout is not decoded.
 
-**Time spent** (`07`), `v2::timing::time_spent`: four bytes on a move,
+**Time spent** (`07`), `game::timing::time_spent`: four bytes on a move,
 **unknown** (0 in 889,661 of 899,160), then seconds, minutes and hours.
 - Seconds cover 0-59, minutes are rarely above 9, and hours are 0 in all but
   1,323.
@@ -210,7 +210,7 @@ the end of the game, but not exactly. Without an export by ChessBase to
 confirm them, they are not written as `[%clk]`. The classic clocks are the
 same `int`, big-endian, in all 6 paired records.
 
-**Time control** (`24`), `v2::timing::time_control`: `01`, three stages of
+**Time control** (`24`), `game::timing::time_control`: `01`, three stages of
 **11** bytes, then an `int` 0: 38 bytes. The description has 12-byte stages,
 which do not add up to 38. Each stage is an `int` initial time and an `int`
 increment in hundredths of a second, a `short` number of moves (1000 for the

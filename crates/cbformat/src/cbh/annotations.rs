@@ -11,8 +11,8 @@
 //! places them by that order.
 
 use super::bytes::{be_u16, be_u24, be_u32};
+use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Square, language};
 use crate::movetable::{Sq, from_cb_square};
-use crate::v2::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Square, language};
 use crate::{Error, Result};
 
 /// Size of a record's head.
@@ -150,5 +150,5 @@ pub fn language_of(nation: u8) -> u16 {
 
 /// UTF-8 when the bytes are valid UTF-8, else Windows-1252, as in 2CBH.
 fn decode_text(b: &[u8]) -> String {
-    crate::v2::annotations_text(b)
+    crate::game::annotations_text(b)
 }
