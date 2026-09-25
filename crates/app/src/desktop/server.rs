@@ -115,7 +115,7 @@ impl Shared {
     }
 
     /// The oschess page the bridge's section is on, without the pairing
-    /// fragment: a browser that paired once needs no token again.
+    /// fragment, for when the pairing cannot be read.
     pub fn section_url(&self) -> String {
         let config = self.config_path().and_then(|path| config::load_or_create(&path));
         pairing::section(config.as_ref().map_or(pairing::DEFAULT_WEB, |c| c.web.as_str()))
