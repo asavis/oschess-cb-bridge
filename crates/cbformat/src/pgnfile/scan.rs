@@ -445,6 +445,10 @@ mod tests {
         assert_eq!(one("[Event \"Actual\"]\n{comment}\n[White \"Alpha\"]\n\n1. e4 e5 *"), 2);
         // A closed comment that quotes an `Event` line.
         assert_eq!(one("[Event \"Actual\"]\n\n1. e4 {quoted tag:\n[Event \"Example\"]\n} e5 2. Nf3 *"), 3);
+        // Comments between a tag's own tokens.
+        assert_eq!(one("[Event \"Synthetic\"]\n[White {note} \"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
+        assert_eq!(one("[Event \"Synthetic\"]\n[White ;note\n\"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
+        assert_eq!(one("[Event \"Synthetic\"]\n[White \"Alpha\" {note}]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
         // A tag pair across lines.
         assert_eq!(one("[Event \"A\"]\n[White\n\"Alpha\"]\n[Black \"Beta\"\n]\n\n1. e4 e5 *"), 2);
         // CR alone ends lines.

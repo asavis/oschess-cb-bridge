@@ -63,6 +63,10 @@ enum State {
     TagEscape,
     /// After a tag's value, before its `]`.
     TagClose,
+    /// A `{` comment or a `;` comment between a tag's tokens; the tag goes on
+    /// in [`Lexer::tag_resume`] after it.
+    TagComment,
+    TagLineComment,
     Symbol,
     Nag,
 }
@@ -128,6 +132,8 @@ pub struct Lexer {
     utf8: Utf8,
     /// Where a tag's value closed, for a tag whose `]` is missing.
     value_end: u64,
+    /// The tag state a comment between a tag's tokens returns to.
+    tag_resume: State,
     /// Bytes of `[Event "` matched at the start of a line in the open
     /// comment, and where that line starts.
     probe: usize,
@@ -174,6 +180,7 @@ impl Lexer {
             symbol: Vec::with_capacity(MAX_SYMBOL),
             utf8: Utf8::NEW,
             value_end: 0,
+            tag_resume: State::TagGap,
             probe: 0,
             probe_at: 0,
             header_utf8: Utf8::NEW,
@@ -235,7 +242,10 @@ impl Lexer {
             }
             State::TagValue | State::TagEscape => self.tag_end(end, sink),
             State::TagClose => self.tag_end(self.value_end, sink),
-            State::Ground | State::TagName | State::TagGap => {}
+            State::TagComment | State::TagLineComment if self.tag_resume == State::TagClose => {
+                self.tag_end(self.value_end, sink)
+            }
+            State::Ground | State::TagName | State::TagGap | State::TagComment | State::TagLineComment => {}
         }
         self.state = State::Ground;
         self.header = None;
@@ -274,6 +284,7 @@ impl Lexer {
             State::TagName => match b {
                 _ if is_blank(b) && self.name.is_empty() => {}
                 _ if is_blank(b) => self.state = State::TagGap,
+                b'{' | b';' if !self.name.is_empty() => self.tag_comment(b, State::TagGap),
                 b'"' => {
                     self.utf8.push(b);
                     self.state = State::TagValue;
@@ -293,6 +304,7 @@ impl Lexer {
             },
             State::TagGap => match b {
                 _ if is_blank(b) => {}
+                b'{' | b';' => self.tag_comment(b, State::TagGap),
                 b'"' => {
                     self.utf8.push(b);
                     self.state = State::TagValue;
@@ -329,6 +341,7 @@ impl Lexer {
             }
             State::TagClose => match b {
                 _ if is_blank(b) => {}
+                b'{' | b';' => self.tag_comment(b, State::TagClose),
                 b']' => self.tag_end(at + 1, sink),
                 // The `]` is missing: the tag ends after its value, and the
                 // byte is read again.
@@ -337,6 +350,20 @@ impl Lexer {
                     self.ground(b, at, starts_line, sink);
                 }
             },
+            // A comment between a tag's tokens: the tag goes on after it.
+            State::TagComment => {
+                self.utf8.push(b);
+                if b == b'}' {
+                    self.state = self.tag_resume;
+                }
+            }
+            State::TagLineComment => {
+                if is_eol(b) {
+                    self.state = self.tag_resume;
+                } else {
+                    self.utf8.push(b);
+                }
+            }
             State::Symbol => {
                 if is_symbol(b) {
                     if self.symbol.len() < MAX_SYMBOL {
@@ -355,6 +382,14 @@ impl Lexer {
                 }
             }
         }
+    }
+
+    /// Starts a comment, opened by `b`, between a tag's tokens; the tag goes
+    /// on in `resume` after it.
+    fn tag_comment(&mut self, b: u8, resume: State) {
+        self.utf8.push(b);
+        self.tag_resume = resume;
+        self.state = if b == b'{' { State::TagComment } else { State::TagLineComment };
     }
 
     /// Starts an element at `at` in `state`, its UTF-8 check from `b`.
@@ -532,6 +567,16 @@ mod tests {
         assert_eq!(lex("[Site \"x\n[Date \"y\" \n1."), ["0-8 [Site=x]", "9-18 [Date=y]", "20-21@0 1", "21-22@0 ~"]);
         // Not a tag: read again as movetext.
         assert_eq!(lex("[%clk]"), ["1-2@0 ~", "2-5@0 clk", "5-6@0 ~"]);
+    }
+
+    #[test]
+    fn comments_may_stand_between_a_tags_tokens() {
+        assert_eq!(lex("[White {note} \"Alpha\"]"), ["0-22 [White=Alpha]"]);
+        assert_eq!(lex("[White ;note\n\"Alpha\"]"), ["0-21 [White=Alpha]"]);
+        assert_eq!(lex("[White \"Alpha\" {note}]"), ["0-22 [White=Alpha]"]);
+        assert_eq!(lex("[White{a}{b}\"Alpha\"{c}]"), ["0-23 [White=Alpha]"]);
+        // Their bytes count in the tag's UTF-8 check.
+        assert_eq!(lex_bytes(b"[White {\xff} \"A\"]"), ["0-15 [White=A] !utf8"]);
     }
 
     #[test]
