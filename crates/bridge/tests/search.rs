@@ -5,11 +5,9 @@
 use std::collections::HashMap;
 
 use bridge::search::{self, Indexes, SearchError, Selection, SuggestField};
-use bridge::store::Any;
-use cbformat::cbh;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
-use cbformat::v2::Database;
+use cbformat::view::Base;
 
 mod common;
 use common::{DOC, block, block_in, classic_fixture, fixture, lid, put};
@@ -22,8 +20,7 @@ fn blocks_read_the_same_with_crlf_line_ends() {
     }
 }
 
-fn numbers<'a>(db: impl Into<Any<'a>>, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
-    let db = db.into();
+fn numbers(db: &Base, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
     match search::select(db, idx, Some(q), None, None) {
         Ok((Selection::All { descending }, _)) => {
             let all = 1..=db.record_count();
@@ -36,8 +33,7 @@ fn numbers<'a>(db: impl Into<Any<'a>>, idx: &Indexes, q: &str) -> Result<Vec<u32
 }
 
 /// The lines of the corpus whose result on `db` is not the one written.
-fn corpus_failures<'a>(db: impl Into<Any<'a>>, idx: &Indexes) -> Vec<String> {
-    let db = db.into();
+fn corpus_failures(db: &Base, idx: &Indexes) -> Vec<String> {
     let lines = block("corpus");
     assert!(lines.len() > 50, "the corpus was read");
     let mut failures = Vec::new();
@@ -59,7 +55,7 @@ fn corpus_failures<'a>(db: impl Into<Any<'a>>, idx: &Indexes) -> Vec<String> {
 #[test]
 fn the_conformance_corpus_holds() {
     let f = fixture("search-corpus", &[]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let failures = corpus_failures(&db, &Indexes::default());
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -70,7 +66,7 @@ fn the_conformance_corpus_holds() {
 #[test]
 fn the_conformance_corpus_holds_on_a_classic_copy() {
     let f = classic_fixture("search-corpus-classic", &[]);
-    let db = cbh::Database::open(f.dir().join("db.cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.cbh")).unwrap();
     let failures = corpus_failures(&db, &Indexes::default());
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -78,7 +74,7 @@ fn the_conformance_corpus_holds_on_a_classic_copy() {
 #[test]
 fn results_are_cached_and_the_url_sort_wins() {
     let f = fixture("search-cache", &[]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let first = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
     let again = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
@@ -94,7 +90,7 @@ fn results_are_cached_and_the_url_sort_wins() {
 #[test]
 fn suggestions_by_prefix_and_count() {
     let f = fixture("search-suggest", &[]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let s = |field, prefix: &str| -> HashMap<String, u32> {
         suggested(&db, &idx, field, prefix, 20).unwrap().into_iter().collect()
@@ -125,7 +121,7 @@ fn texts_and_analyses_by_their_own_layout() {
         "12 | text     | - | - | Aaa survey        | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm",
     ];
     let f = fixture("search-other", &extra);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let q = |text: &str| numbers(&db, &idx, text).unwrap();
     assert_eq!(q("openings"), [11], "a word finds the title");
@@ -145,8 +141,8 @@ fn texts_and_analyses_by_their_own_layout() {
 }
 
 /// Suggestions as (name, games) pairs.
-fn suggested<'a>(
-    db: impl Into<Any<'a>>,
+fn suggested(
+    db: &Base,
     idx: &Indexes,
     field: SuggestField,
     prefix: &str,
@@ -174,7 +170,7 @@ fn set_i64(rec: &mut [u8; 192], at: usize, v: i64) {
     put(rec, at, &v.to_le_bytes());
 }
 
-fn sorted(db: &Database, idx: &Indexes, sort: &str) -> Vec<u32> {
+fn sorted(db: &Base, idx: &Indexes, sort: &str) -> Vec<u32> {
     numbers(db, idx, &format!("sort:{sort}")).unwrap()
 }
 
@@ -188,7 +184,7 @@ fn long_names_are_matched_and_suggested_in_full() {
         &[&a, &b],
         &[&|r| (set_i64(r, 0x18, 0), set_i64(r, 0x20, 0)).1, &|r| (set_i64(r, 0x18, 1), set_i64(r, 0x20, 1)).1],
     );
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     assert_eq!(numbers(&db, &idx, "player:suffixa").unwrap(), [1]);
     assert_eq!(numbers(&db, &idx, "player:SuffixB").unwrap(), [2]);
@@ -202,7 +198,7 @@ fn equal_eco_codes_keep_number_order() {
     let eco = |v: u16| move |r: &mut [u8; 192]| put(r, 0x80, &v.to_le_bytes());
     let (b52_2, b52_1, a00) = (eco(153 * 128 + 2), eco(153 * 128 + 1), eco(128));
     let f = raw_db("search-eco-sub", &["x"], &[&b52_2, &b52_1, &a00]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     assert_eq!(numbers(&db, &idx, "eco:B52").unwrap(), [1, 2]);
     assert_eq!(sorted(&db, &idx, "eco"), [3, 1, 2]);
@@ -218,7 +214,7 @@ fn empty_and_missing_names_share_a_rank() {
     let named = |r: &mut [u8; 192]| set_i64(r, 0x18, 1);
     let text = |r: &mut [u8; 192]| r[0] |= 2;
     let f = raw_db("search-empty-names", &["", "Zed"], &[&empty, &missing, &named, &text]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     assert_eq!(sorted(&db, &idx, "white"), [1, 2, 4, 3]);
     assert_eq!(sorted(&db, &idx, "white-desc"), [3, 1, 2, 4]);
@@ -230,7 +226,7 @@ fn empty_and_missing_names_share_a_rank() {
 fn a_game_counts_once_per_name() {
     let both = |r: &mut [u8; 192]| (set_i64(r, 0x18, 0), set_i64(r, 0x20, 1)).1;
     let f = raw_db("search-same-name", &["Same, Person", "Same, Person"], &[&both]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     assert_eq!(numbers(&db, &idx, "player:same").unwrap(), [1]);
     assert_eq!(suggested(&db, &idx, SuggestField::Player, "same", 20).unwrap(), [("Same, Person".into(), 1)]);
@@ -253,7 +249,7 @@ fn sparse(name: &str, records: u64) -> TempDb {
 #[test]
 fn a_sort_that_cannot_fit_is_refused_up_front() {
     let f = sparse("search-too-large", 200_000_000);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let started = std::time::Instant::now();
     assert!(matches!(
@@ -272,7 +268,7 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
 fn a_newer_search_stops_the_older_one() {
     const RECORDS: u64 = 8_000_000;
     let f = sparse("search-superseded", RECORDS);
-    let db = std::sync::Arc::new(Database::open(f.dir().join("db.2cbh")).unwrap());
+    let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
     let (db1, idx1) = (db.clone(), idx.clone());
     let first = std::thread::spawn(move || {
@@ -299,7 +295,7 @@ fn names_sort_ignoring_case() {
     let white = |id: i64| move |r: &mut [u8; 192]| (set_i64(r, 0x18, id), set_i64(r, 0x20, -1)).1;
     let (alpha, upper, zulu) = (white(0), white(1), white(2));
     let f = raw_db("search-case", &["alpha", "ALPHA", "zulu"], &[&zulu, &alpha, &upper]);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     assert_eq!(sorted(&db, &idx, "white"), [2, 3, 1]);
     assert_eq!(sorted(&db, &idx, "white-desc"), [1, 2, 3]);
@@ -320,7 +316,7 @@ fn suggestions_keep_the_best_of_many() {
     let edits: Vec<_> = (0..NAMES).chain((999..NAMES).step_by(1000)).map(player).collect();
     let edits: Vec<Edit<'_>> = edits.iter().map(|e| e as Edit<'_>).collect();
     let f = raw_db("search-top", &refs, &edits);
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let s = suggested(&db, &idx, SuggestField::Player, "a", 20).unwrap();
     let want: Vec<(String, u32)> = (999..NAMES)
@@ -339,7 +335,7 @@ fn suggestions_keep_the_best_of_many() {
 #[test]
 fn only_the_same_stream_supersedes() {
     let f = sparse("search-streams", 100_000);
-    let db = std::sync::Arc::new(Database::open(f.dir().join("db.2cbh")).unwrap());
+    let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
     let held = idx.gate().hold(2);
     let run = |q: &'static str, stream: Option<&'static str>| {
@@ -367,8 +363,8 @@ fn classic_and_2cbh_copies_agree() {
         "13 | text | - | - | Zugzwang | ????.??.?? | - | * | - | 0 | 0 | 0 | -",
     ];
     let (f2, fc) = (fixture("search-pair-2cbh", &extra), classic_fixture("search-pair-cbh", &extra));
-    let two = Database::open(f2.dir().join("db.2cbh")).unwrap();
-    let classic = cbh::Database::open(fc.dir().join("db.cbh")).unwrap();
+    let two = Base::open(f2.dir().join("db.2cbh")).unwrap();
+    let classic = Base::open(fc.dir().join("db.cbh")).unwrap();
     let (i2, ic) = (Indexes::default(), Indexes::default());
     for field in [SuggestField::Player, SuggestField::Event, SuggestField::Annotator] {
         for prefix in ["", "a", "c", "l", "m", "mik", "n", "p", "r", "s", "st", "t", "w", "z"] {

@@ -1,26 +1,23 @@
-//! `info` and `verify` for classic (`.cbh`) databases, with the same output
-//! as for 2CBH ones, annotations included.
+//! What `info` and `verify` do differently for classic (`.cbh`) databases:
+//! their entity tables, and counting the moves from the positions before them.
+//! The run and the report are the 2CBH ones, through `view` (#66).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use cbformat::cbh::{self, Batch, Database};
 use cbformat::game::{RecordKind, Start};
 use cbformat::replay::TreeVisitor;
 use chesscore::{Board, Move, Piece};
 
-use super::{AnyResult, RUN, Stats, report, run_ids, run_workers, threads};
+use super::Stats;
 
-pub(crate) fn info(path: &str) -> AnyResult<bool> {
-    let db = Database::open(path)?;
-    println!("records        {}", db.record_count());
+/// The lines of `info` after the record count.
+pub(crate) fn info(db: &Database) {
     println!("format version {}", db.format_version());
     let counts = db.entities().counts();
     for (name, n) in ["players", "tournaments", "annotators", "sources"].iter().zip(counts) {
         println!("{name:<14} {n}");
     }
-    Ok(true)
 }
 
 /// Counts what `verify` reports about the moves, from the position before each.
@@ -49,7 +46,7 @@ impl TreeVisitor for Counter<'_> {
     }
 }
 
-fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
+pub(crate) fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
     let fail = |s: &mut Stats, msg: String| {
         s.failures += 1;
         let mut f = failures.lock().unwrap_or_else(|e| e.into_inner());
@@ -109,28 +106,4 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
         Ok(_) => {}
         Err(e) => fail(s, format!("annotations: {e}")),
     }
-}
-
-pub(crate) fn verify(path: &str, limit: Option<u32>) -> AnyResult<bool> {
-    let db = Database::open(path)?;
-    let n = limit.map_or(db.record_count(), |l| l.min(db.record_count()));
-    let failures: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
-    let started = Instant::now();
-    let next_run = AtomicU64::new(0);
-    let total = Mutex::new(Stats::default());
-    let runs = u64::from(n).div_ceil(u64::from(RUN));
-    if runs > 0 {
-        run_workers(threads().min(runs as usize), &|| {
-            let mut s = Stats::default();
-            while let Some(ids) = run_ids(next_run.fetch_add(1, Ordering::Relaxed), n) {
-                let Ok(batch) = db.batch(*ids.start(), *ids.end()).or_else(|_| db.batch(1, 0)) else { continue };
-                for id in ids {
-                    verify_record(&batch, id, &mut s, &failures);
-                }
-            }
-            total.lock().unwrap_or_else(|e| e.into_inner()).add(&s);
-        });
-    }
-    let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());
-    Ok(report(n, started, &stats, failures, Some(db.has_annotations())))
 }

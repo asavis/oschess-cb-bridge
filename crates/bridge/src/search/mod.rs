@@ -21,12 +21,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use cbformat::view::Base;
+
 use memory::{Allowance, Cancel, Evict, Held, Hold, Refused, Streams};
 use names::{BitSet, Groups, Kind, NameTable, joint_ranks};
 use query::{Field, Query, Sort, SortKey};
 use scan::Control;
 
-use crate::store::{Any, Head, Store, with_store};
+use crate::store::{Head, Store, with_store};
 
 /// Searches whose results are kept for paging.
 const KEPT_RESULTS: usize = 4;
@@ -258,8 +260,8 @@ impl From<Refused> for SearchError {
 /// `sort:` token, else by number; and that order. A request that carries a `q`,
 /// even an empty one, and names a `stream` supersedes the search still running
 /// in that stream on the same database; without a stream nothing is superseded.
-pub fn select<'a>(
-    db: impl Into<Any<'a>>,
+pub fn select(
+    db: &Base,
     idx: &Indexes,
     q: Option<&str>,
     stream: Option<&str>,

@@ -1,7 +1,7 @@
 //! The database formats as the bridge reads them: [`Store`] over a format's
 //! database and [`Head`], `cbformat`'s, over its header records, for search, sort,
-//! suggestions, the game list and the position index, and [`Any`] for a
-//! database of any format.
+//! suggestions, the game list and the position index, and [`with_store`]
+//! for a database of any format, a [`cbformat::view::Base`].
 //!
 //! The formats differ where the bridge looks: 2CBH names an annotator as a
 //! player and a guiding text's title as an entity, while the classic format
@@ -16,7 +16,6 @@ use cbformat::pgnfile::lex::Lexer;
 use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor};
 use cbformat::v2;
-use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 use chesscore::{Board, Move};
 
@@ -369,69 +368,15 @@ impl Store for pgnfile::Database {
     }
 }
 
-/// A database of any format, borrowed.
-#[derive(Clone, Copy)]
-pub enum Any<'a> {
-    TwoCbh(&'a v2::Database),
-    Cbh(&'a cbh::Database),
-    Pgn(&'a pgnfile::Database),
-}
-
-impl Any<'_> {
-    /// Number of records, including deleted games, texts and analyses.
-    pub fn record_count(self) -> u32 {
-        match self {
-            Any::TwoCbh(db) => db.record_count(),
-            Any::Cbh(db) => db.record_count(),
-            Any::Pgn(db) => db.record_count(),
-        }
-    }
-}
-
-impl<'a> From<&'a v2::Database> for Any<'a> {
-    fn from(db: &'a v2::Database) -> Self {
-        Any::TwoCbh(db)
-    }
-}
-
-impl<'a> From<&'a cbh::Database> for Any<'a> {
-    fn from(db: &'a cbh::Database) -> Self {
-        Any::Cbh(db)
-    }
-}
-
-impl<'a> From<&'a pgnfile::Database> for Any<'a> {
-    fn from(db: &'a pgnfile::Database) -> Self {
-        Any::Pgn(db)
-    }
-}
-
-impl<'a> From<&'a Base> for Any<'a> {
-    fn from(db: &'a Base) -> Self {
-        match db {
-            Base::TwoCbh(db) => Any::TwoCbh(db),
-            Base::Cbh(db) => Any::Cbh(db),
-            Base::Pgn(db) => Any::Pgn(db),
-        }
-    }
-}
-
-impl<'a, T> From<&'a std::sync::Arc<T>> for Any<'a>
-where
-    &'a T: Into<Any<'a>>,
-{
-    fn from(db: &'a std::sync::Arc<T>) -> Self {
-        (&**db).into()
-    }
-}
-
-/// Runs `$body` with `$db` bound to the [`Store`] an [`Any`] holds.
+/// Runs `$body` with `$db` bound to the [`Store`] a borrowed
+/// [`cbformat::view::Base`] holds: the database of any format is `view`'s,
+/// and the bridge adds only the dispatch to its own trait (#66).
 macro_rules! with_store {
-    ($any:expr, $db:ident => $body:expr) => {
-        match ::std::convert::Into::<$crate::store::Any<'_>>::into($any) {
-            $crate::store::Any::TwoCbh($db) => $body,
-            $crate::store::Any::Cbh($db) => $body,
-            $crate::store::Any::Pgn($db) => $body,
+    ($base:expr, $db:ident => $body:expr) => {
+        match $base {
+            ::cbformat::view::Base::TwoCbh($db) => $body,
+            ::cbformat::view::Base::Cbh($db) => $body,
+            ::cbformat::view::Base::Pgn($db) => $body,
         }
     };
 }

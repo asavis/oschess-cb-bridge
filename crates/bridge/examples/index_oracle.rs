@@ -24,6 +24,7 @@ use bridge::explorer::{self, render};
 use cbformat::game::RecordKind;
 use cbformat::replay::{self, TreeVisitor};
 use cbformat::v2::{Database, MoveData};
+use cbformat::view::Base;
 use chesscore::{Board, Move};
 
 /// A game's main-line positions to the index's depth, each once, with the
@@ -269,6 +270,7 @@ fn main() {
     println!("oracle: {equal} equal, {pruned} pruned as expected, {differ} different");
 
     // Warm latency of the explorer's answer: lookup and rendering.
+    let db = Base::TwoCbh(db);
     let boards: Vec<&Board> = sample.values().collect();
     for b in &boards {
         let _ = render(&db, b, loaded.lookup(b.hash()).expect("lookup"), &loaded);

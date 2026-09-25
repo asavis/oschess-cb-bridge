@@ -281,7 +281,7 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
         Some(s) if valid_stream(s) => Some(s),
         Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
     };
-    let (selection, sort) = match search::select(&*open.db, &open.indexes, req.param("q"), stream, sort_param) {
+    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
         Ok(found) => found,
         Err(e) => return search_error(entry, open.generation, e),
     };
@@ -361,7 +361,7 @@ fn suggest(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
-    let list = match search::suggest(&*open.db, &open.indexes, field, prefix, limit) {
+    let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
         Ok(list) => list,
         Err(e) => return search_error(entry, open.generation, e),
     };

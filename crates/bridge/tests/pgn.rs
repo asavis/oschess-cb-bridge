@@ -13,11 +13,11 @@ use bridge::api::App;
 use bridge::catalog::{Catalog, State, id_of};
 use bridge::search::{self, Indexes, SearchError, Selection};
 use bridge::server;
-use bridge::store::Any;
 use bridge::store::MAX_GAME_BYTES;
 use cbformat::codepage::CodePage;
 use cbformat::fixture::pgn_file;
 use cbformat::pgnfile;
+use cbformat::view::Base;
 
 mod common;
 use common::{block, fixture_of, pgn_fixture, rows};
@@ -174,8 +174,7 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn numbers<'a>(db: impl Into<Any<'a>>, idx: &Indexes, q: &str) -> String {
-    let db = db.into();
+fn numbers(db: &Base, idx: &Indexes, q: &str) -> String {
     match search::select(db, idx, Some(q), None, None) {
         Ok((Selection::All { descending }, _)) => {
             let all: Vec<u32> =
@@ -196,8 +195,8 @@ fn the_conformance_corpus_holds_on_a_pgn_copy() {
     let (fp, f2) = (pgn_fixture("corpus-pgn", &rows), fixture_of("pgn-corpus-2cbh", &rows));
     let (pgn, index) = (fp.dir().join("db.pgn"), fp.dir().join("db.head"));
     pgnfile::build(&pgn, &index, 1, CodePage::WESTERN, &mut |_| true).unwrap();
-    let dp = pgnfile::Database::open(&pgn, &index, 1, CodePage::WESTERN).unwrap();
-    let d2 = cbformat::v2::Database::open(f2.dir().join("db.2cbh")).unwrap();
+    let dp = Base::Pgn(pgnfile::Database::open(&pgn, &index, 1, CodePage::WESTERN).unwrap());
+    let d2 = Base::open(f2.dir().join("db.2cbh")).unwrap();
     let (ip, i2) = (Indexes::default(), Indexes::default());
     let lines = block("corpus");
     assert!(lines.len() > 50, "the corpus was read");
