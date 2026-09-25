@@ -4,7 +4,6 @@
 //! it lives within the search memory budget of [`memory`].
 
 mod compare;
-mod fields;
 pub mod gate;
 pub mod memory;
 mod names;

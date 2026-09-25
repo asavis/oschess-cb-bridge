@@ -5,7 +5,7 @@ use std::sync::{Condvar, Mutex};
 
 use cbformat::Error;
 use cbformat::pgn;
-use cbformat::v2::{Eco, RecordKind};
+use cbformat::v2::{Eco, ROUND_TEXT_BYTES, RecordKind, round_text};
 
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;
@@ -543,11 +543,10 @@ fn row<S: Store>(names: &mut Names<'_, S>, lines: &mut Option<Lines>, r: &S::Hea
         RecordKind::Unknown(_) => Ok(other(base, "unknown", String::new(), String::new())),
         RecordKind::Game => {
             let (event, site) = names.tournament(r.tournament())?;
-            let round = match r.round() {
-                (n, _) if n <= 0 => String::new(),
-                (n, s) if s <= 0 => n.to_string(),
-                (n, s) => format!("{n}({s})"),
-            };
+            // The fields as search matches them and PGN writes them (#68).
+            let (n, s) = r.round();
+            let mut buf = [0; ROUND_TEXT_BYTES];
+            let round = round_text(n, s, &mut buf);
             let flags =
                 Obj::new().bool("deleted", r.is_deleted()).bool("chess960", matches!(r.eco(), Eco::Chess960(_))).done();
             let (white_elo, black_elo) = r.elo();
@@ -563,7 +562,7 @@ fn row<S: Store>(names: &mut Names<'_, S>, lines: &mut Option<Lines>, r: &S::Hea
                 .str("event", &event)
                 .str("site", &site)
                 .str("date", &r.played_date().pgn())
-                .str("round", &round)
+                .str("round", round)
                 .str("annotator", &names.annotator(r.annotator())?)
                 .raw("flags", &flags);
             Ok(match lines {
