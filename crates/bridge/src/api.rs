@@ -100,7 +100,7 @@ fn route(app: &App, req: &Request) -> Response {
     match s[..] {
         ["v1", "status"] => status(app),
         ["v1", "databases"] => databases(app),
-        ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(e, req)),
+        ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(app, e, req)),
         ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
         ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(e, req)),
         ["v1", "databases", id, "explorer"] => with_entry(app, id, |e| crate::explorer::route(app, e, req)),
@@ -250,7 +250,7 @@ fn database_changing() -> Response {
     error(503, "database_changing", "The database changed while it was read; retry")
 }
 
-fn games(entry: &Entry, req: &Request) -> Response {
+fn games(app: &App, entry: &Entry, req: &Request) -> Response {
     let offset = match req.param("offset").map(str::parse::<u64>) {
         None => 0,
         Some(Ok(n)) => n,
@@ -323,6 +323,16 @@ fn games(entry: &Entry, req: &Request) -> Response {
         Err(e) if changing(entry, open.generation, &e) => return database_changing(),
         Err(e) => return error(500, "internal", &e.to_string()),
     };
+    // Lines are read from the move records as well: a database that changed
+    // while they were read is reported, as a game's read reports it.
+    if lines.is_some() {
+        if let Some(hook) = &app.between_reads {
+            hook();
+        }
+        if entry.generation() != Some(open.generation) {
+            return database_changing();
+        }
+    }
     let body = Obj::new()
         .str("generation", &format!("{:016x}", open.generation))
         .num("total", total as i64)

@@ -84,6 +84,8 @@ impl<V: TreeVisitor> Walker<'_, V> {
                 self.pieces = p;
                 self.stats.lines += 1;
                 self.visitor.resume();
+                // A visitor with what it needs ends the walk here.
+                self.ended = self.visitor.stopped();
             }
             None => self.ended = true,
         }
@@ -120,6 +122,8 @@ impl<V: TreeVisitor> Walker<'_, V> {
             self.stack.push(s);
             self.visitor.branch();
         }
+        // A visitor with what it needs ends the walk here.
+        self.ended = self.visitor.stopped();
         Ok(())
     }
 

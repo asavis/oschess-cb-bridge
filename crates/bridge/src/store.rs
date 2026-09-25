@@ -206,15 +206,10 @@ impl Store for v2::Database {
         if moves.is_chess960() || !matches!(moves.start(), Ok(Start::Standard)) {
             return Ok(None);
         }
-        let mut board = Board::startpos();
-        let mut line = SanLine::default();
-        for word in moves.main_line().take(usize::from(plies)) {
-            let before = board.clone();
-            // A null move or damage ends the line.
-            let Ok(Some(mv)) = replay::play(&mut board, word) else { break };
-            line.push(&before, mv);
-        }
-        Ok(Some(line.text))
+        // The walk checks the tree's shape as well as each move.
+        let mut prefix = LinePrefix::new(plies);
+        let walked = replay::walk(&moves, &mut prefix);
+        Ok(prefix.finish(walked.is_ok()))
     }
 }
 
@@ -336,48 +331,45 @@ impl Store for cbh::Database {
             return Ok(None);
         }
         // The compact encoding names a move by the position it is played in,
-        // so the tree is walked; the main line comes first in it. Damage ends
-        // the walk after the moves before it.
-        let mut main = ClassicLine { plies, line: SanLine::default(), pending: None, done: false };
-        let _ = cbh::walk(&moves, &mut main);
-        Ok(Some(main.line.text))
+        // so the tree is walked; the main line comes first in it.
+        let mut prefix = LinePrefix::new(plies);
+        let walked = cbh::walk(&moves, &mut prefix);
+        Ok(prefix.finish(walked.is_ok()))
     }
 }
 
-/// A main line's SAN, one space between moves.
-#[derive(Default)]
-struct SanLine {
+/// The start of a game's main line in SAN, read by a tree walk that ends as
+/// soon as the prefix is complete, so a long game costs only its prefix.
+struct LinePrefix {
+    plies: u8,
     text: String,
-    plies: u8,
-}
-
-impl SanLine {
-    fn push(&mut self, before: &Board, mv: Move) {
-        if !self.text.is_empty() {
-            self.text.push(' ');
-        }
-        self.text.push_str(&pgn::san(before, mv));
-        self.plies += 1;
-    }
-}
-
-/// The main line of a classic game's tree walk, as far as `plies`.
-struct ClassicLine {
-    plies: u8,
-    line: SanLine,
+    read: u8,
     /// A main-line move announced and not yet played: it counts once it is,
     /// as an illegal move is reported before it is found to be one.
     pending: Option<(Board, Move)>,
-    /// The line ended: at `plies`, a null move, or the first move off it.
+    /// The prefix is complete: at `plies`, at a null move, or at the main
+    /// line's end.
     done: bool,
 }
 
-impl TreeVisitor for ClassicLine {
+impl LinePrefix {
+    fn new(plies: u8) -> Self {
+        LinePrefix { plies, text: String::new(), read: 0, pending: None, done: false }
+    }
+
+    /// The line after a walk: the moves before any damage, but `None` when
+    /// damage came before the first move, which is no line at all.
+    fn finish(self, walked: bool) -> Option<String> {
+        (walked || self.read > 0).then_some(self.text)
+    }
+}
+
+impl TreeVisitor for LinePrefix {
     fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool) {
         if self.done {
             return;
         }
-        match mv.filter(|_| main_line && self.line.plies < self.plies) {
+        match mv.filter(|_| main_line) {
             Some(mv) => self.pending = Some((before.clone(), mv)),
             None => self.done = true,
         }
@@ -385,8 +377,22 @@ impl TreeVisitor for ClassicLine {
 
     fn played(&mut self, _after: &Board) {
         if let Some((before, mv)) = self.pending.take() {
-            self.line.push(&before, mv);
+            if !self.text.is_empty() {
+                self.text.push(' ');
+            }
+            self.text.push_str(&pgn::san(&before, mv));
+            self.read += 1;
+            self.done = self.read >= self.plies;
         }
+    }
+
+    /// The main line ended: the walk is in its variations now.
+    fn resume(&mut self) {
+        self.done = true;
+    }
+
+    fn stopped(&self) -> bool {
+        self.done
     }
 }
 

@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
@@ -217,14 +218,14 @@ fn classic(name: &str) -> TempDb {
     b.write(name)
 }
 
-fn start(paths: Vec<PathBuf>) -> u16 {
+fn start(paths: Vec<PathBuf>, between_reads: Option<Box<dyn Fn() + Send + Sync>>) -> u16 {
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
     let app = App {
         version: "test",
         policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
         catalog: Catalog::new(paths),
-        between_reads: None,
+        between_reads,
         engine: bridge::engine::Engine::none(),
     };
     let app = Arc::new(app);
@@ -298,7 +299,7 @@ fn served(port: u16, id: &str, number: u32) -> String {
 fn a_window_carries_each_games_main_line() {
     let (a, c) = (two_cbh("lines-2cbh"), classic("lines-cbh"));
     let (pa, pc) = (a.dir().join("db.2cbh"), c.dir().join("db.cbh"));
-    let port = start(vec![pa.clone(), pc.clone()]);
+    let port = start(vec![pa.clone(), pc.clone()], None);
     for (path, count) in [(&pa, 10), (&pc, 8)] {
         let id = id_of(path);
         let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20&line=60"));
@@ -329,7 +330,7 @@ fn a_window_carries_each_games_main_line() {
 fn line_counts_plies_and_follows_search_and_sort() {
     let db = two_cbh("lines-plies");
     let path = db.dir().join("db.2cbh");
-    let port = start(vec![path.clone()]);
+    let port = start(vec![path.clone()], None);
     let id = id_of(&path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3&line=3"));
     assert_eq!(status, 200, "{body}");
@@ -351,7 +352,7 @@ fn line_counts_plies_and_follows_search_and_sort() {
 fn a_window_without_line_is_unchanged_and_line_is_bounded() {
     let db = two_cbh("lines-bounds");
     let path = db.dir().join("db.2cbh");
-    let port = start(vec![path.clone()]);
+    let port = start(vec![path.clone()], None);
     let id = id_of(&path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20"));
     assert_eq!(status, 200);
@@ -361,4 +362,67 @@ fn a_window_without_line_is_unchanged_and_line_is_bounded() {
         assert_eq!(status, 400, "line={bad}: {body}");
         assert!(body.contains(r#""parameter":"line""#) && body.contains("between 1 and 60"), "{body}");
     }
+}
+
+/// Damage before the first move is no line at all, unlike an empty one: an
+/// illegal first move, an alternative marker before any move, a move record
+/// of an encoding mode that cannot be read.
+#[test]
+fn damage_before_the_first_move_is_no_line() {
+    let mut b = Builder::new();
+    game(
+        &mut b,
+        &[movetable::encode(MoveWord::Normal {
+            color: Color::Black,
+            piece: Piece::Pawn,
+            from: sq("e7"),
+            to: sq("e5"),
+            captured: Captured::Nothing,
+            promotion: None,
+        })
+        .unwrap()],
+    );
+    let mut stream = vec![ALTERNATIVE];
+    stream.extend(words(&mut Board::startpos(), "e2e4"));
+    game(&mut b, &stream);
+    game(&mut b, &[]);
+    b.lid(lid_header(1024, 1));
+    let a = b.write("lines-damage-2cbh");
+    let mut c = fixture_cbh::Builder::new();
+    c.game(&move_record(1, None, None, &[]));
+    classic_game(&mut c, &[]);
+    let cdb = c.write("lines-damage-cbh");
+    let (pa, pc) = (a.dir().join("db.2cbh"), cdb.dir().join("db.cbh"));
+    let port = start(vec![pa.clone(), pc.clone()], None);
+    let (_, body) = get(port, &format!("/v1/databases/{}/games?line=60", id_of(&pa)));
+    let null = || Some("null".to_string());
+    assert_eq!(lines(&body), [(1, null()), (2, null()), (3, Some(String::new()))], "{body}");
+    let (_, body) = get(port, &format!("/v1/databases/{}/games?line=60", id_of(&pc)));
+    assert_eq!(lines(&body), [(1, null()), (2, Some(String::new()))], "{body}");
+}
+
+/// A database that changes while a window's lines are read answers
+/// `503 database_changing`, as a game read during a change does.
+#[test]
+fn a_change_while_lines_are_read_is_reported() {
+    let db = two_cbh("lines-change");
+    let path = db.dir().join("db.2cbh");
+    let moves = db.dir().join("db.2cbg");
+    let once = AtomicBool::new(false);
+    let hook = move || {
+        if !once.swap(true, Ordering::SeqCst) {
+            let mut bytes = std::fs::read(&moves).unwrap();
+            bytes.push(0);
+            std::fs::write(&moves, bytes).unwrap();
+        }
+    };
+    let port = start(vec![path.clone()], Some(Box::new(hook)));
+    let id = id_of(&path);
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3"));
+    assert_eq!(status, 200, "a window without lines reads no move record: {body}");
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3&line=60"));
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains(r#""code":"database_changing""#), "{body}");
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3&line=60"));
+    assert_eq!(status, 200, "the next request reads the new state: {body}");
 }

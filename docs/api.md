@@ -409,13 +409,14 @@ brings its games' openings, for example to build a player's opening tree:
 
 | Field | Meaning |
 |---|---|
-| `line` | The first `line` plies of the main line in SAN, one space between moves, as `GET /v1/databases/{id}/games/{number}` writes them: `"e4 e5 Nf3 Nc6 Bb5"`. It is shorter when the game is, and ends at a null move and before a move that cannot be read. It is `null` when the game does not start from the standard position (a set-up position or Chess960) and when its moves cannot be read at all; such a game never fails the window |
+| `line` | The first `line` plies of the main line in SAN, one space between moves, as `GET /v1/databases/{id}/games/{number}` writes them: `"e4 e5 Nf3 Nc6 Bb5"`. It is shorter when the game is, and ends at a null move and before the first damage: a move that cannot be read or played, or a broken move tree. It is `""` for a game without moves, and `null` when the game does not start from the standard position (a set-up position or Chess960) or its moves cannot be read at all, damage before the first move included; such a game never fails the window. Only the plies asked for are read: the rest of the game is neither replayed nor checked |
 
 Rows of guiding texts and analyses have no `line`. The lines are read after
-the search and the sort, only for the window's games, and like the rows they
-are as stored at the moment they were read ([Consistency](#consistency)). A
-bridge older than this field ignores the parameter: a game row without `line`
-tells the client so.
+the search and the sort, only for the window's games. A database whose
+generation changed while they were read is answered `503 database_changing`,
+as a game read during a change is ([Consistency](#consistency)). A bridge
+older than this field ignores the parameter: a game row without `line` tells
+the client so.
 
 Text fields in a row are cut at 200 characters and then end with `…`; the
 game's PGN has them in full. A window therefore stays small however long a
