@@ -297,9 +297,11 @@ pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> 
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
-/// Asks for an engine's executable and chooses it; `None` when the user cancelled.
+/// Asks for an engine's executable; `None` when the user cancelled. The page
+/// then chooses it with [`choose_engine`], showing that it is being checked
+/// (#73): a slow engine start must not look like a hung window.
 #[tauri::command]
-pub async fn pick_engine(app: AppHandle) -> Answer<Option<EnginesView>> {
+pub async fn pick_engine(app: AppHandle) -> Answer<Option<String>> {
     let strings = &shared(&app).strings;
     let mut dialog = app
         .dialog()
@@ -312,7 +314,7 @@ pub async fn pick_engine(app: AppHandle) -> Answer<Option<EnginesView>> {
     let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_file()).await.map_err(text)?;
     let Some(file) = picked else { return Ok(None) };
     let path = file.into_path().map_err(text)?;
-    choose_engine(app, path.to_string_lossy().into_owned()).await.map(Some)
+    Ok(Some(path.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]

@@ -106,7 +106,7 @@ function engineRow(name, detail, path, chosen, version) {
   radio.type = 'radio';
   radio.name = 'engine';
   radio.checked = path === chosen;
-  radio.addEventListener('change', () => chooseEngine(() => call('choose_engine', { path })));
+  radio.addEventListener('change', () => chooseEngine(path));
   const text = el('div', 'text', el('div', null, name), el('div', 'cap12 path', detail));
   text.lastChild.title = detail;
   // A build the bridge installed carries its licence beside it.
@@ -121,26 +121,44 @@ function engineRow(name, detail, path, chosen, version) {
   return el('label', 'row engine', radio, text, licence);
 }
 
-// One choice at a time: the controls wait while an engine is checked, so a
-// slower answer never replaces a later choice. A refused engine names the
-// dictionary key of its message; the list is read again.
+// One choice at a time: the controls wait from the file dialog until the
+// engine is checked, so a slower answer never replaces a later choice. A
+// refused engine names the dictionary key of its message; the list is read
+// again.
 let choosing = false;
 
-function chooseEngine(start) {
+// `path` gives the engine to check, or nothing (a closed file dialog).
+function choose(path) {
   if (choosing) return;
   choosing = true;
   enginesBusy(true);
-  notice(t('settings.engine.checking'));
-  start()
-    .then((view) => view && renderEngines(view), (message) => {
-      notice(t(String(message)));
-      return call('engines').then(renderEngines);
+  const line = document.getElementById('engine-checking');
+  Promise.resolve()
+    .then(path)
+    .then((chosen) => {
+      if (!chosen) return;
+      // #73: starting an engine can take seconds; the section says so until it answers.
+      line.hidden = false;
+      return call('choose_engine', { path: chosen }).then(renderEngines, (message) => {
+        notice(t(String(message)));
+        return call('engines').then(renderEngines);
+      });
     })
     .catch((message) => notice(t('settings.error', { message })))
     .finally(() => {
       choosing = false;
       enginesBusy(false);
+      line.hidden = true;
     });
+}
+
+function chooseEngine(path) {
+  choose(() => path);
+}
+
+// The file dialog first; the engine is checked only once one is chosen.
+function pickEngine() {
+  choose(() => call('pick_engine'));
 }
 
 function enginesBusy(busy) {
@@ -182,9 +200,10 @@ function toggle(id, onNow) {
 }
 
 function wire() {
+  document.getElementById('engine-checking').prepend(icon('spin', 14, 2.4));
   document.getElementById('add-folder').addEventListener('click', () =>
     act(call('add_folder').then((settings) => settings && renderSettings(settings))));
-  document.getElementById('pick-engine').addEventListener('click', () => chooseEngine(() => call('pick_engine')));
+  document.getElementById('pick-engine').addEventListener('click', pickEngine);
   document.getElementById('install-stockfish').addEventListener('click', installStockfish);
   document.getElementById('offer-update').addEventListener('click', installStockfish);
   document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
