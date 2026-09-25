@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use cbformat::view::Base;
 
 use crate::fetch::{Cloud, Progress, Serial, System};
+use crate::pgnindex::{self, Opening};
 use crate::search::Indexes;
 use crate::sources::{Listed, Read, Sources};
 
@@ -46,6 +47,8 @@ impl Format {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Ready,
+    /// A PGN file whose index is being built; see [`Entry::opening`].
+    Opening,
     Missing,
     /// Files kept only in the cloud; opening the database for its games
     /// downloads them.
@@ -60,6 +63,7 @@ impl State {
     pub fn name(self) -> &'static str {
         match self {
             State::Ready => "ready",
+            State::Opening => "opening",
             State::Missing => "missing",
             State::CloudOnly => "cloudOnly",
             State::Downloading => "downloading",
@@ -89,10 +93,12 @@ pub struct Entry {
     shared: Arc<Shared>,
 }
 
-/// What entries share: how cloud files are seen, and the download queue.
+/// What entries share: how cloud files are seen, the download queue, and the
+/// index builds of PGN files.
 struct Shared {
     cloud: Arc<dyn Cloud>,
     downloads: Arc<Serial>,
+    pgn: pgnindex::Registry,
 }
 
 /// What stays with a database when the list is read again or the window
@@ -162,7 +168,7 @@ impl Entry {
         if self.removed.load(Ordering::Relaxed) {
             return Err(State::Missing);
         }
-        if !matches!(self.format, Format::TwoCbh | Format::Cbh) {
+        if self.format == Format::Other {
             return Err(if self.path.exists() { State::Unsupported } else { State::Missing });
         }
         let files = self.files();
@@ -182,10 +188,23 @@ impl Entry {
         if let Some(open) = slot.as_ref().filter(|o| o.generation == generation) {
             return Ok(open.clone());
         }
-        let db = Base::open(&self.path).map_err(|_| State::Unreadable)?;
+        let db = match self.format {
+            Format::Pgn => match self.shared.pgn.open(&self.id, &self.path, generation) {
+                Opening::Ready(db) => Base::Pgn(db),
+                Opening::Pending(_) => return Err(State::Opening),
+                Opening::Failed => return Err(State::Unreadable),
+            },
+            _ => Base::open(&self.path).map_err(|_| State::Unreadable)?,
+        };
         let open = Opened { db: Arc::new(db), generation, indexes: Indexes::shared() };
         *slot = Some(open.clone());
         Ok(open)
+    }
+
+    /// The build of a PGN file's index running or queued: the bytes of the
+    /// file read, of all.
+    pub fn opening(&self) -> Option<Arc<Progress>> {
+        (self.format == Format::Pgn).then(|| self.shared.pgn.progress(&self.id)).flatten()
     }
 
     /// [`Entry::open`] for reading games: a cloud-only database starts
@@ -287,19 +306,26 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 const CBH_FILES: [&str; 8] = [".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj"];
 
 /// The metadata of the database at `path`, of `format`: its generation and
-/// files. Metadata only, following links: nothing is opened.
+/// files. Metadata only, following links: nothing is opened. A PGN database
+/// is its one file.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let stem = path.with_extension("");
     let mut hash = Hash::new();
     let mut files = Files { generation: None, present: Vec::new(), irregular: false };
     let extensions: &[&str] = match format {
         Format::Cbh => &CBH_FILES,
+        Format::Pgn => &[""],
         _ => &cbformat::v2::EXTENSIONS,
     };
     for &ext in extensions {
-        let mut path = stem.clone().into_os_string();
-        path.push(ext);
-        let path = PathBuf::from(path);
+        let path = match format {
+            Format::Pgn => path.to_path_buf(),
+            _ => {
+                let mut path = stem.clone().into_os_string();
+                path.push(ext);
+                PathBuf::from(path)
+            }
+        };
         match std::fs::metadata(&path) {
             Ok(m) if !m.is_file() => {
                 files.irregular = true;
@@ -352,7 +378,7 @@ impl Catalog {
 
     /// The databases of `sources`, read now and again whenever they change.
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
-        let shared = Arc::new(Shared { cloud, downloads: Arc::default() });
+        let shared = Arc::new(Shared { cloud, downloads: Arc::default(), pgn: pgnindex::Registry::default() });
         let listing = Listing { read: Read::default(), entries: Vec::new() };
         let catalog = Catalog {
             explorer: crate::explorer::Registry::default(),
@@ -370,6 +396,11 @@ impl Catalog {
     /// The queue downloads run in.
     pub fn downloads(&self) -> &Serial {
         &self.shared.downloads
+    }
+
+    /// The index builds of PGN files.
+    pub fn pgn(&self) -> &pgnindex::Registry {
+        &self.shared.pgn
     }
 
     /// Sets a function called each time the sources have been read, before

@@ -75,6 +75,15 @@ impl TempDb {
     }
 }
 
+/// A PGN file `db.pgn` holding `bytes`, in a temporary directory of its own.
+pub fn pgn_file(name: &str, bytes: &[u8]) -> TempDb {
+    let dir = std::env::temp_dir().join(format!("cbformat-pgn-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("db.pgn"), bytes).unwrap();
+    TempDb::at(dir)
+}
+
 impl Drop for TempDb {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);

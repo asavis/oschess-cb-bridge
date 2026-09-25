@@ -1,18 +1,19 @@
-//! The two database formats as the bridge reads them: [`Store`] over a
-//! format's database and [`Head`] over its header records, for search, sort,
+//! The database formats as the bridge reads them: [`Store`] over a format's
+//! database and [`Head`] over its header records, for search, sort,
 //! suggestions, the game list and the position index, and [`Any`] for a
-//! database of either format.
+//! database of any format.
 //!
 //! The formats differ where the bridge looks: 2CBH names an annotator as a
 //! player and a guiding text's title as an entity, while the classic format
 //! keeps annotators in a table of their own and a text's titles in the text's
-//! own `.cbg` record.
+//! own `.cbg` record. A PGN file holds games only, with annotators apart from
+//! players, and its games are served as the file writes them.
 
 use cbformat::pgn::{self, Options, Rendered};
 use cbformat::replay::{self, TreeVisitor};
 use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
 use cbformat::view::Base;
-use cbformat::{Error, Result, cbh};
+use cbformat::{Error, Result, cbh, pgnfile};
 use chesscore::{Board, Move};
 
 use crate::api::MAX_GAME_BYTES;
@@ -404,11 +405,110 @@ impl TreeVisitor for LinePrefix {
     }
 }
 
-/// A database of either format, borrowed.
+impl Head for pgnfile::Record {
+    fn id(&self) -> u32 {
+        pgnfile::Record::id(self)
+    }
+    fn kind(&self) -> RecordKind {
+        RecordKind::Game
+    }
+    fn is_deleted(&self) -> bool {
+        false
+    }
+    fn white(&self) -> i64 {
+        pgnfile::Record::white(self)
+    }
+    fn black(&self) -> i64 {
+        pgnfile::Record::black(self)
+    }
+    fn tournament(&self) -> i64 {
+        pgnfile::Record::tournament(self)
+    }
+    fn annotator(&self) -> i64 {
+        pgnfile::Record::annotator(self)
+    }
+    fn other(&self) -> Option<(i64, i64)> {
+        None
+    }
+    fn result(&self) -> GameResult {
+        pgnfile::Record::result(self)
+    }
+    fn eco(&self) -> Eco {
+        pgnfile::Record::eco(self)
+    }
+    fn played_date(&self) -> Date {
+        pgnfile::Record::played_date(self)
+    }
+    fn round(&self) -> (i32, i32) {
+        let (round, sub) = pgnfile::Record::round(self);
+        (i32::from(round), i32::from(sub))
+    }
+    fn elo(&self) -> (i32, i32) {
+        let (white, black) = pgnfile::Record::elo(self);
+        (i32::from(white), i32::from(black))
+    }
+    fn move_count(&self) -> i32 {
+        i32::from(pgnfile::Record::move_count(self))
+    }
+    fn bytes(&self) -> &[u8] {
+        pgnfile::Record::bytes(self)
+    }
+}
+
+impl Store for pgnfile::Database {
+    type Head = pgnfile::Record;
+    const HEAD_BYTES: usize = pgnfile::RECORD_SIZE;
+    const ANNOTATORS_ARE_PLAYERS: bool = false;
+    const TITLES_BY_RECORD: bool = false;
+
+    fn record_count(&self) -> u32 {
+        pgnfile::Database::record_count(self)
+    }
+    fn read_records(&self, first: u32, buf: &mut [u8]) -> Result<u32> {
+        pgnfile::Database::read_records(self, first, buf)
+    }
+    fn head(id: u32, bytes: &[u8]) -> pgnfile::Record {
+        pgnfile::Record::from_bytes(id, bytes.try_into().expect("a whole header record"))
+    }
+    fn record(&self, id: u32) -> Result<pgnfile::Record> {
+        pgnfile::Database::record(self, id)
+    }
+    fn records(&self, first: u32, last: u32) -> Result<Vec<pgnfile::Record>> {
+        pgnfile::Database::records(self, first, last)
+    }
+    fn name_count(&self, kind: Kind) -> u64 {
+        u64::from(match kind {
+            Kind::Players => self.players(),
+            Kind::Tournaments => self.tournaments(),
+            Kind::Annotators => self.annotators(),
+            Kind::Titles => 0,
+        })
+    }
+    fn player(&self, id: i64) -> Result<Option<Player>> {
+        self.player_within(id, MAX_NAME_RECORD)
+    }
+    fn tournament(&self, id: i64) -> Result<Option<Tournament>> {
+        self.tournament_within(id, MAX_NAME_RECORD)
+    }
+    fn annotator(&self, id: i64) -> Result<Option<String>> {
+        self.annotator_within(id, MAX_NAME_RECORD)
+    }
+    fn title(&self, _: i64) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// The game as the file writes it: its comments are all it has, so the
+    /// preferred languages and the full form change nothing.
+    fn render(&self, r: &pgnfile::Record, _: &Options) -> Result<Rendered> {
+        Ok(Rendered { pgn: self.text(r, MAX_GAME_BYTES)?, annotations: pgn::AnnotationStatus::Complete })
+    }
+}
+
+/// A database of any format, borrowed.
 #[derive(Clone, Copy)]
 pub enum Any<'a> {
     TwoCbh(&'a v2::Database),
     Cbh(&'a cbh::Database),
+    Pgn(&'a pgnfile::Database),
 }
 
 impl Any<'_> {
@@ -417,6 +517,7 @@ impl Any<'_> {
         match self {
             Any::TwoCbh(db) => db.record_count(),
             Any::Cbh(db) => db.record_count(),
+            Any::Pgn(db) => db.record_count(),
         }
     }
 }
@@ -433,11 +534,18 @@ impl<'a> From<&'a cbh::Database> for Any<'a> {
     }
 }
 
+impl<'a> From<&'a pgnfile::Database> for Any<'a> {
+    fn from(db: &'a pgnfile::Database) -> Self {
+        Any::Pgn(db)
+    }
+}
+
 impl<'a> From<&'a Base> for Any<'a> {
     fn from(db: &'a Base) -> Self {
         match db {
             Base::TwoCbh(db) => Any::TwoCbh(db),
             Base::Cbh(db) => Any::Cbh(db),
+            Base::Pgn(db) => Any::Pgn(db),
         }
     }
 }
@@ -457,6 +565,7 @@ macro_rules! with_store {
         match ::std::convert::Into::<$crate::store::Any<'_>>::into($any) {
             $crate::store::Any::TwoCbh($db) => $body,
             $crate::store::Any::Cbh($db) => $body,
+            $crate::store::Any::Pgn($db) => $body,
         }
     };
 }

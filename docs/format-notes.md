@@ -600,3 +600,49 @@ writer handles both formats alike.
   (`cbh::MAX_VARIATION_DEPTH`); a deeper tree is an error, raised before its
   position is saved. The deepest nesting measured is 74 in the Mega Database
   2026 (three games reach 64 or more) and 63 in the classic databases above.
+
+# PGN files
+
+`cbformat::pgnfile` reads a PGN file as a database through a header index it
+builds in one pass (`docs/api.md`, "PGN files"). The reader was checked
+against:
+
+- **ChessBase's own export.** A weekly Mega update (6,223 games) and the PGN
+  that ChessBase '26 exported from it: every game's row fields (date, event,
+  site, round, both ratings, result, ECO, move count) and every main line are
+  equal to the 2CBH copy's, the main line played from the PGN text against
+  the one replayed from the move records. 5,000 sampled positions of the two
+  position indexes answer the same games, results and moves. The players'
+  names differ in 46 places, all of one kind (below).
+- **This reader's own export.** All 47 weekly Mega updates of 2026 (284,781
+  games) exported with `cbtool pgn` and read back: every row field and every
+  main line equal, apart from five names (below). For two of the pairs, 3,000
+  sampled positions each answer the same in both position indexes.
+- **Scale.** The 47 exports written 45 times over into one file of 10.2 GB
+  and 12,815,145 games: its header index (616 MB, 48 bytes a game and the
+  names) is built in 78 to 197 s, with 10 MB of memory, on a loaded 32-thread
+  machine; its position index, of 12,815,100 games, in 186 s; and
+  `cbtool verify` plays all 1,133,884,395 main-line plies with no move it
+  cannot play.
+- **Local files.** Five PGN files of a user's ChessBase folders (10,044
+  games, 2,711 of them from set-up positions, one file with Cyrillic comments
+  and a byte-order mark): every main line plays to its end.
+
+## Findings
+
+- **ChessBase writes PGN as UTF-8 with a byte-order mark**, and a sub-round
+  as `5.2`. Every PGN file seen was valid UTF-8.
+- **A one-letter first name gets a period in ChessBase's export**: a player
+  stored with the first name `N` is written `Last, N.`. That is the whole of
+  the 46 name differences above.
+- **A first name stored with a leading space** is written by `cbtool pgn`
+  with two spaces after the comma; this reader trims it. That is the whole of
+  the five name differences above.
+- **`0-0` is ChessBase's result for a game both players lost** (the header's
+  result 7), in the `Result` tag and at the end of the movetext. In such a
+  game the movetext's last `0-0` is the result, not castling; elsewhere
+  `0-0` castles.
+- **This reader's PGN writer puts a sub-round as `5(2)`**, as the list shows
+  it; the reader takes both forms.
+- **Full moves count move numbers.** A game set up with black to move,
+  `35... Kf8 36. Ke4`, has two moves in ChessBase's header, not one.

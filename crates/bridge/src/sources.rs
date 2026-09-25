@@ -83,9 +83,9 @@ impl Sources {
 }
 
 /// The databases a configured path names: the path itself, or for a folder
-/// the ChessBase databases directly in it, by file name. In a folder only
-/// regular files (or links to them) count: a pipe or a folder named like a
-/// database is none.
+/// the ChessBase databases and PGN files directly in it, by file name. In a
+/// folder only regular files (or links to them) count: a pipe or a folder
+/// named like a database is none.
 pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     match std::fs::metadata(path) {
@@ -98,7 +98,7 @@ pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(path).map_err(err)? {
         let file = entry.map_err(err)?.path();
-        if !matches!(Format::of(&file), Format::TwoCbh | Format::Cbh) {
+        if Format::of(&file) == Format::Other {
             continue;
         }
         match std::fs::metadata(&file) {

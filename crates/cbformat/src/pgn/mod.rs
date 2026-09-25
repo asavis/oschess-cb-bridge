@@ -10,7 +10,7 @@ mod tree;
 pub use classic::{classic_game, classic_game_from, classic_game_with};
 
 pub use commands::language_code;
-pub use san::san;
+pub use san::{parse as parse_san, san};
 
 use chesscore::Board;
 

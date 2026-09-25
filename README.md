@@ -3,12 +3,13 @@
 Read ChessBase chess databases with open-source code, on the machine that
 holds them: the ChessBase 2 format (`.2cbh`, `.2cbg`, `.2lid`, …, written by
 ChessBase 17 and later) and the classic format (`.cbh`, `.cbg`, `.cba`, …).
+PGN files (`.pgn`) are read as databases too.
 
 The repository is a Cargo workspace:
 
 | Crate | What it is |
 |---|---|
-| [`cbformat`](crates/cbformat) | A reader library for both formats: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. `view::Base` reads either format the same way. |
+| [`cbformat`](crates/cbformat) | A reader library for both formats: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. A PGN file read as a database through a header index (`pgnfile`). `view::Base` reads every format the same way. |
 | [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, and `bridge` to run the bridge in a console. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
 | [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
@@ -105,6 +106,16 @@ target/release/cbtool bridge --database "path/to/Database.2cbh"   # the same bri
 ([docs/api.md](docs/api.md#classic-databases)). `--lang` chooses the language
 of comments stored in several languages, in order of preference; English is
 the default.
+
+`cbtool info` and `verify` also read a PGN file as the bridge does: they build
+its header index and play every game's main line as written, printing counts.
+`--code-page N` reads text that is not UTF-8 in Windows code page N; the
+bridge uses the computer's. The bridge serves a PGN file like a 2CBH database
+once it has read it ([docs/api.md](docs/api.md#pgn-files)). `cargo run
+--release -p cbformat --example pgn_pairs -- <db.2cbh> <export.pgn>` compares a
+database with its PGN export field by field and move by move, and `cargo run
+--release -p bridge --example pgn_index_pairs -- <db.2cbh> <export.pgn> <dir>`
+compares their position indexes; both print counts only.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).

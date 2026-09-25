@@ -1,5 +1,6 @@
 //! `cbtool`: inspect, verify and export ChessBase databases, 2CBH and
-//! classic CBH; run the bridge in a console.
+//! classic CBH; inspect and verify PGN files as the bridge reads them; run
+//! the bridge in a console.
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -17,10 +18,12 @@ use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
 use cbformat::view::{self, Base};
 
 mod classic;
+mod pgn_file;
 
 const USAGE: &str = "usage:
-  cbtool info   <db>
-  cbtool verify <db> [--limit N]           decode and replay every game and analysis
+  cbtool info   <db> [--code-page N]
+  cbtool verify <db> [--limit N | --code-page N]
+                                           decode and replay every game and analysis
   cbtool pgn    <db> [--out FILE] [--lang LANGS] [ID...]
                                            export games as PGN (all games when no ids)
   cbtool databases <dir>                   the databases ChessBase's database window lists
@@ -28,7 +31,9 @@ const USAGE: &str = "usage:
   cbtool bridge [--database <path>]... [--show-token] [--new-token]
                                            run the oschess bridge in this console
 
-<db> is a 2CBH (.2cbh) or classic (.cbh) database.
+<db> is a 2CBH (.2cbh) or classic (.cbh) database. info and verify also read a
+PGN file (.pgn), as the bridge serves it; --code-page N reads its text that is
+not UTF-8 in Windows code page N (default: 1252).
 
 --lang takes ISO 639-1 codes in order of preference, comma-separated, for the
 language of comments (default: English, else the first a game has).
@@ -38,7 +43,7 @@ CBTOOL_THREADS sets the number of worker threads (default: one per CPU).";
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("info") if args.len() == 2 => info(&args[1]),
+        Some("info") if args.len() >= 2 => info(&args[1], &args[2..]),
         Some("verify") if args.len() >= 2 => verify(&args[1], &args[2..]),
         Some("pgn") if args.len() >= 2 => pgn(&args[1], &args[2..]),
         Some("databases") if args.len() == 2 => databases::databases(&args[1]),
@@ -62,8 +67,15 @@ fn main() -> ExitCode {
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn info(path: &str) -> AnyResult<bool> {
-    if view::format_of(Path::new(path)) == view::Format::Cbh {
+fn info(path: &str, rest: &[String]) -> AnyResult<bool> {
+    let format = view::format_of(Path::new(path));
+    if format == view::Format::Pgn {
+        return pgn_file::info(path, pgn_file::code_page(rest)?);
+    }
+    if !rest.is_empty() {
+        return Err(USAGE.into());
+    }
+    if format == view::Format::Cbh {
         return classic::info(path);
     }
     let db = Database::open(path)?;
@@ -223,6 +235,9 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
 }
 
 fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
+    if view::format_of(Path::new(path)) == view::Format::Pgn {
+        return pgn_file::verify(path, pgn_file::code_page(rest)?);
+    }
     let limit = match rest {
         [flag, n] if flag == "--limit" => Some(n.parse::<u32>()?),
         [] => None,

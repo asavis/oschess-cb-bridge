@@ -34,8 +34,8 @@ fn extra(path: &Path) -> Extra {
     }
 }
 
-/// The regular `.2cbh` and `.cbh` files directly in `folder`, as the bridge
-/// serves a folder.
+/// The regular `.2cbh`, `.cbh` and `.pgn` files directly in `folder`, as the
+/// bridge serves a folder.
 pub fn databases_in(folder: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(folder) else { return 0 };
     entries
@@ -43,7 +43,8 @@ pub fn databases_in(folder: &Path) -> usize {
         .filter(|e| {
             let path = e.path();
             let ext = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-            matches!(ext.as_deref(), Some("2cbh" | "cbh")) && std::fs::metadata(&path).is_ok_and(|m| m.is_file())
+            matches!(ext.as_deref(), Some("2cbh" | "cbh" | "pgn"))
+                && std::fs::metadata(&path).is_ok_and(|m| m.is_file())
         })
         .count()
 }
@@ -122,7 +123,7 @@ mod tests {
         let list = extras(&config);
         assert_eq!(
             list.iter().map(|e| (e.folder, e.databases, e.present)).collect::<Vec<_>>(),
-            [(true, Some(2), true), (false, None, true), (false, None, false)]
+            [(true, Some(3), true), (false, None, true), (false, None, false)]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

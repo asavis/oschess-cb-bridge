@@ -23,6 +23,7 @@ pub mod files;
 pub mod http;
 pub mod json;
 pub mod pairing;
+pub mod pgnindex;
 pub mod reply;
 pub mod search;
 pub mod server;

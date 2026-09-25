@@ -54,8 +54,8 @@ port = 39581
 # for example [\"http://localhost:5173\"].
 origins = []
 
-# Databases in addition to those ChessBase shows: paths to .2cbh files, or to
-# folders whose databases are all served,
+# Databases in addition to those ChessBase shows: paths to .2cbh, .cbh or .pgn
+# files, or to folders whose databases are all served,
 # for example ['C:\\Users\\me\\Documents\\ChessBase\\MyWork\\Games.2cbh'].
 databases = []
 
