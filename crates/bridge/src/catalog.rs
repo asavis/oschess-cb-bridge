@@ -418,7 +418,8 @@ impl Catalog {
         entries
     }
 
-    /// Sweeps the index folder of what the list no longer uses (#60), now and
+    /// Sweeps the index folder, and the PGN header index folder, of what the
+    /// list no longer uses (#60), now and
     /// from now on: after each change of the list, and at least once a minute
     /// while the list is asked for. The bridge calls it once it has its data
     /// folder; tests call it once they have set theirs.
@@ -442,6 +443,7 @@ impl Catalog {
         // the list, and keeps its index.
         let listed = entries.iter().filter(|e| e.listed()).map(|e| e.id.clone()).collect();
         self.explorer.sweep(&listed);
+        self.shared.pgn.sweep(&listed);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Entry>> {

@@ -354,6 +354,10 @@ of the same games answers, apart from what the format has otherwise:
   after the bridge restarts; a change to the file reads it again. A file whose
   header index cannot be built is `unreadable` for a minute, and the next
   request tries again. A header index takes 48 bytes a game plus the names.
+  The `pgn` folder is swept as the `index` folder is (see "Storage" under
+  `GET /v1/databases/{id}/explorer`): a build's `<id>.head.partial` goes at
+  once unless that file is being read, and the header index of a database
+  off the list for ten minutes goes.
 - **Games only.** Every record is a game: none is deleted, and a PGN file has
   no guiding texts or analyses. A game starts at its first tag, or at its
   first move when it has none, and ends at its result or where the next
