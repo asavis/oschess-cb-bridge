@@ -243,7 +243,8 @@ mod tests {
             format!("{reading}.head"),
             format!("{reading}.head.partial"),
             "notes.txt".into(),
-            "0123456789ABCDEF.head".into(),
+            // Upper case, and no test id in any case: Windows folds case.
+            "ABCDEF0123456789.head".into(),
         ];
         for name in &names {
             std::fs::write(dir.join(name), b"x").unwrap();
