@@ -127,6 +127,29 @@ fn streams_the_lines_of_a_search_to_its_best_move() {
     assert_eq!(app.engine.name().as_deref(), Some("Fake UCI 1.0"));
 }
 
+/// The `nps` of the deepest line: what the fake engine was set to.
+fn settings_of(lines: &[String]) -> (u64, u64, u64) {
+    let line = lines.iter().rev().find(|l| l.contains(r#""nps":"#)).expect("an info line");
+    let nps: u64 = line.split(r#""nps":"#).nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+    (nps / 1_000_000, nps / 1_000 % 1_000, nps % 1_000)
+}
+
+#[test]
+fn threads_and_hash_come_with_the_analysis_and_are_set_only_when_they_change() {
+    let (port, _app) = start(Engine::new(fake()));
+    let search = |extra: &str| {
+        let mut a = Analysis::open(port, &format!("depth=2&stream=tab1{extra}"));
+        assert_eq!(a.status, 200);
+        settings_of(&a.rest())
+    };
+    // The handshake sets the configured 1 thread and 16 MB.
+    assert_eq!(search(""), (1, 16, 2));
+    assert_eq!(search("&threads=1&hash=64"), (1, 64, 3));
+    assert_eq!(search("&threads=1&hash=64"), (1, 64, 3), "the same values set nothing");
+    // Left out, a value goes back to the configured default.
+    assert_eq!(search(""), (1, 16, 4));
+}
+
 #[test]
 fn stops_the_engine_when_the_client_leaves() {
     let (port, app) = start(Engine::new(fake()));
@@ -230,6 +253,10 @@ fn refuses_bad_input_and_a_missing_engine() {
         ("depth=0", "depth"),
         ("depth=5&movetime=100", "movetime"),
         ("stream=a%20b", "stream"),
+        ("threads=0", "threads"),
+        ("threads=x", "threads"),
+        ("hash=15", "hash"),
+        ("hash=99999999", "hash"),
     ] {
         let a = Analysis::open(port, query);
         assert_eq!(a.status, 400, "{query}");
@@ -257,7 +284,12 @@ fn get(port: u16, path: &str, token: bool) -> String {
 fn the_status_names_the_engine() {
     let (port, _app) = start(Engine::new(fake()));
     let status = get(port, "/v1/status", true);
-    assert!(status.contains(r#""engine":{"name":"fake-uci"}"#), "{status}");
+    let limits = bridge::engine::limits();
+    let engine = format!(
+        r#""engine":{{"name":"fake-uci","threads":{{"default":1,"max":{}}},"hash":{{"default":16,"max":{}}}}}"#,
+        limits.max_threads, limits.max_hash_mb
+    );
+    assert!(status.contains(&engine), "{status}");
     let (port, _app) = start(Engine::none());
     assert!(get(port, "/v1/status", true).contains(r#""engine":null"#));
 }

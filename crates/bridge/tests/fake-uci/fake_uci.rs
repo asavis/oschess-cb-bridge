@@ -7,6 +7,9 @@
 //! line and then nothing until it is stopped. Started under a name containing
 //! `chatty`, it answers `uci` with eight seconds of `id name` lines before
 //! `uciok`.
+//!
+//! Its `nps` tells what it was set to (#58): `Threads` × 1 000 000 + `Hash` ×
+//! 1 000 + how many `Threads` and `Hash` options it has been sent.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -27,6 +30,7 @@ fn main() {
         let _ = out.flush();
     };
     let (mut multipv, mut position) = (1u32, String::new());
+    let (mut threads, mut hash, mut resources_set) = (1u64, 16u64, 0u64);
     let mut search: Option<(u32, Option<u32>, Option<Instant>)> = None;
     loop {
         let wait = if search.is_some() { Duration::from_millis(20) } else { Duration::from_secs(3600) };
@@ -48,6 +52,14 @@ fn main() {
                     }
                     ["isready"] => say("readyok"),
                     ["setoption", "name", "MultiPV", "value", n] => multipv = n.parse().unwrap_or(1),
+                    ["setoption", "name", "Threads", "value", n] => {
+                        threads = n.parse().unwrap_or(0);
+                        resources_set += 1;
+                    }
+                    ["setoption", "name", "Hash", "value", n] => {
+                        hash = n.parse().unwrap_or(0);
+                        resources_set += 1;
+                    }
                     ["setoption", ..] => {}
                     ["position", ..] => position = command.clone(),
                     ["go", rest @ ..] => {
@@ -82,10 +94,11 @@ fn main() {
             *depth += 1;
             for k in 1..=multipv {
                 say(&format!(
-                    "info depth {depth} seldepth {} multipv {k} score cp {} nodes {} nps 1000000 time {} pv e2e4 e7e5",
+                    "info depth {depth} seldepth {} multipv {k} score cp {} nodes {} nps {} time {} pv e2e4 e7e5",
                     *depth + 2,
                     10 * k,
                     *depth * 1000,
+                    threads * 1_000_000 + hash * 1_000 + resources_set,
                     *depth * 20,
                 ));
             }

@@ -202,7 +202,7 @@ most recently used streams; a forgotten stream starts afresh.
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
   "download": { "present": 104857600, "total": 734003200 },
   "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ],
-  "engine": { "name": "Stockfish 19" }
+  "engine": { "name": "Stockfish 19", "threads": { "default": 6, "max": 8 }, "hash": { "default": 512, "max": 8192 } }
 }
 ```
 
@@ -214,7 +214,11 @@ being downloaded: the bytes on this computer and in all, over all of them.
 `GET /v1/databases/{id}/explorer`). `engine` names the engine the analysis
 board can use (see `GET /v1/engine/analyze`), or is `null` when `bridge.toml`
 names none. The name is the one the engine gave for itself, or its file's
-name until it has run once.
+name until it has run once. `threads` and `hash` (MB) are what an analysis
+may ask for on this computer (#58): `max` is the logical processors, and the
+largest power of two at or below half the physical memory, from 16 to 32768
+MB. `default` is what an analysis naming none gets, from `bridge.toml` or
+computed, and never above `max`.
 
 ### `GET /v1/databases`
 
@@ -631,8 +635,8 @@ engine is the one `bridge.toml` names:
 
 ```toml
 engine = 'C:\Program Files\Stockfish\stockfish.exe'
-engine_threads = 6   # optional; all processors but two by default
-engine_hash = 512    # optional, in MB; 512 by default, at most a quarter of the memory
+engine_threads = 6   # optional default; all processors but two without it
+engine_hash = 512    # optional default, in MB; 512 without it, at most a quarter of the memory
 ```
 
 | Parameter | |
@@ -643,10 +647,13 @@ engine_hash = 512    # optional, in MB; 512 by default, at most a quarter of the
 | `depth` | Search to this depth, 1 to 99, then name the best move. |
 | `movetime` | Search this many milliseconds, 1 to 600000, then name the best move. Only one of `depth` and `movetime`. |
 | `stream` | The client's view, at most 64 letters, digits, `-` and `_`, for example one browser tab. |
+| `threads` | The engine's `Threads`, 1 to `engine.threads.max` of `GET /v1/status`; the default there without it. |
+| `hash` | The engine's `Hash` in MB, 16 to `engine.hash.max`; the default there without it. |
 
 Nothing else from the browser reaches the engine: the position goes to it as
-`chesscore` writes it after checking it, and `Threads` and `Hash` come from
-`bridge.toml`. A parameter out of bounds answers `400 bad_request` naming it;
+`chesscore` writes it after checking it, and `Threads` and `Hash` are the
+numbers above, sent only when they differ from the engine's current ones;
+Stockfish takes both between searches, and a new `Hash` clears its table. A parameter out of bounds answers `400 bad_request` naming it;
 without an engine the answer is `409 no_engine`.
 
 The answer is `200` with `Content-Type: application/x-ndjson` and a chunked

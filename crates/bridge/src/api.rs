@@ -10,7 +10,7 @@ use cbformat::v2::{Eco, RecordKind};
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
-use crate::engine::{Engine, Limit, Search};
+use crate::engine::{self, Engine, Limit, Search};
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
@@ -121,9 +121,19 @@ fn status(app: &App) -> Response {
         .num("unreadable", count(State::Unreadable))
         .done();
     let bridge = Obj::new().str("version", app.version).num("api", API_VERSION).done();
-    let engine = match app.engine.name() {
-        Some(name) => Obj::new().str("name", &name).done(),
-        None => "null".to_string(),
+    let engine = match (app.engine.name(), app.engine.defaults()) {
+        (Some(name), Some((threads, hash_mb))) => {
+            let limits = engine::limits();
+            let range = |default: u32, max: u32| {
+                Obj::new().num("default", i64::from(default.min(max))).num("max", i64::from(max)).done()
+            };
+            Obj::new()
+                .str("name", &name)
+                .raw("threads", &range(threads, limits.max_threads))
+                .raw("hash", &range(hash_mb, limits.max_hash_mb))
+                .done()
+        }
+        _ => "null".to_string(),
     };
     let mut body = Obj::new().raw("bridge", &bridge).raw("databases", &dbs).raw("engine", &engine);
     // The downloads running or queued, together.
@@ -169,7 +179,13 @@ fn analyze(app: &App, req: &Request) -> Response {
     if stream.len() > 64 || !stream.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return bad_parameter("stream", "stream is at most 64 letters, digits, - and _");
     }
-    let search = match Search::new(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit) {
+    let (threads, hash_mb) = match (number("threads", None), number("hash", None)) {
+        (Err(r), _) | (_, Err(r)) => return r,
+        (Ok(threads), Ok(hash_mb)) => (threads, hash_mb),
+    };
+    let search = Search::new(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit)
+        .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()));
+    let search = match search {
         Ok(search) => search,
         Err((parameter, message)) => return bad_parameter(parameter, &message),
     };
