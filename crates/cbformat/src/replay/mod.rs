@@ -301,7 +301,8 @@ pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<Tre
             }
         }
     }
-    if !ended {
+    // A visitor that stopped on the last word has what it needs too.
+    if !ended && !visitor.stopped() {
         return Err(Error::Format("move tree not terminated".into()));
     }
     Ok(stats)

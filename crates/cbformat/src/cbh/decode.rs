@@ -282,10 +282,10 @@ impl<V: TreeVisitor> Walker<'_, V> {
     }
 
     fn simple(&mut self, s: &[u8]) -> Result<()> {
-        if !s.len().is_multiple_of(2) {
-            return Err(Error::Format("move stream: odd length for two-byte moves".into()));
-        }
-        for pair in s.as_chunks::<2>().0 {
+        // A cut last byte is reported where it is, after the moves before it,
+        // so a visitor that stops earlier never meets it.
+        let (pairs, rest) = s.as_chunks::<2>();
+        for pair in pairs {
             if self.ended {
                 break;
             }
@@ -298,6 +298,9 @@ impl<V: TreeVisitor> Walker<'_, V> {
             if word & 0x4000 != 0 {
                 self.end_line()?;
             }
+        }
+        if !rest.is_empty() && !self.ended {
+            return Err(Error::Format("move stream: odd length for two-byte moves".into()));
         }
         Ok(())
     }

@@ -199,10 +199,10 @@ impl Store for v2::Database {
     fn main_line(&self, r: &v2::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
         let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
             Ok(data) => data,
-            Err(e @ Error::Io(..)) => return Err(e),
+            Err(e) if failed_read(&e) => return Err(e),
             Err(_) => return Ok(None),
         };
-        let Ok(moves) = data.moves() else { return Ok(None) };
+        let Ok(moves) = data.prefix_moves() else { return Ok(None) };
         if moves.is_chess960() || !matches!(moves.start(), Ok(Start::Standard)) {
             return Ok(None);
         }
@@ -323,7 +323,7 @@ impl Store for cbh::Database {
     fn main_line(&self, r: &cbh::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
         let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
             Ok(data) => data,
-            Err(e @ Error::Io(..)) => return Err(e),
+            Err(e) if failed_read(&e) => return Err(e),
             Err(_) => return Ok(None),
         };
         let Ok(moves) = data.moves() else { return Ok(None) };
@@ -336,6 +336,14 @@ impl Store for cbh::Database {
         let walked = cbh::walk(&moves, &mut prefix);
         Ok(prefix.finish(walked.is_ok()))
     }
+}
+
+/// Whether reading a game's moves failed as a read, rather than finding a
+/// record cut short. A record a file ends inside of stays unreadable while the
+/// file stays as it is; a file that changed meanwhile is reported by the
+/// generation check after the window's lines are read.
+fn failed_read(e: &Error) -> bool {
+    matches!(e, Error::Io(_, io) if io.kind() != std::io::ErrorKind::UnexpectedEof)
 }
 
 /// The start of a game's main line in SAN, read by a tree walk that ends as

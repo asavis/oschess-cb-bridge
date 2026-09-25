@@ -11,7 +11,7 @@ use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::server;
-use cbformat::fixture::{Builder, TempDb, lid_header, sq};
+use cbformat::fixture::{Builder, TempDb, bytes, lid_header, sq};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record, start_position};
 use cbformat::movetable::{
     self, ALTERNATIVE, Captured, CastleSide, Color, END_OF_LINE, MOVES, MoveWord, NULL_MOVE, Piece,
@@ -425,4 +425,73 @@ fn a_change_while_lines_are_read_is_reported() {
     assert!(body.contains(r#""code":"database_changing""#), "{body}");
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3&line=60"));
     assert_eq!(status, 200, "the next request reads the new state: {body}");
+}
+
+/// Only the plies asked for are read: a last word cut short, or a tree that
+/// ends without its final end of line, does not cost the moves before it.
+#[test]
+fn a_cut_or_unterminated_tail_keeps_the_prefix_before_it() {
+    let e4 = words(&mut Board::startpos(), "e2e4");
+    let mut b = Builder::new();
+    let mut cut = bytes(&[MOVES, e4[0]]);
+    cut.push(0xff);
+    let at = b.move_bytes(1, &cut);
+    b.game(at);
+    let at = b.moves(1, &[MOVES, e4[0]]);
+    b.game(at);
+    let at = b.moves(1, &[MOVES, NULL_MOVE]);
+    b.game(at);
+    b.lid(lid_header(1024, 1));
+    let a = b.write("lines-tail-2cbh");
+    let mut c = fixture_cbh::Builder::new();
+    // Mode 5 stores two bytes a move: one byte more is a cut move.
+    let mut stream = encode(&Board::startpos(), &[Tok::Mv("e2e4")], 5, true);
+    stream.push(0xff);
+    c.game(&move_record(5, None, None, &stream))[0x1b] = 2;
+    let cdb = c.write("lines-tail-cbh");
+    let (pa, pc) = (a.dir().join("db.2cbh"), cdb.dir().join("db.cbh"));
+    let port = start(vec![pa.clone(), pc.clone()], None);
+    let e4 = || Some("e4".to_string());
+    for plies in [1, 60] {
+        let (status, body) = get(port, &format!("/v1/databases/{}/games?line={plies}", id_of(&pa)));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(lines(&body), [(1, e4()), (2, e4()), (3, Some(String::new()))], "line={plies}: {body}");
+        let (_, body) = get(port, &format!("/v1/databases/{}/games?line={plies}", id_of(&pc)));
+        assert_eq!(lines(&body), [(1, e4())], "line={plies}: {body}");
+    }
+}
+
+/// A classic database over 4 GiB places its moves through `.cbj`. When `.cbj`
+/// ends inside the offsets of its second game, that game has no line, the
+/// window still answers and the first game keeps its line.
+#[cfg(unix)]
+#[test]
+fn a_game_whose_offsets_are_cut_short_has_no_line() {
+    use std::os::unix::fs::FileExt;
+    let mut c = fixture_cbh::Builder::new();
+    classic_game(&mut c, &["e2e4"]);
+    classic_game(&mut c, &["d2d4"]);
+    let db = c.write("lines-cbj");
+    let path = |ext: &str| db.dir().join(format!("db{ext}"));
+    let cbg = std::fs::read(path(".cbg")).unwrap();
+    let (head, records) = cbg.split_at(26);
+    let far: u64 = (1 << 32) + 26;
+    let file = std::fs::File::create(path(".cbg")).unwrap();
+    file.set_len(far + records.len() as u64).unwrap();
+    file.write_all_at(head, 0).unwrap();
+    file.write_all_at(records, far).unwrap();
+    drop(file);
+    // The header names two records of 120 bytes; the file holds the first.
+    let mut cbj = Vec::new();
+    for v in [11i32, 120, 2] {
+        cbj.extend(v.to_le_bytes());
+    }
+    cbj.resize(32 + 120, 0);
+    cbj[32 + 0x1e..32 + 0x26].copy_from_slice(&far.to_be_bytes());
+    std::fs::write(path(".cbj"), cbj).unwrap();
+    let pc = path(".cbh");
+    let port = start(vec![pc.clone()], None);
+    let (status, body) = get(port, &format!("/v1/databases/{}/games?line=1", id_of(&pc)));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(lines(&body), [(1, Some("e4".to_string())), (2, Some("null".to_string()))], "{body}");
 }
