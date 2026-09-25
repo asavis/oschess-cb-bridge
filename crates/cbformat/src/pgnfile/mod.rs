@@ -206,8 +206,11 @@ struct Building {
 }
 
 impl Building {
+    /// A tag's value as a name, in the game's encoding: UTF-8 when all of the
+    /// game is, as [`Database::text`] reads it, else the code page.
     fn text(&self, game: &Game, tag: Tag) -> String {
-        game.tags.get(tag).map(|v| name(self.page.utf8_or(v))).unwrap_or_default()
+        let decode = |v: &[u8]| if game.utf8 { String::from_utf8_lossy(v).into_owned() } else { self.page.decode(v) };
+        game.tags.get(tag).map(|v| name(decode(v))).unwrap_or_default()
     }
 
     fn person(&mut self, game: &Game, tag: Tag, annotator: bool) -> Result<u32> {
@@ -592,15 +595,21 @@ impl Database {
         self.text.read_into(offset, buf)
     }
 
-    /// The game's text as written, refused before it is read when longer
-    /// than `limit` bytes: UTF-8 when it is valid UTF-8, else in the code
-    /// page, with every line ending in `\n`, and a final one.
-    pub fn text(&self, r: &Record, limit: usize) -> Result<String> {
+    /// The game's bytes as the file holds them, refused before anything is
+    /// allocated when longer than `limit`.
+    pub fn bytes(&self, r: &Record, limit: usize) -> Result<Vec<u8>> {
         let len = r.len() as usize;
         if len > limit {
             return Err(Error::Format(format!("the game is {len} bytes, over the {limit}-byte limit")));
         }
-        let bytes = self.text.read(r.offset(), len)?;
+        self.text.read(r.offset(), len)
+    }
+
+    /// The game's text as written, refused before it is read when longer
+    /// than `limit` bytes: UTF-8 when it is valid UTF-8, else in the code
+    /// page, with every line ending in `\n`, and a final one.
+    pub fn text(&self, r: &Record, limit: usize) -> Result<String> {
+        let bytes = self.bytes(r, limit)?;
         let text = self.page.utf8_or(&bytes);
         let mut out = String::with_capacity(text.len() + 1);
         let mut chars = text.chars().peekable();

@@ -115,6 +115,14 @@ fn text_in_the_code_page() {
     let r = db.record(1).unwrap();
     assert_eq!(db.player(r.white()).unwrap().unwrap().last, "Спасский");
     assert_eq!(db.text(&r, 1 << 20).unwrap(), "[White \"Спасский\"]\n\n1. e4 {ход} *\n");
+    // A game is read in one encoding throughout: a name that happens to be
+    // valid UTF-8 in a game that is not reads as the served text shows it.
+    let f2 = pgn_file("mixed", b"[White \"\xc3\xa9\"]\n\n1. e4 {\xff} *\n");
+    let db2 = built(&f2, 1, CodePage::WESTERN);
+    let r2 = db2.record(1).unwrap();
+    let name = db2.player(r2.white()).unwrap().unwrap().last;
+    assert_eq!(name, "\u{c3}\u{a9}");
+    assert!(db2.text(&r2, 1 << 20).unwrap().contains(&format!("[White \"{name}\"]")));
     // The index belongs to the code page it was built with.
     let (pgn, index) = (f.dir().join("db.pgn"), index_of(&f));
     assert!(Database::open(&pgn, &index, 1, CodePage::WESTERN).is_err());

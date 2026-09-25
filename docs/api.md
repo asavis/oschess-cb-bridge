@@ -357,7 +357,11 @@ of the same games answers, apart from what the format has otherwise:
 - **Games only.** Every record is a game: none is deleted, and a PGN file has
   no guiding texts or analyses. A game starts at its first tag, or at its
   first move when it has none, and ends at its result or where the next
-  game's tags start; a tag the game already has also starts the next game.
+  game's tags start after its moves; a tag the game already has also starts
+  the next game, and a comment between tags does not. A line ends at LF, CR
+  or both, and a tag pair may span lines. A comment left open ends where a
+  game's header starts: a line starting `[Event "` whose next line starts
+  with a tag.
 - **Fields.** A row's fields come from the tags. `White` and `Black` are
   players, split at the first comma into `Last, First`; `?`, `-` or nothing is
   no name. `Event` and `Site` are the tournament's title and place. `Date`,
@@ -365,15 +369,16 @@ of the same games answers, apart from what the format has otherwise:
   and `ECO` are read as PGN writes them, and a value out of range is unknown.
   `Result` is the tag's, else the result ending the movetext, else `*`;
   `0-0` is ChessBase's result for a game both players lost, and in a game
-  whose `Result` tag is `0-0` the movetext's closing `0-0` is that result,
-  not castling. `Annotator` is
-  one text in a table of its own, as in a classic database. `moves` counts
+  whose `Result` tag is `0-0` the movetext's last `0-0` is that result and
+  any earlier one castles. `Annotator` is one text in a table of its own, as
+  in a classic database. `moves` counts
   the main line's moves as written, and `flags.chess960` is set by a `Variant`
   tag naming Chess960. A tag value is read to 4 KiB.
 - **Text.** `GET /v1/databases/{id}/games/{number}` serves the game's text as
   the file writes it, from its first tag to its result, with each line ending
   in `\n`: decoded as UTF-8, or, when the game is not valid UTF-8, in the
-  computer's ANSI code page (Windows-1252 where the page has no table).
+  computer's ANSI code page (Windows-1252 where the page has no table). Its
+  row's names are read in the same encoding.
   `lang` and `annotations` change nothing, and `annotations` is `complete`:
   a PGN game's comments are all it has.
 - **Position index.** Each game's main line is played as written, from its

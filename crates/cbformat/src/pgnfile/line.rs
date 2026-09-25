@@ -6,7 +6,7 @@
 use chesscore::{Board, Move};
 
 use super::lex::{Lexer, Sink, Token};
-use super::scan::ResultCode;
+use super::scan::{ResultCode, is_both_lost};
 use crate::pgn::parse_san;
 
 /// The longest `FEN` tag read; a real one is under 90 bytes.
@@ -33,8 +33,16 @@ pub enum LineEnd {
 /// the last position and no move; returning `false` stops the line. `lexer`
 /// is reset and reused, so that reading many games allocates nothing per game.
 pub fn main_line(text: &[u8], lexer: &mut Lexer, visit: &mut dyn FnMut(&Board, Option<Move>) -> bool) -> LineEnd {
-    let mut walk =
-        Walk { visit, fen: [0; MAX_FEN], fen_len: 0, fen_bad: false, both_lost: false, board: None, end: None };
+    let mut walk = Walk {
+        visit,
+        fen: [0; MAX_FEN],
+        fen_len: 0,
+        fen_bad: false,
+        both_lost: false,
+        zero_zero: false,
+        board: None,
+        end: None,
+    };
     lexer.reset(0);
     lexer.feed(text, &mut walk);
     lexer.finish(&mut walk);
@@ -55,8 +63,11 @@ struct Walk<'a> {
     fen: [u8; MAX_FEN],
     fen_len: usize,
     fen_bad: bool,
-    /// The `Result` tag is `0-0`: the movetext's `0-0` is then the result.
+    /// The `Result` tag is `0-0`: the movetext's last `0-0` is then the
+    /// result, and any other a castling.
     both_lost: bool,
+    /// Such a `0-0`, not played until a move follows it.
+    zero_zero: bool,
     board: Option<Board>,
     end: Option<LineEnd>,
 }
@@ -78,33 +89,10 @@ impl Walk<'_> {
         }
         self.board.is_some()
     }
-}
 
-impl Sink for Walk<'_> {
-    fn tag(&mut self, _: u64, _: u64, name: &[u8], value: &[u8]) {
-        if self.board.is_some() {
-            return;
-        }
-        match name {
-            b"FEN" => {
-                self.fen_bad = value.len() > MAX_FEN;
-                if !self.fen_bad {
-                    self.fen[..value.len()].copy_from_slice(value);
-                    self.fen_len = value.len();
-                }
-            }
-            b"Result" => self.both_lost = value.trim_ascii() == b"0-0",
-            _ => {}
-        }
-    }
-
-    fn movetext(&mut self, _: u64, _: u64, depth: u32, token: Token<'_>) {
-        let Token::Symbol(s) = token else { return };
-        let result_tag: Option<&[u8]> = self.both_lost.then_some(b"0-0");
-        if depth != 0 || self.end.is_some() || s.iter().all(u8::is_ascii_digit) {
-            return;
-        }
-        if ResultCode::ending(s, result_tag).is_some() || !self.start() {
+    /// Plays the move `s` names, or ends the line where it names none.
+    fn play(&mut self, s: &[u8]) {
+        if self.end.is_some() || !self.start() {
             return;
         }
         let Some(board) = self.board.as_mut() else { return };
@@ -121,6 +109,58 @@ impl Sink for Walk<'_> {
                 self.end =
                     Some(if matches!(s, b"--" | b"Z0") { LineEnd::NullMove } else { LineEnd::Unplayable(s.to_vec()) });
             }
+        }
+    }
+
+    /// A move after a pending `0-0`: that was a castling.
+    fn castled(&mut self) {
+        if std::mem::take(&mut self.zero_zero) {
+            self.play(b"0-0");
+        }
+    }
+}
+
+impl Sink for Walk<'_> {
+    fn tag(&mut self, _: u64, _: u64, name: &[u8], value: &[u8], _: bool) {
+        if self.board.is_some() {
+            return;
+        }
+        match name {
+            b"FEN" => {
+                self.fen_bad = value.len() > MAX_FEN;
+                if !self.fen_bad {
+                    self.fen[..value.len()].copy_from_slice(value);
+                    self.fen_len = value.len();
+                }
+            }
+            b"Result" => self.both_lost = is_both_lost(Some(value)),
+            _ => {}
+        }
+    }
+
+    fn movetext(&mut self, _: u64, _: u64, depth: u32, token: Token<'_>, _: bool) {
+        if depth != 0 {
+            return;
+        }
+        let s = match token {
+            Token::Symbol(s) => s,
+            Token::Star => {
+                self.castled();
+                return;
+            }
+            Token::Comment | Token::Other => return,
+        };
+        if s.iter().all(u8::is_ascii_digit) {
+            return;
+        }
+        if s == b"0-0" && self.both_lost {
+            self.castled();
+            self.zero_zero = true;
+            return;
+        }
+        self.castled();
+        if ResultCode::ending(s).is_none() {
+            self.play(s);
         }
     }
 }
@@ -160,6 +200,10 @@ mod tests {
         // `0-0` ends a game whose result is both lost, and castles elsewhere.
         let (seen, _) = play("[Result \"0-0\"]\n\n1. e4 e5 2. Nf3 Nf6 3. Bc4 Bc5 0-0");
         assert_eq!(seen.len(), 7);
+        // In such a game an earlier `0-0` castles.
+        let (seen, _) = play("[Result \"0-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. 0-0 Nf6 5. d3 0-0");
+        assert_eq!(seen.len(), 10);
+        assert_eq!(seen[6], "e1h1");
         let (seen, _) = play("1. e4 e5 2. Nf3 Nf6 3. Bc4 Bc5 4. 0-0 *");
         assert_eq!(seen[6], "e1h1");
         let mut n = 0;

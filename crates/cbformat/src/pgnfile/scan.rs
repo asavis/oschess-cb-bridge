@@ -3,10 +3,10 @@
 //! lexer's tokens ([`super::lex`]).
 //!
 //! A game starts at its first tag, or at its first move when it has none. It
-//! ends at its result, or where the next game's tags start. A tag the game
-//! already has also starts the next game, so that games without movetext are
-//! told apart. Whatever stands outside games, such as a comment before the
-//! first tag, belongs to none.
+//! ends at its result, or where the next game's tags start after its moves. A
+//! tag the game already has also starts the next game, so that games without
+//! movetext are told apart; a comment between tags does not. Whatever stands
+//! outside games, such as a comment before the first tag, belongs to none.
 
 use super::lex::{Sink, Token};
 use crate::v2::Date;
@@ -112,6 +112,9 @@ pub struct Game {
     pub plies: u32,
     /// The result written at the end of the movetext, if any.
     pub termination: Option<ResultCode>,
+    /// Whether every token of the game is valid UTF-8: then its text is read
+    /// as UTF-8, else in the code page.
+    pub utf8: bool,
 }
 
 /// Splits the lexer's tokens into games and passes each to `each` as it ends.
@@ -121,12 +124,15 @@ pub struct Splitter<F: FnMut(&Game)> {
     /// Whether the open game has movetext, and whether its result was read.
     movetext: bool,
     ended: bool,
+    /// A `0-0` read in a game whose result is both lost: the result when the
+    /// game ends with it, a castling when a move follows.
+    zero_zero: bool,
     each: F,
 }
 
 impl<F: FnMut(&Game)> Splitter<F> {
     pub fn new(each: F) -> Self {
-        Splitter { game: Game::default(), open: false, movetext: false, ended: false, each }
+        Splitter { game: Game::default(), open: false, movetext: false, ended: false, zero_zero: false, each }
     }
 
     /// Ends the text: the game still open ends with it.
@@ -136,6 +142,9 @@ impl<F: FnMut(&Game)> Splitter<F> {
 
     fn close(&mut self) {
         if self.open {
+            if self.zero_zero {
+                self.game.termination = Some(ResultCode::BOTH_LOST);
+            }
             (self.each)(&self.game);
             self.open = false;
         }
@@ -148,26 +157,36 @@ impl<F: FnMut(&Game)> Splitter<F> {
         self.game.tags.clear();
         self.game.plies = 0;
         self.game.termination = None;
+        self.game.utf8 = true;
         self.open = true;
         self.movetext = false;
         self.ended = false;
+        self.zero_zero = false;
+    }
+
+    /// A move after a pending `0-0`: that was a castling.
+    fn castled(&mut self) {
+        if std::mem::take(&mut self.zero_zero) {
+            self.game.plies = self.game.plies.saturating_add(1);
+        }
     }
 }
 
 impl<F: FnMut(&Game)> Sink for Splitter<F> {
-    fn tag(&mut self, start: u64, end: u64, name: &[u8], value: &[u8]) {
+    fn tag(&mut self, start: u64, end: u64, name: &[u8], value: &[u8], utf8: bool) {
         let tag = Tag::of(name);
         let again = tag.is_some_and(|t| self.game.tags.has(t));
         if !self.open || self.movetext || self.ended || again {
             self.start(start);
         }
         self.game.end = end;
+        self.game.utf8 &= utf8;
         if let Some(tag) = tag {
             self.game.tags.set(tag, value);
         }
     }
 
-    fn movetext(&mut self, start: u64, end: u64, depth: u32, token: Token<'_>) {
+    fn movetext(&mut self, start: u64, end: u64, depth: u32, token: Token<'_>, utf8: bool) {
         let moves = matches!(token, Token::Symbol(_) | Token::Star) && depth == 0;
         if !self.open || (self.ended && moves) {
             // Movetext outside any game, such as a comment between games, is
@@ -177,22 +196,43 @@ impl<F: FnMut(&Game)> Sink for Splitter<F> {
             }
             self.start(start);
         }
-        self.movetext = true;
+        // A comment may stand between tags: only moves and their marks
+        // start the movetext.
+        if token != Token::Comment {
+            self.movetext = true;
+        }
         self.game.end = end;
+        self.game.utf8 &= utf8;
         if depth != 0 {
             return;
         }
         match token {
-            Token::Star => self.finish_with(ResultCode::UNKNOWN),
-            Token::Symbol(s) => match ResultCode::ending(s, self.game.tags.get(Tag::Result)) {
-                Some(result) => self.finish_with(result),
-                // A move number.
-                None if s.iter().all(u8::is_ascii_digit) => {}
-                None => self.game.plies = self.game.plies.saturating_add(1),
-            },
-            Token::Other => {}
+            Token::Star => {
+                self.castled();
+                self.finish_with(ResultCode::UNKNOWN);
+            }
+            // A move number.
+            Token::Symbol(s) if s.iter().all(u8::is_ascii_digit) => {}
+            Token::Symbol(b"0-0") if is_both_lost(self.game.tags.get(Tag::Result)) => {
+                self.castled();
+                self.zero_zero = true;
+            }
+            Token::Symbol(s) => {
+                self.castled();
+                match ResultCode::ending(s) {
+                    Some(result) => self.finish_with(result),
+                    None => self.game.plies = self.game.plies.saturating_add(1),
+                }
+            }
+            Token::Comment | Token::Other => {}
         }
     }
+}
+
+/// Whether a `Result` tag says both players lost: then the movetext's last
+/// `0-0` is the result, and any other a castling.
+pub fn is_both_lost(result_tag: Option<&[u8]>) -> bool {
+    result_tag.is_some_and(|v| v.trim_ascii() == b"0-0")
 }
 
 impl<F: FnMut(&Game)> Splitter<F> {
@@ -228,15 +268,14 @@ impl ResultCode {
         }
     }
 
-    /// The result a movetext symbol ends the game with, if it is one. `0-0`
-    /// is castling, except in a game whose `Result` tag is `0-0`: there it is
-    /// the result, as ChessBase writes it.
-    pub fn ending(symbol: &[u8], result_tag: Option<&[u8]>) -> Option<ResultCode> {
+    /// The result a movetext symbol ends the game with, if it is one. A
+    /// closing `0-0`, ChessBase's result when both lost, is told from a
+    /// castling by the game's end ([`is_both_lost`]).
+    pub fn ending(symbol: &[u8]) -> Option<ResultCode> {
         match symbol {
             b"1-0" => Some(ResultCode::WHITE),
             b"0-1" => Some(ResultCode::BLACK),
             b"1/2-1/2" => Some(ResultCode::DRAW),
-            b"0-0" if result_tag.is_some_and(|v| v.trim_ascii() == b"0-0") => Some(ResultCode::BOTH_LOST),
             _ => None,
         }
     }
@@ -377,7 +416,44 @@ mod tests {
         // Elsewhere `0-0` castles.
         assert_eq!(got[1].1, 7);
         assert_eq!(ResultCode::of_tag(b"0-0"), Some(ResultCode::BOTH_LOST));
-        assert_eq!(ResultCode::ending(b"0-0", None), None);
+        assert_eq!(ResultCode::ending(b"0-0"), None);
+        // An earlier `0-0` in such a game is a castling: only the last ends it.
+        let got = split("[Result \"0-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. 0-0 Nf6 5. d3 0-0");
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].1, got[0].2), (9, Some(7)));
+    }
+
+    #[test]
+    fn comments_line_ends_and_tags_across_lines_keep_one_game() {
+        let one = |text: &str| {
+            let got = split(text);
+            assert_eq!(got.len(), 1, "{text:?}: {got:?}");
+            got[0].1
+        };
+        // Comments between tags, of either kind.
+        assert_eq!(one("[Event \"Actual\"]\n; comment\n[White \"Alpha\"]\n[Black \"Beta\"]\n\n1. e4 e5 *"), 2);
+        assert_eq!(one("[Event \"Actual\"]\n{comment}\n[White \"Alpha\"]\n\n1. e4 e5 *"), 2);
+        // A closed comment that quotes an `Event` line.
+        assert_eq!(one("[Event \"Actual\"]\n\n1. e4 {quoted tag:\n[Event \"Example\"]\n} e5 2. Nf3 *"), 3);
+        // A tag pair across lines.
+        assert_eq!(one("[Event \"A\"]\n[White\n\"Alpha\"]\n[Black \"Beta\"\n]\n\n1. e4 e5 *"), 2);
+        // CR alone ends lines.
+        assert_eq!(one("[Event \"Actual\"]\r\r1. e4 ; comment\re5 2. Nf3 *\r"), 3);
+    }
+
+    #[test]
+    fn a_game_is_utf8_when_all_its_tokens_are() {
+        let utf8 = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            let mut splitter = Splitter::new(|g: &Game| out.push(g.utf8));
+            let mut lexer = Lexer::new();
+            lexer.feed(bytes, &mut splitter);
+            lexer.finish(&mut splitter);
+            splitter.finish();
+            out
+        };
+        assert_eq!(utf8(b"[White \"\xc3\xa9\"]\n\n1. e4 {\xc3\xa9} *\n"), [true]);
+        assert_eq!(utf8(b"[White \"\xc3\xa9\"]\n\n1. e4 {\xff} *\n[White \"\xc3\xa9\"]\n\n1. e4 *"), [false, true]);
     }
 
     #[test]

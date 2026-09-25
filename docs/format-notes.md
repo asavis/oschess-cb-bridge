@@ -640,8 +640,8 @@ against:
   the five name differences above.
 - **`0-0` is ChessBase's result for a game both players lost** (the header's
   result 7), in the `Result` tag and at the end of the movetext. In such a
-  game the movetext's last `0-0` is the result, not castling; elsewhere
-  `0-0` castles.
+  game the movetext's last `0-0` is the result, and an earlier one castles;
+  elsewhere every `0-0` castles.
 - **This reader's PGN writer puts a sub-round as `5(2)`**, as the list shows
   it; the reader takes both forms.
 - **Full moves count move numbers.** A game set up with black to move,
