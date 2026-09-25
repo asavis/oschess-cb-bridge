@@ -397,4 +397,11 @@ impl MoveData<'_> {
     pub fn moves(&self) -> Result<GameMoves<'_>> {
         GameMoves::parse(self.tag, &self.content)
     }
+
+    /// The moves of a record whose last word may be cut short, without that
+    /// byte: for reading the start of a game, which the cut does not reach.
+    /// The tree walk still reports the damage if it gets that far.
+    pub fn prefix_moves(&self) -> Result<GameMoves<'_>> {
+        GameMoves::parse(self.tag, &self.content[..self.content.len() & !1])
+    }
 }

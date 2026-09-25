@@ -9,9 +9,11 @@
 //! own `.cbg` record.
 
 use cbformat::pgn::{self, Options, Rendered};
-use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Tournament};
+use cbformat::replay::{self, TreeVisitor};
+use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
 use cbformat::view::Base;
-use cbformat::{Result, cbh};
+use cbformat::{Error, Result, cbh};
+use chesscore::{Board, Move};
 
 use crate::api::MAX_GAME_BYTES;
 use crate::search::MAX_NAME_RECORD;
@@ -86,6 +88,13 @@ pub trait Store: Sync {
     /// Game `r` as PGN, refusing a move or annotation record larger than
     /// [`MAX_GAME_BYTES`] before it is read.
     fn render(&self, r: &Self::Head, options: &Options) -> Result<Rendered>;
+    /// The first `plies` plies of game `r`'s main line in SAN, as
+    /// [`Store::render`] writes them, separated by single spaces (#81). The
+    /// move record is read into `buf`, whose capacity bounds it as
+    /// [`MAX_GAME_BYTES`] does. `None` when the game does not start from the
+    /// standard position or its moves cannot be decoded; the line ends at a
+    /// null move and before damage. Only a failed read is an error.
+    fn main_line(&self, r: &Self::Head, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>>;
 }
 
 impl Head for v2::Record {
@@ -186,6 +195,21 @@ impl Store for v2::Database {
         let data = self.moves_of_within(r, MAX_GAME_BYTES)?;
         let annotations = self.annotations_of_within(r, MAX_GAME_BYTES)?;
         pgn::game_from(self, r, &data.moves()?, annotations.as_ref(), options)
+    }
+    fn main_line(&self, r: &v2::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
+        let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
+            Ok(data) => data,
+            Err(e) if failed_read(&e) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let Ok(moves) = data.prefix_moves() else { return Ok(None) };
+        if moves.is_chess960() || !matches!(moves.start(), Ok(Start::Standard)) {
+            return Ok(None);
+        }
+        // The walk checks the tree's shape as well as each move.
+        let mut prefix = LinePrefix::new(plies);
+        let walked = replay::walk(&moves, &mut prefix);
+        Ok(prefix.finish(walked.is_ok()))
     }
 }
 
@@ -295,6 +319,88 @@ impl Store for cbh::Database {
         let data = self.moves_of_within(r, MAX_GAME_BYTES)?;
         let annotations = self.annotations_of_within(r, MAX_GAME_BYTES)?;
         pgn::classic_game_from(self, r, &data.moves()?, annotations.as_ref(), options)
+    }
+    fn main_line(&self, r: &cbh::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
+        let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
+            Ok(data) => data,
+            Err(e) if failed_read(&e) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let Ok(moves) = data.moves() else { return Ok(None) };
+        if moves.is_chess960() || !matches!(moves.start(), Ok(Start::Standard)) {
+            return Ok(None);
+        }
+        // The compact encoding names a move by the position it is played in,
+        // so the tree is walked; the main line comes first in it.
+        let mut prefix = LinePrefix::new(plies);
+        let walked = cbh::walk(&moves, &mut prefix);
+        Ok(prefix.finish(walked.is_ok()))
+    }
+}
+
+/// Whether reading a game's moves failed as a read, rather than finding a
+/// record cut short. A record a file ends inside of stays unreadable while the
+/// file stays as it is; a file that changed meanwhile is reported by the
+/// generation check after the window's lines are read.
+fn failed_read(e: &Error) -> bool {
+    matches!(e, Error::Io(_, io) if io.kind() != std::io::ErrorKind::UnexpectedEof)
+}
+
+/// The start of a game's main line in SAN, read by a tree walk that ends as
+/// soon as the prefix is complete, so a long game costs only its prefix.
+struct LinePrefix {
+    plies: u8,
+    text: String,
+    read: u8,
+    /// A main-line move announced and not yet played: it counts once it is,
+    /// as an illegal move is reported before it is found to be one.
+    pending: Option<(Board, Move)>,
+    /// The prefix is complete: at `plies`, at a null move, or at the main
+    /// line's end.
+    done: bool,
+}
+
+impl LinePrefix {
+    fn new(plies: u8) -> Self {
+        LinePrefix { plies, text: String::new(), read: 0, pending: None, done: false }
+    }
+
+    /// The line after a walk: the moves before any damage, but `None` when
+    /// damage came before the first move, which is no line at all.
+    fn finish(self, walked: bool) -> Option<String> {
+        (walked || self.read > 0).then_some(self.text)
+    }
+}
+
+impl TreeVisitor for LinePrefix {
+    fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool) {
+        if self.done {
+            return;
+        }
+        match mv.filter(|_| main_line) {
+            Some(mv) => self.pending = Some((before.clone(), mv)),
+            None => self.done = true,
+        }
+    }
+
+    fn played(&mut self, _after: &Board) {
+        if let Some((before, mv)) = self.pending.take() {
+            if !self.text.is_empty() {
+                self.text.push(' ');
+            }
+            self.text.push_str(&pgn::san(&before, mv));
+            self.read += 1;
+            self.done = self.read >= self.plies;
+        }
+    }
+
+    /// The main line ended: the walk is in its variations now.
+    fn resume(&mut self) {
+        self.done = true;
+    }
+
+    fn stopped(&self) -> bool {
+        self.done
     }
 }
 

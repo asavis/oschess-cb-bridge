@@ -207,6 +207,11 @@ pub trait TreeVisitor {
     fn played(&mut self, _after: &Board) {}
     fn branch(&mut self) {}
     fn resume(&mut self) {}
+    /// Whether the visitor has what it needs. The walk then ends at once and
+    /// successfully, without reading or checking the rest of the tree.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 struct FnVisitor<F>(F);
@@ -243,6 +248,9 @@ pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<Tre
     while let Some(token) = tokens.next() {
         if ended {
             return Err(Error::Format("words after the final end of line".into()));
+        }
+        if visitor.stopped() {
+            return Ok(stats);
         }
         match token {
             Token::Move(w) => {
@@ -293,7 +301,8 @@ pub fn walk(moves: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<Tre
             }
         }
     }
-    if !ended {
+    // A visitor that stopped on the last word has what it needs too.
+    if !ended && !visitor.stopped() {
         return Err(Error::Format("move tree not terminated".into()));
     }
     Ok(stats)

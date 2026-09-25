@@ -110,6 +110,14 @@ impl Builder {
         offset
     }
 
+    /// Appends a move record of variant `tag` holding `content` as it is, an
+    /// odd length included, and returns its offset in `.2cbg`.
+    pub fn move_bytes(&mut self, tag: u16, content: &[u8]) -> i64 {
+        let offset = self.cbg.len() as i64;
+        self.cbg.extend(framed(tag, content));
+        offset
+    }
+
     /// Appends an annotation record holding `content` (see [`annotations`]),
     /// and returns its offset in `.2cba`.
     pub fn annotations(&mut self, content: &[u8]) -> i64 {
