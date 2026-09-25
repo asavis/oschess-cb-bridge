@@ -216,6 +216,11 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
 /// One installation at a time.
 static INSTALLING: Mutex<()> = Mutex::new(());
 
+/// Whether Stockfish is being installed now (#61): an update waits for it.
+pub(super) fn installing() -> bool {
+    INSTALLING.try_lock().is_err()
+}
+
 /// Installs the official Stockfish pinned in this release, then chooses it.
 /// The progress goes to the settings window as `stockfish-progress` events.
 /// A failure answers why, in English, for the window to show. The download

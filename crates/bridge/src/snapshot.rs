@@ -2,6 +2,7 @@
 //! still serves, why it stopped, and the state of each database.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::api::App;
 use crate::catalog::{Entry, State};
@@ -15,7 +16,26 @@ pub struct Snapshot {
     /// `None` while the bridge serves; why it stopped otherwise.
     pub stopped: Option<String>,
     pub databases: Vec<Database>,
+    /// The work a restart would lose now (#61), each kind once.
+    pub work: Vec<Work>,
 }
+
+/// Work a restart of the bridge would lose, which an update waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Work {
+    /// A database brought from the cloud.
+    Downloading,
+    /// A database opened for the first time: a PGN file's header index.
+    Opening,
+    /// A position index built.
+    Indexing,
+    /// An analysis streamed to an analysis board, for [`ANALYSIS_HOLDS_UPDATES`].
+    Analysing,
+}
+
+/// How long a running analysis holds an update back: one left running longer,
+/// as in a tab left open, does not keep the bridge from updating for good.
+pub const ANALYSIS_HOLDS_UPDATES: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Database {
@@ -63,6 +83,26 @@ impl Database {
     }
 }
 
+/// The work a restart would lose: the databases downloading or opening, a
+/// header index built (`headers`), a position index built (`indexing`) and
+/// an analysis running (`analysing`), each kind once and in order.
+fn work_of(databases: &[Database], headers: bool, indexing: bool, analysing: bool) -> Vec<Work> {
+    let mut work: Vec<Work> = databases
+        .iter()
+        .filter_map(|d| match d.state {
+            State::Downloading => Some(Work::Downloading),
+            State::Opening => Some(Work::Opening),
+            _ => None,
+        })
+        .collect();
+    work.extend(headers.then_some(Work::Opening));
+    work.extend(indexing.then_some(Work::Indexing));
+    work.extend(analysing.then_some(Work::Analysing));
+    work.sort();
+    work.dedup();
+    work
+}
+
 /// A bridge serving on a thread of its own.
 pub struct Background {
     app: Arc<App>,
@@ -90,11 +130,20 @@ impl Background {
     /// The state now. Checking a database opens it when it is ready, so call
     /// this from a thread that may wait on the disk.
     pub fn snapshot(&self) -> Snapshot {
+        let databases: Vec<Database> = self.app.catalog.entries().iter().map(|e| Database::of(e)).collect();
+        let catalog = &self.app.catalog;
+        let work = work_of(
+            &databases,
+            catalog.pgn().building(),
+            !catalog.explorer.building().is_empty(),
+            self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES),
+        );
         Snapshot {
             version: self.app.version,
             port: self.port,
             stopped: self.stopped.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            databases: self.app.catalog.entries().iter().map(|e| Database::of(e)).collect(),
+            databases,
+            work,
         }
     }
 }
@@ -181,5 +230,26 @@ mod tests {
         let snapshot = background.snapshot();
         assert_eq!(snapshot.stopped.as_deref(), Some("port lost"));
         assert!(snapshot.databases.is_empty());
+    }
+
+    /// The work an update waits for (#61): each kind once, whatever named it.
+    #[test]
+    fn work_names_each_kind_once() {
+        let db = |state| Database {
+            id: "0123456789abcdef".into(),
+            name: "Base".into(),
+            format: "2cbh",
+            state,
+            records: None,
+            size: None,
+            progress: None,
+            listed: true,
+        };
+        assert_eq!(work_of(&[db(State::Ready), db(State::Missing)], false, false, false), []);
+        assert_eq!(
+            work_of(&[db(State::Opening), db(State::Downloading), db(State::Downloading)], true, false, false),
+            [Work::Downloading, Work::Opening]
+        );
+        assert_eq!(work_of(&[], false, true, true), [Work::Indexing, Work::Analysing]);
     }
 }

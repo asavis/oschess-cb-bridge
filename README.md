@@ -59,7 +59,10 @@ Right-click the tray mark for the menu: open oschess (it pairs the browser it
 opens, so another browser or profile connects with nothing to copy), the
 settings, the pairing code, «Start with Windows» (off until you tick it), checking for updates, and
 quitting. Updates install by themselves while the bridge is idle, unless
-«Update automatically» is off in the settings; a version whose settings say
+«Update automatically» is off in the settings. Idle means that no database is
+downloading or opening, no position index is being built, no Stockfish is
+being installed, and no analysis began less than five minutes ago; an
+analysis left running longer does not hold an update back. A version whose settings say
 «This build does not check for updates» is replaced by running the next
 installer by hand. To remove the bridge, use
 Settings → Apps → Installed apps → oschess bridge → Uninstall. Its data folder,

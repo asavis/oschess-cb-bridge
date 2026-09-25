@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -277,6 +277,18 @@ struct Shared {
     /// The configuration file the engine follows; `None` for a fixed one.
     file: Option<PathBuf>,
     current: Mutex<Current>,
+    /// The analyses running now, and when the newest began (#61).
+    analyses: AtomicUsize,
+    began: Mutex<Option<Instant>>,
+}
+
+/// Counts an analysis while it runs.
+struct Running<'a>(&'a Shared);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.analyses.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -321,7 +333,14 @@ impl Engine {
     fn fixed(config: Option<EngineConfig>, idle: Duration) -> Self {
         let inner = config.clone().map(|c| Inner::start(c, idle));
         let current = Current { signature: None, config, inner };
-        Engine { shared: Arc::new(Shared { idle, file: None, current: Mutex::new(current) }) }
+        let shared = Shared {
+            idle,
+            file: None,
+            current: Mutex::new(current),
+            analyses: AtomicUsize::new(0),
+            began: Mutex::new(None),
+        };
+        Engine { shared: Arc::new(shared) }
     }
 
     /// The engine the `bridge.toml` at `path` names, read again whenever the
@@ -334,7 +353,14 @@ impl Engine {
 
     /// [`Engine::from_config_file`] looking at the file every `poll` (tests).
     pub fn following(path: PathBuf, poll: Duration) -> Self {
-        let engine = Engine { shared: Arc::new(Shared { idle: IDLE, file: Some(path), current: Mutex::default() }) };
+        let shared = Shared {
+            idle: IDLE,
+            file: Some(path),
+            current: Mutex::default(),
+            analyses: AtomicUsize::new(0),
+            began: Mutex::new(None),
+        };
+        let engine = Engine { shared: Arc::new(shared) };
         engine.current();
         let watched = Arc::downgrade(&engine.shared);
         let _ = std::thread::Builder::new().name("bridge-engine-config".into()).stack_size(crate::THREAD_STACK).spawn(
@@ -398,6 +424,15 @@ impl Engine {
         self.current().is_some()
     }
 
+    /// Whether an analysis runs that began less than `within` ago (#61): a
+    /// restart would end its stream. One running longer, as in a tab left
+    /// open on one position, counts as none, so that it cannot hold an
+    /// update back for good.
+    pub fn analyzing(&self, within: Duration) -> bool {
+        self.shared.analyses.load(Ordering::SeqCst) > 0
+            && lock(&self.shared.began).is_some_and(|began| began.elapsed() < within)
+    }
+
     /// Whether the engine's process is running (tests).
     pub fn is_running(&self) -> bool {
         self.current().is_some_and(|i| i.slot.try_lock().map(|s| s.is_some()).unwrap_or(true))
@@ -408,6 +443,9 @@ impl Engine {
     /// client's view: a newer analysis from another one ends this one with
     /// `{"superseded":true}`, one from the same view ends it without a line.
     pub fn analyze(&self, search: &Search, stream: &str, sink: &mut dyn Sink) {
+        self.shared.analyses.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.shared.began) = Some(Instant::now());
+        let _running = Running(&self.shared);
         let Some(inner) = self.current() else {
             let _ = sink.line(&error_line("no_engine", "No engine is configured"));
             return;

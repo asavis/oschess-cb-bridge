@@ -103,7 +103,7 @@ fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
     // The download checks the signature; an installer the key did not sign
     // never runs.
     let bytes = tauri::async_runtime::block_on(update.download(|_, _| {}, || {})).map_err(|e| e.to_string())?;
-    while !updates::idle(&shared.view()) {
+    while !updates::idle(&shared.view(), super::commands::installing()) {
         std::thread::sleep(IDLE_POLL);
     }
     if asked {

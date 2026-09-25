@@ -106,6 +106,25 @@ impl Analysis {
 
 const BEST: &str = r#"{"bestmove":"e2e4"}"#;
 
+/// An analysis counts as work a restart would lose while it streams, for a
+/// bounded time (#61): an update waits for it, and not for one left running.
+#[test]
+fn an_analysis_is_work_while_it_streams() {
+    let (port, app) = start(Engine::new(fake()));
+    assert!(!app.engine.analyzing(Duration::from_secs(60)), "none yet");
+    let mut a = Analysis::open(port, "stream=tab1");
+    assert_eq!(a.status, 200);
+    assert!(a.line().is_some(), "it streams");
+    assert!(app.engine.analyzing(Duration::from_secs(60)));
+    assert!(!app.engine.analyzing(Duration::ZERO), "one running past the bound counts as none");
+    drop(a);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.engine.analyzing(Duration::from_secs(60)) {
+        assert!(Instant::now() < deadline, "the analysis ends when its client leaves");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn streams_the_lines_of_a_search_to_its_best_move() {
     let (port, app) = start(Engine::new(fake()));

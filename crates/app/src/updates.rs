@@ -73,10 +73,13 @@ impl Gate {
     }
 }
 
-/// Whether an update may be installed now: no database is downloading or
-/// opening. The installer restarts the bridge, which would start those over.
-pub fn idle(view: &View) -> bool {
-    !view.databases.iter().any(|d| d.state == "downloading" || d.state == "opening")
+/// Whether an update may be installed now (#61): the bridge has no work a
+/// restart would lose — a download, a database opening, a position index
+/// built, an analysis streamed (for a few minutes; see
+/// `bridge::snapshot::ANALYSIS_HOLDS_UPDATES`) — and no Stockfish is being
+/// installed. The installer restarts the bridge, which would lose them.
+pub fn idle(view: &View, installing: bool) -> bool {
+    !view.busy && !installing
 }
 
 /// Notes in `dir` that `version` is being installed.
@@ -209,7 +212,19 @@ mod tests {
     }
 
     #[test]
-    fn installs_wait_for_downloads_and_openings() {
+    fn installs_wait_for_work_a_restart_would_lose() {
+        use bridge::snapshot::{Snapshot, Work};
+        let snapshot =
+            |work: Vec<Work>| Snapshot { version: "0.1.0", port: 39581, stopped: None, databases: Vec::new(), work };
+        assert!(idle(&View::of(&snapshot(Vec::new())), false));
+        for work in [Work::Downloading, Work::Opening, Work::Indexing, Work::Analysing] {
+            assert!(!idle(&View::of(&snapshot(vec![work])), false), "{work:?}");
+        }
+        assert!(!idle(&View::of(&snapshot(Vec::new())), true), "a Stockfish install");
+    }
+
+    #[test]
+    fn a_view_is_idle_unless_busy() {
         let view = |states: &[&str]| View {
             version: "0.1.0".into(),
             port: 39581,
@@ -227,11 +242,11 @@ mod tests {
                 })
                 .collect(),
             mark: "",
+            busy: false,
         };
-        assert!(idle(&view(&[])));
-        assert!(idle(&view(&["ready", "missing", "cloudOnly", "unreadable", "unsupported"])));
-        assert!(!idle(&view(&["ready", "downloading"])));
-        assert!(!idle(&view(&["opening"])));
+        // The states themselves no longer decide: the bridge's work does.
+        assert!(idle(&view(&["ready", "missing", "cloudOnly", "unreadable", "unsupported"]), false));
+        assert!(!idle(&View { busy: true, ..view(&["ready"]) }, false));
     }
 
     #[test]

@@ -55,6 +55,10 @@ pub struct View {
     pub databases: Vec<DatabaseView>,
     /// [`View::tray`]'s name, for the windows to show the same state.
     pub mark: &'static str,
+    /// Whether the bridge has work a restart would lose (#61), for an update
+    /// to wait for. Not shown in the windows.
+    #[serde(skip)]
+    pub busy: bool,
 }
 
 /// The tray mark's colour.
@@ -118,13 +122,22 @@ impl View {
                 })
                 .collect(),
             mark: "",
+            busy: !snapshot.work.is_empty(),
         }
         .marked()
     }
 
     /// The view of a bridge that could not start.
     pub fn failed(version: &str, port: u16, problem: Problem) -> View {
-        View { version: version.to_string(), port, problem: Some(problem), databases: Vec::new(), mark: "" }.marked()
+        View {
+            version: version.to_string(),
+            port,
+            problem: Some(problem),
+            databases: Vec::new(),
+            mark: "",
+            busy: false,
+        }
+        .marked()
     }
 
     /// The view with its `mark` set from its state.
@@ -218,6 +231,7 @@ mod tests {
                 })
                 .collect(),
             mark: "",
+            busy: false,
         }
         .marked()
     }
@@ -277,6 +291,7 @@ mod tests {
                 progress: None,
                 listed: true,
             }],
+            work: Vec::new(),
         };
         let view = View::of(&snapshot);
         assert_eq!(view.problem, None);
