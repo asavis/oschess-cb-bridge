@@ -563,6 +563,22 @@ fn error_line(code: &str, message: &str) -> String {
     Obj::new().raw("error", &error).done()
 }
 
+/// Starts `command`, trying again for a moment while its program is busy. On
+/// Linux a program written a moment ago, such as a freshly installed engine,
+/// is busy (`ETXTBSY`) while a child another thread is starting still holds
+/// the file open between its fork and its exec.
+fn spawn(command: &mut Command) -> io::Result<Child> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match command.spawn() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            started => return started,
+        }
+    }
+}
+
 /// The engine's process, its input, and its output line by line.
 struct Process {
     child: Child,
@@ -591,7 +607,7 @@ impl Process {
             command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
         }
         let mut child =
-            command.spawn().map_err(|e| format!("The engine {} did not start: {e}", config.program.display()))?;
+            spawn(&mut command).map_err(|e| format!("The engine {} did not start: {e}", config.program.display()))?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();
