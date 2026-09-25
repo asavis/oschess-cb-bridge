@@ -2,8 +2,11 @@
 //! worker. The budget is read once per process, so each test runs itself again
 //! in a child process with that budget set.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bridge::catalog::Catalog;
+use bridge::explorer::Lookup;
 use bridge::explorer::format::MAX_PLY;
 use bridge::explorer::runs::{Limits, Progress, RUN_BUFFER, fan_ins};
 use bridge::explorer::{self, WRITER_BYTES, rendered};
@@ -126,5 +129,32 @@ fn rendered_games_are_budgeted_and_evicted() {
     assert_eq!(held(), others);
     let again = explorer::render(&d, &board, loaded.lookup(board.hash()).unwrap(), &loaded);
     assert_eq!(first, again, "the same answer after eviction");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A request that finds no room in the search memory for the table of the
+/// index kept on disk is answered busy: nothing is built or reported as
+/// building, and once there is room the kept index answers.
+#[test]
+fn a_kept_index_without_memory_is_busy_not_built() {
+    if !in_child("a_kept_index_without_memory_is_busy_not_built") {
+        return;
+    }
+    let db = pawns("small-budget-kept", 10);
+    let dir = std::env::temp_dir().join(format!("bridge-small-budget-kept-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+    catalog.explorer.set_dir(dir.clone());
+    let entry = Arc::clone(&catalog.entries()[0]);
+    let Ok(open) = entry.open() else { panic!("the database does not open") };
+    drop(explorer::prepare(&*open.db, open.generation, &dir, &entry.id, &Progress::default()).unwrap());
+    let file = dir.join(format!("{}.idx", entry.id));
+    let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let taken = Hold::reserve(budget() - held()).unwrap();
+    assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Busy));
+    assert!(catalog.explorer.building().is_empty());
+    drop(taken);
+    assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Ready(_)));
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written, "the file was rewritten");
     std::fs::remove_dir_all(&dir).unwrap();
 }

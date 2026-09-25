@@ -119,7 +119,9 @@ The first request for a database's positions builds its position index in the
 background, on half of those workers and within the same memory, and keeps it
 in the data folder's `index` folder: the games, results, moves and notable
 games of every position the games reach in their first 40 plies. For the Mega
-Database it takes some five minutes and 1.4 GB. `cargo run --release -p bridge
+Database it takes some five minutes and 1.4 GB. Once kept, the index answers
+from the first request after the bridge starts, until the database changes.
+`cargo run --release -p bridge
 --example index_oracle -- <db.2cbh> <index dir>` builds one and checks it
 against a brute-force count, printing numbers only. `cargo run --release -p
 bridge --example classic_pairs -- <scratch dir> <a.cbh> <a.2cbh> …` serves the

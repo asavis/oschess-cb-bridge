@@ -512,6 +512,30 @@ fn the_endpoint_builds_then_answers() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A bridge started again answers from the first request with the index the
+/// one before it kept on disk, and leaves the file as it was.
+#[test]
+fn a_restarted_bridge_answers_from_the_kept_index() {
+    let db = database("explorer-restart");
+    let dir = index_dir("restart");
+    let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    let (port, id) = serve(&db, &dir);
+    let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(start));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while get(port, &url).0 != 200 {
+        assert!(Instant::now() < deadline, "the index was not built");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let file = dir.join(format!("{id}.idx"));
+    let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let (port, _) = serve(&db, &dir);
+    let (status, body) = get(port, &url);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""games":5,"white":2,"draws":2,"black":1"#), "{body}");
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written, "the file was rewritten");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn chess960_games_never_reach_the_index() {
     let db = database("explorer-960");
