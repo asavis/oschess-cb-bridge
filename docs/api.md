@@ -126,7 +126,8 @@ with them.
   again. The files are those the bridge reads: `.2cbh`, `.2cbg`, `.2cba`,
   `.2lid`, `.2lgd` and `.2lcd` of a 2CBH database; `.cbh`, `.cbg`, `.cba`, `.cbp`,
   `.cbt`, `.cbc`, `.cbs` and, when present, `.cbj` of a classic one (see
-  [Classic databases](#classic-databases)).
+  [Classic databases](#classic-databases)); a PGN file itself (see
+  [PGN files](#pgn-files)).
 
 ## Consistency
 
@@ -208,7 +209,8 @@ most recently used streams; a forgotten stream starts afresh.
 
 The web app calls it first. `api` below the version it was written for means
 the bridge is too old; the app then offers the download link. `databases`
-counts the databases in each state. `download` is there while databases are
+counts the databases in each state; `opening` counts the PGN files being read
+for their header index (see [PGN files](#pgn-files)). `download` is there while databases are
 being downloaded: the bytes on this computer and in all, over all of them.
 `indexing` is there while position indexes are checked or built (see
 `GET /v1/databases/{id}/explorer`). `engine` names the engine the analysis
@@ -232,8 +234,8 @@ adds, then those given with `--database`, each once:
   other setting they come in the order the file stores them: 2CBH databases
   first, then the others.
 - **`bridge.toml`'s** follow in the order written. A folder gives the `.2cbh`
-  and `.cbh` database files directly in it, by file name; a folder or a pipe
-  named like one is not a database.
+  and `.cbh` database files and the `.pgn` files directly in it, by file name;
+  a folder or a pipe named like one is not a database.
 - **The list is read again** on a request to `/v1/status` or `/v1/databases`
   after `DBItems.cbini`, `bridge.toml` or a listed folder changed. Each of them
   that cannot be read keeps the databases last read from it, and is read again
@@ -265,7 +267,8 @@ adds, then those given with `--database`, each once:
       "id": "9a8b7c6d5e4f3021",
       "name": "Openings",
       "format": "pgn",
-      "state": "unsupported"
+      "state": "opening",
+      "progress": { "present": 52428800, "total": 157286400 }
     }
   ]
 }
@@ -275,11 +278,11 @@ adds, then those given with `--database`, each once:
 |---|---|
 | `name` | The name ChessBase's window shows: the title it keeps for the database, else the file name without extension. A database that is not in the window has its file name without extension |
 | `format` | `2cbh`, `cbh` or `pgn`; another value is possible later |
-| `state` | `ready`; `opening` (being opened, retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: `.pgn`, which the oschess Library imports itself, and any other); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one) |
+| `state` | `ready`; `opening` (a PGN file being read for its header index, see [PGN files](#pgn-files); retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: any but `.2cbh`, `.cbh` and `.pgn`); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one; for a PGN file, its header index could not be built) |
 | `records` | Games, guiding texts and analyses; present when `ready` |
 | `generation` | See above; present when `ready` |
 | `size` | The bytes of the database's files; present when `cloudOnly` or `downloading` |
-| `progress` | `present` bytes on this computer of `total`; present when `downloading` |
+| `progress` | `present` bytes on this computer of `total`, when `downloading`; `present` bytes of the PGN file read of `total`, when `opening` |
 
 #### Cloud-only databases
 
@@ -334,6 +337,64 @@ what the format stores otherwise:
   The format has no analyses.
 - **`moves`** is at most 255, as the header stores it; the game's PGN has
   every move.
+
+#### PGN files
+
+A PGN file (`format: "pgn"`) is served like a 2CBH database: its list,
+searches, sorts, suggestions, games and position index answer as a 2CBH copy
+of the same games answers, apart from what the format has otherwise:
+
+- **Opening.** The bridge reads the whole file once to find its games and
+  their tags, and keeps what it found, the header index, in the data folder's
+  `pgn` folder as `<id>.head`. While it reads, the database is `opening`, with
+  the bytes read as `progress`, and requests for its games, searches,
+  suggestions and positions are answered `409 database_unavailable` with
+  `state: "opening"`. Files are read one at a time, in the background. A
+  header index built for the file's current generation is used at once, also
+  after the bridge restarts; a change to the file reads it again. A file whose
+  header index cannot be built is `unreadable` for a minute, and the next
+  request tries again. A header index takes 48 bytes a game plus the names.
+  The `pgn` folder is swept as the `index` folder is (see "Storage" under
+  `GET /v1/databases/{id}/explorer`): a build's `<id>.head.partial` goes at
+  once unless that file is being read, and the header index of a database
+  off the list for ten minutes goes.
+- **Games only.** Every record is a game: none is deleted, and a PGN file has
+  no guiding texts or analyses. A game starts at its first tag, or at its
+  first move when it has none, and ends at its result or where the next
+  game's tags start after its moves; a tag the game already has also starts
+  the next game, and a comment between tags does not. A line ends at LF, CR
+  or both, and a tag pair may span lines, with comments and `%` escape lines
+  between any of its tokens. A `{` comment ends at its `}`,
+  whatever it holds; one still open at the end of the file was left open by
+  mistake, and ends before its first line starting `[Event "`, from where the
+  file is read on (at most 64 times in a file).
+- **Fields.** A row's fields come from the tags. `White` and `Black` are
+  players, split at the first comma into `Last, First`; `?`, `-` or nothing is
+  no name. `Event` and `Site` are the tournament's title and place. `Date`,
+  `Round` (`5.2` or `5(2)` is round 5, sub-round 2), `WhiteElo`, `BlackElo`
+  and `ECO` are read as PGN writes them, and a value out of range is unknown.
+  `Result` is the tag's, else the result ending the movetext, else `*`;
+  `0-0` is ChessBase's result for a game both players lost, and in a game
+  whose `Result` tag is `0-0` the movetext's last `0-0` is that result and
+  any earlier one castles. `Annotator` is one text in a table of its own, as
+  in a classic database. `moves` counts
+  the main line's moves as written, and `flags.chess960` is set by a `Variant`
+  tag naming Chess960. A tag value is read to 4 KiB.
+- **Text.** `GET /v1/databases/{id}/games/{number}` serves the game's text as
+  the file writes it, from its first tag to its result, with each line ending
+  in `\n`: decoded as UTF-8, or, when the game is not valid UTF-8, in the
+  computer's ANSI code page (Windows-1252 where the page has no table). Its
+  row's names are read in the same encoding.
+  `lang` and `annotations` change nothing, and `annotations` is `complete`:
+  a PGN game's comments are all it has.
+- **Position index.** Each game's main line is played as written, from its
+  `FEN` tag or the standard start, and ends at the first move that names no
+  legal move, a null move among them. Games of Chess960 and of other variants
+  are left out.
+- **`line`.** A row's `line` is the main line read the same way, written in
+  the bridge's SAN, so its form may differ from the text's: `O-O` for `0-0`,
+  `e8=Q` for `e8Q`. A game with a `FEN` tag other than the standard position
+  has none.
 
 ### `GET /v1/databases/{id}/games`
 
@@ -644,7 +705,8 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   optimisation, only if its results can be shown equal to a build from
   nothing.
 - **Storage.** Index files live in the data folder's `index` folder, one per
-  database (`<id>.idx`); `docs/format-notes.md`,
+  database (`<id>.idx`); a PGN file's header index lives apart, in `pgn`
+  ([PGN files](#pgn-files)). `docs/format-notes.md`,
   "Position index", describes them. A file that is damaged or of another
   version is rebuilt. The Mega Database's index takes about 1.4 GB, and its
   build needs about 8 GB of temporary space there (`<id>.build`,

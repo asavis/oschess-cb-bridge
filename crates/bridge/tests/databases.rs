@@ -124,12 +124,14 @@ fn the_window_comes_first_then_bridge_toml_then_the_command_line() {
     let mut sources = root.sources();
     sources.fixed = vec![fixed, b.clone()];
     let catalog = Catalog::with_sources(sources, Arc::new(bridge::fetch::System));
+    catalog.pgn().set_dir(root.path("pgn-index"));
 
     // 2CBH entries first in the file, as ChessBase writes them; an empty
     // title shows the file name. `Old.cbh` is a classic header file without
-    // the other files of its database.
+    // the other files of its database. The PGN file opens once its index is
+    // built.
     assert_eq!(names(&catalog), ["Beta (2cbh)", "Alpha", "Gone", "Games", "Delta", "Gamma", "Old", "Cli"]);
-    assert_eq!(states(&catalog), ["ready", "ready", "missing", "unsupported", "ready", "ready", "unreadable", "ready"]);
+    assert_eq!(states(&catalog), ["ready", "ready", "missing", "opening", "ready", "ready", "unreadable", "ready"]);
     let entries = catalog.entries();
     assert_eq!(entries[0].id, id_of(&b));
     assert!(catalog.get(&id_of(&d)).is_some());

@@ -3,10 +3,12 @@
 
 use chesscore::{Board, Move};
 
+use cbformat::pgnfile::lex::{self, Lexer};
+use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor, start_board};
 use cbformat::v2::{self, GameResult, HEADER_RECORD_SIZE, MoveData, Record, RecordKind};
 use cbformat::view::Base;
-use cbformat::{Error, Result, cbh};
+use cbformat::{Error, Result, cbh, pgnfile};
 
 use super::format::{NO_MOVE, Outcome, pack_move};
 use crate::store::{Head, Store};
@@ -51,6 +53,8 @@ pub struct Workspace {
     /// The games of a run whose move records the buffer did not hold at once.
     later: Vec<u32>,
     line: Line,
+    /// Reads PGN games' texts.
+    lexer: Lexer,
     /// Games left out because their moves could not be read: damaged, or a
     /// move record over [`MAX_MOVE_RECORD`].
     pub skipped: u64,
@@ -67,6 +71,9 @@ impl Workspace {
     pub const BYTES: usize = (RECORDS + 1)
         * (HEADER_RECORD_SIZE + std::mem::size_of::<Record>() + std::mem::size_of::<cbh::Record>() + 4)
         + MOVE_BYTES
+        + lex::MAX_TAG_VALUE
+        + lex::MAX_TAG_NAME
+        + lex::MAX_SYMBOL
         + 1024;
 
     pub fn new() -> Option<Workspace> {
@@ -89,6 +96,7 @@ impl Workspace {
             moves: buf(MOVE_BYTES)?,
             later,
             line: Line { number: 0, outcome: Outcome::Other, elo: 0, positions },
+            lexer: Lexer::new(),
             skipped: 0,
         })
     }
@@ -233,7 +241,78 @@ impl Source for Base {
         match self {
             Base::TwoCbh(db) => lines(db, first, last, max_ply, work, each),
             Base::Cbh(db) => lines(db, first, last, max_ply, work, each),
+            Base::Pgn(db) => db.lines(first, last, max_ply, work, each),
         }
+    }
+}
+
+/// A PGN file's games are read from its text: the texts of consecutive games
+/// at once when the move buffer holds them, as a run's move records are.
+impl Source for pgnfile::Database {
+    fn records(&self) -> u32 {
+        self.record_count()
+    }
+
+    fn lines(
+        &self,
+        first: u32,
+        last: u32,
+        max_ply: u8,
+        work: &mut Workspace,
+        each: &mut dyn FnMut(&Line),
+    ) -> Result<()> {
+        const SIZE: usize = pgnfile::RECORD_SIZE;
+        let last = last.min(self.record_count());
+        let mut next = first.max(1);
+        let Workspace { headers, moves, line, lexer, skipped, .. } = work;
+        while next <= last {
+            let want = (last - next + 1).min(RECORDS as u32) as usize;
+            // Within the capacity reserved for the headers of a 2CBH run.
+            headers.clear();
+            headers.resize(want * SIZE, 0);
+            let read = self.read_records(next, headers)? as usize;
+            if read == 0 {
+                break;
+            }
+            let record = |i: usize| {
+                let bytes = headers[i * SIZE..(i + 1) * SIZE].try_into().expect("a whole record");
+                pgnfile::Record::from_bytes(next + i as u32, bytes)
+            };
+            let mut i = 0;
+            while i < read {
+                // The games from `i` whose texts the buffer holds together.
+                let start = record(i).offset();
+                let (mut end, mut j) = (start, i);
+                while j < read {
+                    let r = record(j);
+                    let Some(stop) = r.offset().checked_add(u64::from(r.len())) else { break };
+                    if r.offset() < start || stop - start > MAX_MOVE_RECORD as u64 {
+                        break;
+                    }
+                    end = end.max(stop);
+                    j += 1;
+                }
+                if j == i {
+                    // Longer than a move record may be, or placed by damage.
+                    *skipped += 1;
+                    i += 1;
+                    continue;
+                }
+                moves.clear();
+                moves.resize((end - start) as usize, 0);
+                self.read_span(start, moves)?;
+                for k in i..j {
+                    let r = record(k);
+                    let at = (r.offset() - start) as usize;
+                    if walk_pgn(&moves[at..at + r.len() as usize], &r, max_ply, line, lexer) {
+                        each(line);
+                    }
+                }
+                i = j;
+            }
+            next += read as u32;
+        }
+        Ok(())
     }
 }
 
@@ -248,7 +327,7 @@ fn lines<S: Games>(
 ) -> Result<()> {
     let last = last.min(db.record_count());
     let mut next = first.max(1);
-    let Workspace { headers, records, moves, later, line, skipped } = work;
+    let Workspace { headers, records, moves, later, line, skipped, .. } = work;
     let records = S::run_of(records);
     while next <= last {
         let want = (last - next + 1).min(RECORDS as u32) as usize;
@@ -393,6 +472,39 @@ impl TreeVisitor for MainLine<'_> {
             self.at = after.hash();
         }
     }
+}
+
+/// Fills `line` with the main line of a PGN game's text, as [`walk`] reads a
+/// 2CBH game; whether the index holds the game. The moves are read as
+/// written ([`pgnfile::line`]): the line ends at the first that names no
+/// legal move, a null move among them.
+fn walk_pgn(text: &[u8], r: &pgnfile::Record, max_ply: u8, line: &mut Line, lexer: &mut Lexer) -> bool {
+    if r.is_chess960() || r.is_other_variant() {
+        return false;
+    }
+    begin(line, r);
+    let (mut ply, mut chess960) = (0u8, false);
+    let end = main_line(text, lexer, &mut |board, mv| {
+        if ply == 0 && line.positions.is_empty() && board.is_chess960() {
+            chess960 = true;
+            return false;
+        }
+        match mv.filter(|_| ply < max_ply) {
+            Some(mv) => {
+                line.reach(board.hash(), pack_move(mv), ply);
+                ply += 1;
+                true
+            }
+            // The end of the line, the index's depth, a null move or a move
+            // it cannot play: the position is reached, and no move from it is
+            // counted.
+            None => {
+                line.reach(board.hash(), NO_MOVE, ply);
+                false
+            }
+        }
+    });
+    !chess960 && end != LineEnd::BadStart
 }
 
 /// Starts `line` for `r`'s game.

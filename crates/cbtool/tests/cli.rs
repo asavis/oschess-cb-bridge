@@ -479,3 +479,36 @@ fn annotations_past_the_end_are_moved_and_on_no_move_fail() {
     let written = std::fs::read_to_string(&out).unwrap();
     assert!(written.contains("1. e4 {fine} 1-0") && written.contains("1. e4 {past the end} 1-0"), "{written}");
 }
+
+/// `verify --limit` on a PGN file verifies only the first games; its options
+/// are checked before anything is read.
+#[test]
+fn verify_limits_a_pgn_file_and_checks_its_options() {
+    let dir = std::env::temp_dir().join(format!("cbtool-cli-pgn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("games.pgn");
+    std::fs::write(&path, "[Event \"One\"]\n\n1. e4 e5 *\n\n[Event \"Two\"]\n\n1. e4 Ke7 *\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("verify").arg(&path).args(args).output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let (ok, out) = run(&["--limit", "1"]);
+    assert!(ok && out.contains("games               1") && out.contains("unplayable moves    0"), "{out}");
+    let (ok, out) = run(&[]);
+    assert!(!ok && out.contains("games               2") && out.contains("unplayable moves    1"), "{out}");
+    let (ok, out) = run(&["--limit", "0"]);
+    assert!(ok && out.contains("games               0"), "{out}");
+    for bad in [&["--limit", "nonsense"][..], &["--limit"], &["--limit", "1", "--limit", "2"], &["--frobnicate", "1"]] {
+        let (ok, out) = run(bad);
+        assert!(!ok && out.is_empty(), "{bad:?}: {out}");
+    }
+    // `--code-page` is for PGN files only.
+    let db = fixture("code-page-2cbh");
+    let out = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .args(["verify", db.dir().join("db.2cbh").to_str().unwrap(), "--code-page", "1251"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

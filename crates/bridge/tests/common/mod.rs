@@ -113,11 +113,25 @@ pub fn put(rec: &mut [u8; 192], at: usize, bytes: &[u8]) {
 /// the event column and its author from the annotator column, and stores them
 /// in its own header layout.
 pub fn fixture(name: &str, extra: &[&str]) -> TempDb {
+    fixture_of(name, &rows(extra))
+}
+
+/// The fixture's rows of the document, then `extra`.
+pub fn rows(extra: &[&str]) -> Vec<String> {
+    block("fixture")
+        .into_iter()
+        .filter(|l| !l.starts_with('#'))
+        .chain(extra.iter().copied())
+        .map(String::from)
+        .collect()
+}
+
+/// [`fixture`] of `rows` in its form.
+pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
     let (mut players, mut tournaments, mut titles) = (Names::default(), Names::default(), Names::default());
     let mut b = Builder::new();
     let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
-    let rows = block("fixture").into_iter().filter(|l| !l.starts_with('#')).chain(extra.iter().copied());
-    for (i, line) in rows.enumerate() {
+    for (i, line) in rows.iter().enumerate() {
         let f: Vec<&str> = line.split('|').map(str::trim).collect();
         assert_eq!(f[0].parse::<usize>().unwrap(), i + 1, "fixture rows are numbered in order");
         let rec = b.game(e4);
@@ -172,6 +186,52 @@ pub fn fixture(name: &str, extra: &[&str]) -> TempDb {
     }
     b.lid(lid(&players.0, &tournaments.0, &titles.0));
     b.write(name)
+}
+
+/// `rows` of the fixture's form as a PGN file, `db.pgn`: each a game with the
+/// tags its row names and a main line of its row's full moves, `1. e4` and
+/// then knights back and forth. A PGN file holds games only.
+pub fn pgn_fixture(name: &str, rows: &[String]) -> TempDb {
+    let mut text = String::new();
+    for line in rows {
+        let f: Vec<&str> = line.split('|').map(str::trim).collect();
+        assert_eq!(f[1], "game", "a PGN file holds games only");
+        let round = f[6].replace('(', ".").replace(')', "");
+        let tags = [
+            ("Event", f[4]),
+            ("Date", f[5]),
+            ("Round", round.as_str()),
+            ("White", f[2]),
+            ("Black", f[3]),
+            ("Result", f[7]),
+            ("ECO", f[8]),
+            ("WhiteElo", if f[10] == "0" { "-" } else { f[10] }),
+            ("BlackElo", if f[11] == "0" { "-" } else { f[11] }),
+            ("Annotator", f[12]),
+        ];
+        for (tag, value) in tags {
+            if value != "-" {
+                text.push_str(&format!("[{tag} \"{value}\"]\n"));
+            }
+        }
+        text.push('\n');
+        let moves: usize = f[9].parse().unwrap();
+        for ply in 0..(2 * moves).saturating_sub(1) {
+            let san = match ply {
+                0 => "e4",
+                p if p % 2 == 1 => ["Nf6", "Ng8"][(p - 1) / 2 % 2],
+                p => ["Nf3", "Ng1"][(p - 2) / 2 % 2],
+            };
+            if ply % 2 == 0 {
+                text.push_str(&format!("{}. ", ply / 2 + 1));
+            }
+            text.push_str(san);
+            text.push(' ');
+        }
+        text.push_str(f[7]);
+        text.push_str("\n\n");
+    }
+    cbformat::fixture::pgn_file(name, text.as_bytes())
 }
 
 /// The fixture of the document as a classic database, plus `extra` rows: the

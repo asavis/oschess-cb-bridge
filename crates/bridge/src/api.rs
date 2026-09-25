@@ -122,7 +122,7 @@ fn status(app: &App) -> Response {
     let count = |s: State| states.iter().filter(|&&x| x == s).count() as i64;
     let dbs = Obj::new()
         .num("ready", count(State::Ready))
-        .num("opening", 0)
+        .num("opening", count(State::Opening))
         .num("missing", count(State::Missing))
         .num("cloudOnly", count(State::CloudOnly))
         .num("downloading", count(State::Downloading))
@@ -223,6 +223,10 @@ fn databases(app: &App) -> Response {
                     (State::Downloading, Some(p)) => {
                         o.num("size", p.total as i64).raw("progress", &progress(p.present(), p.total)).done()
                     }
+                    (State::Opening, _) => match e.opening() {
+                        Some(p) => o.raw("progress", &progress(p.present(), p.total)).done(),
+                        None => o.done(),
+                    },
                     (State::CloudOnly | State::Downloading, _) => o.num("size", e.size() as i64).done(),
                     _ => o.done(),
                 }

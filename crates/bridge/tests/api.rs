@@ -59,6 +59,7 @@ fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sy
         between_reads: hook,
         engine: bridge::engine::Engine::none(),
     };
+    app.catalog.pgn().set_dir(db.dir().join("pgn-index"));
     let app = Arc::new(app);
     std::thread::spawn(move || server::serve(listeners, app));
     Running { port, id: id_of(&path) }
@@ -115,8 +116,11 @@ fn status_and_databases() {
     let s = get(r.port, "/v1/status", "");
     assert_eq!(s.status, 200, "{}", s.body);
     assert!(s.body.contains(r#""bridge":{"version":"test","api":1}"#), "{}", s.body);
+    // The PGN file is opened in the background: its index is built first.
     assert!(
-        s.body.contains(r#""ready":1"#) && s.body.contains(r#""missing":1"#) && s.body.contains(r#""unsupported":1"#)
+        s.body.contains(r#""ready":1"#) && s.body.contains(r#""missing":1"#) && s.body.contains(r#""opening":1"#),
+        "{}",
+        s.body
     );
     let d = get(r.port, "/v1/databases", "");
     assert_eq!(d.status, 200);
@@ -125,7 +129,7 @@ fn status_and_databases() {
         "{}",
         d.body
     );
-    assert!(d.body.contains(r#""name":"games","format":"pgn","state":"unsupported""#), "{}", d.body);
+    assert!(d.body.contains(r#""name":"games","format":"pgn","state":""#), "{}", d.body);
     assert!(d.body.contains(r#""name":"base","format":"2cbh","state":"missing""#), "{}", d.body);
     assert!(!d.body.contains(db.dir().to_str().unwrap()), "paths are never sent");
     assert_eq!(d.header("access-control-allow-origin"), Some(ORIGIN));

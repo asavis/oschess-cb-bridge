@@ -32,7 +32,8 @@ pub struct Database {
     pub records: Option<u32>,
     /// The bytes of its files, while they are kept in the cloud or downloaded.
     pub size: Option<u64>,
-    /// The bytes on this computer and in all, while it downloads.
+    /// The bytes on this computer and in all, while it downloads; the bytes
+    /// of a PGN file read and in all, while it opens.
     pub progress: Option<(u64, u64)>,
     /// Whether the database is on the list: one that left it is `missing`.
     pub listed: bool,
@@ -43,7 +44,12 @@ impl Database {
         let state = entry.state();
         let records = if state == State::Ready { entry.open().ok().map(|o| o.db.record_count()) } else { None };
         let size = matches!(state, State::CloudOnly | State::Downloading).then(|| entry.size());
-        let progress = entry.progress().filter(|_| state == State::Downloading).map(|p| (p.present(), p.total));
+        let progress = match state {
+            State::Downloading => entry.progress(),
+            State::Opening => entry.opening(),
+            _ => None,
+        }
+        .map(|p| (p.present(), p.total));
         Database {
             id: entry.id.clone(),
             name: entry.name.clone(),
