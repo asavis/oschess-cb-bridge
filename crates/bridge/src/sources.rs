@@ -66,19 +66,11 @@ impl Sources {
             .collect())
     }
 
-    /// The `databases` of `bridge.toml`, as written; empty when there is no file.
+    /// The `databases` of `bridge.toml`, as written; empty when there is no
+    /// file. Read through `config::read`, the one reader of the file (#70).
     pub fn configured(&self) -> Result<Vec<PathBuf>, String> {
         let Some(path) = &self.config else { return Ok(Vec::new()) };
-        match std::fs::metadata(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            // A pipe would block the read.
-            Ok(m) if !m.is_file() => return Err(format!("{}: not a regular file", path.display())),
-            _ => {}
-        }
-        match std::fs::read_to_string(path) {
-            Ok(text) => config::parse(&text).map(|c| c.databases).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        }
+        config::read(path).map(|c| c.map(|c| c.databases).unwrap_or_default())
     }
 }
 
@@ -122,7 +114,11 @@ pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
 #[derive(Default)]
 pub(crate) struct Read {
     window: Kept<Vec<Listed>>,
-    config: Kept<Vec<PathBuf>>,
+    /// `bridge.toml`, followed as every reader of it does (#70); made on the
+    /// first update.
+    config: Option<config::Watched>,
+    /// The `databases` it names, as last read.
+    configured: Vec<PathBuf>,
     /// The databases of each configured path.
     paths: HashMap<PathBuf, Kept<Vec<Listed>>>,
 }
@@ -133,22 +129,29 @@ impl Read {
         let window_file = sources.chessbase.as_ref().map(|d| d.join(dbitems::FILE_NAME));
         let mut changed =
             self.window.update(signature(window_file.as_deref()), &"the database window list", || sources.window());
-        changed |= self.config.update(signature(sources.config.as_deref()), &"bridge.toml", || sources.configured());
-        let configured = &self.config.value;
+        let configured = match &sources.config {
+            Some(path) => {
+                let look = self.config.get_or_insert_with(|| config::Watched::new(path.clone())).look();
+                changed |= look.changed;
+                look.config.databases
+            }
+            None => Vec::new(),
+        };
         let before = self.paths.len();
         self.paths.retain(|p, _| configured.contains(p));
         changed |= self.paths.len() != before;
-        for path in configured {
+        for path in &configured {
             let kept = self.paths.entry(path.clone()).or_default();
             changed |= kept.update(folder_signature(path), &path.display(), || expand(path));
         }
+        self.configured = configured;
         changed
     }
 
     /// The databases in order: the window's, the configured ones, the fixed ones.
     pub(crate) fn listed(&self, sources: &Sources) -> Vec<Listed> {
         let mut listed = self.window.value.clone();
-        for path in &self.config.value {
+        for path in &self.configured {
             listed.extend(self.paths.get(path).into_iter().flat_map(|k| k.value.iter().cloned()));
         }
         listed.extend(sources.fixed.iter().cloned().map(Listed::at));

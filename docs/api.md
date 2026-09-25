@@ -732,6 +732,12 @@ engine_threads = 6   # optional default; all processors but two without it
 engine_hash = 512    # optional default, in MB; 512 without it, at most a quarter of the memory
 ```
 
+`bridge.toml` is followed while the bridge runs, as the database list follows
+it: a changed engine takes effect at once. A file that cannot be read or
+parsed leaves the settings last read in force, for the databases and the
+engine alike, and is read again at the next look; no file at all is the
+defaults, no engine.
+
 | Parameter | |
 |---|---|
 | `fen` | The position, at most 128 bytes; the start position without it. It must be a legal standard position; Chess960 is not analysed. |

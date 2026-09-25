@@ -275,7 +275,7 @@ pub struct Engine {
 struct Shared {
     idle: Duration,
     /// The configuration file the engine follows; `None` for a fixed one.
-    file: Option<PathBuf>,
+    file: Option<crate::config::Watched>,
     current: Mutex<Current>,
     /// The analyses running now, and when the newest began (#61).
     analyses: AtomicUsize,
@@ -293,8 +293,6 @@ impl Drop for Running<'_> {
 
 #[derive(Default)]
 struct Current {
-    /// The configuration file's signature when it was last read.
-    signature: Option<u64>,
     config: Option<EngineConfig>,
     inner: Option<Arc<Inner>>,
 }
@@ -332,7 +330,7 @@ impl Engine {
 
     fn fixed(config: Option<EngineConfig>, idle: Duration) -> Self {
         let inner = config.clone().map(|c| Inner::start(c, idle));
-        let current = Current { signature: None, config, inner };
+        let current = Current { config, inner };
         let shared = Shared {
             idle,
             file: None,
@@ -344,8 +342,9 @@ impl Engine {
     }
 
     /// The engine the `bridge.toml` at `path` names, read again whenever the
-    /// file changes. A file that cannot be read or parsed keeps the engine it
-    /// named before. The file is looked at every [`CONFIG_POLL`] as well, so a
+    /// file changes, as `config::Watched` reads it: a file that cannot be read
+    /// or parsed keeps the engine it named before, and no file is the defaults,
+    /// no engine. The file is looked at every [`CONFIG_POLL`] as well, so a
     /// changed engine stops the running search at once, not at the next call.
     pub fn from_config_file(path: PathBuf) -> Self {
         Self::following(path, CONFIG_POLL)
@@ -355,7 +354,7 @@ impl Engine {
     pub fn following(path: PathBuf, poll: Duration) -> Self {
         let shared = Shared {
             idle: IDLE,
-            file: Some(path),
+            file: Some(crate::config::Watched::new(path)),
             current: Mutex::default(),
             analyses: AtomicUsize::new(0),
             began: Mutex::new(None),
@@ -379,27 +378,17 @@ impl Engine {
     /// that search lets it go.
     fn current(&self) -> Option<Arc<Inner>> {
         let mut current = lock(&self.shared.current);
-        if let Some(path) = &self.shared.file {
-            let signature = crate::sources::signature(Some(path));
-            if current.signature != Some(signature) {
-                // Only a regular file is read: a pipe would block every caller
-                // on this lock. A failed read is tried again next time, even
-                // when the file itself did not change, as access may return.
-                let read = if path.is_file() {
-                    std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| crate::config::parse(&t))
-                } else {
-                    Err("not a regular file".to_string())
-                };
-                if let Ok(config) = read {
-                    current.signature = Some(signature);
-                    let next = config.engine.map(|p| EngineConfig::new(p, config.engine_threads, config.engine_hash));
-                    if next != current.config {
-                        if let Some(old) = current.inner.take() {
-                            old.turn.fetch_add(1, Ordering::SeqCst);
-                        }
-                        current.inner = next.clone().map(|c| Inner::start(c, self.shared.idle));
-                        current.config = next;
+        if let Some(watched) = &self.shared.file {
+            let look = watched.look();
+            if look.changed {
+                let config = look.config;
+                let next = config.engine.map(|p| EngineConfig::new(p, config.engine_threads, config.engine_hash));
+                if next != current.config {
+                    if let Some(old) = current.inner.take() {
+                        old.turn.fetch_add(1, Ordering::SeqCst);
                     }
+                    current.inner = next.clone().map(|c| Inner::start(c, self.shared.idle));
+                    current.config = next;
                 }
             }
         }

@@ -46,7 +46,8 @@ impl Default for Config {
 
 const TEMPLATE: &str = "\
 # oschess bridge settings. A new port, origin or web site takes effect when the
-# bridge restarts; the databases take effect as soon as this file is saved.
+# bridge restarts; the databases and the engine take effect as soon as this
+# file is saved. A file that cannot be read leaves the settings read before.
 
 port = 39581
 
@@ -78,7 +79,7 @@ pub fn load_or_create(path: &Path) -> Result<Config, String> {
         let _one = changing();
         create(path)?;
     }
-    load(path)
+    read(path)?.ok_or_else(|| format!("{}: no such file", path.display()))
 }
 
 /// The lock every write of `bridge.toml` in this process holds.
@@ -99,13 +100,82 @@ fn create(path: &Path) -> Result<(), String> {
     crate::files::write_atomic(path, TEMPLATE.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn load(path: &Path) -> Result<Config, String> {
-    // A pipe would block the read.
-    if !path.is_file() {
-        return Err(format!("{}: not a regular file", path.display()));
+/// The settings of the `bridge.toml` at `path`; `None` when there is no file.
+/// The one place the file is read (#70). Only a regular file is read: a pipe
+/// would block the reader.
+pub fn read(path: &Path) -> Result<Option<Config>, String> {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(m) if !m.is_file() => return Err(format!("{}: not a regular file", path.display())),
+        _ => {}
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse(&text).map(Some).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `bridge.toml` as the running bridge follows it (#70): the database list
+/// and the engine each ask it for the settings in force.
+///
+/// The file is read again whenever its size or modification time changes.
+/// There is one rule for what a read means:
+/// - a missing file is the defaults;
+/// - a file that cannot be read or parsed leaves the last good settings in
+///   force, and is read again at the next look, as access may return.
+pub struct Watched {
+    path: PathBuf,
+    last: std::sync::Mutex<Last>,
+}
+
+#[derive(Default)]
+struct Last {
+    /// The file's signature when it was last read without error.
+    signature: Option<u64>,
+    config: Config,
+    /// Whether a read has succeeded yet.
+    read: bool,
+    /// Whether the last read failed; its error has been logged.
+    failing: bool,
+}
+
+/// The settings in force, and whether a read just changed them.
+pub struct Look {
+    pub config: Config,
+    pub changed: bool,
+}
+
+impl Watched {
+    pub fn new(path: PathBuf) -> Watched {
+        Watched { path, last: std::sync::Mutex::default() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The settings in force, after reading the file again if it changed.
+    /// The first read that succeeds counts as a change.
+    pub fn look(&self) -> Look {
+        let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let signature = crate::sources::signature(Some(&self.path));
+        if last.signature == Some(signature) {
+            return Look { config: last.config.clone(), changed: false };
+        }
+        match read(&self.path) {
+            Ok(read) => {
+                let next = read.unwrap_or_default();
+                let changed = !last.read || next != last.config;
+                (last.config, last.signature, last.read, last.failing) = (next, Some(signature), true, false);
+                Look { config: last.config.clone(), changed }
+            }
+            Err(e) => {
+                if !last.failing {
+                    eprintln!("oschess-bridge: bridge.toml cannot be read, keeping the settings read before: {e}");
+                }
+                (last.signature, last.failing) = (None, true);
+                Look { config: last.config.clone(), changed: false }
+            }
+        }
+    }
 }
 
 /// The file for `config`: the default file's text and comments with its values.
@@ -157,7 +227,8 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
 pub fn update(path: &Path, change: impl FnOnce(&Config) -> Config) -> Result<Config, String> {
     let _one = changing();
     create(path)?;
-    let next = change(&load(path)?);
+    let now = read(path)?.ok_or_else(|| format!("{}: no such file", path.display()))?;
+    let next = change(&now);
     save(path, &next)?;
     Ok(next)
 }
