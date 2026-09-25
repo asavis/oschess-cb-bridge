@@ -37,17 +37,6 @@ fn build(path: &str, page: CodePage) -> AnyResult<Built> {
     Ok(Built { db, index, seconds })
 }
 
-/// `--code-page N` among `rest`: the page of text that is not UTF-8.
-pub fn code_page(rest: &[String]) -> AnyResult<CodePage> {
-    match rest.iter().position(|a| a == "--code-page") {
-        None => Ok(CodePage::WESTERN),
-        Some(i) => {
-            let n: u32 = rest.get(i + 1).ok_or("--code-page needs a number")?.parse()?;
-            Ok(CodePage::new(n))
-        }
-    }
-}
-
 pub fn info(path: &str, page: CodePage) -> AnyResult<bool> {
     let b = build(path, page)?;
     let bytes = std::fs::metadata(path)?.len();
@@ -87,12 +76,13 @@ impl Report {
     }
 }
 
-fn check(path: &str, page: CodePage) -> AnyResult<Report> {
+/// Verifies the first `limit` games, or all.
+fn check(path: &str, page: CodePage, limit: Option<u32>) -> AnyResult<Report> {
     let b = build(path, page)?;
     let db = &b.db;
     let mut report = Report { index_seconds: b.seconds, ..Report::default() };
     let mut lexer = Lexer::new();
-    for id in 1..=db.record_count() {
+    for id in 1..=limit.map_or(db.record_count(), |l| l.min(db.record_count())) {
         let r = db.record(id)?;
         report.games += 1;
         report.setups += u64::from(r.has_setup());
@@ -131,10 +121,11 @@ fn check(path: &str, page: CodePage) -> AnyResult<Report> {
     Ok(report)
 }
 
-/// Verifies every game; fails when any cannot be read, set up or played.
-pub fn verify(path: &str, page: CodePage) -> AnyResult<bool> {
+/// Verifies the first `limit` games, or all; fails when any cannot be read,
+/// set up or played.
+pub fn verify(path: &str, page: CodePage, limit: Option<u32>) -> AnyResult<bool> {
     let started = Instant::now();
-    let r = check(path, page)?;
+    let r = check(path, page, limit)?;
     println!("games               {}", r.games);
     println!("chess960            {}", r.chess960);
     println!("other variants      {}", r.variants);
@@ -165,11 +156,11 @@ mod tests {
     fn a_game_that_does_not_play_fails_the_verification() {
         let path =
             file("fails", b"[FEN \"not a position\"]\n\n1. e4 *\n\n[Event \"x\"]\n\n1. e4 Ke7 *\n\n1. d4 -- *\n");
-        let r = check(path.to_str().unwrap(), CodePage::WESTERN).unwrap();
+        let r = check(path.to_str().unwrap(), CodePage::WESTERN, None).unwrap();
         assert_eq!((r.games, r.bad_starts, r.unplayable, r.nulls), (3, 1, 1, 1));
         assert!(!r.verified());
         let ok = file("passes", b"[Event \"x\"]\n\n1. e4 e5 *\n\n1. d4 -- *\n");
-        assert!(check(ok.to_str().unwrap(), CodePage::WESTERN).unwrap().verified());
+        assert!(check(ok.to_str().unwrap(), CodePage::WESTERN, None).unwrap().verified());
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(ok);
     }
@@ -181,7 +172,7 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(MAX_TEXT as u64 + 1024).unwrap();
         drop(f);
-        let r = check(path.to_str().unwrap(), CodePage::WESTERN).unwrap();
+        let r = check(path.to_str().unwrap(), CodePage::WESTERN, None).unwrap();
         assert_eq!((r.games, r.unreadable), (1, 1));
         assert!(!r.verified());
         let _ = std::fs::remove_file(path);

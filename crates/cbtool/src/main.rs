@@ -22,7 +22,7 @@ mod pgn_file;
 
 const USAGE: &str = "usage:
   cbtool info   <db> [--code-page N]
-  cbtool verify <db> [--limit N | --code-page N]
+  cbtool verify <db> [--limit N] [--code-page N]
                                            decode and replay every game and analysis
   cbtool pgn    <db> [--out FILE] [--lang LANGS] [ID...]
                                            export games as PGN (all games when no ids)
@@ -67,13 +67,39 @@ fn main() -> ExitCode {
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// The options `info` and `verify` take, each at most once: `--limit N`
+/// (`verify` only) and `--code-page N` (a PGN file only). Anything else is an
+/// error, before any database is read.
+#[derive(Debug, Default, PartialEq)]
+struct Opts {
+    limit: Option<u32>,
+    code_page: Option<u32>,
+}
+
+fn opts(rest: &[String], limit: bool, pgn: bool) -> AnyResult<Opts> {
+    let mut o = Opts::default();
+    let mut args = rest.iter();
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| format!("{flag} needs a number\n\n{USAGE}"))?;
+        let n: u32 = value.parse().map_err(|_| format!("{flag} takes a whole number, not {value:?}"))?;
+        match flag.as_str() {
+            "--limit" if limit && o.limit.is_none() => o.limit = Some(n),
+            "--code-page" if pgn && o.code_page.is_none() => o.code_page = Some(n),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    Ok(o)
+}
+
+fn page(o: &Opts) -> cbformat::codepage::CodePage {
+    o.code_page.map_or(cbformat::codepage::CodePage::WESTERN, cbformat::codepage::CodePage::new)
+}
+
 fn info(path: &str, rest: &[String]) -> AnyResult<bool> {
     let format = view::format_of(Path::new(path));
+    let o = opts(rest, false, format == view::Format::Pgn)?;
     if format == view::Format::Pgn {
-        return pgn_file::info(path, pgn_file::code_page(rest)?);
-    }
-    if !rest.is_empty() {
-        return Err(USAGE.into());
+        return pgn_file::info(path, page(&o));
     }
     if format == view::Format::Cbh {
         return classic::info(path);
@@ -235,15 +261,13 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
 }
 
 fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
-    if view::format_of(Path::new(path)) == view::Format::Pgn {
-        return pgn_file::verify(path, pgn_file::code_page(rest)?);
+    let format = view::format_of(Path::new(path));
+    let o = opts(rest, true, format == view::Format::Pgn)?;
+    if format == view::Format::Pgn {
+        return pgn_file::verify(path, page(&o), o.limit);
     }
-    let limit = match rest {
-        [flag, n] if flag == "--limit" => Some(n.parse::<u32>()?),
-        [] => None,
-        _ => return Err(USAGE.into()),
-    };
-    if view::format_of(Path::new(path)) == view::Format::Cbh {
+    let limit = o.limit;
+    if format == view::Format::Cbh {
         return classic::verify(path, limit);
     }
     let db = Database::open(path)?;

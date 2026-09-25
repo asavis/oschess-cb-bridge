@@ -616,11 +616,21 @@ impl Database {
     /// The game's bytes as the file holds them, refused before anything is
     /// allocated when longer than `limit`.
     pub fn bytes(&self, r: &Record, limit: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.bytes_into(r, limit, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// [`Database::bytes`] into `buf`, which a caller reading many games
+    /// reuses.
+    pub fn bytes_into(&self, r: &Record, limit: usize, buf: &mut Vec<u8>) -> Result<()> {
         let len = r.len() as usize;
         if len > limit {
             return Err(Error::Format(format!("the game is {len} bytes, over the {limit}-byte limit")));
         }
-        self.text.read(r.offset(), len)
+        buf.clear();
+        buf.resize(len, 0);
+        self.text.read_into(r.offset(), buf)
     }
 
     /// The game's text as written, refused before it is read when longer

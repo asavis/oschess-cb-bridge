@@ -391,6 +391,10 @@ of the same games answers, apart from what the format has otherwise:
   `FEN` tag or the standard start, and ends at the first move that names no
   legal move, a null move among them. Games of Chess960 and of other variants
   are left out.
+- **`line`.** A row's `line` is the main line read the same way, written in
+  the bridge's SAN, so its form may differ from the text's: `O-O` for `0-0`,
+  `e8=Q` for `e8Q`. A game with a `FEN` tag other than the standard position
+  has none.
 
 ### `GET /v1/databases/{id}/games`
 

@@ -335,3 +335,55 @@ fn the_position_index_reads_main_lines() {
     assert!(body.contains(r#""games":1,"#) && body.contains(r#""moves":[]"#), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `line` members of a games window, in order: `None` for `null`.
+fn lines_of(body: &str) -> Vec<Option<String>> {
+    body.split(r#""line":"#)
+        .skip(1)
+        .map(|rest| rest.strip_prefix('"').map(|s| s[..s.find('"').unwrap()].to_string()))
+        .collect()
+}
+
+/// A PGN game's row carries its main line on request, as its text writes it
+/// and as the other formats give it (#81).
+#[test]
+fn rows_carry_the_main_line() {
+    let text = "\
+[Event \"1\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6 4. O-O Nxe4 5. d3 Nf6 6. Nbd2 *\n\n\
+[Event \"2\"]\n\n1. e4 d5 2. exd5 c6 3. dxc6 Qd7 4. cxb7 Nf6 5. bxc8=Q+ Qd8 *\n\n\
+[Event \"3\"]\n\n1. f3 e5 2. g4 Qh4# 0-1\n\n\
+[Event \"4\"]\n\n1. e4 c5 (1... c6 2. d4) 2. Nf3 *\n\n\
+[Event \"5\"]\n\n1. e4 -- 2. d4 *\n\n\
+[Event \"6\"]\n[FEN \"4k3/8/8/8/8/8/8/4K2R w K - 0 1\"]\n\n1. O-O *\n\n\
+[Event \"7\"]\n[Variant \"Chess960\"]\n\n1. e4 *\n\n\
+[Event \"8\"]\n\n1. e4 e5 2. Ke7 *\n\n\
+[Event \"9\"]\n\n1. Ke2 *\n\n\
+[Event \"10\"]\n\n*\n";
+    let f = pgn_file("lines", text.as_bytes());
+    let path = f.dir().join("db.pgn");
+    let dir = scratch("lines");
+    let (port, app) = start(std::slice::from_ref(&path), &dir);
+    let id = id_of(&path);
+    wait_ready(&app.catalog, &path);
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20&line=60"));
+    assert_eq!(status, 200, "{body}");
+    let want: [Option<&str>; 10] = [
+        Some("e4 e5 Nf3 Nc6 Bc4 Nf6 O-O Nxe4 d3 Nf6 Nbd2"),
+        Some("e4 d5 exd5 c6 dxc6 Qd7 cxb7 Nf6 bxc8=Q+ Qd8"),
+        Some("f3 e5 g4 Qh4#"),
+        // A variation is not the main line; a null move ends it.
+        Some("e4 c5 Nf3"),
+        Some("e4"),
+        // A set-up position and Chess960 have no line.
+        None,
+        None,
+        // Damage ends the line before it, and before the first move leaves none.
+        Some("e4 e5"),
+        None,
+        Some(""),
+    ];
+    assert_eq!(lines_of(&body), want.map(|w| w.map(String::from)), "{body}");
+    let (_, body) = get(port, &format!("/v1/databases/{id}/games?limit=1&line=2"));
+    assert_eq!(lines_of(&body), [Some("e4 e5".to_string())], "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

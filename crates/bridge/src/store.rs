@@ -10,6 +10,8 @@
 //! players, and its games are served as the file writes them.
 
 use cbformat::pgn::{self, Options, Rendered};
+use cbformat::pgnfile::lex::Lexer;
+use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor};
 use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
 use cbformat::view::Base;
@@ -500,6 +502,45 @@ impl Store for pgnfile::Database {
     /// preferred languages and the full form change nothing.
     fn render(&self, r: &pgnfile::Record, _: &Options) -> Result<Rendered> {
         Ok(Rendered { pgn: self.text(r, MAX_GAME_BYTES)?, annotations: pgn::AnnotationStatus::Complete })
+    }
+    /// The main line as the text writes it, played from the standard
+    /// position ([`pgnfile::line`]), and read only until the prefix is
+    /// complete.
+    fn main_line(&self, r: &pgnfile::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
+        if r.is_chess960() || r.is_other_variant() {
+            return Ok(None);
+        }
+        match self.bytes_into(r, MAX_GAME_BYTES, buf) {
+            Ok(()) => {}
+            Err(e) if failed_read(&e) => return Err(e),
+            Err(_) => return Ok(None),
+        }
+        let standard = Board::startpos().hash();
+        let (mut text, mut read, mut started, mut set_up) = (String::new(), 0u8, false, false);
+        let end = main_line(buf, &mut Lexer::new(), &mut |board, mv| {
+            if !std::mem::replace(&mut started, true) && board.hash() != standard {
+                set_up = true;
+                return false;
+            }
+            match mv.filter(|_| read < plies) {
+                Some(mv) => {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&pgn::san(board, mv));
+                    read += 1;
+                    read < plies
+                }
+                None => false,
+            }
+        });
+        Ok(match end {
+            _ if set_up => None,
+            // Damage before the first move is no line at all.
+            LineEnd::BadStart => None,
+            LineEnd::Unplayable(_) if read == 0 => None,
+            _ => Some(text),
+        })
     }
 }
 
