@@ -133,8 +133,10 @@ its own, separate from the code signing certificate. It has been in place since
 #51:
 
 - Its public half is `plugins.updater.pubkey` in
-  `crates/app/tauri.conf.json`. `cargo test -p app` fails if that value is not
-  a public key.
+  `crates/app/tauri.conf.json`. `cargo test -p app` fails if that value is
+  neither a public key nor the `PLACEHOLDER` text of the builds before #51,
+  which the test still accepts and which turns updates off; the build job
+  below catches the placeholder when the secret is set.
 - Its private half and password are the secrets `TAURI_SIGNING_PRIVATE_KEY`
   and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The build job fails when the
   secret is set but `tauri.conf.json` holds the `PLACEHOLDER` text again, and

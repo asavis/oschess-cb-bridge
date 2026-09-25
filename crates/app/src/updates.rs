@@ -137,10 +137,10 @@ mod tests {
         serde_json::json!({ "pubkey": pubkey, "endpoints": ["https://example.org/latest.json"] })
     }
 
-    /// The shipped key must be a public key, or this fails; with the
-    /// `PLACEHOLDER` text of the builds before #51, a build registers no
-    /// updater and never looks for updates. The release workflow tells the two
-    /// apart by the same prefix.
+    /// A shipped value that does not start with `PLACEHOLDER` must be a public
+    /// key, or this fails. The `PLACEHOLDER` text of the builds before #51 still
+    /// passes: with it, a build registers no updater and never looks for
+    /// updates. The release workflow tells the two apart by the same prefix.
     #[test]
     fn the_shipped_configuration_decides() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
