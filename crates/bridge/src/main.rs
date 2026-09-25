@@ -1,5 +1,5 @@
 //! `oschess-bridge`: runs the bridge in a console, as `cbtool bridge` does.
-//! The Windows application of #23 will start the same bridge
+//! The Windows application, `crates/app`, starts the same bridge
 //! ([`bridge::start`]).
 
 use std::process::ExitCode;
