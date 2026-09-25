@@ -20,6 +20,7 @@ use cbformat::view::{self, Base};
 
 mod classic;
 mod pgn_file;
+mod profile;
 
 const USAGE: &str = "usage:
   cbtool info   <db> [--code-page N]
@@ -31,6 +32,9 @@ const USAGE: &str = "usage:
                                            (dir: the ChessBase documents folder)
   cbtool bridge [--database <path>]... [--show-token] [--new-token]
                                            run the oschess bridge in this console
+  cbtool profile <db> --index <dir> [--engine <exe>]
+                                           time the bridge's flows against <db> (#83):
+                                           timings and counts only
 
 <db> is a 2CBH (.2cbh) or classic (.cbh) database. info and verify also read a
 PGN file (.pgn), as the bridge serves it; --code-page N reads its text that is
@@ -48,6 +52,7 @@ fn main() -> ExitCode {
         Some("verify") if args.len() >= 2 => verify(&args[1], &args[2..]),
         Some("pgn") if args.len() >= 2 => pgn(&args[1], &args[2..]),
         Some("databases") if args.len() == 2 => databases::databases(&args[1]),
+        Some("profile") => profile::run(&args[1..]),
         Some("bridge") => {
             bridge::start::console("cbtool bridge", args[1..].iter().cloned()).map(|()| true).map_err(Into::into)
         }
