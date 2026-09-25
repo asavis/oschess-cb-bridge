@@ -107,6 +107,13 @@ impl Registry {
         }
     }
 
+    /// Whether a header index build runs or waits (#61): a restart would
+    /// lose it.
+    pub fn building(&self) -> bool {
+        let builds: Vec<Arc<Mutex<Build>>> = lock(&self.builds).values().map(Arc::clone).collect();
+        builds.iter().any(|b| matches!(*lock(b), Build::Working(_)))
+    }
+
     /// Sets how long a header index outlives its database's place on the list.
     pub fn set_sweep_grace(&self, grace: Duration) {
         *lock(&self.grace) = grace;
