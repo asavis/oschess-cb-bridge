@@ -375,7 +375,11 @@ fn the_engine_follows_bridge_toml() {
     std::fs::create_dir_all(&dir).unwrap();
     let toml = dir.join("bridge.toml");
     let write = |text: &str| {
-        std::fs::write(&toml, text).unwrap();
+        // Replaced whole, as the settings window saves it: the engine's watcher
+        // must never read a half-written file, which an empty one would be.
+        let part = dir.join("bridge.toml.part");
+        std::fs::write(&part, text).unwrap();
+        std::fs::rename(&part, &toml).unwrap();
         // The signature includes the modification time; let it move on coarse clocks.
         std::thread::sleep(Duration::from_millis(20));
     };
