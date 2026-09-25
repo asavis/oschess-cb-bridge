@@ -9,11 +9,12 @@
 //! own `.cbg` record. A PGN file holds games only, with annotators apart from
 //! players, and its games are served as the file writes them.
 
+use cbformat::game::{Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
 use cbformat::pgn::{self, Options, Rendered};
 use cbformat::pgnfile::lex::Lexer;
 use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor};
-use cbformat::v2::{self, Date, Eco, GameResult, Player, RecordKind, Start, Tournament};
+use cbformat::v2;
 use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 use chesscore::{Board, Move};

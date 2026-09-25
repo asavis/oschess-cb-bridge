@@ -2,8 +2,8 @@
 
 use super::{Options, Rendered, Tags, finish, write_tree};
 use crate::cbh::{self, Database, GameMoves, Record};
+use crate::game::{GameAnnotations, Player, RecordKind, Start};
 use crate::replay::start_board;
-use crate::v2::{GameAnnotations, Player, RecordKind, Start};
 use crate::view::PositionOrder;
 use crate::{Error, Result};
 

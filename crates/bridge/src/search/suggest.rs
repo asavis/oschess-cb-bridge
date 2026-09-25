@@ -4,7 +4,7 @@ use std::cmp::Ordering as Order;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cbformat::v2::RecordKind;
+use cbformat::game::RecordKind;
 
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
 use super::names::{BitSet, Groups, Kind, NO_GROUP, NameTable, groups};

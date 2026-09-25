@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::v2::Date;
+use crate::game::Date;
 use crate::{Error, Result};
 
 mod local;

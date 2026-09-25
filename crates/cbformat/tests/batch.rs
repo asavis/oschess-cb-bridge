@@ -1,8 +1,9 @@
 //! Batched reads return exactly what single reads return.
 
 use cbformat::fixture::{Builder, TempDb, quiet};
+use cbformat::game::MAX_BATCH_RECORDS;
 use cbformat::movetable::{self, Color, Piece};
-use cbformat::v2::{Database, MAX_BATCH_RECORDS, Token};
+use cbformat::v2::{Database, Token};
 
 /// `games` games of 0 to 6 plies of 1.e4 e5 2.Nf3 Nc6 3.Bb5 a6, their move
 /// records back to back except game `moved`'s, which is appended at the end.

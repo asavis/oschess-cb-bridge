@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 
 use cbformat::Error;
+use cbformat::game::{Eco, ROUND_TEXT_BYTES, RecordKind, round_text};
 use cbformat::pgn;
-use cbformat::v2::{Eco, ROUND_TEXT_BYTES, RecordKind, round_text};
 
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;

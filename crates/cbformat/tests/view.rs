@@ -3,10 +3,10 @@
 
 use cbformat::fixture::{self, TempDb, quiet, text};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
+use cbformat::game::{RecordKind, Start, language};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, Options};
 use cbformat::replay::TreeVisitor;
-use cbformat::v2::{RecordKind, Start, language};
 use cbformat::view::{Base, Format, Header, PositionOrder, format_of};
 use chesscore::{Board, Move};
 

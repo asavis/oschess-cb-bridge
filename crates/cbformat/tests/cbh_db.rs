@@ -2,7 +2,7 @@
 
 use cbformat::cbh::Database;
 use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
-use cbformat::v2::{GameResult, RecordKind};
+use cbformat::game::{GameResult, RecordKind};
 use chesscore::Board;
 
 use Tok::{End as E, Mv as M};

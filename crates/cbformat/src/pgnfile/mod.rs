@@ -39,8 +39,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::codepage::CodePage;
-use crate::v2::file::DbFile;
-use crate::v2::{Date, Eco, GameResult, MAX_BATCH_RECORDS, Player, Tournament};
+use crate::file::DbFile;
+use crate::game::{Date, Eco, GameResult, MAX_BATCH_RECORDS, Player, Tournament};
 use crate::{Error, Result};
 
 use lex::Lexer;

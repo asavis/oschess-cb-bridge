@@ -18,9 +18,10 @@ use bridge::explorer::format::Stats;
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
 use cbformat::codepage::CodePage;
+use cbformat::game::RecordKind;
 use cbformat::pgnfile;
 use cbformat::replay::{self, start_board};
-use cbformat::v2::{Database, RecordKind};
+use cbformat::v2::Database;
 use cbformat::view::Base;
 
 fn build(db: &Base, dir: &Path, id: &str) -> (Loaded, f64) {

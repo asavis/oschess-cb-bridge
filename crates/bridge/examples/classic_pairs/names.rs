@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use cbformat::cbh::Entity;
-use cbformat::v2::{Player, RecordKind};
+use cbformat::game::{Player, RecordKind};
 use cbformat::view::{Base, Header};
 
 /// The name fields of a game, by index.
@@ -213,8 +213,10 @@ impl Names {
                 names.kinds += 1;
                 continue;
             };
-            let title = |t: &Option<cbformat::v2::Tournament>| t.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-            let place = |t: &Option<cbformat::v2::Tournament>| t.as_ref().map(|t| t.place.clone()).unwrap_or_default();
+            let title =
+                |t: &Option<cbformat::game::Tournament>| t.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+            let place =
+                |t: &Option<cbformat::game::Tournament>| t.as_ref().map(|t| t.place.clone()).unwrap_or_default();
             let mut diffs = [NameDiff::Equal; 5];
             diffs[WHITE] = player(na.white.as_ref(), st.white, nb.white.as_ref());
             diffs[BLACK] = player(na.black.as_ref(), st.black, nb.black.as_ref());

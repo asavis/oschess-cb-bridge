@@ -1,10 +1,11 @@
 //! Move records built by hand, following the format description, and read back.
 
 use cbformat::fixture::{bytes, quiet, sq};
+use cbformat::game::{Setup, Start};
 use cbformat::movetable::{self, Captured, Color, MoveWord, Piece};
 use cbformat::pgn::movetext_of;
 use cbformat::replay::{start_board, walk_tree};
-use cbformat::v2::{GameMoves, Setup, Start};
+use cbformat::v2::GameMoves;
 use chesscore::{CastleSide, Color as CColor, Move as CMove, Square};
 
 use Color::{Black as B, White as W};

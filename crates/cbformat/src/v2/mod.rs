@@ -15,25 +15,22 @@ use crate::{Error, Result};
 mod annotations;
 mod bytes;
 mod entities;
-pub(crate) mod file;
 mod frame;
 mod moves;
 mod record;
 mod window;
 
-pub(crate) use annotations::decode_text as annotations_text;
-pub use annotations::{
-    ANNOTATION_TAG, Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Quotation, QuotedPlayer, Square, Unknown,
-    language, timing,
-};
+pub use annotations::ANNOTATION_TAG;
 use bytes::{le_i16, le_i64};
-pub use entities::{Entities, GAME_TAG, PLAYER, Player, SOURCE, TEAM, TOURNAMENT, Tournament};
-use file::DbFile;
+pub use entities::{Entities, GAME_TAG, PLAYER, SOURCE, TEAM, TOURNAMENT};
 pub use frame::checksum;
 use frame::{FRAME_HEADER, MAX_FRAME_PART, frame_sizes, parse_frame};
-pub use moves::{GameMoves, Setup, Start, Token};
-pub use record::{Date, Eco, GameResult, ROUND_TEXT_BYTES, Record, RecordKind, round_text};
+pub use moves::{GameMoves, Token};
+pub use record::Record;
 pub use window::MoveWindow;
+
+use crate::file::{self, DbFile};
+use crate::game::{GameAnnotations, MAX_BATCH_RECORDS};
 
 pub const HEADER_RECORD_SIZE: usize = 192;
 
@@ -46,9 +43,6 @@ pub const BESIDE: [&str; 3] = [".ini", ".cko", ".cpo"];
 /// Largest span of `.2cbg` read for one batch; a batch whose moves lie wider
 /// apart reads each move record on its own.
 const MAX_BATCH_SPAN: u64 = 256 << 20;
-/// Most records read by one [`Database::records`] or [`Database::batch`]:
-/// 12 MiB of headers.
-pub const MAX_BATCH_RECORDS: u32 = 1 << 16;
 
 /// An open 2CBH database: game headers, moves, annotations and entities.
 pub struct Database {

@@ -11,10 +11,11 @@ use std::time::Instant;
 
 mod databases;
 
+use cbformat::game::{RecordKind, Start};
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::pgn::{AnnotationStatus, Options};
 use cbformat::replay::walk_tree;
-use cbformat::v2::{Batch, Database, RecordKind, Start, Token};
+use cbformat::v2::{Batch, Database, Token};
 use cbformat::view::{self, Base};
 
 mod classic;
@@ -391,7 +392,7 @@ fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
     Ok(ok)
 }
 
-/// The id of every game, from headers read [`cbformat::v2::MAX_BATCH_RECORDS`]
+/// The id of every game, from headers read [`cbformat::game::MAX_BATCH_RECORDS`]
 /// at a time. A failed read fails the export: a database damaged or truncated
 /// under it must not give a silently incomplete one.
 fn game_ids(db: &Base) -> cbformat::Result<Vec<u32>> {

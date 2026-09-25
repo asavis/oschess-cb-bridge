@@ -1,8 +1,8 @@
 //! `.2lid`: players, tournaments, sources, teams and game tags.
 
 use super::bytes::{be_i32, be_i64, le_i32};
-use super::file::DbFile;
-use super::record::Date;
+use crate::file::DbFile;
+use crate::game::{Date, Player, Tournament};
 use crate::{Error, Result};
 
 /// Largest container size accepted; the real ones are at most 1,120 bytes.
@@ -26,25 +26,6 @@ pub struct Entities {
     types: Vec<(usize, i64, i64)>,
     container_offset: Vec<usize>,
     block_size: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Player {
-    pub last: String,
-    pub first: String,
-}
-
-impl Player {
-    pub fn pgn(&self) -> String {
-        if self.first.is_empty() { self.last.clone() } else { format!("{}, {}", self.last, self.first) }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tournament {
-    pub title: String,
-    pub place: String,
-    pub start: Date,
 }
 
 impl Entities {

@@ -5,9 +5,10 @@
 
 use cbformat::fixture::{Builder, TempDb, annotations, arrows, quiet, squares, symbols, text};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
+use cbformat::game::{Date, Quotation, language};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, AnnotationStatus, Options};
-use cbformat::v2::{Database, Date, Quotation, language};
+use cbformat::v2::Database;
 use chesscore::Board;
 
 use Color::{Black as B, White as W};

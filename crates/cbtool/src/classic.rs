@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use cbformat::cbh::{self, Batch, Database};
+use cbformat::game::{RecordKind, Start};
 use cbformat::replay::TreeVisitor;
-use cbformat::v2::{RecordKind, Start};
 use chesscore::{Board, Move, Piece};
 
 use super::{AnyResult, RUN, Stats, report, run_ids, run_workers, threads};

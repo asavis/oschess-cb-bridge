@@ -13,9 +13,9 @@ use super::Options;
 use super::commands;
 use super::san::{file_char, rank_char};
 use super::tree::{At, Notes};
+use crate::game::timing::{self, Score};
+use crate::game::{Annotation, GAME_POSITION, GameAnnotations, language};
 use crate::movetable::Sq;
-use crate::v2::timing::{self, Score};
-use crate::v2::{Annotation, GAME_POSITION, GameAnnotations, language};
 use crate::view::PositionOrder;
 
 /// The annotations of one game, grouped by position, with the one language

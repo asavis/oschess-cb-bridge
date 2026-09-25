@@ -1,9 +1,10 @@
 //! Annotations placed by PGN-order position, with texts, symbols and graphics.
 
 use cbformat::fixture::{Builder, TempDb, annotations, arrows, quiet, squares, symbols, text};
+use cbformat::game::language;
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, AnnotationStatus, Options};
-use cbformat::v2::{Database, language};
+use cbformat::v2::Database;
 
 use Color::{Black as B, White as W};
 use Piece::{Bishop, Knight, Pawn};

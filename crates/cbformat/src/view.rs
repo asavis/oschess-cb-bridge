@@ -11,9 +11,10 @@
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
+use crate::game::{Date, Eco, GameAnnotations, GameResult, Player, RecordKind, Start, Tournament};
 use crate::pgn::{self, Options, Rendered};
 use crate::replay::{self, TreeStats, TreeVisitor};
-use crate::v2::{self, Date, Eco, GameAnnotations, GameResult, Player, RecordKind, Start, Tournament};
+use crate::v2;
 use crate::{Error, Result, cbh, pgnfile};
 
 /// The format of a database.
@@ -84,7 +85,7 @@ impl Base {
             return vec![db.path().to_path_buf()];
         }
         let extensions = v2::EXTENSIONS.iter().chain(&v2::BESIDE).chain(&cbh::EXTENSIONS).chain(&cbh::BESIDE);
-        let mut paths = crate::v2::file::with_extensions(self.stem(), extensions);
+        let mut paths = crate::file::with_extensions(self.stem(), extensions);
         paths.sort();
         paths.dedup();
         paths
@@ -127,7 +128,7 @@ impl Base {
     }
 
     /// Headers `first..=last`, clamped to the database and to
-    /// [`v2::MAX_BATCH_RECORDS`] records, in one read.
+    /// [`crate::game::MAX_BATCH_RECORDS`] records, in one read.
     pub fn headers(&self, first: u32, last: u32) -> Result<Vec<Header>> {
         Ok(match self {
             Base::TwoCbh(db) => db.records(first, last)?.into_iter().map(Header::TwoCbh).collect(),
@@ -206,7 +207,7 @@ impl Base {
             Base::Cbh(db) => Batch::Cbh(db, db.batch(first, last)?),
             Base::Pgn(db) => {
                 let first = first.max(1);
-                let last = last.min(db.record_count()).min(first.saturating_add(v2::MAX_BATCH_RECORDS - 1));
+                let last = last.min(db.record_count()).min(first.saturating_add(crate::game::MAX_BATCH_RECORDS - 1));
                 Batch::Pgn(db, first..=last)
             }
         })

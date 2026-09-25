@@ -3,7 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use cbformat::v2::Eco;
+use cbformat::game::Eco;
 
 use super::SearchError;
 use super::memory::{Held, Hold, Refused};

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use cbformat::codepage::CodePage;
 use cbformat::fixture::{TempDb, pgn_file};
+use cbformat::game::{Eco, GameResult};
 use cbformat::pgnfile::{self, Database, RECORD_SIZE};
-use cbformat::v2::{Eco, GameResult};
 
 const GAMES: &str = "\u{feff}[Event \"Paris\"]\r\n[Site \"Paris FRA\"]\r\n[Date \"1858.??.??\"]\r\n[Round \"5.2\"]\r\n\
 [White \"Morphy, Paul\"]\r\n[Black \"Duke Karl / Count Isouard\"]\r\n[Result \"1-0\"]\r\n[ECO \"C41\"]\r\n\

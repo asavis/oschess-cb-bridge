@@ -3,8 +3,8 @@
 
 use cbformat::cbh::{Database, annotations};
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
+use cbformat::game::{Annotation, Arrow, Square, language};
 use cbformat::pgn::{self, AnnotationStatus, Options};
-use cbformat::v2::{Annotation, Arrow, Square, language};
 use chesscore::Board;
 
 use Tok::{End as E, Mv as M, Var as V};

@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use crate::v2::file::DbFile;
+use crate::file::DbFile;
 use crate::{Error, Result};
 
 const HEADER: u64 = 32;
