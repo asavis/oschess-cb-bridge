@@ -438,7 +438,9 @@ mod tests {
             format!("{building}.idx"),
             format!("{building}.idx.partial"),
             "notes.txt".into(),
-            "0123456789ABCDEF.idx".into(),
+            // Upper case, and no test id in any case: on a file system that
+            // ignores case, as Windows's does, it must not name another file.
+            "ABCDEF0123456789.idx".into(),
             "short.idx".into(),
         ] {
             touch(&name);
@@ -460,7 +462,7 @@ mod tests {
             format!("{building}.build"),
             format!("{building}.idx"),
             format!("{building}.idx.partial"),
-            "0123456789ABCDEF.idx".into(),
+            "ABCDEF0123456789.idx".into(),
             "notes.txt".into(),
             "short.idx".into(),
         ];
