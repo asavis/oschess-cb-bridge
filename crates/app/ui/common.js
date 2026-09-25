@@ -44,15 +44,16 @@ function bytes(n) {
   return gb >= 1 ? t('size.gb', { n: number(gb, 1) }) : t('size.mb', { n: number(Math.max(n / 2 ** 20, 0.1), 1) });
 }
 
-// A download's whole percent, never 100 before the last byte.
+// A download's or a PGN file's read whole percent, never 100 before the last byte.
 function percent(progress) {
   if (progress.present >= progress.total) return 100;
   return Math.min(99, Math.floor((progress.present * 100) / progress.total));
 }
 
-// The bar of a download, or nothing when it has no progress yet.
+// The bar of a download or of a PGN file being read, or nothing when it has
+// no progress yet.
 function progressBar(db) {
-  if (db.state !== 'downloading' || !db.progress) return null;
+  if ((db.state !== 'downloading' && db.state !== 'opening') || !db.progress) return null;
   const fill = el('i');
   fill.style.width = `${percent(db.progress)}%`;
   return el('div', 'bar', fill);
@@ -129,11 +130,11 @@ function stateChip(db) {
     case 'cloudOnly': return chip('cloudOnly', 'cloud', t('db.chip.cloudOnly'));
     case 'downloading':
       return chip('downloading', 'cloudDown', db.progress ? t('db.percent', { n: percent(db.progress) }) : t('db.chip.downloading'));
-    case 'opening': return chip('neutral', 'spin', t('db.chip.opening'));
+    case 'opening':
+      return chip('neutral', 'spin', db.progress ? t('db.percent', { n: percent(db.progress) }) : t('db.chip.opening'));
     case 'missing': return chip('neutral', 'alert', t('db.chip.missing'));
     case 'unreadable': return chip('bad', 'alert', t('db.chip.unreadable'));
-    case 'unsupported':
-      return db.format === 'pgn' ? chip('neutral', 'file', t('db.chip.pgn')) : chip('neutral', 'file', t('db.chip.unsupported'));
+    case 'unsupported': return chip('neutral', 'file', t('db.chip.unsupported'));
     default: return chip('neutral', null, db.state);
   }
 }
@@ -147,10 +148,13 @@ function stateLine(db) {
       return db.progress
         ? t('db.sub.downloadingOf', { present: bytes(db.progress.present), total: bytes(db.progress.total) })
         : t('db.sub.downloading');
-    case 'opening': return t('db.sub.opening');
+    case 'opening':
+      return db.progress
+        ? t('db.sub.openingOf', { present: bytes(db.progress.present), total: bytes(db.progress.total) })
+        : t('db.sub.opening');
     case 'missing': return t('db.sub.missing');
     case 'unreadable': return t('db.sub.unreadable');
-    case 'unsupported': return db.format === 'pgn' ? t('db.sub.pgn') : t('db.sub.unsupported');
+    case 'unsupported': return t('db.sub.unsupported');
     default: return '';
   }
 }

@@ -105,6 +105,8 @@ pub fn updated(dir: &Path, running: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge::catalog::State;
+
     use crate::status::DatabaseView;
 
     /// A public key as `tauri signer generate` prints it, made here from an
@@ -225,7 +227,7 @@ mod tests {
 
     #[test]
     fn a_view_is_idle_unless_busy() {
-        let view = |states: &[&str]| View {
+        let view = |states: &[State]| View {
             version: "0.1.0".into(),
             port: 39581,
             problem: None,
@@ -235,7 +237,7 @@ mod tests {
                     id: "0".into(),
                     name: "Base".into(),
                     format: "2cbh".into(),
-                    state: s.to_string(),
+                    state: *s,
                     records: None,
                     size: None,
                     progress: None,
@@ -245,8 +247,9 @@ mod tests {
             busy: false,
         };
         // The states themselves no longer decide: the bridge's work does.
-        assert!(idle(&view(&["ready", "missing", "cloudOnly", "unreadable", "unsupported"]), false));
-        assert!(!idle(&View { busy: true, ..view(&["ready"]) }, false));
+        let all = [State::Ready, State::Missing, State::CloudOnly, State::Unreadable, State::Unsupported];
+        assert!(idle(&view(&all), false));
+        assert!(!idle(&View { busy: true, ..view(&[State::Ready]) }, false));
     }
 
     #[test]
