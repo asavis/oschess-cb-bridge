@@ -106,7 +106,7 @@ function engineRow(name, detail, path, chosen, version) {
   radio.type = 'radio';
   radio.name = 'engine';
   radio.checked = path === chosen;
-  radio.addEventListener('change', () => chooseEngine(() => call('choose_engine', { path })));
+  radio.addEventListener('change', () => chooseEngine(path));
   const text = el('div', 'text', el('div', null, name), el('div', 'cap12 path', detail));
   text.lastChild.title = detail;
   // A build the bridge installed carries its licence beside it.
@@ -126,13 +126,15 @@ function engineRow(name, detail, path, chosen, version) {
 // dictionary key of its message; the list is read again.
 let choosing = false;
 
-function chooseEngine(start) {
+function chooseEngine(path) {
   if (choosing) return;
   choosing = true;
   enginesBusy(true);
-  notice(t('settings.engine.checking'));
-  start()
-    .then((view) => view && renderEngines(view), (message) => {
+  // #73: starting an engine can take seconds; the section says so until it answers.
+  const line = document.getElementById('engine-checking');
+  line.hidden = false;
+  call('choose_engine', { path })
+    .then(renderEngines, (message) => {
       notice(t(String(message)));
       return call('engines').then(renderEngines);
     })
@@ -140,7 +142,14 @@ function chooseEngine(start) {
     .finally(() => {
       choosing = false;
       enginesBusy(false);
+      line.hidden = true;
     });
+}
+
+// The file dialog first; the engine is checked only once one is chosen.
+function pickEngine() {
+  if (choosing) return;
+  act(call('pick_engine').then((path) => path && chooseEngine(path)));
 }
 
 function enginesBusy(busy) {
@@ -182,9 +191,10 @@ function toggle(id, onNow) {
 }
 
 function wire() {
+  document.getElementById('engine-checking').prepend(icon('spin', 14, 2.4));
   document.getElementById('add-folder').addEventListener('click', () =>
     act(call('add_folder').then((settings) => settings && renderSettings(settings))));
-  document.getElementById('pick-engine').addEventListener('click', () => chooseEngine(() => call('pick_engine')));
+  document.getElementById('pick-engine').addEventListener('click', pickEngine);
   document.getElementById('install-stockfish').addEventListener('click', installStockfish);
   document.getElementById('offer-update').addEventListener('click', installStockfish);
   document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
