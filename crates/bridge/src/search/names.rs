@@ -322,6 +322,7 @@ impl NameTable {
         let mut partial = path.as_os_str().to_owned();
         partial.push(".partial");
         let partial = PathBuf::from(partial);
+        let _writing = super::heads::Writing::new(partial.clone());
         let mut out = BufWriter::with_capacity(1 << 20, File::create(&partial)?);
         out.write_all(&[0u8; FILE_HEADER])?;
         let (mut crc, mut body_len) = (!0u32, 0u64);
@@ -381,20 +382,24 @@ impl NameTable {
             || u32_at(12) != kind_code(kind)
             || u64_at(16) != generation
             || u64_at(24) != count as u64
-            || size != FILE_HEADER as u64 + u64_at(48)
+            || (FILE_HEADER as u64).checked_add(u64_at(48)) != Some(size)
         {
             return None;
         }
-        let (per, chunks, body_crc) = (usize::try_from(u64_at(32)).ok()?, u32_at(40) as usize, u32_at(44));
-        if per == 0 && count > 0 || chunks > count.max(1) {
+        let (per, chunks, body_crc, body_len) =
+            (usize::try_from(u64_at(32)).ok()?, u32_at(40) as usize, u32_at(44), u64_at(48));
+        // The layout `chunk` looks names up in: chunk `i` holds the ids from
+        // `i * per`, `per` of them but for the last, and every chunk takes at
+        // least its 32-byte head of the body.
+        let needed = if count == 0 { 1 } else { count.div_ceil(per.max(1)) };
+        if per == 0 && count > 0 || chunks < needed || (chunks as u64).checked_mul(32).is_none_or(|b| b > body_len) {
             return None;
         }
-        let hold = match Hold::reserve(size as usize) {
-            Ok(h) => h,
-            Err(e) => return Some(Err(e.into())),
-        };
+        // An optional file that cannot be held is a miss: the database's own
+        // read decides whether the table fits.
+        let chunk_bytes = chunks.checked_mul(std::mem::size_of::<Chunk>())?;
+        let hold = Hold::reserve(usize::try_from(size).ok()?.checked_add(chunk_bytes)?).ok()?;
         let (mut crc, mut consumed) = (!0u32, 0u64);
-        let body_len = u64_at(48);
         let mut take = |r: &mut BufReader<File>, n: usize| -> Option<Vec<u8>> {
             consumed = consumed.checked_add(n as u64).filter(|&c| c <= body_len)?;
             let mut v = Vec::new();
@@ -404,17 +409,18 @@ impl NameTable {
             crc = super::heads::crc32_update(crc, &v);
             Some(v)
         };
-        let mut out = Vec::with_capacity(chunks);
+        let mut out: Vec<Chunk> = Vec::new();
+        out.try_reserve_exact(chunks).ok()?;
         let mut seen = 0usize;
         for i in 0..chunks {
             let head = take(&mut r, 32)?;
             let field = |at: usize| usize::try_from(u64::from_le_bytes(head[at..at + 8].try_into().unwrap())).ok();
             let (first, n, names_len, lower_len) = (field(0)?, field(8)?, field(16)?, field(24)?);
-            if first != i * per
+            if Some(first) != i.checked_mul(per.max(1)).map(|f| f.min(count))
                 || first != seen
-                || n > count - seen
-                || names_len > size as usize
-                || lower_len > size as usize
+                || n != per.max(1).min(count - seen)
+                || names_len as u64 > body_len
+                || lower_len as u64 > body_len
             {
                 return None;
             }
@@ -560,6 +566,94 @@ impl BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chunk as a names file holds it: first, count, names, lower, ends,
+    /// lower ends, given.
+    type RawChunk<'a> = (u64, u64, &'a str, &'a str, &'a [u32], &'a [u32], &'a [u32]);
+
+    /// A names file of players at generation 7 as given, with correct CRCs.
+    fn raw_file(
+        name: &str,
+        count: u64,
+        per: u64,
+        chunk_count: u32,
+        chunks: &[RawChunk<'_>],
+        body_len: Option<u64>,
+    ) -> PathBuf {
+        let mut body = Vec::new();
+        for (first, n, names, lower, ends, lower_ends, given) in chunks {
+            for v in [*first, *n, names.len() as u64, lower.len() as u64] {
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+            body.extend_from_slice(names.as_bytes());
+            body.extend_from_slice(lower.as_bytes());
+            for list in [ends, lower_ends, given] {
+                body.extend(list.iter().flat_map(|v| v.to_le_bytes()));
+            }
+        }
+        let mut h = [0u8; FILE_HEADER];
+        h[0..8].copy_from_slice(&FILE_MAGIC);
+        h[8..12].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        h[12..16].copy_from_slice(&kind_code(Kind::Players).to_le_bytes());
+        h[16..24].copy_from_slice(&7u64.to_le_bytes());
+        h[24..32].copy_from_slice(&count.to_le_bytes());
+        h[32..40].copy_from_slice(&per.to_le_bytes());
+        h[40..44].copy_from_slice(&chunk_count.to_le_bytes());
+        h[44..48].copy_from_slice(&super::super::heads::crc32(&body).to_le_bytes());
+        h[48..56].copy_from_slice(&body_len.unwrap_or(body.len() as u64).to_le_bytes());
+        let crc = super::super::heads::crc32(&h[..60]);
+        h[60..64].copy_from_slice(&crc.to_le_bytes());
+        let dir = std::env::temp_dir().join(format!("bridge-names-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0123456789abcdef.players");
+        std::fs::write(&path, [&h[..], &body].concat()).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_names_file_whose_chunks_do_not_cover_their_ids_is_never_used() {
+        // Two names in one chunk, where one per chunk is declared: a lookup of
+        // id 1 would find no chunk.
+        let path = raw_file("layout", 2, 1, 1, &[(0, 2, "ab", "ab", &[1, 2], &[1, 2], &[0, 0])], None);
+        assert!(NameTable::open_file(&path, Kind::Players, 7, 2).is_none());
+        // The same names laid out as declared are read.
+        let path = raw_file(
+            "layout-ok",
+            2,
+            1,
+            2,
+            &[(0, 1, "a", "a", &[1], &[1], &[0]), (1, 1, "b", "b", &[1], &[1], &[0])],
+            None,
+        );
+        let table = NameTable::open_file(&path, Kind::Players, 7, 2).unwrap().unwrap();
+        assert_eq!((table.name(0), table.name(1)), ("a", "b"));
+    }
+
+    #[test]
+    fn a_names_file_claiming_more_chunks_than_its_body_holds_allocates_nothing() {
+        let path = raw_file("chunks", 4_000_000, 1, 4_000_000, &[], None);
+        assert!(NameTable::open_file(&path, Kind::Players, 7, 4_000_000).is_none());
+    }
+
+    #[test]
+    fn a_names_file_body_length_past_any_size_is_a_miss() {
+        let path = raw_file("overflow", 1, 1, 1, &[], Some(u64::MAX));
+        assert!(NameTable::open_file(&path, Kind::Players, 7, 1).is_none());
+    }
+
+    #[test]
+    fn a_names_file_the_budget_cannot_hold_is_a_miss_not_an_error() {
+        let path = raw_file("budget", 1, 1, 1, &[(0, 1, "a", "a", &[1], &[1], &[0])], None);
+        // Sparse: past the budget, with a header that still names its length.
+        let size = super::super::memory::budget() as u64 + 1;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[48..56].copy_from_slice(&(size - FILE_HEADER as u64).to_le_bytes());
+        let crc = super::super::heads::crc32(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(size).unwrap();
+        assert!(NameTable::open_file(&path, Kind::Players, 7, 1).is_none());
+    }
 
     fn table(names: &[&str]) -> NameTable {
         let mut c = Chunk {

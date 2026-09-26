@@ -237,6 +237,33 @@ fn partial_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Partial files being written now, which the sweep leaves alone: a names
+/// file's writer is no build the registry tracks (#108).
+static WRITING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Marks `path` as being written until the guard drops.
+pub struct Writing(PathBuf);
+
+impl Writing {
+    pub fn new(path: PathBuf) -> Writing {
+        WRITING.lock().unwrap_or_else(|e| e.into_inner()).push(path.clone());
+        Writing(path)
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = writing.iter().position(|p| *p == self.0) {
+            writing.swap_remove(i);
+        }
+    }
+}
+
+fn being_written(path: &Path) -> bool {
+    WRITING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == path)
+}
+
 /// What the heads sweep keeps and removes: the heads file and the names
 /// files beside it (#108).
 const KEPT: [&str; 4] = [".heads", ".players", ".tournaments", ".annotators"];
@@ -357,7 +384,9 @@ impl Registry {
                 continue;
             }
             if name.ends_with(".partial") {
-                let _ = std::fs::remove_file(entry.path());
+                if !being_written(&entry.path()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             } else if !listed.contains(id) {
                 let since = *unlisted.entry(id.to_string()).or_insert(now);
                 if now.duration_since(since) < grace || std::fs::remove_file(entry.path()).is_err() {
@@ -448,6 +477,23 @@ mod tests {
             assert_eq!(crc32(&bytes[..len]), crate::explorer::format::crc32(&bytes[..len]), "{len}");
         }
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn the_sweep_leaves_a_partial_file_being_written() {
+        let dir = std::env::temp_dir().join(format!("bridge-heads-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("0123456789abcdef.players.partial");
+        std::fs::write(&partial, b"x").unwrap();
+        let listed: std::collections::HashSet<String> = ["0123456789abcdef".to_string()].into();
+        let registry = Registry::default();
+        let writing = Writing::new(partial.clone());
+        registry.sweep(&dir, &listed, Duration::from_secs(3600));
+        assert!(partial.exists(), "a partial file being written stays");
+        drop(writing);
+        registry.sweep(&dir, &listed, Duration::from_secs(3600));
+        assert!(!partial.exists(), "a partial file left by no writer goes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
