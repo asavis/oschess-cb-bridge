@@ -4,7 +4,7 @@
 //! suggestions. Their memory is reserved in the search budget as it grows.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -274,6 +274,38 @@ const FILE_HEADER: usize = 64;
 
 /// The buffer a names file is read through.
 const FILE_READ_BUFFER: usize = 1 << 20;
+/// The buffer a names file is written through.
+const FILE_WRITE_BUFFER: usize = 1 << 16;
+
+/// A names file being written: its buffer, and the CRC and length of the
+/// body so far. Text longer than the buffer goes to the file as it is.
+struct Out {
+    file: File,
+    buf: Vec<u8>,
+    crc: u32,
+    body_len: u64,
+}
+
+impl Out {
+    fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.crc = super::heads::crc32_update(self.crc, bytes);
+        self.body_len += bytes.len() as u64;
+        if self.buf.len() + bytes.len() > self.buf.capacity() {
+            self.flush()?;
+        }
+        if bytes.len() > self.buf.capacity() {
+            return self.file.write_all(bytes);
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.write_all(&self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
+}
 
 /// A names file's body as it is read: its CRC so far, and how much of its
 /// declared length is used. Every allocation here is fallible and no larger
@@ -368,26 +400,33 @@ impl NameTable {
         partial.push(".partial");
         let partial = PathBuf::from(partial);
         let _writing = super::heads::Writing::new(partial.clone());
-        let mut out = BufWriter::with_capacity(1 << 20, File::create(&partial)?);
-        out.write_all(&[0u8; FILE_HEADER])?;
-        let (mut crc, mut body_len) = (!0u32, 0u64);
-        let mut put = |out: &mut BufWriter<File>, bytes: &[u8]| -> std::io::Result<()> {
-            crc = super::heads::crc32_update(crc, bytes);
-            body_len += bytes.len() as u64;
-            out.write_all(bytes)
-        };
+        // The one buffer the write takes, reserved in the budget and
+        // allocated fallibly: an optional background write that does not fit
+        // is skipped, never the process.
+        let refused = || std::io::Error::other("the search budget holds no names writer now");
+        let _hold = Hold::reserve(FILE_WRITE_BUFFER).map_err(|_| refused())?;
+        let mut out = Out { file: File::create(&partial)?, buf: Vec::new(), crc: !0, body_len: 0 };
+        out.buf.try_reserve_exact(FILE_WRITE_BUFFER).map_err(|_| refused())?;
+        out.file.write_all(&[0u8; FILE_HEADER])?;
         for c in &self.chunks {
             for v in [c.first as u64, c.name_ends.len() as u64, c.names.len() as u64, c.lower.len() as u64] {
-                put(&mut out, &v.to_le_bytes())?;
+                out.put(&v.to_le_bytes())?;
             }
-            put(&mut out, c.names.as_bytes())?;
-            put(&mut out, c.lower.as_bytes())?;
+            out.put(c.names.as_bytes())?;
+            out.put(c.lower.as_bytes())?;
             for list in [&c.name_ends, &c.lower_ends, &c.given] {
-                let bytes: Vec<u8> = list.iter().flat_map(|v| v.to_le_bytes()).collect();
-                put(&mut out, &bytes)?;
+                // Encoded a piece at a time, on the stack.
+                for part in list.chunks(1024) {
+                    let mut piece = [0u8; 4096];
+                    for (i, v) in part.iter().enumerate() {
+                        piece[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    out.put(&piece[..part.len() * 4])?;
+                }
             }
         }
-        let mut file = out.into_inner().map_err(|e| e.into_error())?;
+        out.flush()?;
+        let (mut file, crc, body_len) = (out.file, out.crc, out.body_len);
         let mut h = [0u8; FILE_HEADER];
         h[0..8].copy_from_slice(&FILE_MAGIC);
         h[8..12].copy_from_slice(&FILE_VERSION.to_le_bytes());
@@ -718,6 +757,25 @@ mod tests {
         // bookkeeping.
         let reserved = size + std::mem::size_of::<Chunk>() + FILE_READ_BUFFER;
         assert!(peak <= reserved + 4096, "{peak} bytes at the peak against {reserved} reserved");
+    }
+
+    #[test]
+    fn writing_a_names_file_takes_only_its_own_buffer() {
+        let n = 1_300_000;
+        let names = vec![""; n];
+        let big = table(&names);
+        drop(names);
+        let dir = std::env::temp_dir().join(format!("bridge-names-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0123456789abcdef.players");
+        let start = LIVE.with(Cell::get);
+        PEAK.with(|peak| peak.set(start));
+        big.write_file(&path, Kind::Players, 7).unwrap();
+        let peak = PEAK.with(Cell::get) - start;
+        assert!(peak <= FILE_WRITE_BUFFER + 4096, "{peak} bytes at the peak against a {FILE_WRITE_BUFFER}-byte buffer");
+        let back = NameTable::open_file(&path, Kind::Players, 7, n).unwrap().unwrap();
+        assert_eq!(back.len(), n);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
