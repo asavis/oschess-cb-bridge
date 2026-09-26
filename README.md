@@ -103,6 +103,7 @@ target/release/cbtool pgn    "path/to/Database.2cbh" --lang de,en --out games.pg
 target/release/cbtool databases "path/to/Documents/ChessBase"   # the databases ChessBase lists
 target/release/oschess-bridge --database "path/to/Database.2cbh" --show-token
 target/release/cbtool bridge --database "path/to/Database.2cbh"   # the same bridge
+target/release/cbtool profile "path/to/Database.2cbh" --index "path/to/scratch"   # timings
 ```
 
 `cbtool info`, `verify` and `pgn` also take a classic database
@@ -120,6 +121,33 @@ once it has read it ([docs/api.md](docs/api.md#pgn-files)). `cargo run
 database with its PGN export field by field and move by move, and `cargo run
 --release -p bridge --example pgn_index_pairs -- <db.2cbh> <export.pgn> <dir>`
 compares their position indexes; both print counts only.
+
+`cbtool profile` times the bridge's flows against one database (#83). It
+serves the database from a bridge in a child process, on a free port, and asks
+it over HTTP as oschess does:
+
+- the first answers after the start;
+- the first sort by each key, then cached;
+- windows of 500 rows at the start, middle and end of the list, with and
+  without `line=60`;
+- player suggestions for one to three letters, then searches by player,
+  colour, event and date, cold and cached;
+- one game as PGN, the first one and the most annotated of the first 50,000,
+  in both forms;
+- the position index's build in the `--index` folder, which must be new or
+  empty so that the build is measured, a lookup per move along the most played
+  line and opening it again in a new bridge;
+- when `--engine <exe>` names a UCI engine, a 5-second search: the time to its
+  first line, and the lines a second;
+- a small answer over a kept and over a new connection.
+
+It prints only timings and counts, and for a failed answer its status and the
+bridge's error code; never a name, game, query or path, so its output can go
+into an issue as it is. The child bridge's own messages are discarded. A failed
+answer is left out of the times, and any failure makes the command exit with
+status 1. Run it on the computer the bridge serves,
+against the database's own folder: on Windows from a WSL mount the file
+reads, not the bridge, set the times.
 
 `oschess-bridge` listens on `127.0.0.1:39581` and keeps `bridge.toml` and its
 pairing token in its data folder (`%APPDATA%\oschess-bridge` on Windows).
