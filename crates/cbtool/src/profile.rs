@@ -398,9 +398,13 @@ fn find_move(board: &Board, uci: &str) -> Option<chesscore::Move> {
     board.legal_moves().into_iter().find(|&m| bridge::explorer::uci(board, m) == uci)
 }
 
-/// Whether `dir` is missing or empty, so that the index is built in it.
+/// Whether `dir` is missing or empty, so that the index is built in it; a
+/// folder that cannot be listed may hold an index and is neither.
 fn fresh(dir: &Path) -> bool {
-    std::fs::read_dir(dir).map_or(true, |mut entries| entries.next().is_none())
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
@@ -474,17 +478,21 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     for (i, prefix) in ["m", "mo", "mor"].iter().enumerate() {
         let path = format!("{base}/suggest?field=player&prefix={prefix}");
         let mut first = Samples::default();
-        let body = first.get(&mut c, &path, true);
+        let mut body = first.get(&mut c, &path, true);
         if i == 0 {
             player = body.as_ref().and_then(|b| strings(b, "value").into_iter().next());
             table.row("suggest", "player, first ever", &mut first, "");
         }
-        let mut s = Samples::default();
+        // A longer prefix's first answer is not timed apart, but its failure
+        // counts with the cached ones.
+        let failures = if i == 0 { Vec::new() } else { first.failures };
+        let mut s = Samples { times: Vec::new(), failures };
         for _ in 0..RUNS {
-            s.get(&mut c, &path, true);
+            let answer = s.get(&mut c, &path, true);
+            body = body.or(answer);
         }
-        let names = body.map_or(0, |b| strings(&b, "value").len());
-        table.row("suggest", &format!("player, {} letters", prefix.len()), &mut s, &format!("{names} names"));
+        let names = body.map_or(String::new(), |b| format!("{} names", strings(&b, "value").len()));
+        table.row("suggest", &format!("player, {} letters", prefix.len()), &mut s, &names);
     }
     let mut events = Samples::default();
     let event = events
@@ -738,6 +746,17 @@ mod tests {
         assert!(fresh(&dir));
         std::fs::write(dir.join("x.idx"), b"x").unwrap();
         assert!(!fresh(&dir));
+        // A folder that can be entered but not listed may hold an index; as
+        // root it can still be listed, and the case does not arise.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+            if std::fs::read_dir(&dir).is_err() {
+                assert!(!fresh(&dir));
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
