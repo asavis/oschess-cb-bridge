@@ -4,7 +4,7 @@
 //! suggestions. Their memory is reserved in the search budget as it grows.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -272,8 +272,6 @@ const FILE_MAGIC: [u8; 8] = *b"OSCBNAM\0";
 const FILE_VERSION: u32 = 1;
 const FILE_HEADER: usize = 64;
 
-/// The buffer a names file is read through.
-const FILE_READ_BUFFER: usize = 1 << 20;
 /// The buffer a names file is written through.
 const FILE_WRITE_BUFFER: usize = 1 << 16;
 
@@ -312,7 +310,10 @@ impl Out {
 /// than what it decodes, so a file that the budget holds never asks for
 /// more than the budget reserved.
 struct Body {
-    r: BufReader<File>,
+    /// Read without a buffer of its own: the text in one read each, the
+    /// offsets 4 KiB at a time, so reading takes nothing the budget did not
+    /// reserve.
+    r: File,
     crc: u32,
     consumed: u64,
     len: u64,
@@ -453,7 +454,7 @@ impl NameTable {
     pub fn open_file(path: &Path, kind: Kind, generation: u64, count: usize) -> Option<Result<NameTable, SearchError>> {
         let file = File::open(path).ok()?;
         let size = file.metadata().ok()?.len();
-        let mut r = BufReader::with_capacity(FILE_READ_BUFFER, file);
+        let mut r = file;
         let mut h = [0u8; FILE_HEADER];
         r.read_exact(&mut h).ok()?;
         let (u32_at, u64_at) = (
@@ -483,9 +484,8 @@ impl NameTable {
         // read decides whether the table fits.
         let chunk_bytes = chunks.checked_mul(std::mem::size_of::<Chunk>())?;
         // The table holds as many bytes as the file, decoded in place; the
-        // chunks and the read buffer come on top.
-        let workspace = chunk_bytes.checked_add(FILE_READ_BUFFER)?;
-        let hold = Hold::reserve(usize::try_from(size).ok()?.checked_add(workspace)?).ok()?;
+        // chunks come on top.
+        let hold = Hold::reserve(usize::try_from(size).ok()?.checked_add(chunk_bytes)?).ok()?;
         let mut body = Body { r, crc: !0, consumed: 0, len: body_len };
         let mut out: Vec<Chunk> = Vec::new();
         out.try_reserve_exact(chunks).ok()?;
@@ -755,7 +755,7 @@ mod tests {
         let peak = PEAK.with(Cell::get) - start;
         // What `open_file` reserves, and a page for the file API's own
         // bookkeeping.
-        let reserved = size + std::mem::size_of::<Chunk>() + FILE_READ_BUFFER;
+        let reserved = size + std::mem::size_of::<Chunk>();
         assert!(peak <= reserved + 4096, "{peak} bytes at the peak against {reserved} reserved");
     }
 
