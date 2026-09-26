@@ -14,6 +14,7 @@ use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::v2::Database;
+use cbformat::view::Base;
 use chesscore::Board;
 
 const CHILD: &str = "BRIDGE_SMALL_BUDGET_CHILD";
@@ -110,6 +111,7 @@ fn rendered_games_are_budgeted_and_evicted() {
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
     let dir = std::env::temp_dir().join(format!("bridge-small-budget-cache-{}", std::process::id()));
     let loaded = explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap();
+    let d = Base::TwoCbh(d);
     let cache = rendered::cache();
     let board = Board::startpos();
     let before = held();

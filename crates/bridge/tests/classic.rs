@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
-use bridge::api::{App, MAX_GAME_BYTES};
+use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::server;
+use bridge::store::MAX_GAME_BYTES;
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
 use chesscore::Board;
 

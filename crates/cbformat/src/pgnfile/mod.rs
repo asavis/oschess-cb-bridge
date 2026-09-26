@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use crate::codepage::CodePage;
 use crate::file::DbFile;
-use crate::game::{Date, Eco, GameResult, MAX_BATCH_RECORDS, Player, Tournament};
+use crate::game::{Date, Eco, GameResult, Head, MAX_BATCH_RECORDS, Player, RecordKind, Tournament};
 use crate::{Error, Result};
 
 use lex::Lexer;
@@ -88,6 +88,57 @@ fn le_u32(b: &[u8], at: usize) -> u32 {
 
 fn le_u64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("eight bytes"))
+}
+
+/// A PGN file holds games only, none deleted.
+impl Head for Record {
+    fn id(&self) -> u32 {
+        Record::id(self)
+    }
+    fn kind(&self) -> RecordKind {
+        RecordKind::Game
+    }
+    fn is_deleted(&self) -> bool {
+        false
+    }
+    fn white(&self) -> i64 {
+        Record::white(self)
+    }
+    fn black(&self) -> i64 {
+        Record::black(self)
+    }
+    fn tournament(&self) -> i64 {
+        Record::tournament(self)
+    }
+    fn annotator(&self) -> i64 {
+        Record::annotator(self)
+    }
+    fn other(&self) -> Option<(i64, i64)> {
+        None
+    }
+    fn result(&self) -> GameResult {
+        Record::result(self)
+    }
+    fn eco(&self) -> Eco {
+        Record::eco(self)
+    }
+    fn played_date(&self) -> Date {
+        Record::played_date(self)
+    }
+    fn round(&self) -> (i32, i32) {
+        let (round, sub) = Record::round(self);
+        (i32::from(round), i32::from(sub))
+    }
+    fn elo(&self) -> (i32, i32) {
+        let (white, black) = Record::elo(self);
+        (i32::from(white), i32::from(black))
+    }
+    fn move_count(&self) -> i32 {
+        i32::from(Record::move_count(self))
+    }
+    fn bytes(&self) -> &[u8] {
+        Record::bytes(self)
+    }
 }
 
 impl Record {

@@ -16,18 +16,13 @@ use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
 use crate::search::query::Sort;
 use crate::search::{self, SearchError, Selection, SuggestField};
-use crate::store::{Head, Store, with_store};
+use crate::store::{Head, MAX_GAME_BYTES, Store, with_store};
 
 pub const API_VERSION: i64 = 1;
 pub const MAX_LIMIT: u32 = 500;
 const DEFAULT_LIMIT: u32 = 200;
 /// Reads of one game before a database that keeps changing is reported.
 const GAME_ATTEMPTS: usize = 3;
-/// The largest move or annotation record, content or spare area, served as
-/// PGN. The largest record of any kind in a Mega Database is about 1.2 MB, a
-/// guiding text; a record near the reader's 64 MiB limit would take gigabytes
-/// to render.
-pub const MAX_GAME_BYTES: usize = 2 << 20;
 /// The largest game answer: its PGN written as JSON. Real games stay far
 /// below; names or comments of control characters can grow sixfold in JSON.
 pub const MAX_GAME_RESPONSE: usize = 8 << 20;
@@ -286,7 +281,7 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
         Some(s) if valid_stream(s) => Some(s),
         Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
     };
-    let (selection, sort) = match search::select(&*open.db, &open.indexes, req.param("q"), stream, sort_param) {
+    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
         Ok(found) => found,
         Err(e) => return search_error(entry, open.generation, e),
     };
@@ -366,7 +361,7 @@ fn suggest(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
-    let list = match search::suggest(&*open.db, &open.indexes, field, prefix, limit) {
+    let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
         Ok(list) => list,
         Err(e) => return search_error(entry, open.generation, e),
     };

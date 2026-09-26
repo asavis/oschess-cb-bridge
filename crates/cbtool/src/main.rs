@@ -11,11 +11,11 @@ use std::time::Instant;
 
 mod databases;
 
-use cbformat::game::{RecordKind, Start};
+use cbformat::game::{Head, RecordKind, Start};
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::pgn::{AnnotationStatus, Options};
 use cbformat::replay::walk_tree;
-use cbformat::v2::{Batch, Database, Token};
+use cbformat::v2::{Batch, Token};
 use cbformat::view::{self, Base};
 
 mod classic;
@@ -102,15 +102,19 @@ fn info(path: &str, rest: &[String]) -> AnyResult<bool> {
     if format == view::Format::Pgn {
         return pgn_file::info(path, page(&o));
     }
-    if format == view::Format::Cbh {
-        return classic::info(path);
-    }
-    let db = Database::open(path)?;
+    let db = Base::open(path)?;
     println!("records        {}", db.record_count());
-    println!("format version {}", db.format_version());
-    let e = db.entities();
-    for (i, name) in ["players", "tournaments", "sources", "type 3", "teams", "game tags"].iter().enumerate() {
-        println!("{name:<14} {}", e.count(i));
+    // Each format has entity tables of its own.
+    match &db {
+        Base::TwoCbh(db) => {
+            println!("format version {}", db.format_version());
+            let e = db.entities();
+            for (i, name) in ["players", "tournaments", "sources", "type 3", "teams", "game tags"].iter().enumerate() {
+                println!("{name:<14} {}", e.count(i));
+            }
+        }
+        Base::Cbh(db) => classic::info(db),
+        Base::Pgn(_) => {}
     }
     Ok(true)
 }
@@ -267,12 +271,8 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
     if format == view::Format::Pgn {
         return pgn_file::verify(path, page(&o), o.limit);
     }
-    let limit = o.limit;
-    if format == view::Format::Cbh {
-        return classic::verify(path, limit);
-    }
-    let db = Database::open(path)?;
-    let n = limit.map_or(db.record_count(), |l| l.min(db.record_count()));
+    let db = Base::open(path)?;
+    let n = o.limit.map_or(db.record_count(), |l| l.min(db.record_count()));
     let failures: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
     let started = Instant::now();
     // Workers claim runs of ids from a shared counter and fold their own
@@ -288,7 +288,12 @@ fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
                 // are read one by one and report their own errors.
                 let Ok(batch) = db.batch(*ids.start(), *ids.end()).or_else(|_| db.batch(1, 0)) else { continue };
                 for id in ids {
-                    verify_record(&batch, id, &mut s, &failures);
+                    // The same statistics, each format counting its moves its own way.
+                    match &batch {
+                        view::Batch::TwoCbh(_, batch) => verify_record(batch, id, &mut s, &failures),
+                        view::Batch::Cbh(_, batch) => classic::verify_record(batch, id, &mut s, &failures),
+                        view::Batch::Pgn(..) => {}
+                    }
                 }
             }
             total.lock().unwrap_or_else(|e| e.into_inner()).add(&s);

@@ -533,7 +533,7 @@ fn a_second_instance_leaves_the_token_alone() {
 fn a_game_too_large_to_render_is_refused() {
     let mut b = Builder::new();
     let mut words = vec![MOVES];
-    words.extend(std::iter::repeat_n(cbformat::movetable::NULL_MOVE, bridge::api::MAX_GAME_BYTES / 2 + 1));
+    words.extend(std::iter::repeat_n(cbformat::movetable::NULL_MOVE, bridge::store::MAX_GAME_BYTES / 2 + 1));
     words.push(END_OF_LINE);
     let huge = b.moves(1, &words);
     b.game(huge);
@@ -698,7 +698,7 @@ fn an_unknown_annotation_layout_is_reported() {
 
 #[test]
 fn an_oversized_annotation_record_is_refused() {
-    let long = "x".repeat(bridge::api::MAX_GAME_BYTES);
+    let long = "x".repeat(bridge::store::MAX_GAME_BYTES);
     let db = annotated_database("api-huge-annotation", &annotations(&[(0, vec![text(false, 0, &long)])]));
     let r = start(&db, vec![], None);
     let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");

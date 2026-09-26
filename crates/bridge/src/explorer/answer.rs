@@ -4,13 +4,14 @@
 use chesscore::{Board, Move, Piece};
 
 use cbformat::pgn::san;
+use cbformat::view::Base;
 
 use crate::api::{App, clip};
 use crate::catalog::Entry;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
-use crate::store::{Any, Head, Store, with_store};
+use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
 use super::format::{Counts, MAX_PLY, Stats, TOP_GAMES, unpack_move};
@@ -86,8 +87,7 @@ fn counts(o: Obj, c: &Counts) -> Obj {
 
 /// The answer for `board`: its counts, its moves most played first, and its
 /// notable games, best rated first.
-pub fn render<'a>(db: impl Into<Any<'a>>, board: &Board, stats: Option<Stats>, loaded: &Loaded) -> String {
-    let db = db.into();
+pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -> String {
     let stats = stats.unwrap_or_default();
     let moves = stats.moves.iter().filter_map(|(code, c)| {
         let mv = unpack_move(board, *code).filter(|&mv| board.is_legal(mv))?;

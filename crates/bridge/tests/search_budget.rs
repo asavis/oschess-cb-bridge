@@ -10,7 +10,7 @@ use bridge::search::workers::{taken, threads};
 use bridge::search::{self, BATCH_BYTES, Indexes, SearchError, Selection, SuggestField, Suggestion};
 use cbformat::fixture::{Builder, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
-use cbformat::v2::Database;
+use cbformat::view::Base;
 
 /// The budget is one per process: its checks run one after another.
 #[test]
@@ -31,7 +31,7 @@ fn retained_orders_are_evicted_and_a_full_budget_answers_busy() {
     let f = b.write("budget-evict");
     let file = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.2cbh")).unwrap();
     file.set_len((RECORDS + 1) * 192).unwrap();
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::shared();
     let order = |idx: &Arc<Indexes>, sort: &str| match search::select(&db, idx, None, None, Sort::parse(sort)) {
         Ok((Selection::Numbers(v), _)) => Ok(v.len()),
@@ -99,7 +99,7 @@ fn suggestion_copies_hold_their_bytes() {
     }
     b.lid(lid);
     let f = b.write("budget-suggest");
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::shared();
     // The first call builds the names, groups and counts, which stay.
     drop(search::suggest(&db, &idx, SuggestField::Player, "mor", 20).ok().unwrap());
@@ -127,7 +127,7 @@ fn concurrent_searches_share_the_workers_and_the_budget() {
     let f = b.write("budget-concurrent");
     let file = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.2cbh")).unwrap();
     file.set_len((RECORDS + 1) * 192).unwrap();
-    let db = Database::open(f.dir().join("db.2cbh")).unwrap();
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     // Not registered for eviction, so that the accounting below is exact.
     let idx = Indexes::default();
     // The first search loads the names; after it, only scans need memory.

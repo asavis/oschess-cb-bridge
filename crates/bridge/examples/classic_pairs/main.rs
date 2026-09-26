@@ -47,7 +47,7 @@ use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::format::MAX_PLY;
 use bridge::search::query::{self, Field, SortKey};
 use bridge::server;
-use cbformat::game::RecordKind;
+use cbformat::game::{Head, RecordKind};
 use cbformat::replay::TreeVisitor;
 use cbformat::view::Base;
 use chesscore::{Board, Move};

@@ -7,6 +7,7 @@
 mod annotations;
 mod entities;
 mod fields;
+mod head;
 mod start;
 
 pub(crate) use annotations::decode_text as annotations_text;
@@ -16,6 +17,7 @@ pub use annotations::{
 };
 pub use entities::{Player, Tournament};
 pub use fields::{Date, Eco, GameResult, ROUND_TEXT_BYTES, RecordKind, round_text};
+pub use head::Head;
 pub use start::{Setup, Start};
 
 /// Most records one read returns, in either format and in a PGN file's

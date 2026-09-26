@@ -25,12 +25,14 @@ pub enum Format {
 }
 
 impl Format {
+    /// A listed path's format, as `cbformat` tells it by the extension; any
+    /// other file is `Other`, and never a stem to guess from.
     pub fn of(path: &Path) -> Format {
-        match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-            Some("2cbh") => Format::TwoCbh,
-            Some("cbh") => Format::Cbh,
-            Some("pgn") => Format::Pgn,
-            _ => Format::Other,
+        match cbformat::view::Format::of_extension(path) {
+            Some(cbformat::view::Format::TwoCbh) => Format::TwoCbh,
+            Some(cbformat::view::Format::Cbh) => Format::Cbh,
+            Some(cbformat::view::Format::Pgn) => Format::Pgn,
+            None => Format::Other,
         }
     }
 
@@ -299,12 +301,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The files of a classic database whose content the bridge serves, the
-/// header file first: headers, moves and texts, annotations, the four entity
-/// files, and the 64-bit offsets ChessBase adds for files over 4 GiB. The
-/// search boosters and other optional files are neither read nor downloaded.
-const CBH_FILES: [&str; 8] = [".cbh", ".cbg", ".cba", ".cbp", ".cbt", ".cbc", ".cbs", ".cbj"];
-
 /// The metadata of the database at `path`, of `format`: its generation and
 /// files. Metadata only, following links: nothing is opened. A PGN database
 /// is its one file.
@@ -313,7 +309,9 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let mut hash = Hash::new();
     let mut files = Files { generation: None, present: Vec::new(), irregular: false };
     let extensions: &[&str] = match format {
-        Format::Cbh => &CBH_FILES,
+        // The files the classic reader opens: the search boosters and other
+        // optional files are neither read nor downloaded.
+        Format::Cbh => &cbformat::cbh::READ,
         Format::Pgn => &[""],
         _ => &cbformat::v2::EXTENSIONS,
     };

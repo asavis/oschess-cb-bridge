@@ -1,10 +1,10 @@
 //! `.cbh` records: the 46-byte headers of games and guiding texts.
 //!
 //! Integers are big-endian. Field encodings shared with 2CBH (result, ECO,
-//! date) decode to the `v2` types, so both formats read the same way.
+//! date) decode to the [`crate::game`] types, so both formats read the same way.
 
 use super::bytes::{be_u16, be_u24, be_u32};
-use crate::game::{Date, Eco, GameResult, RecordKind};
+use crate::game::{Date, Eco, GameResult, Head, RecordKind};
 
 /// Size of a `.cbh` record, and of the file header before the first one.
 pub const RECORD_SIZE: usize = 46;
@@ -101,6 +101,61 @@ impl Record {
     /// Number of moves in the main line, capped at 255.
     pub fn move_count(&self) -> u8 {
         self.b[0x2d]
+    }
+}
+
+/// The classic format's one mapping to the shared fields (#66). A guiding
+/// text's title is in its `.cbg` record: its key is the text's number. The
+/// format has no analyses.
+impl Head for Record {
+    fn id(&self) -> u32 {
+        Record::id(self)
+    }
+    fn kind(&self) -> RecordKind {
+        Record::kind(self)
+    }
+    fn is_deleted(&self) -> bool {
+        Record::is_deleted(self)
+    }
+    fn white(&self) -> i64 {
+        i64::from(Record::white(self))
+    }
+    fn black(&self) -> i64 {
+        i64::from(Record::black(self))
+    }
+    fn tournament(&self) -> i64 {
+        i64::from(Record::tournament(self))
+    }
+    fn annotator(&self) -> i64 {
+        i64::from(Record::annotator(self))
+    }
+    fn other(&self) -> Option<(i64, i64)> {
+        match Record::kind(self) {
+            RecordKind::Game => None,
+            RecordKind::Text => Some((i64::from(self.id()), i64::from(Record::annotator(self)))),
+            _ => Some((-1, -1)),
+        }
+    }
+    fn result(&self) -> GameResult {
+        Record::result(self)
+    }
+    fn eco(&self) -> Eco {
+        Record::eco(self)
+    }
+    fn played_date(&self) -> Date {
+        Record::played_date(self)
+    }
+    fn round(&self) -> (i32, i32) {
+        (i32::from(Record::round(self)), i32::from(self.subround()))
+    }
+    fn elo(&self) -> (i32, i32) {
+        (i32::from(self.white_elo()), i32::from(self.black_elo()))
+    }
+    fn move_count(&self) -> i32 {
+        i32::from(Record::move_count(self))
+    }
+    fn bytes(&self) -> &[u8] {
+        Record::bytes(self)
     }
 }
 

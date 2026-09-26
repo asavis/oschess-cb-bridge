@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use cbformat::cbh::Entity;
-use cbformat::game::{Player, RecordKind};
+use cbformat::game::{Head, Player, RecordKind};
 use cbformat::view::{Base, Header};
 
 /// The name fields of a game, by index.

@@ -90,8 +90,8 @@ fn searchable(name: &str) -> bool {
 /// does, for people), with their game counts: most games first, then by name.
 /// Only the best `limit` are kept while the names are looked through, and the
 /// copies returned hold their bytes in the budget.
-pub fn suggest<'a>(
-    db: impl Into<crate::store::Any<'a>>,
+pub fn suggest(
+    db: &cbformat::view::Base,
     idx: &Indexes,
     field: SuggestField,
     prefix: &str,
