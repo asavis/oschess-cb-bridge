@@ -297,6 +297,7 @@ mod tests {
                 format: "2cbh",
                 state: State::Ready,
                 records: Some(7),
+                generation: Some(1),
                 size: None,
                 progress: None,
                 listed: true,

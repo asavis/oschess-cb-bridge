@@ -261,6 +261,8 @@ struct FakeCloud {
     fetches: AtomicUsize,
     running: AtomicUsize,
     most_at_once: AtomicUsize,
+    /// The files whose marks were looked at, one each time.
+    looks: AtomicUsize,
 }
 
 impl FakeCloud {
@@ -282,6 +284,7 @@ impl FakeCloud {
 
 impl Cloud for FakeCloud {
     fn is_cloud_only(&self, path: &Path, _: &Metadata) -> bool {
+        self.looks.fetch_add(1, Ordering::SeqCst);
         self.cloud.lock().unwrap().contains(path)
     }
 
@@ -803,15 +806,18 @@ fn cloud_states_over_http() {
 
 /// The snapshot a user interface polls shows a cloud database as the list
 /// does, without reading it: cloud-only, downloading once its games were
-/// asked for, then ready.
+/// asked for, then ready. The list's row and the snapshot are one view (#67),
+/// made from one look at the database's files.
 #[test]
 fn the_snapshot_shows_cloud_states() {
-    use bridge::snapshot::Background;
+    use bridge::snapshot::{Background, Database};
     use bridge::start::Bridge;
 
     let root = Root::new("snapshot");
     let db = database_at(&root.path("bases"), "Remote");
-    let cloud = Arc::new(FakeCloud::with_files(files_of(&db), false));
+    let files = files_of(&db);
+    let size = size_of(&files);
+    let cloud = Arc::new(FakeCloud::with_files(files.clone(), false));
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
     let app = Arc::new(App {
@@ -824,18 +830,48 @@ fn the_snapshot_shows_cloud_states() {
     let bridge =
         Bridge { listeners, app: app.clone(), port, token: TOKEN.into(), link: String::new(), first_run: false };
     let background = Background::serve(bridge).unwrap();
-    let snapshot_states = || background.snapshot().databases.iter().map(|d| d.state).collect::<Vec<_>>();
-    assert_eq!(snapshot_states(), [State::CloudOnly]);
+    // The database in one snapshot, which looks at each of its files once, and
+    // the list's row for it, which says the same.
+    let snapshot = || {
+        let before = cloud.looks.load(Ordering::SeqCst);
+        let database = background.snapshot().databases[0].clone();
+        assert_eq!(cloud.looks.load(Ordering::SeqCst) - before, files.len(), "{:?}", database.state);
+        let (_, body) = get(port, "/v1/databases");
+        assert!(body.contains(&row(&database)), "{} in {body}", row(&database));
+        database
+    };
+    let fields = |d: &Database| (d.state, d.records, d.size, d.progress);
+    assert_eq!(fields(&snapshot()), (State::CloudOnly, None, Some(size), None));
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0);
 
     cloud.hold(true);
     let entry = app.catalog.get(&id_of(&db)).unwrap();
     assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
-    assert_eq!(snapshot_states(), [State::Downloading]);
+    assert_eq!(fields(&snapshot()), (State::Downloading, None, Some(size), Some((0, size))));
     cloud.hold(false);
     wait_for(&entry, State::Ready);
-    assert_eq!(snapshot_states(), [State::Ready]);
-    assert_eq!(background.snapshot().databases[0].name, "Remote");
+    let ready = snapshot();
+    assert_eq!(fields(&ready), (State::Ready, Some(1), None, None));
+    assert_eq!((ready.name.as_str(), ready.generation), ("Remote", entry.generation()));
+}
+
+/// A database's row in `GET /v1/databases` from its state on, as the contract
+/// writes it.
+fn row(d: &bridge::snapshot::Database) -> String {
+    let mut row = format!("\"state\":\"{}\"", d.state.name());
+    if let Some(records) = d.records {
+        row += &format!(",\"records\":{records}");
+    }
+    if let Some(generation) = d.generation {
+        row += &format!(",\"generation\":\"{generation:016x}\"");
+    }
+    if let Some(size) = d.size {
+        row += &format!(",\"size\":{size}");
+    }
+    if let Some((present, total)) = d.progress {
+        row += &format!(",\"progress\":{{\"present\":{present},\"total\":{total}}}");
+    }
+    row + "}"
 }
 
 /// The binary finds the window list through `OSCHESS_BRIDGE_DOCUMENTS`.

@@ -167,13 +167,24 @@ impl Entry {
     /// A database with any file marked cloud-only is never opened, since
     /// reading that file would download it: see [`Entry::open_to_read`].
     pub fn open(&self) -> Result<Opened, State> {
+        self.open_sized().0
+    }
+
+    /// [`Entry::open`], and the bytes of the database's files from the same
+    /// look at their metadata: `None` when the files were not looked at, for
+    /// a database that left the list or is of another format (#67).
+    pub fn open_sized(&self) -> (Result<Opened, State>, Option<u64>) {
         if self.removed.load(Ordering::Relaxed) {
-            return Err(State::Missing);
+            return (Err(State::Missing), None);
         }
         if self.format == Format::Other {
-            return Err(if self.path.exists() { State::Unsupported } else { State::Missing });
+            return (Err(if self.path.exists() { State::Unsupported } else { State::Missing }), None);
         }
         let files = self.files();
+        (self.open_files(&files), Some(files.size()))
+    }
+
+    fn open_files(&self, files: &Files) -> Result<Opened, State> {
         let generation = files.generation.ok_or(State::Missing)?;
         if files.irregular {
             return Err(State::Unreadable);

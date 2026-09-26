@@ -16,6 +16,7 @@ use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
 use crate::search::query::Sort;
 use crate::search::{self, SearchError, Selection, SuggestField};
+use crate::snapshot::Database;
 use crate::store::{Head, MAX_GAME_BYTES, Store, with_store};
 
 pub const API_VERSION: i64 = 1;
@@ -113,7 +114,7 @@ fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Respon
 
 fn status(app: &App) -> Response {
     let entries = app.catalog.entries();
-    let states: Vec<State> = entries.iter().map(|e| e.state()).collect();
+    let states: Vec<State> = entries.iter().map(|e| Database::of(e).state).collect();
     let count = |s: State| states.iter().filter(|&&x| x == s).count() as i64;
     let dbs = Obj::new()
         .num("ready", count(State::Ready))
@@ -204,31 +205,26 @@ fn progress(present: u64, total: u64) -> String {
 
 fn databases(app: &App) -> Response {
     let entries = app.catalog.entries();
-    let items = entries.iter().map(|e| {
-        let o = Obj::new().str("id", &e.id).str("name", &e.name).str("format", e.format.name());
-        match e.open() {
-            Ok(open) => o
-                .str("state", State::Ready.name())
-                .num("records", open.db.record_count())
-                .str("generation", &format!("{:016x}", open.generation))
-                .done(),
-            Err(state) => {
-                let o = o.str("state", state.name());
-                match (state, e.progress()) {
-                    (State::Downloading, Some(p)) => {
-                        o.num("size", p.total as i64).raw("progress", &progress(p.present(), p.total)).done()
-                    }
-                    (State::Opening, _) => match e.opening() {
-                        Some(p) => o.raw("progress", &progress(p.present(), p.total)).done(),
-                        None => o.done(),
-                    },
-                    (State::CloudOnly | State::Downloading, _) => o.num("size", e.size() as i64).done(),
-                    _ => o.done(),
-                }
-            }
-        }
-    });
+    let items = entries.iter().map(|e| database(&Database::of(e)));
     ok(Obj::new().raw("databases", &json::array(items)).done())
+}
+
+/// A database of `GET /v1/databases`, as the tray app shows it too.
+fn database(d: &Database) -> String {
+    let mut o = Obj::new().str("id", &d.id).str("name", &d.name).str("format", d.format).str("state", d.state.name());
+    if let Some(records) = d.records {
+        o = o.num("records", records);
+    }
+    if let Some(generation) = d.generation {
+        o = o.str("generation", &format!("{generation:016x}"));
+    }
+    if let Some(size) = d.size {
+        o = o.num("size", size as i64);
+    }
+    if let Some((present, total)) = d.progress {
+        o = o.raw("progress", &progress(present, total));
+    }
+    o.done()
 }
 
 fn unavailable(state: State) -> Response {
