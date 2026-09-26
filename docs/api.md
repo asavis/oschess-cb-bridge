@@ -810,7 +810,7 @@ engine is ready:
 An analysis with the same `threads` and `hash` then sends neither and only
 searches. While an analysis runs, the engine is left to it and the answer is
 `{"engine":"busy"}`. A warm-up counts as use: the ten minutes start again from
-it. Bad `threads` or `hash` are `400 bad_parameter`, as for `analyze`; without
+it. Bad `threads` or `hash` are `400 bad_request`, as for `analyze`; without
 an engine the answer is `409 no_engine`, and an engine that cannot be started
 or is not ready is `502 engine_failed`. A client ignores the answer: an older
 bridge without this route answers `404`.
