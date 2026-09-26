@@ -6,7 +6,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use crate::search::SearchError;
 use crate::search::memory::{Cancel, Hold, Refused};
 use crate::search::workers::{self, threads};
 
+use super::file::read_at;
 use super::format::Outcome;
 use super::source::{Line, Source, Workspace};
 
@@ -36,6 +37,16 @@ pub const MAX_GAME: u32 = (1 << 30) - 1;
 pub const FAN_IN: usize = 256;
 /// The read buffer of each run in a merge.
 pub const RUN_BUFFER: usize = 64 << 10;
+/// The top bits of a key that name its part.
+const PART_BITS: u32 = 4;
+/// Ranges of keys the final merge takes apart, on the workers. Keys are
+/// hashes, so equal ranges of their values hold about as many positions.
+pub const PARTS: usize = 1 << PART_BITS;
+
+/// The part of the keys `key` lies in.
+pub fn part_of(key: u64) -> usize {
+    (key >> (64 - PART_BITS)) as usize
+}
 
 impl Entry {
     pub fn new(key: u64, game: u32, outcome: Outcome, mv: u16, ply: u8, elo: u16) -> Entry {
@@ -83,6 +94,17 @@ impl Entry {
 pub struct Run {
     pub path: PathBuf,
     pub entries: u64,
+    /// Where each part's entries start in the run, and where the run ends.
+    pub parts: [u64; PARTS + 1],
+}
+
+/// Where each part starts among entries of `counts[part]` each, in order.
+fn starts(counts: &[u64; PARTS]) -> [u64; PARTS + 1] {
+    let mut at = [0; PARTS + 1];
+    for k in 0..PARTS {
+        at[k + 1] = at[k] + counts[k];
+    }
+    at
 }
 
 /// How far a build has come: records read, then entries merged.
@@ -244,7 +266,7 @@ pub fn write_runs(
 }
 
 /// Sorts `buf` by key and game and writes it as a run.
-fn flush(buf: &mut Vec<Entry>, dir: &Path, worker: usize, runs: &mut Vec<Run>) -> Result<(), SearchError> {
+pub(super) fn flush(buf: &mut Vec<Entry>, dir: &Path, worker: usize, runs: &mut Vec<Run>) -> Result<(), SearchError> {
     if buf.is_empty() {
         return Ok(());
     }
@@ -255,48 +277,107 @@ fn flush(buf: &mut Vec<Entry>, dir: &Path, worker: usize, runs: &mut Vec<Run>) -
         out.write_all(&e.to_bytes()).map_err(|e| io(&path, e))?;
     }
     out.flush().map_err(|e| io(&path, e))?;
-    runs.push(Run { path, entries: buf.len() as u64 });
+    let mut counts = [0u64; PARTS];
+    for e in buf.iter() {
+        counts[part_of(e.key)] += 1;
+    }
+    runs.push(Run { path, entries: buf.len() as u64, parts: starts(&counts) });
     buf.clear();
     Ok(())
 }
 
-/// A run read in order.
-pub struct RunReader {
-    input: BufReader<File>,
-    path: PathBuf,
-    left: u64,
+/// The files of `runs`, each opened once and checked against its length, for
+/// their readers to share.
+pub fn open(runs: &[Run]) -> Result<Vec<File>, SearchError> {
+    runs.iter()
+        .map(|run| {
+            let file = File::open(&run.path).map_err(|e| io(&run.path, e))?;
+            let len = file.metadata().map_err(|e| io(&run.path, e))?.len();
+            if len != run.entries * ENTRY_BYTES as u64 {
+                return Err(io(&run.path, std::io::Error::other("a run has the wrong length")));
+            }
+            Ok(file)
+        })
+        .collect()
 }
 
-impl RunReader {
-    pub fn open(run: &Run) -> Result<RunReader, SearchError> {
-        let file = File::open(&run.path).map_err(|e| io(&run.path, e))?;
-        let len = file.metadata().map_err(|e| io(&run.path, e))?.len();
-        if len != run.entries * ENTRY_BYTES as u64 {
-            return Err(io(&run.path, std::io::Error::other("a run has the wrong length")));
+/// A run's entries `from..to` read in order from its file, which other
+/// readers may share: each reads at its own offset into its own buffer.
+pub struct RunReader<'a> {
+    file: &'a File,
+    path: &'a Path,
+    offset: u64,
+    left: u64,
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl<'a> RunReader<'a> {
+    fn new(file: &'a File, run: &'a Run, from: u64, to: u64) -> RunReader<'a> {
+        RunReader {
+            file,
+            path: &run.path,
+            offset: from * ENTRY_BYTES as u64,
+            left: to.saturating_sub(from),
+            buf: Vec::new(),
+            at: 0,
         }
-        Ok(RunReader { input: BufReader::with_capacity(RUN_BUFFER, file), path: run.path.clone(), left: run.entries })
     }
 
     pub fn next_entry(&mut self) -> Result<Option<Entry>, SearchError> {
         if self.left == 0 {
             return Ok(None);
         }
-        let mut b = [0u8; ENTRY_BYTES];
-        self.input.read_exact(&mut b).map_err(|e| io(&self.path, e))?;
+        if self.at == self.buf.len() {
+            let entries = (RUN_BUFFER / ENTRY_BYTES).min(usize::try_from(self.left).unwrap_or(usize::MAX));
+            self.buf.resize(entries * ENTRY_BYTES, 0);
+            read_at(self.file, self.offset, &mut self.buf).map_err(|e| io(self.path, e))?;
+            self.offset += self.buf.len() as u64;
+            self.at = 0;
+        }
+        let bytes: &[u8; ENTRY_BYTES] = self.buf[self.at..self.at + ENTRY_BYTES]
+            .try_into()
+            .map_err(|_| io(self.path, std::io::Error::other("a short read of a run")))?;
+        self.at += ENTRY_BYTES;
         self.left -= 1;
-        Ok(Some(Entry::from_bytes(&b)))
+        Ok(Some(Entry::from_bytes(bytes)))
     }
 }
 
 /// Merges `runs` in key order, calling `each` with every entry; the runs are
-/// deleted as they are consumed. At most [`FAN_IN`] runs may be given.
+/// deleted once merged. At most [`FAN_IN`] runs may be given.
 pub fn merge(
     runs: &[Run],
     progress: &Progress,
-    mut each: impl FnMut(Entry) -> Result<(), SearchError>,
+    each: impl FnMut(Entry) -> Result<(), SearchError>,
 ) -> Result<(), SearchError> {
     let _buffers = reserve(runs.len() * RUN_BUFFER, progress)?;
-    let mut readers = runs.iter().map(RunReader::open).collect::<Result<Vec<_>, _>>()?;
+    let files = open(runs)?;
+    merge_readers(runs.iter().zip(&files).map(|(r, f)| RunReader::new(f, r, 0, r.entries)).collect(), each)?;
+    drop(files);
+    for r in runs {
+        let _ = std::fs::remove_file(&r.path);
+    }
+    Ok(())
+}
+
+/// Merges part `part` of `runs` in key order, calling `each` with its every
+/// entry, from `files`, the runs' files as [`open`] gave them, which the other
+/// parts share. The caller holds a read buffer per run in the budget.
+pub fn merge_part(
+    runs: &[Run],
+    files: &[File],
+    part: usize,
+    each: impl FnMut(Entry) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
+    let readers = runs.iter().zip(files).map(|(r, f)| RunReader::new(f, r, r.parts[part], r.parts[part + 1])).collect();
+    merge_readers(readers, each)
+}
+
+fn merge_readers(
+    mut readers: Vec<RunReader<'_>>,
+    mut each: impl FnMut(Entry) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
     let mut heap = BinaryHeap::with_capacity(readers.len());
     for (i, r) in readers.iter_mut().enumerate() {
         if let Some(e) = r.next_entry()? {
@@ -308,10 +389,6 @@ pub fn merge(
         if let Some(e) = readers[i].next_entry()? {
             heap.push(Reverse((e.key, e.game_outcome, i, e.meta)));
         }
-    }
-    drop(readers);
-    for r in runs {
-        let _ = std::fs::remove_file(&r.path);
     }
     Ok(())
 }
@@ -331,13 +408,13 @@ pub fn reduce(
             let _out_buffer = reserve(RUN_BUFFER, progress)?;
             let path = dir.join(format!("merged-{level}-{n}"));
             let mut out = BufWriter::with_capacity(RUN_BUFFER, File::create(&path).map_err(|e| io(&path, e))?);
-            let mut entries = 0u64;
+            let mut counts = [0u64; PARTS];
             merge(group, progress, |e| {
-                entries += 1;
+                counts[part_of(e.key)] += 1;
                 out.write_all(&e.to_bytes()).map_err(|e| io(&path, e))
             })?;
             out.flush().map_err(|e| io(&path, e))?;
-            next.push(Run { path, entries });
+            next.push(Run { path, entries: counts.iter().sum(), parts: starts(&counts) });
         }
         runs = next;
         level += 1;

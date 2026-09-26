@@ -105,12 +105,12 @@ impl IndexFile {
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+pub(super) fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
 }
 
 #[cfg(windows)]
-fn read_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
+pub(super) fn read_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match file.seek_read(buf, offset) {
