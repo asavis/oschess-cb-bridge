@@ -101,6 +101,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(app, e, req)),
         ["v1", "databases", id, "explorer"] => with_entry(app, id, |e| crate::explorer::route(app, e, req)),
         ["v1", "engine", "analyze"] => analyze(app, req),
+        ["v1", "engine", "warm"] => warm(app, req),
         _ => not_found(),
     }
 }
@@ -197,6 +198,36 @@ fn analyze(app: &App, req: &Request) -> Response {
     };
     let (engine, stream) = (app.engine.clone(), stream.to_string());
     Response::stream(200, move |sink| engine.analyze(&search, &stream, sink))
+}
+
+/// Starts the engine before an analysis asks for it (#110), with the same
+/// `threads` and `hash` an analysis takes.
+fn warm(app: &App, req: &Request) -> Response {
+    if !app.engine.is_configured() {
+        return error(409, "no_engine", "No engine is configured in the bridge");
+    }
+    let number = |name: &'static str| -> Result<Option<u32>, Response> {
+        match req.param(name) {
+            None => Ok(None),
+            Some(v) => v.parse().map(Some).map_err(|_| bad_parameter(name, &format!("{name} is a whole number"))),
+        }
+    };
+    let (threads, hash_mb) = match (number("threads"), number("hash")) {
+        (Err(r), _) | (_, Err(r)) => return r,
+        (Ok(threads), Ok(hash_mb)) => (threads, hash_mb),
+    };
+    let search = match Search::new(None, "", 1, Limit::Infinite)
+        .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()))
+    {
+        Ok(search) => search,
+        Err((parameter, message)) => return bad_parameter(parameter, &message),
+    };
+    match app.engine.warm(&search) {
+        engine::Warmed::Ready => Response::json(200, Obj::new().str("engine", "ready").done()),
+        engine::Warmed::Busy => Response::json(200, Obj::new().str("engine", "busy").done()),
+        engine::Warmed::NoEngine => error(409, "no_engine", "No engine is configured in the bridge"),
+        engine::Warmed::Failed(why) => error(502, "engine_failed", &why),
+    }
 }
 
 fn progress(present: u64, total: u64) -> String {

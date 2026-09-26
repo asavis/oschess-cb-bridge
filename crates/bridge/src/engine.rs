@@ -470,6 +470,58 @@ impl Engine {
             *slot = None;
         }
     }
+
+    /// Starts the engine's process when none runs, with the threads and hash
+    /// of `search` set and the engine ready, so that an analysis asking for
+    /// the same only searches (#110). An analysis running now has the engine:
+    /// nothing is sent to it. A warm-up counts as use for the idle timer.
+    pub fn warm(&self, search: &Search) -> Warmed {
+        let Some(inner) = self.current() else { return Warmed::NoEngine };
+        let Ok(mut slot) = inner.slot.try_lock() else { return Warmed::Busy };
+        if slot.as_mut().is_some_and(|p| !p.alive()) {
+            *slot = None;
+        }
+        if slot.is_none() {
+            match Process::start(&inner.config) {
+                Ok(p) => {
+                    *lock(&inner.name) = Some(p.name.clone());
+                    *slot = Some(p);
+                }
+                Err(e) => return Warmed::Failed(e),
+            }
+        }
+        let p = slot.as_mut().expect("started above");
+        let threads = search.threads.unwrap_or(inner.config.threads);
+        let hash_mb = search.hash_mb.unwrap_or(inner.config.hash_mb);
+        let mut setup = Vec::new();
+        if p.threads != threads {
+            setup.push(format!("setoption name Threads value {threads}"));
+        }
+        if p.hash_mb != hash_mb {
+            setup.push(format!("setoption name Hash value {hash_mb}"));
+        }
+        setup.push("isready".into());
+        if setup.iter().any(|c| p.send(c).is_err()) || p.wait_for("readyok", READY).is_none() {
+            *slot = None;
+            return Warmed::Failed("the engine did not say it is ready".into());
+        }
+        (p.threads, p.hash_mb) = (threads, hash_mb);
+        p.used = Instant::now();
+        Warmed::Ready
+    }
+}
+
+/// What a warm-up found (#110).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Warmed {
+    /// The engine's process runs, set to the threads and hash asked for, and
+    /// said it is ready.
+    Ready,
+    /// An analysis has the engine: nothing was sent.
+    Busy,
+    NoEngine,
+    /// The process could not start or did not say it is ready.
+    Failed(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
