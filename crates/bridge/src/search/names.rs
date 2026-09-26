@@ -272,6 +272,51 @@ const FILE_MAGIC: [u8; 8] = *b"OSCBNAM\0";
 const FILE_VERSION: u32 = 1;
 const FILE_HEADER: usize = 64;
 
+/// The buffer a names file is read through.
+const FILE_READ_BUFFER: usize = 1 << 20;
+
+/// A names file's body as it is read: its CRC so far, and how much of its
+/// declared length is used. Every allocation here is fallible and no larger
+/// than what it decodes, so a file that the budget holds never asks for
+/// more than the budget reserved.
+struct Body {
+    r: BufReader<File>,
+    crc: u32,
+    consumed: u64,
+    len: u64,
+}
+
+impl Body {
+    /// `n` more bytes, when the body has them.
+    fn bytes(&mut self, n: usize) -> Option<Vec<u8>> {
+        self.consumed = self.consumed.checked_add(n as u64).filter(|&c| c <= self.len)?;
+        let mut v = Vec::new();
+        v.try_reserve_exact(n).ok()?;
+        v.resize(n, 0);
+        self.r.read_exact(&mut v).ok()?;
+        self.crc = super::heads::crc32_update(self.crc, &v);
+        Some(v)
+    }
+
+    /// `n` more little-endian `u32`s, decoded straight into their list.
+    fn u32s(&mut self, n: usize) -> Option<Vec<u32>> {
+        let bytes = n.checked_mul(4)?;
+        self.consumed = self.consumed.checked_add(bytes as u64).filter(|&c| c <= self.len)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(n).ok()?;
+        let mut piece = [0u8; 4096];
+        let mut left = bytes;
+        while left > 0 {
+            let k = left.min(piece.len());
+            self.r.read_exact(&mut piece[..k]).ok()?;
+            self.crc = super::heads::crc32_update(self.crc, &piece[..k]);
+            out.extend(piece[..k].as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
+            left -= k;
+        }
+        Some(out)
+    }
+}
+
 /// Name tables read from their files, for tests.
 pub static FILES_READ: AtomicU64 = AtomicU64::new(0);
 
@@ -369,7 +414,7 @@ impl NameTable {
     pub fn open_file(path: &Path, kind: Kind, generation: u64, count: usize) -> Option<Result<NameTable, SearchError>> {
         let file = File::open(path).ok()?;
         let size = file.metadata().ok()?.len();
-        let mut r = BufReader::with_capacity(1 << 20, file);
+        let mut r = BufReader::with_capacity(FILE_READ_BUFFER, file);
         let mut h = [0u8; FILE_HEADER];
         r.read_exact(&mut h).ok()?;
         let (u32_at, u64_at) = (
@@ -398,22 +443,16 @@ impl NameTable {
         // An optional file that cannot be held is a miss: the database's own
         // read decides whether the table fits.
         let chunk_bytes = chunks.checked_mul(std::mem::size_of::<Chunk>())?;
-        let hold = Hold::reserve(usize::try_from(size).ok()?.checked_add(chunk_bytes)?).ok()?;
-        let (mut crc, mut consumed) = (!0u32, 0u64);
-        let mut take = |r: &mut BufReader<File>, n: usize| -> Option<Vec<u8>> {
-            consumed = consumed.checked_add(n as u64).filter(|&c| c <= body_len)?;
-            let mut v = Vec::new();
-            v.try_reserve_exact(n).ok()?;
-            v.resize(n, 0);
-            r.read_exact(&mut v).ok()?;
-            crc = super::heads::crc32_update(crc, &v);
-            Some(v)
-        };
+        // The table holds as many bytes as the file, decoded in place; the
+        // chunks and the read buffer come on top.
+        let workspace = chunk_bytes.checked_add(FILE_READ_BUFFER)?;
+        let hold = Hold::reserve(usize::try_from(size).ok()?.checked_add(workspace)?).ok()?;
+        let mut body = Body { r, crc: !0, consumed: 0, len: body_len };
         let mut out: Vec<Chunk> = Vec::new();
         out.try_reserve_exact(chunks).ok()?;
         let mut seen = 0usize;
         for i in 0..chunks {
-            let head = take(&mut r, 32)?;
+            let head = body.bytes(32)?;
             let field = |at: usize| usize::try_from(u64::from_le_bytes(head[at..at + 8].try_into().unwrap())).ok();
             let (first, n, names_len, lower_len) = (field(0)?, field(8)?, field(16)?, field(24)?);
             if Some(first) != i.checked_mul(per.max(1)).map(|f| f.min(count))
@@ -424,13 +463,9 @@ impl NameTable {
             {
                 return None;
             }
-            let names = String::from_utf8(take(&mut r, names_len)?).ok()?;
-            let lower = String::from_utf8(take(&mut r, lower_len)?).ok()?;
-            let mut list = || -> Option<Vec<u32>> {
-                let bytes = take(&mut r, n.checked_mul(4)?)?;
-                Some(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect())
-            };
-            let (name_ends, lower_ends, given) = (list()?, list()?, list()?);
+            let names = String::from_utf8(body.bytes(names_len)?).ok()?;
+            let lower = String::from_utf8(body.bytes(lower_len)?).ok()?;
+            let (name_ends, lower_ends, given) = (body.u32s(n)?, body.u32s(n)?, body.u32s(n)?);
             // Every part a lookup slices must lie on the text's own bounds.
             let bounded = |text: &str, ends: &[u32]| {
                 ends.windows(2).all(|w| w[0] <= w[1])
@@ -451,7 +486,7 @@ impl NameTable {
             seen += n;
             out.push(Chunk { first, names, name_ends, lower, lower_ends, given });
         }
-        if seen != count || consumed != body_len || !crc != body_crc {
+        if seen != count || body.consumed != body_len || !body.crc != body_crc {
             return None;
         }
         FILES_READ.fetch_add(1, Ordering::Relaxed);
@@ -608,6 +643,81 @@ mod tests {
         let path = dir.join("0123456789abcdef.players");
         std::fs::write(&path, [&h[..], &body].concat()).unwrap();
         path
+    }
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn grew(n: usize) {
+        let _ = LIVE.try_with(|live| {
+            live.set(live.get() + n);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(live.get())));
+        });
+    }
+
+    fn shrank(n: usize) {
+        let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(n)));
+    }
+
+    /// The system allocator, counting each thread's live bytes and their
+    /// peak: what reading a names file takes on the thread that reads it.
+    struct Counting;
+
+    // SAFETY: every call goes to the system allocator as it came; the counts
+    // beside it touch only the calling thread's cells.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() {
+                grew(layout.size());
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(p, layout) };
+            shrank(layout.size());
+        }
+        unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let q = unsafe { System.realloc(p, layout, size) };
+            if !q.is_null() {
+                grew(size);
+                shrank(layout.size());
+            }
+            q
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    #[test]
+    fn reading_a_names_file_takes_no_more_memory_than_it_reserves() {
+        // The review's file: one chunk of 1.3 million empty names, three
+        // arrays of offsets, and a body CRC that fails at the very end.
+        let n = 1_300_000usize;
+        let zeros = vec![0u32; n];
+        let path = raw_file("peak", n as u64, n as u64, 1, &[(0, n as u64, "", "", &zeros, &zeros, &zeros)], None);
+        drop(zeros);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[44] ^= 1;
+        let crc = super::super::heads::crc32(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let size = bytes.len();
+        drop(bytes);
+        let start = LIVE.with(Cell::get);
+        PEAK.with(|peak| peak.set(start));
+        assert!(NameTable::open_file(&path, Kind::Players, 7, n).is_none());
+        let peak = PEAK.with(Cell::get) - start;
+        // What `open_file` reserves, and a page for the file API's own
+        // bookkeeping.
+        let reserved = size + std::mem::size_of::<Chunk>() + FILE_READ_BUFFER;
+        assert!(peak <= reserved + 4096, "{peak} bytes at the peak against {reserved} reserved");
     }
 
     #[test]
