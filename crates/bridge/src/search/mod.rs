@@ -97,8 +97,14 @@ impl Indexes {
     }
 
     /// The heads file passes read, when one is set and still usable.
+    /// A file found broken is let go here, so that its handles close and
+    /// Windows lets its replacement take its name.
     fn heads(&self) -> Option<Arc<heads::Heads>> {
-        self.heads.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|h| h.usable()).cloned()
+        let mut slot = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|h| !h.usable()) {
+            *slot = None;
+        }
+        slot.clone()
     }
 
     /// Indexes whose retained structures are evicted when the budget runs short.

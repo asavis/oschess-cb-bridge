@@ -124,7 +124,7 @@ pub fn build<S: Store>(db: &S, generation: u64, path: &Path, still: &dyn Fn() ->
     let result = write(db, generation, records, &partial, still);
     match result {
         Ok(true) => {
-            std::fs::rename(&partial, path).map_err(|e| format!("renaming {}: {e}", partial.display()))?;
+            replace(&partial, path).map_err(|e| format!("renaming {}: {e}", partial.display()))?;
             Heads::open(path, generation, records)
                 .map(Built::Ready)
                 .ok_or_else(|| "the new file does not read back".into())
@@ -149,6 +149,24 @@ pub fn build_base(
 ) -> Result<Built, String> {
     crate::store::with_store!(db, s => build(s, generation, path, still))
 }
+
+/// Renames `partial` to `path`. A pass still reading a broken file that was
+/// removed holds its name on Windows until the pass ends, so a refusal is
+/// tried again for a few seconds.
+fn replace(partial: &Path, path: &Path) -> std::io::Result<()> {
+    let until = Instant::now() + REPLACE_WAIT;
+    loop {
+        match std::fs::rename(partial, path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// How long [`replace`] waits for the readers of a removed file.
+const REPLACE_WAIT: Duration = Duration::from_secs(10);
 
 /// Writes the file; `false` when a record does not fit a row or the database
 /// changed meanwhile.
@@ -276,7 +294,11 @@ impl Registry {
             Some(State::Ready(h)) if h.generation == generation && h.usable() => return Lookup::Ready(Arc::clone(h)),
             Some(State::Ready(h)) if h.generation == generation => {
                 // A block failed its CRC: the file goes, and is built again.
-                let _ = std::fs::remove_file(&h.path);
+                // Its handles are let go first: Windows keeps a file's name
+                // until the last one closes.
+                let path = h.path.clone();
+                states.remove(id);
+                let _ = std::fs::remove_file(&path);
             }
             Some(State::Working(g)) if *g == generation => return Lookup::None,
             Some(State::Unsuited(g)) if *g == generation => return Lookup::None,
