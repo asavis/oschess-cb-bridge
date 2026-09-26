@@ -145,6 +145,27 @@ fn other_streams_do_not_supersede() {
     assert_eq!(status, 400, "{out}");
 }
 
+/// Two million records sort on the workers, and their runs merge in parts:
+/// every record comes once and in order, ties in number order in both
+/// directions, at the start, across the parts and at the end.
+#[test]
+fn a_large_order_merges_every_record_once() {
+    let s = serve_sparse("limits-large-order", 2_000_000);
+    let numbers = |query: &str| -> Vec<u32> {
+        let (status, out) = s.get(query);
+        assert_eq!(status, 200, "{query}: {out}");
+        out.split(r#""number":"#).skip(1).map(|n| n.split(',').next().unwrap().parse().unwrap()).collect()
+    };
+    for sort in ["whiteElo", "whiteElo-desc"] {
+        assert_eq!(numbers(&format!("sort={sort}&limit=3")), [1, 2, 3], "{sort}");
+        for at in [262_143, 1_000_000, 1_048_575] {
+            let got = numbers(&format!("sort={sort}&offset={at}&limit=3"));
+            assert_eq!(got, [at + 1, at + 2, at + 3], "{sort} at {at}");
+        }
+        assert_eq!(numbers(&format!("sort={sort}&offset=1999998")), [1_999_999, 2_000_000], "{sort}");
+    }
+}
+
 /// The bridge as a separate process under a 256 MiB address-space limit,
 /// serving `path`, with `env` set; killed when dropped.
 struct Limited {
