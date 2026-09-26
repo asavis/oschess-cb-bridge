@@ -16,6 +16,7 @@ mod sort;
 mod suggest;
 pub mod workers;
 
+pub use names::FILES_READ as NAME_FILES_READ;
 pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
 
@@ -135,13 +136,29 @@ impl Indexes {
             Kind::Annotators => &self.annotators,
             Kind::Titles => &self.titles,
         };
-        cached(slot, || {
+        let table = cached(slot, || {
             let keys = match kind == Kind::Titles && S::TITLES_BY_RECORD {
                 true => Some(self.title_keys(db, cancel)?),
                 false => None,
             };
-            NameTable::load(db, kind, keys, cancel)
-        })
+            // Beside a heads file the table is kept in a file of its own
+            // (#108): read from there, else read from the database and
+            // written there.
+            let file = self.heads().and_then(|h| Some((names::file_path(&h.path, kind)?, h.generation)));
+            if let Some((path, generation)) = &file {
+                let count = usize::try_from(db.name_count(kind)).unwrap_or(usize::MAX);
+                if let Some(table) = NameTable::open_file(path, kind, *generation, count) {
+                    return table;
+                }
+            }
+            let table = NameTable::load(db, kind, keys, cancel)?;
+            if let Some((path, generation)) = file {
+                table.to_be_written(path, kind, generation);
+            }
+            Ok(table)
+        })?;
+        table.write_later();
+        Ok(table)
     }
 
     /// The numbers of the records with a title of their own, in order, for a
