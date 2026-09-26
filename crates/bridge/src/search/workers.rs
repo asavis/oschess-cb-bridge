@@ -183,9 +183,103 @@ pub fn run<T: Send>(
     }
 }
 
+/// Items a sorting worker takes at least; fewer are sorted on one thread.
+const SORT_PART_MIN: usize = 1 << 15;
+
+/// Sorts `items` by `cmp` on the workers, with a second buffer as long as
+/// `items`, which the caller holds in the budget: each worker sorts a chunk,
+/// splitters sampled evenly from the sorted chunks cut them into ranges, and
+/// each range of every chunk merges into its own part of the second buffer,
+/// which becomes `items`. Items that `cmp` calls equal come in any order.
+pub fn sort_by<T, F>(items: &mut Vec<T>, cmp: &F) -> Result<(), SearchError>
+where
+    T: Copy + Send + Sync,
+    F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
+{
+    let n = items.len();
+    let parts = threads().min(n / SORT_PART_MIN).max(1);
+    if parts == 1 {
+        items.sort_unstable_by(cmp);
+        return Ok(());
+    }
+    let per = n.div_ceil(parts);
+    let chunks: Vec<Mutex<Option<&mut [T]>>> = items.chunks_mut(per).map(|c| Mutex::new(Some(c))).collect();
+    run(parts, 0, &Cancel::never(), |w| {
+        for k in (w.index..chunks.len()).step_by(w.count) {
+            if let Some(chunk) = chunks[k].lock().unwrap_or_else(|e| e.into_inner()).take() {
+                chunk.sort_unstable_by(cmp);
+            }
+        }
+        Ok(())
+    })?;
+    drop(chunks);
+    let chunks: Vec<&[T]> = items.chunks(per).collect();
+    let mut samples: Vec<T> = chunks.iter().flat_map(|c| (1..parts).map(move |j| c[j * c.len() / parts])).collect();
+    samples.sort_unstable_by(cmp);
+    let splitters: Vec<T> = (1..parts).map(|k| samples[k * samples.len() / parts]).collect();
+    // Where each range starts in each chunk; the last row is where they end.
+    let mut starts = vec![vec![0; chunks.len()]];
+    starts.extend(splitters.iter().map(|s| chunks.iter().map(|c| c.partition_point(|x| cmp(x, s).is_lt())).collect()));
+    starts.push(chunks.iter().map(|c| c.len()).collect());
+    let mut sorted: Vec<T> = Vec::new();
+    sorted.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
+    sorted.extend_from_slice(items);
+    let mut ranges = Vec::with_capacity(parts);
+    let mut rest = sorted.as_mut_slice();
+    for k in 0..parts {
+        let len = (0..chunks.len()).map(|c| starts[k + 1][c] - starts[k][c]).sum();
+        let (range, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        ranges.push(Mutex::new(Some(range)));
+        rest = tail;
+    }
+    run(parts, 0, &Cancel::never(), |w| {
+        for k in (w.index..parts).step_by(w.count) {
+            let Some(out) = ranges[k].lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
+            let (mut at, to) = (starts[k].clone(), &starts[k + 1]);
+            for slot in out.iter_mut() {
+                // The least head of the chunks: few, so looked through in turn.
+                let mut best: Option<usize> = None;
+                for c in 0..chunks.len() {
+                    if at[c] < to[c] && best.is_none_or(|b| cmp(&chunks[c][at[c]], &chunks[b][at[b]]).is_lt()) {
+                        best = Some(c);
+                    }
+                }
+                let Some(b) = best else { break };
+                *slot = chunks[b][at[b]];
+                at[b] += 1;
+            }
+        }
+        Ok(())
+    })?;
+    drop(ranges);
+    *items = sorted;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Items sorted on the workers come in the order one sort gives: many
+    /// equal keys, told apart by their numbers, a few items, and none.
+    #[test]
+    fn a_sort_on_the_workers_orders_as_one_sort() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for n in [0, 1, 7, SORT_PART_MIN * 2 + 3, 300_001] {
+            let mut items: Vec<(u32, u32)> = (0..n as u32)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed % 1000) as u32, i)
+                })
+                .collect();
+            let mut want = items.clone();
+            want.sort_unstable();
+            sort_by(&mut items, &|a: &(u32, u32), b: &(u32, u32)| a.cmp(b)).unwrap();
+            assert_eq!(items, want, "{n} items");
+        }
+    }
 
     #[test]
     fn workers_are_bounded_and_returned() {
