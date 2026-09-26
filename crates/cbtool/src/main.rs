@@ -53,6 +53,8 @@ fn main() -> ExitCode {
         Some("pgn") if args.len() >= 2 => pgn(&args[1], &args[2..]),
         Some("databases") if args.len() == 2 => databases::databases(&args[1]),
         Some("profile") => profile::run(&args[1..]),
+        // The bridge `profile` asks, in a process of its own; not in the usage.
+        Some("profile-serve") => profile::serve(&args[1..]),
         Some("bridge") => {
             bridge::start::console("cbtool bridge", args[1..].iter().cloned()).map(|()| true).map_err(Into::into)
         }

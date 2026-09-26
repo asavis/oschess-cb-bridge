@@ -123,7 +123,7 @@ database with its PGN export field by field and move by move, and `cargo run
 compares their position indexes; both print counts only.
 
 `cbtool profile` times the bridge's flows against one database (#83). It
-serves the database from a bridge in its own process, on a free port, and asks
+serves the database from a bridge in a child process, on a free port, and asks
 it over HTTP as oschess does:
 
 - the first answers after the start;
@@ -134,13 +134,18 @@ it over HTTP as oschess does:
   colour, event and date, cold and cached;
 - one game as PGN, the first one and the most annotated of the first 50,000,
   in both forms;
-- the position index's build in the `--index` folder, a lookup per move and
-  opening it again;
-- a 5-second search when `--engine <exe>` names a UCI engine;
+- the position index's build in the `--index` folder, which must be new or
+  empty so that the build is measured, a lookup per move along the most played
+  line and opening it again in a new bridge;
+- when `--engine <exe>` names a UCI engine, a 5-second search: the time to its
+  first line, and the lines a second;
 - a small answer over a kept and over a new connection.
 
-It prints only timings and counts, never a name, game, query or path, so its
-output can go into an issue as it is. Run it on the computer the bridge serves,
+It prints only timings and counts, and for a failed answer its status and the
+bridge's error code; never a name, game, query or path, so its output can go
+into an issue as it is. The child bridge's own messages are discarded. A failed
+answer is left out of the times, and any failure makes the command exit with
+status 1. Run it on the computer the bridge serves,
 against the database's own folder: on Windows from a WSL mount the file
 reads, not the bridge, set the times.
 

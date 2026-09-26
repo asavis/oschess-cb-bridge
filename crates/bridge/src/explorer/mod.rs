@@ -14,7 +14,7 @@ pub mod rendered;
 pub mod runs;
 pub mod source;
 
-pub use answer::{render, route};
+pub use answer::{render, route, uci};
 pub use build::WRITER_BYTES;
 
 use std::collections::{HashMap, HashSet};

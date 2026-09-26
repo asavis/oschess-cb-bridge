@@ -115,8 +115,9 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a
-/// standard position; `chesscore` writes it as the king taking its rook.
-fn uci(board: &Board, mv: Move) -> String {
+/// standard position; `chesscore` writes it as the king taking its rook. The
+/// explorer's moves are written this way.
+pub fn uci(board: &Board, mv: Move) -> String {
     let castles =
         matches!(board.piece_at(mv.from), Some((Piece::King, c)) if board.piece_at(mv.to) == Some((Piece::Rook, c)));
     if castles {
