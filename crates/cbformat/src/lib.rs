@@ -14,7 +14,7 @@ use std::path::PathBuf;
 pub mod cbh;
 pub mod codepage;
 pub mod dbitems;
-pub(crate) mod file;
+pub mod file;
 #[cfg(feature = "fixture")]
 pub mod fixture;
 #[cfg(feature = "fixture")]

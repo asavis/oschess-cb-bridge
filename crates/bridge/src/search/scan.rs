@@ -9,23 +9,33 @@ use cbformat::v2::HEADER_RECORD_SIZE;
 use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
 
 use super::SearchError;
+use super::heads::{Heads, ROWS_READ};
 use super::memory::{Allowance, Cancel, Refused};
 use super::names::{BitSet, NameTable};
 use super::query::{Cmp, Field, Query, Value};
+use super::slim::{ROW, Slim};
 use super::workers::{self, threads};
 use crate::store::{Head, Store};
 
 /// Header records read at a time by one worker.
-const CHUNK: u32 = 16 << 10;
+pub(super) const CHUNK: u32 = 16 << 10;
 /// The batch buffer of one worker: 3 MiB, reserved in the budget and reused.
-/// It holds a chunk of records of either format.
+/// It holds a chunk of records of either format, or a block of heads rows.
 pub const BATCH_BYTES: usize = CHUNK as usize * HEADER_RECORD_SIZE;
 
-/// What a pass answers to: the cancellation of its search, and a count of the
-/// records it read.
+/// What a pass answers to: the cancellation of its search, a count of the
+/// records it read, and the database's heads file when one is ready (#106).
 pub struct Control<'a> {
     pub cancel: &'a Cancel,
     pub scanned: &'a AtomicU64,
+    pub heads: Option<&'a Heads>,
+}
+
+/// What a pass does with each record: fold it into the worker's accumulator.
+/// Generic over the record, so a pass reads the database's own records and
+/// the rows of its heads file alike.
+pub trait Visit<T>: Sync {
+    fn visit(&self, acc: &mut T, r: &impl Head) -> Result<(), SearchError>;
 }
 
 /// Visits every record, in parallel over contiguous ranges of numbers, on the
@@ -34,14 +44,22 @@ pub struct Control<'a> {
 /// it will visit and finished by `finish`; the accumulators come back in range
 /// order. Every worker reads its batches into one reserved buffer, and stops at
 /// its next batch once one has failed or the search is superseded.
+///
+/// The records come from the heads file when [`Control::heads`] holds one for
+/// this database, as rows; a block of rows that fails its CRC is read from the
+/// database instead, so the pass visits every record either way.
 pub fn scan<S: Store, T: Send>(
     db: &S,
     ctl: &Control<'_>,
     init: impl Fn(usize) -> Result<T, SearchError> + Sync,
-    visit: impl Fn(&mut T, &S::Head) -> Result<(), SearchError> + Sync,
+    visit: &impl Visit<T>,
     finish: impl Fn(&mut T) + Sync,
 ) -> Result<Vec<T>, SearchError> {
-    let total = u64::from(db.record_count());
+    let total = db.record_count();
+    if let Some(heads) = ctl.heads.filter(|h| h.usable() && h.records == total) {
+        return scan_heads(db, heads, ctl, init, visit, finish);
+    }
+    let total = u64::from(total);
     let want = (threads() as u64).min(total.div_ceil(u64::from(CHUNK))).max(1) as usize;
     workers::run(want, BATCH_BYTES, ctl.cancel, |w| {
         let per = total.div_ceil(w.count as u64);
@@ -54,20 +72,77 @@ pub fn scan<S: Store, T: Send>(
                 return Err(SearchError::Superseded);
             }
             let batch = (last - next + 1).min(u64::from(CHUNK)) as usize;
-            let read = db.read_records(next as u32, &mut buf[..batch * S::HEAD_BYTES])?;
+            let read = visit_records(db, next as u32, batch, &mut buf, &mut acc, visit)?;
             if read == 0 {
                 break;
             }
             ctl.scanned.fetch_add(u64::from(read), Ordering::Relaxed);
-            for i in 0..read as usize {
-                let at = i * S::HEAD_BYTES;
-                visit(&mut acc, &S::head(next as u32 + i as u32, &buf[at..at + S::HEAD_BYTES]))?;
-            }
             next += u64::from(read);
         }
         finish(&mut acc);
         Ok(acc)
     })
+}
+
+/// [`scan`] over a heads file: each worker takes a range of whole blocks.
+fn scan_heads<S: Store, T: Send>(
+    db: &S,
+    heads: &Heads,
+    ctl: &Control<'_>,
+    init: impl Fn(usize) -> Result<T, SearchError> + Sync,
+    visit: &impl Visit<T>,
+    finish: impl Fn(&mut T) + Sync,
+) -> Result<Vec<T>, SearchError> {
+    let blocks = heads.blocks();
+    let want = (threads() as u32).min(blocks).max(1) as usize;
+    workers::run(want, BATCH_BYTES, ctl.cancel, |w| {
+        let per = blocks.div_ceil(w.count as u32);
+        let (first, last) = ((w.index as u32 * per).min(blocks), ((w.index as u32 + 1) * per).min(blocks));
+        let records = (u64::from(last) * u64::from(CHUNK)).min(u64::from(heads.records))
+            - (u64::from(first) * u64::from(CHUNK)).min(u64::from(heads.records));
+        let mut acc = init(records as usize)?;
+        let mut buf = w.buffer()?;
+        for block in first..last {
+            if w.stopped() || ctl.cancel.is_cancelled() {
+                return Err(SearchError::Superseded);
+            }
+            let number = block * CHUNK + 1;
+            let read = match heads.read_block(block, &mut buf) {
+                Some(rows) => {
+                    for i in 0..rows as usize {
+                        visit.visit(&mut acc, &Slim::new(number + i as u32, &buf[i * ROW..]))?;
+                    }
+                    ROWS_READ.fetch_add(u64::from(rows), Ordering::Relaxed);
+                    rows
+                }
+                None => {
+                    let batch = (heads.records - number + 1).min(CHUNK) as usize;
+                    visit_records(db, number, batch, &mut buf, &mut acc, visit)?
+                }
+            };
+            ctl.scanned.fetch_add(u64::from(read), Ordering::Relaxed);
+        }
+        finish(&mut acc);
+        Ok(acc)
+    })
+}
+
+/// Reads up to `batch` records of `db` from record `first` into `buf` and
+/// visits them in order; their count.
+fn visit_records<S: Store, T>(
+    db: &S,
+    first: u32,
+    batch: usize,
+    buf: &mut [u8],
+    acc: &mut T,
+    visit: &impl Visit<T>,
+) -> Result<u32, SearchError> {
+    let read = db.read_records(first, &mut buf[..batch * S::HEAD_BYTES])?;
+    for i in 0..read as usize {
+        let at = i * S::HEAD_BYTES;
+        visit.visit(acc, &S::head(first + i as u32, &buf[at..at + S::HEAD_BYTES]))?;
+    }
+    Ok(read)
 }
 
 /// Which of a game's player ids a name test looks at.

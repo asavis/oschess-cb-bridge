@@ -5,11 +5,13 @@
 
 mod compare;
 pub mod gate;
+pub mod heads;
 pub mod memory;
 mod names;
 mod order;
 pub mod query;
 mod scan;
+mod slim;
 mod sort;
 mod suggest;
 pub mod workers;
@@ -66,6 +68,8 @@ pub struct Indexes {
     scanned: AtomicU64,
     /// Where tests hold searches on this database.
     gate: gate::Gate,
+    /// The database's heads file at this generation, once it is ready (#106).
+    heads: Mutex<Option<Arc<heads::Heads>>>,
 }
 
 /// The value in `slot`, built by `build` the first time. Concurrent callers
@@ -82,6 +86,27 @@ pub(super) fn cached<T, E>(slot: &Slot<T>, build: impl FnOnce() -> Result<T, E>)
 }
 
 impl Indexes {
+    /// Passes read `heads` from now on, while it stays usable.
+    pub fn set_heads(&self, heads: Arc<heads::Heads>) {
+        *self.heads.lock().unwrap_or_else(|e| e.into_inner()) = Some(heads);
+    }
+
+    /// Whether a heads file is set that passes still read.
+    pub fn has_usable_heads(&self) -> bool {
+        self.heads().is_some()
+    }
+
+    /// The heads file passes read, when one is set and still usable.
+    /// A file found broken is let go here, so that its handles close and
+    /// Windows lets its replacement take its name.
+    fn heads(&self) -> Option<Arc<heads::Heads>> {
+        let mut slot = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|h| !h.usable()) {
+            *slot = None;
+        }
+        slot.clone()
+    }
+
     /// Indexes whose retained structures are evicted when the budget runs short.
     pub fn shared() -> Arc<Indexes> {
         let indexes = Arc::new(Indexes::default());
@@ -122,20 +147,10 @@ impl Indexes {
     /// The numbers of the records with a title of their own, in order, for a
     /// format that keeps titles with their records: one pass over the headers.
     fn title_keys<S: Store>(&self, db: &S, cancel: &Cancel) -> Result<Held<Vec<u32>>, SearchError> {
-        let ctl = Control { cancel, scanned: &self.scanned };
+        let heads = self.heads();
+        let ctl = Control { cancel, scanned: &self.scanned, heads: heads.as_deref() };
         let found = Mutex::new(Hold::default());
-        let parts = scan::scan(
-            db,
-            &ctl,
-            |_| Ok((Vec::new(), Allowance::new(&found))),
-            |(numbers, allow), r| {
-                if r.other().is_some_and(|(key, _)| key >= 0) {
-                    push_u32(numbers, r.id(), allow)?;
-                }
-                Ok(())
-            },
-            |_| {},
-        )?;
+        let parts = scan::scan(db, &ctl, |_| Ok((Vec::new(), Allowance::new(&found))), &TitleKeys, |_| {})?;
         let total: usize = parts.iter().map(|p| p.0.len()).sum();
         let hold = Hold::reserve(total * 4)?;
         let mut keys: Vec<u32> = Vec::new();
@@ -285,7 +300,8 @@ fn select_in<S: Store>(
     let q = q.unwrap_or("");
     let query = query::parse(q).map_err(|u| SearchError::Unsupported(u.0))?;
     let sort = sort_param.or(query.sort).unwrap_or(Sort::DEFAULT);
-    let ctl = Control { cancel: &cancel, scanned: &idx.scanned };
+    let heads = idx.heads();
+    let ctl = Control { cancel: &cancel, scanned: &idx.scanned, heads: heads.as_deref() };
     if query.terms.is_empty() {
         return Ok(match sort.key {
             SortKey::Number => (Selection::All { descending: sort.descending }, sort),
@@ -310,6 +326,30 @@ fn select_in<S: Store>(
 }
 
 /// Appends to a vector whose growth is reserved in the budget first.
+/// The numbers of the records with a title of their own.
+struct TitleKeys;
+
+impl<'h> scan::Visit<(Vec<u32>, Allowance<'h>)> for TitleKeys {
+    fn visit(&self, acc: &mut (Vec<u32>, Allowance<'h>), r: &impl Head) -> Result<(), SearchError> {
+        if r.other().is_some_and(|(key, _)| key >= 0) {
+            push_u32(&mut acc.0, r.id(), &mut acc.1)?;
+        }
+        Ok(())
+    }
+}
+
+/// The numbers of the records a query matches.
+struct Matching<'m, 'a>(&'m scan::Matcher<'a>);
+
+impl<'h> scan::Visit<(Vec<u32>, Allowance<'h>)> for Matching<'_, '_> {
+    fn visit(&self, acc: &mut (Vec<u32>, Allowance<'h>), r: &impl Head) -> Result<(), SearchError> {
+        if self.0.matches(r) {
+            push_u32(&mut acc.0, r.id(), &mut acc.1)?;
+        }
+        Ok(())
+    }
+}
+
 fn push_u32(v: &mut Vec<u32>, x: u32, allow: &mut Allowance<'_>) -> Result<(), Refused> {
     if v.len() == v.capacity() {
         let add = v.capacity().max(1024);
@@ -348,18 +388,7 @@ fn search<S: Store>(
     let sets = Mutex::new(Hold::default());
     let matcher = scan::Matcher::new(query, &tables, &mut Allowance::new(&sets))?;
     let found = Mutex::new(Hold::default());
-    let parts = scan::scan(
-        db,
-        ctl,
-        |_| Ok((Vec::new(), Allowance::new(&found))),
-        |(numbers, allow), r| {
-            if matcher.matches(r) {
-                push_u32(numbers, r.id(), allow)?;
-            }
-            Ok(())
-        },
-        |_| {},
-    )?;
+    let parts = scan::scan(db, ctl, |_| Ok((Vec::new(), Allowance::new(&found))), &Matching(&matcher), |_| {})?;
     let parts: Vec<Vec<u32>> = parts.into_iter().map(|(numbers, _)| numbers).collect();
     let matches: usize = parts.iter().map(Vec::len).sum();
     let mut hold = Hold::reserve(matches * 4)?;

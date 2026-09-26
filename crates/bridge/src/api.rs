@@ -98,7 +98,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "databases"] => databases(app),
         ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(app, e, req)),
         ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
-        ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(e, req)),
+        ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(app, e, req)),
         ["v1", "databases", id, "explorer"] => with_entry(app, id, |e| crate::explorer::route(app, e, req)),
         ["v1", "engine", "analyze"] => analyze(app, req),
         _ => not_found(),
@@ -277,6 +277,7 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
         Some(s) if valid_stream(s) => Some(s),
         Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
     };
+    app.catalog.attach_heads(entry, &open);
     let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
         Ok(found) => found,
         Err(e) => return search_error(entry, open.generation, e),
@@ -338,7 +339,7 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
     ok(body).holding(hold)
 }
 
-fn suggest(entry: &Entry, req: &Request) -> Response {
+fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
     let field = match req.param("field") {
         Some("player") => SuggestField::Player,
         Some("event") => SuggestField::Event,
@@ -357,6 +358,7 @@ fn suggest(entry: &Entry, req: &Request) -> Response {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
+    app.catalog.attach_heads(entry, &open);
     let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
         Ok(list) => list,
         Err(e) => return search_error(entry, open.generation, e),

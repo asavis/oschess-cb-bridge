@@ -14,6 +14,7 @@ use cbformat::view::Base;
 use crate::fetch::{Cloud, Progress, Serial, System};
 use crate::pgnindex::{self, Opening};
 use crate::search::Indexes;
+use crate::search::heads::{self, Lookup};
 use crate::sources::{Listed, Read, Sources};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +295,13 @@ impl Entry {
         self.files().generation
     }
 
+    /// Reads the database's generation when called, from any thread, without
+    /// holding the entry: what a background job asks between its steps.
+    pub fn generation_probe(&self) -> impl Fn() -> Option<u64> + Send + 'static {
+        let (path, format, cloud) = (self.path.clone(), self.format, Arc::clone(&self.shared.cloud));
+        move || generation_of(&path, format, &*cloud).generation
+    }
+
     fn files(&self) -> Files {
         generation_of(&self.path, self.format, &*self.shared.cloud)
     }
@@ -356,6 +364,9 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
 pub struct Catalog {
     /// The position indexes of the databases, and the queue that builds them.
     pub explorer: crate::explorer::Registry,
+    /// The heads files of the databases (#106), and the queue that builds them.
+    pub heads: Arc<heads::Registry>,
+    heads_queue: Arc<Serial>,
     sources: Sources,
     shared: Arc<Shared>,
     listing: Mutex<Listing>,
@@ -391,6 +402,8 @@ impl Catalog {
         let listing = Listing { read: Read::default(), entries: Vec::new() };
         let catalog = Catalog {
             explorer: crate::explorer::Registry::default(),
+            heads: Arc::default(),
+            heads_queue: Arc::new(Serial::labelled("heads")),
             sources,
             shared,
             listing: Mutex::new(listing),
@@ -453,6 +466,40 @@ impl Catalog {
         let listed = entries.iter().filter(|e| e.listed()).map(|e| e.id.clone()).collect();
         self.explorer.sweep(&listed);
         self.shared.pgn.sweep(&listed);
+        if let Some(dir) = self.explorer.dir() {
+            self.heads.sweep(&dir, &listed, self.explorer.sweep_grace());
+        }
+    }
+
+    /// Hands `open` the heads file of its generation when one is ready, and
+    /// starts the build of one when none is (#106). Until it is ready, passes
+    /// over the database read its own records.
+    pub fn attach_heads(&self, entry: &Entry, open: &Opened) {
+        // A file that failed its CRC is left for the registry, which drops it
+        // and builds it again.
+        if open.indexes.has_usable_heads() {
+            return;
+        }
+        let Some(dir) = self.explorer.dir() else { return };
+        match self.heads.lookup(&dir, &entry.id, open.generation, open.db.record_count()) {
+            Lookup::Ready(h) => open.indexes.set_heads(h),
+            Lookup::None => {}
+            Lookup::Build => {
+                let (registry, id, generation) = (Arc::clone(&self.heads), entry.id.clone(), open.generation);
+                let (db, indexes, probe) = (Arc::clone(&open.db), Arc::clone(&open.indexes), entry.generation_probe());
+                let path = heads::path(&dir, &entry.id);
+                let started = self.heads_queue.submit(Box::new(move || {
+                    let still = || probe() == Some(generation);
+                    let result = heads::build_base(&db, generation, &path, &still);
+                    if let Some(h) = registry.built(&id, generation, result) {
+                        indexes.set_heads(h);
+                    }
+                }));
+                if !started {
+                    self.heads.built(&entry.id, open.generation, Err("the heads thread could not start".into()));
+                }
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Entry>> {

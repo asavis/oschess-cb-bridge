@@ -214,6 +214,11 @@ impl Registry {
         *lock(&self.grace) = grace;
     }
 
+    /// How long an index outlives its database's place on the list.
+    pub fn sweep_grace(&self) -> Duration {
+        *lock(&self.grace)
+    }
+
     /// Removes from the index folder what no database on the list will use
     /// (#60): the index of a database that has been off the list for
     /// [`SWEEP_GRACE`] or longer, and a build's work left by a build that no

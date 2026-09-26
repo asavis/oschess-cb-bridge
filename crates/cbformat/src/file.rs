@@ -13,7 +13,7 @@ use crate::{Error, Result};
 const SPARE_HANDLES: usize = 64;
 
 /// One file of a database, read at positions.
-pub(crate) struct DbFile {
+pub struct DbFile {
     file: File,
     /// Boxed, so that a database of many files stays small with the handles
     /// below.
@@ -26,7 +26,7 @@ pub(crate) struct DbFile {
 }
 
 impl DbFile {
-    pub(crate) fn open(path: PathBuf) -> Result<DbFile> {
+    pub fn open(path: PathBuf) -> Result<DbFile> {
         let file = File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
         Ok(DbFile {
             file,
@@ -40,8 +40,13 @@ impl DbFile {
         self.file.metadata().map(|m| m.len()).map_err(|e| Error::Io(self.path.to_path_buf(), e))
     }
 
+    /// The file's size in bytes.
+    pub fn size(&self) -> Result<u64> {
+        self.len()
+    }
+
     /// Fills `buf` from `offset`; a short file is an error.
-    pub(crate) fn read_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+    pub fn read_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.with_handle(|file| read_exact_at(file, buf, offset)).map_err(|e| Error::Io(self.path.to_path_buf(), e))
     }
 

@@ -39,6 +39,21 @@ impl GameResult {
         }
     }
 
+    /// The result byte [`GameResult::from_field`] reads this from.
+    pub fn field(self) -> u8 {
+        match self {
+            GameResult::BlackWins => 0,
+            GameResult::Draw => 1,
+            GameResult::WhiteWins => 2,
+            GameResult::Line => 3,
+            GameResult::BlackWinsForfeit => 4,
+            GameResult::DrawForfeit => 5,
+            GameResult::WhiteWinsForfeit => 6,
+            GameResult::BothLost => 7,
+            GameResult::Unknown(r) => r,
+        }
+    }
+
     pub fn pgn(self) -> &'static str {
         match self {
             GameResult::BlackWins | GameResult::BlackWinsForfeit => "0-1",
@@ -71,6 +86,16 @@ impl Eco {
             v @ 128..=64127 => Eco::Code { code: v / 128 - 1, sub: (v % 128) as u8 },
             v @ 64576.. => Eco::Chess960(v - 64576),
             v => Eco::Invalid(v),
+        }
+    }
+
+    /// The field [`Eco::from_field`] reads this from.
+    pub fn field(self) -> u16 {
+        match self {
+            Eco::None => 0,
+            Eco::Code { code, sub } => code.saturating_add(1).saturating_mul(128).saturating_add(u16::from(sub)),
+            Eco::Chess960(n) => n.saturating_add(64576),
+            Eco::Invalid(v) => v,
         }
     }
 
@@ -176,6 +201,16 @@ fn put_number(buf: &mut [u8], at: usize, v: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fields_read_back_as_they_were_stored() {
+        for v in 0..=u16::MAX {
+            assert_eq!(Eco::from_field(v).field(), v);
+        }
+        for v in 0..=u8::MAX {
+            assert_eq!(GameResult::from_field(v).field(), v);
+        }
+    }
 
     #[test]
     fn eco_field() {
