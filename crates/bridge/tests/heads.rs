@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use bridge::catalog::{Catalog, Opened};
 use bridge::search::heads::{self, BLOCK_ROWS, Built, Heads, ROWS_READ};
-use bridge::search::{self, Indexes, SearchError, Selection, SuggestField};
+use bridge::search::{self, Indexes, NAME_FILES_READ, SearchError, Selection, SuggestField};
 use cbformat::codepage::CodePage;
 use cbformat::pgnfile;
 use cbformat::view::Base;
@@ -269,5 +269,88 @@ fn a_broken_heads_file_is_built_again() {
     let before = ROWS_READ.load(Ordering::Relaxed);
     assert_eq!(answers(&open.db, &open.indexes), plain);
     assert!(ROWS_READ.load(Ordering::Relaxed) > before, "the new file's rows were read");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Waits for `paths` to exist, as the names files are written on a thread of
+/// their own.
+fn written(paths: &[PathBuf]) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !paths.iter().all(|p| p.exists()) {
+        assert!(std::time::Instant::now() < until, "the names files were written");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// With a heads file set, the name tables read from the database are written
+/// beside it, and the next indexes read them from there and answer the same.
+fn names_come_back(db: &Base, name: &str, kinds: &[&str]) {
+    let plain = answers(db, &Indexes::default());
+    let dir = scratch(&format!("names-{name}"));
+    let heads_path = heads::path(&dir, ID);
+    let h = Arc::new(built(db, &heads_path));
+    let first = Indexes::default();
+    first.set_heads(Arc::clone(&h));
+    assert_eq!(answers(db, &first), plain, "{name}: reading the names");
+    written(&kinds.iter().map(|k| heads_path.with_extension(k)).collect::<Vec<_>>());
+    let before = NAME_FILES_READ.load(Ordering::Relaxed);
+    let second = Indexes::default();
+    second.set_heads(h);
+    assert_eq!(answers(db, &second), plain, "{name}: from the names files");
+    assert!(NAME_FILES_READ.load(Ordering::Relaxed) - before >= kinds.len() as u64, "{name}: the files were read");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn name_tables_come_back_from_their_files() {
+    let two = fixture_of("names-2cbh", &many(40_000, &["text", "analysis", "deleted"]));
+    names_come_back(&Base::open(two.dir().join("db.2cbh")).unwrap(), "2cbh", &["players", "tournaments"]);
+    let all = many(40_000, &["text", "deleted"]);
+    let extra: Vec<&str> = all[rows(&[]).len()..].iter().map(String::as_str).collect();
+    let classic = classic_fixture("names-cbh", &extra);
+    names_come_back(&Base::open(classic.dir().join("db.cbh")).unwrap(), "cbh", &["players", "tournaments"]);
+    let games: Vec<String> =
+        many(20_000, &[]).into_iter().filter(|l| l.split('|').nth(1).unwrap().trim() == "game").collect();
+    let fp = pgn_fixture("names-pgn", &games);
+    let (pgn, index) = (fp.dir().join("db.pgn"), fp.dir().join("db.head"));
+    pgnfile::build(&pgn, &index, 1, CodePage::WESTERN, &mut |_| true).unwrap();
+    let db = Base::Pgn(pgnfile::Database::open(&pgn, &index, 1, CodePage::WESTERN).unwrap());
+    names_come_back(&db, "pgn", &["players", "tournaments", "annotators"]);
+}
+
+#[test]
+fn a_damaged_names_file_is_read_from_the_database_and_written_again() {
+    let two = fixture_of("names-damaged", &many(40_000, &["text", "analysis", "deleted"]));
+    let db = Base::open(two.dir().join("db.2cbh")).unwrap();
+    let plain = answers(&db, &Indexes::default());
+    let dir = scratch("names-damaged");
+    let heads_path = heads::path(&dir, ID);
+    let h = Arc::new(built(&db, &heads_path));
+    let first = Indexes::default();
+    first.set_heads(Arc::clone(&h));
+    answers(&db, &first);
+    let players = heads_path.with_extension("players");
+    written(std::slice::from_ref(&players));
+    let whole = std::fs::read(&players).unwrap();
+    for at in [70, whole.len() / 2, whole.len() - 1] {
+        let mut bad = whole.clone();
+        bad[at] ^= 0x21;
+        std::fs::write(&players, &bad).unwrap();
+        let again = Indexes::default();
+        again.set_heads(Arc::clone(&h));
+        assert_eq!(answers(&db, &again), plain, "byte {at} damaged");
+        // Written again from the table read from the database: whole, though
+        // its chunks may fall otherwise when fewer workers were free.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::fs::read(&players).unwrap() == bad {
+            assert!(std::time::Instant::now() < until, "byte {at}: the file was written again");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let before = NAME_FILES_READ.load(Ordering::Relaxed);
+        let fresh = Indexes::default();
+        fresh.set_heads(Arc::clone(&h));
+        assert_eq!(answers(&db, &fresh), plain, "byte {at}: from the file written again");
+        assert!(NAME_FILES_READ.load(Ordering::Relaxed) > before, "byte {at}: the file written again was read");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

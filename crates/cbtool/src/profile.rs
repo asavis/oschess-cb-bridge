@@ -623,6 +623,38 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         table.row("search+heads", &format!("{name} cold"), &mut cold, present);
     }
 
+    // The names files (#108): the bridge above wrote its name tables beside
+    // the heads file. A third bridge reads them from there for its first sort
+    // by white, suggestion and player search.
+    let names: Vec<PathBuf> = ["players", "tournaments"].iter().map(|k| heads.with_extension(k)).collect();
+    let waited = Instant::now();
+    while !names.iter().all(|p| p.exists()) && waited.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
+    let third = spawn(&o)?;
+    let mut third_client = Client::new(third.port);
+    let base = format!("/v1/databases/{}", third.id);
+    for key in ["white", "tournament"] {
+        let mut cold = Samples::default();
+        cold.get(&mut third_client, &format!("{base}/games?sort={key}&limit=500"), true);
+        table.row("sort+names", &format!("{key} cold"), &mut cold, have);
+    }
+    let fourth = spawn(&o)?;
+    let mut fourth_client = Client::new(fourth.port);
+    let base = format!("/v1/databases/{}", fourth.id);
+    let mut suggestion = Samples::default();
+    suggestion.get(&mut fourth_client, &format!("{base}/suggest?field=player&prefix=m"), true);
+    table.row("suggest+names", "player, first after start", &mut suggestion, have);
+    if let Some((_, q)) = searches.iter().find(|(name, _)| *name == "player") {
+        let fifth = spawn(&o)?;
+        let mut fifth_client = Client::new(fifth.port);
+        let mut cold = Samples::default();
+        let path = format!("/v1/databases/{}/games?limit=500&q={}", fifth.id, encode(q));
+        cold.get(&mut fifth_client, &path, true);
+        table.row("search+names", "player, first after start", &mut cold, have);
+    }
+
     // The engine, when one is given: the first line of a 5-second search, and
     // the lines a second after it.
     if o.engine.is_some() {

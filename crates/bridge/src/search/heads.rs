@@ -237,9 +237,15 @@ fn partial_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// The database id of a heads folder entry: `<id>.heads` or `<id>.heads.partial`.
+/// What the heads sweep keeps and removes: the heads file and the names
+/// files beside it (#108).
+const KEPT: [&str; 4] = [".heads", ".players", ".tournaments", ".annotators"];
+
+/// The database id of a heads folder entry: `<id>` and one of [`KEPT`],
+/// perhaps followed by `.partial`.
 pub fn entry_id(name: &str) -> Option<&str> {
-    let id = name.strip_suffix(".heads").or_else(|| name.strip_suffix(".heads.partial"))?;
+    let whole = name.strip_suffix(".partial").unwrap_or(name);
+    let id = KEPT.iter().find_map(|ext| whole.strip_suffix(ext))?;
     (id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some(id)
 }
 
@@ -380,8 +386,14 @@ pub static ROWS_READ: AtomicU64 = AtomicU64::new(0);
 /// (`explorer::format::crc32`) at several times its speed, for the rows of
 /// every block the first pass reads.
 pub fn crc32(bytes: &[u8]) -> u32 {
+    !crc32_update(!0, bytes)
+}
+
+/// Continues a CRC-32 over `bytes` from `state`, which starts at `!0`; the
+/// CRC of all the bytes so fed is `!state`.
+pub fn crc32_update(state: u32, bytes: &[u8]) -> u32 {
     let t = &*TABLES;
-    let mut c = !0u32;
+    let mut c = state;
     let (chunks, rest) = bytes.as_chunks::<8>();
     for b in chunks {
         let lo = c ^ u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -397,7 +409,7 @@ pub fn crc32(bytes: &[u8]) -> u32 {
     for &b in rest {
         c = t[0][((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
     }
-    !c
+    c
 }
 
 static TABLES: std::sync::LazyLock<[[u32; 256]; 8]> = std::sync::LazyLock::new(|| {
@@ -442,6 +454,8 @@ mod tests {
     fn only_the_bridges_own_names_are_heads_entries() {
         assert_eq!(entry_id("0123456789abcdef.heads"), Some("0123456789abcdef"));
         assert_eq!(entry_id("0123456789abcdef.heads.partial"), Some("0123456789abcdef"));
+        assert_eq!(entry_id("0123456789abcdef.players"), Some("0123456789abcdef"));
+        assert_eq!(entry_id("0123456789abcdef.annotators.partial"), Some("0123456789abcdef"));
         assert_eq!(entry_id("0123456789abcdef.idx"), None);
         assert_eq!(entry_id("notes.heads"), None);
     }

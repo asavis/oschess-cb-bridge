@@ -3,8 +3,12 @@
 //! substring matching for search, ranks for sorting, identities for
 //! suggestions. Their memory is reserved in the search budget as it grows.
 
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cbformat::game::{Player, Tournament};
 
@@ -56,6 +60,10 @@ fn push_str(s: &mut String, add: &str, allow: &mut Allowance<'_>) -> Result<(), 
 
 pub struct NameTable {
     len: usize,
+    /// Where the table is to be written once it is shared, and for which
+    /// generation: set for a table read from the database while a heads file
+    /// is set (#108).
+    write_to: Mutex<Option<(PathBuf, Kind, u64)>>,
     /// Ids per chunk; the last chunk may hold fewer.
     per: usize,
     chunks: Vec<Chunk>,
@@ -126,7 +134,7 @@ impl NameTable {
             Ok(read as usize)
         };
         let (per, chunks, hold) = NameTable::read(count, &names, cancel)?;
-        Ok(NameTable { len: count, per, chunks, keys, _hold: hold })
+        Ok(NameTable { len: count, write_to: Mutex::default(), per, chunks, keys, _hold: hold })
     }
 
     /// Reads the names of ids `0..count` on the workers, each worker a range
@@ -260,6 +268,198 @@ impl NameTable {
     }
 }
 
+const FILE_MAGIC: [u8; 8] = *b"OSCBNAM\0";
+const FILE_VERSION: u32 = 1;
+const FILE_HEADER: usize = 64;
+
+/// Name tables read from their files, for tests.
+pub static FILES_READ: AtomicU64 = AtomicU64::new(0);
+
+/// The names file of `kind` beside the heads file `heads` (#108).
+pub fn file_path(heads: &Path, kind: Kind) -> Option<PathBuf> {
+    let ext = match kind {
+        Kind::Players => "players",
+        Kind::Tournaments => "tournaments",
+        Kind::Annotators => "annotators",
+        Kind::Titles => return None,
+    };
+    Some(heads.with_extension(ext))
+}
+
+fn kind_code(kind: Kind) -> u32 {
+    match kind {
+        Kind::Players => 1,
+        Kind::Tournaments => 2,
+        Kind::Annotators => 3,
+        Kind::Titles => 4,
+    }
+}
+
+impl NameTable {
+    /// Marks the table to be written as the names file `path` of `kind` at
+    /// `generation`, by [`NameTable::write_later`].
+    pub(super) fn to_be_written(&self, path: PathBuf, kind: Kind, generation: u64) {
+        *self.write_to.lock().unwrap_or_else(|e| e.into_inner()) = Some((path, kind, generation));
+    }
+
+    /// Writes the table on a thread of its own when it is marked to be, once.
+    pub(super) fn write_later(self: &std::sync::Arc<Self>) {
+        let Some((path, kind, generation)) = self.write_to.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let table = std::sync::Arc::clone(self);
+        let _ =
+            std::thread::Builder::new().name("bridge-names".into()).stack_size(crate::THREAD_STACK).spawn(move || {
+                if let Err(e) = table.write_file(&path, kind, generation) {
+                    eprintln!("oschess-bridge: writing a names file failed: {e}");
+                }
+            });
+    }
+
+    /// Writes the table as the names file `path` of `kind` at `generation`:
+    /// as `<path>.partial`, then renamed.
+    pub fn write_file(&self, path: &Path, kind: Kind, generation: u64) -> std::io::Result<()> {
+        let mut partial = path.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&partial)?);
+        out.write_all(&[0u8; FILE_HEADER])?;
+        let (mut crc, mut body_len) = (!0u32, 0u64);
+        let mut put = |out: &mut BufWriter<File>, bytes: &[u8]| -> std::io::Result<()> {
+            crc = super::heads::crc32_update(crc, bytes);
+            body_len += bytes.len() as u64;
+            out.write_all(bytes)
+        };
+        for c in &self.chunks {
+            for v in [c.first as u64, c.name_ends.len() as u64, c.names.len() as u64, c.lower.len() as u64] {
+                put(&mut out, &v.to_le_bytes())?;
+            }
+            put(&mut out, c.names.as_bytes())?;
+            put(&mut out, c.lower.as_bytes())?;
+            for list in [&c.name_ends, &c.lower_ends, &c.given] {
+                let bytes: Vec<u8> = list.iter().flat_map(|v| v.to_le_bytes()).collect();
+                put(&mut out, &bytes)?;
+            }
+        }
+        let mut file = out.into_inner().map_err(|e| e.into_error())?;
+        let mut h = [0u8; FILE_HEADER];
+        h[0..8].copy_from_slice(&FILE_MAGIC);
+        h[8..12].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        h[12..16].copy_from_slice(&kind_code(kind).to_le_bytes());
+        h[16..24].copy_from_slice(&generation.to_le_bytes());
+        h[24..32].copy_from_slice(&(self.len as u64).to_le_bytes());
+        h[32..40].copy_from_slice(&(self.per as u64).to_le_bytes());
+        h[40..44].copy_from_slice(&(self.chunks.len() as u32).to_le_bytes());
+        h[44..48].copy_from_slice(&(!crc).to_le_bytes());
+        h[48..56].copy_from_slice(&body_len.to_le_bytes());
+        let header_crc = super::heads::crc32(&h[..60]);
+        h[60..64].copy_from_slice(&header_crc.to_le_bytes());
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&h)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&partial, path)
+    }
+
+    /// The table of `kind` from the names file `path`, when it was written
+    /// at `generation` for `count` names and reads back whole; `None`
+    /// otherwise, and the table is read from the database instead. Its
+    /// memory is reserved in the search budget first.
+    pub fn open_file(path: &Path, kind: Kind, generation: u64, count: usize) -> Option<Result<NameTable, SearchError>> {
+        let file = File::open(path).ok()?;
+        let size = file.metadata().ok()?.len();
+        let mut r = BufReader::with_capacity(1 << 20, file);
+        let mut h = [0u8; FILE_HEADER];
+        r.read_exact(&mut h).ok()?;
+        let (u32_at, u64_at) = (
+            |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap()),
+            |at: usize| u64::from_le_bytes(h[at..at + 8].try_into().unwrap()),
+        );
+        if h[0..8] != FILE_MAGIC
+            || u32_at(8) != FILE_VERSION
+            || super::heads::crc32(&h[..60]) != u32_at(60)
+            || u32_at(12) != kind_code(kind)
+            || u64_at(16) != generation
+            || u64_at(24) != count as u64
+            || size != FILE_HEADER as u64 + u64_at(48)
+        {
+            return None;
+        }
+        let (per, chunks, body_crc) = (usize::try_from(u64_at(32)).ok()?, u32_at(40) as usize, u32_at(44));
+        if per == 0 && count > 0 || chunks > count.max(1) {
+            return None;
+        }
+        let hold = match Hold::reserve(size as usize) {
+            Ok(h) => h,
+            Err(e) => return Some(Err(e.into())),
+        };
+        let (mut crc, mut consumed) = (!0u32, 0u64);
+        let body_len = u64_at(48);
+        let mut take = |r: &mut BufReader<File>, n: usize| -> Option<Vec<u8>> {
+            consumed = consumed.checked_add(n as u64).filter(|&c| c <= body_len)?;
+            let mut v = Vec::new();
+            v.try_reserve_exact(n).ok()?;
+            v.resize(n, 0);
+            r.read_exact(&mut v).ok()?;
+            crc = super::heads::crc32_update(crc, &v);
+            Some(v)
+        };
+        let mut out = Vec::with_capacity(chunks);
+        let mut seen = 0usize;
+        for i in 0..chunks {
+            let head = take(&mut r, 32)?;
+            let field = |at: usize| usize::try_from(u64::from_le_bytes(head[at..at + 8].try_into().unwrap())).ok();
+            let (first, n, names_len, lower_len) = (field(0)?, field(8)?, field(16)?, field(24)?);
+            if first != i * per
+                || first != seen
+                || n > count - seen
+                || names_len > size as usize
+                || lower_len > size as usize
+            {
+                return None;
+            }
+            let names = String::from_utf8(take(&mut r, names_len)?).ok()?;
+            let lower = String::from_utf8(take(&mut r, lower_len)?).ok()?;
+            let mut list = || -> Option<Vec<u32>> {
+                let bytes = take(&mut r, n.checked_mul(4)?)?;
+                Some(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect())
+            };
+            let (name_ends, lower_ends, given) = (list()?, list()?, list()?);
+            // Every part a lookup slices must lie on the text's own bounds.
+            let bounded = |text: &str, ends: &[u32]| {
+                ends.windows(2).all(|w| w[0] <= w[1])
+                    && ends.last().is_none_or(|&e| e as usize == text.len())
+                    && ends.iter().all(|&e| text.is_char_boundary(e as usize))
+            };
+            if !bounded(&names, &name_ends) || !bounded(&lower, &lower_ends) {
+                return None;
+            }
+            let starts = std::iter::once(0).chain(lower_ends.iter().copied());
+            if !starts
+                .zip(&lower_ends)
+                .zip(&given)
+                .all(|((start, &end), &g)| g == 0 || (g <= end - start && lower.is_char_boundary((start + g) as usize)))
+            {
+                return None;
+            }
+            seen += n;
+            out.push(Chunk { first, names, name_ends, lower, lower_ends, given });
+        }
+        if seen != count || consumed != body_len || !crc != body_crc {
+            return None;
+        }
+        FILES_READ.fetch_add(1, Ordering::Relaxed);
+        Some(Ok(NameTable {
+            len: count,
+            write_to: Mutex::default(),
+            per: per.max(1),
+            chunks: out,
+            keys: None,
+            _hold: hold,
+        }))
+    }
+}
+
 /// Positions in one case-insensitive name order over several tables together,
 /// per table and id: a tournament and a guiding text's title sort among each
 /// other. Names equal but for case share a position, so that sorting falls back
@@ -377,7 +577,14 @@ mod tests {
             c.lower_ends.push(c.lower.len() as u32);
             c.given.push(0);
         }
-        NameTable { len: names.len(), per: names.len().max(1), chunks: vec![c], keys: None, _hold: Hold::default() }
+        NameTable {
+            len: names.len(),
+            write_to: Mutex::default(),
+            per: names.len().max(1),
+            chunks: vec![c],
+            keys: None,
+            _hold: Hold::default(),
+        }
     }
 
     #[test]
