@@ -369,8 +369,8 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
 
     // One game as PGN: the first game, and the most annotated one of the first
     // records, in the reading and the full form.
-    let (annotated, notes) = most_annotated(&o)?;
-    for (which, number) in [("first game", 1), ("most annotated", annotated)] {
+    let (first_game, annotated, notes) = scan_games(&o)?;
+    for (which, number) in [("first game", first_game), ("most annotated", annotated)] {
         for (form, extra) in [("reading", ""), ("full", "?annotations=full")] {
             let path = format!("{base}/games/{number}{extra}");
             let (body, cold) = timed(|| c.ok(&path));
@@ -444,11 +444,13 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     Ok(true)
 }
 
-/// The game with the most annotations among the first records, and how many
-/// it has; game 1 when none has any.
-fn most_annotated(o: &Options) -> AnyResult<(u32, usize)> {
+/// The first game among the first records, which need not be record 1 (a
+/// database may open with guiding texts), the most annotated of them, and how
+/// many annotations it has.
+fn scan_games(o: &Options) -> AnyResult<(u32, u32, usize)> {
     let db = Base::open(&o.db)?;
     let last = db.record_count().min(ANNOTATED_SCAN);
+    let mut first_game = None;
     let mut best = (1, 0);
     let mut first = 1;
     while first <= last {
@@ -457,6 +459,7 @@ fn most_annotated(o: &Options) -> AnyResult<(u32, usize)> {
             if h.kind() != RecordKind::Game || h.is_deleted() {
                 continue;
             }
+            first_game.get_or_insert(h.id());
             if let Ok(Some(a)) = db.annotations_of(&h) {
                 let n: usize = a.blocks.iter().map(|b| b.annotations.len()).sum();
                 if n > best.1 {
@@ -466,7 +469,11 @@ fn most_annotated(o: &Options) -> AnyResult<(u32, usize)> {
         }
         first = upto + 1;
     }
-    Ok(best)
+    let first_game = first_game.ok_or("no game among the first records")?;
+    if best.1 == 0 {
+        best.0 = first_game;
+    }
+    Ok((first_game, best.0, best.1))
 }
 
 #[cfg(test)]
