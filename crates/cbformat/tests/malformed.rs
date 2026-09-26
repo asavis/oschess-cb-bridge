@@ -1,6 +1,7 @@
 //! Damaged and hostile inputs must produce errors, never panics or silently
 //! incomplete output.
 
+use cbformat::Error;
 use cbformat::fixture::{Builder, TempDb, bytes, lid_header, quiet, sq};
 use cbformat::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece};
 use cbformat::pgn::{self, movetext_of};
@@ -194,6 +195,123 @@ fn stored_counts_are_bounded_by_the_file() {
     assert_eq!(Database::open(f.base()).unwrap().entities().stored_count(0), 0);
 }
 
+/// Entity records read many at a time are the ones read one by one: players
+/// in 64-byte containers beside 48-byte tournaments, so an id's block is 112
+/// bytes, with an unused id, damaged lengths, a name longer than a small
+/// limit, ids past the header's count, and a file ending inside player 9.
+#[test]
+fn entities_read_many_at_once_read_as_each_alone() {
+    let (player, tournament) = (64usize, 48usize);
+    let mut lid = 184i32.to_be_bytes().to_vec();
+    lid.extend(2i32.to_be_bytes());
+    for size in [player, tournament] {
+        lid.extend((size as i32).to_be_bytes());
+        lid.extend(12i64.to_be_bytes());
+        lid.extend((-1i64).to_be_bytes());
+    }
+    lid.resize(184, 0);
+    let field = |s: &[u8]| [(s.len() as i32).to_le_bytes().to_vec(), s.to_vec()].concat();
+    let container = |record: Vec<u8>, length: i32, size: usize| {
+        let mut c = length.to_le_bytes().to_vec();
+        c.extend(record);
+        c.resize(size, 0);
+        c
+    };
+    for id in 0..10 {
+        let name = format!("Player{id}").into_bytes();
+        let record = [field(&name), field(b"Ann")].concat();
+        let length = match id {
+            1 => 0,
+            2 => 1000,
+            4 => -5,
+            _ => record.len() as i32,
+        };
+        let record = if id == 3 { [field(&[b'x'; 40]), field(b"")].concat() } else { record };
+        let length = if id == 3 { record.len() as i32 } else { length };
+        let mut block = container(record, length, player);
+        let place =
+            [field(b"Wijk"), field(format!("Open {id}").as_bytes()), 20240101i32.to_le_bytes().to_vec()].concat();
+        block.extend(container(place.clone(), place.len() as i32, tournament));
+        if id == 9 {
+            block.truncate(24);
+        }
+        lid.extend(block);
+    }
+    let f = fixture("entity-runs", lid, |_| {});
+    let db = Database::open(f.base()).unwrap();
+    let e = db.entities();
+    let mut buf = vec![0u8; 1 << 12];
+    for typ in [0, 1, 7] {
+        for len in [0, 10, 63, 64, 112, 176, 400, 1 << 12] {
+            for limit in [8, 20, 4 << 10] {
+                for (first, end) in [(-1, 3), (0, 15), (3, 9), (8, 12), (9, 10), (12, 20), (5, 5)] {
+                    let mut got = Vec::new();
+                    let mut id = first;
+                    while id < end {
+                        let read = e
+                            .read_within(typ, id..end, &mut buf[..len], limit, &mut |r| {
+                                got.push(r.map(<[u8]>::to_vec));
+                                Ok::<(), Error>(())
+                            })
+                            .unwrap();
+                        assert!(read >= 1 && id + read as i64 <= end, "{typ} {len} {limit} {id}..{end}: {read}");
+                        id += read as i64;
+                    }
+                    let each: Vec<_> = (first..end).map(|id| e.raw_within(typ, id, limit).unwrap()).collect();
+                    assert_eq!(got, each, "type {typ}, {len}-byte buffer, limit {limit}, ids {first}..{end}");
+                }
+            }
+        }
+    }
+    let mut read =
+        |len: usize| e.read_within(0, 0..15, &mut buf[..len], 4 << 10, &mut |_| Ok::<(), Error>(())).unwrap();
+    assert_eq!(read(400), 4, "three whole blocks and a player's container");
+    assert_eq!(read(63), 1, "less than a container: one alone");
+    assert_eq!(e.read_within(0, 5..5, &mut buf, 64, &mut |_| Ok::<(), Error>(())).unwrap(), 0);
+    let mut players = Vec::new();
+    e.read_players_within(0..12, &mut buf, 4 << 10, &mut |p| {
+        players.push(p);
+        Ok::<(), Error>(())
+    })
+    .unwrap();
+    assert_eq!(players, (0..12).map(|id| e.player_within(id, 4 << 10).unwrap()).collect::<Vec<_>>());
+    assert_eq!(players[0].as_ref().map(|p| p.last.as_str()), Some("Player0"));
+    let mut tournaments = Vec::new();
+    e.read_tournaments_within(0..12, &mut buf, 4 << 10, &mut |t| {
+        tournaments.push(t);
+        Ok::<(), Error>(())
+    })
+    .unwrap();
+    assert_eq!(tournaments, (0..12).map(|id| e.tournament_within(id, 4 << 10).unwrap()).collect::<Vec<_>>());
+    assert_eq!(tournaments[8].as_ref().map(|t| t.title.as_str()), Some("Open 8"));
+}
+
+/// A block larger than 64 KiB, which no real file has, is read a container
+/// at a time, so that a small limit bounds what is read for each id.
+#[test]
+fn huge_entity_blocks_are_read_one_container_at_a_time() {
+    let container = 64 << 10;
+    let mut lid = lid_header(container + 1, 3);
+    for id in 0..3 {
+        let mut c = player_record(format!("P{id}").as_bytes());
+        c.resize(container as usize + 1, 0);
+        lid.extend(c);
+    }
+    let f = fixture("entity-huge-blocks", lid, |_| {});
+    let db = Database::open(f.base()).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut names = Vec::new();
+    let read = db
+        .entities()
+        .read_players_within(0..3, &mut buf, 64, &mut |p| {
+            names.push(p.map(|p| p.last));
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+    assert_eq!(read, 1);
+    assert_eq!(names, [Some("P0".to_string())]);
+}
+
 #[test]
 fn an_entity_file_truncated_after_opening_is_an_error() {
     // Player 0, the white and black of the game: "Tester, Ann".
@@ -211,6 +329,8 @@ fn an_entity_file_truncated_after_opening_is_an_error() {
     assert!(text.contains("[White \"Tester, Ann\"]"), "{text}");
     std::fs::OpenOptions::new().write(true).open(f.dir().join("db.2lid")).unwrap().set_len(184).unwrap();
     assert!(db.entities().player(0).is_err());
+    let each = &mut |_| Ok::<(), cbformat::Error>(());
+    assert!(db.entities().read_players_within(0..1, &mut [0u8; 4096], 64, each).is_err());
     assert!(pgn::game(&db, 1).is_err());
 }
 
