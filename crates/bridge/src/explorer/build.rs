@@ -119,12 +119,21 @@ fn merge_parts(
     progress: &Progress,
     share: usize,
 ) -> Result<Vec<Part>, SearchError> {
+    // One range's buffers and writer are waited for, as one merge of all the
+    // ranges would wait for them; more ranges at once only as far as the
+    // budget holds them now, all reserved before any is merged.
     let each = runs.len() * RUN_BUFFER + WRITER_BYTES;
-    let want = threads().div_ceil(2).min(PARTS).min(share / each).max(1);
+    let mut memory = runs::reserve(each, progress)?;
+    let mut want = threads().div_ceil(2).min(PARTS).min(share / each).max(1);
+    while want > 1 && memory.grow_quietly((want - 1) * each).is_err() {
+        want -= 1;
+    }
+    // Each run's file is opened once, for all the ranges.
+    let files = runs::open(runs)?;
     let merged: Vec<Mutex<Option<Part>>> = (0..PARTS).map(|_| Mutex::new(None)).collect();
     workers::run(want, 0, &Cancel::never(), |w| {
         for k in (w.index..PARTS).step_by(w.count) {
-            let part = merge_part(runs, k, dir, prune_ply, progress, &|| w.stopped())?;
+            let part = merge_part(runs, &files, k, dir, prune_ply, progress, &|| w.stopped())?;
             *merged[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(part);
         }
         Ok(())
@@ -135,16 +144,17 @@ fn merge_parts(
         .collect()
 }
 
-/// Merges part `k` of `runs` into its file in `dir`.
+/// Merges part `k` of `runs`, read from their `files`, into its file in `dir`;
+/// the caller holds the memory.
 fn merge_part(
     runs: &[Run],
+    files: &[File],
     k: usize,
     dir: &Path,
     prune_ply: u8,
     progress: &Progress,
     stopped: &dyn Fn() -> bool,
 ) -> Result<Part, SearchError> {
-    let _writer_memory = runs::reserve(WRITER_BYTES, progress)?;
     let mut writer = Writer::create(&dir.join(format!("part-{k}")))?;
     let mut agg = Aggregate::default();
     let (mut games, mut done, mut positions) = (0u64, 0u64, 0u64);
@@ -152,7 +162,7 @@ fn merge_part(
         progress.done.fetch_add(std::mem::take(done), Ordering::Relaxed);
         progress.positions.fetch_add(std::mem::take(positions), Ordering::Relaxed);
     };
-    runs::merge_part(runs, k, progress, |e| {
+    runs::merge_part(runs, files, k, |e| {
         if progress.stop.load(Ordering::Relaxed) || stopped() {
             return Err(SearchError::Superseded);
         }

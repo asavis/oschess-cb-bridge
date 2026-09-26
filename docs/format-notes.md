@@ -422,10 +422,14 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   entries into its record as it passes them. It runs apart for sixteen ranges
   of keys, split by the keys' top four bits: keys are hashes, so the ranges
   hold about as many positions. Each run notes where each range starts in it,
-  and up to half the workers merge a range each, as many at once as half the
-  budget holds with their runs' buffers and writers, into a file of the
-  range's blocks. The index is then those files in key order, copied behind
-  the header, and the table of all their blocks. Half the budget is at least
+  and up to half the workers merge a range each into a file of the range's
+  blocks. The memory of one range, its runs' buffers and a writer, is waited
+  for as the one merge waited for it; more ranges merge at once only as far as
+  the budget holds theirs now, all reserved before any starts. Each run's file
+  is opened once, and every range reads it at its own offsets, so a merge
+  keeps no more files open than one merge of all the runs. The index is then
+  those files in key order, copied behind the header, and the table of all
+  their blocks. Half the budget is at least
   8 MiB, which holds the writer and 30 runs; a smaller share fails the build
   as too large rather than waiting for memory the build holds itself.
 
