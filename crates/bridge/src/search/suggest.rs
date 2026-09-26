@@ -36,34 +36,46 @@ fn counts<S: Store>(
         Ok(v)
     };
     let (p, a, t) = (zeros(np)?, zeros(na)?, zeros(nt)?);
-    let group =
-        |g: &Groups, id: i64| usize::try_from(id).ok().and_then(|i| g.of_id.get(i)).copied().filter(|&x| x != NO_GROUP);
-    let bump = |v: &[AtomicU32], g: Option<u32>| {
-        if let Some(g) = g {
-            v[g as usize].fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    scan::scan(
-        db,
-        ctl,
-        |_| Ok(()),
-        |_, r| {
-            if matches!(r.kind(), RecordKind::Game) {
-                // A game counts once for a name, whichever colours carry it.
-                let (w, b) = (group(players, r.white()), group(players, r.black()));
-                bump(&p, w);
-                if b != w {
-                    bump(&p, b);
-                }
-                bump(&a, group(annotators, r.annotator()));
-                bump(&t, group(tournaments, r.tournament()));
-            }
-            Ok(())
-        },
-        |_| {},
-    )?;
+    let counting = Counting { players, annotators, tournaments, p: &p, a: &a, t: &t };
+    scan::scan(db, ctl, |_| Ok(()), &counting, |_| {})?;
     let plain = |v: Vec<AtomicU32>| v.into_iter().map(AtomicU32::into_inner).collect();
     Ok(Held::new(Counts { players: plain(p), annotators: plain(a), tournaments: plain(t) }, hold))
+}
+
+/// Each game's count for its names' groups.
+struct Counting<'a> {
+    players: &'a Groups,
+    annotators: &'a Groups,
+    tournaments: &'a Groups,
+    p: &'a [AtomicU32],
+    a: &'a [AtomicU32],
+    t: &'a [AtomicU32],
+}
+
+impl scan::Visit<()> for Counting<'_> {
+    fn visit(&self, _: &mut (), r: &impl Head) -> Result<(), SearchError> {
+        if matches!(r.kind(), RecordKind::Game) {
+            // A game counts once for a name, whichever colours carry it.
+            let (w, b) = (group(self.players, r.white()), group(self.players, r.black()));
+            bump(self.p, w);
+            if b != w {
+                bump(self.p, b);
+            }
+            bump(self.a, group(self.annotators, r.annotator()));
+            bump(self.t, group(self.tournaments, r.tournament()));
+        }
+        Ok(())
+    }
+}
+
+fn group(g: &Groups, id: i64) -> Option<u32> {
+    usize::try_from(id).ok().and_then(|i| g.of_id.get(i)).copied().filter(|&x| x != NO_GROUP)
+}
+
+fn bump(v: &[AtomicU32], g: Option<u32>) {
+    if let Some(g) = g {
+        v[g as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +120,8 @@ fn suggest_in<S: Store>(
     limit: usize,
 ) -> Result<Held<Vec<Suggestion>>, SearchError> {
     let never = Cancel::never();
-    let ctl = Control { cancel: &never, scanned: &idx.scanned };
+    let heads = idx.heads();
+    let ctl = Control { cancel: &never, scanned: &idx.scanned, heads: heads.as_deref() };
     let players = idx.names(db, Kind::Players, &never)?;
     let annotators = idx.names(db, Kind::Annotators, &never)?;
     let tournaments = idx.names(db, Kind::Tournaments, &never)?;

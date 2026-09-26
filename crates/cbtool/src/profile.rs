@@ -603,6 +603,26 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         table.row("index", "new bridge, first answer", &mut open, "");
     }
 
+    // The heads file (#106): the first bridge built it after its first sort.
+    // The new one, its caches empty, answers its first sorts, suggestion and
+    // searches from it.
+    let heads = o.index.join(format!("{}.heads", again.id));
+    let present = if heads.exists() { "from the heads file" } else { "no heads file" };
+    let base = format!("/v1/databases/{}", again.id);
+    for key in SORT_KEYS {
+        let mut cold = Samples::default();
+        cold.get(&mut fresh_client, &format!("{base}/games?sort={key}&limit=500"), true);
+        table.row("sort+heads", &format!("{key} cold"), &mut cold, present);
+    }
+    let mut suggestion = Samples::default();
+    suggestion.get(&mut fresh_client, &format!("{base}/suggest?field=player&prefix=m"), true);
+    table.row("suggest+heads", "player, first ever", &mut suggestion, present);
+    for (name, q) in &searches {
+        let mut cold = Samples::default();
+        cold.get(&mut fresh_client, &format!("{base}/games?limit=500&q={}", encode(q)), true);
+        table.row("search+heads", &format!("{name} cold"), &mut cold, present);
+    }
+
     // The engine, when one is given: the first line of a 5-second search, and
     // the lines a second after it.
     if o.engine.is_some() {

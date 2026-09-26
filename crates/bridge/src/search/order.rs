@@ -10,7 +10,7 @@ use super::SearchError;
 use super::memory::{Cancel, Held, Hold, Refused};
 use super::names::NameTable;
 use super::query::{Sort, SortKey};
-use super::scan::{Control, scan};
+use super::scan::{Control, Visit, scan};
 use super::workers::{self, threads};
 use crate::store::{Head, Store};
 
@@ -83,6 +83,20 @@ fn key(r: &impl Head, key: SortKey, ranks: &Ranks<'_>) -> u32 {
     }
 }
 
+/// Each record's packed key and number, for a worker's run.
+struct Keys<'r, 'a> {
+    key: SortKey,
+    ranks: &'r Ranks<'a>,
+    flip: u32,
+}
+
+impl Visit<Vec<u64>> for Keys<'_, '_> {
+    fn visit(&self, run: &mut Vec<u64>, r: &impl Head) -> Result<(), SearchError> {
+        run.push((u64::from(key(r, self.key, self.ranks) ^ self.flip) << 32) | u64::from(r.id()));
+        Ok(())
+    }
+}
+
 /// Bytes a sort order needs while it is built: a key and number per record,
 /// and the finished order.
 pub fn build_bytes(records: u32) -> usize {
@@ -110,10 +124,7 @@ pub fn build<S: Store>(
             run.try_reserve_exact(len).map_err(|_| Refused::Busy)?;
             Ok(run)
         },
-        |run, r| {
-            run.push((u64::from(key(r, sort.key, ranks) ^ flip) << 32) | u64::from(r.id()));
-            Ok(())
-        },
+        &Keys { key: sort.key, ranks, flip },
         // Each worker sorts its own range; the ranges are merged below.
         |run| run.sort_unstable(),
     )?;
