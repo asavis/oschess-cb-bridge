@@ -786,6 +786,35 @@ body: one JSON object per line, until the search ends.
 body from `fetch` as a stream. The engine runs at below-normal priority, starts
 with the first request and ends after ten minutes without one.
 
+### `GET /v1/engine/warm`
+
+Starts the engine before an analysis asks for it (#110). Stockfish's own start
+(the process, its network and its hash) takes about half a second, and it
+recurs at the first analysis after ten minutes without one. The web app asks
+for a warm-up when an analysis page opens with the bridge's engine chosen, and
+when that page is shown again after a while.
+
+| Parameter | Meaning |
+|---|---|
+| `threads` | As for `/v1/engine/analyze`: the `Threads` the next analysis will ask for. |
+| `hash` | As for `/v1/engine/analyze`: its `Hash` in MB. |
+
+The engine's process starts when none runs. `Threads` and `Hash` are sent where
+they differ from the process's, then `isready`, and the answer comes once the
+engine is ready:
+
+```json
+{"engine":"ready"}
+```
+
+An analysis with the same `threads` and `hash` then sends neither and only
+searches. While an analysis runs, the engine is left to it and the answer is
+`{"engine":"busy"}`. A warm-up counts as use: the ten minutes start again from
+it. Bad `threads` or `hash` are `400 bad_request`, as for `analyze`; without
+an engine the answer is `409 no_engine`, and an engine that cannot be started
+or is not ready is `502 engine_failed`. A client ignores the answer: an older
+bridge without this route answers `404`.
+
 ## Pairing
 
 On first run, and from the tray menu's «Open oschess», the bridge opens

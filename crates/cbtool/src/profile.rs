@@ -626,7 +626,15 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     // The engine, when one is given: the first line of a 5-second search, and
     // the lines a second after it.
     if o.engine.is_some() {
-        engine(&mut table, &mut fresh_client);
+        engine(&mut table, &mut fresh_client, "first line");
+        // A new bridge whose engine is warmed up first (#110), as the web app
+        // does when an analysis page opens: the warm-up, then the first line.
+        let warmed = spawn(&o)?;
+        let mut warm_client = Client::new(warmed.port);
+        let mut warm = Samples::default();
+        warm.get(&mut warm_client, "/v1/engine/warm", true);
+        table.row("engine", "warm-up to ready", &mut warm, "");
+        engine(&mut table, &mut warm_client, "first line after a warm-up");
     }
 
     // HTTP: a small answer over one kept connection, and over a new one each.
@@ -642,7 +650,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
 
 /// A 5-second search from the start position, read line by line: the time to
 /// its first line, and the lines a second from then to its best move.
-fn engine(table: &mut Table, c: &mut Client) {
+fn engine(table: &mut Table, c: &mut Client, first_case: &str) {
     let t = Instant::now();
     let (mut first, mut last, mut lines) = (None, None, 0u32);
     let mut error = None;
@@ -667,7 +675,7 @@ fn engine(table: &mut Table, c: &mut Client) {
         (Ok(200), Some(first), None) if done => {
             let span = last.unwrap_or(first) - first;
             let rate = if span > 0.0 { f64::from(lines.saturating_sub(1)) * 1000.0 / span } else { 0.0 };
-            table.once("engine", "first line", first, "");
+            table.once("engine", first_case, first, "");
             table.once(
                 "engine",
                 "5 s search to best move",

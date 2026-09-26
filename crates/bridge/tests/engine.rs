@@ -515,3 +515,64 @@ fn a_probe_accepts_only_a_uci_engine() {
     assert!(engine::probe(&dir.join("missing.exe")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `GET /v1/engine/warm?{query}`: the status and the body.
+fn warm(port: u16, query: &str) -> (u16, String) {
+    let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let raw = format!(
+        "GET /v1/engine/warm?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n"
+    );
+    (&s).write_all(raw.as_bytes()).unwrap();
+    let mut text = String::new();
+    BufReader::new(s).read_to_string(&mut text).unwrap();
+    let status = text.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, text.split_once("\r\n\r\n").map_or("", |(_, body)| body).to_string())
+}
+
+/// A warm-up starts the engine with the threads and hash asked for (#110), so
+/// that an analysis asking for the same sends neither and only searches.
+#[test]
+fn a_warm_up_starts_the_engine_set_as_the_next_analysis_asks() {
+    let (port, app) = start(Engine::new(fake()));
+    assert!(!app.engine.is_running());
+    assert_eq!(warm(port, "threads=1&hash=64"), (200, r#"{"engine":"ready"}"#.to_string()));
+    assert!(app.engine.is_running());
+    // The handshake set Threads and Hash, and the warm-up Hash 64: three. An
+    // analysis with the configured 16 MB must set Hash back: four.
+    let mut a = Analysis::open(port, "depth=2");
+    assert_eq!(a.status, 200);
+    assert_eq!(settings_of(&a.rest()), (1, 16, 4), "the warm-up had set the hash");
+    // Warmed to 64 MB again, an analysis asking for 64 MB sends nothing.
+    assert_eq!(warm(port, "threads=1&hash=64").0, 200);
+    let mut a = Analysis::open(port, "depth=2&threads=1&hash=64");
+    assert_eq!(settings_of(&a.rest()), (1, 64, 5), "the analysis sent neither option");
+}
+
+#[test]
+fn a_warm_up_leaves_a_running_analysis_alone() {
+    let (port, _app) = start(Engine::new(fake()));
+    let mut a = Analysis::open(port, "movetime=800&stream=tab1");
+    assert!(a.line().is_some(), "the analysis runs");
+    assert_eq!(warm(port, "hash=64"), (200, r#"{"engine":"busy"}"#.to_string()));
+    let rest = a.rest();
+    assert_eq!(rest.last().unwrap(), BEST, "the analysis went on to its best move");
+    assert_eq!(settings_of(&rest).1, 16, "and kept its hash");
+}
+
+#[test]
+fn a_warm_up_refuses_bad_input_and_a_missing_engine() {
+    let (port, app) = start(Engine::new(fake()));
+    for (query, parameter) in
+        [("threads=0", "threads"), ("threads=x", "threads"), ("hash=15", "hash"), ("hash=x", "hash")]
+    {
+        let (status, body) = warm(port, query);
+        assert_eq!(status, 400, "{query}");
+        assert!(body.contains(parameter), "{query}: {body}");
+    }
+    assert!(!app.engine.is_running(), "a refused warm-up starts nothing");
+    let (port, _app) = start(Engine::none());
+    let (status, body) = warm(port, "");
+    assert_eq!(status, 409);
+    assert!(body.contains("no_engine"), "{body}");
+}
