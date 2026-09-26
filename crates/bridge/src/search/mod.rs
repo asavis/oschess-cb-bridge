@@ -91,9 +91,9 @@ impl Indexes {
         *self.heads.lock().unwrap_or_else(|e| e.into_inner()) = Some(heads);
     }
 
-    /// Whether a heads file is set, usable or not.
-    pub fn has_heads(&self) -> bool {
-        self.heads.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    /// Whether a heads file is set that passes still read.
+    pub fn has_usable_heads(&self) -> bool {
+        self.heads().is_some()
     }
 
     /// The heads file passes read, when one is set and still usable.

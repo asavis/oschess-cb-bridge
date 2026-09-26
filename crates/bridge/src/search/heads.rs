@@ -43,8 +43,6 @@ pub struct Heads {
     pub generation: u64,
     pub records: u32,
     crcs: Vec<u32>,
-    /// Blocks whose CRC has been checked in this process, a bit each.
-    checked: Vec<AtomicU64>,
     /// A block failed its CRC: passes read the database's own records again.
     broken: AtomicBool,
 }
@@ -79,7 +77,6 @@ impl Heads {
             generation,
             records,
             crcs: table.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect(),
-            checked: (0..blocks.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
             broken: AtomicBool::new(false),
         })
     }
@@ -95,18 +92,13 @@ impl Heads {
 
     /// The rows of block `block` into `buf`, their count; `None` when the
     /// block cannot be read or fails its CRC, which marks the file broken.
+    /// Every read is checked: the file can change after an earlier pass.
     pub fn read_block(&self, block: u32, buf: &mut [u8]) -> Option<u32> {
         let first = block * BLOCK_ROWS;
         let rows = (self.records - first).min(BLOCK_ROWS);
         let bytes = &mut buf[..rows as usize * ROW];
-        let ok = self.file.read_into(HEADER as u64 + u64::from(first) * ROW as u64, bytes).is_ok() && {
-            let (word, bit) = (&self.checked[block as usize / 64], 1u64 << (block % 64));
-            word.load(Ordering::Relaxed) & bit != 0
-                || (crc32(bytes) == self.crcs[block as usize] && {
-                    word.fetch_or(bit, Ordering::Relaxed);
-                    true
-                })
-        };
+        let ok = self.file.read_into(HEADER as u64 + u64::from(first) * ROW as u64, bytes).is_ok()
+            && crc32(bytes) == self.crcs[block as usize];
         if !ok {
             self.broken.store(true, Ordering::Relaxed);
         }

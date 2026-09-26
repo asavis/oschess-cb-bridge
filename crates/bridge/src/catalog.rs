@@ -475,7 +475,9 @@ impl Catalog {
     /// starts the build of one when none is (#106). Until it is ready, passes
     /// over the database read its own records.
     pub fn attach_heads(&self, entry: &Entry, open: &Opened) {
-        if open.indexes.has_heads() {
+        // A file that failed its CRC is left for the registry, which drops it
+        // and builds it again.
+        if open.indexes.has_usable_heads() {
             return;
         }
         let Some(dir) = self.explorer.dir() else { return };

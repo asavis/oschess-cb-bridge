@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use bridge::catalog::{Catalog, Opened};
 use bridge::search::heads::{self, BLOCK_ROWS, Built, Heads, ROWS_READ};
 use bridge::search::{self, Indexes, SearchError, Selection, SuggestField};
 use cbformat::codepage::CodePage;
@@ -202,5 +203,71 @@ fn a_build_whose_database_changes_keeps_nothing() {
     let still = || asked.fetch_add(1, Ordering::Relaxed) < 1;
     assert!(matches!(heads::build_base(&db, 7, &path, &still), Ok(Built::Changed)));
     assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file, whole or partial, is left");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every read of a block is checked, not only the first: a block damaged after
+/// a pass has read it whole is read from the database, and the answer stays.
+#[test]
+fn a_block_damaged_after_a_pass_is_read_from_the_database() {
+    let two = fixture_of("heads-later", &many(40_000, &["text", "analysis", "deleted"]));
+    let db = Base::open(two.dir().join("db.2cbh")).unwrap();
+    let plain = answers(&db, &Indexes::default());
+    let dir = scratch("later");
+    let path = heads::path(&dir, ID);
+    let h = Arc::new(built(&db, &path));
+    let idx = Indexes::default();
+    idx.set_heads(Arc::clone(&h));
+    assert_eq!(answers(&db, &idx), plain);
+    assert!(h.usable());
+    // The first record's result, in place, with the CRC table left as it was.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[64 + 34] ^= 0x03;
+    std::fs::write(&path, &bytes).unwrap();
+    let fresh = Indexes::default();
+    fresh.set_heads(Arc::clone(&h));
+    assert_eq!(answers(&db, &fresh), plain);
+    assert!(!h.usable(), "the file is marked broken, to be built again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Through the catalog: a heads file found broken is dropped and built again,
+/// and passes read the new one.
+#[test]
+fn a_broken_heads_file_is_built_again() {
+    let two = fixture_of("heads-rebuilt", &many(40_000, &["text", "analysis", "deleted"]));
+    let db_path = two.dir().join("db.2cbh");
+    let plain = answers(&Base::open(&db_path).unwrap(), &Indexes::default());
+    let dir = scratch("rebuilt");
+    let catalog = Catalog::new([db_path]);
+    catalog.explorer.set_dir(dir.clone());
+    catalog.heads.set_min_records(1);
+    let entry = catalog.entries().into_iter().next().unwrap();
+    let path = heads::path(&dir, &entry.id);
+    let open = entry.open().unwrap();
+    let ready = |open: &Opened| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            catalog.attach_heads(&entry, open);
+            if open.indexes.has_usable_heads() {
+                return;
+            }
+            assert!(std::time::Instant::now() < until, "a heads file was attached");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    ready(&open);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let damaged = 64 + (BLOCK_ROWS as usize + 5) * 36 + 3;
+    bytes[damaged] ^= 0x5a;
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(answers(&open.db, &open.indexes), plain, "the damaged block is read from the database");
+    assert!(!open.indexes.has_usable_heads(), "the file is marked broken");
+    // The next requests drop it and build it again; the rows are read again.
+    ready(&open);
+    assert_ne!(std::fs::read(&path).unwrap()[damaged], bytes[damaged], "the file was built again");
+    let before = ROWS_READ.load(Ordering::Relaxed);
+    assert_eq!(answers(&open.db, &open.indexes), plain);
+    assert!(ROWS_READ.load(Ordering::Relaxed) > before, "the new file's rows were read");
     let _ = std::fs::remove_dir_all(&dir);
 }
