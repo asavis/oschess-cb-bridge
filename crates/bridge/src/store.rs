@@ -9,6 +9,8 @@
 //! own `.cbg` record. A PGN file holds games only, with annotators apart from
 //! players, and its games are served as the file writes them.
 
+use std::ops::Range;
+
 pub use cbformat::game::Head;
 use cbformat::game::{Player, Start, Tournament};
 use cbformat::pgn::{self, Options, Rendered};
@@ -66,6 +68,36 @@ pub trait Store: Sync {
     fn name_count(&self, kind: Kind) -> u64;
     fn player(&self, id: i64) -> Result<Option<Player>>;
     fn tournament(&self, id: i64) -> Result<Option<Tournament>>;
+    /// The players from `ids.start` on, as [`Store::player`] reads them one by
+    /// one, handed to `each` in id order and never past `ids.end`; how many.
+    /// At least one of a range that is not empty: a format that can reads the
+    /// records of many consecutive players into `buf` at once.
+    fn read_players<E: From<Error>>(
+        &self,
+        ids: Range<i64>,
+        _buf: &mut [u8],
+        each: &mut impl FnMut(Option<Player>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        each(self.player(ids.start)?)?;
+        Ok(1)
+    }
+    /// [`Store::read_players`] for tournaments, as [`Store::tournament`] reads
+    /// them.
+    fn read_tournaments<E: From<Error>>(
+        &self,
+        ids: Range<i64>,
+        _buf: &mut [u8],
+        each: &mut impl FnMut(Option<Tournament>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        each(self.tournament(ids.start)?)?;
+        Ok(1)
+    }
     fn annotator(&self, id: i64) -> Result<Option<String>>;
     /// The title whose key is `key` ([`Head::other`]).
     fn title(&self, key: i64) -> Result<Option<String>>;
@@ -115,6 +147,22 @@ impl Store for v2::Database {
     }
     fn tournament(&self, id: i64) -> Result<Option<Tournament>> {
         self.entities().tournament_within(id, MAX_NAME_RECORD)
+    }
+    fn read_players<E: From<Error>>(
+        &self,
+        ids: Range<i64>,
+        buf: &mut [u8],
+        each: &mut impl FnMut(Option<Player>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
+        self.entities().read_players_within(ids, buf, MAX_NAME_RECORD, each)
+    }
+    fn read_tournaments<E: From<Error>>(
+        &self,
+        ids: Range<i64>,
+        buf: &mut [u8],
+        each: &mut impl FnMut(Option<Tournament>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
+        self.entities().read_tournaments_within(ids, buf, MAX_NAME_RECORD, each)
     }
     fn annotator(&self, id: i64) -> Result<Option<String>> {
         Ok(self.player(id)?.map(|p| p.pgn()))

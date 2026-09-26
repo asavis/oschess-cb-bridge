@@ -291,7 +291,9 @@ fn players_lid(names: &[String]) -> Vec<u8> {
 /// Name tables load on the shared workers too: 100,000 short player names,
 /// sixteen workers and a 16 MiB budget. Each worker grows its share of the
 /// table in steps that scale with the budget, so sixteen shares fit beside
-/// the table's offsets instead of being refused as too large.
+/// the table's offsets instead of being refused as too large. Each worker
+/// reads its players a few thousand at a time, and every name stays with its
+/// id.
 #[test]
 fn many_names_load_on_many_workers_within_a_small_budget() {
     let names: Vec<String> = std::iter::once(String::new()).chain((1..=100_000).map(|i| format!("a{i:06}"))).collect();
@@ -309,6 +311,12 @@ fn many_names_load_on_many_workers_within_a_small_budget() {
         let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
         assert_eq!(status, 200, "{query}: {out}");
         assert!(out.contains(&format!(r#""total":{total}"#)), "{query}: {out}");
+    }
+    // The game found by a name is the game of that name, as its row reads it.
+    for name in ["a000001", "a054321", "a100000"] {
+        let (status, out) = get(b.port, &format!("/v1/databases/{}/games?q=white:{name}&limit=1", b.id));
+        assert_eq!(status, 200, "{out}");
+        assert!(out.contains(r#""total":1"#) && out.contains(&format!(r#""white":"{name}""#)), "{name}: {out}");
     }
     let (status, out) = get(b.port, &format!("/v1/databases/{}/suggest?field=player&prefix=a0&limit=3", b.id));
     assert_eq!(status, 200, "{out}");

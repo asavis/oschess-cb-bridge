@@ -3,7 +3,10 @@
 //! substring matching for search, ranks for sorting, identities for
 //! suggestions. Their memory is reserved in the search budget as it grows.
 
+use std::ops::Range;
 use std::sync::Mutex;
+
+use cbformat::game::{Player, Tournament};
 
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
@@ -13,11 +16,13 @@ use crate::store::Store;
 
 /// Ids of a type read in one worker's go.
 const IDS_PER_WORKER_MIN: usize = 4096;
-/// Ids read between two cancellation checks.
-const IDS_PER_CHECK: usize = 1024;
-/// Each name worker's workspace for one record, decoded and lowercased,
-/// reserved in the budget before the worker starts.
-const NAME_WORKSPACE: usize = 64 << 10;
+/// The buffer a name worker reads many entity records into at once: a
+/// mebibyte, about 250 players of a Mega Database, and one read instead of
+/// 250 (#83).
+const NAME_READ: usize = 1 << 20;
+/// Each name worker's workspace, reserved in the budget before the worker
+/// starts: its read buffer, and one record decoded and lowercased.
+const NAME_WORKSPACE: usize = NAME_READ + (64 << 10);
 
 /// The names of consecutive ids, one after another in two strings: as shown
 /// ("Last, First" for players) and in lower case.
@@ -63,6 +68,13 @@ pub struct NameTable {
 /// A name as shown, and a person's first name in lower case.
 type Named = (String, String);
 
+/// What takes each name as it is read.
+type Each<'a> = dyn FnMut(Named) -> Result<(), SearchError> + 'a;
+
+/// What reads the names from a range's start on into a buffer, handing each
+/// over, and says how many it read.
+type Names<'a> = dyn Fn(Range<usize>, &mut [u8], &mut Each<'_>) -> Result<usize, SearchError> + Sync + 'a;
+
 impl NameTable {
     /// The names of `kind`, by entity id; for titles found by record, of the
     /// records `keys` numbers, by position.
@@ -76,17 +88,19 @@ impl NameTable {
             Some(keys) => keys.len(),
             None => usize::try_from(db.name_count(kind)).unwrap_or(usize::MAX),
         };
+        let player = |p: Option<Player>| match p {
+            Some(p) => (p.pgn(), p.first.to_lowercase()),
+            None => (String::new(), String::new()),
+        };
+        let tournament = |t: Option<Tournament>| (t.map(|t| t.title).unwrap_or_default(), String::new());
         let name = |id: usize| -> cbformat::Result<Named> {
             let id = match &keys {
                 Some(keys) => i64::from(keys[id]),
                 None => id as i64,
             };
             Ok(match kind {
-                Kind::Players => match db.player(id)? {
-                    Some(p) => (p.pgn(), p.first.to_lowercase()),
-                    None => (String::new(), String::new()),
-                },
-                Kind::Tournaments => (db.tournament(id)?.map(|t| t.title).unwrap_or_default(), String::new()),
+                Kind::Players => player(db.player(id)?),
+                Kind::Tournaments => tournament(db.tournament(id)?),
                 // An annotator of its own is one text; written as "Last,
                 // First", what follows the comma is its first name.
                 Kind::Annotators => {
@@ -97,16 +111,28 @@ impl NameTable {
                 Kind::Titles => (db.title(id)?.unwrap_or_default(), String::new()),
             })
         };
-        let (per, chunks, hold) = NameTable::read(count, &name, cancel)?;
+        // Players and tournaments by id are read many at a time; the rest one
+        // by one.
+        let names = |ids: Range<usize>, buf: &mut [u8], each: &mut Each<'_>| -> Result<usize, SearchError> {
+            let range = ids.start as i64..ids.end as i64;
+            let read = match (&keys, kind) {
+                (None, Kind::Players) => db.read_players(range, buf, &mut |p| each(player(p)))?,
+                (None, Kind::Tournaments) => db.read_tournaments(range, buf, &mut |t| each(tournament(t)))?,
+                _ => {
+                    each(name(ids.start)?)?;
+                    1
+                }
+            };
+            Ok(read as usize)
+        };
+        let (per, chunks, hold) = NameTable::read(count, &names, cancel)?;
         Ok(NameTable { len: count, per, chunks, keys, _hold: hold })
     }
 
-    /// Reads the names of ids `0..count` on the workers.
-    fn read(
-        count: usize,
-        name: &(dyn Fn(usize) -> cbformat::Result<Named> + Sync),
-        cancel: &Cancel,
-    ) -> Result<(usize, Vec<Chunk>, Hold), SearchError> {
+    /// Reads the names of ids `0..count` on the workers, each worker a range
+    /// of them in order. `names` hands `each` the names from its range's start
+    /// on, as many as it reads at once into the buffer, and says how many.
+    fn read(count: usize, names: &Names<'_>, cancel: &Cancel) -> Result<(usize, Vec<Chunk>, Hold), SearchError> {
         if count > u32::MAX as usize {
             return Err(Refused::TooLarge.into());
         }
@@ -130,24 +156,33 @@ impl NameTable {
             c.name_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
             c.lower_ends.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
             c.given.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
-            for id in first..end {
-                if (id - first) % IDS_PER_CHECK == 0 && (w.stopped() || cancel.is_cancelled()) {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(NAME_READ).map_err(|_| Refused::Busy)?;
+            buf.resize(NAME_READ, 0);
+            let mut id = first;
+            while id < end {
+                if w.stopped() || cancel.is_cancelled() {
                     return Err(SearchError::Superseded);
                 }
-                let (name, first_name) = name(id)?;
-                let lower = name.to_lowercase();
-                // The first name ends the name ("Last, First"); a comma inside
-                // the last name does not move it.
-                let given = match lower.strip_suffix(first_name.as_str()) {
-                    Some(before) if !first_name.is_empty() => before.len(),
-                    _ => 0,
-                };
-                push_str(&mut c.names, &name, &mut allow)?;
-                push_str(&mut c.lower, &lower, &mut allow)?;
-                c.name_ends.push(u32::try_from(c.names.len()).map_err(|_| Refused::TooLarge)?);
-                c.lower_ends.push(u32::try_from(c.lower.len()).map_err(|_| Refused::TooLarge)?);
-                c.given.push(u32::try_from(given).map_err(|_| Refused::TooLarge)?);
+                let read = names(id..end, &mut buf, &mut |(name, first_name)| {
+                    let lower = name.to_lowercase();
+                    // The first name ends the name ("Last, First"); a comma
+                    // inside the last name does not move it.
+                    let given = match lower.strip_suffix(first_name.as_str()) {
+                        Some(before) if !first_name.is_empty() => before.len(),
+                        _ => 0,
+                    };
+                    push_str(&mut c.names, &name, &mut allow)?;
+                    push_str(&mut c.lower, &lower, &mut allow)?;
+                    c.name_ends.push(u32::try_from(c.names.len()).map_err(|_| Refused::TooLarge)?);
+                    c.lower_ends.push(u32::try_from(c.lower.len()).map_err(|_| Refused::TooLarge)?);
+                    c.given.push(u32::try_from(given).map_err(|_| Refused::TooLarge)?);
+                    Ok(())
+                })?;
+                debug_assert!(read > 0, "a read of names that are left hands at least one over");
+                id += read.max(1);
             }
+            debug_assert_eq!(c.name_ends.len(), n);
             Ok(c)
         })?;
         let per = count.div_ceil(chunks.len()).max(1);
