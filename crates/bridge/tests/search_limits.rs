@@ -339,8 +339,16 @@ fn many_names_load_on_many_workers_within_a_small_budget() {
         assert_eq!(status, 200, "{out}");
         assert!(out.contains(r#""total":1"#) && out.contains(&format!(r#""white":"{name}""#)), "{name}: {out}");
     }
+    // The name order and the name groups, both sorted on the workers.
+    for (query, name) in [("sort=white&offset=54320", "a054321"), ("sort=white-desc", "a100000")] {
+        let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}&limit=1", b.id));
+        assert_eq!(status, 200, "{query}: {out}");
+        assert!(out.contains(&format!(r#""white":"{name}""#)), "{query}: {out}");
+    }
     let (status, out) = get(b.port, &format!("/v1/databases/{}/suggest?field=player&prefix=a0&limit=3", b.id));
     assert_eq!(status, 200, "{out}");
+    let at = |name: &str| out.find(&format!(r#""value":"{name}""#)).unwrap_or_else(|| panic!("{name}: {out}"));
+    assert!(at("a000001") < at("a000002") && at("a000002") < at("a000003"), "{out}");
 }
 
 /// A player table of `slots` 1 MiB containers, a hole on disk except for a

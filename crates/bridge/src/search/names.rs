@@ -245,13 +245,17 @@ impl NameTable {
         Ok(set)
     }
 
-    /// The ids in order of their name as shown; ids with an empty name left out.
-    fn by_exact_name(&self, allow: &mut Allowance<'_>) -> Result<Vec<u32>, Refused> {
-        allow.take(self.len * 4)?;
+    /// The ids in order of their name as shown, equal names in id order; ids
+    /// with an empty name left out. Sorted on the workers, with a second list
+    /// while they sort.
+    fn by_exact_name(&self, allow: &mut Allowance<'_>) -> Result<Vec<u32>, SearchError> {
+        allow.take(self.len * 8)?;
         let mut ids = Vec::new();
         ids.try_reserve_exact(self.len).map_err(|_| Refused::Busy)?;
         ids.extend((0..self.len as u32).filter(|&i| !self.name(i64::from(i)).is_empty()));
-        ids.sort_unstable_by(|&a, &b| self.name(i64::from(a)).cmp(self.name(i64::from(b))));
+        workers::sort_by(&mut ids, &|&a: &u32, &b: &u32| {
+            self.name(i64::from(a)).cmp(self.name(i64::from(b))).then(a.cmp(&b))
+        })?;
         Ok(ids)
     }
 }
@@ -263,15 +267,16 @@ impl NameTable {
 /// key of a missing name.
 pub fn joint_ranks(tables: &[&NameTable]) -> Result<Held<Vec<Vec<u32>>>, SearchError> {
     let total: usize = tables.iter().map(|t| t.len()).sum();
-    // The ranks kept, and the sorted entries while they are built.
-    let mut hold = Hold::reserve(total.checked_mul(12).ok_or(Refused::TooLarge)?)?;
+    // The entries twice while the workers sort them, then the entries and the
+    // ranks kept.
+    let mut hold = Hold::reserve(total.checked_mul(16).ok_or(Refused::TooLarge)?)?;
     let mut all: Vec<u64> = Vec::new();
     all.try_reserve_exact(total).map_err(|_| Refused::Busy)?;
     for (t, table) in tables.iter().enumerate() {
         all.extend((0..table.len()).filter(|&id| !table.lower(id).is_empty()).map(|id| ((t as u64) << 48) | id as u64));
     }
     let name = |e: u64| tables[(e >> 48) as usize].lower((e & ((1 << 48) - 1)) as usize);
-    all.sort_unstable_by(|&a, &b| name(a).cmp(name(b)));
+    workers::sort_by(&mut all, &|&a: &u64, &b: &u64| name(a).cmp(name(b)).then(a.cmp(&b)))?;
     let mut ranks: Vec<Vec<u32>> = Vec::new();
     for t in tables {
         let mut r = Vec::new();
