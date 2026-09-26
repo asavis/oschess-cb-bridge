@@ -11,7 +11,7 @@ use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::file::{Bad, IndexFile};
-use bridge::explorer::format::{Counts, pack_move};
+use bridge::explorer::format::{BLOCK_ENTRY, Block, Counts, Header, pack_move};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
 use bridge::server;
@@ -328,7 +328,13 @@ fn a_damaged_index_is_refused_and_rebuilt() {
     let path = idx.base.path.clone();
     drop(idx);
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[200] ^= 0xff;
+    // A byte of the block that holds the starting position.
+    let header = Header::decode(&bytes).unwrap();
+    let block = (0..header.blocks as usize)
+        .map(|i| Block::decode(&bytes[header.table_offset as usize + i * BLOCK_ENTRY..]))
+        .rfind(|b| b.first_key <= key_after(""))
+        .unwrap();
+    bytes[block.offset as usize + 4] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
     let file = IndexFile::open(&path).unwrap();
     assert!(matches!(file.lookup(key_after("")), Err(Bad::Corrupt(_))), "the block's CRC catches it");

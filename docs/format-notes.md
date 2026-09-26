@@ -384,7 +384,8 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   The other bytes are zero.
 
 - **Blocks** follow the header back to back, positions in ascending key order,
-  up to 4,096 a block, and a block ends once its records reach 1 MiB. A block holds its keys, 12 bytes each (the key, then the
+  up to 4,096 a block, and a block ends once its records reach 1 MiB, or where
+  one of the build's sixteen ranges of keys ends (see "The build"). A block holds its keys, 12 bytes each (the key, then the
   record's offset in the block's data, 4 bytes), then the records.
 - **A record** is unsigned LEB128 numbers:
   - the games, white wins, draws and black wins;
@@ -418,7 +419,13 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   merged, each run with a 64 KiB read buffer: in passes of as many runs as half
   the budget holds, at most 256, until the final merge can take all that are
   left beside the writer's 6 MiB. That final merge adds up each position's
-  entries into its record as it passes them. Half the budget is at least
+  entries into its record as it passes them. It runs apart for sixteen ranges
+  of keys, split by the keys' top four bits: keys are hashes, so the ranges
+  hold about as many positions. Each run notes where each range starts in it,
+  and up to half the workers merge a range each, as many at once as half the
+  budget holds with their runs' buffers and writers, into a file of the
+  range's blocks. The index is then those files in key order, copied behind
+  the header, and the table of all their blocks. Half the budget is at least
   8 MiB, which holds the writer and 30 runs; a smaller share fails the build
   as too large rather than waiting for memory the build holds itself.
 

@@ -6,7 +6,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +36,16 @@ pub const MAX_GAME: u32 = (1 << 30) - 1;
 pub const FAN_IN: usize = 256;
 /// The read buffer of each run in a merge.
 pub const RUN_BUFFER: usize = 64 << 10;
+/// The top bits of a key that name its part.
+const PART_BITS: u32 = 4;
+/// Ranges of keys the final merge takes apart, on the workers. Keys are
+/// hashes, so equal ranges of their values hold about as many positions.
+pub const PARTS: usize = 1 << PART_BITS;
+
+/// The part of the keys `key` lies in.
+pub fn part_of(key: u64) -> usize {
+    (key >> (64 - PART_BITS)) as usize
+}
 
 impl Entry {
     pub fn new(key: u64, game: u32, outcome: Outcome, mv: u16, ply: u8, elo: u16) -> Entry {
@@ -83,6 +93,17 @@ impl Entry {
 pub struct Run {
     pub path: PathBuf,
     pub entries: u64,
+    /// Where each part's entries start in the run, and where the run ends.
+    pub parts: [u64; PARTS + 1],
+}
+
+/// Where each part starts among entries of `counts[part]` each, in order.
+fn starts(counts: &[u64; PARTS]) -> [u64; PARTS + 1] {
+    let mut at = [0; PARTS + 1];
+    for k in 0..PARTS {
+        at[k + 1] = at[k] + counts[k];
+    }
+    at
 }
 
 /// How far a build has come: records read, then entries merged.
@@ -244,7 +265,7 @@ pub fn write_runs(
 }
 
 /// Sorts `buf` by key and game and writes it as a run.
-fn flush(buf: &mut Vec<Entry>, dir: &Path, worker: usize, runs: &mut Vec<Run>) -> Result<(), SearchError> {
+pub(super) fn flush(buf: &mut Vec<Entry>, dir: &Path, worker: usize, runs: &mut Vec<Run>) -> Result<(), SearchError> {
     if buf.is_empty() {
         return Ok(());
     }
@@ -255,7 +276,11 @@ fn flush(buf: &mut Vec<Entry>, dir: &Path, worker: usize, runs: &mut Vec<Run>) -
         out.write_all(&e.to_bytes()).map_err(|e| io(&path, e))?;
     }
     out.flush().map_err(|e| io(&path, e))?;
-    runs.push(Run { path, entries: buf.len() as u64 });
+    let mut counts = [0u64; PARTS];
+    for e in buf.iter() {
+        counts[part_of(e.key)] += 1;
+    }
+    runs.push(Run { path, entries: buf.len() as u64, parts: starts(&counts) });
     buf.clear();
     Ok(())
 }
@@ -269,12 +294,18 @@ pub struct RunReader {
 
 impl RunReader {
     pub fn open(run: &Run) -> Result<RunReader, SearchError> {
-        let file = File::open(&run.path).map_err(|e| io(&run.path, e))?;
+        RunReader::range(run, 0, run.entries)
+    }
+
+    /// The run's entries `from..to`.
+    fn range(run: &Run, from: u64, to: u64) -> Result<RunReader, SearchError> {
+        let mut file = File::open(&run.path).map_err(|e| io(&run.path, e))?;
         let len = file.metadata().map_err(|e| io(&run.path, e))?.len();
-        if len != run.entries * ENTRY_BYTES as u64 {
+        if len != run.entries * ENTRY_BYTES as u64 || from > to || to > run.entries {
             return Err(io(&run.path, std::io::Error::other("a run has the wrong length")));
         }
-        Ok(RunReader { input: BufReader::with_capacity(RUN_BUFFER, file), path: run.path.clone(), left: run.entries })
+        file.seek(SeekFrom::Start(from * ENTRY_BYTES as u64)).map_err(|e| io(&run.path, e))?;
+        Ok(RunReader { input: BufReader::with_capacity(RUN_BUFFER, file), path: run.path.clone(), left: to - from })
     }
 
     pub fn next_entry(&mut self) -> Result<Option<Entry>, SearchError> {
@@ -293,10 +324,35 @@ impl RunReader {
 pub fn merge(
     runs: &[Run],
     progress: &Progress,
-    mut each: impl FnMut(Entry) -> Result<(), SearchError>,
+    each: impl FnMut(Entry) -> Result<(), SearchError>,
 ) -> Result<(), SearchError> {
     let _buffers = reserve(runs.len() * RUN_BUFFER, progress)?;
-    let mut readers = runs.iter().map(RunReader::open).collect::<Result<Vec<_>, _>>()?;
+    let readers = runs.iter().map(RunReader::open).collect::<Result<Vec<_>, _>>()?;
+    merge_readers(readers, each)?;
+    for r in runs {
+        let _ = std::fs::remove_file(&r.path);
+    }
+    Ok(())
+}
+
+/// Merges part `part` of `runs` in key order, calling `each` with its every
+/// entry; the runs are kept for the other parts.
+pub fn merge_part(
+    runs: &[Run],
+    part: usize,
+    progress: &Progress,
+    each: impl FnMut(Entry) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
+    let _buffers = reserve(runs.len() * RUN_BUFFER, progress)?;
+    let readers =
+        runs.iter().map(|r| RunReader::range(r, r.parts[part], r.parts[part + 1])).collect::<Result<Vec<_>, _>>()?;
+    merge_readers(readers, each)
+}
+
+fn merge_readers(
+    mut readers: Vec<RunReader>,
+    mut each: impl FnMut(Entry) -> Result<(), SearchError>,
+) -> Result<(), SearchError> {
     let mut heap = BinaryHeap::with_capacity(readers.len());
     for (i, r) in readers.iter_mut().enumerate() {
         if let Some(e) = r.next_entry()? {
@@ -308,10 +364,6 @@ pub fn merge(
         if let Some(e) = readers[i].next_entry()? {
             heap.push(Reverse((e.key, e.game_outcome, i, e.meta)));
         }
-    }
-    drop(readers);
-    for r in runs {
-        let _ = std::fs::remove_file(&r.path);
     }
     Ok(())
 }
@@ -331,13 +383,13 @@ pub fn reduce(
             let _out_buffer = reserve(RUN_BUFFER, progress)?;
             let path = dir.join(format!("merged-{level}-{n}"));
             let mut out = BufWriter::with_capacity(RUN_BUFFER, File::create(&path).map_err(|e| io(&path, e))?);
-            let mut entries = 0u64;
+            let mut counts = [0u64; PARTS];
             merge(group, progress, |e| {
-                entries += 1;
+                counts[part_of(e.key)] += 1;
                 out.write_all(&e.to_bytes()).map_err(|e| io(&path, e))
             })?;
             out.flush().map_err(|e| io(&path, e))?;
-            next.push(Run { path, entries });
+            next.push(Run { path, entries: counts.iter().sum(), parts: starts(&counts) });
         }
         runs = next;
         level += 1;
