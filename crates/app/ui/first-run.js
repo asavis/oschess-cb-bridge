@@ -18,8 +18,11 @@ async function main() {
   }));
   const pairing = await call('pairing_code');
   document.getElementById('code').textContent = pairing.code;
+  // Subscribe first, then read: a connection that arrives in between is heard
+  // by the listener, and one that came before is in the view read after it.
+  // The app stores each view before it announces it (#130).
+  await on('view', showConnected);
   showConnected(await call('view'));
-  on('view', showConnected);
 }
 
 // Swaps the waiting line for «connected» once, and folds the code away: it is
