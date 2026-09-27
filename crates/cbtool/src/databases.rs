@@ -1,9 +1,9 @@
 //! `cbtool databases`: the databases ChessBase's database window lists.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use cbformat::dbitems::{self, Format};
-use cbformat::v2::Database;
+use cbformat::dbitems;
+use cbformat::view::{Base, Format};
 
 /// Lists the databases of a ChessBase documents folder with their state on
 /// this computer. The stored paths are not printed.
@@ -27,11 +27,13 @@ pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let path = dbitems::local_path(dir, &e.path);
         // Every file the database would be opened through is checked from its
         // metadata first; a database is opened only when all of them are here.
-        let files: Vec<(State, bool)> =
-            database_files(&path, e.format).iter().map(|(file, required)| (state_of(file), *required)).collect();
+        // A file of another format is checked alone.
+        let files = e.format.map_or_else(|| vec![(path.clone(), true)], |format| format.files(&path));
+        let files: Vec<(State, bool)> = files.iter().map(|(file, required)| (state_of(file), *required)).collect();
         let state = combine(&files);
         let records = match (e.format, state) {
-            (Format::Cbh2, State::Present) => match Database::open(&path) {
+            // A PGN file is opened through an index built from it, never here.
+            (Some(Format::TwoCbh | Format::Cbh), State::Present) => match Base::open(&path) {
                 Ok(db) => db.record_count().to_string(),
                 Err(_) => "unreadable".into(),
             },
@@ -54,12 +56,12 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "y" } else { "ies" }
 }
 
-fn format_name(f: Format) -> &'static str {
+fn format_name(f: Option<Format>) -> &'static str {
     match f {
-        Format::Cbh2 => "2cbh",
-        Format::Cbh => "cbh",
-        Format::Pgn => "pgn",
-        Format::Other => "other",
+        Some(Format::TwoCbh) => "2cbh",
+        Some(Format::Cbh) => "cbh",
+        Some(Format::Pgn) => "pgn",
+        None => "other",
     }
 }
 
@@ -86,26 +88,6 @@ impl State {
             State::MaybeCloudOnly => "cloud-only?",
             State::NotAFile => "unreadable",
         }
-    }
-}
-
-/// The files a database is read through, each with whether it is required:
-/// for 2CBH the ones `Database::open` opens, plus the annotations when present.
-/// Other formats are not opened; their main file alone is checked.
-fn database_files(path: &Path, format: Format) -> Vec<(PathBuf, bool)> {
-    match format {
-        Format::Cbh2 => {
-            let stem = path.with_extension("");
-            [(".2cbh", true), (".2cbg", true), (".2lid", true), (".2cba", false)]
-                .iter()
-                .map(|&(ext, required)| {
-                    let mut p = stem.clone().into_os_string();
-                    p.push(ext);
-                    (PathBuf::from(p), required)
-                })
-                .collect()
-        }
-        _ => vec![(path.to_owned(), true)],
     }
 }
 
@@ -183,23 +165,6 @@ mod tests {
         assert_eq!(db(P, N, P, P), N);
         assert_eq!(db(P, P, C, N), N);
         assert_eq!(db(N, X, P, P), X);
-    }
-
-    #[test]
-    fn companion_files_of_a_2cbh_database() {
-        let files = database_files(Path::new("/d/Big Base.2cbh"), Format::Cbh2);
-        let names: Vec<(String, bool)> =
-            files.iter().map(|(p, r)| (p.file_name().unwrap().to_string_lossy().into_owned(), *r)).collect();
-        assert_eq!(
-            names,
-            [
-                ("Big Base.2cbh".to_string(), true),
-                ("Big Base.2cbg".to_string(), true),
-                ("Big Base.2lid".to_string(), true),
-                ("Big Base.2cba".to_string(), false)
-            ]
-        );
-        assert_eq!(database_files(Path::new("/d/a.pgn"), Format::Pgn), [(PathBuf::from("/d/a.pgn"), true)]);
     }
 
     #[test]

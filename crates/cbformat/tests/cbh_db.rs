@@ -1,6 +1,6 @@
 //! Classic databases written by the fixture's builder, read back whole.
 
-use cbformat::cbh::Database;
+use cbformat::cbh::{Database, needs_wide};
 use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
 use cbformat::game::{GameResult, RecordKind};
 use chesscore::Board;
@@ -201,6 +201,20 @@ fn damaged_files_are_refused() {
         let db = r.unwrap();
         assert!(db.moves_of(&db.record(1).unwrap()).is_err());
     });
+}
+
+/// `.cbj` is needed once `.cbg` or `.cba` is longer than the 32-bit offsets of
+/// `.cbh` reach, 4 GiB, and not before; a database without `.cba` needs it for
+/// its moves alone.
+#[test]
+fn cbj_is_needed_past_4_gib_only() {
+    let max = u64::from(u32::MAX);
+    assert!(!needs_wide(max, None));
+    assert!(needs_wide(max + 1, None));
+    assert!(!needs_wide(max, Some(max)));
+    assert!(needs_wide(max + 1, Some(0)));
+    assert!(needs_wide(0, Some(max + 1)));
+    assert!(!needs_wide(0, Some(0)));
 }
 
 /// A move file over 4 GiB is read through the 64-bit offsets of `.cbj`: the

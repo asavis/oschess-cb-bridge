@@ -151,37 +151,106 @@ fn databases_never_opens_a_database_with_an_offline_companion() {
     let mut list = DbItems::new();
     list.section("2cbg").database(f.dir().join("db.2cbh").to_str().unwrap(), "Db", [0, 28, 3, 1, 1037620, 1037559]);
     std::fs::write(f.dir().join("DBItems.cbini"), list.bytes()).unwrap();
-    let row = || {
-        let r = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("databases").arg(f.dir()).output().unwrap();
-        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
-        let out = String::from_utf8(r.stdout).unwrap();
-        let row: Vec<String> = out
-            .lines()
-            .find(|l| l.trim_start().starts_with('1'))
-            .unwrap_or_else(|| panic!("{out}"))
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        row
-    };
+    let row = || first_database(f.dir());
     assert_eq!(row(), ["1", "2cbh", "present", "3", "3", "Db"]);
-    // Replace a file by one of the same length with no blocks on disk.
-    let hollow = |name: &str| {
-        let p = f.dir().join(name);
-        let len = std::fs::metadata(&p).unwrap().len();
-        std::fs::remove_file(&p).unwrap();
-        std::fs::File::create(&p).unwrap().set_len(len.max(1)).unwrap();
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(std::fs::metadata(&p).unwrap().blocks(), 0, "{name} is not sparse on this file system");
-    };
     let saved_cba = std::fs::read(f.dir().join("db.2cba")).unwrap();
-    hollow("db.2cba");
+    hollow(&f.dir().join("db.2cba"));
     assert_eq!(row(), ["1", "2cbh", "cloud-only?", "3", "-", "Db"]);
     std::fs::write(f.dir().join("db.2cba"), &saved_cba).unwrap();
-    hollow("db.2lid");
+    hollow(&f.dir().join("db.2lid"));
     assert_eq!(row(), ["1", "2cbh", "cloud-only?", "3", "-", "Db"]);
     std::fs::remove_file(f.dir().join("db.2cbg")).unwrap();
     assert_eq!(row(), ["1", "2cbh", "missing", "3", "-", "Db"]);
+}
+
+/// Replaces a file by one of the same length with no blocks on disk, as a
+/// cloud-only placeholder shows through WSL.
+#[cfg(unix)]
+fn hollow(file: &Path) {
+    let len = std::fs::metadata(file).unwrap().len();
+    std::fs::remove_file(file).unwrap();
+    std::fs::File::create(file).unwrap().set_len(len.max(1)).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(file).unwrap().blocks(), 0, "{} is not sparse on this file system", file.display());
+}
+
+/// The first row `cbtool databases` lists for the ChessBase folder `dir`.
+fn first_database(dir: &Path) -> Vec<String> {
+    let r = Command::new(env!("CARGO_BIN_EXE_cbtool")).arg("databases").arg(dir).output().unwrap();
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let out = String::from_utf8(r.stdout).unwrap();
+    let row = out.lines().find(|l| l.trim_start().starts_with('1')).unwrap_or_else(|| panic!("{out}"));
+    row.split_whitespace().map(str::to_owned).collect()
+}
+
+/// A two-game classic database, listed in the window of its own folder as
+/// `Old`, with 5 games when ChessBase last looked.
+fn listed_classic(name: &str) -> TempDb {
+    use cbformat::fixture_cbh::{Builder, Tok, encode, move_record};
+    let e4 = move_record(0, None, None, &encode(&chesscore::Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = Builder::new();
+    b.game(&e4);
+    b.game(&e4);
+    let f = b.write(name);
+    let mut list = DbItems::new();
+    list.section("Databases").database(f.dir().join("db.cbh").to_str().unwrap(), "Old", [0, 1, 5, 1, 1037620, 1037559]);
+    std::fs::write(f.dir().join("DBItems.cbini"), list.bytes()).unwrap();
+    f
+}
+
+/// A classic database is checked through every file its reader opens, as the
+/// bridge checks it: without its moves or one of its entity files it is
+/// missing, and without its annotations it is present. A present one is
+/// opened for its record count.
+#[test]
+fn databases_checks_every_file_of_a_classic_database() {
+    let f = listed_classic("cli-databases-classic");
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
+    for name in ["db.cbg", "db.cbp", "db.cbs"] {
+        let file = f.dir().join(name);
+        let saved = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(first_database(f.dir()), ["1", "cbh", "missing", "5", "-", "Old"], "without {name}");
+        std::fs::write(&file, saved).unwrap();
+    }
+    std::fs::remove_file(f.dir().join("db.cba")).unwrap();
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
+}
+
+/// A classic database whose moves are kept only in the cloud is reported so
+/// and never opened. Zero-block files stand for placeholders, which needs a
+/// Unix file system.
+#[cfg(unix)]
+#[test]
+fn databases_never_opens_a_classic_database_with_offline_moves() {
+    let f = listed_classic("cli-databases-classic-offline");
+    hollow(&f.dir().join("db.cbg"));
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "cloud-only?", "5", "-", "Old"]);
+}
+
+/// A classic database whose moves are over 4 GiB is missing without its
+/// `.cbj`, which its reader then needs, and present with it. The move file is
+/// made sparse past 4 GiB, which needs a Unix file system; its first block
+/// keeps its data, so that it is not taken for a placeholder.
+#[cfg(unix)]
+#[test]
+fn databases_requires_the_cbj_of_a_classic_database_over_4_gib() {
+    use std::os::unix::fs::MetadataExt;
+    let f = listed_classic("cli-databases-classic-wide");
+    let cbg = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.cbg")).unwrap();
+    cbg.set_len(u64::from(u32::MAX)).unwrap();
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
+    cbg.set_len(u64::from(u32::MAX) + 1).unwrap();
+    assert_ne!(cbg.metadata().unwrap().blocks(), 0, "db.cbg holds no data");
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "missing", "5", "-", "Old"]);
+    // A header of 64-bit offsets for no game: each keeps its `.cbh` offsets.
+    let mut cbj = Vec::new();
+    for v in [11i32, 120, 0] {
+        cbj.extend(v.to_le_bytes());
+    }
+    cbj.resize(32, 0);
+    std::fs::write(f.dir().join("db.cbj"), cbj).unwrap();
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
 }
 
 /// A companion that is not a regular file is reported and never opened:
