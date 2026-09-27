@@ -63,6 +63,16 @@ const MIN_FILE_HEADER: u64 = 10;
 /// apart reads each move record on its own.
 const MAX_BATCH_SPAN: u64 = 256 << 20;
 
+/// Whether a classic database needs its `.cbj` to be read: when its `.cbg`,
+/// `moves_len` bytes long, or its `.cba`, `annotations_len` bytes when it has
+/// one, is longer than the 32-bit offsets of `.cbh` reach. [`Database::open`]
+/// opens `.cbj` exactly then, and [`crate::view::Format::files`] calls it
+/// required exactly then.
+pub fn needs_wide(moves_len: u64, annotations_len: Option<u64>) -> bool {
+    let large = |len: u64| len > u64::from(u32::MAX);
+    large(moves_len) || annotations_len.is_some_and(large)
+}
+
 /// An open classic database: game headers, moves and entities.
 pub struct Database {
     stem: PathBuf,
@@ -112,12 +122,8 @@ impl Database {
             Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let large = |f: &DbFile| f.len().map(|n| n > u64::from(u32::MAX));
-        let wide = if large(&moves)? || annotations.as_ref().map(large).transpose()?.unwrap_or(false) {
-            Some(wide::Wide::open(with(".cbj"))?)
-        } else {
-            None
-        };
+        let annotations_len = annotations.as_ref().map(DbFile::len).transpose()?;
+        let wide = if needs_wide(moves.len()?, annotations_len) { Some(wide::Wide::open(with(".cbj"))?) } else { None };
         let entities = Entities::open(with)?;
         Ok(Database { stem, headers, moves, annotations, wide, entities, records, format_version: header[0x05] })
     }

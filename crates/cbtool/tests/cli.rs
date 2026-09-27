@@ -228,6 +228,31 @@ fn databases_never_opens_a_classic_database_with_offline_moves() {
     assert_eq!(first_database(f.dir()), ["1", "cbh", "cloud-only?", "5", "-", "Old"]);
 }
 
+/// A classic database whose moves are over 4 GiB is missing without its
+/// `.cbj`, which its reader then needs, and present with it. The move file is
+/// made sparse past 4 GiB, which needs a Unix file system; its first block
+/// keeps its data, so that it is not taken for a placeholder.
+#[cfg(unix)]
+#[test]
+fn databases_requires_the_cbj_of_a_classic_database_over_4_gib() {
+    use std::os::unix::fs::MetadataExt;
+    let f = listed_classic("cli-databases-classic-wide");
+    let cbg = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.cbg")).unwrap();
+    cbg.set_len(u64::from(u32::MAX)).unwrap();
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
+    cbg.set_len(u64::from(u32::MAX) + 1).unwrap();
+    assert_ne!(cbg.metadata().unwrap().blocks(), 0, "db.cbg holds no data");
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "missing", "5", "-", "Old"]);
+    // A header of 64-bit offsets for no game: each keeps its `.cbh` offsets.
+    let mut cbj = Vec::new();
+    for v in [11i32, 120, 0] {
+        cbj.extend(v.to_le_bytes());
+    }
+    cbj.resize(32, 0);
+    std::fs::write(f.dir().join("db.cbj"), cbj).unwrap();
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
+}
+
 /// A companion that is not a regular file is reported and never opened:
 /// opening a pipe would block until a writer appears. The listing must finish
 /// promptly with the database unreadable.

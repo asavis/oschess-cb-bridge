@@ -237,11 +237,16 @@ impl Format {
     /// without it: for 2CBH [`v2::EXTENSIONS`], for the classic format
     /// [`cbh::READ`], and a PGN file alone. `path` names the main file or the
     /// stem the files share, as [`Base::open`] takes it.
+    ///
+    /// The flags of a classic database depend on its files' sizes: its
+    /// `.cbj` is required when its `.cbg` or `.cba` is over 4 GiB
+    /// ([`cbh::needs_wide`]). The sizes are taken from metadata, following
+    /// links, and no file is opened, so a cloud-only file is not downloaded.
     pub fn files(self, path: &Path) -> Vec<(PathBuf, bool)> {
         let (main, extensions, required): (&str, &[&str], &[&str]) = match self {
             Format::TwoCbh => ("2cbh", &v2::EXTENSIONS, &[".2cbh", ".2cbg", ".2lid"]),
-            // The annotations are optional, and the 64-bit offsets are read
-            // only for a move or annotation file over 4 GiB.
+            // The annotations are optional, and the 64-bit offsets are
+            // required only for a move or annotation file over 4 GiB.
             Format::Cbh => ("cbh", &cbh::READ, &[".cbh", ".cbg", ".cbp", ".cbt", ".cbc", ".cbs"]),
             Format::Pgn => return vec![(path.to_path_buf(), true)],
         };
@@ -250,10 +255,17 @@ impl Format {
         } else {
             path.to_path_buf()
         };
-        crate::file::with_extensions(&stem, extensions)
+        let files = crate::file::with_extensions(&stem, extensions);
+        // A missing file has no size.
+        let len = |ext: &str| {
+            let file = files.get(extensions.iter().position(|e| *e == ext)?)?;
+            std::fs::metadata(file).ok().map(|m| m.len())
+        };
+        let wide = self == Format::Cbh && cbh::needs_wide(len(".cbg").unwrap_or(0), len(".cba"));
+        files
             .into_iter()
             .zip(extensions)
-            .map(|(file, ext)| (file, required.contains(ext)))
+            .map(|(file, &ext)| (file, required.contains(&ext) || (wide && ext == ".cbj")))
             .collect()
     }
 }

@@ -277,3 +277,40 @@ fn a_database_opens_without_its_optional_files_only() {
         assert!(Base::open(&main).is_ok());
     }
 }
+
+/// A classic database's `.cbj` is required once its `.cbg` or its `.cba` is
+/// over 4 GiB, as the reader cannot open it without `.cbj` then, and optional
+/// up to 4 GiB. Each file is made sparse at the boundary, which needs a Unix
+/// file system.
+#[cfg(unix)]
+#[test]
+fn a_classic_database_requires_its_cbj_past_4_gib() {
+    let f = classic("wide");
+    let main = f.dir().join("db.cbh");
+    let required = || -> Vec<String> {
+        Format::Cbh
+            .files(&main)
+            .into_iter()
+            .filter(|(_, required)| *required)
+            .map(|(p, _)| p.extension().unwrap().to_string_lossy().into_owned())
+            .collect()
+    };
+    let small = ["cbh", "cbg", "cbp", "cbt", "cbc", "cbs"];
+    let large = ["cbh", "cbg", "cbp", "cbt", "cbc", "cbs", "cbj"];
+    assert_eq!(required(), small);
+    let max = u64::from(u32::MAX);
+    for ext in ["cbg", "cba"] {
+        let file = main.with_extension(ext);
+        let len = std::fs::metadata(&file).unwrap().len();
+        let set_len = |len: u64| std::fs::OpenOptions::new().write(true).open(&file).unwrap().set_len(len).unwrap();
+        set_len(max);
+        assert_eq!(required(), small, ".{ext} of 4 GiB less a byte");
+        assert!(Base::open(&main).is_ok(), ".{ext} of 4 GiB less a byte");
+        set_len(max + 1);
+        assert_eq!(required(), large, ".{ext} of 4 GiB");
+        let err = Base::open(&main).err().unwrap_or_else(|| panic!(".{ext} of 4 GiB opened without .cbj"));
+        assert!(err.to_string().contains(".cbj"), "{err}");
+        set_len(len);
+    }
+    assert_eq!(required(), small);
+}
