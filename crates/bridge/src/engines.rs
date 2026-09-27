@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use cbformat::codepage::CodePage;
+
 /// An engine found on this computer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
@@ -182,22 +184,7 @@ fn decode(bytes: &[u8]) -> String {
         let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         return String::from_utf16_lossy(&units);
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    match std::str::from_utf8(bytes) {
-        Ok(text) => text.to_string(),
-        Err(_) => bytes.iter().map(|&b| windows_1252(b)).collect(),
-    }
-}
-
-fn windows_1252(b: u8) -> char {
-    const HIGH: [char; 32] = [
-        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}', '\u{90}', '‘',
-        '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-    ];
-    match b {
-        0x80..=0x9F => HIGH[usize::from(b - 0x80)],
-        _ => char::from(b),
-    }
+    CodePage::WESTERN.utf8_or(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes))
 }
 
 #[cfg(test)]
@@ -306,6 +293,6 @@ mod tests {
             let found = read_uci(&file).unwrap_or_else(|| panic!("{label}"));
             assert_eq!((found.name.as_str(), found.path.as_path()), ("Stöckfish", exe.as_path()), "{label}");
         }
-        assert_eq!(windows_1252(0x80), '€');
+        assert_eq!(decode(&[0x80]), "€");
     }
 }
