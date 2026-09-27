@@ -163,6 +163,8 @@
   "firstRun.subtitle": "oschess міст працюватиме у фоні — знак біля годинника.",
   "firstRun.opening.title": "Відкриваємо oschess у браузері, щоб підключити…",
   "firstRun.opening.hint": "Браузер попросить дозвіл на доступ до локальної мережі — натисніть «Дозволити».",
+  "firstRun.connected.title": "oschess підключено",
+  "firstRun.connected.hint": "Бази з ChessBase уже видно в бібліотеці oschess. Це вікно можна закрити.",
   "firstRun.open": "Відкрити oschess",
   "firstRun.close": "Закрити",
   "firstRun.manual.title": "Вставити код вручну",

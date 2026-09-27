@@ -60,6 +60,9 @@ pub struct View {
     pub problem: Option<Problem>,
     /// The databases on the list: one that left it is not shown.
     pub databases: Vec<DatabaseView>,
+    /// A paired browser has reached the bridge since it started: the
+    /// first-run window stops waiting for the connection.
+    pub connected: bool,
     /// [`View::tray`]'s name, for the windows to show the same state.
     pub mark: &'static str,
     /// Whether the bridge has work a restart would lose (#61), for an update
@@ -128,6 +131,7 @@ impl View {
                     progress: d.progress.map(|(present, total)| Progress { present, total }),
                 })
                 .collect(),
+            connected: snapshot.served,
             mark: "",
             busy: !snapshot.work.is_empty(),
         }
@@ -141,6 +145,7 @@ impl View {
             port,
             problem: Some(problem),
             databases: Vec::new(),
+            connected: false,
             mark: "",
             busy: false,
         }
@@ -240,6 +245,7 @@ mod tests {
                     progress: None,
                 })
                 .collect(),
+            connected: false,
             mark: "",
             busy: false,
         }
@@ -303,13 +309,14 @@ mod tests {
                 listed: true,
             }],
             work: Vec::new(),
+            served: true,
         };
         let view = View::of(&snapshot);
         assert_eq!(view.problem, None);
         let json = serde_json::to_string(&view).unwrap();
         assert_eq!(
             json,
-            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"mark":"ready"}"#
+            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"connected":true,"mark":"ready"}"#
         );
         let stopped = View::of(&Snapshot { stopped: Some("accept failed".into()), ..snapshot });
         assert_eq!(stopped.problem, Some(Problem::Stopped { reason: "accept failed".into() }));

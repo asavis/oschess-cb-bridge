@@ -1,9 +1,12 @@
 {
   "identifier": "first-run",
-  "description": "The first-run window: shows and copies the pairing code, opens oschess with it, and closes itself.",
+  "description": "The first-run window: shows and copies the pairing code, opens oschess with it, follows the bridge's state to say when oschess connected, and closes itself.",
   "windows": ["first-run"],
   "permissions": [
     "core:window:allow-close",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-view",
     "allow-pairing-code",
     "allow-copy-code",
     "allow-open-pairing"
