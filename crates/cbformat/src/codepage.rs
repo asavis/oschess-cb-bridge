@@ -23,7 +23,9 @@ impl CodePage {
         self.0
     }
 
-    /// The character of byte `b`; U+FFFD for a byte the page leaves undefined.
+    /// The character of byte `b`. A byte the page leaves undefined reads as
+    /// the C1 control or Latin-1 character of the same value, so no byte is
+    /// lost.
     pub fn char(self, b: u8) -> char {
         if b < 0x80 {
             return char::from(b);
@@ -39,7 +41,8 @@ impl CodePage {
             1258 => &CP1258,
             _ => &CP1252,
         };
-        char::from_u32(u32::from(table[usize::from(b - 0x80)])).unwrap_or(char::REPLACEMENT_CHARACTER)
+        let mapped = char::from_u32(u32::from(table[usize::from(b - 0x80)]));
+        mapped.filter(|&c| c != char::REPLACEMENT_CHARACTER).unwrap_or(char::from(b))
     }
 
     /// `bytes` in this page.
@@ -57,7 +60,8 @@ impl CodePage {
 }
 
 // The bytes 0x80-0xFF of each page, from the Unicode mapping tables of the
-// Windows code pages; U+FFFD where a page leaves a byte undefined.
+// Windows code pages; U+FFFD where a page leaves a byte undefined, which
+// `CodePage::char` reads as the byte's own value.
 const CP1250: [u16; 128] = [
     0x20AC, 0xFFFD, 0x201A, 0xFFFD, 0x201E, 0x2026, 0x2020, 0x2021, 0xFFFD, 0x2030, 0x0160, 0x2039, 0x015A, 0x0164,
     0x017D, 0x0179, 0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0xFFFD, 0x2122, 0x0161, 0x203A,
@@ -181,8 +185,18 @@ mod tests {
         assert_eq!(CodePage::WESTERN.decode(&[0xC5, b'n', b'g', b's', b't', b'r', 0xF6, b'm']), "Ångström");
         assert_eq!(CodePage::new(1251).char(0x88), '€');
         assert_eq!(CodePage::WESTERN.char(0x80), '€');
-        assert_eq!(CodePage::WESTERN.char(0x81), char::REPLACEMENT_CHARACTER);
+        assert_eq!(CodePage::WESTERN.char(0x81), '\u{81}');
         assert_eq!(CodePage::new(1250).char(0x8A), 'Š');
+    }
+
+    #[test]
+    fn undefined_bytes_keep_their_value() {
+        let undefined = [0x81, 0x8D, 0x8F, 0x90, 0x9D];
+        assert_eq!(CodePage::WESTERN.decode(&undefined), "\u{81}\u{8d}\u{8f}\u{90}\u{9d}");
+        assert_eq!(CodePage::new(1253).char(0xAA), '\u{aa}');
+        assert_eq!(CodePage::new(1255).char(0xFF), '\u{ff}');
+        // Above 0x9f, 1252 is Latin-1.
+        assert!((0xA0..=0xFF).all(|b| CodePage::WESTERN.char(b) == char::from(b)));
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn texts_symbols_squares_arrows() {
 }
 
 #[test]
-fn cp1252_fallback() {
+fn non_utf8_text_reads_as_windows_1252() {
     let a = GameAnnotations::parse(&end(block(0, &[text(2, 0, &[b'a', 0x93, 0xe9])]))).unwrap();
     assert_eq!(a.blocks[0].annotations[0], Annotation::Text { before: false, language: 0, text: "a“é".into() });
 }

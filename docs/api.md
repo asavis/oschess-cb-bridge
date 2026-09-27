@@ -127,7 +127,8 @@ with them.
   `.2lid`, `.2lgd` and `.2lcd` of a 2CBH database; `.cbh`, `.cbg`, `.cba`, `.cbp`,
   `.cbt`, `.cbc`, `.cbs` and, when present, `.cbj` of a classic one (see
   [Classic databases](#classic-databases)); a PGN file itself (see
-  [PGN files](#pgn-files)).
+  [PGN files](#pgn-files)). For a PGN file, a bridge whose reading of PGN
+  files changed also reports a new generation.
 
 ## Consistency
 

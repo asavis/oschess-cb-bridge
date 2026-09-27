@@ -3,6 +3,7 @@
 //! the reading form of the PGN leaves out. [`crate::v2`] decodes `.2cba`
 //! records into them, and [`crate::cbh`] classic `.cba` records.
 
+use crate::codepage::CodePage;
 use crate::movetable::Sq;
 use crate::{Error, Result};
 
@@ -137,19 +138,5 @@ impl GameAnnotations {
 /// UTF-8 when the bytes are valid UTF-8, else Windows-1252: nothing in the
 /// record says which.
 pub(crate) fn decode_text(b: &[u8]) -> String {
-    match std::str::from_utf8(b) {
-        Ok(s) => s.to_owned(),
-        Err(_) => b.iter().map(|&c| cp1252(c)).collect(),
-    }
-}
-
-fn cp1252(c: u8) -> char {
-    const HIGH: [char; 32] = [
-        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}', '\u{90}', '‘',
-        '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-    ];
-    match c {
-        0x80..=0x9f => HIGH[(c - 0x80) as usize],
-        _ => c as char,
-    }
+    CodePage::WESTERN.utf8_or(b)
 }
