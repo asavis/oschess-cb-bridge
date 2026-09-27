@@ -47,12 +47,17 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Declared minimum Rust
-        # Cargo.toml's rust-version stays true.
+        # Cargo.toml's rust-version names the pinned toolchain, the only
+        # compiler anything is built with, so it stays true without a second
+        # toolchain. A bump that moves one and not the other fails here.
         if: runner.os == 'Linux'
         run: |
           minimum=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
-          rustup toolchain install "$minimum" --profile minimal
-          cargo "+$minimum" check --workspace --all-targets --locked
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          if [ -z "$minimum" ] || [ "$minimum" != "$channel" ]; then
+            echo "::error::rust-version '$minimum' in Cargo.toml differs from channel '$channel' in rust-toolchain.toml; bump both together"
+            exit 1
+          fi
       - name: Release build
         run: cargo build --release --locked
       - name: Upload the Windows executable
