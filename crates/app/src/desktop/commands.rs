@@ -10,13 +10,14 @@ use bridge::stockfish::{self, Build, Progress};
 use bridge::{config, engine, token};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
+use super::autostart::{self, State};
 use super::server::{self, Pairing};
-use super::{SharedState, shared, tray, updater, windows};
+use super::{SharedState, channel, shared, tray, updater, windows};
+use crate::channel::engine_to_choose;
 use crate::choices::Choices;
 use crate::prefs;
 use crate::settings::{self, Extra};
@@ -30,9 +31,14 @@ pub struct SettingsView {
     port: u16,
     extras: Vec<Extra>,
     autostart: bool,
+    /// Windows' own settings turned starting with Windows off, and only they
+    /// turn it on again.
+    autostart_blocked: bool,
     auto_update: bool,
     /// Whether this build looks for updates at all.
     updates: bool,
+    /// Whether the Microsoft Store installed this copy and updates it (#112).
+    store: bool,
 }
 
 /// What the engine section shows: the engines found and the one chosen, the
@@ -47,6 +53,9 @@ pub struct EnginesView {
     /// The chosen engine's name when it is an older Stockfish and the offer
     /// was not put off for this bridge version.
     offer_for: Option<String>,
+    /// Whether the bridge downloads Stockfish: the Store's package carries it
+    /// instead (#112).
+    can_install: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -129,13 +138,16 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
     let shared = shared(app);
     let dir = shared.dir()?;
     let config = config::load_or_create(&shared.config_path()?)?;
+    let autostart = autostart::state(app);
     Ok(SettingsView {
         version: env!("CARGO_PKG_VERSION"),
         port: config.port,
         extras: settings::extras(&config),
-        autostart: app.autolaunch().is_enabled().unwrap_or(false),
+        autostart: autostart == State::On,
+        autostart_blocked: autostart == State::Blocked,
         auto_update: prefs::load(&dir).auto_update,
         updates: updater::enabled(app),
+        store: channel().is_store(),
     })
 }
 
@@ -176,11 +188,11 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     let shared = shared(app);
     let config = config::load_or_create(&shared.config_path()?)?;
     let data = shared.dir()?;
-    let roots = Roots { bridge_data: Some(data.clone()), ..Roots::system() };
+    let roots = Roots { bridge_data: Some(data.clone()), bundled: package_folder(), ..Roots::system() };
     let found: Vec<FoundEngine> = engines::find(&roots)
         .into_iter()
         .map(|f| {
-            let version = (f.source == engines::BRIDGE)
+            let version = (f.source == engines::BRIDGE || f.source == engines::BUNDLED)
                 .then(|| f.path.parent()?.file_name()?.to_str()?.strip_prefix("stockfish-").map(str::to_string))
                 .flatten();
             FoundEngine { name: f.name, path: f.path.to_string_lossy().into_owned(), source: f.source, version }
@@ -196,8 +208,11 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
             .map(|f| f.name.clone())
             .unwrap_or_else(|| path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(".exe").to_string())
     });
-    // An installed pinned build is in the list already: nothing to offer.
-    let dismissed = stockfish::is_installed(&data, build)
+    // An installed pinned build is in the list already: nothing to offer. The
+    // Store's package offers no download at all.
+    let store = channel().is_store();
+    let dismissed = store
+        || stockfish::is_installed(&data, build)
         || prefs::load(&data).stockfish_offer_dismissed.as_deref() == Some(env!("CARGO_PKG_VERSION"));
     let offer_for = match (&chosen, &chosen_name) {
         (Some(path), Some(name)) if !dismissed && stockfish::offer(Some((Path::new(path), name))).is_some() => {
@@ -210,7 +225,37 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
         found,
         install: Installable { version: build.version, megabytes: build.megabytes() },
         offer_for,
+        can_install: !store,
     })
+}
+
+/// The Store package's install folder, whose `engines` holds the Stockfish it
+/// carries; none for the NSIS installation.
+fn package_folder() -> Option<PathBuf> {
+    channel().package().map(|p| p.install.clone())
+}
+
+/// In the Store channel, chooses the Stockfish the package carries when no
+/// engine is chosen yet, the chosen file is gone, or the choice is the build an
+/// earlier version of the package carried (#112). The user's own engine stays.
+pub fn choose_carried_engine(app: &AppHandle) {
+    let Some(package) = channel().package() else { return };
+    let roots = Roots { bundled: Some(package.install.clone()), ..Roots::default() };
+    let Some(carried) = engines::find(&roots).into_iter().next() else {
+        eprintln!("oschess bridge: the package carries no engine");
+        return;
+    };
+    let chose = shared(app).config_path().and_then(|config_path| {
+        let config = config::load_or_create(&config_path)?;
+        let _one = CHOOSING.lock().unwrap_or_else(PoisonError::into_inner);
+        match engine_to_choose(config.engine.as_deref(), &carried.path, package, Path::is_file) {
+            Some(engine) => CHOICES.choose(&config_path, engine),
+            None => Ok(()),
+        }
+    });
+    if let Err(e) = chose {
+        eprintln!("oschess bridge: the carried engine was not chosen: {e}");
+    }
 }
 
 /// One installation at a time.
@@ -227,6 +272,9 @@ pub(super) fn installing() -> bool {
 /// holds no lock another choice waits on: only the probe and the save do.
 #[tauri::command]
 pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
+    if channel().is_store() {
+        return Err("the Microsoft Store version carries Stockfish and downloads none".into());
+    }
     let data = shared(&app).dir()?;
     let config_path = shared(&app).config_path()?;
     let window = app.clone();
@@ -254,17 +302,21 @@ pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
-/// Opens the licence of the Stockfish `version` the bridge installed. Only a
-/// version is taken from the window; the path is the bridge's own.
+/// Opens the licence of the Stockfish `version` the bridge installed or the
+/// Store's package carries. Only a version is taken from the window; the path
+/// is the bridge's own.
 #[tauri::command]
 pub fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
     if version.is_empty() || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
         return Err("not a Stockfish version".into());
     }
-    let licence = shared(&app).dir()?.join("engines").join(format!("stockfish-{version}")).join(stockfish::LICENCE);
-    if !licence.is_file() {
-        return Err(format!("{} is missing", licence.display()));
-    }
+    let beside = |root: PathBuf| root.join("engines").join(format!("stockfish-{version}")).join(stockfish::LICENCE);
+    let installed = beside(shared(&app).dir()?);
+    let Some(licence) =
+        [Some(installed.clone()), package_folder().map(beside)].into_iter().flatten().find(|l| l.is_file())
+    else {
+        return Err(format!("{} is missing", installed.display()));
+    };
     app.opener().open_path(licence.to_string_lossy(), None::<&str>).map_err(text)
 }
 
@@ -321,18 +373,19 @@ pub async fn pick_engine(app: AppHandle) -> Answer<Option<String>> {
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+/// Asynchronous: in the Store channel it waits on Windows' startup task.
 #[tauri::command]
-pub fn set_autostart(app: AppHandle, on: bool) -> Answer<SettingsView> {
+pub async fn set_autostart(app: AppHandle, on: bool) -> Answer<SettingsView> {
     switch_autostart(&app, on)?;
     settings_view(&app)
 }
 
-/// Writes or removes the Run key, and moves the menu's tick with it.
-pub fn switch_autostart(app: &AppHandle, on: bool) -> Answer<()> {
-    let launcher = app.autolaunch();
-    let result = if on { launcher.enable() } else { launcher.disable() };
-    tray::show_autostart(app, launcher.is_enabled().unwrap_or(false));
-    result.map_err(text)
+/// Turns starting with Windows on or off, moves the menu's tick with it, and
+/// answers where it stands.
+pub fn switch_autostart(app: &AppHandle, on: bool) -> Answer<State> {
+    let result = autostart::set(app, on);
+    tray::show_autostart(app, autostart::state(app) == State::On);
+    result
 }
 
 #[tauri::command]

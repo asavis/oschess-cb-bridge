@@ -11,6 +11,7 @@ publishes the draft.
 | `oschess-bridge.exe` | The same app without the installer. |
 | `SHA256SUMS.txt` | The SHA-256 of both; the release notes list them too. |
 | `latest.json`, `oschess-bridge-setup.exe.sig` | What installed apps read to update themselves; made only while the updater secret is set (see [The updater key](#the-updater-key)). |
+| `oschess-bridge.msix` | The Microsoft Store package, unsigned, for Partner Center; attached only while the Store identity is set (see [Microsoft Store](#microsoft-store)). |
 
 The workflow runs on GitHub's hosted Windows runners, the one exception to the
 own-runners rule in [CLAUDE.md](../CLAUDE.md), because SignPath requires every
@@ -25,11 +26,14 @@ jobs, in order:
 2. **sign-exe**: SignPath signs the executable, once signing is on.
 3. **bundle**: builds the installer around that executable.
 4. **sign-installer**: SignPath signs the installer, once signing is on.
-5. **release**: checks that both files are signed or neither and that the
+5. **msix**: packs the same executable into the Microsoft Store package with
+   `scripts/msix.py`, on every release, so that a broken package shows early.
+6. **release**: checks that both files are signed or neither and that the
    signatures are valid, signs the installer for the updater and writes
    `latest.json` while the updater secret is set, computes the SHA-256, and
    creates the draft with the files, the checksums and notes generated from
-   the merged pull requests.
+   the merged pull requests. The package joins them while the Store identity
+   is set.
 
 The executable is signed before the installer is built around it: Smart App
 Control blocks the installed program if only its installer is signed, and an
@@ -176,3 +180,94 @@ being built, no Stockfish is being installed, and no analysis began less than
 five minutes ago. The installer replaces the app and starts it again, and the
 new start shows «Міст оновлено до X». A draft is never the latest release, so
 nothing updates before the owner publishes.
+
+## Microsoft Store
+
+The Microsoft Store signs the packages it distributes, so a copy installed
+from the Store needs no certificate of ours and raises no SmartScreen warning
+(#112). The Store re-signs only MSIX packages; an EXE or MSI installer would
+need our own signature first. The package holds the same `oschess-bridge.exe`
+as the installer, and the app tells where it came from by its package identity
+(`crates/app/src/channel.rs`). In the Store's copy:
+
+- the Store updates the package, so the app registers no updater and shows no
+  update controls;
+- «Start with Windows» enables the package's startup task instead of writing
+  the Run value, which inside a package Windows would never read at sign-in. A
+  task the user turned off in Windows' Startup apps settings can only be turned
+  on there, and the settings window says so;
+- the package carries the Stockfish build that `crates/bridge/src/stockfish.rs`
+  pins, with its licence, and the app downloads none. It chooses that build
+  when no engine is chosen or when the choice was an earlier version's build;
+  an engine the user chose stays;
+- the data folder is the same, and Windows keeps it for the package, removing
+  it on uninstall.
+
+The package is x64 only; ARM64 Windows runs it emulated. It uses the system's
+WebView2, which Windows 11 has, since a package cannot run the WebView2
+installer.
+
+### Packing
+
+`scripts/msix.py` stages the executable, `crates/app/msix/AppxManifest.xml`
+with the identity and version filled in, the images from `crates/app/icons/msix`
+(drawn by `icons/generate.py`) and the pinned Stockfish, whose size and SHA-256
+it checks, and packs them with `makeappx` from the Windows SDK. The version is
+the app's with a fourth part of 0, as the Store requires. `cargo test -p app`
+checks the manifest against the app: the startup task, the executable and the
+images.
+
+The identity comes from three repository variables, all public values from
+Partner Center's product identity page:
+
+```
+gh variable set MSSTORE_IDENTITY_NAME -R asavis/oschess-cb-bridge --body "<Package/Identity/Name>"
+```
+```
+gh variable set MSSTORE_PUBLISHER -R asavis/oschess-cb-bridge --body "<Package/Identity/Publisher>"
+```
+```
+gh variable set MSSTORE_PUBLISHER_DISPLAY_NAME -R asavis/oschess-cb-bridge --body "<Package/Properties/PublisherDisplayName>"
+```
+
+Without them the package gets the test identity `oschess.bridge.test` and
+stays out of the release.
+
+### Trying a package by hand
+
+On a Windows 11 computer with Developer Mode on (Settings → System → For
+developers), pack a local build with the test identity and register the staged
+folder, which needs no signature:
+
+```
+python scripts/msix.py --exe target\release\oschess-bridge.exe --out msix-test\oschess-bridge.msix --stage-only
+```
+```
+powershell -Command "Add-AppxPackage -Register msix-test\msix-stage\AppxManifest.xml"
+```
+
+Start «oschess bridge» from the Start menu, then check the list below, and
+remove it with `Get-AppxPackage oschess.bridge.test | Remove-AppxPackage`:
+
+- the settings show no update controls, and the tray menu has no «Check for
+  updates»;
+- the engine section lists the carried Stockfish, chosen, and analysis works
+  without a download;
+- «Start with Windows» turns the task on and off (Settings → Apps → Startup
+  shows it), and survives a sign-out;
+- pairing, the databases and the port work as in the installed app.
+
+### The owner's steps in Partner Center
+
+1. Register a free individual developer account at
+   https://storedeveloper.microsoft.com.
+2. Apps and games → New product → MSIX or PWA app, and reserve the name
+   `oschess bridge`.
+3. Product management → Product identity: set the three variables above from
+   it.
+4. After the next release, create a submission: upload `oschess-bridge.msix`
+   from the release, and fill in the listing, the age rating and the
+   `runFullTrust` justification from [store-listing.md](store-listing.md).
+   Pricing: free. Then submit it for certification.
+
+Later versions are submitted the same way, with the package from each release.

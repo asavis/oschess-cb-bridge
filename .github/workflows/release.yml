@@ -3,7 +3,8 @@ name: release
 # The release of the Windows app, from a version tag: the bare
 # oschess-bridge.exe and its per-user NSIS installer, each signed by SignPath
 # once that is switched on, the updater's signature and latest.json once its key
-# exists, their SHA-256, and a DRAFT release that the owner checks and publishes
+# exists, the Microsoft Store package once its identity exists (#112), their
+# SHA-256, and a DRAFT release that the owner checks and publishes
 # (docs/release.md).
 #
 # The one exception to our own-runners rule (owner decision on #23,
@@ -211,11 +212,47 @@ jobs:
           path: signed/oschess-bridge-setup.exe
           if-no-files-found: error
 
+  msix:
+    name: Pack the Microsoft Store package
+    needs: [build, sign-exe]
+    # Around the same executable as the installer. Packed on every release, so
+    # a broken package shows before the Store needs one.
+    if: >-
+      !cancelled() && needs.build.result == 'success' &&
+      (needs.sign-exe.result == 'success' || needs.sign-exe.result == 'skipped')
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      # Partner Center's product identity (docs/release.md, "Microsoft Store").
+      # Without it the package gets a test identity and stays out of the release.
+      MSSTORE_IDENTITY_NAME: ${{ vars.MSSTORE_IDENTITY_NAME }}
+      MSSTORE_PUBLISHER: ${{ vars.MSSTORE_PUBLISHER }}
+      MSSTORE_PUBLISHER_DISPLAY_NAME: ${{ vars.MSSTORE_PUBLISHER_DISPLAY_NAME }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.sign-exe.result == 'success' && 'exe-signed' || 'exe-unsigned' }}
+          path: exe
+      - name: Pack
+        # makeappx from the runner's Windows SDK; the pinned Stockfish from its
+        # GitHub release, checked against stockfish.rs. Unsigned: the Store signs it.
+        run: python scripts/msix.py --exe exe/oschess-bridge.exe --out dist/oschess-bridge.msix
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msix
+          path: dist/oschess-bridge.msix
+          if-no-files-found: error
+
   release:
     name: Draft the release
-    needs: [build, sign-exe, bundle, sign-installer]
+    needs: [build, sign-exe, bundle, sign-installer, msix]
     if: >-
-      !cancelled() && needs.bundle.result == 'success' &&
+      !cancelled() && needs.bundle.result == 'success' && needs.msix.result == 'success' &&
       (needs.sign-installer.result == 'success' || needs.sign-installer.result == 'skipped')
     runs-on: windows-latest
     timeout-minutes: 20
@@ -227,6 +264,7 @@ jobs:
       EXE_SIGNED: ${{ needs.sign-exe.result == 'success' }}
       INSTALLER_SIGNED: ${{ needs.sign-installer.result == 'success' }}
       HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+      HAS_STORE_IDENTITY: ${{ vars.MSSTORE_IDENTITY_NAME != '' }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -235,6 +273,11 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.sign-installer.result == 'success' && 'installer-signed' || 'installer-unsigned' }}
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: env.HAS_STORE_IDENTITY == 'true'
+        with:
+          name: msix
           path: dist
       - name: Both files signed, or neither
         run: |
@@ -279,7 +322,9 @@ jobs:
           cat dist/latest.json
       - name: Checksums and notes
         run: |
-          (cd dist && sha256sum oschess-bridge-setup.exe oschess-bridge.exe > SHA256SUMS.txt)
+          files=(oschess-bridge-setup.exe oschess-bridge.exe)
+          if [ -f dist/oschess-bridge.msix ]; then files+=(oschess-bridge.msix); fi
+          (cd dist && sha256sum "${files[@]}" > SHA256SUMS.txt)
           {
             echo "## Download"
             echo
@@ -289,6 +334,10 @@ jobs:
               echo "Both files are signed. Free code signing provided by SignPath.io, certificate by SignPath Foundation."
             else
               echo "Both files are **unsigned**: SmartScreen asks for «More info → Run anyway», and Smart App Control, where it is on, blocks them."
+            fi
+            if [ -f dist/oschess-bridge.msix ]; then
+              echo
+              echo "\`oschess-bridge.msix\` is the package for the Microsoft Store, which signs it: it goes to Partner Center and installs only from the Store."
             fi
             echo
             echo "| File | SHA-256 |"
