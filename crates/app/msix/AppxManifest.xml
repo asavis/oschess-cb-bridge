@@ -2,10 +2,10 @@
 <!--
   The Microsoft Store package (#112). scripts/msix.py fills in the identity
   from Partner Center and the version from Cargo.toml. The package holds the
-  same oschess-bridge.exe as the NSIS installer, the images from icons/msix,
-  and the pinned Stockfish under engines\stockfish-<version>.
-  The Store signs the package; runFullTrust lets the app serve the loopback
-  port and read the databases wherever they are, as the installed app does.
+  same oschess-bridge.exe as the NSIS installer and the images from
+  icons/msix. The Store signs the package; runFullTrust lets the app serve the
+  loopback port, read the databases wherever they are and run the engine the
+  user chose, as the installed app does.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"

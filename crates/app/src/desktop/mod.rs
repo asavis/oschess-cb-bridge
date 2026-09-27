@@ -86,7 +86,6 @@ pub fn run() {
             let started = Shared::start(strings);
             let shared = Arc::new(started.shared);
             app.manage(shared.clone());
-            commands::choose_carried_engine(app.handle());
             tray::create(app.handle())?;
             windows::create_flyout(app.handle());
             if started.first_run {

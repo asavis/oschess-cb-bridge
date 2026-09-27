@@ -99,7 +99,6 @@
   "settings.folders.missing": "немає на місці",
   "settings.engine.title": "Рушій",
   "settings.engine.intro": "Рушій аналізує позиції з ваших баз в oschess. Міст не має власного рушія: він бере вже встановлений або ставить офіційну збірку Stockfish.",
-  "settings.engine.introStore": "Рушій аналізує позиції з ваших баз в oschess. До мосту входить офіційна збірка Stockfish; можна обрати й інший рушій, уже встановлений на комп’ютері.",
   "settings.engine.none.title": "Рушій не знайдено",
   "settings.engine.none.hint": "На цьому комп’ютері немає Stockfish у папках ChessBase і Fritz. Без рушія бази відкриваються, але аналізу позицій не буде.",
   "settings.engine.found.title": "Знайдені рушії",
@@ -122,7 +121,6 @@
   "settings.engine.offer.update": "Оновити",
   "settings.engine.offer.later": "Пізніше",
   "settings.engine.installedByBridge": "встановлено мостом",
-  "settings.engine.bundled": "входить до мосту",
   "settings.engine.licence": "Ліцензія (GPL)",
 
   "settings.general.title": "Загальне",

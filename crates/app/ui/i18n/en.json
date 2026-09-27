@@ -99,7 +99,6 @@
   "settings.folders.missing": "not there",
   "settings.engine.title": "Engine",
   "settings.engine.intro": "The engine analyses positions from your databases in oschess. The bridge has no engine of its own: it uses one already installed or installs the official Stockfish build.",
-  "settings.engine.introStore": "The engine analyses positions from your databases in oschess. The bridge comes with the official Stockfish build; you can also choose another engine already installed on this computer.",
   "settings.engine.none.title": "No engine found",
   "settings.engine.none.hint": "This computer has no Stockfish in the ChessBase and Fritz folders. Without an engine the databases still open, but positions are not analysed.",
   "settings.engine.found.title": "Engines found",
@@ -122,7 +121,6 @@
   "settings.engine.offer.update": "Update",
   "settings.engine.offer.later": "Later",
   "settings.engine.installedByBridge": "installed by the bridge",
-  "settings.engine.bundled": "comes with the bridge",
   "settings.engine.licence": "Licence (GPL)",
 
   "settings.general.title": "General",

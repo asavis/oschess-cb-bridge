@@ -88,9 +88,6 @@ function renderEngines(view) {
   engines = view;
   document.getElementById('install-hint').textContent =
     t('settings.engine.installHint', { version: view.install.version, mb: view.install.megabytes });
-  // The Store's package carries Stockfish and downloads none (#112).
-  document.getElementById('install-stockfish').closest('.row').hidden = !view.canInstall;
-  if (!view.canInstall) document.getElementById('engine-intro').textContent = t('settings.engine.introStore');
   const offer = document.getElementById('engine-offer');
   offer.hidden = !view.offerFor;
   if (view.offerFor) {
@@ -99,9 +96,7 @@ function renderEngines(view) {
       t('settings.engine.offer.hint', { current: view.offerFor, mb: view.install.megabytes });
   }
   const rows = view.found.map((f) => {
-    const origin = f.source === 'bridge'
-      ? t('settings.engine.installedByBridge')
-      : f.source === 'bundled' ? t('settings.engine.bundled') : t('settings.engine.from', { source: f.source });
+    const origin = f.source === 'bridge' ? t('settings.engine.installedByBridge') : t('settings.engine.from', { source: f.source });
     return engineRow(f.name, `${origin} · ${f.path}`, f.path, view.chosen, f.version);
   });
   if (view.chosen && !view.found.some((f) => f.path === view.chosen)) {

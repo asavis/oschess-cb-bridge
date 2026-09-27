@@ -4,12 +4,9 @@
     python3 scripts/msix.py --exe target/.../oschess-bridge.exe --out dist/oschess-bridge.msix
 
 The package holds the given oschess-bridge.exe, the manifest
-crates/app/msix/AppxManifest.xml with its values filled in, the images in
-crates/app/icons/msix as Assets, and the Stockfish build that
-crates/bridge/src/stockfish.rs pins for x86-64, with its licence, under
-engines/stockfish-<version>, as the app finds it (#112). The zip comes from
---stockfish-zip or from Stockfish's GitHub release, and its size and SHA-256
-must match the pinned ones.
+crates/app/msix/AppxManifest.xml with its values filled in, and the images in
+crates/app/icons/msix as Assets. It carries no engine: as the installed app,
+the Store's copy installs Stockfish only when the user asks (#13).
 
 The identity comes from the variables MSSTORE_IDENTITY_NAME, MSSTORE_PUBLISHER
 and MSSTORE_PUBLISHER_DISPLAY_NAME, the values Partner Center shows on the
@@ -24,14 +21,11 @@ stops, on any system.
 
 import argparse
 import glob
-import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
-import urllib.request
-import zipfile
 from typing import NoReturn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -76,42 +70,7 @@ def identity():
     return given
 
 
-def pinned_stockfish():
-    """The x86-64 build stockfish.rs pins, read from its PINNED table."""
-    source = read(os.path.join(ROOT, "crates", "bridge", "src", "stockfish.rs"))
-    table = source.split("pub const PINNED", 1)[-1].split("];", 1)[0]
-    for block in re.findall(r"Build \{(.*?)\}", table, re.S):
-        if "Arch::X86_64" not in block:
-            continue
-        fields = dict(re.findall(r'(\w+): "([^"]*)"', block))
-        size = re.search(r"size: ([\d_]+),", block)
-        if not size or not {"version", "asset", "sha256", "exe"} <= fields.keys():
-            fail("stockfish.rs: the x86-64 build lacks a field")
-        fields["size"] = int(size.group(1).replace("_", ""))
-        return fields
-    fail("stockfish.rs pins no x86-64 build")
-
-
-def stockfish_zip(build, given, cache):
-    path = given or os.path.join(cache, build["asset"])
-    if not given and not os.path.isfile(path):
-        url = f"https://github.com/official-stockfish/Stockfish/releases/download/sf_{build['version']}/{build['asset']}"
-        print(f"msix: downloading {url}")
-        os.makedirs(cache, exist_ok=True)
-        with urllib.request.urlopen(url, timeout=120) as answer, open(path + ".part", "wb") as f:
-            shutil.copyfileobj(answer, f)
-        os.replace(path + ".part", path)
-    size = os.path.getsize(path)
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for piece in iter(lambda: f.read(1 << 20), b""):
-            digest.update(piece)
-    if size != build["size"] or digest.hexdigest() != build["sha256"]:
-        fail(f"{path}: {size} bytes, SHA-256 {digest.hexdigest()}; stockfish.rs pins {build['size']}, {build['sha256']}")
-    return path
-
-
-def stage(folder, exe, values, build, zip_path):
+def stage(folder, exe, values):
     if os.path.exists(folder):
         shutil.rmtree(folder)
     os.makedirs(os.path.join(folder, "Assets"))
@@ -126,12 +85,6 @@ def stage(folder, exe, values, build, zip_path):
         f.write(manifest)
     for image in glob.glob(os.path.join(APP, "icons", "msix", "*.png")):
         shutil.copy2(image, os.path.join(folder, "Assets"))
-    engine = os.path.join(folder, "engines", f"stockfish-{build['version']}")
-    os.makedirs(engine)
-    with zipfile.ZipFile(zip_path) as archive:
-        for name in (build["exe"], "Copying.txt"):
-            with archive.open(f"stockfish/{name}") as src, open(os.path.join(engine, name), "wb") as dst:
-                shutil.copyfileobj(src, dst)
 
 
 def escape(text):
@@ -151,7 +104,6 @@ def main():
     parser = argparse.ArgumentParser(description="Packs the Microsoft Store package, oschess-bridge.msix.")
     parser.add_argument("--exe", required=True, help="the oschess-bridge.exe to pack")
     parser.add_argument("--out", required=True, help="the .msix to write; its folder also gets the staging folder")
-    parser.add_argument("--stockfish-zip", help="the pinned Stockfish zip, instead of downloading it")
     parser.add_argument("--makeappx", help="makeappx.exe, instead of the newest Windows SDK's")
     parser.add_argument("--stage-only", action="store_true", help="fill the staging folder and stop")
     args = parser.parse_args()
@@ -161,10 +113,8 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(args.out))
     values = identity()
     values["VERSION"] = app_version()
-    build = pinned_stockfish()
-    zip_path = stockfish_zip(build, args.stockfish_zip, os.path.join(out_dir, "msix-cache"))
     folder = os.path.join(out_dir, "msix-stage")
-    stage(folder, args.exe, values, build, zip_path)
+    stage(folder, args.exe, values)
     print(f"msix: staged {folder} as {values['NAME']} {values['VERSION']}")
     if args.stage_only:
         return

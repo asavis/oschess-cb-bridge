@@ -196,12 +196,12 @@ as the installer, and the app tells where it came from by its package identity
   the Run value, which inside a package Windows would never read at sign-in. A
   task the user turned off in Windows' Startup apps settings can only be turned
   on there, and the settings window says so;
-- the package carries the Stockfish build that `crates/bridge/src/stockfish.rs`
-  pins, with its licence, and the app downloads none. It chooses that build
-  when no engine is chosen or when the choice was an earlier version's build;
-  an engine the user chose stays;
 - the data folder is the same, and Windows keeps it for the package, removing
   it on uninstall.
+
+Everything else is the installed app's, the engine included: the package
+carries no Stockfish, as #13 decided, and «Install Stockfish» downloads the
+pinned build into the data folder on the user's request.
 
 The package is x64 only; ARM64 Windows runs it emulated. It uses the system's
 WebView2, which Windows 11 has, since a package cannot run the WebView2
@@ -210,9 +210,9 @@ installer.
 ### Packing
 
 `scripts/msix.py` stages the executable, `crates/app/msix/AppxManifest.xml`
-with the identity and version filled in, the images from `crates/app/icons/msix`
-(drawn by `icons/generate.py`) and the pinned Stockfish, whose size and SHA-256
-it checks, and packs them with `makeappx` from the Windows SDK. The version is
+with the identity and version filled in, and the images from
+`crates/app/icons/msix` (drawn by `icons/generate.py`), and packs them with
+`makeappx` from the Windows SDK. The version is
 the app's with a fourth part of 0, as the Store requires. `cargo test -p app`
 checks the manifest against the app: the startup task, the executable and the
 images.
@@ -251,8 +251,8 @@ remove it with `Get-AppxPackage oschess.bridge.test | Remove-AppxPackage`:
 
 - the settings show no update controls, and the tray menu has no «Check for
   updates»;
-- the engine section lists the carried Stockfish, chosen, and analysis works
-  without a download;
+- «Install Stockfish» downloads, checks and chooses the pinned build, and
+  analysis works with it;
 - «Start with Windows» turns the task on and off (Settings → Apps → Startup
   shows it), and survives a sign-out;
 - pairing, the databases and the port work as in the installed app.
