@@ -61,15 +61,16 @@ def app_version():
 
 
 def package_version(version):
-    """The package version for the app's x.y.z. The Store needs a first part
-    above 0, every part at most 65535 and a fourth part of 0, so the first part
-    is the app's plus one: 0.1.0 packs as 1.1.0.0, and 1.0.0 will pack as
-    2.0.0.0. That keeps every later app version above every earlier one."""
+    """The package version for the app's x.y.z: the same, with a fourth part
+    of 0, so the Store shows the version the app does (1.0.0 packs as
+    1.0.0.0). The Store needs a first part above 0, every part at most 65535
+    and a fourth part of 0, so a 0.x version cannot be packed."""
     found = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
     if not found:
         fail(f"{version!r} is not a plain x.y.z version")
-    major, minor, patch = (int(part) for part in found.groups())
-    parts = (major + 1, minor, patch, 0)
+    parts = tuple(int(part) for part in found.groups()) + (0,)
+    if parts[0] == 0:
+        fail(f"{version}: the Store takes no package version whose first part is 0")
     if max(parts) > 65535:
         fail(f"{version} does not fit a package version, whose parts go up to 65535")
     return ".".join(str(part) for part in parts)
