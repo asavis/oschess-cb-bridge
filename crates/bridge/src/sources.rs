@@ -144,7 +144,7 @@ impl Read {
             let kept = self.paths.entry(path.clone()).or_default();
             // Named by its place: the path would name the user and the database.
             let place = i + 1;
-            let what = format_args!("databases entry {place} of bridge.toml");
+            let what = format!("databases entry {place} of bridge.toml");
             changed |= kept.update(folder_signature(path), &what, || expand(path));
         }
         self.configured = configured;
