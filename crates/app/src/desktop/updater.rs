@@ -89,7 +89,8 @@ fn look(app: &AppHandle, asked: bool) {
 }
 
 /// On success the installer runs and this process exits, so this returns
-/// only when there was nothing to install or something failed.
+/// only when there was nothing to install or something failed. [`look`] logs
+/// the error as it is, so no error of this crate's own names a path.
 fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
     let shared = shared(app);
     let strings = &shared.strings;

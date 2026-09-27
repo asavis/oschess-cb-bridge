@@ -64,12 +64,22 @@ fn open_file(dir: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// Writes `message` as a line, after the time: to standard error, and to the
-/// log file once open. Called by [`log!`].
+/// Writes `message` as a line, after the time: to the log file once open, and
+/// to standard error. Called by [`log!`].
 pub fn write(message: fmt::Arguments<'_>) {
     let line = format!("{} {message}\n", timestamp(now()));
-    eprint!("{line}");
-    append(&FILE, &line);
+    put(&FILE, &line, &mut std::io::stderr());
+}
+
+/// Appends `line` to the file `file` holds, if any, and then writes it to
+/// `stderr`. Neither can fail the caller: standard error is optional, full or
+/// closed at times, and a line it refuses still reaches the file. The
+/// standard library's printing macros would panic there instead, and a start
+/// would stop at its first line.
+fn put(file: &Mutex<Option<File>>, line: &str, stderr: &mut dyn Write) {
+    append(file, line);
+    // `Stderr` writes the whole line under its own lock.
+    let _ = stderr.write_all(line.as_bytes());
 }
 
 /// Appends `line` whole to the file `file` holds, if any: under the lock, so
@@ -222,6 +232,30 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
         assert_eq!(text.lines().count(), 8 * 50);
         assert!(text.split_inclusive('\n').all(|l| lines.iter().any(|w| w == l)), "a line was cut");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_reaches_the_file_when_standard_error_fails() {
+        /// Standard error on a full disk or a closed pipe.
+        struct Refusing(usize);
+        impl Write for Refusing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+        let dir = folder("stderr");
+        let file = Mutex::new(Some(open_file(&dir).unwrap()));
+        let mut stderr = Refusing(0);
+        put(&file, "a line\n", &mut stderr);
+        put(&file, "another\n", &mut stderr);
+        drop(file);
+        assert_eq!(stderr.0, 2, "each line was offered to standard error");
+        assert_eq!(std::fs::read_to_string(dir.join(FILE_NAME)).unwrap(), "a line\nanother\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
