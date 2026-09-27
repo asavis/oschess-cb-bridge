@@ -144,6 +144,11 @@ it over HTTP as oschess does:
   first line, and the lines a second;
 - a small answer over a kept and over a new connection.
 
+The `--index` folder stands for the bridge's data folder: every index the
+child bridge builds, a PGN file's header index included, goes there as it
+would in the data folder, and nothing goes into the data folder itself, so
+another run starts cold again with a new folder.
+
 It prints only timings and counts, and for a failed answer its status and the
 bridge's error code; never a name, game, query or path, so its output can go
 into an issue as it is. The child bridge's own messages are discarded. A failed

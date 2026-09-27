@@ -1,24 +1,18 @@
 //! The games window's `line` parameter (#81): the start of each game's main
 //! line in SAN, as `GET /games/{number}` writes it, in both formats.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
-use bridge::server;
-use cbformat::fixture::{Builder, TempDb, bytes, lid_header, sq};
+use cbformat::fixture::{Builder, TempDb, bytes, lid_header, sq, words};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record, start_position};
-use cbformat::movetable::{
-    self, ALTERNATIVE, Captured, CastleSide, Color, END_OF_LINE, MOVES, MoveWord, NULL_MOVE, Piece,
-};
+use cbformat::movetable::{self, ALTERNATIVE, Captured, Color, END_OF_LINE, MOVES, MoveWord, NULL_MOVE, Piece};
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+mod common;
+use common::{get, policy, serve};
 
 /// Castling, a capture, a knight named by its file, a promotion with check,
 /// a mate: the games both formats hold, with the line each must answer.
@@ -27,56 +21,6 @@ const GAMES: [(&str, &str); 3] = [
     ("e2e4 d7d5 e4d5 c7c6 d5c6 d8d7 c6b7 g8f6 b7c8q d7d8", "e4 d5 exd5 c6 dxc6 Qd7 cxb7 Nf6 bxc8=Q+ Qd8"),
     ("f2f3 e7e5 g2g4 d8h4", "f3 e5 g4 Qh4#"),
 ];
-
-fn color(c: CColor) -> Color {
-    if c == CColor::White { Color::White } else { Color::Black }
-}
-
-fn piece(p: CPiece) -> Piece {
-    match p {
-        CPiece::King => Piece::King,
-        CPiece::Queen => Piece::Queen,
-        CPiece::Rook => Piece::Rook,
-        CPiece::Bishop => Piece::Bishop,
-        CPiece::Knight => Piece::Knight,
-        CPiece::Pawn => Piece::Pawn,
-    }
-}
-
-/// The 2CBH words of `ucis` played from `board`.
-fn words(board: &mut Board, ucis: &str) -> Vec<u16> {
-    let mut out = Vec::new();
-    for uci in ucis.split_whitespace() {
-        let mut mv: Move = uci.parse().unwrap();
-        let (p, c) = board.piece_at(mv.from).unwrap();
-        let word = if p == CPiece::King && mv.from.file().abs_diff(mv.to.file()) == 2 {
-            let short = mv.to.file() == 6;
-            mv.to = chesscore::Square::new(if short { 7 } else { 0 }, mv.from.rank());
-            MoveWord::Castle { color: color(c), side: if short { CastleSide::Short } else { CastleSide::Long } }
-        } else {
-            let captured = match board.piece_at(mv.to) {
-                Some((CPiece::Queen, _)) => Captured::Queen,
-                Some((CPiece::Rook, _)) => Captured::Rook,
-                Some((CPiece::Bishop, _)) => Captured::Bishop,
-                Some((CPiece::Knight, _)) => Captured::Knight,
-                Some(_) => Captured::Pawn,
-                None if p == CPiece::Pawn && mv.from.file() != mv.to.file() => Captured::EnPassant,
-                None => Captured::Nothing,
-            };
-            MoveWord::Normal {
-                color: color(c),
-                piece: piece(p),
-                from: mv.from.index() as u8,
-                to: mv.to.index() as u8,
-                captured,
-                promotion: mv.promotion.map(piece),
-            }
-        };
-        board.play_checked(mv).unwrap();
-        out.push(movetable::encode(word).unwrap());
-    }
-    out
-}
 
 /// A 2CBH game of the words `stream` holds after `MOVES`.
 fn game(b: &mut Builder, stream: &[u16]) {
@@ -219,31 +163,7 @@ fn classic(name: &str) -> TempDb {
 }
 
 fn start(paths: Vec<PathBuf>, between_reads: Option<Box<dyn Fn() + Send + Sync>>) -> u16 {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new(paths),
-        between_reads,
-        engine: bridge::engine::Engine::none(),
-    };
-    let app = Arc::new(app);
-    std::thread::spawn(move || server::serve(listeners, app));
-    port
-}
-
-fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {}\r\nConnection: close\r\n\r\n",
-        DEFAULT_ORIGINS[0]
-    );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split(' ').nth(1).unwrap().parse().unwrap();
-    (status, out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default())
+    serve(App { between_reads, ..App::new("test", policy(), Catalog::new(paths)) })
 }
 
 /// Each row's `line` member, verbatim, by the row's number: `"…"`, `null`,

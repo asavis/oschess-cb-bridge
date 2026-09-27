@@ -178,13 +178,8 @@ mod tests {
     fn bridge(databases: Vec<PathBuf>) -> Bridge {
         let listeners = server::bind(0).unwrap();
         let port = listeners[0].local_addr().unwrap().port();
-        let app = App {
-            version: "test",
-            policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() },
-            catalog: Catalog::new(databases),
-            between_reads: None,
-            engine: crate::engine::Engine::none(),
-        };
+        let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() };
+        let app = App::new("test", policy, Catalog::new(databases));
         Bridge { listeners, app: Arc::new(app), port, token: TOKEN.into(), link: String::new(), first_run: false }
     }
 

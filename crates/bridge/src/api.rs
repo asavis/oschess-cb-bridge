@@ -83,6 +83,15 @@ pub struct App {
     pub engine: Engine,
 }
 
+impl App {
+    /// A bridge serving `catalog` under `policy`, with no engine and no hook
+    /// between reads; a caller that needs either sets it with struct update
+    /// syntax, `App { engine, ..App::new(..) }`.
+    pub fn new(version: &'static str, policy: Policy, catalog: Catalog) -> App {
+        App { version, policy, catalog, between_reads: None, engine: Engine::none() }
+    }
+}
+
 pub fn handle(app: &App, req: &Request) -> Response {
     match app.policy.check(req) {
         Verdict::Answer(response) => response,

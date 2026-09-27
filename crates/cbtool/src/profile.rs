@@ -74,7 +74,7 @@ fn options(args: &[String]) -> AnyResult<Options> {
         }
     }
     let db = db.ok_or("no database given")?;
-    let index = index.ok_or("--index <dir> is required: the position index is built there")?;
+    let index = index.ok_or("--index <dir> is required: the indexes are built there")?;
     Ok(Options { db, index, engine })
 }
 
@@ -88,14 +88,12 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
         Some(exe) => Engine::new(EngineConfig::new(PathBuf::from(exe), None, None)),
         None => Engine::none(),
     };
-    let app = App {
-        version: "profile",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new([PathBuf::from(db)]),
-        between_reads: None,
-        engine,
-    };
-    app.catalog.explorer.set_dir(PathBuf::from(index));
+    let policy = Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() };
+    let app = App { engine, ..App::new("profile", policy, Catalog::new([PathBuf::from(db)])) };
+    // The `--index` folder stands for the data folder: every index the bridge
+    // builds goes there, never into the real data folder, whose indexes would
+    // make the first answers warm.
+    app.catalog.use_data_dir(Path::new(index));
     let mut out = std::io::stdout();
     writeln!(out, "port {port}")?;
     out.flush()?;
@@ -606,7 +604,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     // The heads file (#106): the first bridge built it after its first sort.
     // The new one, its caches empty, answers its first sorts, suggestion and
     // searches from it.
-    let heads = o.index.join(format!("{}.heads", again.id));
+    let heads = o.index.join("index").join(format!("{}.heads", again.id));
     let present = if heads.exists() { "from the heads file" } else { "no heads file" };
     let base = format!("/v1/databases/{}", again.id);
     for key in SORT_KEYS {

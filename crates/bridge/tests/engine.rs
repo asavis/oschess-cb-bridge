@@ -6,15 +6,13 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::Catalog;
 use bridge::engine::{self, Engine, EngineConfig};
-use bridge::server;
 use bridge::sources::Sources;
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
-const ORIGIN: &str = "https://oschess.org";
+mod common;
+use common::{ORIGIN, exchange, get, policy, request, serve_shared};
 
 fn fake() -> EngineConfig {
     EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(1), Some(16))
@@ -22,18 +20,7 @@ fn fake() -> EngineConfig {
 
 /// A server with `engine`, and the port it listens on.
 fn start(engine: Engine) -> (u16, Arc<App>) {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    let app = Arc::new(App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new(Vec::new()),
-        between_reads: None,
-        engine,
-    });
-    let served = app.clone();
-    std::thread::spawn(move || server::serve(listeners, served));
-    (port, app)
+    serve_shared(App { engine, ..App::new("test", policy(), Catalog::new(Vec::new())) })
 }
 
 /// An analysis being read: the response head, then its lines one by one.
@@ -47,10 +34,7 @@ impl Analysis {
     fn open(port: u16, query: &str) -> Analysis {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let raw = format!(
-            "GET /v1/engine/analyze?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n"
-        );
-        (&s).write_all(raw.as_bytes()).unwrap();
+        (&s).write_all(request(port, &format!("/v1/engine/analyze?{query}")).as_bytes()).unwrap();
         let mut reader = BufReader::new(s);
         let mut head = String::new();
         loop {
@@ -175,7 +159,7 @@ fn configured_values_above_the_limits_start_and_stay_within_them() {
     let limits = bridge::engine::limits();
     let over = EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(u32::MAX), Some(u32::MAX));
     let (port, _app) = start(Engine::new(over));
-    let status = get(port, "/v1/status", true);
+    let (_, status) = get(port, "/v1/status");
     let (threads, hash) = (u64::from(limits.max_threads), u64::from(limits.max_hash_mb));
     assert!(status.contains(&format!(r#""threads":{{"default":{threads},"max":{threads}}}"#)), "{status}");
     assert!(status.contains(&format!(r#""hash":{{"default":{hash},"max":{hash}}}"#)), "{status}");
@@ -311,21 +295,16 @@ fn refuses_bad_input_and_a_missing_engine() {
     assert!(a.body().contains(r#""code":"no_engine""#));
 }
 
-fn get(port: u16, path: &str, token: bool) -> String {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let auth = if token { format!("Authorization: Bearer {TOKEN}\r\n") } else { String::new() };
-    let raw =
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Origin: {ORIGIN}\r\nConnection: close\r\n\r\n");
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    out
+/// The whole answer to a GET of `path` that carries no token.
+fn get_without_token(port: u16, path: &str) -> String {
+    let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n");
+    exchange(port, &raw).unwrap()
 }
 
 #[test]
 fn the_status_names_the_engine() {
     let (port, _app) = start(Engine::new(fake()));
-    let status = get(port, "/v1/status", true);
+    let (_, status) = get(port, "/v1/status");
     let limits = bridge::engine::limits();
     let engine = format!(
         r#""engine":{{"name":"fake-uci","threads":{{"default":1,"max":{}}},"hash":{{"default":16,"max":{}}}}}"#,
@@ -333,13 +312,13 @@ fn the_status_names_the_engine() {
     );
     assert!(status.contains(&engine), "{status}");
     let (port, _app) = start(Engine::none());
-    assert!(get(port, "/v1/status", true).contains(r#""engine":null"#));
+    assert!(get(port, "/v1/status").1.contains(r#""engine":null"#));
 }
 
 #[test]
 fn the_token_is_required() {
     let (port, _app) = start(Engine::new(fake()));
-    let out = get(port, "/v1/engine/analyze?depth=1", false);
+    let out = get_without_token(port, "/v1/engine/analyze?depth=1");
     assert!(out.starts_with("HTTP/1.1 401"), "{out}");
 }
 
@@ -520,10 +499,7 @@ fn a_probe_accepts_only_a_uci_engine() {
 fn warm(port: u16, query: &str) -> (u16, String) {
     let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let raw = format!(
-        "GET /v1/engine/warm?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n"
-    );
-    (&s).write_all(raw.as_bytes()).unwrap();
+    (&s).write_all(request(port, &format!("/v1/engine/warm?{query}")).as_bytes()).unwrap();
     let mut text = String::new();
     BufReader::new(s).read_to_string(&mut text).unwrap();
     let status = text.split(' ').nth(1).unwrap().parse().unwrap();

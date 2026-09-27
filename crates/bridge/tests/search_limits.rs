@@ -2,39 +2,19 @@
 //! too large to sort. Both use sparse files, which need a Unix file system.
 #![cfg(unix)]
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::search::Indexes;
-use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
-
-fn get(port: u16, path: &str) -> (u16, String) {
-    try_get(port, path).expect("the bridge answers")
-}
-
-/// [`get`], or `None` when the connection is refused or cut: during a start,
-/// the port may belong to another test's bridge that has just ended.
-fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
-    );
-    s.write_all(raw.as_bytes()).ok()?;
-    let mut out = String::new();
-    s.read_to_string(&mut out).ok()?;
-    let status = out.split(' ').nth(1)?.parse().ok()?;
-    Some((status, out))
-}
+mod common;
+use common::{TOKEN, get, policy, serve_shared, try_get};
 
 /// One game, then `records - 1` headers that are a hole in the file.
 fn sparse(name: &str, records: u64) -> TempDb {
@@ -56,18 +36,8 @@ struct Served {
 
 fn serve_sparse(name: &str, records: u64) -> Served {
     let db = sparse(name, records);
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
     let path = db.dir().join("db.2cbh");
-    let app = Arc::new(App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new([path.clone()]),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    });
-    let served = app.clone();
-    std::thread::spawn(move || server::serve(listeners, served));
+    let (port, app) = serve_shared(App::new("test", policy(), Catalog::new([path.clone()])));
     Served { port, id: id_of(&path), app, _db: db }
 }
 

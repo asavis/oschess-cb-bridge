@@ -162,13 +162,8 @@ mod tests {
     fn a_connection_stops_counting_before_its_client_sees_it_close() {
         let listener = bind(0).unwrap().remove(0);
         let port = listener.local_addr().unwrap().port();
-        let app = Arc::new(App {
-            version: "test",
-            policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) },
-            catalog: Catalog::new(Vec::new()),
-            between_reads: None,
-            engine: crate::engine::Engine::none(),
-        });
+        let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) };
+        let app = Arc::new(App::new("test", policy, Catalog::new(Vec::new())));
         let active = Arc::new(AtomicUsize::new(0));
         let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);
         let counted = active.clone();

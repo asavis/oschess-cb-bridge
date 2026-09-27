@@ -3,8 +3,6 @@
 //! the bridge allocate beyond its budget or abort. Sparse files need Unix.
 #![cfg(unix)]
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,23 +11,10 @@ use bridge::explorer::format::{BLOCK_ENTRY, Header, MAX_PLY, PRUNE_PLY};
 use cbformat::fixture::{Builder, TempDb, annotations, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
-const START: &str = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR%20w%20KQkq%20-%200%201";
+mod common;
+use common::{TOKEN, try_get};
 
-/// A request's status and whole answer, or `None` when the connection is
-/// refused or cut: during a start, the port may belong to another test's
-/// bridge that has just ended.
-fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
-    );
-    s.write_all(raw.as_bytes()).ok()?;
-    let mut out = String::new();
-    s.read_to_string(&mut out).ok()?;
-    let status = out.split(' ').nth(1)?.parse().ok()?;
-    Some((status, out))
-}
+const START: &str = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR%20w%20KQkq%20-%200%201";
 
 /// The bridge as a separate process under an address-space limit of
 /// `limit_kib`, with a 16 MiB search budget and four workers; killed when

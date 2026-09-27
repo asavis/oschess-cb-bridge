@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::server;
@@ -14,8 +13,8 @@ use cbformat::fixture::{Builder, TempDb, annotations, arrows, lid_header, quiet,
 use cbformat::game::language;
 use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Piece};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
-const ORIGIN: &str = "https://oschess.org";
+mod common;
+use common::{ORIGIN, TOKEN, exchange, policy, request, serve};
 
 /// `games` games of 1.e4 won by white, white and black being "Morphy, Paul";
 /// record `text` (1-based, 0 for none) is a guiding text and record `broken`
@@ -47,22 +46,12 @@ struct Running {
 }
 
 fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sync>>) -> Running {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
     let path = db.dir().join("db.2cbh");
     let mut paths = vec![path.clone()];
     paths.extend(extra);
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new(paths),
-        between_reads: hook,
-        engine: bridge::engine::Engine::none(),
-    };
-    app.catalog.pgn().set_dir(db.dir().join("pgn-index"));
-    let app = Arc::new(app);
-    std::thread::spawn(move || server::serve(listeners, app));
-    Running { port, id: id_of(&path) }
+    let app = App { between_reads: hook, ..App::new("test", policy(), Catalog::new(paths)) };
+    app.catalog.use_data_dir(db.dir());
+    Running { port: serve(app), id: id_of(&path) }
 }
 
 struct Reply {
@@ -80,12 +69,8 @@ impl Reply {
     }
 }
 
-fn exchange(port: u16, raw: &[u8]) -> Reply {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.write_all(raw).unwrap();
-    let mut out = Vec::new();
-    s.read_to_end(&mut out).unwrap();
-    parse_reply(&String::from_utf8(out).unwrap())
+fn send(port: u16, raw: &str) -> Reply {
+    parse_reply(&exchange(port, raw).unwrap())
 }
 
 fn parse_reply(text: &str) -> Reply {
@@ -95,16 +80,13 @@ fn parse_reply(text: &str) -> Reply {
     Reply { status, headers: headers.to_string(), body: body.to_string() }
 }
 
-/// A GET with the token, an allowed Origin and `Connection: close`, plus `extra` header lines.
-fn get(port: u16, path: &str, extra: &str) -> Reply {
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {ORIGIN}\r\n{extra}Connection: close\r\n\r\n"
-    );
-    exchange(port, raw.as_bytes())
+/// The answer to [`request`]`(port, path)`, with its headers.
+fn get_reply(port: u16, path: &str) -> Reply {
+    send(port, &request(port, path))
 }
 
 fn plain(port: u16, head: &str) -> Reply {
-    exchange(port, format!("{head}\r\nConnection: close\r\n\r\n").as_bytes())
+    send(port, &format!("{head}\r\nConnection: close\r\n\r\n"))
 }
 
 #[test]
@@ -113,7 +95,7 @@ fn status_and_databases() {
     let pgn = db.dir().join("games.pgn");
     std::fs::write(&pgn, "[Event \"x\"]\n\n1. e4 *\n").unwrap();
     let r = start(&db, vec![pgn, PathBuf::from("/no/such/base.2cbh")], None);
-    let s = get(r.port, "/v1/status", "");
+    let s = get_reply(r.port, "/v1/status");
     assert_eq!(s.status, 200, "{}", s.body);
     assert!(s.body.contains(r#""bridge":{"version":"test","api":1}"#), "{}", s.body);
     // The PGN file is opened in the background: its index is built first.
@@ -122,7 +104,7 @@ fn status_and_databases() {
         "{}",
         s.body
     );
-    let d = get(r.port, "/v1/databases", "");
+    let d = get_reply(r.port, "/v1/databases");
     assert_eq!(d.status, 200);
     assert!(
         d.body.contains(&format!(r#""id":"{}","name":"db","format":"2cbh","state":"ready","records":3"#, r.id)),
@@ -186,7 +168,7 @@ fn malformed_requests_bodies_and_oversized_headers() {
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}"));
     assert_eq!((r.status, r.body.contains("headers_too_large")), (431, true));
     assert_eq!(plain(p, "BLAH").status, 400);
-    assert_eq!(get(p, "/v1/nothing", "").status, 404);
+    assert_eq!(get_reply(p, "/v1/nothing").status, 404);
 }
 
 #[test]
@@ -197,17 +179,17 @@ fn game_windows() {
     let numbers = |reply: &Reply| -> Vec<u32> {
         reply.body.split(r#""number":"#).skip(1).map(|s| s.split(',').next().unwrap().parse().unwrap()).collect()
     };
-    let w = get(r.port, &path("?limit=10"), "");
+    let w = get_reply(r.port, &path("?limit=10"));
     assert_eq!(w.status, 200, "{}", w.body);
     assert!(w.body.contains(r#""total":30,"offset":0,"sort":"number-asc""#), "{}", w.body);
     assert_eq!(numbers(&w), (1..=10).collect::<Vec<_>>());
     assert!(w.body.contains(r#""white":"Morphy, Paul","whiteElo":0,"black":"Morphy, Paul""#), "{}", w.body);
     assert!(w.body.contains(r#""result":"1-0""#) && w.body.contains(r#""flags":{"deleted":false,"chess960":false}"#));
-    assert_eq!(numbers(&get(r.port, &path("?offset=25&limit=10"), "")), [26, 27, 28, 29, 30]);
-    assert_eq!(numbers(&get(r.port, &path("?sort=number-desc&limit=3"), "")), [30, 29, 28]);
-    assert_eq!(numbers(&get(r.port, &path("?sort=number-desc&offset=28"), "")), [2, 1]);
-    assert_eq!(numbers(&get(r.port, &path("?offset=30"), "")), Vec::<u32>::new());
-    assert_eq!(numbers(&get(r.port, &path(""), "")).len(), 30);
+    assert_eq!(numbers(&get_reply(r.port, &path("?offset=25&limit=10"))), [26, 27, 28, 29, 30]);
+    assert_eq!(numbers(&get_reply(r.port, &path("?sort=number-desc&limit=3"))), [30, 29, 28]);
+    assert_eq!(numbers(&get_reply(r.port, &path("?sort=number-desc&offset=28"))), [2, 1]);
+    assert_eq!(numbers(&get_reply(r.port, &path("?offset=30"))), Vec::<u32>::new());
+    assert_eq!(numbers(&get_reply(r.port, &path(""))).len(), 30);
     for (q, parameter) in [
         ("?limit=0", "limit"),
         ("?limit=501", "limit"),
@@ -215,18 +197,18 @@ fn game_windows() {
         ("?sort=bogus", "sort"),
         ("?sort=name", "sort"),
     ] {
-        let e = get(r.port, &path(q), "");
+        let e = get_reply(r.port, &path(q));
         assert_eq!(e.status, 400, "{q}");
         assert!(e.body.contains(&format!(r#""parameter":"{parameter}""#)), "{q}: {}", e.body);
     }
-    assert_eq!(get(r.port, "/v1/databases/0000000000000000/games", "").status, 404);
+    assert_eq!(get_reply(r.port, "/v1/databases/0000000000000000/games").status, 404);
 }
 
 #[test]
 fn one_game_and_its_errors() {
     let db = database("api-game", 4, 3, 4);
     let r = start(&db, vec![], None);
-    let game = |n: &str| get(r.port, &format!("/v1/databases/{}/games/{n}", r.id), "");
+    let game = |n: &str| get_reply(r.port, &format!("/v1/databases/{}/games/{n}", r.id));
     let g = game("1");
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(g.body.contains(r#""number":1,"pgn":"[Event "#) && g.body.contains(r#"1. e4 1-0\n""#), "{}", g.body);
@@ -266,7 +248,7 @@ fn a_change_during_the_read_is_retried() {
         }
     };
     let r = start(&db, vec![], Some(Box::new(hook)));
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(g.body.contains(r#"1. e4 0-1\n""#), "the retry serves the saved game: {}", g.body);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -279,7 +261,7 @@ fn a_database_that_keeps_changing_is_reported() {
     let n = Arc::new(AtomicUsize::new(0));
     let hook = move || flip_result(&dir, n.fetch_add(1, Ordering::SeqCst) as u8 % 2);
     let r = start(&db, vec![], Some(Box::new(hook)));
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 503, "{}", g.body);
     assert!(g.body.contains(r#""code":"database_changing""#));
     assert_eq!(g.header("retry-after"), Some("1"));
@@ -293,13 +275,13 @@ fn a_database_that_keeps_changing_is_reported() {
 fn a_save_paused_between_its_steps_serves_a_valid_game() {
     let db = database("api-limitation", 1, 0, 0);
     let r = start(&db, vec![], None);
-    assert!(get(r.port, &format!("/v1/databases/{}/games/1", r.id), "").body.contains("1. e4 1-0"));
+    assert!(get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id)).body.contains("1. e4 1-0"));
     // The save writes 1.d4 into the move record and has not yet written the new
     // result into the header.
     let words = [MOVES, quiet(Color::White, Piece::Pawn, "d2", "d4"), END_OF_LINE];
     let content: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     write_at(&db.dir().join("db.2cbg"), 12, &cbformat::fixture::framed(1, &content));
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(g.body.contains("1. d4 1-0"), "new moves, old header: {}", g.body);
 }
@@ -310,12 +292,12 @@ fn appended_games_appear_on_the_next_request() {
     let r = start(&db, vec![], None);
     let total = |reply: Reply| reply.body.split(r#""total":"#).nth(1).unwrap().split(',').next().unwrap().to_string();
     let path = format!("/v1/databases/{}/games", r.id);
-    assert_eq!(total(get(r.port, &path, "")), "2");
+    assert_eq!(total(get_reply(r.port, &path)), "2");
     let bigger = database("api-append-bigger", 5, 0, 0);
     for f in ["db.2cbh", "db.2cbg", "db.2lid"] {
         std::fs::copy(bigger.dir().join(f), db.dir().join(f)).unwrap();
     }
-    assert_eq!(total(get(r.port, &path, "")), "5");
+    assert_eq!(total(get_reply(r.port, &path)), "5");
 }
 
 #[test]
@@ -398,7 +380,7 @@ fn texts_and_analyses_are_read_with_their_own_layouts() {
     ));
     let db = b.write("api-kinds");
     let r = start(&db, vec![], None);
-    let w = get(r.port, &format!("/v1/databases/{}/games", r.id), "");
+    let w = get_reply(r.port, &format!("/v1/databases/{}/games", r.id));
     assert_eq!(w.status, 200, "{}", w.body);
     let rows: Vec<&str> = w.body.split(r#"{"number":"#).skip(1).collect();
     assert!(rows[0].contains(r#""kind":"game","white":"Morphy, Paul""#), "{}", rows[0]);
@@ -437,7 +419,7 @@ fn a_huge_shared_entity_does_not_blow_up_a_window() {
     b.lid(lid);
     let db = b.write("api-huge-entity");
     let r = start(&db, vec![], None);
-    let w = get(r.port, &format!("/v1/databases/{}/games?limit=500", r.id), "");
+    let w = get_reply(r.port, &format!("/v1/databases/{}/games?limit=500", r.id));
     assert_eq!(w.status, 200);
     assert!(w.body.len() < 2 << 20, "window of {} bytes", w.body.len());
     let whites: Vec<&str> =
@@ -457,7 +439,7 @@ fn a_window_at_the_last_record_number() {
     file.set_len((u64::from(u32::MAX) + 1) * 192).unwrap();
     let r = start(&db, vec![], None);
     let numbers = |q: &str| -> Vec<u64> {
-        let w = get(r.port, &format!("/v1/databases/{}/games{q}", r.id), "");
+        let w = get_reply(r.port, &format!("/v1/databases/{}/games{q}", r.id));
         assert_eq!(w.status, 200, "{q}: {}", w.body);
         w.body.split(r#""number":"#).skip(1).map(|s| s.split(',').next().unwrap().parse().unwrap()).collect()
     };
@@ -539,10 +521,10 @@ fn a_game_too_large_to_render_is_refused() {
     b.game(huge);
     let db = b.write("api-huge-game");
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 422, "{}", g.body);
     assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("limit"), "{}", g.body);
-    assert_eq!(get(r.port, "/v1/status", "").status, 200);
+    assert_eq!(get_reply(r.port, "/v1/status").status, 200);
 }
 
 /// Over the connection cap, the `busy` answer is readable by an allowed page,
@@ -558,7 +540,7 @@ fn busy_and_misdirected_answers_carry_cors() {
     let idle: Vec<TcpStream> =
         (0..server::MAX_CONNECTIONS).map(|_| TcpStream::connect(("127.0.0.1", p)).unwrap()).collect();
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let r = get(p, "/v1/status", "");
+    let r = get_reply(p, "/v1/status");
     assert_eq!(r.status, 503, "{}", r.body);
     assert!(r.body.contains(r#""code":"busy""#));
     assert_eq!(r.header("retry-after"), Some("1"));
@@ -587,10 +569,10 @@ fn a_game_whose_answer_would_be_huge_is_refused() {
     ));
     let db = b.write("api-huge-answer");
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 422, "{}", &g.body[..g.body.len().min(300)]);
     assert!(g.body.contains("too large") && g.body.contains("limit"), "{}", g.body);
-    assert_eq!(get(r.port, "/v1/status", "").status, 200);
+    assert_eq!(get_reply(r.port, "/v1/status").status, 200);
 }
 
 /// Silent connections queued over the cap cannot delay the busy answer of a
@@ -604,7 +586,7 @@ fn silent_queued_connections_do_not_delay_the_busy_answer() {
     std::thread::sleep(std::time::Duration::from_millis(200));
     let silent: Vec<TcpStream> = (0..12).map(|_| TcpStream::connect(("127.0.0.1", p)).unwrap()).collect();
     let started = std::time::Instant::now();
-    let r = get(p, "/v1/status", "");
+    let r = get_reply(p, "/v1/status");
     let waited = started.elapsed();
     assert_eq!(r.status, 503, "{}", r.body);
     assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
@@ -612,7 +594,7 @@ fn silent_queued_connections_do_not_delay_the_busy_answer() {
     drop(silent);
     drop(serving);
     std::thread::sleep(std::time::Duration::from_millis(200));
-    assert_eq!(get(p, "/v1/status", "").status, 200);
+    assert_eq!(get_reply(p, "/v1/status").status, 200);
 }
 
 /// Game 1: 1.e4 e5 with annotation record `content`; game 2: 1.e4 with an
@@ -652,7 +634,7 @@ fn annotated_games_are_served_with_their_annotations() {
     ]);
     let db = annotated_database("api-annotated", &content);
     let r = start(&db, vec![], None);
-    let game = |query: &str| get(r.port, &format!("/v1/databases/{}/games/1{query}", r.id), "");
+    let game = |query: &str| get_reply(r.port, &format!("/v1/databases/{}/games/1{query}", r.id));
     let g = game("");
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(
@@ -672,11 +654,11 @@ fn annotated_games_are_served_with_their_annotations() {
         assert!(game(query).body.contains("Best by test} {Then}"), "{query}");
     }
     // A game with an empty annotation record, and a database without `.2cba`.
-    let g = get(r.port, &format!("/v1/databases/{}/games/2", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/2", r.id));
     assert!(g.body.ends_with(r#""annotations":"none"}"#), "{}", g.body);
     let plain = database("api-no-annotations", 1, 0, 0);
     let r = start(&plain, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert!(g.body.ends_with(r#""annotations":"none"}"#), "{}", g.body);
 }
 
@@ -689,7 +671,7 @@ fn an_unknown_annotation_layout_is_reported() {
     ]);
     let db = annotated_database("api-unknown-annotation", &content);
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(g.body.contains(r#"1. e4 {kept} 1... e5 1-0"#), "{}", g.body);
     assert!(!g.body.contains("lost"), "{}", g.body);
@@ -701,7 +683,7 @@ fn an_oversized_annotation_record_is_refused() {
     let long = "x".repeat(bridge::store::MAX_GAME_BYTES);
     let db = annotated_database("api-huge-annotation", &annotations(&[(0, vec![text(false, 0, &long)])]));
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 422, "{}", &g.body[..g.body.len().min(300)]);
     assert!(
         g.body.contains(r#""code":"unreadable_game""#)
@@ -711,7 +693,7 @@ fn an_oversized_annotation_record_is_refused() {
         g.body
     );
     // The other game of that database is served.
-    assert_eq!(get(r.port, &format!("/v1/databases/{}/games/2", r.id), "").status, 200);
+    assert_eq!(get_reply(r.port, &format!("/v1/databases/{}/games/2", r.id)).status, 200);
 }
 
 /// The full form (#42): every language as its own comment, and every
@@ -727,7 +709,7 @@ fn the_full_form_keeps_every_language_and_annotation() {
     ]);
     let db = annotated_database("api-full-form", &content);
     let r = start(&db, vec![], None);
-    let game = |q: &str| get(r.port, &format!("/v1/databases/{}/games/1{q}", r.id), "");
+    let game = |q: &str| get_reply(r.port, &format!("/v1/databases/{}/games/1{q}", r.id));
     let full = game("?annotations=full");
     assert_eq!(full.status, 200, "{}", full.body);
     assert!(full.body.contains("{[%lang en] centre} {[%lang de] Zentrum}"), "{}", full.body);
@@ -752,7 +734,7 @@ fn a_full_form_over_the_answer_limit_is_refused() {
     let pawns: Vec<Vec<u8>> = (0..400_000).map(|_| vec![0x14, 0, 5]).collect();
     let db = annotated_database("api-full-limit", &annotations(&[(0, pawns)]));
     let r = start(&db, vec![], None);
-    let game = |q: &str| get(r.port, &format!("/v1/databases/{}/games/1{q}", r.id), "");
+    let game = |q: &str| get_reply(r.port, &format!("/v1/databases/{}/games/1{q}", r.id));
     assert_eq!(game("").status, 200);
     let full = game("?annotations=full");
     assert_eq!(full.status, 422, "{}", &full.body[..full.body.len().min(300)]);
@@ -776,7 +758,7 @@ fn a_change_to_the_annotations_during_the_read_is_retried() {
         }
     };
     let r = start(&db, vec![], Some(Box::new(hook)));
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(g.body.contains("1. e4 {latest}"), "the retry serves the saved annotations: {}", g.body);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -789,7 +771,7 @@ fn an_annotation_past_the_end_is_served_and_one_on_no_move_is_an_unreadable_game
     let content = annotations(&[(2, vec![text(false, language::ENGLISH, "past the end")])]);
     let db = annotated_database("api-annotation-past-end", &content);
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 200, "{}", g.body);
     assert!(g.body.contains("1. e4 e5 {past the end}"), "{}", g.body);
     assert!(g.body.ends_with(r#""annotations":"complete"}"#), "{}", g.body);
@@ -800,7 +782,7 @@ fn an_annotation_past_the_end_is_served_and_one_on_no_move_is_an_unreadable_game
     b.annotated_game(none, a);
     let db = b.write("api-annotation-no-move");
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 422, "{}", g.body);
     assert!(g.body.contains(r#""code":"unreadable_game""#) && g.body.contains("position 0"), "{}", g.body);
 }
@@ -809,7 +791,7 @@ fn an_annotation_past_the_end_is_served_and_one_on_no_move_is_an_unreadable_game
 fn search_sort_and_unsupported_qualifiers() {
     let db = database("api-search", 6, 3, 0);
     let r = start(&db, vec![], None);
-    let list = |q: &str| get(r.port, &format!("/v1/databases/{}/games{q}", r.id), "");
+    let list = |q: &str| get_reply(r.port, &format!("/v1/databases/{}/games{q}", r.id));
     let numbers = |reply: &Reply| -> Vec<u32> {
         reply.body.split(r#""number":"#).skip(1).map(|s| s.split(',').next().unwrap().parse().unwrap()).collect()
     };
@@ -829,7 +811,7 @@ fn search_sort_and_unsupported_qualifiers() {
         "{}",
         e.body
     );
-    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix=mor", r.id), "");
+    let s = get_reply(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix=mor", r.id));
     assert_eq!(s.status, 200, "{}", s.body);
     assert!(
         s.body.contains(
@@ -843,7 +825,7 @@ fn search_sort_and_unsupported_qualifiers() {
         ("?field=player&prefix=+", "prefix"),
         ("?field=event&prefix=p&limit=21", "limit"),
     ] {
-        let e = get(r.port, &format!("/v1/databases/{}/suggest{q}", r.id), "");
+        let e = get_reply(r.port, &format!("/v1/databases/{}/suggest{q}", r.id));
         assert!(e.status == 400 && e.body.contains(&format!(r#""parameter":"{parameter}""#)), "{q}: {}", e.body);
     }
 }
@@ -868,7 +850,7 @@ fn event_suggestions_match_the_start_of_the_name() {
     b.lid(lid_with(64, 21, &entities));
     let db = b.write("api-event-prefix");
     let r = start(&db, vec![], None);
-    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=event&prefix=Paris&limit=20", r.id), "");
+    let s = get_reply(r.port, &format!("/v1/databases/{}/suggest?field=event&prefix=Paris&limit=20", r.id));
     assert_eq!(s.status, 200, "{}", s.body);
     assert!(s.body.contains(r#"{"value":"Paris Open","label":"Paris Open","games":1}"#), "{}", s.body);
     assert!(!s.body.contains("Other event"), "{}", s.body);
@@ -888,10 +870,10 @@ fn first_names_come_from_their_own_field() {
     let db = b.write("api-first-name-field");
     let r = start(&db, vec![], None);
     for field in ["player", "annotator"] {
-        let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id), "");
+        let s = get_reply(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id));
         assert_eq!(s.status, 200, "{}", s.body);
         assert!(s.body.contains(r#""value":"Smith, Jr., Alex""#), "{field}: {}", s.body);
-        let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Jr.", r.id), "");
+        let s = get_reply(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Jr.", r.id));
         assert!(s.body.contains(r#""suggestions":[]"#), "{field}: {}", s.body);
     }
 }
@@ -911,7 +893,7 @@ fn a_first_name_counts_for_every_entity_of_a_shown_name() {
         let db = b.write(&format!("api-first-name-group-{unused}"));
         let r = start(&db, vec![], None);
         for field in ["player", "annotator"] {
-            let s = get(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id), "");
+            let s = get_reply(r.port, &format!("/v1/databases/{}/suggest?field={field}&prefix=Alex", r.id));
             assert_eq!(s.status, 200, "{}", s.body);
             assert!(
                 s.body.contains(r#"{"value":"Smith, Alex","label":"Smith, Alex","games":1}"#),
@@ -939,7 +921,7 @@ fn the_deepest_variations_are_served_on_a_connection_thread() {
     b.game(at);
     let db = b.write("api-deep-variations");
     let r = start(&db, vec![], None);
-    let g = get(r.port, &format!("/v1/databases/{}/games/1", r.id), "");
+    let g = get_reply(r.port, &format!("/v1/databases/{}/games/1", r.id));
     assert_eq!(g.status, 200, "{}", g.body);
     assert_eq!(g.body.matches('(').count(), MAX_VARIATION_DEPTH, "{}", &g.body[..200.min(g.body.len())]);
 }
@@ -950,12 +932,12 @@ fn a_changed_database_is_searched_afresh() {
     let r = start(&db, vec![], None);
     let total = |reply: Reply| reply.body.split(r#""total":"#).nth(1).unwrap().split(',').next().unwrap().to_string();
     let path = format!("/v1/databases/{}/games?q=player:morphy+sort:white", r.id);
-    assert_eq!(total(get(r.port, &path, "")), "2");
+    assert_eq!(total(get_reply(r.port, &path)), "2");
     let bigger = database("api-search-fresh-bigger", 5, 0, 0);
     for f in ["db.2cbh", "db.2cbg", "db.2lid"] {
         std::fs::copy(bigger.dir().join(f), db.dir().join(f)).unwrap();
     }
-    assert_eq!(total(get(r.port, &path, "")), "5", "the kept result and sort order belong to the old generation");
+    assert_eq!(total(get_reply(r.port, &path)), "5", "the kept result and sort order belong to the old generation");
 }
 
 /// Percent-encodes everything but unreserved characters, for a query value.
@@ -988,14 +970,14 @@ fn suggestions_carry_the_complete_value_and_a_clipped_label() {
     builder.lid(lid_with(1024, 3, &players));
     let db = builder.write("api-suggest-long");
     let r = start(&db, vec![], None);
-    let s = get(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix={}", r.id, encode("éé")), "");
+    let s = get_reply(r.port, &format!("/v1/databases/{}/suggest?field=player&prefix={}", r.id, encode("éé")));
     assert_eq!(s.status, 200, "{}", s.body);
     let label: String = prefix.chars().take(200).collect::<String>() + "…";
     for name in [&a, &b] {
         let item = format!(r#"{{"value":"{name}","label":"{label}","games":1}}"#);
         assert!(s.body.contains(&item), "{name}: {}", s.body);
         let q = encode(&format!("player:\"{name}\""));
-        let w = get(r.port, &format!("/v1/databases/{}/games?q={q}", r.id), "");
+        let w = get_reply(r.port, &format!("/v1/databases/{}/games?q={q}", r.id));
         assert!(w.body.contains(r#""total":1,"#), "{}", w.body);
     }
     assert!(!s.body.contains("xxx"), "a name of 270 characters is not offered: {}", s.body);

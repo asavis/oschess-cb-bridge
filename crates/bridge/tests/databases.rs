@@ -4,14 +4,13 @@
 
 use std::collections::HashSet;
 use std::fs::Metadata;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
+use bridge::access::Policy;
 use bridge::api::App;
 use bridge::catalog::{Catalog, Entry, State, id_of};
 use bridge::fetch::Cloud;
@@ -22,7 +21,9 @@ use cbformat::fixture_cbh::{self, Tok, encode, move_record};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+mod common;
+use common::{TOKEN, get, policy, serve};
+
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 
 /// A temporary folder standing for Documents, removed on drop.
@@ -124,7 +125,7 @@ fn the_window_comes_first_then_bridge_toml_then_the_command_line() {
     let mut sources = root.sources();
     sources.fixed = vec![fixed, b.clone()];
     let catalog = Catalog::with_sources(sources, Arc::new(bridge::fetch::System));
-    catalog.pgn().set_dir(root.path("pgn-index"));
+    catalog.use_data_dir(&root.path("data"));
 
     // 2CBH entries first in the file, as ChessBase writes them; an empty
     // title shows the file name. `Old.cbh` is a classic header file without
@@ -732,19 +733,6 @@ fn a_folder_unreadable_for_a_while_keeps_its_databases() {
     assert_eq!(states(&catalog), ["ready", "ready"]);
 }
 
-fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
-    );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split(' ').nth(1).unwrap().parse().unwrap();
-    let body = out.split_once("\r\n\r\n").unwrap().1.to_string();
-    (status, body)
-}
-
 /// The contract's rows and answers for a cloud-only database.
 #[test]
 fn cloud_states_over_http() {
@@ -753,16 +741,8 @@ fn cloud_states_over_http() {
     let files = files_of(&db);
     let size = size_of(&files);
     let cloud = Arc::new(FakeCloud::with_files(files.clone(), false));
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone()),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
-    std::thread::spawn(move || server::serve(listeners, Arc::new(app)));
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let port = serve(App::new("test", policy(), catalog));
     let id = id_of(&db);
 
     let (status, body) = get(port, "/v1/databases");
@@ -820,13 +800,8 @@ fn the_snapshot_shows_cloud_states() {
     let cloud = Arc::new(FakeCloud::with_files(files.clone(), false));
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
-    let app = Arc::new(App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone()),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    });
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let app = Arc::new(App::new("test", Policy { port, ..policy() }, catalog));
     let bridge =
         Bridge { listeners, app: app.clone(), port, token: TOKEN.into(), link: String::new(), first_run: false };
     let background = Background::serve(bridge).unwrap();
