@@ -15,22 +15,21 @@ def parts(version):
 
 
 class PackageVersion(unittest.TestCase):
-    def test_raises_the_first_part_and_leaves_the_fourth_to_the_store(self):
+    def test_keeps_the_app_s_version_and_leaves_the_fourth_part_to_the_store(self):
         for app, package in [
-            ("0.1.0", "1.1.0.0"),
-            ("0.9.12", "1.9.12.0"),
-            ("1.0.0", "2.0.0.0"),
-            ("65534.65535.65535", "65535.65535.65535.0"),
+            ("1.0.0", "1.0.0.0"),
+            ("1.2.3", "1.2.3.0"),
+            ("65535.65535.65535", "65535.65535.65535.0"),
         ]:
             self.assertEqual(msix.package_version(app), package, app)
 
     def test_every_later_app_version_packs_higher(self):
-        apps = ["0.1.0", "0.1.1", "0.2.0", "0.10.0", "1.0.0", "1.0.1", "1.2.0", "2.0.0"]
+        apps = ["1.0.0", "1.0.1", "1.2.0", "1.10.0", "2.0.0"]
         packages = [parts(msix.package_version(app)) for app in apps]
         self.assertEqual(packages, sorted(set(packages)))
 
     def test_refuses_what_the_store_would(self):
-        for app in ["65535.0.0", "0.65536.0", "0.1.65536", "0.1", "0.1.0-beta", "v0.1.0", ""]:
+        for app in ["0.1.0", "0.2.0", "65536.0.0", "1.65536.0", "1.0.65536", "1.0", "1.0.0-beta", "v1.0.0", ""]:
             with self.assertRaises(SystemExit, msg=app):
                 msix.package_version(app)
 
