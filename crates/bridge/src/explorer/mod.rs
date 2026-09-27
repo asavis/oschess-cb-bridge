@@ -191,15 +191,15 @@ impl Registry {
         let (db, generation, p) = (Arc::clone(&open.db), open.generation, Arc::clone(&progress));
         let job_state = Arc::clone(&state);
         let started = self.queue.submit(Box::new(move || {
-            let result = prepare(&*db, generation, &dir, &entry.id, &p);
+            let result = index(&*db, generation, &dir, &entry.id, &p, &Limits::default());
             let still = entry.generation() == Some(generation);
             *lock(&job_state) = match result {
                 Ok(loaded) if still => State::Ready(Arc::new(loaded)),
                 // The database changed meanwhile: the next request starts afresh.
                 Ok(_) => State::Idle,
-                Err(why) => {
-                    eprintln!("oschess-bridge: indexing {} failed: {why}", entry.name);
-                    State::Failed(Instant::now(), why)
+                Err(failure) => {
+                    crate::log!("indexing database {} failed: {}", entry.id, failure.logged());
+                    State::Failed(Instant::now(), failure.answered(&dir))
                 }
             };
         }));
@@ -314,19 +314,64 @@ pub fn prepare_with(
     progress: &Progress,
     limits: &Limits,
 ) -> Result<Loaded, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    index(db, generation, dir, id, progress, limits).map_err(|failure| failure.answered(dir))
+}
+
+/// [`prepare_with`], its failure kept whole for the log.
+fn index(
+    db: &dyn Source,
+    generation: u64,
+    dir: &Path,
+    id: &str,
+    progress: &Progress,
+    limits: &Limits,
+) -> Result<Loaded, Failure> {
+    std::fs::create_dir_all(dir).map_err(Failure::Folder)?;
     let (path, work) = paths(dir, id);
     let count = db.records();
     progress.start("checking", u64::from(count));
     match current(&path, generation, count) {
         Ok(Some(file)) => return Ok(Loaded::new(generation, file)),
-        Err(_) => return Err("the search memory is taken by searches; retry".into()),
+        Err(_) => return Err(Failure::Busy),
         Ok(None) => {}
     }
     let plan = Plan { first: 1, last: count, prune_ply: PRUNE_PLY, generation };
-    build::build_with(db, &plan, &work, &path, progress, limits).map_err(describe)?;
-    let file = IndexFile::open(&path).map_err(|e| format!("{e:?}"))?;
+    build::build_with(db, &plan, &work, &path, progress, limits).map_err(Failure::Build)?;
+    let file = IndexFile::open(&path).map_err(Failure::Open)?;
     Ok(Loaded::new(generation, file))
+}
+
+/// Why a build failed.
+enum Failure {
+    /// The index folder could not be made.
+    Folder(std::io::Error),
+    /// The search memory had no room to check the index on disk.
+    Busy,
+    Build(SearchError),
+    /// The index just built does not open.
+    Open(Bad),
+}
+
+impl Failure {
+    /// What its `503 index_unavailable` says, which names the index folder
+    /// `dir` or the file at fault.
+    fn answered(&self, dir: &Path) -> String {
+        match self {
+            Failure::Folder(e) => format!("{}: {e}", dir.display()),
+            Failure::Build(SearchError::Read(e)) => e.to_string(),
+            _ => self.logged(),
+        }
+    }
+
+    /// What its log line says, which names no path (#117).
+    fn logged(&self) -> String {
+        match self {
+            Failure::Folder(e) => format!("the index folder: {e}"),
+            Failure::Busy => "the search memory is taken by searches; retry".into(),
+            Failure::Build(e) => describe(e),
+            Failure::Open(e) => format!("{e:?}"),
+        }
+    }
 }
 
 /// The index file at `path` when it is the whole index of a database of
@@ -350,14 +395,15 @@ fn current(path: &Path, generation: u64, records: u32) -> Result<Option<IndexFil
     }
 }
 
-/// Why a build failed, for its log line and its `503 index_unavailable`.
-fn describe(e: SearchError) -> String {
+/// Why a build failed, as its log line says it: a failed read names its file
+/// by the extension alone, where the `503 index_unavailable` gives its path.
+fn describe(e: &SearchError) -> String {
     match e {
         SearchError::TooLarge => "the search memory budget is too small to build this index".into(),
         SearchError::Busy => "the search memory stayed taken by searches; retry".into(),
         SearchError::Superseded => "the build was stopped".into(),
-        SearchError::Read(e) => e.to_string(),
-        SearchError::Unsupported(q) => q,
+        SearchError::Read(e) => crate::log::error(e),
+        SearchError::Unsupported(q) => q.clone(),
     }
 }
 

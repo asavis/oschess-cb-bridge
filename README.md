@@ -67,9 +67,12 @@ analysis left running longer does not hold an update back. A version whose setti
 installer by hand. To remove the bridge, use
 Settings → Apps → Installed apps → oschess bridge → Uninstall. Its data folder,
 `%APPDATA%\oschess-bridge`, stays: the settings (`bridge.toml`), the pairing
-code, the position indexes (`index`, some 1.4 GB for the Mega Database) and any
-Stockfish the bridge installed (`engines`). Delete the folder by hand to remove
-them too.
+code, the log (`bridge.log`), the position indexes (`index`, some 1.4 GB for the
+Mega Database) and any Stockfish the bridge installed (`engines`). Delete the
+folder by hand to remove them too. The log says what went wrong, naming a
+database by its id and never by its name or path, so you can attach it to an
+issue as it is; past 1 MiB, the bridge moves it to `bridge.log.1` when it
+starts.
 
 The release also has `oschess-bridge.exe`, the same app without the installer.
 Updates come as the installer, so they install the bridge for your user as

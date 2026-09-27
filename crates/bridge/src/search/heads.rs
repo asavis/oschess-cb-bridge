@@ -117,14 +117,15 @@ pub enum Built {
 
 /// Builds the heads file of `db` at `generation` as `path`: written beside it
 /// as `<path>.partial`, then renamed. `still` is asked between blocks whether
-/// the database is still at that generation.
+/// the database is still at that generation. The error, for the log, names
+/// no path.
 pub fn build<S: Store>(db: &S, generation: u64, path: &Path, still: &dyn Fn() -> bool) -> Result<Built, String> {
     let records = db.record_count();
     let partial = partial_path(path);
     let result = write(db, generation, records, &partial, still);
     match result {
         Ok(true) => {
-            replace(&partial, path).map_err(|e| format!("renaming {}: {e}", partial.display()))?;
+            replace(&partial, path).map_err(|e| format!("renaming the new heads file: {e}"))?;
             Heads::open(path, generation, records)
                 .map(Built::Ready)
                 .ok_or_else(|| "the new file does not read back".into())
@@ -177,7 +178,7 @@ fn write<S: Store>(
     partial: &Path,
     still: &dyn Fn() -> bool,
 ) -> Result<bool, String> {
-    let io = |e: std::io::Error| format!("writing {}: {e}", partial.display());
+    let io = |e: std::io::Error| format!("writing the heads file: {e}");
     if let Some(dir) = partial.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
@@ -192,7 +193,8 @@ fn write<S: Store>(
             return Ok(false);
         }
         let want = (records - first + 1).min(BLOCK_ROWS) as usize;
-        let read = db.read_records(first, &mut buf[..want * S::HEAD_BYTES]).map_err(|e| e.to_string())? as usize;
+        let read =
+            db.read_records(first, &mut buf[..want * S::HEAD_BYTES]).map_err(|e| crate::log::error(&e))? as usize;
         if read != want {
             return Err(format!("record {first} read short: {read} of {want}"));
         }
@@ -358,7 +360,7 @@ impl Registry {
             Ok(Built::Unsuited) => (State::Unsuited(generation), None),
             Ok(Built::Changed) => (State::Waiting(Instant::now()), None),
             Err(why) => {
-                eprintln!("oschess-bridge: copying the headers of {id} failed: {why}");
+                crate::log!("copying the headers of database {id} failed: {why}");
                 (State::Waiting(Instant::now()), None)
             }
         };

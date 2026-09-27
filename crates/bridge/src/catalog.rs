@@ -265,15 +265,15 @@ impl Entry {
         }
         self.held.kept.store(false, Ordering::Relaxed);
         let cloud_files: Vec<PathBuf> = files.present.into_iter().filter(|f| f.2).map(|f| f.0).collect();
-        let (held, cloud, path, name, format) =
-            (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.name.clone(), self.format);
+        let (held, cloud, path, id, format) =
+            (Arc::clone(&self.held), Arc::clone(&self.shared.cloud), self.path.clone(), self.id.clone(), self.format);
         // Ends the download however the job ends, and also when it is
         // dropped unrun because no thread could start.
         let done = Done(Arc::clone(&held));
         self.shared.downloads.submit(Box::new(move || {
             let _done = done;
             if let Err(e) = cloud_files.iter().try_for_each(|file| cloud.fetch(file, &mut |n| progress.add(n))) {
-                eprintln!("oschess-bridge: downloading {name} failed: {e}");
+                crate::log!("downloading database {id} failed: {e}");
                 return;
             }
             let after = generation_of(&path, format, &*cloud);
@@ -281,8 +281,8 @@ impl Entry {
                 after.present.iter().filter(|f| f.2 && cloud_files.contains(&f.0)).map(|f| &f.0).collect();
             if !kept.is_empty() {
                 held.kept.store(true, Ordering::Relaxed);
-                eprintln!(
-                    "oschess-bridge: downloaded {name}, but {} of its files still show as kept in the cloud",
+                crate::log!(
+                    "downloaded database {id}, but {} of its files still show as kept in the cloud",
                     kept.len()
                 );
             }

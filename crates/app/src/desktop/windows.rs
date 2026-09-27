@@ -50,7 +50,7 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
             return;
         }
         if let Err(e) = build_window(&app, &spec) {
-            eprintln!("oschess bridge: the {} window: {e}", spec.label);
+            bridge::log!("the {} window: {e}", spec.label);
         }
     });
 }

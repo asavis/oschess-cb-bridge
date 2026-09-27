@@ -123,7 +123,7 @@ impl Serial {
                 true
             }
             Err(e) => {
-                eprintln!("oschess-bridge: cannot start a {} thread: {e}", self.label);
+                crate::log!("cannot start a {} thread: {e}", self.label);
                 // No thread runs, so this is the only job queued.
                 let job = queue.0.pop_back();
                 drop(queue);
@@ -156,7 +156,7 @@ impl Serial {
             };
             // A panicking job must not end the thread.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                eprintln!("oschess-bridge: a {} job failed with a bug", self.label);
+                crate::log!("a {} job failed with a bug", self.label);
             }
         }
     }

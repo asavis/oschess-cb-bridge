@@ -389,7 +389,9 @@ impl NameTable {
         let _ =
             std::thread::Builder::new().name("bridge-names".into()).stack_size(crate::THREAD_STACK).spawn(move || {
                 if let Err(e) = table.write_file(&path, kind, generation) {
-                    eprintln!("oschess-bridge: writing a names file failed: {e}");
+                    // The file is named after the database's id.
+                    let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    crate::log!("writing a names file of database {id} failed: {e}");
                 }
             });
     }

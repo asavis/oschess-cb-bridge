@@ -109,7 +109,12 @@ pub fn run() {
             }
         }),
         Err(e) => {
-            eprintln!("oschess bridge: {e}");
+            // The log may not be open yet: the app can fail before the bridge
+            // starts.
+            if let Ok(dir) = bridge::start::data_dir() {
+                bridge::log::open(&dir);
+            }
+            bridge::log!("the app cannot start: {e}");
             std::process::exit(1);
         }
     }
@@ -140,7 +145,7 @@ fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
         }
     });
     if let Err(e) = spawned {
-        eprintln!("oschess bridge: no status thread: {e}");
+        bridge::log!("no status thread: {e}");
     }
 }
 
