@@ -1,6 +1,8 @@
 //! Integers at fixed offsets of a byte slice, and the text encoding of the
 //! classic format. Callers bound the offsets.
 
+use crate::codepage::CodePage;
+
 pub(super) fn be_u16(b: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([b[o], b[o + 1]])
 }
@@ -13,13 +15,6 @@ pub(super) fn be_u32(b: &[u8], o: usize) -> u32 {
 pub(super) fn le_i32(b: &[u8], o: usize) -> i32 {
     i32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
-
-/// Windows-1252 characters for the bytes 0x80-0x9f; ISO 8859-1 has control
-/// codes there, which ChessBase, a Windows program, never means.
-const CP1252_HIGH: [char; 32] = [
-    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}', '\u{90}', '‘', '’',
-    '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-];
 
 /// A fixed-size string field, up to the first zero byte; the bytes after the
 /// terminator are leftovers and are ignored. The format stores single-byte
@@ -40,13 +35,7 @@ pub(super) fn text(field: &[u8]) -> String {
         }
         Err(_) => {}
     }
-    field[..end]
-        .iter()
-        .map(|&b| match b {
-            0x80..=0x9f => CP1252_HIGH[(b - 0x80) as usize],
-            _ => b as char,
-        })
-        .collect()
+    CodePage::WESTERN.decode(&field[..end])
 }
 
 #[cfg(test)]

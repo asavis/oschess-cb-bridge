@@ -490,7 +490,9 @@ The reader was checked against:
   0x80-0x9f. A database ChessBase converted from 2CBH holds names as UTF-8
   instead: 96 player and tournament names in the partial Mega. A field whose
   bytes are valid UTF-8 is read as UTF-8; a UTF-8 text cut at the field's width
-  loses its incomplete last character.
+  loses its incomplete last character. Text that is not UTF-8 is read through
+  one code-page decoder (`cbformat::codepage`), and a byte the page leaves
+  undefined reads as the C1 control of the same value, so no byte is lost.
 - **Names that differ from the 2CBH copy** do so for two reasons only. Names
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut
