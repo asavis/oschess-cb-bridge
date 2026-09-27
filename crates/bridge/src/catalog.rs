@@ -431,6 +431,14 @@ impl Catalog {
         &self.shared.pgn
     }
 
+    /// Keeps the indexes in `dir` as the bridge's data folder keeps them: the
+    /// position indexes, with the heads and names files, in its `index`
+    /// folder, and the header indexes of PGN files in its `pgn` folder.
+    pub fn use_data_dir(&self, dir: &Path) {
+        self.explorer.set_dir(dir.join("index"));
+        self.shared.pgn.set_dir(dir.join("pgn"));
+    }
+
     /// Sets a function called each time the sources have been read, before
     /// the list is rebuilt from them. Tests use it to change a source at
     /// exactly that moment.

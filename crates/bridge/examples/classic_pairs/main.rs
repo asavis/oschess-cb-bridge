@@ -105,14 +105,9 @@ struct Server {
 fn serve(classic: &Path, two: &Path, dir: &Path) -> Server {
     let listeners = server::bind(0).expect("bind");
     let port = listeners[0].local_addr().expect("address").port();
-    let app = App {
-        version: "harness",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new([classic.to_path_buf(), two.to_path_buf()]),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
-    app.catalog.explorer.set_dir(dir.to_path_buf());
+    let policy = Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() };
+    let app = App::new("harness", policy, Catalog::new([classic.to_path_buf(), two.to_path_buf()]));
+    app.catalog.use_data_dir(dir);
     let app = Arc::new(app);
     std::thread::spawn(move || server::serve(listeners, app));
     Server { port, classic: id_of(classic), two: id_of(two) }

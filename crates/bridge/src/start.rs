@@ -137,14 +137,15 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     };
     let link = pairing::link(web, &token, config.port);
     let app = App {
-        version: options.version.unwrap_or(env!("CARGO_PKG_VERSION")),
-        policy: Policy { port: config.port, origins, token: token.clone() },
-        catalog: Catalog::with_sources(sources, Arc::new(System)),
-        between_reads: None,
         // The engine follows bridge.toml, as the databases do.
         engine: Engine::from_config_file(config_path),
+        ..App::new(
+            options.version.unwrap_or(env!("CARGO_PKG_VERSION")),
+            Policy { port: config.port, origins, token: token.clone() },
+            Catalog::with_sources(sources, Arc::new(System)),
+        )
     };
-    app.catalog.explorer.set_dir(dir.join("index"));
+    app.catalog.use_data_dir(dir);
     app.catalog.sweep_indexes();
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
 }

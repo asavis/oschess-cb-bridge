@@ -1,4 +1,5 @@
-//! What the test files share: the fixture of `docs/search-grammar.md`,
+//! What the test files share: a bridge served on a free port and the
+//! requests a test sends it, and the fixture of `docs/search-grammar.md`,
 //! written as a 2CBH database and as a classic one with the same content.
 //! Each test file uses a part of it.
 //!
@@ -13,10 +14,77 @@
 //! else, a test asserts on its own holds only.
 #![allow(dead_code)]
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+
+use bridge::access::{DEFAULT_ORIGINS, Policy};
+use bridge::api::App;
+use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
+
+/// The pairing token of every bridge a test serves or starts.
+pub const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+/// The origin the requests of [`request`] name, which the default policy
+/// allows.
+pub const ORIGIN: &str = DEFAULT_ORIGINS[0];
+
+/// The policy of a test's bridge: the default origins and [`TOKEN`]. Its port
+/// is the one [`serve`] binds.
+pub fn policy() -> Policy {
+    Policy { port: 0, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() }
+}
+
+/// Serves `app` on a free loopback port, from a thread of its own, its
+/// policy's port set to that one; the port.
+pub fn serve(app: App) -> u16 {
+    serve_shared(app).0
+}
+
+/// [`serve`], and the app served, for a test that asks it things as it serves.
+pub fn serve_shared(mut app: App) -> (u16, Arc<App>) {
+    let listeners = server::bind(0).unwrap();
+    let port = listeners[0].local_addr().unwrap().port();
+    app.policy.port = port;
+    let app = Arc::new(app);
+    let served = Arc::clone(&app);
+    std::thread::spawn(move || server::serve(listeners, served));
+    (port, app)
+}
+
+/// `GET path` as the page sends it: with the token and an allowed `Origin`,
+/// and `Connection: close`.
+pub fn request(port: u16, path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// Sends `raw` on a new connection and reads the whole answer, head and body;
+/// `None` when the connection is refused or cut.
+pub fn exchange(port: u16, raw: &str) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.write_all(raw.as_bytes()).ok()?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+/// The status and body of [`request`]`(port, path)`.
+pub fn get(port: u16, path: &str) -> (u16, String) {
+    try_get(port, path).expect("the bridge answers")
+}
+
+/// [`get`], or `None` when the connection is refused or cut: during a start,
+/// the port may belong to another test's bridge that has just ended.
+pub fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
+    let out = exchange(port, &request(port, path))?;
+    let status = out.split(' ').nth(1)?.parse().ok()?;
+    Some((status, out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default()))
+}
 
 pub const DOC: &str = include_str!("../../../../docs/search-grammar.md");
 

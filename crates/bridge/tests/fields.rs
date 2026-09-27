@@ -2,19 +2,15 @@
 //! them (#68): the game list's row, what a search matches, and the served
 //! PGN's tag, which writes `?` where the list shows nothing.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
-use bridge::server;
 use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+mod common;
+use common::{get, policy, serve};
 
 /// A date (year, month, day, 0 unknown), an ECO field as stored, and a round
 /// and sub-round as 2CBH stores them, signed.
@@ -47,31 +43,14 @@ fn database(name: &str) -> TempDb {
 }
 
 fn start(paths: Vec<PathBuf>) -> u16 {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new(paths),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
-    let app = Arc::new(app);
-    std::thread::spawn(move || server::serve(listeners, app));
-    port
+    serve(App::new("test", policy(), Catalog::new(paths)))
 }
 
-fn get(port: u16, path: &str) -> String {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {}\r\nConnection: close\r\n\r\n",
-        DEFAULT_ORIGINS[0]
-    );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    assert!(out.starts_with("HTTP/1.1 200"), "{path}: {out}");
-    out.split_once("\r\n\r\n").unwrap().1.to_string()
+/// The body of a `200` answer to `GET path`.
+fn get_ok(port: u16, path: &str) -> String {
+    let (status, body) = get(port, path);
+    assert_eq!(status, 200, "{path}: {body}");
+    body
 }
 
 /// A string member `"key":"…"` of a JSON text, or a `[Key \"…\"]` tag of a
@@ -96,14 +75,14 @@ fn the_list_the_search_and_the_pgn_agree() {
     let path = db.dir().join("db.2cbh");
     let port = start(vec![path.clone()]);
     let id = id_of(&path);
-    let list = get(port, &format!("/v1/databases/{id}/games?limit=20"));
+    let list = get_ok(port, &format!("/v1/databases/{id}/games?limit=20"));
     let rows: Vec<&str> = list.split(r#"{"number":"#).skip(1).collect();
     assert_eq!(rows.len(), GAMES.len());
     let mut seen = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let number = i as u32 + 1;
         let (date, eco, round) = (member(row, "date"), member(row, "eco"), member(row, "round"));
-        let pgn = get(port, &format!("/v1/databases/{id}/games/{number}"));
+        let pgn = get_ok(port, &format!("/v1/databases/{id}/games/{number}"));
         assert_eq!(tag(&pgn, "Date"), Some(date), "game {number}");
         assert_eq!(tag(&pgn, "ECO"), Some(eco).filter(|e| !e.is_empty()), "game {number}");
         assert_eq!(tag(&pgn, "Round"), Some(if round.is_empty() { "?" } else { round }), "game {number}");
@@ -112,7 +91,7 @@ fn the_list_the_search_and_the_pgn_agree() {
             if value.is_empty() || (qualifier == "date" && value.contains('?')) {
                 continue;
             }
-            let found = get(port, &format!("/v1/databases/{id}/games?limit=20&q={qualifier}%3A%22{value}%22"));
+            let found = get_ok(port, &format!("/v1/databases/{id}/games?limit=20&q={qualifier}%3A%22{value}%22"));
             assert!(numbers(&found).contains(&number), "{qualifier}:\"{value}\" finds game {number}: {found}");
         }
         seen.push((date.to_string(), eco.to_string(), round.to_string()));

@@ -1,81 +1,25 @@
 //! The position index and `GET /v1/databases/{id}/explorer`, on databases
 //! built by hand.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::file::{Bad, IndexFile};
 use bridge::explorer::format::{BLOCK_ENTRY, Block, Counts, Header, pack_move};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
-use bridge::server;
 use cbformat::cbh;
-use cbformat::fixture::{Builder, TempDb, lid_header, sq};
+use cbformat::fixture::{Builder, TempDb, lid_header, sq, words};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record, start_position};
-use cbformat::movetable::{self, Captured, CastleSide, Color, END_OF_LINE, MOVES, MoveWord, Piece};
+use cbformat::movetable::{self, Captured, Color, END_OF_LINE, MOVES, MoveWord, Piece};
 use cbformat::v2::Database;
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
-
-fn color(c: CColor) -> Color {
-    if c == CColor::White { Color::White } else { Color::Black }
-}
-
-fn piece(p: CPiece) -> Piece {
-    match p {
-        CPiece::King => Piece::King,
-        CPiece::Queen => Piece::Queen,
-        CPiece::Rook => Piece::Rook,
-        CPiece::Bishop => Piece::Bishop,
-        CPiece::Knight => Piece::Knight,
-        CPiece::Pawn => Piece::Pawn,
-    }
-}
-
-/// The move words of `ucis` played from `board`, which they advance; castling
-/// is written `e1g1`.
-fn words(board: &mut Board, ucis: &str) -> Vec<u16> {
-    let mut out = Vec::new();
-    for uci in ucis.split_whitespace() {
-        let mut mv: Move = uci.parse().unwrap();
-        let (p, c) = board.piece_at(mv.from).unwrap();
-        let word = if p == CPiece::King && mv.from.file().abs_diff(mv.to.file()) == 2 {
-            let short = mv.to.file() == 6;
-            mv.to = chesscore::Square::new(if short { 7 } else { 0 }, mv.from.rank());
-            MoveWord::Castle { color: color(c), side: if short { CastleSide::Short } else { CastleSide::Long } }
-        } else {
-            let captured = match board.piece_at(mv.to) {
-                Some((q, _)) => match q {
-                    CPiece::Queen => Captured::Queen,
-                    CPiece::Rook => Captured::Rook,
-                    CPiece::Bishop => Captured::Bishop,
-                    CPiece::Knight => Captured::Knight,
-                    _ => Captured::Pawn,
-                },
-                None if p == CPiece::Pawn && mv.from.file() != mv.to.file() => Captured::EnPassant,
-                None => Captured::Nothing,
-            };
-            MoveWord::Normal {
-                color: color(c),
-                piece: piece(p),
-                from: mv.from.index() as u8,
-                to: mv.to.index() as u8,
-                captured,
-                promotion: mv.promotion.map(piece),
-            }
-        };
-        board.play_checked(mv).unwrap();
-        out.push(movetable::encode(word).unwrap());
-    }
-    out
-}
+mod common;
+use common::{get, policy};
 
 /// A standard game of `ucis` with `result` (0 black, 1 draw, 2 white) and
 /// ratings; its record, for further changes.
@@ -403,33 +347,13 @@ fn any_change_rebuilds_the_whole_index() {
     }
 }
 
-fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
-    );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split(' ').nth(1).unwrap().parse().unwrap();
-    (status, out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default())
-}
-
+/// Serves `db`, with the indexes in `dir` as in a data folder; the port and
+/// the database's id.
 fn serve(db: &TempDb, dir: &Path) -> (u16, String) {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
     let path = db.dir().join("db.2cbh");
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new([path.clone()]),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
-    app.catalog.explorer.set_dir(dir.to_path_buf());
-    let app = Arc::new(app);
-    std::thread::spawn(move || server::serve(listeners, app));
-    (port, id_of(&path))
+    let app = App::new("test", policy(), Catalog::new([path.clone()]));
+    app.catalog.use_data_dir(dir);
+    (common::serve(app), id_of(&path))
 }
 
 fn fen_param(fen: &str) -> String {
@@ -532,7 +456,7 @@ fn a_restarted_bridge_answers_from_the_kept_index() {
         assert!(Instant::now() < deadline, "the index was not built");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let file = dir.join(format!("{id}.idx"));
+    let file = dir.join("index").join(format!("{id}.idx"));
     let written = std::fs::metadata(&file).unwrap().modified().unwrap();
     let (port, _) = serve(&db, &dir);
     let (status, body) = get(port, &url);

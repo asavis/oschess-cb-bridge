@@ -56,13 +56,8 @@ fn the_tray_follows_the_catalog() {
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
     let token = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ".to_string();
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: token.clone() },
-        catalog: Catalog::with_sources(sources, Arc::new(System)),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
+    let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: token.clone() };
+    let app = App::new("test", policy, Catalog::with_sources(sources, Arc::new(System)));
     let bridge = Bridge { listeners, app: Arc::new(app), port, token, link: String::new(), first_run: false };
     let background = Background::serve(bridge).unwrap();
     let uk = Strings::new(Lang::Uk);

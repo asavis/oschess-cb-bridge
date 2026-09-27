@@ -1,53 +1,23 @@
 //! Classic databases through the HTTP API: listed, searched and served like
 //! 2CBH ones, and answering as a 2CBH copy of the same content answers.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
-use bridge::server;
 use bridge::store::MAX_GAME_BYTES;
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
 use chesscore::Board;
 
 mod common;
-use common::{classic_fixture, fixture};
+use common::{classic_fixture, fixture, get, policy, serve};
 
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
-
-/// Serves `paths`, with the position indexes in `index_dir`.
+/// Serves `paths`, with the indexes in `index_dir` as in a data folder.
 fn start(paths: &[PathBuf], index_dir: &Path) -> u16 {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new(paths.to_vec()),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
-    app.catalog.explorer.set_dir(index_dir.to_path_buf());
-    let app = Arc::new(app);
-    std::thread::spawn(move || server::serve(listeners, app));
-    port
-}
-
-fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {}\r\nConnection: close\r\n\r\n",
-        DEFAULT_ORIGINS[0]
-    );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split(' ').nth(1).unwrap().parse().unwrap();
-    (status, out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default())
+    let app = App::new("test", policy(), Catalog::new(paths.to_vec()));
+    app.catalog.use_data_dir(index_dir);
+    serve(app)
 }
 
 /// A body without its `"generation":"…"` member, which differs between copies.

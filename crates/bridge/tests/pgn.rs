@@ -2,17 +2,13 @@
 //! is built, then listed, searched and served like the other formats, and
 //! answering as a 2CBH copy of the same games answers.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, State, id_of};
 use bridge::search::{self, Indexes, SearchError, Selection};
-use bridge::server;
 use bridge::store::MAX_GAME_BYTES;
 use cbformat::codepage::CodePage;
 use cbformat::fixture::pgn_file;
@@ -20,9 +16,7 @@ use cbformat::pgnfile;
 use cbformat::view::Base;
 
 mod common;
-use common::{block, fixture_of, pgn_fixture, rows};
-
-const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+use common::{block, fixture_of, get, pgn_fixture, policy, rows, serve_shared};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bridge-pgn-{}-{name}", std::process::id()));
@@ -32,34 +26,9 @@ fn scratch(name: &str) -> PathBuf {
 
 /// Serves `paths`, with the PGN and position indexes in `dir`.
 fn start(paths: &[PathBuf], dir: &Path) -> (u16, Arc<App>) {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    let app = App {
-        version: "test",
-        policy: Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() },
-        catalog: Catalog::new(paths.to_vec()),
-        between_reads: None,
-        engine: bridge::engine::Engine::none(),
-    };
-    app.catalog.explorer.set_dir(dir.join("index"));
-    app.catalog.pgn().set_dir(dir.join("pgn"));
-    let app = Arc::new(app);
-    let served = Arc::clone(&app);
-    std::thread::spawn(move || server::serve(listeners, served));
-    (port, app)
-}
-
-fn get(port: u16, path: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let raw = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nOrigin: {}\r\nConnection: close\r\n\r\n",
-        DEFAULT_ORIGINS[0]
-    );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split(' ').nth(1).unwrap().parse().unwrap();
-    (status, out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default())
+    let app = App::new("test", policy(), Catalog::new(paths.to_vec()));
+    app.catalog.use_data_dir(dir);
+    serve_shared(app)
 }
 
 /// Asks for `path` until the answer is no longer a `409` for a database or an
@@ -273,7 +242,7 @@ fn opening_restarting_and_changing() {
 
     // Started again, the bridge reads the index built before: no build runs.
     let catalog = Catalog::new(vec![path.clone()]);
-    catalog.pgn().set_dir(dir.join("pgn"));
+    catalog.use_data_dir(&dir);
     catalog.pgn().queue().refuse_starts(true);
     assert_eq!(catalog.get(&id).unwrap().state(), State::Ready);
 

@@ -1,16 +1,20 @@
 //! `cbtool profile` prints timings and counts only (#83): a flow that fails
 //! shows its status and the bridge's code, never the database's name or a
-//! path, and the command then exits with status 1.
-#![cfg(unix)]
+//! path, and the command then exits with status 1. Every index it has built
+//! is in its `--index` folder (#118).
 
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use cbformat::fixture::{Builder, quiet};
-use cbformat::movetable::{self, Color, Piece};
+use cbformat::fixture::pgn_file;
 
+#[cfg(unix)]
 #[test]
 fn failures_name_no_database_and_no_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+
     let mut b = Builder::new();
     let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
     b.game(e4);
@@ -46,4 +50,26 @@ fn failures_name_no_database_and_no_path() {
     assert!(text.contains("engine"), "{text}");
     assert!(!text.contains("PRIVATE_SENTINEL"), "{text}");
     assert!(!text.contains(db.dir().to_str().unwrap()), "{text}");
+}
+
+/// A PGN file's header index is built in the `--index` folder, as the
+/// position index is, and never in the bridge's data folder: a second run
+/// would find it there, and its first answers would not be cold.
+#[test]
+fn no_index_is_built_in_the_data_folder() {
+    let pgn = pgn_file("cbtool-profile-home", b"[Event \"x\"]\n\n1. e4 e5 2. Nf3 Nc6 1-0\n");
+    let (home, index) = (pgn.dir().join("home"), pgn.dir().join("index"));
+    std::fs::create_dir_all(&home).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(pgn.dir().join("db.pgn"))
+        .arg("--index")
+        .arg(&index)
+        .env("OSCHESS_BRIDGE_HOME", &home)
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let written: Vec<_> = std::fs::read_dir(&home).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(written.is_empty(), "{written:?} in the data folder\n{text}");
+    assert!(index.join("pgn").is_dir(), "{text}");
 }
