@@ -83,9 +83,11 @@ pub fn idle(view: &View, installing: bool) -> bool {
     !view.busy && !installing
 }
 
-/// Notes in `dir` that `version` is being installed.
+/// Notes in `dir` that `version` is being installed. The error names the
+/// note by its file name alone: it goes to the log, which holds no path
+/// (#117).
 pub fn note(dir: &Path, version: &str) -> Result<(), String> {
-    std::fs::write(dir.join(NOTE), version).map_err(|e| format!("{}: {e}", dir.join(NOTE).display()))
+    std::fs::write(dir.join(NOTE), version).map_err(|e| format!("{NOTE}: {e}"))
 }
 
 /// Removes the note, after an installer that did not start.
@@ -272,5 +274,26 @@ mod tests {
         forget(&dir);
         assert_eq!(updated(&dir, "0.3.0"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note that cannot be written fails with an error the updater logs as
+    /// it is: it names the note, and neither its folder nor any above it.
+    #[test]
+    fn a_note_that_fails_names_no_folder() {
+        let top = std::env::temp_dir().join(format!("bridge-app-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let dir = top.join("Jane Doe").join("oschess-bridge");
+        std::fs::create_dir_all(dir.join(NOTE)).unwrap();
+        let e = note(&dir, "0.2.0").unwrap_err();
+        assert!(e.starts_with("updating-to: "), "{e}");
+        let logged = format!("update: {e}");
+        for folder in dir.ancestors().filter(|a| a.parent().is_some()) {
+            assert!(!logged.contains(folder.to_str().unwrap()), "{} in {logged}", folder.display());
+        }
+        for name in ["Jane Doe", "oschess-bridge", top.file_name().unwrap().to_str().unwrap()] {
+            assert!(!logged.contains(name), "{name} in {logged}");
+        }
+        assert!(dir.join(NOTE).is_dir(), "the folder in its way is left");
+        let _ = std::fs::remove_dir_all(&top);
     }
 }

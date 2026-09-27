@@ -58,7 +58,7 @@ pub fn start(app: &AppHandle) {
         }
     });
     if let Err(e) = spawned {
-        eprintln!("oschess bridge: no update thread: {e}");
+        bridge::log!("no update thread: {e}");
     }
 }
 
@@ -80,7 +80,7 @@ fn look(app: &AppHandle, asked: bool) {
     let outcome = look_and_install(app, asked);
     drop(running);
     if let Err(e) = outcome {
-        eprintln!("oschess bridge: update: {e}");
+        bridge::log!("update: {e}");
         if asked {
             let strings = &shared(app).strings;
             notify(app, strings.get("toast.update.failed.title").to_string(), strings.get("toast.update.failed.body"));
@@ -89,7 +89,8 @@ fn look(app: &AppHandle, asked: bool) {
 }
 
 /// On success the installer runs and this process exits, so this returns
-/// only when there was nothing to install or something failed.
+/// only when there was nothing to install or something failed. [`look`] logs
+/// the error as it is, so no error of this crate's own names a path.
 fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
     let shared = shared(app);
     let strings = &shared.strings;

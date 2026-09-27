@@ -109,7 +109,7 @@ with them.
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
-| 500 | `internal` | A bug; the bridge logs it |
+| 500 | `internal` | A bug; the bridge logs it with the database's `id`, in `bridge.log` in its data folder and, in a console, on standard error |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
 | 503 | `index_unavailable` | The position index could not be built; the message says why, and the next request after a minute tries again |
 | 503 | `busy` | Too many open connections, too many large answers being sent at once, or search memory taken by other searches; `Retry-After: 1` |
@@ -307,8 +307,9 @@ or waits), and one without is opened as usual. So a file the service moves
 back to the cloud, or one moved there while the download read another, makes
 the database `cloudOnly` again, and the next request for its games downloads
 it. A service that keeps a file marked after all of it was read leaves the
-database `cloudOnly`; the bridge logs that, and downloads again only when its
-games are requested again.
+database `cloudOnly`; the bridge logs that, with the database's `id`, in
+`bridge.log` in its data folder and, in a console, on standard error. It
+downloads again only when the database's games are requested again.
 
 #### Classic databases
 

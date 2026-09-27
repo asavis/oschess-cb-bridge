@@ -177,7 +177,7 @@ impl Registry {
             return Opening::Ready(db);
         }
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("oschess-bridge: {}: {e}", dir.display());
+            crate::log!("the index folder cannot be made for database {id}: {e}");
             *b = Build::Failed(generation, Instant::now());
             return Opening::Failed;
         }
@@ -186,6 +186,7 @@ impl Registry {
         *b = Build::Working(Arc::clone(&progress));
         drop(b);
         let (job_build, p, path, page) = (Arc::clone(&build), Arc::clone(&progress), path.to_path_buf(), self.page);
+        let id = id.to_string();
         let started = self.queue.submit(Box::new(move || {
             let mut last = 0;
             let built = pgnfile::build(&path, &index, generation, page, &mut |read| {
@@ -196,7 +197,7 @@ impl Registry {
             *lock(&job_build) = match built {
                 Ok(_) => Build::Idle,
                 Err(e) => {
-                    eprintln!("oschess-bridge: reading {} failed: {e}", path.display());
+                    crate::log!("indexing the PGN file of database {id} failed: {}", crate::log::error(&e));
                     Build::Failed(generation, Instant::now())
                 }
             };

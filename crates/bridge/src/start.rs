@@ -12,7 +12,7 @@ use crate::catalog::Catalog;
 use crate::engine::Engine;
 use crate::fetch::System;
 use crate::sources::Sources;
-use crate::{config, documents, pairing, server, token};
+use crate::{config, documents, log, pairing, server, token};
 
 /// The options every way of starting the bridge takes.
 pub const OPTIONS: &str = "[--database <path>]... [--show-token] [--new-token]
@@ -76,21 +76,57 @@ pub struct Bridge {
 }
 
 /// Prepares the bridge whose data folder is `dir`, creating the folder, its
-/// `bridge.toml` and the token when they are missing.
+/// `bridge.toml` and the token when they are missing. From now on the log
+/// goes to `bridge.log` there too, and it records how the start went.
 pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
+    // First, so that a start that fails is in the file.
+    log::open(dir);
+    match ready(dir, options) {
+        Ok(bridge) => {
+            crate::log!("the bridge {} starts on port {}", bridge.app.version, bridge.port);
+            Ok(bridge)
+        }
+        Err(failed) => {
+            crate::log!("the bridge cannot start: {}", failed.logged);
+            Err(failed.shown)
+        }
+    }
+}
+
+/// Why a start failed: the message the console and the app show, and the
+/// log's, which names no path and quotes nothing of `bridge.toml`.
+struct Failed {
+    shown: String,
+    logged: String,
+}
+
+impl Failed {
+    /// A message that quotes nothing of the user's, shown and logged alike.
+    fn plain(message: String) -> Failed {
+        Failed { logged: message.clone(), shown: message }
+    }
+}
+
+/// [`prepare`], its failure kept whole for the log.
+fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     let first_run = !token::exists(dir);
-    let config = config::load_or_create(&dir.join("bridge.toml"))?;
+    let config =
+        config::load(&dir.join("bridge.toml")).map_err(|e| Failed { shown: e.to_string(), logged: e.logged() })?;
     let mut origins: Vec<String> = DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect();
     origins.extend(config.origins);
     let web = config.web.trim_end_matches('/');
     if !origins.iter().any(|o| o == web) {
-        return Err(format!("web = \"{}\" in bridge.toml is not an allowed origin", config.web));
+        return Err(Failed {
+            shown: format!("web = \"{}\" in bridge.toml is not an allowed origin", config.web),
+            logged: "web in bridge.toml is not an allowed origin".into(),
+        });
     }
     // The port first: a second instance stops here, before it could replace the
     // token the running one still accepts.
-    let listeners = server::bind(config.port).map_err(|e| format!("port {}: {e}", config.port))?;
-    let token = if options.new_token { token::replace(dir) } else { token::load_or_create(dir) }
-        .map_err(|e| format!("pairing token in {}: {e}", dir.display()))?;
+    let listeners = server::bind(config.port).map_err(|e| Failed::plain(format!("port {}: {e}", config.port)))?;
+    let token = if options.new_token { token::replace(dir) } else { token::load_or_create(dir) }.map_err(|e| {
+        Failed { shown: format!("pairing token in {}: {e}", dir.display()), logged: format!("the pairing token: {e}") }
+    })?;
     // The databases of bridge.toml are read by the catalog, again whenever
     // the file changes.
     let config_path = dir.join("bridge.toml");
@@ -182,6 +218,7 @@ mod tests {
 
     #[test]
     fn the_first_run_is_the_one_that_creates_the_token() {
+        let _log = log::testing::hold();
         let dir = folder("first", None);
         let first = prepare(&dir, &Options::default()).unwrap();
         assert!(first.first_run);
@@ -202,6 +239,7 @@ mod tests {
 
     #[test]
     fn the_site_must_be_an_allowed_origin() {
+        let _log = log::testing::hold();
         let dir = folder("staging", Some("https://staging.oschess.org/"));
         let bridge = prepare(&dir, &Options::default()).unwrap();
         assert!(bridge.link.starts_with("https://staging.oschess.org/library?"));
@@ -217,6 +255,7 @@ mod tests {
 
     #[test]
     fn reports_the_version_it_is_given_else_its_own() {
+        let _log = log::testing::hold();
         // The Windows app passes its release version, which differs from this
         // library's package version.
         let dir = folder("version", None);
@@ -231,12 +270,38 @@ mod tests {
 
     #[test]
     fn a_taken_port_stops_the_start_before_the_token() {
+        let _log = log::testing::hold();
         let dir = folder("taken", None);
         let running = prepare(&dir, &Options::default()).unwrap();
         let e = prepare(&dir, &Options { new_token: true, ..Options::default() }).err().unwrap();
         assert!(e.starts_with(&format!("port {}", running.port)), "{e}");
         assert_eq!(token::load_or_create(&dir).unwrap(), running.token, "the running bridge keeps its token");
         drop(running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A start is logged in the data folder, and so is one that fails, with
+    /// no path in the log (#117).
+    #[test]
+    fn a_start_is_logged_in_the_data_folder() {
+        let _log = log::testing::hold();
+        let dir = folder("logged", None);
+        let running = prepare(&dir, &Options::default()).unwrap();
+        let port = running.port;
+        assert!(prepare(&dir, &Options::default()).is_err());
+        drop(running);
+        std::fs::write(dir.join("bridge.toml"), format!("engine = {}\n", dir.display())).unwrap();
+        let e = prepare(&dir, &Options::default()).err().unwrap();
+        assert!(e.contains(&dir.display().to_string()), "the message shown names the file: {e}");
+        let text = std::fs::read_to_string(dir.join(log::FILE_NAME)).unwrap();
+        for line in [
+            format!("the bridge {} starts on port {port}", env!("CARGO_PKG_VERSION")),
+            format!("the bridge cannot start: port {port}: "),
+            "the bridge cannot start: bridge.toml: line 1: not a value".to_string(),
+        ] {
+            assert!(text.lines().any(|l| l.contains(&line)), "{line} not in {text}");
+        }
+        assert!(!text.contains(dir.to_str().unwrap()), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

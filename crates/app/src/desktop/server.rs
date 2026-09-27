@@ -74,6 +74,11 @@ impl Shared {
     /// Starts the bridge.
     pub fn start(strings: Strings) -> Started {
         let dir = start::data_dir().ok();
+        // Before the bridge's own start, which opens it too: a start that
+        // stops at bridge.toml is logged as well.
+        if let Some(dir) = &dir {
+            bridge::log::open(dir);
+        }
         let (running, view, first_run) = match &dir {
             Some(dir) => serve(dir),
             None => (None, failed(DEFAULT_PORT, "no data folder: %APPDATA% is not set".into()), false),
@@ -137,9 +142,12 @@ fn failed(port: u16, reason: String) -> View {
 /// Starts serving from `dir`, waiting up to [`PORT_WAIT`] for a port that is
 /// taken.
 fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
-    let port = match config::load_or_create(&dir.join("bridge.toml")) {
+    let port = match config::load(&dir.join("bridge.toml")) {
         Ok(config) => config.port,
-        Err(e) => return (None, failed(DEFAULT_PORT, e), false),
+        Err(e) => {
+            bridge::log!("the bridge cannot start: {}", e.logged());
+            return (None, failed(DEFAULT_PORT, e.to_string()), false);
+        }
     };
     let deadline = Instant::now() + PORT_WAIT;
     let bridge = loop {
@@ -169,7 +177,10 @@ fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
             let view = View::of(&running.background.snapshot());
             (Some(running), view, first_run)
         }
-        Err(e) => (None, failed(port, format!("no server thread: {e}")), false),
+        Err(e) => {
+            bridge::log!("the bridge cannot start: no server thread: {e}");
+            (None, failed(port, format!("no server thread: {e}")), false)
+        }
     }
 }
 

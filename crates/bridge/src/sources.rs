@@ -40,25 +40,25 @@ impl Sources {
     /// The databases ChessBase's window lists, in the order the window shows
     /// them where that is decoded and in the file's order otherwise
     /// (`DbList::window_order`), named as the window names them. `Ok(empty)`
-    /// when there is no such list.
+    /// when there is no such list. The error, for the log, names no path.
     pub fn window(&self) -> Result<Vec<Listed>, String> {
         let Some(dir) = &self.chessbase else { return Ok(Vec::new()) };
         match std::fs::metadata(dir) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => return Ok(Vec::new()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("{}: {e}", dir.display())),
+            Err(e) => return Err(format!("ChessBase's documents folder: {e}")),
         }
-        let located = dbitems::locate(dir).map_err(|e| e.to_string())?;
+        let located = dbitems::locate(dir).map_err(|e| crate::log::error(&e))?;
         if !located.conflict_copies.is_empty() {
-            eprintln!(
-                "oschess-bridge: ignoring {} sync-conflict cop{} of {}",
+            crate::log!(
+                "ignoring {} sync-conflict cop{} of {}",
                 located.conflict_copies.len(),
                 if located.conflict_copies.len() == 1 { "y" } else { "ies" },
                 dbitems::FILE_NAME
             );
         }
-        let Some(list) = dbitems::read(dir).map_err(|e| e.to_string())? else { return Ok(Vec::new()) };
+        let Some(list) = dbitems::read(dir).map_err(|e| crate::log::error(&e))? else { return Ok(Vec::new()) };
         Ok(list
             .into_window_order()
             .into_iter()
@@ -77,9 +77,9 @@ impl Sources {
 /// The databases a configured path names: the path itself, or for a folder
 /// the ChessBase databases and PGN files directly in it, by file name. In a
 /// folder only regular files (or links to them) count: a pipe or a folder
-/// named like a database is none.
+/// named like a database is none. The error, for the log, names no path.
 pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
-    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+    let err = |e: std::io::Error| e.to_string();
     match std::fs::metadata(path) {
         Ok(m) if m.is_dir() => {}
         // A database, or a path that names nothing and is then reported missing.
@@ -128,7 +128,7 @@ impl Read {
     pub(crate) fn update(&mut self, sources: &Sources) -> bool {
         let window_file = sources.chessbase.as_ref().map(|d| d.join(dbitems::FILE_NAME));
         let mut changed =
-            self.window.update(signature(window_file.as_deref()), &"the database window list", || sources.window());
+            self.window.update(signature(window_file.as_deref()), &dbitems::FILE_NAME, || sources.window());
         let configured = match &sources.config {
             Some(path) => {
                 let look = self.config.get_or_insert_with(|| config::Watched::new(path.clone())).look();
@@ -140,9 +140,12 @@ impl Read {
         let before = self.paths.len();
         self.paths.retain(|p, _| configured.contains(p));
         changed |= self.paths.len() != before;
-        for path in &configured {
+        for (i, path) in configured.iter().enumerate() {
             let kept = self.paths.entry(path.clone()).or_default();
-            changed |= kept.update(folder_signature(path), &path.display(), || expand(path));
+            // Named by its place: the path would name the user and the database.
+            let place = i + 1;
+            let what = format_args!("databases entry {place} of bridge.toml");
+            changed |= kept.update(folder_signature(path), &what, || expand(path));
         }
         self.configured = configured;
         changed
@@ -172,7 +175,8 @@ struct Kept<T> {
 
 impl<T> Kept<T> {
     /// Reads the source with `read` unless it was last read at `signature`;
-    /// whether it was read.
+    /// whether it was read. `what` names the source in the log, and the
+    /// error it logs must name no path.
     fn update(&mut self, signature: u64, what: &dyn Display, read: impl FnOnce() -> Result<T, String>) -> bool {
         if self.signature == Some(signature) {
             return false;
@@ -184,7 +188,7 @@ impl<T> Kept<T> {
             }
             Err(e) => {
                 if !self.failing {
-                    eprintln!("oschess-bridge: {what} cannot be read, keeping what was read before: {e}");
+                    crate::log!("{what} cannot be read, keeping what was read before: {e}");
                 }
                 (self.signature, self.failing) = (None, true);
                 false

@@ -73,13 +73,70 @@ databases = []
 
 /// Reads `path`, writing the default file first when there is none.
 pub fn load_or_create(path: &Path) -> Result<Config, String> {
+    load(path).map_err(|e| e.to_string())
+}
+
+/// [`load_or_create`], its error kept whole for the log.
+pub fn load(path: &Path) -> Result<Config, Error> {
     if !path.exists() {
         // Under the lock of every change: a default file written beside a
         // change would replace it (#62).
         let _one = changing();
         create(path)?;
     }
-    read(path)?.ok_or_else(|| format!("{}: no such file", path.display()))
+    read_file(path)?.ok_or_else(|| Error { path: path.to_owned(), why: Why::Missing })
+}
+
+/// Why `bridge.toml` cannot be read or made. Its message, which the console
+/// and the windows show, names the file's path and quotes the text at fault;
+/// [`Error::logged`] does neither (#117).
+#[derive(Debug)]
+pub struct Error {
+    path: PathBuf,
+    why: Why,
+}
+
+#[derive(Debug)]
+enum Why {
+    Io(std::io::Error),
+    /// Making the folder the file goes in.
+    Folder(std::io::Error),
+    NotAFile,
+    Missing,
+    Syntax(Syntax),
+}
+
+impl Error {
+    /// The error as a log line says it: the file by its name, and a line at
+    /// fault by its number and what is wrong with it.
+    pub fn logged(&self) -> String {
+        match &self.why {
+            Why::Io(e) => format!("bridge.toml: {e}"),
+            Why::Folder(e) => format!("the folder of bridge.toml: {e}"),
+            Why::NotAFile => "bridge.toml: not a regular file".into(),
+            Why::Missing => "bridge.toml: no such file".into(),
+            Why::Syntax(s) => format!("bridge.toml: line {}: {}", s.line, s.fault.what()),
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.path.display();
+        match &self.why {
+            Why::Io(e) => write!(f, "{path}: {e}"),
+            Why::Folder(e) => write!(f, "{}: {e}", self.path.parent().unwrap_or(&self.path).display()),
+            Why::NotAFile => write!(f, "{path}: not a regular file"),
+            Why::Missing => write!(f, "{path}: no such file"),
+            Why::Syntax(s) => write!(f, "{path}: {s}"),
+        }
+    }
+}
+
+impl From<Error> for String {
+    fn from(e: Error) -> String {
+        e.to_string()
+    }
 }
 
 /// The lock every write of `bridge.toml` in this process holds.
@@ -90,27 +147,34 @@ fn changing() -> std::sync::MutexGuard<'static, ()> {
 
 /// Writes the default file at `path` unless there is a file; the caller
 /// holds [`changing`].
-fn create(path: &Path) -> Result<(), String> {
+fn create(path: &Path) -> Result<(), Error> {
     if path.exists() {
         return Ok(());
     }
+    let error = |why| Error { path: path.to_owned(), why };
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| error(Why::Folder(e)))?;
     }
-    crate::files::write_atomic(path, TEMPLATE.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    crate::files::write_atomic(path, TEMPLATE.as_bytes()).map_err(|e| error(Why::Io(e)))
 }
 
 /// The settings of the `bridge.toml` at `path`; `None` when there is no file.
 /// The one place the file is read (#70). Only a regular file is read: a pipe
 /// would block the reader.
 pub fn read(path: &Path) -> Result<Option<Config>, String> {
+    read_file(path).map_err(|e| e.to_string())
+}
+
+/// [`read`], its error kept whole for the log.
+fn read_file(path: &Path) -> Result<Option<Config>, Error> {
+    let error = |why| Error { path: path.to_owned(), why };
     match std::fs::metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Ok(m) if !m.is_file() => return Err(format!("{}: not a regular file", path.display())),
+        Ok(m) if !m.is_file() => return Err(error(Why::NotAFile)),
         _ => {}
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    parse(&text).map(Some).map_err(|e| format!("{}: {e}", path.display()))
+    let text = std::fs::read_to_string(path).map_err(|e| error(Why::Io(e)))?;
+    parse_text(&text).map(Some).map_err(|e| error(Why::Syntax(e)))
 }
 
 /// `bridge.toml` as the running bridge follows it (#70): the database list
@@ -160,7 +224,7 @@ impl Watched {
         if last.signature == Some(signature) {
             return Look { config: last.config.clone(), changed: false };
         }
-        match read(&self.path) {
+        match read_file(&self.path) {
             Ok(read) => {
                 let next = read.unwrap_or_default();
                 let changed = !last.read || next != last.config;
@@ -169,7 +233,7 @@ impl Watched {
             }
             Err(e) => {
                 if !last.failing {
-                    eprintln!("oschess-bridge: bridge.toml cannot be read, keeping the settings read before: {e}");
+                    crate::log!("{}; keeping the settings read before", e.logged());
                 }
                 (last.signature, last.failing) = (None, true);
                 Look { config: last.config.clone(), changed: false }
@@ -227,7 +291,7 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
 pub fn update(path: &Path, change: impl FnOnce(&Config) -> Config) -> Result<Config, String> {
     let _one = changing();
     create(path)?;
-    let now = read(path)?.ok_or_else(|| format!("{}: no such file", path.display()))?;
+    let now = read_file(path)?.ok_or_else(|| Error { path: path.to_owned(), why: Why::Missing })?;
     let next = change(&now);
     save(path, &next)?;
     Ok(next)
@@ -259,6 +323,48 @@ enum Value {
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
+    parse_text(text).map_err(|e| e.to_string())
+}
+
+/// A line of the file that cannot be read.
+#[derive(Debug)]
+struct Syntax {
+    line: usize,
+    fault: Fault,
+}
+
+/// What is wrong with a line. The message quotes the text at fault; the log
+/// says only what is wrong.
+#[derive(Debug)]
+enum Fault {
+    Fixed(&'static str),
+    NotAValue(String),
+    UnknownKey(String),
+}
+
+impl Fault {
+    fn what(&self) -> &'static str {
+        match self {
+            Fault::Fixed(what) => what,
+            Fault::NotAValue(_) => "not a value",
+            Fault::UnknownKey(_) => "unknown key",
+        }
+    }
+}
+
+impl std::fmt::Display for Syntax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}: ", self.line)?;
+        match &self.fault {
+            Fault::Fixed(what) => f.write_str(what),
+            Fault::NotAValue(text) => write!(f, "not a value: {text}"),
+            Fault::UnknownKey(key) => write!(f, "unknown key {key}"),
+        }
+    }
+}
+
+/// [`parse`], its error kept whole.
+fn parse_text(text: &str) -> Result<Config, Syntax> {
     let mut config = Config::default();
     let mut lines = text.lines().enumerate();
     while let Some((i, line)) = lines.next() {
@@ -266,7 +372,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if line.is_empty() {
             continue;
         }
-        let at = |msg: &str| format!("line {}: {msg}", i + 1);
+        let with = |fault| Syntax { line: i + 1, fault };
+        let at = |what| with(Fault::Fixed(what));
         let (key, rest) = line.split_once('=').ok_or_else(|| at("expected key = value"))?;
         let mut value_text = rest.trim().to_string();
         // An array may continue on the following lines up to its closing bracket.
@@ -275,7 +382,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             value_text.push(' ');
             value_text.push_str(strip_comment(next).trim());
         }
-        let value = parse_value(&value_text).map_err(|e| at(&e))?;
+        let value = parse_value(&value_text).map_err(with)?;
         match (key.trim(), value) {
             ("port", Value::Int(p)) => {
                 config.port = u16::try_from(p).ok().filter(|&p| p > 0).ok_or_else(|| at("port out of range"))?
@@ -295,7 +402,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ("port" | "origins" | "databases" | "web" | "engine" | "engine_threads" | "engine_hash", _) => {
                 return Err(at("wrong type"));
             }
-            (k, _) => return Err(at(&format!("unknown key {k}"))),
+            (k, _) => return Err(with(Fault::UnknownKey(k.to_string()))),
         }
     }
     Ok(config)
@@ -339,32 +446,36 @@ fn closes(text: &str) -> bool {
     false
 }
 
-fn parse_value(text: &str) -> Result<Value, String> {
+fn parse_value(text: &str) -> Result<Value, Fault> {
     if let Some(inner) = text.strip_prefix('[') {
-        let inner = inner.strip_suffix(']').ok_or("text after the array")?;
+        let inner = inner.strip_suffix(']').ok_or(Fault::Fixed("text after the array"))?;
         let mut items = Vec::new();
         let mut rest = inner.trim();
         while !rest.is_empty() {
-            let (item, after) = parse_string(rest)?;
+            let (item, after) = parse_string(rest).map_err(Fault::Fixed)?;
             items.push(item);
             rest = after.trim_start();
             rest = match rest.strip_prefix(',') {
                 Some(r) => r.trim_start(),
                 None if rest.is_empty() => rest,
-                None => return Err("expected , between array items".into()),
+                None => return Err(Fault::Fixed("expected , between array items")),
             };
         }
         return Ok(Value::List(items));
     }
     if text.starts_with(['"', '\'']) {
-        let (value, after) = parse_string(text)?;
-        return if after.trim().is_empty() { Ok(Value::Str(value)) } else { Err("text after the string".into()) };
+        let (value, after) = parse_string(text).map_err(Fault::Fixed)?;
+        return if after.trim().is_empty() {
+            Ok(Value::Str(value))
+        } else {
+            Err(Fault::Fixed("text after the string"))
+        };
     }
-    text.parse::<i64>().map(Value::Int).map_err(|_| format!("not a value: {text}"))
+    text.parse::<i64>().map(Value::Int).map_err(|_| Fault::NotAValue(text.to_string()))
 }
 
 /// One quoted string at the start of `text`, and what follows it.
-fn parse_string(text: &str) -> Result<(String, &str), String> {
+fn parse_string(text: &str) -> Result<(String, &str), &'static str> {
     if let Some(body) = text.strip_prefix('\'') {
         let end = body.find('\'').ok_or("unterminated string")?;
         return Ok((body[..end].to_string(), &body[end + 1..]));
@@ -385,12 +496,12 @@ fn parse_string(text: &str) -> Result<(String, &str), String> {
                     let code = u32::from_str_radix(&hex, 16).map_err(|_| "bad \\u escape")?;
                     out.push(char::from_u32(code).ok_or("bad \\u escape")?);
                 }
-                _ => return Err("unknown escape".into()),
+                _ => return Err("unknown escape"),
             },
             c => out.push(c),
         }
     }
-    Err("unterminated string".into())
+    Err("unterminated string")
 }
 
 #[cfg(test)]
@@ -547,5 +658,39 @@ mod tests {
             let e = parse(text).unwrap_err();
             assert!(e.starts_with(&format!("line {line}:")), "{text:?}: {e}");
         }
+    }
+
+    /// The log names the file alone and quotes none of it (#117); the message
+    /// the console and the windows show is as before.
+    #[test]
+    fn the_log_names_the_file_alone() {
+        let dir = std::env::temp_dir().join(format!("bridge-config-logged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bridge.toml");
+        let error = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            let e = read_file(&path).unwrap_err();
+            assert_eq!(read(&path).unwrap_err(), e.to_string());
+            (e.to_string(), e.logged())
+        };
+        let shown = |message: &str| format!("{}: {message}", path.display());
+        assert_eq!(
+            error("port = 1\nengine = C:\\Users\\Jane\\sf.exe\n"),
+            (shown("line 2: not a value: C:\\Users\\Jane\\sf.exe"), "bridge.toml: line 2: not a value".into())
+        );
+        assert_eq!(error("Jane = 1"), (shown("line 1: unknown key Jane"), "bridge.toml: line 1: unknown key".into()));
+        assert_eq!(
+            error("port = 0"),
+            (shown("line 1: port out of range"), "bridge.toml: line 1: port out of range".into())
+        );
+        let folder = dir.join("folder.toml");
+        std::fs::create_dir(&folder).unwrap();
+        let e = load(&folder).unwrap_err();
+        assert_eq!(
+            (e.to_string(), e.logged()),
+            (format!("{}: not a regular file", folder.display()), "bridge.toml: not a regular file".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

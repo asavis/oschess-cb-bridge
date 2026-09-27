@@ -348,7 +348,7 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
     let rows = match rows {
         Ok(rows) => rows,
         Err(e) if changing(entry, open.generation, &e) => return database_changing(),
-        Err(e) => return error(500, "internal", &e.to_string()),
+        Err(e) => return internal(&entry.id, &e),
     };
     // Lines are read from the move records as well: a database that changed
     // while they were read is reported, as a game's read reports it.
@@ -423,8 +423,16 @@ fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
         }
         SearchError::Busy => error(503, "busy", "Search memory is taken by other searches; retry"),
         SearchError::Read(e) if changing(entry, generation, &e) => database_changing(),
-        SearchError::Read(e) => error(500, "internal", &e.to_string()),
+        SearchError::Read(e) => internal(&entry.id, &e),
     }
+}
+
+/// The answer to a read of database `id` that failed with a bug: `500
+/// internal`, logged with the id and the error, whose path the log leaves
+/// out (#117).
+fn internal(id: &str, e: &Error) -> Response {
+    crate::log!("internal error on database {id}: {}", crate::log::error(e));
+    error(500, "internal", &e.to_string())
 }
 
 /// Rows `first..first + count` in one header read.
@@ -693,4 +701,34 @@ fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
         };
     }
     database_changing()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `500 internal` is logged by its database's id, without the path its
+    /// error carries; the answer is as `docs/api.md` gives it (#117).
+    #[test]
+    fn an_internal_error_is_logged_by_the_database_id_alone() {
+        let held = crate::log::testing::hold();
+        let dir = std::env::temp_dir().join(format!("bridge-api-internal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::log::open(&dir);
+        let db = dir.join("Jane Doe").join("Private Games.2cbg");
+        assert!(db.is_absolute());
+        let id = "0123456789abcdef";
+        let r = internal(id, &Error::Io(db.clone(), std::io::Error::other("the disk is gone")));
+        assert_eq!(r.status, 500);
+        assert!(r.body.contains(r#""code":"internal""#), "{}", r.body);
+        // Other tests may log beside this one.
+        let log = std::fs::read_to_string(dir.join(crate::log::FILE_NAME)).unwrap();
+        let line = log.lines().find(|l| l.contains(id)).unwrap();
+        assert!(line.ends_with(" internal error on database 0123456789abcdef: .2cbg: the disk is gone"), "{line}");
+        for private in [dir.to_str().unwrap(), "Jane Doe", "Private Games"] {
+            assert!(!log.contains(private), "{private} in {log}");
+        }
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
