@@ -1,6 +1,7 @@
 //! The v1 endpoints of `docs/api.md`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use cbformat::Error;
@@ -81,6 +82,10 @@ pub struct App {
     pub between_reads: Option<Box<dyn Fn() + Send + Sync>>,
     /// The engine of `bridge.toml`, or none.
     pub engine: Engine,
+    /// Whether a request passed the policy since the start: a paired browser
+    /// reached the bridge. The Windows app's first-run window stops waiting
+    /// for it then.
+    pub served: AtomicBool,
 }
 
 impl App {
@@ -88,14 +93,17 @@ impl App {
     /// between reads; a caller that needs either sets it with struct update
     /// syntax, `App { engine, ..App::new(..) }`.
     pub fn new(version: &'static str, policy: Policy, catalog: Catalog) -> App {
-        App { version, policy, catalog, between_reads: None, engine: Engine::none() }
+        App { version, policy, catalog, between_reads: None, engine: Engine::none(), served: AtomicBool::new(false) }
     }
 }
 
 pub fn handle(app: &App, req: &Request) -> Response {
     match app.policy.check(req) {
         Verdict::Answer(response) => response,
-        Verdict::Serve { origin } => cors(route(app, req), origin.as_deref()),
+        Verdict::Serve { origin } => {
+            app.served.store(true, Ordering::Relaxed);
+            cors(route(app, req), origin.as_deref())
+        }
     }
 }
 

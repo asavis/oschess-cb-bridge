@@ -1,6 +1,7 @@
 //! The bridge's state at one moment, for a user interface to poll: whether it
 //! still serves, why it stopped, and the state of each database.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +19,8 @@ pub struct Snapshot {
     pub databases: Vec<Database>,
     /// The work a restart would lose now (#61), each kind once.
     pub work: Vec<Work>,
+    /// A paired browser has been served since the bridge started.
+    pub served: bool,
 }
 
 /// Work a restart of the bridge would lose, which an update waits for.
@@ -157,6 +160,7 @@ impl Background {
             stopped: self.stopped.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             databases,
             work,
+            served: self.app.served.load(Ordering::Relaxed),
         }
     }
 }
@@ -228,6 +232,30 @@ mod tests {
         );
         assert_eq!(snapshot.databases[0].id, crate::catalog::id_of(&missing));
         assert!(snapshot.databases.iter().all(|d| d.listed));
+    }
+
+    /// The status line of a `GET /v1/status` sent with `token`.
+    fn status_with(port: u16, token: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let request = format!(
+            "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer.lines().next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn a_browser_counts_as_served_only_once_it_passes_the_policy() {
+        let bridge = bridge(Vec::new());
+        let port = bridge.port;
+        let background = Background::serve(bridge).unwrap();
+        assert!(!background.snapshot().served);
+        assert!(status_with(port, "not-the-token").starts_with("HTTP/1.1 401"));
+        assert!(!background.snapshot().served, "a refused request is no paired browser");
+        assert!(status_with(port, TOKEN).starts_with("HTTP/1.1 200"));
+        assert!(background.snapshot().served);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // The first-run window. The app has already opened oschess with the pairing
-// link; this window says so and offers the code for pasting by hand.
+// link; this window says so and offers the code for pasting by hand. Once a
+// paired browser reaches the bridge, it says oschess is connected instead.
 'use strict';
 
 async function main() {
@@ -17,6 +18,28 @@ async function main() {
   }));
   const pairing = await call('pairing_code');
   document.getElementById('code').textContent = pairing.code;
+  // Subscribe first, then read: a connection that arrives in between is heard
+  // by the listener, and one that came before is in the view read after it.
+  // The app stores each view before it announces it (#130).
+  await on('view', showConnected);
+  showConnected(await call('view'));
+}
+
+// Swaps the waiting line for «connected» once, and folds the code away: it is
+// no longer needed.
+let connected = false;
+function showConnected(view) {
+  if (connected || !view.connected) return;
+  connected = true;
+  const opening = document.getElementById('opening');
+  opening.classList.add('connected');
+  opening.querySelector('svg').replaceWith(icon('check', 18, 2.4));
+  document.getElementById('opening-title').textContent = t('firstRun.connected.title');
+  document.getElementById('opening-hint').textContent = t('firstRun.connected.hint');
+  document.querySelector('details').open = false;
+  // Nothing is left to do here: closing becomes the main action.
+  document.getElementById('open').classList.remove('accent');
+  document.getElementById('close').classList.add('accent');
 }
 
 main();

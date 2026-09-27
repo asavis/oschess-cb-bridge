@@ -219,8 +219,14 @@ mod tests {
     #[test]
     fn installs_wait_for_work_a_restart_would_lose() {
         use bridge::snapshot::{Snapshot, Work};
-        let snapshot =
-            |work: Vec<Work>| Snapshot { version: "0.1.0", port: 39581, stopped: None, databases: Vec::new(), work };
+        let snapshot = |work: Vec<Work>| Snapshot {
+            version: "0.1.0",
+            port: 39581,
+            stopped: None,
+            databases: Vec::new(),
+            work,
+            served: false,
+        };
         assert!(idle(&View::of(&snapshot(Vec::new())), false));
         for work in [Work::Downloading, Work::Opening, Work::Indexing, Work::Analysing] {
             assert!(!idle(&View::of(&snapshot(vec![work])), false), "{work:?}");
@@ -246,6 +252,7 @@ mod tests {
                     progress: None,
                 })
                 .collect(),
+            connected: false,
             mark: "",
             busy: false,
         };

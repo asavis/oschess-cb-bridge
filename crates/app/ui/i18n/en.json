@@ -163,6 +163,8 @@
   "firstRun.subtitle": "The oschess bridge runs in the background — the mark by the clock.",
   "firstRun.opening.title": "Opening oschess in your browser to connect…",
   "firstRun.opening.hint": "The browser asks for permission to access the local network — choose «Allow».",
+  "firstRun.connected.title": "oschess is connected",
+  "firstRun.connected.hint": "Your ChessBase databases are in the oschess Library now. You can close this window.",
   "firstRun.open": "Open oschess",
   "firstRun.close": "Close",
   "firstRun.manual.title": "Paste the code by hand",

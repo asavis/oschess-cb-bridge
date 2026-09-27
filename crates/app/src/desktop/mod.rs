@@ -137,8 +137,11 @@ fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
                 if view.problem.is_some() && last.as_ref().is_none_or(|l| l.problem.is_none()) {
                     notify_problem(&app, &shared.strings, &view);
                 }
-                let _ = app.emit("view", &view);
+                // The view is stored before it is announced: a window that
+                // subscribes and then reads the view either hears this event
+                // or reads it, and never misses it between the two (#130).
                 shared.set_view(view.clone());
+                let _ = app.emit("view", &view);
                 last = Some(view);
             }
             std::thread::sleep(Duration::from_secs(1));
