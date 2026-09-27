@@ -465,6 +465,16 @@ impl Catalog {
         self.entries();
     }
 
+    /// Sets how long the files of a database that left the list stay in the
+    /// index folders (#60): its position index, heads and names files, and
+    /// the header index of its PGN file; [`crate::indexdir::SWEEP_GRACE`]
+    /// unless set.
+    pub fn set_sweep_grace(&self, grace: Duration) {
+        lock(&self.explorer.unlisted).set_grace(grace);
+        lock(&self.shared.pgn.unlisted).set_grace(grace);
+        lock(&self.heads.unlisted).set_grace(grace);
+    }
+
     fn sweep_if_due(&self, entries: &[Arc<Entry>], rebuilt: bool) {
         if !self.sweeping.load(Ordering::Relaxed) {
             return;
@@ -481,7 +491,7 @@ impl Catalog {
         self.explorer.sweep(&listed);
         self.shared.pgn.sweep(&listed);
         if let Some(dir) = self.explorer.dir() {
-            self.heads.sweep(&dir, &listed, self.explorer.sweep_grace());
+            self.heads.sweep(&dir, &listed);
         }
     }
 

@@ -11,13 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
+use crate::indexdir::crc32;
 use crate::search::SearchError;
 use crate::search::memory::Cancel;
 use crate::search::workers::{self, threads};
 
-use super::format::{
-    BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, crc32,
-};
+use super::format::{BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES};
 use super::runs::{self, Entry, Limits, PARTS, Progress, RUN_BUFFER, Run, io};
 use super::source::Source;
 

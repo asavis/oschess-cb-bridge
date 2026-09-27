@@ -21,6 +21,7 @@ pub mod explorer;
 pub mod fetch;
 pub mod files;
 pub mod http;
+pub mod indexdir;
 pub mod json;
 pub mod log;
 pub mod pairing;
