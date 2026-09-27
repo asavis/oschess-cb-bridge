@@ -96,17 +96,28 @@ content question is answered «No».
 
 ## Restricted capability: runFullTrust
 
+Partner Center takes at most 500 characters here.
+
 > oschess bridge is a packaged Win32 desktop app (Windows.FullTrustApplication)
-> that lives in the notification area. It reads ChessBase database files from
-> any folder the user picks, serves them read-only on a loopback port
-> (127.0.0.1) to the oschess web app the user paired it with, and runs the
-> UCI chess engine the user chose as a child process: one installed with
-> ChessBase or Fritz, or the official Stockfish build, which it downloads from
-> Stockfish's GitHub release on the user's request and checks against a pinned
-> SHA-256. These need the full-trust desktop access that runFullTrust grants.
+> in the notification area. It reads ChessBase database files from folders the
+> user picks, serves them read-only on a loopback port (127.0.0.1) to the
+> oschess web app the user paired it with, and runs the UCI engine the user
+> chose as a child process: one from ChessBase or Fritz, or the official
+> Stockfish it downloads on request and checks against a pinned SHA-256. This
+> needs full-trust desktop access.
 
 ## Notes for certification
 
+The oschess Library needs an account. The testers get the same demo account
+as Google Play and App Store review, with its admin-set permanent code
+(`docs/mobile-android.md` in the oschess repository, "Store review access").
+The owner enters its email and code under Credentials on the Additional Testing
+Information page, never in these notes or in this repository.
+
+> Sign-in: the oschess Library needs an account. Use the demo account in the
+> Credentials below: at https://oschess.org enter the demo email, select
+> Continue, then enter the six-digit code. No login email is sent.
+>
 > The tray icon's menu opens the settings. In the engine section, «Install
 > Stockfish» downloads the official build and chooses it. «Open oschess» pairs
 > the default browser with the bridge through https://oschess.org and shows the
