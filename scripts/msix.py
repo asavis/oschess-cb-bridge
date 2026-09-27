@@ -11,8 +11,8 @@ the Store's copy installs Stockfish only when the user asks (#13).
 The identity comes from the variables MSSTORE_IDENTITY_NAME, MSSTORE_PUBLISHER
 and MSSTORE_PUBLISHER_DISPLAY_NAME, the values Partner Center shows on the
 product's identity page. Without any of them the package gets a test identity,
-for installing it by hand (docs/release.md). The version is the app's, with a
-fourth part of 0, as the Store requires.
+for installing it by hand (docs/release.md). The version comes from the app's
+x.y.z by package_version.
 
 The package is left unsigned: the Store signs it. makeappx.exe comes from
 --makeappx or from the newest Windows SDK; --stage-only fills the folder and
@@ -52,11 +52,27 @@ def read(path):
 
 
 def app_version():
+    """The app's version, x.y.z, as crates/app/Cargo.toml names it."""
     package = read(os.path.join(APP, "Cargo.toml")).split("[package]", 1)[1].split("\n[", 1)[0]
-    found = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"$', package, re.M)
+    found = re.search(r'^version = "([^"]*)"$', package, re.M)
     if not found:
-        fail("crates/app/Cargo.toml names no plain x.y.z version")
-    return ".".join(found.groups()) + ".0"
+        fail("crates/app/Cargo.toml names no version")
+    return found.group(1)
+
+
+def package_version(version):
+    """The package version for the app's x.y.z. The Store needs a first part
+    above 0, every part at most 65535 and a fourth part of 0, so the first part
+    is the app's plus one: 0.1.0 packs as 1.1.0.0, and 1.0.0 will pack as
+    2.0.0.0. That keeps every later app version above every earlier one."""
+    found = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+    if not found:
+        fail(f"{version!r} is not a plain x.y.z version")
+    major, minor, patch = (int(part) for part in found.groups())
+    parts = (major + 1, minor, patch, 0)
+    if max(parts) > 65535:
+        fail(f"{version} does not fit a package version, whose parts go up to 65535")
+    return ".".join(str(part) for part in parts)
 
 
 def identity():
@@ -112,7 +128,7 @@ def main():
         fail(f"{args.exe}: no such file")
     out_dir = os.path.dirname(os.path.abspath(args.out))
     values = identity()
-    values["VERSION"] = app_version()
+    values["VERSION"] = package_version(app_version())
     folder = os.path.join(out_dir, "msix-stage")
     stage(folder, args.exe, values)
     print(f"msix: staged {folder} as {values['NAME']} {values['VERSION']}")

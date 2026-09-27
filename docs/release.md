@@ -212,10 +212,14 @@ installer.
 `scripts/msix.py` stages the executable, `crates/app/msix/AppxManifest.xml`
 with the identity and version filled in, and the images from
 `crates/app/icons/msix` (drawn by `icons/generate.py`), and packs them with
-`makeappx` from the Windows SDK. The version is
-the app's with a fourth part of 0, as the Store requires. `cargo test -p app`
-checks the manifest against the app: the startup task, the executable and the
-images.
+`makeappx` from the Windows SDK. `cargo test -p app` checks the manifest
+against the app: the startup task, the executable and the images.
+
+The Store takes a package version whose first part is above 0, whose parts
+are at most 65535 and whose fourth part is 0. The package version is therefore
+the app's with its first part raised by one: 0.1.0 packs as 1.1.0.0, and 1.0.0
+will pack as 2.0.0.0, so every later version stays above every earlier one.
+`scripts/test_msix.py` pins that mapping, and CI runs it.
 
 The identity comes from three repository variables, all public values from
 Partner Center's product identity page:
