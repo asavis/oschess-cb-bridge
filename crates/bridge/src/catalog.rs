@@ -334,6 +334,12 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
         Format::Pgn => &[""],
         _ => &cbformat::v2::EXTENSIONS,
     };
+    // Every cache keyed on a PGN database's generation (the header index, the
+    // heads and names files, the position index) is then built again once
+    // when the reading of PGN files changes; other formats' caches stay.
+    if format == Format::Pgn {
+        hash.write(&cbformat::pgnfile::VERSION.to_le_bytes());
+    }
     for &ext in extensions {
         let path = match format {
             Format::Pgn => path.to_path_buf(),
@@ -624,5 +630,22 @@ mod tests {
         assert_eq!(entries[0].name, "x");
         assert_eq!(entries[0].state(), State::Missing);
         assert_eq!(entries[1].state(), State::Missing);
+    }
+
+    #[test]
+    fn a_pgn_generation_carries_the_index_version() {
+        let f = cbformat::fixture::pgn_file("catalog-generation", b"[White \"A\"]\n\n1. e4 *\n");
+        let path = f.dir().join("db.pgn");
+        let generation = generation_of(&path, Format::Pgn, &System).generation.unwrap();
+        // The version salt is what rebuilds the caches of an unchanged PGN
+        // file once its reading changes: without it the generation is the
+        // file's metadata alone.
+        let mut metadata = Hash::new();
+        metadata.write_meta(&std::fs::metadata(&path).unwrap());
+        assert_ne!(generation, metadata.finish());
+        let mut salted = Hash::new();
+        salted.write(&cbformat::pgnfile::VERSION.to_le_bytes());
+        salted.write_meta(&std::fs::metadata(&path).unwrap());
+        assert_eq!(generation, salted.finish());
     }
 }

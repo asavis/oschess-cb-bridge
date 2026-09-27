@@ -279,3 +279,42 @@ fn names_follow_the_served_text_at_the_edges() {
         assert!(text.contains(&format!("[White \"{name}\"")), "{i}: {name} in {text:?}");
     }
 }
+
+/// Two games whose White values hold bytes that code page 1252 leaves
+/// undefined, `A 81 Z` and `A 8D Z`: not UTF-8, so read in the code page.
+const UNDEFINED: &[u8] = b"[White \"A\x81Z\"]\n\n1. e4 *\n\n[White \"A\x8dZ\"]\n\n1. d4 *\n";
+
+#[test]
+fn bytes_the_code_page_leaves_undefined_are_distinct_names() {
+    // They read as the C1 controls of the same values, as the served text
+    // shows them, where they once both read as U+FFFD, one name.
+    let f = pgn_file("undefined", UNDEFINED);
+    let db = built(&f, 1, CodePage::WESTERN);
+    assert_eq!(db.players(), 2);
+    let (r1, r2) = (db.record(1).unwrap(), db.record(2).unwrap());
+    assert_ne!(r1.white(), r2.white());
+    for (r, name) in [(r1, "A\u{81}Z"), (r2, "A\u{8d}Z")] {
+        assert_eq!(db.player(r.white()).unwrap().unwrap().last, name);
+        assert!(db.text(&r, 1 << 20).unwrap().contains(&format!("[White \"{name}\"]")));
+    }
+}
+
+#[test]
+fn an_index_of_an_earlier_version_is_built_again() {
+    // An index built before the reading changed holds the names as it then
+    // read them: it is refused, and building it again reads them anew.
+    let f = pgn_file("earlier-version", UNDEFINED);
+    let (pgn, index) = (f.dir().join("db.pgn"), index_of(&f));
+    pgnfile::build(&pgn, &index, 1, CodePage::WESTERN, &mut |_| true).unwrap();
+    let mut bytes = std::fs::read(&index).unwrap();
+    assert_eq!(bytes[8..12], pgnfile::VERSION.to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&index, &bytes).unwrap();
+    assert!(Database::open(&pgn, &index, 1, CodePage::WESTERN).is_err());
+
+    let db = built(&f, 1, CodePage::WESTERN);
+    assert_eq!(db.players(), 2);
+    let names: Vec<String> =
+        (1..=2).map(|id| db.player(db.record(id).unwrap().white()).unwrap().unwrap().last).collect();
+    assert_eq!(names, ["A\u{81}Z", "A\u{8d}Z"]);
+}

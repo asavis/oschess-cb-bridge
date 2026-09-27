@@ -14,7 +14,7 @@
 //! | Offset | Size | Field |
 //! |---|---|---|
 //! | 0 | 8 | `OSPGNIDX` |
-//! | 8 | 4 | version, 1 |
+//! | 8 | 4 | version, 2 |
 //! | 12 | 4 | record size, 48 |
 //! | 16 | 8 | the stamp the index was built for, which its user chooses |
 //! | 24 | 8 | bytes of the PGN file read |
@@ -50,7 +50,10 @@ use scan::{Game, ResultCode, Splitter, Tag, Variant};
 pub const RECORD_SIZE: usize = 48;
 const HEADER_SIZE: u64 = 64;
 const MAGIC: &[u8; 8] = b"OSPGNIDX";
-const VERSION: u32 = 1;
+/// The index format's version, which an index must carry to be opened.
+/// Raise it whenever the index's layout changes, or the text it yields for
+/// the same file does, as the decoding of code page text did in #120.
+pub const VERSION: u32 = 2;
 /// Bytes of one entry of the name table.
 const ENTRY_SIZE: u64 = 12;
 /// The longest name kept, in bytes of UTF-8; a longer one is cut.
