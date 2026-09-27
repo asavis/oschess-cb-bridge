@@ -1,20 +1,23 @@
 //! The Tauri app: the tray mark and its menu, the status flyout, the settings
 //! and first-run windows, and the commands the windows call. Windows only.
 
+mod autostart;
 mod commands;
+mod package;
 mod server;
 mod system;
 mod tray;
 mod updater;
 mod windows;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_notification::NotificationExt;
 
+use crate::channel::Channel;
 use crate::i18n::{Lang, Strings};
 use crate::status::{Problem, View};
 use server::Shared;
@@ -22,6 +25,14 @@ use server::Shared;
 /// The argument the Run key starts the app with, so a start at sign-in can be
 /// told from one by hand.
 const AUTOSTART_ARG: &str = "--autostart";
+
+/// The channel, asked of Windows once.
+static CHANNEL: OnceLock<Channel> = OnceLock::new();
+
+/// Where this copy came from: the NSIS installer or the Microsoft Store (#112).
+pub(crate) fn channel() -> &'static Channel {
+    CHANNEL.get_or_init(package::channel)
+}
 
 pub fn run() {
     let strings = Strings::new(Lang::from_langid(system::display_language()));
@@ -39,8 +50,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
-    // Only with a real key in tauri.conf.json: the placeholder keeps updates off.
-    if let Some(updater) = updater::plugin(context.config()) {
+    // Only with a real key in tauri.conf.json: the placeholder keeps updates
+    // off. The Store updates its package itself.
+    if let Some(updater) = updater::plugin(context.config()).filter(|_| !channel().is_store()) {
         builder = builder.plugin(updater);
     }
     let app = builder

@@ -5,9 +5,9 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
-use tauri_plugin_autostart::ManagerExt;
 
-use super::{commands, shared, updater, windows};
+use super::autostart::{self, State};
+use super::{channel, commands, shared, updater, windows};
 use crate::i18n::Strings;
 use crate::status::{Theme, View, icon_file, icon_size};
 
@@ -57,24 +57,26 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let shared = shared(app);
     let strings = &shared.strings;
     let view = shared.view();
-    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+    let autostart = autostart::state(app) == State::On;
     let item = |id: &str, key: &str| MenuItem::with_id(app, id, strings.get(key), true, None::<&str>);
     let tick = CheckMenuItem::with_id(app, AUTOSTART, strings.get("menu.autostart"), true, autostart, None::<&str>)?;
     app.manage(AutostartTick(tick.clone()));
-    let menu = Menu::with_items(
-        app,
-        &[
-            &item("open", "menu.open")?,
-            &item("settings", "menu.settings")?,
-            &item("code", "menu.code")?,
-            &PredefinedMenuItem::separator(app)?,
-            &tick,
-            // Only a build with a real updater key looks for updates.
-            &MenuItem::with_id(app, "update", strings.get("menu.update"), updater::enabled(app), None::<&str>)?,
-            &PredefinedMenuItem::separator(app)?,
-            &item("quit", "menu.quit")?,
-        ],
-    )?;
+    // Only a build with a real updater key looks for updates. The Store's
+    // package has no such item: the Store updates it.
+    let update = MenuItem::with_id(app, "update", strings.get("menu.update"), updater::enabled(app), None::<&str>)?;
+    let (open, settings, code, quit) = (
+        item("open", "menu.open")?,
+        item("settings", "menu.settings")?,
+        item("code", "menu.code")?,
+        item("quit", "menu.quit")?,
+    );
+    let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = vec![&open, &settings, &code, &first, &tick];
+    if !channel().is_store() {
+        items.push(&update);
+    }
+    items.extend([&second as &dyn tauri::menu::IsMenuItem<Wry>, &quit]);
+    let menu = Menu::with_items(app, &items)?;
     let mut builder = TrayIconBuilder::with_id(TRAY)
         .tooltip(view.tooltip(strings))
         .menu(&menu)
@@ -122,8 +124,12 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
         "settings" => windows::open_settings(app, "databases"),
         "code" => windows::open_settings(app, "code"),
         AUTOSTART => {
-            let on = !app.autolaunch().is_enabled().unwrap_or(false);
-            let _ = commands::switch_autostart(app, on);
+            let on = autostart::state(app) != State::On;
+            // Only Windows' own settings turn a task the user turned off there
+            // back on: the settings window says where.
+            if let Ok(State::Blocked) = commands::switch_autostart(app, on) {
+                windows::open_settings(app, "general");
+            }
         }
         "update" => updater::look_now(app),
         "quit" => app.exit(0),
@@ -134,7 +140,7 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
 /// The menu's autostart tick, kept so that the settings window can move it.
 struct AutostartTick(CheckMenuItem<Wry>);
 
-/// Puts the menu's autostart tick in step with the Run key.
+/// Puts the menu's autostart tick in step with the Run key or the startup task.
 pub fn show_autostart(app: &AppHandle, on: bool) {
     if let Some(tick) = app.try_state::<AutostartTick>() {
         let _ = tick.0.set_checked(on);

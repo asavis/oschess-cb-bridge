@@ -12,7 +12,9 @@ writes, next to this script:
   40-unit round-joined stroke in the logo's 1254-unit box at 32 px, and with a
   stroke of 0.84 px at 16, 20 and 24 px, moved there by the fraction of a
   pixel that lands the most of its lines on whole pixels (#74);
-- icon.ico and icon.png: the logo on a light rounded tile, the app's icon.
+- icon.ico and icon.png: the logo on a light rounded tile, the app's icon;
+- msix/*.png: the same icon for the Microsoft Store package (#112): its store
+  logo, its tiles, and its app list and taskbar icons at their target sizes.
 
 The outputs are committed; run this again only when the logo or a colour
 changes. The oschess name and logo are not covered by the MIT licence (NOTICE).
@@ -38,6 +40,10 @@ TRAY = {
 }
 TRAY_SIZES = (16, 20, 24, 32)
 ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+# The package's images by file name, as crates/app/msix/AppxManifest.xml names
+# them, and the target sizes Windows picks the app list and taskbar icon from.
+MSIX = {"StoreLogo.png": 50, "Square150x150Logo.png": 150, "Square44x44Logo.png": 44}
+MSIX_TARGET_SIZES = (16, 24, 32, 48, 256)
 MARK = "#1d140f"
 TILE = "#fffdf9"
 TILE_BORDER = "#eadfd3"
@@ -279,6 +285,13 @@ def main():
         f.write(ico(images))
     with open(os.path.join(HERE, "icon.png"), "wb") as f:
         f.write(dict(images)[256])
+    os.makedirs(os.path.join(HERE, "msix"), exist_ok=True)
+    msix = dict(MSIX)
+    for size in MSIX_TARGET_SIZES:
+        msix[f"Square44x44Logo.targetsize-{size}_altform-unplated.png"] = size
+    for name, size in msix.items():
+        with open(os.path.join(HERE, "msix", name), "wb") as f:
+            f.write(dict(images).get(size) or png(app_icon(size, polys)))
 
 
 if __name__ == "__main__":

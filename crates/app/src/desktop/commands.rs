@@ -10,13 +10,13 @@ use bridge::stockfish::{self, Build, Progress};
 use bridge::{config, engine, token};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
+use super::autostart::{self, State};
 use super::server::{self, Pairing};
-use super::{SharedState, shared, tray, updater, windows};
+use super::{SharedState, channel, shared, tray, updater, windows};
 use crate::choices::Choices;
 use crate::prefs;
 use crate::settings::{self, Extra};
@@ -30,9 +30,14 @@ pub struct SettingsView {
     port: u16,
     extras: Vec<Extra>,
     autostart: bool,
+    /// Windows' own settings turned starting with Windows off, and only they
+    /// turn it on again.
+    autostart_blocked: bool,
     auto_update: bool,
     /// Whether this build looks for updates at all.
     updates: bool,
+    /// Whether the Microsoft Store installed this copy and updates it (#112).
+    store: bool,
 }
 
 /// What the engine section shows: the engines found and the one chosen, the
@@ -129,13 +134,16 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
     let shared = shared(app);
     let dir = shared.dir()?;
     let config = config::load_or_create(&shared.config_path()?)?;
+    let autostart = autostart::state(app);
     Ok(SettingsView {
         version: env!("CARGO_PKG_VERSION"),
         port: config.port,
         extras: settings::extras(&config),
-        autostart: app.autolaunch().is_enabled().unwrap_or(false),
+        autostart: autostart == State::On,
+        autostart_blocked: autostart == State::Blocked,
         auto_update: prefs::load(&dir).auto_update,
         updates: updater::enabled(app),
+        store: channel().is_store(),
     })
 }
 
@@ -321,18 +329,19 @@ pub async fn pick_engine(app: AppHandle) -> Answer<Option<String>> {
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+/// Asynchronous: in the Store channel it waits on Windows' startup task.
 #[tauri::command]
-pub fn set_autostart(app: AppHandle, on: bool) -> Answer<SettingsView> {
+pub async fn set_autostart(app: AppHandle, on: bool) -> Answer<SettingsView> {
     switch_autostart(&app, on)?;
     settings_view(&app)
 }
 
-/// Writes or removes the Run key, and moves the menu's tick with it.
-pub fn switch_autostart(app: &AppHandle, on: bool) -> Answer<()> {
-    let launcher = app.autolaunch();
-    let result = if on { launcher.enable() } else { launcher.disable() };
-    tray::show_autostart(app, launcher.is_enabled().unwrap_or(false));
-    result.map_err(text)
+/// Turns starting with Windows on or off, moves the menu's tick with it, and
+/// answers where it stands.
+pub fn switch_autostart(app: &AppHandle, on: bool) -> Answer<State> {
+    let result = autostart::set(app, on);
+    tray::show_autostart(app, autostart::state(app) == State::On);
+    result
 }
 
 #[tauri::command]

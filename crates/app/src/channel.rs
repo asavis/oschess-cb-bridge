@@ -1,0 +1,23 @@
+//! Where this copy of the bridge came from (#112). The NSIS installer from
+//! GitHub gives the direct channel: the app updates itself and starts with
+//! Windows through the Run key. The Microsoft Store installs the same
+//! executable in an MSIX package: the Store updates it, and Windows starts it
+//! through the package's startup task. The app tells the two apart by asking
+//! Windows for its package identity.
+
+/// The startup task the package manifest declares; «Start with Windows»
+/// enables it in the Store channel.
+pub const STARTUP_TASK: &str = "oschessBridgeStartup";
+
+/// Where the app came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    Direct,
+    Store,
+}
+
+impl Channel {
+    pub fn is_store(self) -> bool {
+        self == Channel::Store
+    }
+}

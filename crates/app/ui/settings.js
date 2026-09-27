@@ -56,12 +56,18 @@ function renderSettings(settings) {
   current = settings;
   document.getElementById('version').textContent = t('settings.version', { version: settings.version });
   document.getElementById('version-title').textContent = t('settings.versionRow.title', { version: settings.version });
-  // A build without a real updater key does not look for updates.
-  document.getElementById('version-hint').textContent =
-    settings.updates ? t('settings.versionRow.hint') : t('settings.versionRow.off');
+  // A build without a real updater key does not look for updates. The
+  // Microsoft Store updates its package itself: no update controls (#112).
+  document.getElementById('version-hint').textContent = settings.store
+    ? t('settings.versionRow.store')
+    : settings.updates ? t('settings.versionRow.hint') : t('settings.versionRow.off');
   document.getElementById('check-updates').disabled = !settings.updates;
+  document.getElementById('check-updates').hidden = settings.store;
+  document.getElementById('auto-update').closest('.row').hidden = settings.store;
   document.getElementById('port-title').textContent = t('settings.port.title', { port: settings.port });
   toggle('autostart', settings.autostart);
+  // Only Windows' Startup apps settings turn back on what the user turned off there.
+  if (settings.autostartBlocked) document.getElementById('autostart-state').textContent = t('settings.autostart.blocked');
   toggle('auto-update', settings.autoUpdate);
   const rows = settings.extras.map((extra) => {
     const detail = !extra.present
@@ -209,7 +215,10 @@ function wire() {
   document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
   on('stockfish-progress', showInstallProgress);
   document.getElementById('autostart').addEventListener('click', () =>
-    act(call('set_autostart', { on: !current.autostart }).then(renderSettings)));
+    act(call('set_autostart', { on: !current.autostart }).then((settings) => {
+      renderSettings(settings);
+      if (settings.autostartBlocked) notice(t('settings.autostart.blockedHint'));
+    })));
   document.getElementById('auto-update').addEventListener('click', () =>
     act(call('set_auto_update', { on: !current.autoUpdate }).then(renderSettings)));
   // The outcome comes as a Windows notification.

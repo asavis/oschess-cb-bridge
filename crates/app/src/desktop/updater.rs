@@ -30,9 +30,10 @@ pub fn plugin<R: Runtime>(config: &tauri::Config) -> Option<TauriPlugin<R, tauri
     Some(tauri_plugin_updater::Builder::new().pubkey(key).build())
 }
 
-/// Whether this build looks for updates: its configuration holds a real key.
+/// Whether this build looks for updates: its configuration holds a real key,
+/// and it is not the Store's package, which the Store updates.
 pub fn enabled(app: &AppHandle) -> bool {
-    updates::public_key(app.config().plugins.0.get("updater")).is_some()
+    !super::channel().is_store() && updates::public_key(app.config().plugins.0.get("updater")).is_some()
 }
 
 /// Says «updated to X» when this start follows an update, and starts the
