@@ -1,6 +1,8 @@
 //! One view of both formats: the same game, stored once as 2CBH and once as a
 //! classic database, reads the same through `view::Base`.
 
+use std::path::Path;
+
 use cbformat::fixture::{self, TempDb, quiet, text};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
 use cbformat::game::{Date, Eco, GameResult, Head, RecordKind, Start, language};
@@ -212,4 +214,66 @@ fn formats_by_extension_and_by_stem() {
     // A stem with neither file is read as 2CBH, whose error names what is missing.
     assert_eq!(format_of(&f1.dir().join("none")), Format::TwoCbh);
     assert!(Base::open(f1.dir().join("none")).is_err());
+}
+
+/// Each format's files, the main one first, with whether its reader cannot
+/// open the database without it; a path is taken with or without its main
+/// extension, as `Base::open` takes it.
+#[test]
+fn the_files_of_each_format() {
+    let names = |format: Format, path: &str| -> Vec<(String, bool)> {
+        format
+            .files(Path::new(path))
+            .into_iter()
+            .map(|(p, required)| {
+                assert_eq!(p.parent(), Some(Path::new("/d")), "{}", p.display());
+                (p.file_name().unwrap().to_string_lossy().into_owned(), required)
+            })
+            .collect()
+    };
+    let with = |stem: &str, files: &[(&str, bool)]| -> Vec<(String, bool)> {
+        files.iter().map(|&(ext, required)| (format!("{stem}{ext}"), required)).collect()
+    };
+    let two_cbh =
+        [(".2cbh", true), (".2cbg", true), (".2cba", false), (".2lid", true), (".2lgd", false), (".2lcd", false)];
+    assert_eq!(names(Format::TwoCbh, "/d/Big Base.2cbh"), with("Big Base", &two_cbh));
+    assert_eq!(names(Format::TwoCbh, "/d/Big Base.2CBH"), with("Big Base", &two_cbh));
+    assert_eq!(names(Format::TwoCbh, "/d/Big Base"), with("Big Base", &two_cbh));
+    // Only the format's own extension is taken off: a stem may hold a dot.
+    assert_eq!(names(Format::TwoCbh, "/d/v1.5"), with("v1.5", &two_cbh));
+    let classic = [
+        (".cbh", true),
+        (".cbg", true),
+        (".cba", false),
+        (".cbp", true),
+        (".cbt", true),
+        (".cbc", true),
+        (".cbs", true),
+        (".cbj", false),
+    ];
+    assert_eq!(names(Format::Cbh, "/d/Old.cbh"), with("Old", &classic));
+    assert_eq!(names(Format::Cbh, "/d/Old"), with("Old", &classic));
+    assert_eq!(names(Format::Pgn, "/d/games.PGN"), [("games.PGN".to_string(), true)]);
+}
+
+/// Every file `Format::files` calls required is one the reader cannot open
+/// the database without, and every other one it can.
+#[test]
+fn a_database_opens_without_its_optional_files_only() {
+    for (format, f) in [(Format::TwoCbh, two_cbh("files")), (Format::Cbh, classic("files"))] {
+        let main = f.dir().join(if format == Format::TwoCbh { "db.2cbh" } else { "db.cbh" });
+        let files = format.files(&main);
+        assert_eq!(files[0].0, main);
+        for (file, required) in files {
+            let moved = file.with_extension("moved");
+            let existed = std::fs::rename(&file, &moved).is_ok();
+            assert!(existed || !required, "{} is required but was not built", file.display());
+            let opened = Base::open(&main);
+            assert_eq!(opened.is_err(), required, "{}", file.display());
+            if existed {
+                std::fs::rename(&moved, &file).unwrap();
+            }
+        }
+        assert!(Base::open(&main).is_ok());
+    }
 }

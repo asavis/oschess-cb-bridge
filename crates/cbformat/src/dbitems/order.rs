@@ -56,13 +56,13 @@ fn by_icon(e: &Entry) -> (Reverse<i64>, Reverse<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dbitems::Format;
+    use crate::view::Format;
 
     fn entry(name: &str, icon: i64) -> Entry {
         Entry {
             path: format!("C:\\Bases\\{name}.2cbh"),
             name: name.to_owned(),
-            format: Format::of(&format!("{name}.2cbh")),
+            format: Some(Format::TwoCbh),
             section: None,
             numbers: [icon, 28, 1, 1, 1_037_624, 1_037_559],
         }

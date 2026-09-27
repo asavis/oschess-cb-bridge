@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::game::Date;
+use crate::view::Format;
 use crate::{Error, Result};
 
 mod local;
@@ -119,29 +120,6 @@ fn text(b: &[u8]) -> String {
     }
 }
 
-/// A database's format, from its file extension.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
-    /// `.2cbh`, ChessBase 17 and later.
-    Cbh2,
-    /// `.cbh`, the classic format.
-    Cbh,
-    Pgn,
-    Other,
-}
-
-impl Format {
-    pub fn of(path: &str) -> Format {
-        let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-        match ext.as_deref() {
-            Some("2cbh") => Format::Cbh2,
-            Some("cbh") => Format::Cbh,
-            Some("pgn") => Format::Pgn,
-            _ => Format::Other,
-        }
-    }
-}
-
 /// One database in the window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -150,7 +128,8 @@ pub struct Entry {
     /// The title the window shows, or the file name without its extension
     /// when the stored title is empty.
     pub name: String,
-    pub format: Format,
+    /// The format the path's extension names; `None` for any other file.
+    pub format: Option<Format>,
     /// The section holding the entry, an index into [`DbList::sections`]:
     /// `2cbg` for 2CBH databases and `Databases` for the others in the files
     /// examined. `None` before the first section header.
@@ -219,7 +198,7 @@ pub fn parse(bytes: &[u8]) -> Result<DbList> {
             Value::Text { text, .. } => {
                 if let Some((title, numbers)) = title_and_numbers(&text) {
                     let name = if title.is_empty() { stem(&item.key).to_owned() } else { title.to_owned() };
-                    let format = Format::of(&item.key);
+                    let format = Format::of_extension(Path::new(&item.key));
                     list.entries.push(Entry { path: item.key, name, format, section, numbers });
                 } else if in_section("2cbh") && item.key == "RefDB" {
                     list.reference = Some(text);
@@ -340,14 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn stems_and_formats() {
+    fn stems() {
         assert_eq!(stem(r"C:\Bases\Mega Database 2026.2cbh"), "Mega Database 2026");
         assert_eq!(stem("/tmp/x/Old.cbh"), "Old");
         assert_eq!(stem("noext"), "noext");
-        assert_eq!(Format::of(r"C:\a.2CBH"), Format::Cbh2);
-        assert_eq!(Format::of("a.cbh"), Format::Cbh);
-        assert_eq!(Format::of("a.PGN"), Format::Pgn);
-        assert_eq!(Format::of("a.cbv"), Format::Other);
     }
 
     #[test]

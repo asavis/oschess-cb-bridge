@@ -45,6 +45,16 @@ impl Format {
             Format::Other => "other",
         }
     }
+
+    /// The format as `cbformat` names it; `None` for another file.
+    fn view(self) -> Option<cbformat::view::Format> {
+        match self {
+            Format::TwoCbh => Some(cbformat::view::Format::TwoCbh),
+            Format::Cbh => Some(cbformat::view::Format::Cbh),
+            Format::Pgn => Some(cbformat::view::Format::Pgn),
+            Format::Other => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,34 +331,21 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The metadata of the database at `path`, of `format`: its generation and
-/// files. Metadata only, following links: nothing is opened. A PGN database
-/// is its one file.
+/// files, the ones its reader opens ([`cbformat::view::Format::files`]), so
+/// that the search boosters and other optional classic files are neither
+/// read nor downloaded. Metadata only, following links: nothing is opened. A
+/// PGN database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
-    let stem = path.with_extension("");
     let mut hash = Hash::new();
     let mut files = Files { generation: None, present: Vec::new(), irregular: false };
-    let extensions: &[&str] = match format {
-        // The files the classic reader opens: the search boosters and other
-        // optional files are neither read nor downloaded.
-        Format::Cbh => &cbformat::cbh::READ,
-        Format::Pgn => &[""],
-        _ => &cbformat::v2::EXTENSIONS,
-    };
+    let Some(format) = format.view() else { return files };
     // Every cache keyed on a PGN database's generation (the header index, the
     // heads and names files, the position index) is then built again once
     // when the reading of PGN files changes; other formats' caches stay.
-    if format == Format::Pgn {
+    if format == cbformat::view::Format::Pgn {
         hash.write(&cbformat::pgnfile::VERSION.to_le_bytes());
     }
-    for &ext in extensions {
-        let path = match format {
-            Format::Pgn => path.to_path_buf(),
-            _ => {
-                let mut path = stem.clone().into_os_string();
-                path.push(ext);
-                PathBuf::from(path)
-            }
-        };
+    for (i, (path, _)) in format.files(path).into_iter().enumerate() {
         match std::fs::metadata(&path) {
             Ok(m) if !m.is_file() => {
                 files.irregular = true;
@@ -359,7 +356,8 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
             }
-            Err(_) if ext == extensions[0] => return files,
+            // The main file comes first: without it there is no database.
+            Err(_) if i == 0 => return files,
             Err(_) => hash.write(&[0xff]),
         }
     }

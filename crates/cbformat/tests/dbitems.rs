@@ -2,8 +2,9 @@
 
 use std::path::PathBuf;
 
-use cbformat::dbitems::{self, Format, Value};
+use cbformat::dbitems::{self, Value};
 use cbformat::fixture::DbItems;
+use cbformat::view::Format;
 
 /// A list shaped like the ones ChessBase writes: 2CBH databases in `2cbg`, the
 /// reference database in `2cbh`, other formats in `Databases`, then the
@@ -47,8 +48,8 @@ fn entries_come_in_file_order_with_their_fields() {
     let list = dbitems::parse(&sample().bytes()).unwrap();
     let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["Big Base", "Чорні - репертуар", "Club, 2026 games", "Old", "Downloads (pgn)"]);
-    let formats: Vec<Format> = list.entries.iter().map(|e| e.format).collect();
-    assert_eq!(formats, [Format::Cbh2, Format::Cbh2, Format::Cbh2, Format::Cbh, Format::Pgn]);
+    let formats: Vec<Option<Format>> = list.entries.iter().map(|e| e.format).collect();
+    assert_eq!(formats, [Format::TwoCbh, Format::TwoCbh, Format::TwoCbh, Format::Cbh, Format::Pgn].map(Some));
     let sections: Vec<&str> = list.entries.iter().map(|e| list.section_of(e).unwrap()).collect();
     assert_eq!(sections, ["2cbg", "2cbg", "2cbg", "Databases", "Databases"]);
     assert_eq!(list.sections, ["2cbg", "2cbh", "Databases", "Pathes", "Status"]);
@@ -71,6 +72,20 @@ fn sort_directions_are_read_only_from_status() {
     let list = dbitems::parse(&f.bytes()).unwrap();
     assert_eq!(list.sort_dir, [None, None, None, Some(1), None, None, None, None]);
     assert_eq!(list.sort, None);
+}
+
+/// The format is the one the stored path's extension names, in any case.
+#[test]
+fn an_entry_of_another_format_has_none() {
+    let mut f = DbItems::new();
+    f.section("Databases")
+        .database(r"C:\x\A.2CBH", "A", [0, 28, 1, 0, 0, 0])
+        .database(r"C:\x\B.PGN", "B", [0, 3, 1, 0, 0, 0])
+        .database(r"C:\x\C.cbv", "C", [0, 0, 1, 0, 0, 0])
+        .database(r"C:\x.cbh\D", "D", [0, 0, 1, 0, 0, 0]);
+    let list = dbitems::parse(&f.bytes()).unwrap();
+    let formats: Vec<Option<Format>> = list.entries.iter().map(|e| e.format).collect();
+    assert_eq!(formats, [Some(Format::TwoCbh), Some(Format::Pgn), None, None]);
 }
 
 #[test]

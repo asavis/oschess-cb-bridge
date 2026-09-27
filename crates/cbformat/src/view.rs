@@ -231,6 +231,31 @@ impl Format {
             .find(|(_, name)| ext.eq_ignore_ascii_case(name))
             .map(|(format, _)| format)
     }
+
+    /// The files a database of this format at `path` is made of, the main
+    /// file first, each with whether its reader cannot open the database
+    /// without it: for 2CBH [`v2::EXTENSIONS`], for the classic format
+    /// [`cbh::READ`], and a PGN file alone. `path` names the main file or the
+    /// stem the files share, as [`Base::open`] takes it.
+    pub fn files(self, path: &Path) -> Vec<(PathBuf, bool)> {
+        let (main, extensions, required): (&str, &[&str], &[&str]) = match self {
+            Format::TwoCbh => ("2cbh", &v2::EXTENSIONS, &[".2cbh", ".2cbg", ".2lid"]),
+            // The annotations are optional, and the 64-bit offsets are read
+            // only for a move or annotation file over 4 GiB.
+            Format::Cbh => ("cbh", &cbh::READ, &[".cbh", ".cbg", ".cbp", ".cbt", ".cbc", ".cbs"]),
+            Format::Pgn => return vec![(path.to_path_buf(), true)],
+        };
+        let stem = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(main)) {
+            path.with_extension("")
+        } else {
+            path.to_path_buf()
+        };
+        crate::file::with_extensions(&stem, extensions)
+            .into_iter()
+            .zip(extensions)
+            .map(|(file, ext)| (file, required.contains(ext)))
+            .collect()
+    }
 }
 
 /// The format of the database `path` names; see [`Base::open`]. A path
