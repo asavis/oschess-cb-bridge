@@ -33,6 +33,10 @@ pub struct Options {
     pub databases: Vec<PathBuf>,
     pub show_token: bool,
     pub new_token: bool,
+    /// The version the bridge reports in its status: the Windows app's own,
+    /// which its release carries. `None` reports this library's version, as
+    /// `oschess-bridge` and `cbtool bridge` do.
+    pub version: Option<&'static str>,
 }
 
 impl Options {
@@ -97,7 +101,7 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, String> {
     };
     let link = pairing::link(web, &token, config.port);
     let app = App {
-        version: env!("CARGO_PKG_VERSION"),
+        version: options.version.unwrap_or(env!("CARGO_PKG_VERSION")),
         policy: Policy { port: config.port, origins, token: token.clone() },
         catalog: Catalog::with_sources(sources, Arc::new(System)),
         between_reads: None,
@@ -152,7 +156,12 @@ mod tests {
         let o = Options::parse(args(&["--database", "a b.2cbh", "--show-token", "--database", "c", "--new-token"]));
         assert_eq!(
             o.unwrap(),
-            Options { databases: vec!["a b.2cbh".into(), "c".into()], show_token: true, new_token: true }
+            Options {
+                databases: vec!["a b.2cbh".into(), "c".into()],
+                show_token: true,
+                new_token: true,
+                version: None
+            }
         );
         assert!(Options::parse(args(&["--database"])).is_err());
         assert!(Options::parse(args(&["--port", "1"])).is_err());
@@ -203,6 +212,20 @@ mod tests {
         let e = prepare(&dir, &Options::default()).err().unwrap();
         assert!(e.contains("not an allowed origin"), "{e}");
         assert!(!token::exists(&dir), "a refused start creates no token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reports_the_version_it_is_given_else_its_own() {
+        // The Windows app passes its release version, which differs from this
+        // library's package version.
+        let dir = folder("version", None);
+        let app = prepare(&dir, &Options { version: Some("9.8.7"), ..Options::default() }).unwrap();
+        assert_eq!(app.app.version, "9.8.7");
+        drop(app);
+        let console = prepare(&dir, &Options::default()).unwrap();
+        assert_eq!(console.app.version, env!("CARGO_PKG_VERSION"));
+        drop(console);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

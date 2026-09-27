@@ -143,7 +143,9 @@ fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
     };
     let deadline = Instant::now() + PORT_WAIT;
     let bridge = loop {
-        match start::prepare(dir, &Options::default()) {
+        // The status reports the app's version, the one its release carries,
+        // not the bridge library's.
+        match start::prepare(dir, &Options { version: Some(env!("CARGO_PKG_VERSION")), ..Options::default() }) {
             Ok(bridge) => break bridge,
             Err(e) => {
                 let busy = port_busy(port);
