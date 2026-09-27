@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::{Entry, Opened};
 use crate::fetch::Serial;
+use crate::indexdir::{self, Unlisted};
 use crate::search::SearchError;
 
 use build::Plan;
@@ -35,12 +36,6 @@ use source::Source;
 
 /// How long a failed build is reported before the next request tries again.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
-
-/// How long an index stays on disk after its database left the list (#60): a
-/// list that loses a database for a moment, as while ChessBase rewrites its
-/// list, must not cost a rebuild: minutes, and some 8 GB of temporary space
-/// for the Mega Database.
-pub const SWEEP_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The index of one database, at the generation it was built for.
 pub struct Loaded {
@@ -108,8 +103,7 @@ pub struct Registry {
     states: Mutex<HashMap<String, Arc<Mutex<State>>>>,
     queue: Arc<Serial>,
     /// Index files whose database is not on the list, and since when.
-    unlisted: Mutex<HashMap<String, Instant>>,
-    grace: Mutex<Duration>,
+    pub(crate) unlisted: Mutex<Unlisted>,
 }
 
 impl Default for Registry {
@@ -119,7 +113,6 @@ impl Default for Registry {
             states: Mutex::default(),
             queue: Arc::new(Serial::labelled("index")),
             unlisted: Mutex::default(),
-            grace: Mutex::new(SWEEP_GRACE),
         }
     }
 }
@@ -136,11 +129,8 @@ enum Kept {
 /// The database id and kind of an index folder entry; `None` for anything
 /// the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
-    let (id, kind) = match name.strip_suffix(".idx") {
-        Some(id) => (id, Kept::Index),
-        None => (name.strip_suffix(".idx.partial").or_else(|| name.strip_suffix(".build"))?, Kept::Work),
-    };
-    (id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some((id, kind))
+    let (id, kind) = indexdir::db_id(name, &[".idx", ".idx.partial", ".build"])?;
+    Some((id, if kind == 0 { Kept::Index } else { Kept::Work }))
 }
 
 impl Registry {
@@ -209,27 +199,17 @@ impl Registry {
         Lookup::Pending(progress)
     }
 
-    /// Sets how long an index outlives its database's place on the list.
-    pub fn set_sweep_grace(&self, grace: Duration) {
-        *lock(&self.grace) = grace;
-    }
-
-    /// How long an index outlives its database's place on the list.
-    pub fn sweep_grace(&self) -> Duration {
-        *lock(&self.grace)
-    }
-
     /// Removes from the index folder what no database on the list will use
-    /// (#60): the index of a database that has been off the list for
-    /// [`SWEEP_GRACE`] or longer, and a build's work left by a build that no
-    /// longer runs. The files of a database being built are never touched,
-    /// nor anything the bridge did not write.
+    /// (#60): the index of a database that has been off the list for the
+    /// grace ([`indexdir::SWEEP_GRACE`] unless the catalog sets another) or
+    /// longer, and a build's work left by a build that no longer runs. The
+    /// files of a database being built are never touched, nor anything the
+    /// bridge did not write.
     pub fn sweep(&self, listed: &HashSet<String>) {
         let Some(dir) = self.dir() else { return };
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
-        let (now, grace) = (Instant::now(), *lock(&self.grace));
+        let now = Instant::now();
         let mut unlisted = lock(&self.unlisted);
-        let mut still = HashSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some((id, kind)) = name.to_str().and_then(index_entry) else { continue };
@@ -243,11 +223,10 @@ impl Registry {
             match kind {
                 Kept::Index if listed.contains(id) => {}
                 Kept::Index => {
-                    let since = *unlisted.entry(id.to_string()).or_insert(now);
-                    if now.duration_since(since) < grace || std::fs::remove_file(&path).is_err() {
-                        still.insert(id.to_string());
-                    } else {
+                    if unlisted.due(id, now) && std::fs::remove_file(&path).is_ok() {
                         *s = State::Idle;
+                    } else {
+                        unlisted.still(id);
                     }
                 }
                 Kept::Work if path.is_dir() => {
@@ -259,7 +238,7 @@ impl Registry {
             }
         }
         // A database back on the list, or an index gone, starts afresh.
-        unlisted.retain(|id, _| still.contains(id));
+        unlisted.retain();
     }
 
     /// Drops the index of `id` after a read found it damaged, and deletes its
@@ -524,7 +503,7 @@ mod tests {
         assert_eq!(names(), keep);
 
         // After it, the index of the database off the list goes too.
-        catalog.explorer.set_sweep_grace(Duration::ZERO);
+        catalog.set_sweep_grace(Duration::ZERO);
         catalog.sweep_indexes();
         keep.retain(|n| n != &format!("{gone}.idx"));
         assert_eq!(names(), keep);
@@ -532,7 +511,7 @@ mod tests {
         // The build that ran ends: its leftovers go; its database, off the
         // list, keeps its index until the grace has passed since now.
         *lock(&catalog.explorer.state(building)) = State::Idle;
-        catalog.explorer.set_sweep_grace(SWEEP_GRACE);
+        catalog.set_sweep_grace(indexdir::SWEEP_GRACE);
         catalog.sweep_indexes();
         keep.retain(|n| !n.starts_with(&format!("{building}.build")) && n != &format!("{building}.idx.partial"));
         assert_eq!(names(), keep);

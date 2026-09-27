@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use cbformat::file::DbFile;
 
 use super::slim::{ROW, Slim};
+use crate::indexdir::{self, Unlisted, crc32, u32_at, u64_at};
 use crate::store::Store;
 
 const MAGIC: [u8; 8] = *b"OSCBHDS\0";
@@ -274,8 +275,7 @@ const KEPT: [&str; 4] = [".heads", ".players", ".tournaments", ".annotators"];
 /// perhaps followed by `.partial`.
 pub fn entry_id(name: &str) -> Option<&str> {
     let whole = name.strip_suffix(".partial").unwrap_or(name);
-    let id = KEPT.iter().find_map(|ext| whole.strip_suffix(ext))?;
-    (id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some(id)
+    indexdir::db_id(whole, &KEPT).map(|(id, _)| id)
 }
 
 /// Where the heads files of the listed databases stand.
@@ -284,7 +284,7 @@ pub struct Registry {
     states: Mutex<HashMap<String, State>>,
     min_records: Mutex<Option<u32>>,
     /// Heads files whose database is not on the list, and since when.
-    unlisted: Mutex<HashMap<String, Instant>>,
+    pub(crate) unlisted: Mutex<Unlisted>,
 }
 
 enum State {
@@ -370,13 +370,12 @@ impl Registry {
 
     /// Removes from `dir` the heads files no listed database uses, as the
     /// position index's sweep does (#60): a database's file once it has been
-    /// off the list for `grace`, and a build's partial file when no build of
-    /// its database runs. Nothing else in `dir` is touched.
-    pub fn sweep(&self, dir: &Path, listed: &std::collections::HashSet<String>, grace: Duration) {
+    /// off the list for the grace, and a build's partial file when no build
+    /// of its database runs. Nothing else in `dir` is touched.
+    pub fn sweep(&self, dir: &Path, listed: &std::collections::HashSet<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let now = Instant::now();
         let mut unlisted = self.unlisted.lock().unwrap_or_else(|e| e.into_inner());
-        let mut still = std::collections::HashSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -390,96 +389,23 @@ impl Registry {
                     let _ = std::fs::remove_file(entry.path());
                 }
             } else if !listed.contains(id) {
-                let since = *unlisted.entry(id.to_string()).or_insert(now);
-                if now.duration_since(since) < grace || std::fs::remove_file(entry.path()).is_err() {
-                    still.insert(id.to_string());
-                } else {
+                if unlisted.due(id, now) && std::fs::remove_file(entry.path()).is_ok() {
                     states.remove(id);
+                } else {
+                    unlisted.still(id);
                 }
             }
         }
-        unlisted.retain(|id, _| still.contains(id));
+        unlisted.retain();
     }
-}
-
-fn u32_at(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
-}
-
-fn u64_at(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 /// Record numbers a pass over the heads file has read, for tests.
 pub static ROWS_READ: AtomicU64 = AtomicU64::new(0);
 
-/// CRC-32 (IEEE), eight bytes at a time: the position index's checksum
-/// (`explorer::format::crc32`) at several times its speed, for the rows of
-/// every block the first pass reads.
-pub fn crc32(bytes: &[u8]) -> u32 {
-    !crc32_update(!0, bytes)
-}
-
-/// Continues a CRC-32 over `bytes` from `state`, which starts at `!0`; the
-/// CRC of all the bytes so fed is `!state`.
-pub fn crc32_update(state: u32, bytes: &[u8]) -> u32 {
-    let t = &*TABLES;
-    let mut c = state;
-    let (chunks, rest) = bytes.as_chunks::<8>();
-    for b in chunks {
-        let lo = c ^ u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        c = t[7][(lo & 0xff) as usize]
-            ^ t[6][(lo >> 8 & 0xff) as usize]
-            ^ t[5][(lo >> 16 & 0xff) as usize]
-            ^ t[4][(lo >> 24) as usize]
-            ^ t[3][b[4] as usize]
-            ^ t[2][b[5] as usize]
-            ^ t[1][b[6] as usize]
-            ^ t[0][b[7] as usize];
-    }
-    for &b in rest {
-        c = t[0][((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
-    }
-    c
-}
-
-static TABLES: std::sync::LazyLock<[[u32; 256]; 8]> = std::sync::LazyLock::new(|| {
-    let mut t = [[0u32; 256]; 8];
-    for i in 0..256u32 {
-        let mut c = i;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
-        }
-        t[0][i as usize] = c;
-    }
-    for i in 0..256 {
-        for k in 1..8 {
-            t[k][i] = (t[k - 1][i] >> 8) ^ t[0][(t[k - 1][i] & 0xff) as usize];
-        }
-    }
-    t
-});
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_fast_crc_is_the_index_crc() {
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let bytes: Vec<u8> = (0..10_007)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as u8
-            })
-            .collect();
-        for len in [0, 1, 7, 8, 9, 63, 64, 1000, 10_007] {
-            assert_eq!(crc32(&bytes[..len]), crate::explorer::format::crc32(&bytes[..len]), "{len}");
-        }
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-    }
 
     #[test]
     fn the_sweep_leaves_a_partial_file_being_written() {
@@ -490,10 +416,10 @@ mod tests {
         let listed: std::collections::HashSet<String> = ["0123456789abcdef".to_string()].into();
         let registry = Registry::default();
         let writing = Writing::new(partial.clone());
-        registry.sweep(&dir, &listed, Duration::from_secs(3600));
+        registry.sweep(&dir, &listed);
         assert!(partial.exists(), "a partial file being written stays");
         drop(writing);
-        registry.sweep(&dir, &listed, Duration::from_secs(3600));
+        registry.sweep(&dir, &listed);
         assert!(!partial.exists(), "a partial file left by no writer goes");
         let _ = std::fs::remove_dir_all(&dir);
     }

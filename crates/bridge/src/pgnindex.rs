@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use cbformat::codepage::CodePage;
 use cbformat::pgnfile;
 
-use crate::explorer::SWEEP_GRACE;
 use crate::fetch::{Progress, Serial};
+use crate::indexdir::{self, Unlisted};
 
 /// How long a failed build is reported before the next request tries again.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
@@ -43,8 +43,7 @@ pub struct Registry {
     /// The code page of games that are not UTF-8: this computer's.
     page: CodePage,
     /// Header indexes whose database is not on the list, and since when.
-    unlisted: Mutex<HashMap<String, Instant>>,
-    grace: Mutex<Duration>,
+    pub(crate) unlisted: Mutex<Unlisted>,
 }
 
 impl Default for Registry {
@@ -55,7 +54,6 @@ impl Default for Registry {
             queue: Arc::new(Serial::labelled("pgn")),
             page: system_code_page(),
             unlisted: Mutex::default(),
-            grace: Mutex::new(SWEEP_GRACE),
         }
     }
 }
@@ -72,11 +70,8 @@ enum Kept {
 /// The database id and kind of a header index folder entry; `None` for
 /// anything the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
-    let (id, kind) = match name.strip_suffix(".head") {
-        Some(id) => (id, Kept::Index),
-        None => (name.strip_suffix(".head.partial")?, Kept::Work),
-    };
-    (id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some((id, kind))
+    let (id, kind) = indexdir::db_id(name, &[".head", ".head.partial"])?;
+    Some((id, if kind == 0 { Kept::Index } else { Kept::Work }))
 }
 
 impl Registry {
@@ -114,23 +109,17 @@ impl Registry {
         builds.iter().any(|b| matches!(*lock(b), Build::Working(_)))
     }
 
-    /// Sets how long a header index outlives its database's place on the list.
-    pub fn set_sweep_grace(&self, grace: Duration) {
-        *lock(&self.grace) = grace;
-    }
-
     /// Removes from the header index folder what no database on the list will
     /// use, as the position index folder is swept (`crate::explorer::Registry::sweep`,
-    /// #60): the index of a database off the list for [`SWEEP_GRACE`] or
-    /// longer, and a build's work left by a build that no longer runs. The
-    /// files of a database being read are never touched, nor anything the
-    /// bridge did not write.
+    /// #60): the index of a database off the list for the grace or longer,
+    /// and a build's work left by a build that no longer runs. The files of a
+    /// database being read are never touched, nor anything the bridge did not
+    /// write.
     pub fn sweep(&self, listed: &HashSet<String>) {
         let Some(dir) = self.dir() else { return };
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
-        let (now, grace) = (Instant::now(), *lock(&self.grace));
+        let now = Instant::now();
         let mut unlisted = lock(&self.unlisted);
-        let mut still = HashSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some((id, kind)) = name.to_str().and_then(index_entry) else { continue };
@@ -144,9 +133,8 @@ impl Registry {
             match kind {
                 Kept::Index if listed.contains(id) => {}
                 Kept::Index => {
-                    let since = *unlisted.entry(id.to_string()).or_insert(now);
-                    if now.duration_since(since) < grace || std::fs::remove_file(&path).is_err() {
-                        still.insert(id.to_string());
+                    if !unlisted.due(id, now) || std::fs::remove_file(&path).is_err() {
+                        unlisted.still(id);
                     }
                 }
                 Kept::Work => {
@@ -155,7 +143,7 @@ impl Registry {
             }
         }
         // A database back on the list, or an index gone, starts afresh.
-        unlisted.retain(|id, _| still.contains(id));
+        unlisted.retain();
     }
 
     /// The PGN file `path` of database `id` at `generation`: opened with the
@@ -275,14 +263,14 @@ mod tests {
 
         // After it, the index of the database off the list goes too; the
         // database being read keeps everything.
-        registry.set_sweep_grace(Duration::ZERO);
+        lock(&registry.unlisted).set_grace(Duration::ZERO);
         registry.sweep(&on_list);
         keep.retain(|n| n != &format!("{gone}.head"));
         assert_eq!(left(), keep);
 
         // Its read over, its leftover goes.
         *lock(&registry.build(reading)) = Build::Idle;
-        registry.set_sweep_grace(SWEEP_GRACE);
+        lock(&registry.unlisted).set_grace(indexdir::SWEEP_GRACE);
         registry.sweep(&on_list);
         keep.retain(|n| n != &format!("{reading}.head.partial"));
         assert_eq!(left(), keep);

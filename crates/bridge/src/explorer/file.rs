@@ -6,12 +6,10 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use crate::indexdir::{crc32, u32_at, u64_at};
 use crate::search::memory::{Hold, Refused};
 
-use super::format::{
-    BLOCK_ENTRY, BLOCK_KEYS, Block, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MIN_RECORD, Stats, crc32, u32_at,
-    u64_at,
-};
+use super::format::{BLOCK_ENTRY, BLOCK_KEYS, Block, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MIN_RECORD, Stats};
 
 /// Why an index file cannot be used.
 #[derive(Debug)]

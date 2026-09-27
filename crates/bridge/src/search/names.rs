@@ -15,6 +15,7 @@ use cbformat::game::{Player, Tournament};
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
 use super::workers::{self, threads};
+use crate::indexdir::{crc32, crc32_update, u32_at, u64_at};
 pub use crate::store::Kind;
 use crate::store::Store;
 
@@ -286,7 +287,7 @@ struct Out {
 
 impl Out {
     fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.crc = super::heads::crc32_update(self.crc, bytes);
+        self.crc = crc32_update(self.crc, bytes);
         self.body_len += bytes.len() as u64;
         if self.buf.len() + bytes.len() > self.buf.capacity() {
             self.flush()?;
@@ -327,7 +328,7 @@ impl Body {
         v.try_reserve_exact(n).ok()?;
         v.resize(n, 0);
         self.r.read_exact(&mut v).ok()?;
-        self.crc = super::heads::crc32_update(self.crc, &v);
+        self.crc = crc32_update(self.crc, &v);
         Some(v)
     }
 
@@ -342,7 +343,7 @@ impl Body {
         while left > 0 {
             let k = left.min(piece.len());
             self.r.read_exact(&mut piece[..k]).ok()?;
-            self.crc = super::heads::crc32_update(self.crc, &piece[..k]);
+            self.crc = crc32_update(self.crc, &piece[..k]);
             out.extend(piece[..k].as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
             left -= k;
         }
@@ -440,7 +441,7 @@ impl NameTable {
         h[40..44].copy_from_slice(&(self.chunks.len() as u32).to_le_bytes());
         h[44..48].copy_from_slice(&(!crc).to_le_bytes());
         h[48..56].copy_from_slice(&body_len.to_le_bytes());
-        let header_crc = super::heads::crc32(&h[..60]);
+        let header_crc = crc32(&h[..60]);
         h[60..64].copy_from_slice(&header_crc.to_le_bytes());
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&h)?;
@@ -459,22 +460,18 @@ impl NameTable {
         let mut r = file;
         let mut h = [0u8; FILE_HEADER];
         r.read_exact(&mut h).ok()?;
-        let (u32_at, u64_at) = (
-            |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap()),
-            |at: usize| u64::from_le_bytes(h[at..at + 8].try_into().unwrap()),
-        );
         if h[0..8] != FILE_MAGIC
-            || u32_at(8) != FILE_VERSION
-            || super::heads::crc32(&h[..60]) != u32_at(60)
-            || u32_at(12) != kind_code(kind)
-            || u64_at(16) != generation
-            || u64_at(24) != count as u64
-            || (FILE_HEADER as u64).checked_add(u64_at(48)) != Some(size)
+            || u32_at(&h, 8) != FILE_VERSION
+            || crc32(&h[..60]) != u32_at(&h, 60)
+            || u32_at(&h, 12) != kind_code(kind)
+            || u64_at(&h, 16) != generation
+            || u64_at(&h, 24) != count as u64
+            || (FILE_HEADER as u64).checked_add(u64_at(&h, 48)) != Some(size)
         {
             return None;
         }
         let (per, chunks, body_crc, body_len) =
-            (usize::try_from(u64_at(32)).ok()?, u32_at(40) as usize, u32_at(44), u64_at(48));
+            (usize::try_from(u64_at(&h, 32)).ok()?, u32_at(&h, 40) as usize, u32_at(&h, 44), u64_at(&h, 48));
         // The layout `chunk` looks names up in: chunk `i` holds the ids from
         // `i * per`, `per` of them but for the last, and every chunk takes at
         // least its 32-byte head of the body.
@@ -494,7 +491,7 @@ impl NameTable {
         let mut seen = 0usize;
         for i in 0..chunks {
             let head = body.bytes(32)?;
-            let field = |at: usize| usize::try_from(u64::from_le_bytes(head[at..at + 8].try_into().unwrap())).ok();
+            let field = |at: usize| usize::try_from(u64_at(&head, at)).ok();
             let (first, n, names_len, lower_len) = (field(0)?, field(8)?, field(16)?, field(24)?);
             if Some(first) != i.checked_mul(per.max(1)).map(|f| f.min(count))
                 || first != seen
@@ -675,9 +672,9 @@ mod tests {
         h[24..32].copy_from_slice(&count.to_le_bytes());
         h[32..40].copy_from_slice(&per.to_le_bytes());
         h[40..44].copy_from_slice(&chunk_count.to_le_bytes());
-        h[44..48].copy_from_slice(&super::super::heads::crc32(&body).to_le_bytes());
+        h[44..48].copy_from_slice(&crc32(&body).to_le_bytes());
         h[48..56].copy_from_slice(&body_len.unwrap_or(body.len() as u64).to_le_bytes());
-        let crc = super::super::heads::crc32(&h[..60]);
+        let crc = crc32(&h[..60]);
         h[60..64].copy_from_slice(&crc.to_le_bytes());
         let dir = std::env::temp_dir().join(format!("bridge-names-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -746,7 +743,7 @@ mod tests {
         drop(zeros);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[44] ^= 1;
-        let crc = super::super::heads::crc32(&bytes[..60]);
+        let crc = crc32(&bytes[..60]);
         bytes[60..64].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         let size = bytes.len();
@@ -818,7 +815,7 @@ mod tests {
         let size = super::super::memory::budget() as u64 + 1;
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[48..56].copy_from_slice(&(size - FILE_HEADER as u64).to_le_bytes());
-        let crc = super::super::heads::crc32(&bytes[..60]);
+        let crc = crc32(&bytes[..60]);
         bytes[60..64].copy_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(size).unwrap();
