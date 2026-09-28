@@ -1,10 +1,10 @@
 //! What the bridge's index folders share (#119). The data folder keeps files
-//! of each database: its position index, heads file and names files in
-//! `index`, and the header index of a PGN file in `pgn`. Each kind has a
-//! registry, which sweeps its folder in its own way; this module holds what
-//! they have in common: the names of the files, how long they outlive their
-//! database's place on the list (#60), and the CRC-32 and fixed-width reads
-//! the files are checked and decoded with.
+//! of each database: its position index and move stream, heads file and
+//! names files in `index`, and the header index of a PGN file in `pgn`. Each
+//! kind has a registry, which sweeps its folder in its own way; this module
+//! holds what they have in common: the names of the files, how long they
+//! outlive their database's place on the list (#60), and the CRC-32 and
+//! fixed-width reads the files are checked and decoded with.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;

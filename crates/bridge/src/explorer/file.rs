@@ -188,6 +188,28 @@ pub(super) fn read_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::
     Ok(())
 }
 
+#[cfg(unix)]
+pub(super) fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+pub(super) fn write_at(file: &File, mut offset: u64, mut buf: &[u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -221,6 +243,7 @@ mod tests {
             deep_offset,
             deep_table_offset: deep_offset,
             deep_table_crc: 0,
+            build_id: 1,
         };
         let f = File::create(&path).unwrap();
         f.set_len(h.file_len).unwrap();

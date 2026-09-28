@@ -167,6 +167,9 @@ is refused at once with `422 database_too_large`: a sort order needs 12 bytes
 per record while it is built and 4 bytes after, so the default budget sorts
 databases of up to about 89 million records. A Mega Database of 12 million
 records needs about 330 MB with three sort orders and the suggestion counts.
+The position index's move stream is not in the budget: it is mapped
+read-only, and its pages are the operating system's file cache, which drops
+them when memory is short and reads them again when they are needed.
 
 Passes over a database run on workers shared by all requests: the machine's
 cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
@@ -666,9 +669,9 @@ the oschess analysis panel shows it like its Lichess tabs.
   Names are cut at 200 characters as in list rows. `date` is the date as list
   rows write it, `YYYY.MM.DD` with `?` for an unknown part; `year` is its year,
   `null` when the date has none.
-- **What is indexed.** Every position of each game's main line, to its end:
-  standard chess only, from the standard start or a set-up position, without
-  deleted games, guiding texts or analyses. A game whose move record is over
+- **What is indexed.** Every position of each game's main line, to its end
+  (its 65,535th ply at most): standard chess only, from the standard start or
+  a set-up position, without deleted games, guiding texts or analyses. A game whose move record is over
   2 MiB, the limit `games/{number}` serves, or cannot be read, is left out.
   `index` names the last record the index covers and the games it holds.
 - **How a position is found** (#133). The index has two parts:
@@ -683,10 +686,17 @@ the oschess analysis panel shows it like its Lichess tabs.
     deep one. A position the tree does not hold is looked for among the games
     of its structure, which are replayed on at most half the search workers:
     each game counts once, at the first ply its main line reaches the
-    position, with the move it played from there. On the Mega Database a
-    game's position the tree does not hold is answered in about a millisecond;
-    fewer than 1 in 100 share their structure with more than 4,096 games,
-    and the most crowded one, bare kings, takes about half a second.
+    position, with the move it played from there. Fewer than 1 in 100 of the
+    Mega Database's positions share their structure with more than 4,096
+    games, and the most crowded structure, bare kings, with 38,367.
+
+  The games are replayed from the index's **move stream** (#145), which holds
+  every game's main line as the move codes of the 2CBH format, checked when
+  the index was built, so a replay reads none of the database's files and
+  checks no move. A replay stops as soon as its game can no longer reach the
+  position, having fewer men or pawns of a side, or no longer having a pawn
+  on a home square where the position has one; a game whose home pawns left
+  in an order the position excludes is not replayed.
 
   A position no game reaches is answered with zero counts and empty lists. A
   game that reaches a position the tree holds only beyond ply 40 is not
@@ -725,18 +735,25 @@ the oschess analysis panel shows it like its Lichess tabs.
   index from the games appended to a database is a possible later
   optimisation, only if its results can be shown equal to a build from
   nothing.
-- **Storage.** Index files live in the data folder's `index` folder, one per
-  database (`<id>.idx`); a PGN file's header index lives apart, in `pgn`
+- **Storage.** Index files live in the data folder's `index` folder, two per
+  database: the index (`<id>.idx`) and its move stream (`<id>.moves`),
+  built together; a PGN file's header index lives apart, in `pgn`
   ([PGN files](#pgn-files)). `docs/format-notes.md`,
-  "Position index", describes them. A file that is damaged or of another
-  version is rebuilt. The Mega Database's index takes about 2.2 GB, 0.85
+  "Position index" and "Move stream", describes them. A file that is damaged
+  or of another version, or an index and a stream of different builds, are
+  rebuilt. The Mega Database's index takes about 2.2 GB, 0.85
   GB of it the deep section, and its build needs about 11 GB of temporary
   space there (`<id>.build`,
-  `<id>.idx.partial`). When the bridge starts, after each change of the
+  `<id>.idx.partial`). Its move stream takes 58 bytes a game and 2 bytes for
+  each ply past the 21st, written in place as `<id>.moves.partial`. The stream
+  is mapped read-only: the operating system keeps as much of it in memory as
+  it can spare, outside the search memory. On Windows a build replaces a
+  stream still mapped by an answer in flight once that answer is done. When the bridge starts, after each change of the
   database list, and at least once a minute while the list is asked for, the
   folder is swept (#60):
   - a build's leftovers go at once unless that build is running;
-  - the index of a database that has been off the list for ten minutes goes.
+  - the index and move stream of a database that has been off the list for
+    ten minutes go.
     A database that is only missing, in the cloud or downloading is still on
     the list and keeps its index. The wait keeps a list that loses a database
     for a moment, as while ChessBase rewrites it, from costing a rebuild.

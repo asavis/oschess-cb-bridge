@@ -10,8 +10,9 @@ use chesscore::{Board, Color, Move, Piece, Square};
 use crate::indexdir::{crc32, u32_at, u64_at};
 
 pub const MAGIC: [u8; 8] = *b"OSCBIDX\0";
-/// 2 added the deep section (#133).
-pub const VERSION: u32 = 2;
+/// 2 added the deep section (#133); 3 the build id, which the move stream
+/// built with the index carries too (#145).
+pub const VERSION: u32 = 3;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
@@ -65,6 +66,9 @@ pub struct Header {
     pub deep_offset: u64,
     pub deep_table_offset: u64,
     pub deep_table_crc: u32,
+    /// The build's id: the index answers only with the move stream of the
+    /// same build ([`super::stream`]).
+    pub build_id: u64,
 }
 
 impl Header {
@@ -89,6 +93,7 @@ impl Header {
         b[96..104].copy_from_slice(&self.deep_offset.to_le_bytes());
         b[104..112].copy_from_slice(&self.deep_table_offset.to_le_bytes());
         b[112..116].copy_from_slice(&self.deep_table_crc.to_le_bytes());
+        b[116..124].copy_from_slice(&self.build_id.to_le_bytes());
         let crc = crc32(&b[..124]);
         b[124..128].copy_from_slice(&crc.to_le_bytes());
         b
@@ -119,6 +124,7 @@ impl Header {
             deep_offset: u64_at(b, 96),
             deep_table_offset: u64_at(b, 104),
             deep_table_crc: u32_at(b, 112),
+            build_id: u64_at(b, 116),
         })
     }
 }
@@ -414,6 +420,7 @@ mod tests {
             deep_offset: 5000,
             deep_table_offset: 8000,
             deep_table_crc: 11,
+            build_id: 0x0123_4567_89ab_cdef,
         };
         let e = h.encode();
         assert_eq!(Header::decode(&e), Some(h));

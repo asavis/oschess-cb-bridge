@@ -17,9 +17,10 @@ use crate::search::workers::{self, threads};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
-use super::format::{Counts, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, deep_bucket, structure, unpack_move};
+use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, deep_bucket, structure, unpack_move};
 use super::runs::Progress;
-use super::source::{Mode, Source, Target, Workspace, average_elo};
+use super::source::average_elo;
+use super::stream::Target;
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
@@ -48,7 +49,7 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
             Some(stats) => Ok(Some(stats)),
             // The tree holds positions within its plies that more than one
             // game reached; any other is looked for in its games (#133).
-            None => deep(&*open.db, &loaded, &board),
+            None => deep(&loaded, &board, &Cancel::never()),
         }) {
             Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
             Err(Bad::Busy) => busy(),
@@ -133,7 +134,7 @@ struct Found {
 }
 
 impl Found {
-    /// What one takes, reserved with its worker's buffers.
+    /// What one takes, all a worker reserves.
     const BYTES: usize =
         MAX_MOVES * std::mem::size_of::<(u16, Counts)>() + (TOP_GAMES + 1) * std::mem::size_of::<(u16, u32)>();
 
@@ -186,47 +187,47 @@ impl Found {
 }
 
 /// A position the tree does not hold: the games of its structure's bucket,
-/// replayed on at most half the shared workers, so that searches keep the
-/// rest, each counted once at the first ply its main line reaches the
-/// position, with the move played from there. `None` when none does.
-pub fn deep(db: &dyn Source, loaded: &Loaded, board: &Board) -> Result<Option<Stats>, Bad> {
+/// replayed from the move stream on at most half the shared workers, so that
+/// searches keep the rest, each counted once at the first ply its main line
+/// reaches the position, with the move played from there. `None` when none
+/// does. A worker stops at its next game once `cancel` is, and the answer is
+/// then `Busy`; a stream found damaged is `Corrupt`.
+pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
     let (games, _memory) = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
     if games.is_empty() {
         return Ok(None);
     }
     let target = Target::of(board);
     let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
-    let parts = workers::run(want, Workspace::BYTES + Found::BYTES, &Cancel::never(), |w| {
-        let mut work = Workspace::new().ok_or(SearchError::Busy)?;
-        work.set_mode(Mode::Find(target));
+    let parts = workers::run(want, Found::BYTES, cancel, |w| {
         let mut found = Found::new().ok_or(SearchError::Busy)?;
         let per = games.len().div_ceil(w.count);
         for &game in games.iter().skip(w.index * per).take(per) {
-            if w.stopped() {
+            if w.stopped() || cancel.is_cancelled() {
                 return Err(SearchError::Superseded);
             }
-            db.lines(game, game, MAX_PLY, &mut work, &mut |line| {
-                if let Some(mv) = line.found {
+            match loaded.stream.find(game, &target) {
+                Ok(Some(hit)) => {
                     let mut counts = Counts::default();
-                    counts.add(line.outcome);
-                    found.add(mv, &counts, (line.elo, line.number));
+                    counts.add(hit.outcome);
+                    found.add(hit.mv, &counts, (hit.elo, game));
                 }
-            })?;
+                Ok(None) => {}
+                Err(damaged) => return Ok(Err(damaged)),
+            }
         }
-        Ok(found)
+        Ok(Ok(found))
     })
-    .map_err(|e| match e {
-        SearchError::Read(e) => Bad::Io(std::io::Error::other(e.to_string())),
-        _ => Bad::Busy,
-    })?;
-    let mut parts = parts.into_iter();
-    let Some(mut all) = parts.next() else { return Ok(None) };
+    .map_err(|_| Bad::Busy)?;
+    let mut all: Option<Found> = None;
     for part in parts {
-        all.merge(&part);
+        let part = part?;
+        match &mut all {
+            Some(all) => all.merge(&part),
+            None => all = Some(part),
+        }
     }
-    if all.counts.games == 0 {
-        return Ok(None);
-    }
+    let Some(mut all) = all.filter(|all| all.counts.games > 0) else { return Ok(None) };
     all.moves.sort_by_key(|m| std::cmp::Reverse(m.1.games));
     Ok(Some(Stats { counts: all.counts, moves: all.moves, top: all.top.iter().map(|b| b.1).collect() }))
 }

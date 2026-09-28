@@ -3,7 +3,8 @@
 //! order, dropping single-game positions beyond the pruning ply. The merge
 //! takes the [`PARTS`] ranges of keys apart on the workers, each into a file of
 //! its own blocks, and the index file is those blocks in key order, then the
-//! table of blocks.
+//! table of blocks. The games' move stream (#145) is written while they are
+//! read, and both files carry one build id.
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -22,6 +23,7 @@ use super::format::{
 };
 use super::runs::{self, Entry, Limits, PARTS, Progress, RUN_BUFFER, Run, io};
 use super::source::Source;
+use super::stream;
 
 /// Entries a merging worker counts before it adds them to the progress.
 const PROGRESS_STEP: u64 = 1 << 16;
@@ -39,8 +41,9 @@ pub struct Plan {
 /// table of blocks.
 pub const WRITER_BYTES: usize = (1 << 20) + BLOCK_KEYS * 12 + super::format::MAX_BLOCK_DATA + (4 << 20);
 
-/// Builds the index of `plan` into `target`, through a temporary file renamed
-/// at the end; the runs go to `work`, which is emptied afterwards.
+/// Builds the index of `plan` into `target`, and its move stream beside it
+/// ([`stream::path_of`]), each through a temporary file renamed at the end;
+/// the runs go to `work`, which is emptied afterwards.
 pub fn build_with(
     source: &dyn Source,
     plan: &Plan,
@@ -55,6 +58,7 @@ pub fn build_with(
     let _ = std::fs::remove_dir_all(work);
     if result.is_err() {
         let _ = std::fs::remove_file(temporary(target));
+        let _ = std::fs::remove_file(temporary(&stream::path_of(target)));
     }
     result
 }
@@ -77,9 +81,13 @@ fn build_in(
     }
     progress.start("reading", u64::from(plan.last.saturating_sub(plan.first) + 1));
     let sink = deep::Sink::create(work, deep_bits(plan.last), progress)?;
-    let runs = runs::write_runs(source, plan.first, plan.last, work, progress, limits, Some(&sink))?;
+    let moves = stream::path_of(target);
+    let writer = stream::Writer::create(&temporary(&moves), plan.first, plan.last)?;
+    let runs = runs::write_runs(source, plan.first, plan.last, work, progress, limits, &sink, &writer)?;
     let bits = sink.bits();
     let deep_parts = sink.finish()?;
+    let build_id = stream::build_id();
+    writer.finish(plan.generation, build_id, progress)?;
     let entries: u64 = runs.iter().map(|r| r.entries).sum();
     progress.start("merging", entries);
     let runs = runs::reduce(runs, work, progress, fan_ins)?;
@@ -107,8 +115,13 @@ fn build_in(
         deep_offset: 0,
         deep_table_offset: 0,
         deep_table_crc: 0,
+        build_id,
     };
     let header = assemble(&parts, &deep_parts, &partial, header, progress, deep_memory)?;
+    // The stream, then the index: a stop between the two leaves files of
+    // different builds, which are rebuilt. On Windows the old stream may be
+    // mapped by an answer still in flight, which the rename waits for.
+    stream::replace(&temporary(&moves), &moves).map_err(|e| io(&moves, e))?;
     std::fs::rename(&partial, target).map_err(|e| io(target, e))?;
     Ok(header)
 }
@@ -453,6 +466,7 @@ mod tests {
             deep_offset: 0,
             deep_table_offset: 0,
             deep_table_crc: 0,
+            build_id: 1,
         };
         let path = dir.join("index");
         let deep = deep::Sink::create(&dir, MIN_DEEP_BITS, &Progress::default()).unwrap().finish().unwrap();
