@@ -629,3 +629,22 @@ fn a_crowded_bucket_is_counted_whole() {
     assert_eq!(stats.top, (n as u32 - 11..=n as u32).rev().collect::<Vec<_>>());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The tree's last ply lists the moves played from it, as every other does.
+#[test]
+fn the_moves_from_the_trees_last_ply_are_listed() {
+    let forty = format!("e2e4 e7e5 {}a2a3 a7a6", hops(9));
+    assert_eq!(forty.split_whitespace().count(), usize::from(explorer::format::MAX_PLY));
+    let mut b = Builder::new();
+    game(&mut b, &format!("{forty} h2h3"), 1, (2200, 2200));
+    game(&mut b, &format!("{forty} g2g3"), 0, (2100, 2100));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-last-ply");
+    let dir = index_dir("last-ply");
+    let idx = prepared(&db, &dir);
+    let stats = idx.lookup(key_after(&forty)).unwrap().expect("two games reach it");
+    assert_eq!(stats.counts.games, 2);
+    assert_eq!(stats.lookup_move("h2h3"), Some(1));
+    assert_eq!(stats.lookup_move("g2g3"), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

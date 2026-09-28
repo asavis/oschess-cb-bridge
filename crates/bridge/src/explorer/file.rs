@@ -98,12 +98,15 @@ impl IndexFile {
 
     /// The games whose main line holds a structure of `bucket` past the
     /// tree's pruning ply (#133): the candidates for a position the tree does
-    /// not hold.
-    pub fn deep_games(&self, bucket: u32) -> Result<Vec<u32>, Bad> {
+    /// not hold. The block and the games, at most four bytes for each of its
+    /// bytes, are held in the search budget until the hold is dropped:
+    /// `Busy` when it has no room.
+    pub fn deep_games(&self, bucket: u32) -> Result<(Vec<u32>, Hold), Bad> {
         let local = bucket as usize % BLOCK_BUCKETS;
         let Some(&(offset, len, crc)) = self.deep.get(bucket as usize / BLOCK_BUCKETS) else {
             return Err(Bad::Corrupt("deep bucket"));
         };
+        let memory = Hold::reserve_quietly((len as usize).saturating_mul(5)).map_err(|_| Bad::Busy)?;
         let mut buf = Vec::new();
         buf.try_reserve_exact(len as usize).map_err(|_| Bad::Busy)?;
         buf.resize(len as usize, 0);
@@ -111,7 +114,8 @@ impl IndexFile {
         if crc32(&buf) != crc {
             return Err(Bad::Corrupt("deep block"));
         }
-        bucket_games(&buf, local, self.header.last_record).ok_or(Bad::Corrupt("deep block"))
+        let games = bucket_games(&buf, local, self.header.last_record).ok_or(Bad::Corrupt("deep block"))?;
+        Ok((games, memory))
     }
 
     /// The position `key`, `None` when the index does not hold it.

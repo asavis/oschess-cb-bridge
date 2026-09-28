@@ -93,7 +93,7 @@ impl Line {
 
     /// Whether the walk reads the move played from the position at `ply`.
     fn reads(&self, ply: u32, max_ply: u8) -> bool {
-        self.mode != Mode::Tree || ply < u32::from(max_ply)
+        self.mode != Mode::Tree || ply <= u32::from(max_ply)
     }
 
     /// Notes the position `board` at `ply`, before its move is played.
@@ -119,8 +119,6 @@ impl Line {
             return !self.past;
         }
         if ply <= u32::from(max_ply) {
-            // At the index's depth the position counts, and no move from it.
-            let mv = if ply < u32::from(max_ply) { mv } else { NO_MOVE };
             self.reach(self.here, mv, ply as u8);
         }
         if self.mode == Mode::Build && ply > u32::from(PRUNE_PLY) {

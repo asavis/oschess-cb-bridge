@@ -30,7 +30,7 @@ pub const BLOCK_ENTRY: usize = 28;
 /// The notable games kept per position.
 pub const TOP_GAMES: usize = 12;
 /// Positions reached in the first `MAX_PLY` plies are indexed, with the moves
-/// played from them for plies below it.
+/// played from them.
 pub const MAX_PLY: u8 = 40;
 /// A position reached by one game only is dropped beyond this ply. Every
 /// position past it is found through the deep section as well.

@@ -175,7 +175,9 @@ pub fn bucket_games(block: &[u8], local: usize, max_game: u32) -> Option<Vec<u32
         }
     }
     let n = read_varint(block, &mut at)?;
-    if n > u64::from(max_game) {
+    // Each game takes a byte at least, so a damaged count never reserves
+    // more than the block's size.
+    if n > u64::from(max_game) || n > (block.len() - at) as u64 {
         return None;
     }
     let mut games = Vec::new();
@@ -183,7 +185,7 @@ pub fn bucket_games(block: &[u8], local: usize, max_game: u32) -> Option<Vec<u32
     let mut game = 0u64;
     for _ in 0..n {
         let delta = read_varint(block, &mut at)?;
-        game += delta;
+        game = game.checked_add(delta)?;
         if delta == 0 || game > u64::from(max_game) {
             return None;
         }
@@ -226,6 +228,12 @@ mod tests {
         assert_eq!(bucket_games(&block(3), BLOCK_BUCKETS - 1, 100), Some(vec![2]));
         // A game past the database's last record is damage.
         assert_eq!(bucket_games(&block(0), 5, 8), None);
+        // So is a delta that wraps around to a game already listed.
+        let mut wrap = Vec::new();
+        for v in [2, 5, u64::MAX - 2] {
+            varint(&mut wrap, v);
+        }
+        assert_eq!(bucket_games(&wrap, 0, 100), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

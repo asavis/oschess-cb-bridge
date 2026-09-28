@@ -355,8 +355,9 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   are left out, since the key names a castling right by its side, not by its
   rook.
 - **What a game adds.** Each position of its main line from the start to
-  ply 40, once however often it is reached, with the move played from it up to
-  ply 40; a position reached again adds only the move from its first visit.
+  ply 40, once however often it is reached, with the move played from it, the
+  one from ply 40 included; a position reached again adds only the move from
+  its first visit.
   A null move or damaged moves end the line there; the position before them
   counts, and no move from it. A game whose move record is over 2 MiB, or
   cannot be read, adds nothing. A position reached by one game only beyond

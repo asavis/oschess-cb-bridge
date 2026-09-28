@@ -126,7 +126,7 @@ const DEEP_GAMES_PER_WORKER: usize = 256;
 /// rest, each counted once at the first ply its main line reaches the
 /// position, with the move played from there. `None` when none does.
 pub fn deep(db: &dyn Source, loaded: &Loaded, board: &Board) -> Result<Option<Stats>, Bad> {
-    let games = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
+    let (games, _memory) = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
     if games.is_empty() {
         return Ok(None);
     }
