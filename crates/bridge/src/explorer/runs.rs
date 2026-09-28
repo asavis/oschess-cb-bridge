@@ -18,7 +18,8 @@ use crate::search::workers::{self, threads};
 use super::deep::{self, Sink};
 use super::file::read_at;
 use super::format::{MAX_PLY, Outcome, deep_bucket};
-use super::source::{Line, Mode, Source, Workspace};
+use super::source::{Line, Source, Workspace};
+use super::stream::{self, BATCH};
 
 /// One game passing through one position, in 16 bytes: the key, the game and
 /// its outcome, and the move, ply and rating.
@@ -186,16 +187,17 @@ pub fn fan_ins(share: usize, writer: usize) -> Result<(usize, usize), SearchErro
     Ok((middle, last))
 }
 
-/// The memory of one worker's entries: a quarter of the budget shared by the
-/// workers, from 4 MiB to 64 MiB.
+/// The memory of one worker's entries and its part of the move stream: a
+/// quarter of the budget shared by the workers, from 4 MiB to 64 MiB.
 fn run_bytes(workers: usize) -> usize {
     (crate::search::memory::budget() / 4 / workers.max(1)).clamp(4 << 20, 64 << 20)
 }
 
 /// Writes the entries of records `first..=last` as sorted runs in `dir`, on at
-/// most half the shared workers, so that searches keep the rest. With `deep`,
-/// every game's structures past the tree's pruning ply go to it too (#133),
-/// which reads each main line to its end.
+/// most half the shared workers, so that searches keep the rest. Each main
+/// line is read to its end: its structures past the tree's pruning ply go to
+/// `deep` (#133), and its words to `stream` (#145), batch by batch.
+#[allow(clippy::too_many_arguments)]
 pub fn write_runs(
     source: &dyn Source,
     first: u32,
@@ -203,7 +205,8 @@ pub fn write_runs(
     dir: &Path,
     progress: &Progress,
     limits: &Limits,
-    deep: Option<&Sink>,
+    deep: &Sink,
+    stream: &stream::Writer,
 ) -> Result<Vec<Run>, SearchError> {
     if last < first {
         return Ok(Vec::new());
@@ -214,30 +217,32 @@ pub fn write_runs(
     let total = u64::from(last - first + 1);
     // Half the workers at most, and no more than half the budget holds with
     // their entries and read buffers, so that searches keep the rest.
-    let want = threads().div_ceil(2).min(total.div_ceil(4096) as usize).max(1);
+    let want = threads().div_ceil(2).min(total.div_ceil(BATCH as u64) as usize).max(1);
+    // A worker's entries and its part of the stream, which takes its share
+    // out of the entries'.
     let per_worker = run_bytes(want);
-    let postings_bytes = if deep.is_some() { deep::WORKER_BYTES } else { 0 };
     // The deep sink holds its buffers already; the workers share the rest.
-    let share = limits.share.checked_sub(deep.map_or(0, Sink::bytes)).ok_or(SearchError::TooLarge)?;
-    let fit = share / (per_worker + Workspace::BYTES + postings_bytes);
+    let share = limits.share.checked_sub(deep.bytes()).ok_or(SearchError::TooLarge)?;
+    let fit = share / (per_worker + Workspace::BYTES + deep::WORKER_BYTES);
     if fit == 0 {
         return Err(SearchError::TooLarge);
     }
     let want = want.min(fit).max(1);
     let runs = workers::run(want, 0, &Cancel::never(), |w| {
-        // The entries, and the buffers games are read into, reserved first.
-        let hold = reserve(per_worker + Workspace::BYTES + postings_bytes, progress)?;
+        // The entries, the buffers games are read into, the postings and the
+        // worker's part of the stream, reserved first.
+        let hold = reserve(per_worker + Workspace::BYTES + deep::WORKER_BYTES, progress)?;
         let mut work = Workspace::new().ok_or(Refused::Busy)?;
+        work.keep_words().ok_or(Refused::Busy)?;
+        let mut part = stream.part().ok_or(Refused::Busy)?;
         let mut postings: Vec<u64> = Vec::new();
-        if deep.is_some() {
-            work.set_mode(Mode::Build);
-            postings.try_reserve_exact(deep::WORKER_POSTINGS).map_err(|_| Refused::Busy)?;
-        }
-        let capacity =
-            (per_worker / std::mem::size_of::<Entry>()).min(limits.run_entries.unwrap_or(usize::MAX)).max(64);
+        postings.try_reserve_exact(deep::WORKER_POSTINGS).map_err(|_| Refused::Busy)?;
+        let entries = per_worker.saturating_sub(stream::WORKER_BYTES) / std::mem::size_of::<Entry>();
+        let capacity = entries.min(limits.run_entries.unwrap_or(usize::MAX)).max(64);
         let mut buf: Vec<Entry> = Vec::new();
         buf.try_reserve_exact(capacity).map_err(|_| Refused::Busy)?;
-        let per = total.div_ceil(w.count as u64);
+        // Whole blocks of the stream each, so that each block is one worker's.
+        let per = total.div_ceil(w.count as u64).next_multiple_of(BATCH as u64);
         let lo = u64::from(first) + w.index as u64 * per;
         let hi = (lo + per - 1).min(u64::from(last));
         let mut runs = Vec::new();
@@ -247,7 +252,8 @@ pub fn write_runs(
             if w.stopped() || progress.stop.load(Ordering::Relaxed) {
                 return Err(SearchError::Superseded);
             }
-            let end = (next + 4095).min(hi);
+            let end = (next + BATCH as u64 - 1).min(hi);
+            part.begin(next as u32, end as u32);
             source.lines(next as u32, end as u32, MAX_PLY, &mut work, &mut |line: &Line| {
                 if failed.is_some() {
                     return;
@@ -261,18 +267,24 @@ pub fn write_runs(
                 for &(key, mv, ply) in &line.positions {
                     buf.push(Entry::new(key, line.number, line.outcome, mv, ply, line.elo));
                 }
-                if let Some(sink) = deep {
-                    if postings.len() + line.structures.len() > deep::WORKER_POSTINGS
-                        && let Err(e) = sink.add(&mut postings)
-                    {
-                        failed = Some(e);
-                        return;
-                    }
-                    for &s in &line.structures {
-                        postings.push(u64::from(deep_bucket(s, sink.bits())) << 32 | u64::from(line.number));
-                    }
+                if postings.len() + line.structures.len() > deep::WORKER_POSTINGS
+                    && let Err(e) = deep.add(&mut postings)
+                {
+                    failed = Some(e);
+                    return;
+                }
+                for &s in &line.structures {
+                    postings.push(u64::from(deep_bucket(s, deep.bits())) << 32 | u64::from(line.number));
+                }
+                if let Err(e) = part.add(line) {
+                    failed = Some(e);
                 }
             })?;
+            if failed.is_none()
+                && let Err(e) = part.end()
+            {
+                failed = Some(e);
+            }
             progress.done.fetch_add(end - next + 1, Ordering::Relaxed);
             next = end + 1;
         }
@@ -280,11 +292,9 @@ pub fn write_runs(
             return Err(e);
         }
         flush(&mut buf, dir, w.index, &mut runs)?;
-        if let Some(sink) = deep {
-            sink.add(&mut postings)?;
-        }
+        deep.add(&mut postings)?;
         progress.skipped.fetch_add(work.skipped, Ordering::Relaxed);
-        drop((buf, work, postings, hold));
+        drop((buf, work, part, postings, hold));
         Ok(runs)
     })?;
     Ok(runs.into_iter().flatten().collect())

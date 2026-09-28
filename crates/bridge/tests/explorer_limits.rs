@@ -184,6 +184,7 @@ fn an_index_file_claiming_a_huge_table_is_rebuilt() {
         deep_offset,
         deep_table_offset: deep_offset,
         deep_table_crc: 0,
+        build_id: 1,
     };
     std::fs::create_dir_all(home.join("index")).unwrap();
     let f = std::fs::File::create(home.join("index").join(format!("{}.idx", id_of(&cbh)))).unwrap();

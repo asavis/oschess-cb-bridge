@@ -1,9 +1,10 @@
 //! Where an index gets its games: the positions of each game's main line, as a
 //! small trait that each database format implements.
 
-use chesscore::{Board, Color, Move, Piece};
+use chesscore::{Board, Move};
 
 use cbformat::game::{GameResult, RecordKind};
+use cbformat::movetable::{self, FIRST_CASTLE_960, MoveWord};
 use cbformat::pgnfile::lex::{self, Lexer};
 use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor, start_board};
@@ -12,51 +13,15 @@ use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 
 use super::format::{NO_MOVE, Outcome, PRUNE_PLY, pack_move, structure};
+use super::stream::{self, Departures, MAX_PLIES, SETUP_BYTES};
 use crate::store::{Head, Store};
-
-/// What a walk takes from each game's main line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// The positions within the index's plies, for the tree.
-    Tree,
-    /// Those, and every [`structure`] the main line holds past
-    /// [`PRUNE_PLY`], for the deep section (#133): the whole line is read.
-    Build,
-    /// The first ply the main line reaches this position at, and the move
-    /// played from it.
-    Find(Target),
-}
-
-/// A position looked for in games: its key, and each side's men and pawns.
-/// A game only ever loses those, so a line left with fewer than the position
-/// has can no longer reach it, and its walk stops there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Target {
-    key: u64,
-    counts: [u32; 4],
-}
-
-impl Target {
-    pub fn of(board: &Board) -> Target {
-        Target { key: board.hash(), counts: counts(board) }
-    }
-}
-
-/// Each side's men, then each side's pawns.
-fn counts(board: &Board) -> [u32; 4] {
-    [
-        board.colors(Color::White).count_ones(),
-        board.colors(Color::Black).count_ones(),
-        board.colored(Piece::Pawn, Color::White).count_ones(),
-        board.colored(Piece::Pawn, Color::Black).count_ones(),
-    ]
-}
 
 /// The most structures a main line holds: each change of one is a pawn
 /// moving forward or a capture, so no line holds more.
 const MAX_STRUCTURES: usize = 8 * 6 * 2 + 30 + 1;
 
-/// One game's contribution to the index.
+/// One game's contribution to the index. Its main line is read to its end,
+/// or to [`MAX_PLIES`], where the move stream ends it.
 pub struct Line {
     pub number: u32,
     pub outcome: Outcome,
@@ -65,25 +30,45 @@ pub struct Line {
     /// Each position the main line reaches within the index's plies, once,
     /// with the move played from it (`NO_MOVE` at the end) and its ply.
     pub positions: Vec<(u64, u16, u8)>,
-    /// [`Mode::Build`]: the structures the main line holds past
-    /// [`PRUNE_PLY`], each once, in the order it reaches them. A structure
-    /// never comes back once it changed, so the last one is all a new one is
-    /// compared with.
+    /// The structures the main line holds past [`PRUNE_PLY`], each once, in
+    /// the order it reaches them. A structure never comes back once it
+    /// changed, so the last one is all a new one is compared with.
     pub structures: Vec<u64>,
-    /// [`Mode::Find`]: the move played from the position's first occurrence
-    /// (`NO_MOVE` at the line's end), once the line reached it.
-    pub found: Option<u16>,
-    pub mode: Mode,
-    /// The position the walk is at, noted before its move is played: its key
-    /// and, in [`Mode::Build`] past [`PRUNE_PLY`], its structure.
+    /// The main line's moves as 2CBH move words, each checked as it was
+    /// played: normal moves and the four castlings of standard chess, for the
+    /// move stream (#145).
+    pub words: Vec<u16>,
+    /// The start, when it is not the standard one ([`stream::setup_of`]).
+    pub setup: Option<[u8; SETUP_BYTES]>,
+    /// The home pawns in the order the line lost them.
+    pub departures: Departures,
+    /// The position the walk is at, noted before its move is played: its
+    /// key, its structure past [`PRUNE_PLY`], and its home pawns.
     here: u64,
     here_structure: u64,
-    /// [`Mode::Find`]: the position the walk is at has fewer men or pawns of
-    /// a side than the one looked for.
-    past: bool,
+    home: u16,
 }
 
 impl Line {
+    /// Game `number`'s line of `words` from `setup`, as a walk leaves it, for
+    /// the tests of the move stream.
+    #[cfg(test)]
+    pub(super) fn of(number: u32, words: Vec<u16>, setup: Option<[u8; SETUP_BYTES]>, outcome: Outcome) -> Line {
+        Line {
+            number,
+            outcome,
+            elo: 2000,
+            positions: Vec::new(),
+            structures: Vec::new(),
+            words,
+            setup,
+            departures: Departures::default(),
+            here: 0,
+            here_structure: 0,
+            home: 0,
+        }
+    }
+
     /// Adds a position the first time the line reaches it.
     fn reach(&mut self, key: u64, mv: u16, ply: u8) {
         if !self.positions.iter().any(|p| p.0 == key) {
@@ -91,43 +76,51 @@ impl Line {
         }
     }
 
-    /// Whether the walk reads the move played from the position at `ply`.
-    fn reads(&self, ply: u32, max_ply: u8) -> bool {
-        self.mode != Mode::Tree || ply <= u32::from(max_ply)
+    /// Whether the walk reads the move played from the position at `ply`:
+    /// the move stream keeps at most [`MAX_PLIES`] of a line.
+    fn reads(&self, ply: u32) -> bool {
+        (ply as usize) < MAX_PLIES
+    }
+
+    /// Notes the line's start, `board`: a set-up start is kept.
+    fn start(&mut self, board: &Board) {
+        let setup = stream::setup_of(board);
+        self.setup = (setup != *stream::standard_setup()).then_some(setup);
+        self.home = stream::home_pawns(board);
     }
 
     /// Notes the position `board` at `ply`, before its move is played.
     fn at(&mut self, board: &Board, ply: u32) {
         self.here = board.hash();
-        match self.mode {
-            Mode::Build if ply > u32::from(PRUNE_PLY) => self.here_structure = structure(board),
-            Mode::Find(target) => {
-                self.past = counts(board).iter().zip(target.counts).any(|(&have, need)| have < need);
-            }
-            _ => {}
+        if ply > u32::from(PRUNE_PLY) {
+            self.here_structure = structure(board);
         }
+        let home = stream::home_pawns(board);
+        let mut left = self.home & !home;
+        while left != 0 {
+            self.departures.push(left.trailing_zeros());
+            left &= left - 1;
+        }
+        self.home = home;
     }
 
     /// Takes the position noted at `ply`, with `mv` played from it
-    /// (`NO_MOVE` at the line's end); whether the walk goes on.
-    fn visit(&mut self, mv: u16, ply: u32, max_ply: u8) -> bool {
-        if let Mode::Find(target) = self.mode {
-            if self.here == target.key {
-                self.found = Some(mv);
-                return false;
-            }
-            return !self.past;
-        }
+    /// (`NO_MOVE` at the line's end).
+    fn visit(&mut self, mv: u16, ply: u32, max_ply: u8) {
         if ply <= u32::from(max_ply) {
             self.reach(self.here, mv, ply as u8);
         }
-        if self.mode == Mode::Build && ply > u32::from(PRUNE_PLY) {
+        if ply > u32::from(PRUNE_PLY) {
             let structure = self.here_structure;
             if self.structures.last() != Some(&structure) && self.structures.len() < MAX_STRUCTURES {
                 self.structures.push(structure);
             }
         }
-        true
+    }
+
+    /// Takes `word`, the move just played from the position visited last.
+    fn played(&mut self, word: u16) {
+        self.words.push(word);
     }
 }
 
@@ -166,7 +159,8 @@ struct Records {
 
 impl Workspace {
     /// What a workspace takes: the buffers, a line of at most 41 positions
-    /// and its structures.
+    /// and its structures. Its words, once kept ([`Workspace::keep_words`]),
+    /// are counted in [`stream::WORKER_BYTES`].
     pub const BYTES: usize = (RECORDS + 1)
         * (HEADER_RECORD_SIZE + std::mem::size_of::<Record>() + std::mem::size_of::<cbh::Record>() + 4)
         + MOVE_BYTES
@@ -176,9 +170,11 @@ impl Workspace {
         + 1024
         + MAX_STRUCTURES * 8;
 
-    /// Sets what the walks take from each game from now on.
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.line.mode = mode;
+    /// Makes room for a line's words, [`MAX_PLIES`] at most, so that the
+    /// walks allocate nothing for them; `None` when there is none.
+    pub fn keep_words(&mut self) -> Option<()> {
+        let words = &mut self.line.words;
+        words.try_reserve_exact(MAX_PLIES.saturating_sub(words.len())).ok()
     }
 
     /// The last game's line, as the walk left it.
@@ -213,11 +209,12 @@ impl Workspace {
                 elo: 0,
                 positions,
                 structures,
-                found: None,
-                mode: Mode::Tree,
+                words: Vec::new(),
+                setup: None,
+                departures: Departures::default(),
                 here: 0,
                 here_structure: 0,
-                past: false,
+                home: 0,
             },
             lexer: Lexer::new(),
             skipped: 0,
@@ -506,7 +503,8 @@ fn lines<S: Games>(
 }
 
 /// Fills `line` with the main line of `record`'s 2CBH game; whether the
-/// index holds the game.
+/// index holds the game. Its words are kept as stored, each checked as it is
+/// played.
 fn walk(data: &MoveData<'_>, record: &Record, max_ply: u8, line: &mut Line) -> bool {
     let Ok(moves) = data.moves() else { return false };
     if moves.is_chess960() {
@@ -517,28 +515,47 @@ fn walk(data: &MoveData<'_>, record: &Record, max_ply: u8, line: &mut Line) -> b
         return false;
     }
     begin(line, record);
+    line.start(&board);
     let mut words = moves.main_line();
     let mut ply = 0u32;
     loop {
         line.at(&board, ply);
-        let played = if line.reads(ply, max_ply) { words.next() } else { None };
-        let mv = match played.map(|w| replay::play(&mut board, w)) {
-            Some(Ok(Some(mv))) => Some(mv),
-            // The end of the line, a null move, damage or the index's depth:
-            // the position is reached, and no move from it is counted.
+        let word = if line.reads(ply) { words.next() } else { None };
+        let played = word.and_then(|w| match replay::play(&mut board, w) {
+            Ok(Some(mv)) => Some((w, mv)),
             _ => None,
-        };
-        if !line.visit(mv.map_or(NO_MOVE, pack_move), ply, max_ply) || mv.is_none() {
+        });
+        // The end of the line, a null move, damage or the stream's longest
+        // line: the position is reached, and no move from it is counted.
+        let Some((word, mv)) = played else {
+            line.visit(NO_MOVE, ply, max_ply);
             return true;
-        }
+        };
+        line.visit(pack_move(mv), ply, max_ply);
+        line.played(standard_word(word));
         ply += 1;
+    }
+}
+
+/// The word a standard game's move is kept as: a Chess960 castling word,
+/// which such a game may use, is the standard castling of its side.
+fn standard_word(word: u16) -> u16 {
+    if word < FIRST_CASTLE_960 {
+        return word;
+    }
+    match movetable::decode(word) {
+        Some(MoveWord::Castle960 { color, side, .. }) => {
+            movetable::encode(MoveWord::Castle { color, side }).unwrap_or(word)
+        }
+        _ => word,
     }
 }
 
 /// Fills `line` with the main line of `record`'s classic game, the same way
 /// as [`walk`]. The compact encoding names a move by the position it is
 /// played in, so the tree is walked; the main line comes first in it, and
-/// a walk stopped by damage has reported the moves before the damage.
+/// a walk stopped by damage has reported the moves before the damage. Each
+/// move is kept as the 2CBH word that names it.
 fn walk_classic(data: &cbh::MoveData<'_>, record: &cbh::Record, max_ply: u8, line: &mut Line) -> bool {
     let Ok(moves) = data.moves() else { return false };
     if moves.is_chess960() {
@@ -551,6 +568,7 @@ fn walk_classic(data: &cbh::MoveData<'_>, record: &cbh::Record, max_ply: u8, lin
         return false;
     }
     begin(line, record);
+    line.start(&board);
     line.at(&board, 0);
     let mut main = MainLine { line, max_ply, ply: 0, pending: None, done: false };
     // Damage ends the line where it is: the positions before it are kept.
@@ -566,21 +584,23 @@ struct MainLine<'a> {
     line: &'a mut Line,
     max_ply: u8,
     ply: u32,
-    /// A main-line move announced and not yet played: it counts once it is,
-    /// as an illegal move is reported before it is found to be one.
-    pending: Option<u16>,
-    /// The line ended: at the index's depth, a null move, or the first move
-    /// off the main line.
+    /// A main-line move announced and not yet played, with its word: it
+    /// counts once it is, as an illegal move is reported before it is found
+    /// to be one.
+    pending: Option<(u16, u16)>,
+    /// The line ended: at the stream's longest line, a null move, or the
+    /// first move off the main line.
     done: bool,
 }
 
 impl TreeVisitor for MainLine<'_> {
-    fn play(&mut self, _before: &Board, mv: Option<Move>, main_line: bool) {
+    fn play(&mut self, before: &Board, mv: Option<Move>, main_line: bool) {
         if self.done {
             return;
         }
-        match mv.filter(|_| main_line && self.line.reads(self.ply, self.max_ply)) {
-            Some(mv) => self.pending = Some(pack_move(mv)),
+        let read = mv.filter(|_| main_line && self.line.reads(self.ply));
+        match read.and_then(|mv| Some((pack_move(mv), replay::word_of(before, mv)?))) {
+            Some(pending) => self.pending = Some(pending),
             None => {
                 self.line.visit(NO_MOVE, self.ply, self.max_ply);
                 self.done = true;
@@ -589,18 +609,15 @@ impl TreeVisitor for MainLine<'_> {
     }
 
     fn played(&mut self, after: &Board) {
-        if let Some(mv) = self.pending.take() {
-            if !self.line.visit(mv, self.ply, self.max_ply) {
-                self.done = true;
-                return;
-            }
+        if let Some((mv, word)) = self.pending.take() {
+            self.line.visit(mv, self.ply, self.max_ply);
+            self.line.played(word);
             self.ply += 1;
             self.line.at(after, self.ply);
         }
     }
 
-    /// Once the line is done the rest of the game is not decoded: a find
-    /// replays each candidate only as far as it has to.
+    /// Once the line is done the rest of the game is not decoded.
     fn stopped(&self) -> bool {
         self.done
     }
@@ -609,7 +626,8 @@ impl TreeVisitor for MainLine<'_> {
 /// Fills `line` with the main line of a PGN game's text, as [`walk`] reads a
 /// 2CBH game; whether the index holds the game. The moves are read as
 /// written ([`pgnfile::line`]): the line ends at the first that names no
-/// legal move, a null move among them.
+/// legal move, a null move among them. Each is kept as the 2CBH word that
+/// names it.
 fn walk_pgn(text: &[u8], r: &pgnfile::Record, max_ply: u8, line: &mut Line, lexer: &mut Lexer) -> bool {
     if r.is_chess960() || r.is_other_variant() {
         return false;
@@ -617,20 +635,24 @@ fn walk_pgn(text: &[u8], r: &pgnfile::Record, max_ply: u8, line: &mut Line, lexe
     begin(line, r);
     let (mut ply, mut chess960) = (0u32, false);
     let end = main_line(text, lexer, &mut |board, mv| {
-        if ply == 0 && board.is_chess960() {
-            chess960 = true;
-            return false;
+        if ply == 0 {
+            if board.is_chess960() {
+                chess960 = true;
+                return false;
+            }
+            line.start(board);
         }
         line.at(board, ply);
-        match mv.filter(|_| line.reads(ply, max_ply)) {
-            Some(mv) => {
-                let more = line.visit(pack_move(mv), ply, max_ply);
+        match mv.filter(|_| line.reads(ply)).and_then(|mv| Some((mv, replay::word_of(board, mv)?))) {
+            Some((mv, word)) => {
+                line.visit(pack_move(mv), ply, max_ply);
+                line.played(word);
                 ply += 1;
-                more
+                true
             }
-            // The end of the line, the index's depth, a null move or a move
-            // it cannot play: the position is reached, and no move from it is
-            // counted.
+            // The end of the line, the stream's longest line, a null move or
+            // a move it cannot play: the position is reached, and no move
+            // from it is counted.
             None => {
                 line.visit(NO_MOVE, ply, max_ply);
                 false
@@ -647,7 +669,9 @@ fn begin(line: &mut Line, r: &impl Head) {
     line.elo = average_elo(r);
     line.positions.clear();
     line.structures.clear();
-    line.found = None;
+    line.words.clear();
+    line.setup = None;
+    line.departures = Departures::default();
 }
 
 pub fn outcome(r: &impl Head) -> Outcome {
@@ -676,25 +700,48 @@ mod tests {
     use super::*;
     use crate::explorer::format::MAX_PLY;
 
-    /// A classic game's walk is told to stop once the position is found.
+    /// A classic game's walk keeps the 2CBH word of each main-line move, its
+    /// castling as the standard castling word, and stops at the first move
+    /// off the main line: the rest of the game is not decoded.
     #[test]
-    fn a_classic_walk_stops_at_the_position_found() {
+    fn a_classic_walk_keeps_the_words_of_its_main_line() {
         let mut work = Workspace::new().unwrap();
-        let start = Board::startpos();
-        let mut e4 = start.clone();
-        e4.play_checked("e2e4".parse().unwrap()).unwrap();
-        let mut e5 = e4.clone();
-        e5.play_checked("e7e5".parse().unwrap()).unwrap();
-        work.set_mode(Mode::Find(Target::of(&e4)));
-        work.line.at(&start, 0);
-        let mut main = MainLine { line: &mut work.line, max_ply: MAX_PLY, ply: 0, pending: None, done: false };
-        main.play(&start, Some("e2e4".parse().unwrap()), true);
-        main.played(&e4);
-        assert!(!main.stopped(), "not found yet");
-        let reply: Move = "e7e5".parse().unwrap();
-        main.play(&e4, Some(reply), true);
-        main.played(&e5);
-        assert!(main.stopped(), "found: the rest of the game is not decoded");
-        assert_eq!(work.line.found, Some(pack_move(reply)));
+        work.keep_words().unwrap();
+        let mut board = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        let line = &mut work.line;
+        line.start(&board);
+        line.at(&board, 0);
+        let mut main = MainLine { line, max_ply: MAX_PLY, ply: 0, pending: None, done: false };
+        let mut words = Vec::new();
+        for uci in ["e1h1", "a8a1"] {
+            let mv: Move = uci.parse().unwrap();
+            words.push(replay::word_of(&board, mv).unwrap());
+            main.play(&board, Some(mv), true);
+            board.play_checked(mv).unwrap();
+            main.played(&board);
+        }
+        assert!(!main.stopped());
+        main.play(&board, Some("f1f2".parse().unwrap()), false);
+        assert!(main.stopped(), "off the main line");
+        assert_eq!(work.line.words, words);
+        assert_eq!(replay::standard_move(words[0]), Some("e1h1".parse().unwrap()));
+        assert!(work.line.setup.is_some(), "a set-up start is kept");
+        assert_eq!(work.line.positions.len(), 3);
+    }
+
+    /// A Chess960 castling word in a standard game is kept as the standard
+    /// castling of its side.
+    #[test]
+    fn chess960_castling_words_are_kept_as_standard_castling() {
+        let short = movetable::encode(MoveWord::Castle960 {
+            position: 518,
+            color: movetable::Color::White,
+            side: movetable::CastleSide::Short,
+        })
+        .unwrap();
+        let standard =
+            movetable::encode(MoveWord::Castle { color: movetable::Color::White, side: movetable::CastleSide::Short });
+        assert_eq!(standard_word(short), standard.unwrap());
+        assert_eq!(standard_word(1), 1);
     }
 }

@@ -55,6 +55,31 @@ pub fn serve_shared(mut app: App) -> (u16, Arc<App>) {
     (port, app)
 }
 
+/// A bridge served for a test that gives up the position indexes it holds
+/// when dropped. A held index keeps its move stream mapped, and a mapped file
+/// cannot be replaced or removed on Windows: a test drops the bridge before
+/// it changes or removes the files, or starts another bridge that rebuilds
+/// them. Its threads go on listening, holding no index, until the process
+/// ends.
+pub struct Served {
+    pub port: u16,
+    app: Arc<App>,
+}
+
+impl Served {
+    /// Serves `app` as [`serve`] does.
+    pub fn new(app: App) -> Served {
+        let (port, app) = serve_shared(app);
+        Served { port, app }
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.app.catalog.explorer.release();
+    }
+}
+
 /// `GET path` as the page sends it: with the token and an allowed `Origin`,
 /// and `Connection: close`.
 pub fn request(port: u16, path: &str) -> String {

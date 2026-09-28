@@ -131,6 +131,7 @@ fn rendered_games_are_budgeted_and_evicted() {
     assert_eq!(held(), others);
     let again = explorer::render(&d, &board, loaded.lookup(board.hash()).unwrap(), &loaded);
     assert_eq!(first, again, "the same answer after eviction");
+    drop(loaded);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -158,6 +159,8 @@ fn a_kept_index_without_memory_is_busy_not_built() {
     drop(taken);
     assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Ready(_)));
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written, "the file was rewritten");
+    // The catalog holds the index, its stream mapped.
+    drop(catalog);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

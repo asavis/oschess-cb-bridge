@@ -82,7 +82,9 @@ pub const ALTERNATIVE: u16 = 0xfffd;
 pub const END_OF_LINE: u16 = 0xffff;
 
 const FIRST_CASTLE: u16 = 0xb129;
-const FIRST_CASTLE_960: u16 = 0xb12d;
+/// First Chess960 castling word: the words below it are the normal moves and
+/// the four castlings of standard chess.
+pub const FIRST_CASTLE_960: u16 = 0xb12d;
 /// First word above the move words: set-up pieces start here.
 pub const FIRST_PIECE_WORD: u16 = 0xc02d;
 

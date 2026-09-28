@@ -347,8 +347,9 @@ been confirmed, because no placeholder was available.
 ## Position index (the bridge's own files)
 
 Not a ChessBase format: the files the bridge writes for
-`GET /v1/databases/{id}/explorer` (`docs/api.md`), one per database in the
-data folder's `index` folder, `<id>.idx`. Integers are little-endian.
+`GET /v1/databases/{id}/explorer` (`docs/api.md`), two per database in the
+data folder's `index` folder: the index, `<id>.idx`, and its move stream,
+`<id>.moves` (see "Move stream" below). Integers are little-endian.
 
 - **Key.** A position is its Polyglot key (`chesscore::Board::hash`), which
   adds an en passant square only when a capture is possible. Chess960 games
@@ -358,18 +359,19 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   ply 40, once however often it is reached, with the move played from it, the
   one from ply 40 included; a position reached again adds only the move from
   its first visit.
-  A null move or damaged moves end the line there; the position before them
-  counts, and no move from it. A game whose move record is over 2 MiB, or
-  cannot be read, adds nothing. A position reached by one game only beyond
-  ply 20 is dropped.
+  A null move or damaged moves end the line there, and so does its
+  65,535th ply; the position before them counts, and no move from it. A game
+  whose move record is over 2 MiB, or cannot be read, adds nothing. A
+  position reached by one game only beyond ply 20 is dropped. The tree, the
+  deep section and the move stream are built from one walk of each line, so
+  they all hold the same lines.
 - **What a game adds to the deep section** (#133): each structure (each
   side's pawns and its knights, bishops, rooks and queens counted) that its
   main line holds at some ply beyond 20, once, to its bucket. Only a pawn move
   or a capture changes a structure, and neither is undone, so a game holds
   each one for a single stretch of plies. Every position the tree does not
-  hold is found among the games of its structure's bucket, by replaying them;
-  a replay stops once the game has fewer men or pawns of a side than the
-  position, which it can then never reach. The pieces matter: every pawnless
+  hold is found among the games of its structure's bucket, by replaying
+  their lines from the move stream. The pieces matter: every pawnless
   ending shares one pawn structure, 186,041 games of the Mega Database, and
   with the pieces counted the most crowded bucket, bare kings, holds 38,367.
 - **Header** (128 bytes):
@@ -377,7 +379,7 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBIDX\0` |
-  | 8 | 4 | format version, 2 |
+  | 8 | 4 | format version, 3 |
   | 12 | 4 | header length, 128 |
   | 17 | 1 | depth in plies, 40 |
   | 18 | 1 | pruning ply, 20 |
@@ -395,6 +397,7 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   | 96 | 8 | offset of the deep section, right after the block table |
   | 104 | 8 | offset of the deep table |
   | 112 | 4 | CRC-32 of the deep table |
+  | 116 | 8 | build id, which the move stream built with it carries too |
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
   The other bytes are zero.
@@ -437,8 +440,11 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   read; a deep bucket's games must ascend and stay within the records
   indexed. Any failure rebuilds the index. The table is held within the search
   memory budget while the index is open.
-- **Deciding what to build.** An index built at the database's generation is
-  current; any other is rebuilt.
+- **Deciding what to build.** An index and a move stream both built at the
+  database's generation, with the same build id, are current; anything else
+  rebuilds both. A crash between writing one and the other, or a file copied
+  from another build, never pairs an index with a stream it was not built
+  with.
 - **The build.** Workers read the header records and the move records of 2,048
   games at a time into buffers reserved in the search budget, about 3 MiB a
   worker: the run's move records at once when they fit a 2 MiB window of
@@ -446,7 +452,11 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   turn their share of the games into 16-byte entries:
   the key, the game number (30 bits) with its result (2), and the move (14),
   ply (6) and average rating (12). Each worker sorts its entries within its
-  share of the search memory budget and writes them as runs. The runs are then
+  share of the search memory budget and writes them as runs. It writes each
+  block's part of the move stream as it goes: its buffers, 1 MiB of tails, a
+  block's slots and a line's words, about 1.4 MiB, come out of its entries'
+  share, and each worker's games start at a block's start. Nothing of the
+  stream is read back. The runs are then
   merged, each run with a 64 KiB read buffer: in passes of as many runs as half
   the budget holds, at most 256, until the final merge can take all that are
   left beside the writer's 6 MiB. That final merge adds up each position's
@@ -478,6 +488,114 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   their games. Blocks are written as they are made, their CRC kept running. A
   share too small to merge a partition's chunks, each through at least 4 KiB,
   fails the build at once.
+
+## Move stream (the bridge's own file)
+
+`<id>.moves` (#145), written by the same build as `<id>.idx`: each game's
+main line as 2CBH move words, so that the deep section's candidates are
+replayed from memory instead of from the database's files. A 2CBH word names
+one move from a list of every move each piece can make on an empty board, so
+it means the same in any position and needs no board to decode.
+
+- **Words.** Normal moves and the four castlings of standard chess, words
+  below `0xb12d`. Each was checked when the build played it. A 2CBH game's
+  words are copied as stored, a Chess960 castling word in a standard game as
+  the standard castling of its side; a classic game's or a PGN game's are the
+  words of its moves (`cbformat::replay::word_of`). The same games in the
+  three formats give the same records; with one worker, as for a few thousand
+  games, the same file byte for byte past the generation and the build id,
+  since with more the order of tails and blocks follows the workers'
+  progress. A line ends where the index's ends: before a null move or
+  damage, or at 65,535 plies.
+- **Mapped read-only.** The bridge maps the file whole (`mmap`, or
+  `MapViewOfFile` on Windows) and replays its words without legality checks.
+  Its pages are the operating system's file cache, outside the search memory
+  budget. The bridge maps only its own files, never a database's, and never
+  writes a file it maps: a build writes `<id>.moves.partial` and renames it.
+  On Windows a mapped file cannot be replaced, so the rename is tried again
+  until the answers that still map the old stream are done, for up to a
+  minute. The stream is renamed before the index: a build stopped between
+  the two leaves files of different builds, which are rebuilt.
+- **Header** (128 bytes):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 8 | magic `OSCBMOV\0` |
+  | 8 | 4 | format version, 2 |
+  | 12 | 4 | header length, 128 |
+  | 16 | 1 | prefix words per record, *W* = 21 |
+  | 20 | 4 | first record, 1 |
+  | 24 | 4 | last record, *R* |
+  | 32 | 8 | the database's generation when built |
+  | 40 | 8 | build id, as in the index's header |
+  | 48 | 8 | games indexed |
+  | 56 | 8 | plies stored |
+  | 64 | 4 | records per block, *B* = 4,096 |
+  | 72 | 8 | offset of the block table |
+  | 80 | 4 | blocks, ⌈*R*/*B*⌉ |
+  | 84 | 4 | CRC-32 of the block table |
+  | 124 | 4 | CRC-32 of bytes 0-123 |
+
+  The other bytes are zero. Version 1, whose directory, prefix and tail
+  areas lay apart with a CRC for each MiB, is rebuilt.
+- **Body**, from 128 to the block table: the tails and the blocks of slots,
+  each starting at a multiple of 64 bytes, in the order the build's workers
+  appended them. A worker takes the records of one block at a time and
+  gathers their tails, appending them when the next would pass 1 MiB and at
+  the block's end, then appends the block's slots, so the file is written
+  from its start to its end: a game's tail is found only by its offset, and
+  a block only by the table.
+- **Slot**, 64 bytes a record, *B* in a block, record *r* the
+  ((*r* − 1) mod *B*)th slot of block ⌊(*r* − 1)/*B*⌋:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 4 | tail offset, in words from the file's start; meaningful when the line is longer than *W* or starts from a set-up position |
+  | 4 | 2 | plies stored |
+  | 6 | 2 | bits 0-1: outcome (white, draw, black, other, as the index counts it); bits 2-13: average rating, as the index ranks by it; bit 14: set-up start; bit 15: indexed (a standard game, not deleted, whose moves could be read) |
+  | 8 | 8 | home-pawn departures: bits 0-59 the first 15 home pawns to leave home, in order, 4 bits each (white a-h 0-7, black a-h 8-15); bits 60-63 how many, 15 meaning 15 or 16 |
+  | 16 | 42 | words 0 to *W* − 1 of its line, then `0xffff` after its end |
+  | 58 | 2 | zero |
+  | 60 | 4 | CRC-32 of the record's number (4 bytes), bytes 0-59 and its tail |
+
+  A record the index does not hold has zeros for bytes 0-15 and no words.
+- **Tail**: for a set-up start, 18 words describing it (32 bytes of pieces
+  from a1 to h8, a square in each half of a byte, low half first: 0 empty,
+  1-6 white pawn, knight, bishop, rook, queen, king, 9-14 the same for black;
+  a byte for the side to move, 0 white; a byte of castling rights, bits as in
+  the set-up section above; the en passant file 0-7 when a capture is
+  possible, else 8; a zero byte); then words *W* to plies − 1. A start equal
+  to the standard one is no set-up. A file takes 64 bytes a record and 2
+  bytes for each ply past the 21st, 36 more for a set-up start, up to 63
+  bytes of padding after each append of tails, and 8 bytes a block.
+- **Block table**, at the end of the body: the offset of each block's slots,
+  8 bytes each. The file must end with it, have a block for every *B*
+  records and room before the table for every record's slot, and each
+  block's slots must lie within the body at a multiple of 64 bytes; the
+  table is checked against its CRC when the file opens and held in the
+  search memory budget. A record is checked against its CRC whenever it is
+  read, its slot and its tail, which are all a replay reads: its number in
+  the CRC places it, so that a slot moved elsewhere fails too. A failure
+  drops both files, and the next request rebuilds them. A torn file, which
+  the build does not sync, fails the CRCs of the records it lost.
+- **Finding a position.** Of a bucket's games, a replay skips those the
+  index does not hold, and a standard game whose home pawns left in an order
+  the position does not allow: a pawn on its home square never came there and
+  never returns, and a ply loses at most one, so the pawns a position lacks
+  from home must be the first ones its line lost, in any order among
+  themselves (Scid's home-pawn test). A set-up game is not tested so. A replay
+  stops at the first ply whose key is the position's, and as soon as its line
+  has fewer men or pawns of a side than the position, or lacks one of the
+  position's home pawns: a line only ever loses those, and only a capture or
+  a pawn's move changes them, so they are counted again only then. Nothing
+  is concluded from the pieces of each kind, which a promotion adds to. The
+  moves are played without finding the pieces that give check, which only
+  legality needs (`chesscore::Replayer`). The bucket is replayed on at most
+  half the search workers, which take its games 64 at a time as they go, so
+  that a worker the machine runs less often takes fewer; each holds only what
+  it found, and a replay stops at its next game once its request is
+  superseded. Moves played as often are listed in the order of the first
+  game, by number, that played each.
 
 # The classic format (`.cbh`)
 

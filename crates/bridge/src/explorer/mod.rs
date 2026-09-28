@@ -1,7 +1,8 @@
 //! The position index behind `GET /v1/databases/{id}/explorer`
 //! (`docs/api.md`): for each position reached in the first plies of a
 //! database's games, the games through it, their results, the moves played
-//! from it and its notable games. An index is built in the background the
+//! from it and its notable games, and the games' main lines as a move stream
+//! to find any other position in. An index is built in the background the
 //! first time it is asked for and kept on disk in the bridge's data folder;
 //! a change to the database rebuilds it. An index kept on disk for the
 //! database as it is now answers from the first request, without a build.
@@ -11,9 +12,11 @@ mod build;
 pub mod deep;
 pub mod file;
 pub mod format;
+mod map;
 pub mod rendered;
 pub mod runs;
 pub mod source;
+pub mod stream;
 
 pub use answer::{deep, render, route, uci};
 pub use build::WRITER_BYTES;
@@ -34,22 +37,25 @@ use file::{Bad, IndexFile};
 use format::{MAX_PLY, PRUNE_PLY, Stats};
 use runs::{Limits, Progress};
 use source::Source;
+use stream::Stream;
 
 /// How long a failed build is reported before the next request tries again.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
-/// The index of one database, at the generation it was built for.
+/// The index of one database, at the generation it was built for, and the
+/// move stream of the same build.
 pub struct Loaded {
     pub generation: u64,
     pub base: IndexFile,
+    pub stream: Stream,
     /// This index's key in the cache of rendered games, unique in the process.
     id: u64,
 }
 
 impl Loaded {
-    pub fn new(generation: u64, base: IndexFile) -> Loaded {
+    pub fn new(generation: u64, base: IndexFile, stream: Stream) -> Loaded {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Loaded { generation, base, id: NEXT.fetch_add(1, Ordering::Relaxed) }
+        Loaded { generation, base, stream, id: NEXT.fetch_add(1, Ordering::Relaxed) }
     }
 
     /// Game `number`'s rating and rendered JSON, from the cache of rendered
@@ -120,18 +126,18 @@ impl Default for Registry {
 
 /// What a file in the index folder is, by its name.
 enum Kept {
-    /// `<id>.idx`: a database's index.
+    /// `<id>.idx` or `<id>.moves`: a database's index or its move stream.
     Index,
-    /// `<id>.idx.partial` or the `<id>.build` folder: a build's work, which
-    /// only the build running for `<id>` uses.
+    /// `<id>.idx.partial`, `<id>.moves.partial` or the `<id>.build` folder: a
+    /// build's work, which only the build running for `<id>` uses.
     Work,
 }
 
 /// The database id and kind of an index folder entry; `None` for anything
 /// the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
-    let (id, kind) = indexdir::db_id(name, &[".idx", ".idx.partial", ".build"])?;
-    Some((id, if kind == 0 { Kept::Index } else { Kept::Work }))
+    let (id, kind) = indexdir::db_id(name, &[".idx", ".moves", ".idx.partial", ".moves.partial", ".build"])?;
+    Some((id, if kind < 2 { Kept::Index } else { Kept::Work }))
 }
 
 impl Registry {
@@ -168,8 +174,8 @@ impl Registry {
         // milliseconds, so it is done here rather than behind a build of
         // another database in the queue: only a build is answered `indexing`.
         match current(&paths(&dir, &entry.id).0, open.generation, open.db.records()) {
-            Ok(Some(file)) => {
-                let loaded = Arc::new(Loaded::new(open.generation, file));
+            Ok(Some(loaded)) => {
+                let loaded = Arc::new(loaded);
                 *s = State::Ready(Arc::clone(&loaded));
                 return Lookup::Ready(loaded);
             }
@@ -242,15 +248,32 @@ impl Registry {
         unlisted.retain();
     }
 
-    /// Drops the index of `id` after a read found it damaged, and deletes its
-    /// file, so the next request rebuilds it.
+    /// Drops the index of `id` after a read found it or its move stream
+    /// damaged, and deletes both files, so the next request rebuilds them. A
+    /// stream still mapped on Windows stays until the build replaces it; the
+    /// index alone is gone, and without it the stream is never used.
     pub fn forget(&self, id: &str) {
         let state = self.state(id);
         let mut s = lock(&state);
         if let State::Ready(l) = &*s {
             let _ = std::fs::remove_file(&l.base.path);
+            let _ = std::fs::remove_file(&l.stream.path);
         }
         *s = State::Idle;
+    }
+
+    /// Drops every index held in memory and leaves its files as they are: the
+    /// next request opens them again. A build running goes on. Tests release a
+    /// bridge's indexes before they change or remove the files, which a
+    /// mapped move stream keeps from being replaced or removed on Windows.
+    pub fn release(&self) {
+        let states: Vec<Arc<Mutex<State>>> = lock(&self.states).values().cloned().collect();
+        for state in states {
+            let mut s = lock(&state);
+            if matches!(*s, State::Ready(_)) {
+                *s = State::Idle;
+            }
+        }
     }
 
     /// The checks and builds running or waiting: database id, phase, done
@@ -273,6 +296,7 @@ impl Registry {
 }
 
 /// The index file of database `id` in `dir`, and the folder its build uses.
+/// Its move stream lies beside the index file ([`stream::path_of`]).
 pub fn paths(dir: &Path, id: &str) -> (PathBuf, PathBuf) {
     (dir.join(format!("{id}.idx")), dir.join(format!("{id}.build")))
 }
@@ -311,14 +335,18 @@ fn index(
     let count = db.records();
     progress.start("checking", u64::from(count));
     match current(&path, generation, count) {
-        Ok(Some(file)) => return Ok(Loaded::new(generation, file)),
+        Ok(Some(loaded)) => return Ok(loaded),
         Err(_) => return Err(Failure::Busy),
         Ok(None) => {}
     }
     let plan = Plan { first: 1, last: count, prune_ply: PRUNE_PLY, generation };
-    build::build_with(db, &plan, &work, &path, progress, limits).map_err(Failure::Build)?;
+    let header = build::build_with(db, &plan, &work, &path, progress, limits).map_err(Failure::Build)?;
     let file = IndexFile::open(&path).map_err(Failure::Open)?;
-    Ok(Loaded::new(generation, file))
+    let stream = Stream::open(&stream::path_of(&path)).map_err(Failure::Open)?;
+    if stream.header.build_id != header.build_id || file.header.build_id != header.build_id {
+        return Err(Failure::Open(Bad::Corrupt("another build's files")));
+    }
+    Ok(Loaded::new(generation, file, stream))
 }
 
 /// Why a build failed.
@@ -354,13 +382,14 @@ impl Failure {
     }
 }
 
-/// The index file at `path` when it is the whole index of a database of
-/// `records` records at `generation`, built by this version; `None` when it is
-/// absent, damaged, or of another generation or version, and so is built
-/// afresh. The error is [`Bad::Busy`]: the search memory has no room for its
-/// table now.
-fn current(path: &Path, generation: u64, records: u32) -> Result<Option<IndexFile>, Bad> {
-    match IndexFile::open(path) {
+/// The index file at `path` and its move stream when they are the whole
+/// index of a database of `records` records at `generation`, built together
+/// by this version; `None` when either is absent, damaged, of another
+/// generation or version, or of another build than the other, and so both are
+/// built afresh. The error is [`Bad::Busy`]: the search memory has no room
+/// for their tables now.
+fn current(path: &Path, generation: u64, records: u32) -> Result<Option<Loaded>, Bad> {
+    let file = match IndexFile::open(path) {
         Ok(file)
             if file.header.generation == generation
                 && file.header.max_ply == MAX_PLY
@@ -368,7 +397,19 @@ fn current(path: &Path, generation: u64, records: u32) -> Result<Option<IndexFil
                 && file.header.first_record == 1
                 && file.header.last_record == records =>
         {
-            Ok(Some(file))
+            file
+        }
+        Err(Bad::Busy) => return Err(Bad::Busy),
+        _ => return Ok(None),
+    };
+    match Stream::open(&stream::path_of(path)) {
+        Ok(stream)
+            if stream.header.generation == generation
+                && stream.header.build_id == file.header.build_id
+                && stream.header.first_record == 1
+                && stream.header.last_record == records =>
+        {
+            Ok(Some(Loaded::new(generation, file, stream)))
         }
         Err(Bad::Busy) => Err(Bad::Busy),
         _ => Ok(None),
@@ -412,7 +453,8 @@ mod tests {
 
     /// The index kept on disk for the database as it is answers the first
     /// request after the bridge starts at once, even while the queue runs
-    /// another database's build, and the file is only read.
+    /// another database's build, and the file is only read. Released, it is
+    /// held by the requests that took it alone.
     #[test]
     fn a_kept_index_answers_at_once_while_the_queue_builds() {
         let db = e4s("explorer-kept");
@@ -441,15 +483,18 @@ mod tests {
         // The next request finds it in memory.
         let Lookup::Ready(again) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!() };
         assert!(Arc::ptr_eq(&loaded, &again));
+        // The catalog holds it too, its stream mapped, until released.
+        catalog.explorer.release();
+        assert_eq!(Arc::strong_count(&loaded), 2, "held by the two requests alone");
         drop((loaded, again));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The index folder is swept of what the list no longer uses (#60): the
-    /// index of a database off the list once the grace has passed, and a
-    /// build's leftovers at once. A listed database keeps its index even
-    /// while it is missing; a database being built keeps everything; files
-    /// the bridge did not write stay.
+    /// index and move stream of a database off the list once the grace has
+    /// passed, and a build's leftovers at once. A listed database keeps its
+    /// index even while it is missing; a database being built keeps
+    /// everything; files the bridge did not write stay.
     #[test]
     fn the_index_folder_keeps_only_what_the_list_uses() {
         let dir = std::env::temp_dir().join(format!("bridge-explorer-sweep-{}", std::process::id()));
@@ -463,12 +508,19 @@ mod tests {
         let touch = |name: &str| std::fs::write(dir.join(name), b"x").unwrap();
         for name in [
             format!("{listed}.idx"),
+            format!("{listed}.moves"),
             format!("{listed}.idx.partial"),
+            format!("{listed}.moves.partial"),
             format!("{gone}.idx"),
+            format!("{gone}.moves"),
             format!("{gone}.idx.partial"),
+            format!("{gone}.moves.partial"),
             format!("{building}.idx"),
+            format!("{building}.moves"),
             format!("{building}.idx.partial"),
+            format!("{building}.moves.partial"),
             "notes.txt".into(),
+            format!("{listed}.moves.old"),
             // Upper case, and no test id in any case: on a file system that
             // ignores case, as Windows's does, it must not name another file.
             "ABCDEF0123456789.idx".into(),
@@ -489,10 +541,15 @@ mod tests {
         };
         let mut keep = vec![
             format!("{listed}.idx"),
+            format!("{listed}.moves"),
+            format!("{listed}.moves.old"),
             format!("{gone}.idx"),
+            format!("{gone}.moves"),
             format!("{building}.build"),
             format!("{building}.idx"),
+            format!("{building}.moves"),
             format!("{building}.idx.partial"),
+            format!("{building}.moves.partial"),
             "ABCDEF0123456789.idx".into(),
             "notes.txt".into(),
             "short.idx".into(),
@@ -503,10 +560,10 @@ mod tests {
         catalog.sweep_indexes();
         assert_eq!(names(), keep);
 
-        // After it, the index of the database off the list goes too.
+        // After it, the index and stream of the database off the list go too.
         catalog.set_sweep_grace(Duration::ZERO);
         catalog.sweep_indexes();
-        keep.retain(|n| n != &format!("{gone}.idx"));
+        keep.retain(|n| n != &format!("{gone}.idx") && n != &format!("{gone}.moves"));
         assert_eq!(names(), keep);
 
         // The build that ran ends: its leftovers go; its database, off the
@@ -514,7 +571,11 @@ mod tests {
         *lock(&catalog.explorer.state(building)) = State::Idle;
         catalog.set_sweep_grace(indexdir::SWEEP_GRACE);
         catalog.sweep_indexes();
-        keep.retain(|n| !n.starts_with(&format!("{building}.build")) && n != &format!("{building}.idx.partial"));
+        keep.retain(|n| {
+            !n.starts_with(&format!("{building}.build"))
+                && n != &format!("{building}.idx.partial")
+                && n != &format!("{building}.moves.partial")
+        });
         assert_eq!(names(), keep);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -57,6 +57,8 @@ const SORT_KEYS: [&str; 12] = [
     "annotator",
 ];
 const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+/// Bare kings in two corners: the most crowded structure of a large database.
+const BARE_KINGS: &str = "7k/8/8/8/8/8/8/K7 w - - 0 1";
 
 struct Options {
     db: PathBuf,
@@ -437,6 +439,20 @@ fn find_move(board: &Board, uci: &str) -> Option<chesscore::Move> {
     board.legal_moves().into_iter().find(|&m| bridge::explorer::uci(board, m) == uci)
 }
 
+/// The games, plies and bytes of the move stream at `path`, from its header.
+fn stream_counts(path: &Path) -> String {
+    use bridge::explorer::stream::{HEADER_LEN, Header};
+    let mut head = [0u8; HEADER_LEN];
+    let read = std::fs::File::open(path).and_then(|mut f| {
+        f.read_exact(&mut head)?;
+        f.metadata().map(|m| m.len())
+    });
+    match (read, Header::decode(&head)) {
+        (Ok(bytes), Some(h)) => format!("stream {} games, {} plies, {bytes} bytes", h.games, h.plies),
+        _ => "no move stream".into(),
+    }
+}
+
 /// Whether `dir` is missing or empty, so that the index is built in it; a
 /// folder that cannot be listed may hold an index and is neither.
 fn fresh(dir: &Path) -> bool {
@@ -606,7 +622,11 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         }
     };
     match built {
-        Ok(()) => table.once("index", "build to first answer", ms(t.elapsed()), &format!("{polls} polls")),
+        Ok(()) => {
+            let took = ms(t.elapsed());
+            let stream = stream_counts(&o.index.join("index").join(format!("{}.moves", served.id)));
+            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}"));
+        }
         Err(why) => table.failure("index", "build to first answer", &why),
     }
     let mut board = Board::startpos();
@@ -660,6 +680,18 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         table.failed = true;
     }
     table.row("index", "deep lookup, plies 30/60/90", &mut deep, &format!("{found} of {asked} found"));
+    // The most crowded structure (#145): bare kings, which every game that
+    // ends in them holds, all home pawns gone, so their bucket is replayed
+    // whole.
+    let bare = explorer(BARE_KINGS);
+    let (mut first, mut crowded) = (Samples::default(), Samples::default());
+    let games = first.get(&mut c, &bare, true).and_then(|a| number(&a, "games"));
+    for _ in 0..RUNS {
+        crowded.get(&mut c, &bare, true);
+    }
+    let games = games.map_or(String::new(), |g| format!("{g} games reach it"));
+    table.row("index", "crowded structure, first", &mut first, &games);
+    table.row("index", "crowded structure", &mut crowded, "");
     // Each notable game the lookups named is its `/games` row whole, then its
     // year (#144): compared with its number's row, asked for once a number
     // after the lookups, so that their times stay as they were.
@@ -907,6 +939,33 @@ mod tests {
         assert_eq!(bridge::explorer::uci(&board, short), "e1g1");
         assert_eq!(bridge::explorer::uci(&board, long), "e1c1");
         assert!(find_move(&board, "e1e5").is_none());
+    }
+
+    /// The stream's counts come from its header; a missing or foreign file
+    /// is named as such.
+    #[test]
+    fn the_move_streams_counts_are_read_from_its_header() {
+        use bridge::explorer::stream::Header;
+        let path = std::env::temp_dir().join(format!("cbtool-profile-stream-{}", std::process::id()));
+        assert_eq!(stream_counts(&path), "no move stream");
+        let h = Header {
+            first_record: 1,
+            last_record: 3,
+            generation: 1,
+            build_id: 2,
+            games: 3,
+            plies: 120,
+            table_offset: 320,
+            blocks: 1,
+            table_crc: 0,
+        };
+        let mut bytes = h.encode().to_vec();
+        bytes.resize(328, 0);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(stream_counts(&path), "stream 3 games, 120 plies, 328 bytes");
+        std::fs::write(&path, b"not a stream").unwrap();
+        assert_eq!(stream_counts(&path), "no move stream");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -11,15 +11,16 @@ use bridge::explorer::file::{Bad, IndexFile};
 use bridge::explorer::format::{BLOCK_ENTRY, Block, Counts, Header, pack_move};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
+use bridge::search::memory::Cancel;
 use cbformat::cbh;
-use cbformat::fixture::{Builder, TempDb, lid_header, sq, words};
+use cbformat::fixture::{Builder, TempDb, lid_header, quiet, sq, words};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record, start_position};
 use cbformat::movetable::{self, Captured, Color, END_OF_LINE, MOVES, MoveWord, Piece};
 use cbformat::v2::Database;
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{get, policy};
+use common::{Served, get, policy};
 
 /// A standard game of `ucis` with `result` (0 black, 1 draw, 2 white) and
 /// ratings; its record, for further changes.
@@ -170,6 +171,7 @@ fn positions_moves_results_and_transpositions() {
     let line7 = "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7";
     assert!(idx.lookup(key_after(line7)).unwrap().is_some(), "ply 20 is kept");
     assert!(idx.lookup(key_after(&format!("{line7} e1g1"))).unwrap().is_none(), "ply 21 alone is dropped");
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -200,6 +202,7 @@ fn a_classic_copy_is_indexed_the_same() {
         }
     }
     assert!(compared > 40);
+    drop((two, classic));
     std::fs::remove_dir_all(&two_dir).unwrap();
     std::fs::remove_dir_all(&classic_dir).unwrap();
 }
@@ -242,6 +245,7 @@ fn the_move_record_limit_holds_on_both_reading_paths() {
                 let skipped = progress.skipped.load(std::sync::atomic::Ordering::Relaxed);
                 let want = if over == 1 { (0, 1) } else { (1, 0) };
                 assert_eq!((loaded.games(), skipped), want, "{format}, {over} over the limit, hole {hole}");
+                drop(loaded);
                 std::fs::remove_dir_all(&dir).unwrap();
             }
         }
@@ -289,11 +293,13 @@ fn a_damaged_index_is_refused_and_rebuilt() {
     std::fs::write(&path, &bytes).unwrap();
     let file = IndexFile::open(&path).unwrap();
     assert!(matches!(file.lookup(key_after("")), Err(Bad::Corrupt(_))), "the block's CRC catches it");
+    drop(file);
     std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
     assert!(matches!(IndexFile::open(&path), Err(Bad::Corrupt(_))), "a cut file is refused");
     // The next check builds it afresh.
     let idx = prepared(&db, &dir);
     assert_eq!(idx.lookup(key_after("")).unwrap().unwrap().counts.games, 5);
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -349,18 +355,20 @@ fn any_change_rebuilds_the_whole_index() {
         assert_eq!(grown.lookup(key_after(ucis)).unwrap(), cold.lookup(key_after(ucis)).unwrap(), "{ucis}");
     }
     assert_eq!(grown.lookup(key_after("")).unwrap().unwrap().counts, Counts { games: 7, white: 5, draws: 2, black: 0 });
+    drop((grown, cold));
     for dir in [dir, cold_dir] {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
-/// Serves `db`, with the indexes in `dir` as in a data folder; the port and
+/// Serves `db`, with the indexes in `dir` as in a data folder; the bridge,
+/// which a test drops before it changes or removes the files in `dir`, and
 /// the database's id.
-fn serve(db: &TempDb, dir: &Path) -> (u16, String) {
+fn serve(db: &TempDb, dir: &Path) -> (Served, String) {
     let path = db.dir().join("db.2cbh");
     let app = App::new("test", policy(), Catalog::new([path.clone()]));
     app.catalog.use_data_dir(dir);
-    (common::serve(app), id_of(&path))
+    (Served::new(app), id_of(&path))
 }
 
 fn fen_param(fen: &str) -> String {
@@ -371,7 +379,8 @@ fn fen_param(fen: &str) -> String {
 fn the_endpoint_builds_then_answers() {
     let db = database("explorer-http");
     let dir = index_dir("http");
-    let (port, id) = serve(&db, &dir);
+    let (bridge, id) = serve(&db, &dir);
+    let port = bridge.port;
     let url = |fen: &str| format!("/v1/databases/{id}/explorer?fen={}", fen_param(fen));
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     let (status, body) = get(port, &url(start));
@@ -453,6 +462,7 @@ fn the_endpoint_builds_then_answers() {
         assert!(body.contains(r#""parameter":"fen""#), "{body}");
     }
     assert_eq!(get(port, &format!("/v1/databases/0000000000000000/explorer?fen={}", fen_param(start))).0, 404);
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -519,7 +529,8 @@ fn every_notable_game_is_its_games_row_and_its_year() {
     let dir = index_dir("rows");
     let app = App::new("test", policy(), Catalog::new(paths.clone()));
     app.catalog.use_data_dir(&dir);
-    let port = common::serve(app);
+    let bridge = Served::new(app);
+    let port = bridge.port;
     // A PGN file is opened, and each index built, in the background.
     let ready = |path: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -559,6 +570,7 @@ fn every_notable_game_is_its_games_row_and_its_year() {
         assert!(eleven.contains(r#""event":"Riga Club Ch","site":"","date":"????.??.??","round":"3""#), "{eleven}");
         assert!(eleven.contains(r#""annotator":"Nimzowitsch, Aron""#), "{eleven}");
     }
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -569,20 +581,22 @@ fn a_restarted_bridge_answers_from_the_kept_index() {
     let db = database("explorer-restart");
     let dir = index_dir("restart");
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    let (port, id) = serve(&db, &dir);
+    let (first, id) = serve(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(start));
     let deadline = Instant::now() + Duration::from_secs(30);
-    while get(port, &url).0 != 200 {
+    while get(first.port, &url).0 != 200 {
         assert!(Instant::now() < deadline, "the index was not built");
         std::thread::sleep(Duration::from_millis(20));
     }
     let file = dir.join("index").join(format!("{id}.idx"));
     let written = std::fs::metadata(&file).unwrap().modified().unwrap();
-    let (port, _) = serve(&db, &dir);
-    let (status, body) = get(port, &url);
+    drop(first);
+    let (bridge, _) = serve(&db, &dir);
+    let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""games":5,"white":2,"draws":2,"black":1"#), "{body}");
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written, "the file was rewritten");
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -600,6 +614,7 @@ fn chess960_games_never_reach_the_index() {
     // not among the three games of 1.e4.
     let start = idx.lookup(key_after("")).unwrap().unwrap();
     assert_eq!(start.lookup_move("e2e4"), Some(3));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -636,6 +651,7 @@ fn a_promotion_from_a_set_up_position() {
     let s = idx.lookup(before.hash()).unwrap().unwrap();
     assert_eq!(s.lookup_move("a7a8n"), Some(1));
     assert_eq!(s.lookup_move("a7a8q"), None);
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -664,11 +680,10 @@ fn every_position_of_every_game_is_found_at_any_depth() {
     let db = b.write("explorer-deep");
     let dir = index_dir("deep");
     let idx = prepared(&db, &dir);
-    let base = Database::open(db.dir().join("db.2cbh")).unwrap();
     let find = |ucis: &str| {
         let board = board_after(ucis);
         assert!(idx.lookup(board.hash()).unwrap().is_none(), "the tree does not hold it: {ucis}");
-        explorer::deep(&base, &idx, &board).unwrap()
+        explorer::deep(&idx, &board, &Cancel::never()).unwrap()
     };
 
     // Ply 21, reached by game 1 alone: the tree dropped it.
@@ -702,7 +717,8 @@ fn every_position_of_every_game_is_found_at_any_depth() {
     assert_eq!(find(&format!("{one} g8f6 g1f3")), None);
 
     // Through the endpoint, as the analysis panel asks for it.
-    let (port, id) = serve(&db, &dir);
+    let (bridge, id) = serve(&db, &dir);
+    let port = bridge.port;
     let fen = board_after(&one).fen();
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen));
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -718,6 +734,7 @@ fn every_position_of_every_game_is_found_at_any_depth() {
         body.contains(r#""games":2,"white":0,"draws":1,"black":1,"moves":[{"uci":"g8f6","san":"Nf6","games":1"#),
         "{body}"
     );
+    drop((idx, bridge));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -735,14 +752,14 @@ fn a_crowded_bucket_is_counted_whole() {
     let db = b.write("explorer-crowded");
     let dir = index_dir("crowded");
     let idx = prepared(&db, &dir);
-    let base = Database::open(db.dir().join("db.2cbh")).unwrap();
     let board = board_after(&long);
     assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree's depth");
-    let stats = explorer::deep(&base, &idx, &board).unwrap().unwrap();
+    let stats = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
     assert_eq!(stats.counts.games, n as u64);
     assert_eq!(stats.counts.white + stats.counts.draws + stats.counts.black, n as u64);
     // The best rated first: the last games written.
     assert_eq!(stats.top, (n as u32 - 11..=n as u32).rev().collect::<Vec<_>>());
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -762,6 +779,7 @@ fn the_moves_from_the_trees_last_ply_are_listed() {
     assert_eq!(stats.counts.games, 2);
     assert_eq!(stats.lookup_move("h2h3"), Some(1));
     assert_eq!(stats.lookup_move("g2g3"), Some(1));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -798,7 +816,7 @@ fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
         (0..3)
             .map(|_| {
                 let at = Instant::now();
-                let stats = explorer::deep(&base, &idx, board).unwrap();
+                let stats = explorer::deep(&idx, board, &Cancel::never()).unwrap();
                 (at.elapsed(), stats.map(|s| s.counts.games))
             })
             .min()
@@ -809,5 +827,595 @@ fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
     let (missed, none) = time(&never);
     assert_eq!(none, None);
     assert!(found * 5 < missed, "found in {found:?}, missed in {missed:?}");
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The words of `ucis` from the start, or from `fen`; "--" is a null move.
+fn stream_words(fen: Option<&str>, ucis: &str) -> Vec<u16> {
+    let mut board = fen.map_or_else(Board::startpos, |f| Board::from_fen(f).unwrap());
+    let mut out = Vec::new();
+    for uci in ucis.split_whitespace() {
+        if uci == "--" {
+            out.push(movetable::NULL_MOVE);
+            board = board.null_move().unwrap();
+        } else {
+            out.extend(words(&mut board, uci));
+        }
+    }
+    out
+}
+
+/// The 2CBH move record of a game from `fen`, or from the standard start.
+fn move_words(fen: Option<&str>, ucis: &str) -> Vec<u16> {
+    let mut stream = Vec::new();
+    if let Some(fen) = fen {
+        let board = Board::from_fen(fen).unwrap();
+        let castling = [(CColor::White, 1, 0), (CColor::White, 2, 7), (CColor::Black, 4, 0), (CColor::Black, 8, 7)]
+            .iter()
+            .filter(|(c, _, file)| {
+                let side = if *file == 7 { chesscore::CastleSide::Short } else { chesscore::CastleSide::Long };
+                board.castling_rook(*c, side).is_some()
+            })
+            .fold(0u16, |bits, (_, bit, _)| bits | bit);
+        let side = u16::from(board.side_to_move() == CColor::Black);
+        stream.extend([movetable::START_POSITION, 1, side | castling << 8, 0]);
+        for i in 0..64u8 {
+            let sq = chesscore::Square::from_index(i).unwrap();
+            if let Some((p, c)) = board.piece_at(sq) {
+                let color = if c == CColor::White { Color::White } else { Color::Black };
+                let piece = match p {
+                    CPiece::Pawn => Piece::Pawn,
+                    CPiece::Knight => Piece::Knight,
+                    CPiece::Bishop => Piece::Bishop,
+                    CPiece::Rook => Piece::Rook,
+                    CPiece::Queen => Piece::Queen,
+                    CPiece::King => Piece::King,
+                };
+                stream.push(movetable::encode_piece_word(color, piece, i).unwrap());
+            }
+        }
+    }
+    stream.push(MOVES);
+    stream.extend(stream_words(fen, ucis));
+    stream.push(END_OF_LINE);
+    stream
+}
+
+/// Game 7 of [`database`]: 30 plies, past its prefix slot.
+const LINE_30: &str = "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7 e1g1 d5c3 c1c3 e6e5 d1c2 e5e4 f3d2 d7f6 f1e1 c8f5";
+
+/// The move stream (#145) holds every main-line word of each game the index
+/// holds, as the database stores it, in the prefix slot and past it in the
+/// tail, with the game's result and rating; the games the index leaves out,
+/// deleted or Chess960, hold none.
+#[test]
+fn the_stream_holds_every_main_line_word() {
+    let db = database("explorer-stream-words");
+    let dir = index_dir("stream-words");
+    let idx = prepared(&db, &dir);
+    let lines = [
+        Some("e2e4 e7e5 g1f3 b8c6"),
+        Some("e2e4 e7e5 g1f3 b8c6 f1b5"),
+        Some("g1f3 b8c6 e2e4 e7e5"),
+        Some("e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1"),
+        None,
+        None,
+        Some(LINE_30),
+    ];
+    let mut plies = 0;
+    for (n, line) in (1..).zip(lines) {
+        let game = idx.stream.game(n).unwrap();
+        assert_eq!(game.start, None);
+        match line {
+            Some(ucis) => {
+                assert!(game.entry.indexed(), "game {n}");
+                assert_eq!(game.words, stream_words(None, ucis), "game {n}");
+                plies += game.words.len() as u64;
+            }
+            None => assert!(!game.entry.indexed() && game.words.is_empty(), "game {n}"),
+        }
+    }
+    let first = idx.stream.entry(1).unwrap();
+    assert_eq!((first.elo(), first.outcome()), (2350, explorer::format::Outcome::White));
+    assert_eq!(idx.stream.entry(3).unwrap().elo(), 2100, "the one rating known");
+    let h = idx.stream.header;
+    assert_eq!((h.first_record, h.last_record, h.games, h.plies), (1, 7, 5, plies));
+    assert_eq!((h.generation, h.build_id), (idx.generation, idx.base.header.build_id));
+    drop(idx);
+    // The deep fixture's long lines, each past its prefix slot.
+    let long = format!("e2e4 e7e5 {}d2d3", hops(15));
+    let mut b = Builder::new();
+    game(&mut b, &long, 2, (2500, 2400));
+    game(&mut b, &format!("{}a2a3", hops(20)), 1, (2300, 2300));
+    let deep = b.write("explorer-stream-words-long");
+    let deep_dir = index_dir("stream-words-long");
+    let idx = prepared(&deep, &deep_dir);
+    assert_eq!(idx.stream.game(1).unwrap().words, stream_words(None, &long));
+    assert_eq!(idx.stream.game(2).unwrap().words.len(), 81);
+    drop(idx);
+    for dir in [dir, deep_dir] {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// A set-up game's start is stored in its tail and replayed from there: a
+/// position of it past the tree is found, although its start lacks the home
+/// pawns a standard game would have to lose first.
+#[test]
+fn a_set_up_start_is_stored_and_replayed() {
+    let fen = "4k3/8/8/8/8/8/P7/4K3 w - - 0 1";
+    let ucis = format!("{}a2a4 e8d8 e1f2", "e1d1 e8d8 d1e1 d8e8 ".repeat(6));
+    let mut b = Builder::new();
+    let at = b.moves(1, &move_words(Some(fen), &ucis));
+    b.game(at)[0x58] = 1;
+    let db = b.write("explorer-stream-setup");
+    let dir = index_dir("stream-setup");
+    let idx = prepared(&db, &dir);
+    let game = idx.stream.game(1).unwrap();
+    assert!(game.entry.indexed() && game.entry.setup());
+    let start = Board::from_fen(fen).unwrap();
+    assert_eq!(game.start.as_ref().map(Board::hash), Some(start.hash()));
+    assert_eq!(game.words, stream_words(Some(fen), &ucis));
+    // Ply 25, after 13. a4, and the move played from it.
+    let mut board = start;
+    for uci in ucis.split_whitespace().take(25) {
+        board.play_checked(uci.parse().unwrap()).unwrap();
+    }
+    assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree");
+    let found = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    assert_eq!(found.counts, Counts { games: 1, white: 0, draws: 1, black: 0 });
+    assert_eq!(found.lookup_move("e8d8"), Some(1));
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A null move ends a line in the stream as in the tree, and so does damage:
+/// the words before it are kept, and nothing after it.
+#[test]
+fn a_null_move_and_damage_end_a_line() {
+    let mut b = Builder::new();
+    let at = b.moves(1, &move_words(None, "e2e4 e7e5 -- b8c6"));
+    b.game(at);
+    let mut damaged = move_words(None, "d2d4 d7d5");
+    // A white queen from h5, where none stands, then a move that would be legal.
+    damaged.insert(damaged.len() - 1, quiet(Color::White, Piece::Queen, "h5", "h6"));
+    damaged.insert(damaged.len() - 1, stream_words(Some(&board_after("d2d4 d7d5").fen()), "c2c4")[0]);
+    let at = b.moves(1, &damaged);
+    b.game(at);
+    let db = b.write("explorer-stream-ends");
+    let dir = index_dir("stream-ends");
+    let idx = prepared(&db, &dir);
+    assert_eq!(idx.stream.game(1).unwrap().words, stream_words(None, "e2e4 e7e5"));
+    assert_eq!(idx.stream.game(2).unwrap().words, stream_words(None, "d2d4 d7d5"));
+    assert_eq!(idx.stream.entry(2).unwrap().plies, 2);
+    for (ucis, key) in [("e2e4 e7e5", key_after("e2e4 e7e5")), ("d2d4 d7d5", key_after("d2d4 d7d5"))] {
+        let stats = idx.lookup(key).unwrap().unwrap();
+        assert!(stats.moves.is_empty(), "no move from the last position of {ucis}");
+    }
+    assert_eq!(idx.stream.header.plies, 4);
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A game in the three formats: its start (the standard one without), its
+/// moves in UCI with "--" for a null move, its result (0 black, 1 draw, 2
+/// white) and ratings.
+struct Same {
+    fen: Option<&'static str>,
+    ucis: String,
+    result: u8,
+    elo: (u16, u16),
+}
+
+fn same_games() -> Vec<Same> {
+    let game = |fen, ucis: &str, result, elo| Same { fen, ucis: ucis.to_string(), result, elo };
+    vec![
+        game(None, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1 g8f6 d2d3 e8g8", 2, (2400, 2300)),
+        game(None, LINE_30, 1, (2200, 0)),
+        game(None, "e2e4 a7a6 e4e5 d7d5 e5d6 c7d6", 0, (0, 1800)),
+        game(None, "a2a4 b7b5 a4b5 a7a6 b5a6 c8b7 a6b7 b8c6 b7a8q d8a8", 2, (2600, 2650)),
+        game(Some("4k3/8/8/8/8/8/P7/4K3 w - - 0 1"), "a2a4 e8d8 a4a5", 1, (2000, 2000)),
+        game(Some("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1"), "e8c8 e1g1 d8d1 f1d1", 0, (1900, 2100)),
+        game(None, "d2d4 -- c2c4 d7d5", 1, (2100, 2100)),
+        game(None, &format!("{}h2h3", hops(8)), 1, (1500, 1600)),
+    ]
+}
+
+/// The PGN text of `games`.
+fn same_pgn(games: &[Same]) -> String {
+    let mut text = String::new();
+    for (n, g) in games.iter().enumerate() {
+        let result = ["0-1", "1/2-1/2", "1-0"][usize::from(g.result)];
+        text.push_str(&format!("[Event \"{n}\"]\n[Result \"{result}\"]\n"));
+        for (tag, elo) in [("WhiteElo", g.elo.0), ("BlackElo", g.elo.1)] {
+            if elo > 0 {
+                text.push_str(&format!("[{tag} \"{elo}\"]\n"));
+            }
+        }
+        if let Some(fen) = g.fen {
+            text.push_str(&format!("[SetUp \"1\"]\n[FEN \"{fen}\"]\n"));
+        }
+        text.push('\n');
+        let mut board = g.fen.map_or_else(Board::startpos, |f| Board::from_fen(f).unwrap());
+        for (i, uci) in g.ucis.split_whitespace().enumerate() {
+            let white = board.side_to_move() == CColor::White;
+            if white || i == 0 {
+                text.push_str(&format!("{}{} ", board.fullmove_number(), if white { "." } else { "..." }));
+            }
+            if uci == "--" {
+                text.push_str("-- ");
+                board = board.null_move().unwrap();
+                continue;
+            }
+            let mut mv: Move = uci.parse().unwrap();
+            if board.piece_at(mv.from).map(|p| p.0) == Some(CPiece::King) && mv.from.file().abs_diff(mv.to.file()) == 2
+            {
+                mv.to = chesscore::Square::new(if mv.to.file() == 6 { 7 } else { 0 }, mv.from.rank());
+            }
+            text.push_str(&format!("{} ", cbformat::pgn::san(&board, mv)));
+            board.play_checked(mv).unwrap();
+        }
+        text.push_str(&format!("{result}\n\n"));
+    }
+    text
+}
+
+/// The classic record of `g`.
+fn same_classic(b: &mut fixture_cbh::Builder, g: &Same) {
+    let start = g.fen.map_or_else(Board::startpos, |f| Board::from_fen(f).unwrap());
+    let mut board = start.clone();
+    let mut toks = Vec::new();
+    for uci in g.ucis.split_whitespace() {
+        if uci == "--" {
+            toks.push("--".to_string());
+            board = board.null_move().unwrap();
+            continue;
+        }
+        let mut mv: Move = uci.parse().unwrap();
+        let castles =
+            board.piece_at(mv.from).map(|p| p.0) == Some(CPiece::King) && mv.from.file().abs_diff(mv.to.file()) == 2;
+        toks.push(match castles {
+            true if mv.to.file() == 6 => "O-O".to_string(),
+            true => "O-O-O".to_string(),
+            false => uci.to_string(),
+        });
+        if castles {
+            mv.to = chesscore::Square::new(if mv.to.file() == 6 { 7 } else { 0 }, mv.from.rank());
+        }
+        board.play_checked(mv).unwrap();
+    }
+    let mut stream: Vec<Tok<'_>> = toks.iter().map(|t| Tok::Mv(t)).collect();
+    stream.push(Tok::End);
+    let moves = encode(&start, &stream, 0, false);
+    let record = match g.fen {
+        None => move_record(0, None, None, &moves),
+        Some(_) => {
+            let names: Vec<String> = (0..64u8).map(|i| format!("{}{}", (b'a' + i % 8) as char, i / 8 + 1)).collect();
+            let pieces: Vec<(&str, CPiece, CColor)> = names
+                .iter()
+                .filter_map(|n| start.piece_at(n.parse().unwrap()).map(|(p, c)| (n.as_str(), p, c)))
+                .collect();
+            let castling = [(CColor::White, 2, 0), (CColor::White, 1, 7), (CColor::Black, 8, 0), (CColor::Black, 4, 7)]
+                .iter()
+                .filter(|(c, _, file)| {
+                    let side = if *file == 7 { chesscore::CastleSide::Short } else { chesscore::CastleSide::Long };
+                    start.castling_rook(*c, side).is_some()
+                })
+                .fold(0u8, |bits, (_, bit, _)| bits | bit);
+            let position = start_position(&pieces, start.side_to_move() == CColor::Black, castling, 0);
+            move_record(0x40, Some(&position), None, &moves)
+        }
+    };
+    let rec = b.game(&record);
+    rec[0x1b] = g.result;
+    rec[0x1f..0x21].copy_from_slice(&g.elo.0.to_be_bytes());
+    rec[0x21..0x23].copy_from_slice(&g.elo.1.to_be_bytes());
+}
+
+/// 2CBH, classic and PGN copies of the same games give the same stream, byte
+/// for byte past the generation and the build id: one format for all three,
+/// set-up starts, castling, en passant, promotions and null moves included.
+#[test]
+fn every_format_gives_the_same_stream() {
+    let games = same_games();
+    let mut b = Builder::new();
+    for g in &games {
+        let at = b.moves(1, &move_words(g.fen, &g.ucis));
+        let rec = b.game(at);
+        rec[0x58] = g.result;
+        rec[0x60..0x62].copy_from_slice(&(g.elo.0 as i16).to_le_bytes());
+        rec[0x70..0x72].copy_from_slice(&(g.elo.1 as i16).to_le_bytes());
+    }
+    let two = b.write("explorer-stream-2cbh");
+    let mut c = fixture_cbh::Builder::new();
+    for g in &games {
+        same_classic(&mut c, g);
+    }
+    let classic = c.write("explorer-stream-cbh");
+    let pgn = cbformat::fixture::pgn_file("explorer-stream-pgn", same_pgn(&games).as_bytes());
+    let (pgn_path, pgn_index) = (pgn.dir().join("db.pgn"), pgn.dir().join("db.head"));
+    let page = cbformat::codepage::CodePage::WESTERN;
+    cbformat::pgnfile::build(&pgn_path, &pgn_index, 1, page, &mut |_| true).unwrap();
+    let pgn_db = cbformat::pgnfile::Database::open(&pgn_path, &pgn_index, 1, page).unwrap();
+    let dirs = [index_dir("stream-2cbh"), index_dir("stream-cbh"), index_dir("stream-pgn")];
+    let built = [
+        explorer::prepare(&Database::open(two.dir().join("db.2cbh")).unwrap(), 1, &dirs[0], "db", &Progress::default()),
+        explorer::prepare(
+            &cbh::Database::open(classic.dir().join("db.cbh")).unwrap(),
+            2,
+            &dirs[1],
+            "db",
+            &Progress::default(),
+        ),
+        explorer::prepare(&pgn_db, 3, &dirs[2], "db", &Progress::default()),
+    ]
+    .map(Result::unwrap);
+    let two_cbh = &built[0];
+    assert_eq!(two_cbh.stream.header.games, games.len() as u64);
+    // Each game's line is as written, to its null move.
+    for (n, g) in (1..).zip(&games) {
+        let ucis = g.ucis.split(" --").next().unwrap();
+        assert_eq!(two_cbh.stream.game(n).unwrap().words, stream_words(g.fen, ucis), "game {n}");
+        assert_eq!(two_cbh.stream.entry(n).unwrap().setup(), g.fen.is_some(), "game {n}");
+    }
+    let bytes = |l: &Loaded| std::fs::read(&l.stream.path).unwrap();
+    let reference = bytes(two_cbh);
+    for (l, format) in built[1..].iter().zip(["classic", "PGN"]) {
+        let other = bytes(l);
+        assert_eq!(l.stream.header.build_id, l.base.header.build_id);
+        assert_eq!(other[48..124], reference[48..124], "the {format} header's counts and layout");
+        assert_eq!(other[128..], reference[128..], "the {format} stream");
+    }
+    drop(built);
+    for dir in dirs {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The games of [`every_position_of_every_game_is_found_at_any_depth`]: one
+/// alone past the tree's pruning ply, and one past its depth.
+fn deep_games(name: &str) -> TempDb {
+    let line7 = "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7";
+    let mut b = Builder::new();
+    game(&mut b, &format!("{line7} e1g1 d5c3 c1c3"), 1, (2200, 2200));
+    game(&mut b, &format!("e2e4 e7e5 {}d2d3", hops(15)), 2, (2500, 2400));
+    b.lid(lid_header(1024, 1));
+    b.write(name)
+}
+
+/// Waits for a `200` answer to `path`: the index is built meanwhile.
+fn answered(port: u16, path: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, body) = get(port, path);
+        if status == 200 {
+            return body;
+        }
+        assert_eq!(status, 409, "{body}");
+        assert!(Instant::now() < deadline, "the index was not built: {body}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A stream record that fails its CRC, in its slot or in its tail, is found
+/// when a replay reads it: nothing is answered from it, the answer is `409`
+/// while both files are built again, and the next answers come from the new
+/// build.
+#[test]
+fn a_stream_record_that_fails_its_crc_is_rebuilt() {
+    let db = deep_games("explorer-stream-crc");
+    let dir = index_dir("stream-crc");
+    let (bridge, id) = serve(&db, &dir);
+    let ucis = format!("e2e4 e7e5 {}d2d3", hops(15));
+    let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after(&ucis).fen()));
+    let found = r#""games":1,"white":1,"draws":0,"black":0"#;
+    assert!(answered(bridge.port, &url).contains(found));
+    // Dropped, the bridge maps the stream no longer, which on Windows would
+    // keep the next bridge from replacing it.
+    drop(bridge);
+    let path = dir.join("index").join(format!("{id}.moves"));
+    for part in ["slot", "tail"] {
+        let before = std::fs::read(&path).unwrap();
+        let header = explorer::stream::Header::decode(&before).unwrap();
+        // Game 2's slot, 64 bytes into the only block, which the table at
+        // the file's end places: a word of its prefix, or of its tail.
+        let table = header.table_offset as usize;
+        let block = u64::from_le_bytes(before[table..table + 8].try_into().unwrap()) as usize;
+        let slot = block + 64;
+        let at = match part {
+            "slot" => slot + 16 + 6,
+            _ => 2 * u32::from_le_bytes(before[slot..slot + 4].try_into().unwrap()) as usize + 10,
+        };
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(at as u64)).unwrap();
+        file.write_all(&[before[at] ^ 0x5a]).unwrap();
+        drop(file);
+        // A bridge started now opens the files, whose header and table are
+        // sound, and finds the damage on the first replay.
+        let (bridge, _) = serve(&db, &dir);
+        let (status, body) = get(bridge.port, &url);
+        assert_eq!(status, 409, "{part}: {body}");
+        assert!(body.contains("rebuilt"), "{part}: {body}");
+        assert!(answered(bridge.port, &url).contains(found), "{part}");
+        let after = explorer::stream::Header::decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_ne!(after.build_id, header.build_id, "{part}: built again");
+        let direct = {
+            let loaded = explorer::prepare(
+                &Database::open(db.dir().join("db.2cbh")).unwrap(),
+                after.generation,
+                &dir.join("index"),
+                &id,
+                &Progress::default(),
+            )
+            .unwrap();
+            loaded.stream.header
+        };
+        assert_eq!(direct, after, "{part}: the new files are kept");
+        // Dropped before the next part changes the stream it maps.
+        drop(bridge);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Games of three blocks, which the build's workers write in any order:
+/// every game's line reads back whole, and a position past the tree is found
+/// in all the games of every block that reach it.
+#[test]
+fn a_stream_of_many_blocks_holds_every_game() {
+    let games = 2 * explorer::stream::BATCH as u32 + 300;
+    let mut b = Builder::new();
+    let long = format!("e2e4 e7e5 {}d2d3", hops(15));
+    for n in 1..=games {
+        match n % 3 {
+            0 => game(&mut b, &long, 2, (2000, 2000)),
+            1 => game(&mut b, "d2d4 d7d5", 1, (2000, 2000)),
+            _ => game(&mut b, "e2e4", 0, (2000, 2000)),
+        };
+    }
+    let db = b.write("explorer-stream-blocks");
+    let dir = index_dir("stream-blocks");
+    let idx = prepared(&db, &dir);
+    assert_eq!((idx.stream.header.games, idx.stream.header.blocks), (u64::from(games), 3));
+    for n in 1..=games {
+        let ucis = ["", "d2d4 d7d5", "e2e4"][n as usize % 3];
+        let ucis = if ucis.is_empty() { long.as_str() } else { ucis };
+        assert_eq!(idx.stream.game(n).unwrap().words, stream_words(None, ucis), "game {n}");
+    }
+    let found = explorer::deep(&idx, &board_after(&long), &Cancel::never()).unwrap().unwrap();
+    assert_eq!(found.counts.games, u64::from(games / 3));
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An index and a stream of different builds are never used together: either
+/// file from another build of the same database and generation rebuilds both.
+#[test]
+fn files_from_different_builds_are_rebuilt() {
+    let db = deep_games("explorer-stream-builds");
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let (dir, other) = (index_dir("stream-builds"), index_dir("stream-builds-other"));
+    let ids = |dir: &Path| {
+        let l = explorer::prepare(&d, 1, dir, "db", &Progress::default()).unwrap();
+        (l.base.header.build_id, l.stream.header.build_id)
+    };
+    let (a, _) = ids(&dir);
+    let (b, _) = ids(&other);
+    assert_ne!(a, b);
+    for name in ["db.moves", "db.idx"] {
+        std::fs::copy(other.join(name), dir.join(name)).unwrap();
+        let progress = Progress::default();
+        let again = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
+        assert_eq!(progress.phase(), "merging", "{name} of another build: built again");
+        assert_eq!(again.stream.header.build_id, again.base.header.build_id);
+        let alone = explorer::deep(&again, &board_after(&format!("e2e4 e7e5 {}d2d3", hops(15))), &Cancel::never());
+        assert_eq!(alone.unwrap().unwrap().counts.games, 1);
+    }
+    // A stream missing: both are built again.
+    std::fs::remove_file(dir.join("db.moves")).unwrap();
+    let progress = Progress::default();
+    drop(explorer::prepare(&d, 1, &dir, "db", &progress).unwrap());
+    assert_eq!(progress.phase(), "merging");
+    // Both as built: used as they are.
+    let progress = Progress::default();
+    drop(explorer::prepare(&d, 1, &dir, "db", &progress).unwrap());
+    assert_eq!(progress.phase(), "checking");
+    for dir in [dir, other] {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// A line past the tree only ever loses men, pawns and home pawns, so those
+/// alone end a replay early: the pieces of each kind do not, since a
+/// promotion adds one. A queen taken and a pawn promoted to a queen later, a
+/// third knight and a second bishop on the same squares are each found.
+#[test]
+fn positions_after_a_promotion_are_found() {
+    // 1.e4 e5 2.Qh5 Nc6 3.Qxf7+ Kxf7 4.a4 b5 5.axb5 a6 6.bxa6 Bb7 7.axb7 Nf6
+    // 8.bxa8, from ply 8.
+    let before = format!("{}e2e4 e7e5 d1h5 b8c6 h5f7 e8f7 a2a4 b7b5 a4b5 a7a6 b5a6 c8b7 a6b7 g8f6", hops(2));
+    let promotions = ["b7a8q", "b7a8n", "b7a8b"];
+    let mut b = Builder::new();
+    for (i, p) in promotions.iter().enumerate() {
+        game(&mut b, &format!("{before} {p} f8e7"), i as u8, (2000 + i as i16, 2000));
+    }
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-stream-promotions");
+    let dir = index_dir("stream-promotions");
+    let idx = prepared(&db, &dir);
+    for (i, p) in promotions.iter().enumerate() {
+        let board = board_after(&format!("{before} {p}"));
+        assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree: {p}");
+        let found = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap_or_else(|| panic!("{p} not found"));
+        assert_eq!((found.counts.games, found.top.clone()), (1, vec![i as u32 + 1]), "{p}");
+        assert_eq!(found.lookup_move("f8e7"), Some(1), "{p}");
+    }
+    let queens = board_after(&format!("{before} b7a8q"));
+    assert_eq!(queens.colored(CPiece::Queen, CColor::White).count_ones(), 1, "the queen taken, then a new one");
+    let knights = board_after(&format!("{before} b7a8n"));
+    assert_eq!(knights.colored(CPiece::Knight, CColor::White).count_ones(), 3);
+    let bishops = board_after(&format!("{before} b7a8b")).colored(CPiece::Bishop, CColor::White);
+    const LIGHT: u64 = 0x55aa_55aa_55aa_55aa;
+    assert_eq!((bishops & LIGHT).count_ones(), 2, "two bishops on light squares");
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A replay whose request was superseded stops at its next game, and is
+/// answered as busy.
+#[test]
+fn a_superseded_replay_stops() {
+    let long = format!("e2e4 e7e5 {}d2d3", hops(15));
+    let mut b = Builder::new();
+    for _ in 0..300 {
+        game(&mut b, &long, 1, (2000, 2000));
+    }
+    let db = b.write("explorer-stream-cancel");
+    let dir = index_dir("stream-cancel");
+    let idx = prepared(&db, &dir);
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let old = Cancel::newest(&latest);
+    let board = board_after(&long);
+    assert_eq!(explorer::deep(&idx, &board, &old).unwrap().unwrap().counts.games, 300);
+    let _newer = Cancel::newest(&latest);
+    assert!(matches!(explorer::deep(&idx, &board, &old), Err(Bad::Busy)));
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// On Windows a mapped file cannot be replaced: a rebuild waits for an answer
+/// still in flight with the old stream mapped, which reads it unchanged
+/// meanwhile, then replaces it.
+#[cfg(windows)]
+#[test]
+fn a_rebuild_replaces_a_stream_still_mapped_by_an_answer_in_flight() {
+    let dir = index_dir("stream-mapped");
+    let db = five("explorer-stream-mapped", "e2e4", &[]);
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let old = explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap();
+    drop(d);
+    let (started, rebuilding) = std::sync::mpsc::channel::<()>();
+    let answer = std::thread::spawn(move || {
+        // An answer that reads the old stream throughout the rebuild.
+        rebuilding.recv().unwrap();
+        let until = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < until {
+            assert_eq!(old.stream.game(1).unwrap().words, stream_words(None, "e2e4 e7e5"));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(old);
+    });
+    let db2 = five("explorer-stream-mapped", "d2d4", &[]);
+    let d = Database::open(db2.dir().join("db.2cbh")).unwrap();
+    started.send(()).unwrap();
+    let new = explorer::prepare(&d, 2, &dir, "db", &Progress::default()).unwrap();
+    answer.join().unwrap();
+    assert_eq!((new.generation, new.stream.header.generation), (2, 2));
+    assert_eq!(new.stream.header.build_id, new.base.header.build_id);
+    let start = new.lookup(key_after("")).unwrap().unwrap();
+    assert_eq!((start.lookup_move("e2e4"), start.lookup_move("d2d4")), (Some(4), Some(1)));
+    assert_eq!(new.stream.game(1).unwrap().words, stream_words(None, "d2d4 e7e5"));
+    assert!(!dir.join("db.moves.partial").exists());
+    drop(new);
     std::fs::remove_dir_all(&dir).unwrap();
 }
