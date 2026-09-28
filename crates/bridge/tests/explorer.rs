@@ -398,13 +398,18 @@ fn the_endpoint_builds_then_answers() {
     );
     assert!(body.contains(r#""index":{"records":7,"games":5}"#), "{body}");
     // A game without a date.
-    assert!(body.contains(r#""result":"1/2-1/2","year":null,"date":"????.??.??","event":""}"#), "{body}");
+    assert!(
+        body.contains(
+            r#""date":"????.??.??","round":"","annotator":"","flags":{"deleted":false,"chess960":false},"year":null}"#
+        ),
+        "{body}"
+    );
     // Castling is written as the king's two-square step.
     let before = "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
     let (status, body) = get(port, &url(before));
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""uci":"e1g1","san":"O-O""#), "{body}");
-    assert!(body.contains(r#""topGames":[{"number":4,"white":"","black":"","whiteElo":1500,"blackElo":1500,"result":"1-0","year":2003,"date":"2003.07.??","event":""}]"#), "{body}");
+    assert!(body.contains(r#""topGames":[{"number":4,"kind":"game","white":"","whiteElo":1500,"black":"","blackElo":1500,"result":"1-0","moves":0,"eco":"","event":"","site":"","date":"2003.07.??","round":"","annotator":"","flags":{"deleted":false,"chess960":false},"year":2003}]"#), "{body}");
     // A position no game reached.
     let (status, body) = get(port, &url("4k3/8/8/8/8/8/8/4K3 w - - 0 1"));
     assert_eq!(
@@ -449,6 +454,112 @@ fn the_endpoint_builds_then_answers() {
     }
     assert_eq!(get(port, &format!("/v1/databases/0000000000000000/explorer?fen={}", fen_param(start))).0, 404);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The objects of the array member `key` of the JSON text `body`, each as its
+/// text: a scan that keeps to strings and nesting.
+fn objects<'a>(body: &'a str, key: &str) -> Vec<&'a str> {
+    let open = format!(r#""{key}":["#);
+    let rest = &body[body.find(&open).unwrap_or_else(|| panic!("no {key} in {body}")) + open.len()..];
+    let (mut out, mut depth, mut from, mut in_string, mut escaped) = (Vec::new(), 0, 0, false, false);
+    for (at, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ if in_string => {}
+            '{' => {
+                if depth == 0 {
+                    from = at;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(&rest[from..=at]);
+                }
+            }
+            ']' if depth == 0 => return out,
+            _ => {}
+        }
+    }
+    panic!("{key} is not closed in {body}")
+}
+
+/// The `number` a row or a notable game begins with.
+fn number_of(object: &str) -> u32 {
+    let digits = object.strip_prefix(r#"{"number":"#).unwrap_or_else(|| panic!("no number first in {object}"));
+    digits[..digits.find(',').unwrap()].parse().unwrap()
+}
+
+/// Every notable game is its `/games` row whole, then `year` for clients
+/// written before rows (#144). In a 2CBH, a classic and a PGN database, each
+/// `topGames` entry is its number's row, member for member and value for
+/// value, plus `year`: the year of the row's `date`, `null` when it has none.
+#[test]
+fn every_notable_game_is_its_games_row_and_its_year() {
+    // A game dated without a year, beside the fixture's.
+    let extra = [
+        "11 | game | Tal, Mikhail | Morphy, Paul | Riga Club Ch | ????.??.?? | 3 | 1-0 | B20 | 20 | 2400 | 0 | Nimzowitsch, Aron",
+    ];
+    let two = common::fixture("explorer-rows-2cbh", &extra);
+    let classic = common::classic_fixture("explorer-rows-cbh", &extra);
+    // A PGN file holds games only: the guiding text and the deleted game are games there.
+    let pgn_rows: Vec<String> = common::rows(&extra)
+        .into_iter()
+        .map(|line| {
+            let mut f: Vec<&str> = line.split('|').map(str::trim).collect();
+            f[1] = "game";
+            f.join(" | ")
+        })
+        .collect();
+    let pgn = common::pgn_fixture("explorer-rows-pgn", &pgn_rows);
+    let paths = [two.dir().join("db.2cbh"), classic.dir().join("db.cbh"), pgn.dir().join("db.pgn")];
+    let dir = index_dir("rows");
+    let app = App::new("test", policy(), Catalog::new(paths.clone()));
+    app.catalog.use_data_dir(&dir);
+    let port = common::serve(app);
+    // A PGN file is opened, and each index built, in the background.
+    let ready = |path: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) = get(port, path);
+            if status != 409 {
+                assert_eq!(status, 200, "{path}: {body}");
+                return body;
+            }
+            assert!(Instant::now() < deadline, "{path} stayed {body}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let start = fen_param("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    // Games 1-7, 10 and 11 are indexed, and in the PGN file 8 and 9 as well.
+    for (path, indexed) in paths.iter().zip([9, 9, 11]) {
+        let id = id_of(path);
+        let format = path.extension().unwrap().to_str().unwrap();
+        let answer = ready(&format!("/v1/databases/{id}/explorer?fen={start}"));
+        let list = ready(&format!("/v1/databases/{id}/games?limit=500"));
+        let rows = objects(&list, "rows");
+        let top = objects(&answer, "topGames");
+        assert_eq!(top.len(), indexed, "{format}: {answer}");
+        for entry in &top {
+            let row = rows.iter().find(|r| number_of(r) == number_of(entry)).unwrap();
+            let date = &row[row.find(r#""date":""#).unwrap() + 8..][..10];
+            let year = date[..4].parse::<u16>().map_or("null".to_string(), |y| y.to_string());
+            assert_eq!(*entry, format!("{},\"year\":{year}}}", &row[..row.len() - 1]), "{format}");
+        }
+        let year = |n: u32| {
+            let entry = top.iter().find(|e| number_of(e) == n).unwrap();
+            entry[entry.rfind(r#""year":"#).unwrap() + 7..entry.len() - 1].to_string()
+        };
+        assert_eq!([year(1), year(7), year(11)], ["1858", "1951", "null"], "{format}: {answer}");
+        let eleven = top.iter().find(|e| number_of(e) == 11).unwrap();
+        assert!(eleven.contains(r#""white":"Tal, Mikhail","whiteElo":2400,"black":"Morphy, Paul""#), "{eleven}");
+        assert!(eleven.contains(r#""event":"Riga Club Ch","site":"","date":"????.??.??","round":"3""#), "{eleven}");
+        assert!(eleven.contains(r#""annotator":"Nimzowitsch, Aron""#), "{eleven}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A bridge started again answers from the first request with the index the

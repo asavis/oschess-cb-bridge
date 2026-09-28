@@ -3,14 +3,16 @@
 
 use chesscore::{Board, Move, Piece};
 
+use cbformat::game::RecordKind;
 use cbformat::pgn::san;
 use cbformat::view::Base;
 
-use crate::api::{App, clip};
+use crate::api::App;
 use crate::catalog::Entry;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
+use crate::rows::{Names, row_obj};
 use crate::search::SearchError;
 use crate::search::memory::Cancel;
 use crate::search::workers::{self, threads};
@@ -101,11 +103,15 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
         let mv = unpack_move(board, *code).filter(|&mv| board.is_legal(mv))?;
         Some(counts(Obj::new().str("uci", &uci(board, mv)).str("san", &san(board, mv)), c).done())
     });
-    let mut top: Vec<(u16, u32, std::sync::Arc<str>)> = stats
-        .top
-        .iter()
-        .filter_map(|&n| loaded.game(n, || with_store!(db, db => top_game(db, n))).map(|(elo, json)| (elo, n, json)))
-        .collect();
+    let mut top: Vec<(u16, u32, std::sync::Arc<str>)> = with_store!(db, db => {
+        // The names of one answer's games, read once for all of them.
+        let mut names = Names::new(db);
+        stats
+            .top
+            .iter()
+            .filter_map(|&n| loaded.game(n, || top_game(db, &mut names, n)).map(|(elo, json)| (elo, n, json)))
+            .collect()
+    });
     top.sort_unstable_by_key(|t| std::cmp::Reverse((t.0, t.1)));
     top.dedup_by_key(|t| t.1);
     top.truncate(TOP_GAMES);
@@ -244,23 +250,16 @@ pub fn uci(board: &Board, mv: Move) -> String {
     mv.to_string()
 }
 
-/// Game `number`'s rating, for ranking, and its entry in `topGames`.
-fn top_game<S: Store>(db: &S, number: u32) -> Option<(u16, String)> {
+/// Game `number`'s rating, for ranking, and its entry in `topGames`: its
+/// `/games` row whole, and the year of its date for clients written before
+/// rows (#144). `None` when the row cannot be read.
+fn top_game<S: Store>(db: &S, names: &mut Names<'_, S>, number: u32) -> Option<(u16, String)> {
     let r = db.record(number).ok()?;
-    let name = |id: i64| db.player(id).ok().flatten().map(|p| clip(p.pgn())).unwrap_or_default();
-    let event = db.tournament(r.tournament()).ok().flatten().map(|t| clip(t.title)).unwrap_or_default();
-    let date = r.played_date();
-    let year = date.year();
-    let (white_elo, black_elo) = r.elo();
-    let o = Obj::new()
-        .num("number", i64::from(number))
-        .str("white", &name(r.white()))
-        .str("black", &name(r.black()))
-        .num("whiteElo", i64::from(white_elo.max(0)))
-        .num("blackElo", i64::from(black_elo.max(0)))
-        .str("result", r.result().pgn());
-    let o = if year == 0 { o.raw("year", "null") } else { o.num("year", i64::from(year)) };
-    Some((average_elo(&r), o.str("date", &date.pgn()).str("event", &event).done()))
+    let row = row_obj(names, &r).ok()?;
+    // Only a game's header holds a date; any other record's row has `????.??.??`.
+    let year = if matches!(r.kind(), RecordKind::Game) { r.played_date().year() } else { 0 };
+    let row = if year == 0 { row.raw("year", "null") } else { row.num("year", i64::from(year)) };
+    Some((average_elo(&r), row.done()))
 }
 
 #[cfg(test)]

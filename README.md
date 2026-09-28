@@ -139,7 +139,8 @@ it over HTTP as oschess does:
   in both forms;
 - the position index's build in the `--index` folder, which must be new or
   empty so that the build is measured, a lookup per move along the most played
-  line and opening it again in a new bridge;
+  line, how many of the notable games those lookups name are their `/games`
+  row whole, and opening it again in a new bridge;
 - when `--engine <exe>` names a UCI engine, a 5-second search: the time to its
   first line, and the lines a second;
 - a small answer over a kept and over a new connection.

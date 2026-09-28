@@ -27,6 +27,7 @@ pub mod log;
 pub mod pairing;
 pub mod pgnindex;
 pub mod reply;
+pub mod rows;
 pub mod search;
 pub mod server;
 pub mod sha256;

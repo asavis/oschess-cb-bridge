@@ -73,3 +73,32 @@ fn no_index_is_built_in_the_data_folder() {
     assert!(written.is_empty(), "{written:?} in the data folder\n{text}");
     assert!(index.join("pgn").is_dir(), "{text}");
 }
+
+/// Every notable game the lookups name is checked against its `/games` row
+/// (#144), and the count says how many are that row whole, then `year`.
+#[test]
+fn notable_games_are_counted_as_whole_rows() {
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+
+    let mut b = Builder::new();
+    let e4 = quiet(Color::White, Piece::Pawn, "e2", "e4");
+    let e5 = quiet(Color::Black, Piece::Pawn, "e7", "e5");
+    let open = b.moves(1, &[movetable::MOVES, e4, e5, movetable::END_OF_LINE]);
+    b.game(open)[0xbc..0xc0].copy_from_slice(&((1951i32 << 9) | (7 << 5) | 1).to_le_bytes());
+    let short = b.moves(1, &[movetable::MOVES, e4, movetable::END_OF_LINE]);
+    b.game(short);
+    let db = b.write("cbtool-profile-rows");
+    let out = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(db.dir().join("db.2cbh"))
+        .arg("--index")
+        .arg(db.dir().join("index"))
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // The lookups: from the start and after 1. e4, both games; after 1... e5,
+    // the first, and no move from there.
+    assert!(text.contains("topGames entries with every row field: 5 of 5"), "{text}");
+    assert!(out.status.success(), "{text}");
+}
