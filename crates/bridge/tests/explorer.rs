@@ -37,14 +37,16 @@ fn game<'a>(b: &'a mut Builder, ucis: &str, result: u8, elo: (i16, i16)) -> &'a 
 }
 
 /// Games 1-3 reach the position after 1.e4 e5 2.Nf3 Nc6, game 3 by another
-/// order; game 4 castles; game 5 is deleted; game 6 is Chess960 from the
-/// standard arrangement; game 7 is 30 plies long and alone past its fourth.
+/// order; game 4 castles, played in a known month on an unknown day; game 5 is
+/// deleted; game 6 is Chess960 from the standard arrangement; game 7 is 30
+/// plies long and alone past its fourth.
 fn database(name: &str) -> TempDb {
     let mut b = Builder::new();
     game(&mut b, "e2e4 e7e5 g1f3 b8c6", 2, (2400, 2300));
     game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1b5", 1, (2600, 2600));
     game(&mut b, "g1f3 b8c6 e2e4 e7e5", 0, (0, 2100));
-    game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1", 2, (1500, 1500));
+    let castles = game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1", 2, (1500, 1500));
+    castles[0xbc..0xc0].copy_from_slice(&((2003i32 << 9) | (7 << 5)).to_le_bytes());
     game(&mut b, "e2e4", 2, (2800, 2800))[0] |= 0x80;
     let mut board = Board::startpos();
     let mut stream = vec![movetable::START_POSITION, 518, MOVES];
@@ -97,7 +99,8 @@ fn classic_database(name: &str) -> TempDb {
     classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6", 2, (2400, 2300));
     classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1b5", 1, (2600, 2600));
     classic_game(&mut b, "g1f3 b8c6 e2e4 e7e5", 0, (0, 2100));
-    classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1", 2, (1500, 1500));
+    let castles = classic_game(&mut b, "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 e1g1", 2, (1500, 1500));
+    castles[0x18..0x1b].copy_from_slice(&((2003u32 << 9) | (7 << 5)).to_be_bytes()[1..]);
     classic_game(&mut b, "e2e4", 2, (2800, 2800))[0] |= 0x80;
     // Chess960 from the standard arrangement: start 518.
     let start = Board::chess960(518).unwrap();
@@ -394,12 +397,14 @@ fn the_endpoint_builds_then_answers() {
         "{body}"
     );
     assert!(body.contains(r#""index":{"records":7,"games":5}"#), "{body}");
+    // A game without a date.
+    assert!(body.contains(r#""result":"1/2-1/2","year":null,"date":"????.??.??","event":""}"#), "{body}");
     // Castling is written as the king's two-square step.
     let before = "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
     let (status, body) = get(port, &url(before));
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""uci":"e1g1","san":"O-O""#), "{body}");
-    assert!(body.contains(r#""topGames":[{"number":4,"white":"","black":"","whiteElo":1500,"blackElo":1500,"result":"1-0","year":null,"event":""}]"#), "{body}");
+    assert!(body.contains(r#""topGames":[{"number":4,"white":"","black":"","whiteElo":1500,"blackElo":1500,"result":"1-0","year":2003,"date":"2003.07.??","event":""}]"#), "{body}");
     // A position no game reached.
     let (status, body) = get(port, &url("4k3/8/8/8/8/8/8/4K3 w - - 0 1"));
     assert_eq!(

@@ -648,7 +648,7 @@ the oschess analysis panel shows it like its Lichess tabs.
   "generation": "0a1b2c3d4e5f6071",
   "games": 5012345, "white": 1700000, "draws": 2100000, "black": 1212345,
   "moves": [ { "uci": "e2e4", "san": "e4", "games": 2305000, "white": 810000, "draws": 950000, "black": 545000 } ],
-  "topGames": [ { "number": 1234, "white": "…", "black": "…", "whiteElo": 2882, "blackElo": 2800, "result": "1-0", "year": 2014, "event": "…" } ],
+  "topGames": [ { "number": 1234, "white": "…", "black": "…", "whiteElo": 2882, "blackElo": 2800, "result": "1-0", "year": 2014, "date": "2014.06.??", "event": "…" } ],
   "index": { "records": 11966514, "games": 11959813 }
 }
 ```
@@ -663,8 +663,9 @@ the oschess analysis panel shows it like its Lichess tabs.
   way, `e1g1` and `e1c1`; `san` is the move in SAN.
 - **`topGames`**: up to 12 games that reached the position, the highest
   average rating first (the known rating when only one is), then the latest.
-  Names are cut at 200 characters as in list rows; `year` is `null` when the
-  date has none.
+  Names are cut at 200 characters as in list rows. `date` is the date as list
+  rows write it, `YYYY.MM.DD` with `?` for an unknown part; `year` is its year,
+  `null` when the date has none.
 - **What is indexed.** Every position of each game's main line, to its end:
   standard chess only, from the standard start or a set-up position, without
   deleted games, guiding texts or analyses. A game whose move record is over
