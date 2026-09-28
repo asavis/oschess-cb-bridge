@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::file::{Bad, IndexFile};
-use bridge::explorer::format::{BLOCK_ENTRY, Block, Counts, Header, pack_move};
+use bridge::explorer::format::{
+    BLOCK_ENTRY, Block, Counts, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, Stats, pack_move,
+};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
+use bridge::indexdir::crc32;
 use bridge::search::memory::Cancel;
 use cbformat::cbh;
 use cbformat::fixture::{Builder, TempDb, lid_header, quiet, sq, words};
@@ -1417,5 +1420,268 @@ fn a_rebuild_replaces_a_stream_still_mapped_by_an_answer_in_flight() {
     assert_eq!(new.stream.game(1).unwrap().words, stream_words(None, "d2d4 e7e5"));
     assert!(!dir.join("db.moves.partial").exists());
     drop(new);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The moves of `stats` as codes with their games, in their order.
+fn moves_of(stats: &bridge::explorer::format::Stats) -> Vec<(u16, u64)> {
+    stats.moves.iter().map(|m| (m.0, m.1.games)).collect()
+}
+
+fn code(uci: &str) -> u16 {
+    pack_move(uci.parse().unwrap())
+}
+
+/// A tree position that other games reach only beyond the tree's plies
+/// counts them too, each with the move it played from there (#146): counts
+/// add, moves add by code, most played first, then by code, and the notable
+/// games are the best of both. So does one the tree holds past its pruning
+/// ply, which two games reach within it. The start, which the long games
+/// reach again and again beyond the tree, counts each game once.
+#[test]
+fn a_tree_position_counts_the_games_that_reach_it_only_beyond_the_tree() {
+    let beyond = format!("{}e2e4 e7e5", hops(10));
+    // After 1.d4 d5 and 14 hops, 16. a3 a6: first reached at ply 32.
+    let late = format!("d2d4 d7d5 {}a2a3 a7a6", hops(7));
+    let mut b = Builder::new();
+    game(&mut b, "e2e4 e7e5 g1f3", 2, (2400, 2400));
+    game(&mut b, "e2e4 e7e5 f1c4", 1, (2200, 2200));
+    // Ply 42, after 40 plies of hops that never leave the start's structure.
+    game(&mut b, &format!("{beyond} g1f3"), 0, (2500, 2500));
+    game(&mut b, &format!("{beyond} d2d4"), 2, (2300, 2300));
+    game(&mut b, &format!("{late} c1f4"), 1, (2000, 2000));
+    game(&mut b, &format!("{late} c2c4"), 1, (2000, 2000));
+    // Ply 44.
+    game(&mut b, &format!("{}{late} e2e3", hops(3)), 2, (2100, 2100));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-beyond");
+    let dir = index_dir("beyond");
+    let idx = prepared(&db, &dir);
+    let board = board_after("e2e4 e7e5");
+    let tree = idx.lookup(board.hash()).unwrap().unwrap();
+    assert_eq!((tree.counts.games, tree.top.clone()), (2, vec![1, 2]), "games 1 and 2 reach it within the tree");
+    let all = explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    assert_eq!(all.counts, Counts { games: 4, white: 2, draws: 1, black: 1 });
+    assert_eq!(moves_of(&all), [(code("g1f3"), 2), (code("f1c4"), 1), (code("d2d4"), 1)]);
+    assert_eq!(all.moves[0].1, Counts { games: 2, white: 1, draws: 0, black: 1 }, "game 1's and game 3's");
+    assert_eq!(all.top, vec![3, 1, 4, 2]);
+
+    // Held past ply 20, as two games reach it at ply 32; game 7 at ply 44.
+    let board = board_after(&late);
+    assert_eq!(idx.lookup(board.hash()).unwrap().unwrap().counts.games, 2);
+    let all = explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    assert_eq!(all.counts, Counts { games: 3, white: 1, draws: 2, black: 0 });
+    assert_eq!(moves_of(&all), [(code("e2e3"), 1), (code("c2c4"), 1), (code("c1f4"), 1)]);
+    assert_eq!(all.top, vec![7, 6, 5]);
+
+    // Every game starts at the start: the tree counted them all there.
+    let start = Board::startpos();
+    let tree = idx.lookup(start.hash()).unwrap();
+    assert_eq!(tree.as_ref().map(|s| s.counts.games), Some(7));
+    assert_eq!(explorer::stats(&idx, &start, &Cancel::never()).unwrap(), tree);
+
+    // Through the endpoint, as the analysis panel asks for it.
+    let (bridge, id) = serve(&db, &dir);
+    let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after("e2e4 e7e5").fen()));
+    let body = answered(bridge.port, &url);
+    assert!(
+        body.contains(r#""games":4,"white":2,"draws":1,"black":1,"moves":[{"uci":"g1f3","san":"Nf3","games":2"#),
+        "{body}"
+    );
+    let numbers: Vec<u32> = objects(&body, "topGames").into_iter().map(number_of).collect();
+    assert_eq!(numbers, [3, 1, 4, 2]);
+    drop((idx, bridge));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A game that reaches a position both within the tree's plies and beyond
+/// them counts once, with the move it played from its first visit, and so
+/// does one that reaches it more than once beyond them (#146).
+#[test]
+fn a_game_reaching_a_position_within_and_beyond_the_tree_counts_once() {
+    let mut b = Builder::new();
+    game(&mut b, "e2e4 e7e5 f1c4", 1, (2200, 2200));
+    // At ply 2, then every fourth ply to ply 46, which plays 24. Nc3.
+    game(&mut b, &format!("e2e4 e7e5 {}b1c3", hops(11)), 2, (2400, 2400));
+    // At ply 42, then at 46 and 50, which plays 26. c3.
+    game(&mut b, &format!("{}e2e4 e7e5 {}c2c3", hops(10), hops(2)), 0, (2300, 2300));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-within-and-beyond");
+    let dir = index_dir("within-and-beyond");
+    let idx = prepared(&db, &dir);
+    let board = board_after("e2e4 e7e5");
+    let tree = idx.lookup(board.hash()).unwrap().unwrap();
+    assert_eq!(tree.counts.games, 2);
+    assert_eq!(tree.lookup_move("g1f3"), Some(1), "game 2's move from its first visit");
+    let all = explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    assert_eq!(all.counts, Counts { games: 3, white: 1, draws: 1, black: 1 });
+    assert_eq!(moves_of(&all), [(code("g1f3"), 2), (code("f1c4"), 1)]);
+    assert_eq!(all.moves[0].1, Counts { games: 2, white: 1, draws: 0, black: 1 });
+    assert_eq!(all.top, vec![2, 3, 1]);
+    // The same games, all of them, whichever part counts them: game 2 at
+    // ply 2 and game 3 at ply 42, each once.
+    let every = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    assert_eq!((every.counts.games, every.lookup_move("g1f3")), (2, Some(2)), "game 1 is too short for the bucket");
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A set-up game is counted in a tree position it reaches from its own start
+/// only beyond the tree's plies, at ply 41, the first beyond them; one that
+/// reaches it within them, at ply 37, is counted by the tree alone (#146).
+#[test]
+fn a_set_up_game_reaching_a_tree_position_beyond_the_tree_is_counted() {
+    // 1.e4 e5 2.Nf3, black to move, knights out and back from there.
+    let fen = board_after("e2e4 e7e5 g1f3").fen();
+    let cycle = "b8c6 b1c3 c6b8 c3b1 ";
+    let mut b = Builder::new();
+    game(&mut b, "e2e4 e7e5 g1f3 g8f6 b1c3", 2, (2200, 2200));
+    game(&mut b, "e2e4 e7e5 g1f3 g8f6 f3e5", 1, (2300, 2300));
+    for (cycles, next, result, elo) in [(10, "d2d3", 0u8, 2500i16), (9, "d2d4", 2, 0)] {
+        let at = b.moves(1, &move_words(Some(&fen), &format!("{}g8f6 {next}", cycle.repeat(cycles))));
+        let rec = b.game(at);
+        rec[0x58] = result;
+        rec[0x60..0x62].copy_from_slice(&elo.to_le_bytes());
+        rec[0x70..0x72].copy_from_slice(&elo.to_le_bytes());
+    }
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-setup-beyond");
+    let dir = index_dir("setup-beyond");
+    let idx = prepared(&db, &dir);
+    assert!(idx.stream.entry(3).unwrap().setup() && idx.stream.entry(4).unwrap().setup());
+    let board = board_after("e2e4 e7e5 g1f3 g8f6");
+    let tree = idx.lookup(board.hash()).unwrap().unwrap();
+    assert_eq!((tree.counts.games, tree.lookup_move("d2d4")), (3, Some(1)), "games 1, 2 and 4");
+    let all = explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    assert_eq!(all.counts, Counts { games: 4, white: 2, draws: 1, black: 1 });
+    assert_eq!(
+        moves_of(&all),
+        [(code("b1c3"), 1), (code("d2d3"), 1), (code("d2d4"), 1), (code("f3e5"), 1)],
+        "one each, by code"
+    );
+    assert_eq!(all.top, vec![3, 2, 1, 4]);
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The index file at `path` with the record of position `key` replaced by
+/// `stats`, and the offsets, tables and CRCs after it written again to match:
+/// a file sound in every check but what that record counts.
+fn replace_record(path: &Path, key: u64, stats: &Stats) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut header = Header::decode(&bytes).unwrap();
+    let mut out = vec![0u8; HEADER_LEN];
+    let (mut table, mut replaced) = (Vec::new(), false);
+    for i in 0..header.blocks as usize {
+        let block = Block::decode(&bytes[header.table_offset as usize + i * BLOCK_ENTRY..]);
+        let (keys, data) = bytes[block.offset as usize..].split_at(block.keys as usize * KEY_ENTRY);
+        let (mut written, mut records) = (Vec::new(), Vec::new());
+        for entry in keys.chunks(KEY_ENTRY) {
+            let k = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            written.extend(k.to_le_bytes());
+            written.extend((records.len() as u32).to_le_bytes());
+            let at = u32::from_le_bytes(entry[8..].try_into().unwrap()) as usize;
+            let record = if k == key { stats.clone() } else { Stats::decode(&data[at..], header.games).unwrap() };
+            replaced |= k == key;
+            record.encode(&mut records);
+        }
+        written.extend(&records);
+        let offset = out.len() as u64;
+        Block { offset, data_len: records.len() as u32, crc: crc32(&written), ..block }.encode(&mut table);
+        out.extend(&written);
+    }
+    assert!(replaced, "the index holds the position");
+    let deep = &bytes[header.deep_offset as usize..header.deep_table_offset as usize];
+    header.table_offset = out.len() as u64;
+    header.table_crc = crc32(&table);
+    out.extend(&table);
+    let deep_offset = out.len() as u64;
+    out.extend(deep);
+    let mut deep_table = Vec::new();
+    for e in bytes[header.deep_table_offset as usize..].chunks(DEEP_BLOCK_ENTRY) {
+        let offset = u64::from_le_bytes(e[..8].try_into().unwrap()) - header.deep_offset + deep_offset;
+        deep_table.extend(offset.to_le_bytes());
+        deep_table.extend(&e[8..]);
+    }
+    header.deep_offset = deep_offset;
+    header.deep_table_offset = out.len() as u64;
+    header.deep_table_crc = crc32(&deep_table);
+    out.extend(&deep_table);
+    header.file_len = out.len() as u64;
+    out[..HEADER_LEN].copy_from_slice(&header.encode());
+    std::fs::write(path, out).unwrap();
+}
+
+/// A tree record that passes every CRC but counts what no sound index
+/// holds: more games than the index, results beyond their games, a move's
+/// too, moves of more games than the position's, or counts sound alone that
+/// pass the index's games once the games beyond the tree are added (#146),
+/// and a header that claims more games than records. Each is damage, never
+/// a panic or a sum cut to 64 bits: the answer is `Corrupt`, and the
+/// endpoint rebuilds the index and answers from the new one.
+#[test]
+fn counts_that_no_sound_index_holds_are_rebuilt() {
+    let mut b = Builder::new();
+    game(&mut b, "e2e4 e7e5 g1f3", 2, (2400, 2400));
+    game(&mut b, "e2e4 e7e5 f1c4", 1, (2200, 2200));
+    // At ply 42, after 40 plies of hops.
+    game(&mut b, &format!("{}e2e4 e7e5 g1f3", hops(10)), 0, (2500, 2500));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-bad-counts");
+    let dir = index_dir("bad-counts");
+    let board = board_after("e2e4 e7e5");
+    let idx = prepared(&db, &dir);
+    let tree = idx.lookup(board.hash()).unwrap().unwrap();
+    assert_eq!((idx.games(), tree.counts.games), (3, 2));
+    let all = Counts { games: 3, white: 1, draws: 1, black: 1 };
+    assert_eq!(explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap().counts, all);
+    let (path, build) = (idx.base.path.clone(), idx.base.header.build_id);
+    drop(idx);
+    let sound = std::fs::read(&path).unwrap();
+    let c = |games, white, draws, black| Counts { games, white, draws, black };
+    let max = c(u64::MAX, u64::MAX, 0, 0);
+    let (nf3, bc4) = (code("g1f3"), code("f1c4"));
+    for (counts, moves, alone, why) in [
+        // The reviewer's: the sum with the game beyond the tree passes 64 bits.
+        (max, vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))], false, "more games than the index"),
+        (c(2, 1, 1, 1), vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))], false, "results beyond the games"),
+        (c(2, 1, 1, 0), vec![(nf3, max), (bc4, c(1, 0, 1, 0))], false, "a move of more games than the position"),
+        (c(2, 1, 1, 0), vec![(nf3, c(1, 1, 0, 1)), (bc4, c(1, 0, 1, 0))], false, "a move's results beyond its games"),
+        (c(2, 1, 1, 0), vec![(nf3, c(2, 1, 0, 0)), (bc4, c(1, 0, 1, 0))], false, "moves of more games than it"),
+        // Sound alone: all three games, which the game beyond the tree passes.
+        (c(3, 1, 1, 1), vec![(nf3, c(2, 1, 0, 1)), (bc4, c(1, 0, 1, 0))], true, "a sum beyond the index's games"),
+    ] {
+        std::fs::write(&path, &sound).unwrap();
+        replace_record(&path, board.hash(), &Stats { counts, moves, top: tree.top.clone() });
+        let idx = prepared(&db, &dir);
+        assert_eq!(idx.base.header.build_id, build, "{why}: the file was kept");
+        assert_eq!(idx.lookup(board.hash()).is_ok(), alone, "{why}");
+        assert!(matches!(explorer::stats(&idx, &board, &Cancel::never()), Err(Bad::Corrupt(_))), "{why}");
+    }
+    // A header that claims more games than the records indexed, every
+    // record's count within them.
+    let mut header = Header::decode(&sound).unwrap();
+    header.games = 4;
+    let mut claims = sound.clone();
+    claims[..HEADER_LEN].copy_from_slice(&header.encode());
+    std::fs::write(&path, &claims).unwrap();
+    assert!(matches!(IndexFile::open(&path), Err(Bad::Corrupt(_))), "more games than records");
+
+    // Through the endpoint: `409` while the index is built again, then the
+    // new one's answer.
+    let (bridge, id) = serve(&db, &dir);
+    let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board.fen()));
+    let found = r#""games":3,"white":1,"draws":1,"black":1"#;
+    assert!(answered(bridge.port, &url).contains(found));
+    drop(bridge);
+    let path = dir.join("index").join(format!("{id}.idx"));
+    let moves = vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))];
+    replace_record(&path, board.hash(), &Stats { counts: max, moves, top: tree.top.clone() });
+    let (bridge, _) = serve(&db, &dir);
+    let (status, body) = get(bridge.port, &url);
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("rebuilt"), "{body}");
+    assert!(answered(bridge.port, &url).contains(found));
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }

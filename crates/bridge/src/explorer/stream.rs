@@ -578,12 +578,26 @@ pub struct Target {
     key: u64,
     counts: [u32; 4],
     home: u16,
+    /// The first ply a line's first visit counts at: a line that reaches the
+    /// position before it is counted elsewhere, by the tree (#146).
+    from: u32,
 }
 
 impl Target {
     pub fn of(board: &Board) -> Target {
         let (white, black, pawns) = (board.colors(Color::White), board.colors(Color::Black), board.pieces(Piece::Pawn));
-        Target { key: board.hash(), counts: counts(white, black, pawns), home: home_of(pawns & white, pawns & black) }
+        Target {
+            key: board.hash(),
+            counts: counts(white, black, pawns),
+            home: home_of(pawns & white, pawns & black),
+            from: 0,
+        }
+    }
+
+    /// The same position, found only in the lines that reach it first beyond
+    /// ply `ply`: the tree holds it, with every game that reaches it within.
+    pub fn beyond(self, ply: u8) -> Target {
+        Target { from: u32::from(ply) + 1, ..self }
     }
 
     /// Whether a line at `board` can no longer reach the position.
@@ -727,15 +741,20 @@ impl Stream {
 
     /// Replays game `number`'s line to the first position that is `target`:
     /// the game, with the move played from there; `None` when the index does
-    /// not hold the game, or its line never reaches the position. The words
-    /// were checked when the stream was built, so they are played unchecked.
-    /// A line stops as soon as it can no longer reach the position (see
-    /// [`Target`]), and one whose home pawns left in an order the position
-    /// does not allow is not played.
+    /// not hold the game, or its line never reaches the position, or first
+    /// reaches it before the target's first ply ([`Target::beyond`]). The
+    /// words were checked when the stream was built, so they are played
+    /// unchecked. A line stops as soon as it can no longer reach the position
+    /// (see [`Target`]), and one whose home pawns left in an order the
+    /// position does not allow, or that ends before the first ply, is not
+    /// played.
     pub fn find(&self, number: u32, target: &Target) -> Result<Option<Hit>, Bad> {
         let record = self.record(number)?;
         let entry = record.entry;
-        if !entry.indexed() || (!entry.setup() && !entry.departures.allows(target.home)) {
+        if !entry.indexed()
+            || u32::from(entry.plies) < target.from
+            || (!entry.setup() && !entry.departures.allows(target.home))
+        {
             return Ok(None);
         }
         let mut board = Replayer::new(record.start()?.unwrap_or_else(|| standard().clone()));
@@ -744,12 +763,16 @@ impl Stream {
         }
         let moves = moves();
         let mut words = record.words();
+        let mut ply = 0u32;
         loop {
             let mv = match words.next() {
                 Some(w) => Some(moves.get(usize::from(w)).copied().flatten().ok_or(Bad::Corrupt("stream word"))?),
                 None => None,
             };
             if board.hash() == target.key {
+                if ply < target.from {
+                    return Ok(None);
+                }
                 return Ok(Some(Hit { mv: mv.map_or(NO_MOVE, pack_move), outcome: entry.outcome(), elo: entry.elo() }));
             }
             let Some(mv) = mv else { return Ok(None) };
@@ -758,6 +781,7 @@ impl Stream {
             let them = !board.side_to_move();
             let before = (board.colors(them), board.pieces(Piece::Pawn));
             board.play(mv);
+            ply += 1;
             if (board.colors(them), board.pieces(Piece::Pawn)) != before && target.passed(&board) {
                 return Ok(None);
             }

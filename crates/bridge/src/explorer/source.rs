@@ -34,6 +34,11 @@ pub struct Line {
     /// the order it reaches them. A structure never comes back once it
     /// changed, so the last one is all a new one is compared with.
     pub structures: Vec<u64>,
+    /// The first of the structures that the line holds beyond the index's
+    /// plies, which the ones after it follow; `None` when the line ends
+    /// within them. A game can reach a position the tree holds first beyond
+    /// its plies only in one of these (#146).
+    pub beyond: Option<usize>,
     /// The main line's moves as 2CBH move words, each checked as it was
     /// played: normal moves and the four castlings of standard chess, for the
     /// move stream (#145).
@@ -60,6 +65,7 @@ impl Line {
             elo: 2000,
             positions: Vec::new(),
             structures: Vec::new(),
+            beyond: None,
             words,
             setup,
             departures: Departures::default(),
@@ -114,6 +120,9 @@ impl Line {
             let structure = self.here_structure;
             if self.structures.last() != Some(&structure) && self.structures.len() < MAX_STRUCTURES {
                 self.structures.push(structure);
+            }
+            if ply > u32::from(max_ply) && self.beyond.is_none() {
+                self.beyond = Some(self.structures.len().saturating_sub(1));
             }
         }
     }
@@ -209,6 +218,7 @@ impl Workspace {
                 elo: 0,
                 positions,
                 structures,
+                beyond: None,
                 words: Vec::new(),
                 setup: None,
                 departures: Departures::default(),
@@ -669,6 +679,7 @@ fn begin(line: &mut Line, r: &impl Head) {
     line.elo = average_elo(r);
     line.positions.clear();
     line.structures.clear();
+    line.beyond = None;
     line.words.clear();
     line.setup = None;
     line.departures = Departures::default();

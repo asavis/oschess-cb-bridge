@@ -11,8 +11,10 @@ use crate::indexdir::{crc32, u32_at, u64_at};
 
 pub const MAGIC: [u8; 8] = *b"OSCBIDX\0";
 /// 2 added the deep section (#133); 3 the build id, which the move stream
-/// built with the index carries too (#145).
-pub const VERSION: u32 = 3;
+/// built with the index carries too (#145); 4 deep blocks of 256 buckets, and
+/// with each game its structure's print and whether it holds that structure
+/// beyond the tree's plies (#146).
+pub const VERSION: u32 = 4;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
@@ -36,8 +38,9 @@ pub const MAX_PLY: u8 = 40;
 /// A position reached by one game only is dropped beyond this ply. Every
 /// position past it is found through the deep section as well.
 pub const PRUNE_PLY: u8 = 20;
-/// Buckets per deep block: a lookup reads one block and walks to its bucket.
-pub const DEEP_BLOCK_BITS: u8 = 12;
+/// Buckets per deep block: a lookup reads one block, a few KiB, and walks to
+/// its bucket.
+pub const DEEP_BLOCK_BITS: u8 = 8;
 /// The fewest and the most bucket bits a deep section has.
 pub const MIN_DEEP_BITS: u8 = DEEP_BLOCK_BITS;
 pub const MAX_DEEP_BITS: u8 = 24;
@@ -212,6 +215,23 @@ impl Counts {
         self.draws += other.draws;
         self.black += other.black;
     }
+
+    /// These and `other` added, `None` when a sum passes 64 bits.
+    pub fn checked_merge(&self, other: &Counts) -> Option<Counts> {
+        Some(Counts {
+            games: self.games.checked_add(other.games)?,
+            white: self.white.checked_add(other.white)?,
+            draws: self.draws.checked_add(other.draws)?,
+            black: self.black.checked_add(other.black)?,
+        })
+    }
+
+    /// Whether these are counts of at most `games` games, with their results
+    /// adding up within their own games, as a sound index's are.
+    pub fn within(&self, games: u64) -> bool {
+        let results = self.white.checked_add(self.draws).and_then(|r| r.checked_add(self.black));
+        self.games <= games && results.is_some_and(|r| r <= self.games)
+    }
 }
 
 /// What the index holds for one position.
@@ -245,21 +265,27 @@ impl Stats {
         }
     }
 
-    /// The record at the start of `b`; `None` when it runs past the end or
-    /// holds more than it could.
-    pub fn decode(b: &[u8]) -> Option<Stats> {
+    /// The record at the start of `b`, in an index of `games` games; `None`
+    /// when it runs past the end or holds more than it could: more games
+    /// than the index, results beyond their games, or moves played by more
+    /// games than reach the position, each of which plays one move from it
+    /// at most.
+    pub fn decode(b: &[u8], games: u64) -> Option<Stats> {
         let mut at = 0;
-        let total = read_counts(b, &mut at)?;
+        let total = read_counts(b, &mut at).filter(|c| c.within(games))?;
         // No position has more legal moves than 218.
         let n = read_varint(b, &mut at)?;
         if n > 218 {
             return None;
         }
         let mut moves = Vec::with_capacity(n as usize);
+        let mut played = 0u64;
         for _ in 0..n {
             let code = u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?);
             at += 2;
-            moves.push((code, read_counts(b, &mut at)?));
+            let counts = read_counts(b, &mut at).filter(|c| c.within(total.games))?;
+            played = played.checked_add(counts.games).filter(|&p| p <= total.games)?;
+            moves.push((code, counts));
         }
         let t = read_varint(b, &mut at)?;
         if t > TOP_GAMES as u64 {
@@ -381,6 +407,17 @@ pub fn deep_bucket(structure: u64, bits: u8) -> u32 {
     (structure >> (64 - u32::from(bits))) as u32
 }
 
+/// The bits of a structure below its bucket's that the deep section keeps
+/// with each game: the games of another structure of the bucket are then
+/// left out without a replay, all but one in 128.
+pub const PRINT_BITS: u8 = 7;
+
+/// The print of `structure` in a bucket of `bits` bits: its [`PRINT_BITS`]
+/// bits below the bucket's.
+pub fn deep_print(structure: u64, bits: u8) -> u8 {
+    (structure >> (64 - u32::from(bits) - u32::from(PRINT_BITS))) as u8 & ((1 << PRINT_BITS) - 1)
+}
+
 /// The splitmix64 finaliser: every input bit reaches every output bit.
 fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -401,8 +438,29 @@ mod tests {
         };
         let mut b = Vec::new();
         s.encode(&mut b);
-        assert_eq!(Stats::decode(&b), Some(s));
-        assert_eq!(Stats::decode(&b[..b.len() - 1]), None, "a cut record is refused");
+        assert_eq!(Stats::decode(&b, 300), Some(s.clone()));
+        assert_eq!(Stats::decode(&b[..b.len() - 1], 300), None, "a cut record is refused");
+        // Counts no sound index holds: more games than the index's, results
+        // beyond their games, a move's too, or moves of more games than the
+        // position's, each a sum within 64 bits or not.
+        assert_eq!(Stats::decode(&b, 299), None, "more games than the index holds");
+        let max = Counts { games: u64::MAX, white: u64::MAX, draws: 0, black: 0 };
+        let e4 = s.moves[0].0;
+        for (counts, moves) in [
+            (max, s.moves.clone()),
+            (Counts { games: 300, white: 120, draws: 100, black: 81 }, s.moves.clone()),
+            (s.counts, vec![(e4, max)]),
+            (s.counts, vec![(e4, Counts { games: 301, white: 0, draws: 0, black: 0 })]),
+            (s.counts, vec![(e4, Counts { games: 200, white: 90, draws: 60, black: 51 })]),
+            (
+                s.counts,
+                vec![(e4, Counts { games: 200, ..Counts::default() }), (1, Counts { games: 101, ..Counts::default() })],
+            ),
+        ] {
+            let mut b = Vec::new();
+            Stats { counts, moves: moves.clone(), top: vec![] }.encode(&mut b);
+            assert_eq!(Stats::decode(&b, 300), None, "{counts:?} {moves:?}");
+        }
         let h = Header {
             max_ply: MAX_PLY,
             prune_ply: PRUNE_PLY,

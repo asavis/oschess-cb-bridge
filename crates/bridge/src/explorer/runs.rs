@@ -17,7 +17,7 @@ use crate::search::workers::{self, threads};
 
 use super::deep::{self, Sink};
 use super::file::read_at;
-use super::format::{MAX_PLY, Outcome, deep_bucket};
+use super::format::{MAX_PLY, Outcome};
 use super::source::{Line, Source, Workspace};
 use super::stream::{self, BATCH};
 
@@ -273,8 +273,9 @@ pub fn write_runs(
                     failed = Some(e);
                     return;
                 }
-                for &s in &line.structures {
-                    postings.push(u64::from(deep_bucket(s, deep.bits())) << 32 | u64::from(line.number));
+                for (i, &s) in line.structures.iter().enumerate() {
+                    let beyond = line.beyond.is_some_and(|b| i >= b);
+                    postings.push(deep::posting(s, deep.bits(), line.number, beyond));
                 }
                 if let Err(e) = part.add(line) {
                     failed = Some(e);

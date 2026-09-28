@@ -1,16 +1,22 @@
 //! The deep section of an index (#133): for each bucket of structures
 //! ([`super::format::structure`]), the games whose main line holds a
-//! structure of that bucket past [`super::format::PRUNE_PLY`]. The tree
-//! answers the positions it holds; a position it does not hold is looked for
-//! in the games of its structure's bucket, which are few, by replaying them.
+//! structure of that bucket past [`super::format::PRUNE_PLY`], each with the
+//! structure's print ([`deep_print`]) and marked when the game holds it
+//! beyond the tree's plies. The tree counts the games that reach a position
+//! it holds within its plies; any other game that reaches a position is
+//! looked for in the games of its structure's bucket, which are few, by
+//! replaying them (#146). A game holds a position's structure wherever it
+//! reaches it, so only the games with the structure's print are replayed,
+//! and for a position the tree holds only those marked.
 //!
-//! A build hands each worker's postings (`bucket << 32 | game`) to a
-//! [`Sink`], which spreads them over partition files by the bucket's top
-//! bits. [`write_section`] then sorts one partition at a time, in memory when
-//! it fits the build's share and in chunks on disk when not, and writes its
+//! A build hands each worker's postings ([`posting`]) to a [`Sink`], which
+//! spreads them over partition files by the bucket's top bits.
+//! [`write_section`] then sorts one partition at a time, in memory when it
+//! fits the build's share and in chunks on disk when not, and writes its
 //! buckets in order: per block of [`BLOCK_BUCKETS`] buckets, each bucket's
-//! game count and its ascending games as varint deltas, the block covered by
-//! a CRC-32 in the section's table.
+//! posting count and its postings by game, then print, each a varint of the
+//! game's difference from the one before, shifted left by eight, the print
+//! and the mark; the block covered by a CRC-32 in the section's table.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -23,13 +29,18 @@ use crate::indexdir::crc32_update;
 use crate::search::SearchError;
 use crate::search::memory::Hold;
 
-use super::format::{DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_DEEP_BITS, read_varint, varint};
+use super::format::{
+    DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_DEEP_BITS, PRINT_BITS, deep_bucket, deep_print, read_varint, varint,
+};
 use super::runs::{Progress, io, reserve};
 
 /// Buckets per block.
 pub const BLOCK_BUCKETS: usize = 1 << DEEP_BLOCK_BITS;
 /// The most partitions a build spreads its postings over.
 const MAX_PART_BITS: u8 = 8;
+/// A partition's fewest buckets, 4,096, whole blocks, so that a small
+/// database's build keeps few files open.
+const MIN_PART_BUCKET_BITS: u8 = 12;
 /// A worker's postings kept before they go to the partitions.
 pub const WORKER_POSTINGS: usize = 1 << 17;
 /// What a worker's postings take.
@@ -37,6 +48,26 @@ pub const WORKER_BYTES: usize = WORKER_POSTINGS * 8;
 
 /// What each partition file's writer buffers.
 const PART_BUFFER: usize = 4 << 10;
+
+/// Game `game` holds `structure`, of a bucket of `bits` bits, `beyond` the
+/// tree's plies or only within them: `bucket << 40 | game << 8 | print << 1`,
+/// and 1 when only within. A bucket's postings sort by game, then print, and
+/// a game's posting beyond before its posting within, which is the one kept
+/// of the two.
+pub fn posting(structure: u64, bits: u8, game: u32, beyond: bool) -> u64 {
+    let (bucket, print) = (deep_bucket(structure, bits), deep_print(structure, bits));
+    u64::from(bucket) << 40 | u64::from(game) << 8 | u64::from(print) << 1 | u64::from(!beyond)
+}
+
+/// A posting's bucket.
+fn bucket_of(p: u64) -> u64 {
+    p >> 40
+}
+
+/// A posting's bucket, game and print, apart from its mark.
+fn place(p: u64) -> u64 {
+    p >> 1
+}
 
 /// The postings of one build, spread over partition files by bucket.
 pub struct Sink {
@@ -57,7 +88,7 @@ impl Sink {
     /// Partition files in `dir` for buckets of `bits` bits, their buffers
     /// held in the search budget first.
     pub fn create(dir: &Path, bits: u8, progress: &Progress) -> Result<Sink, SearchError> {
-        let part_bits = MAX_PART_BITS.min(bits.saturating_sub(DEEP_BLOCK_BITS));
+        let part_bits = MAX_PART_BITS.min(bits.saturating_sub(MIN_PART_BUCKET_BITS));
         let memory = reserve((1 << part_bits) * PART_BUFFER, progress)?;
         let mut parts = Vec::new();
         for p in 0..1usize << part_bits {
@@ -80,7 +111,7 @@ impl Sink {
     /// Takes a worker's postings, emptying `postings`.
     pub fn add(&self, postings: &mut Vec<u64>) -> Result<(), SearchError> {
         postings.sort_unstable();
-        let shift = 32 + u32::from(self.bits - self.part_bits);
+        let shift = 40 + u32::from(self.bits - self.part_bits);
         let mut rest = &postings[..];
         while let Some(&first) = rest.first() {
             let part = (first >> shift) as usize;
@@ -131,7 +162,8 @@ pub const MIN_MEMORY: usize = FIXED_BYTES + CHUNK_WRITER + READ_BUFFER + 2 * (MI
 /// most `memory` bytes of the search budget at once. A partition whose
 /// postings fit is sorted in memory; a larger one in sorted chunks on disk,
 /// merged into one file that its blocks are then read from. Returns the table
-/// of blocks and the postings kept, a game once per bucket.
+/// of blocks and the postings kept, a game once per structure print in a
+/// bucket, marked when any of its postings there is.
 pub fn write_section(
     parts: &[(PathBuf, u64)],
     bits: u8,
@@ -162,7 +194,7 @@ pub fn write_section(
             let mut all = read_postings(path, *postings)?;
             let _ = std::fs::remove_file(path);
             all.sort_unstable();
-            all.dedup();
+            all.dedup_by_key(|p| place(*p));
             kept += all.len() as u64;
             w.write_slice(&all, first, blocks_per_part, path)?;
         } else {
@@ -207,6 +239,16 @@ impl<W: Write> Blocks<'_, W> {
         Ok(())
     }
 
+    /// Puts posting `x` of a bucket whose game before was `last`, which is
+    /// 0 for its first: the game as its difference, shifted left by eight,
+    /// the structure's print in bits 1-7, and 1 in bit 0 when the game holds
+    /// it beyond the tree's plies. Returns the game.
+    fn put_game(&mut self, x: u64, last: u64) -> Result<u64, SearchError> {
+        let game = x >> 8 & 0xffff_ffff;
+        self.put((game - last) << 8 | x & 0xfe | !x & 1)?;
+        Ok(game)
+    }
+
     fn flush(&mut self) -> Result<(), SearchError> {
         self.out.write_all(&self.pending).map_err(|e| io(self.target, e))?;
         self.crc = crc32_update(self.crc, &self.pending);
@@ -231,13 +273,11 @@ impl<W: Write> Blocks<'_, W> {
             let first_bucket = (b * BLOCK_BUCKETS) as u64;
             self.begin();
             for bucket in first_bucket..first_bucket + BLOCK_BUCKETS as u64 {
-                let n = rest.partition_point(|&x| x >> 32 == bucket);
+                let n = rest.partition_point(|&x| bucket_of(x) == bucket);
                 self.put(n as u64)?;
                 let mut last = 0u64;
                 for &x in &rest[..n] {
-                    let game = x & 0xffff_ffff;
-                    self.put(game - last)?;
-                    last = game;
+                    last = self.put_game(x, last)?;
                 }
                 rest = &rest[n..];
             }
@@ -272,7 +312,7 @@ impl<W: Write> Blocks<'_, W> {
             counts.fill(0);
             let mut in_block = 0u64;
             while let Some(x) = ahead.peek()? {
-                let local = (x >> 32).checked_sub(first_bucket).ok_or_else(|| outside(path))?;
+                let local = bucket_of(x).checked_sub(first_bucket).ok_or_else(|| outside(path))?;
                 if local >= BLOCK_BUCKETS as u64 {
                     break;
                 }
@@ -286,9 +326,8 @@ impl<W: Write> Blocks<'_, W> {
                 self.put(n)?;
                 let mut last = 0u64;
                 for _ in 0..n {
-                    let game = games.next()?.ok_or_else(|| outside(path))? & 0xffff_ffff;
-                    self.put(game - last)?;
-                    last = game;
+                    let x = games.next()?.ok_or_else(|| outside(path))?;
+                    last = self.put_game(x, last)?;
                 }
             }
             self.end()?;
@@ -312,9 +351,9 @@ fn merged_path(path: &Path) -> PathBuf {
 }
 
 /// Sorts the partition at `path`, too large for `room` bytes, into the file
-/// at [`merged_path`], repeated postings dropped: chunks that fit `room`
-/// beside a reader and a writer are sorted and written apart, then merged,
-/// each read through an equal share of `room`. Returns the postings kept. A
+/// at [`merged_path`], each game's postings kept as [`write_section`] keeps
+/// them: chunks that fit `room` beside a reader and a writer are sorted and
+/// written apart, then merged, each read through an equal share of `room`. Returns the postings kept. A
 /// partition whose merge would read through less than [`MIN_BUFFER`] a chunk
 /// is `TooLarge` at once.
 fn sort_on_disk(path: &Path, postings: u64, room: usize, progress: &Progress) -> Result<u64, SearchError> {
@@ -367,7 +406,7 @@ fn sort_chunks(
             bytes -= m;
         }
         chunk.sort_unstable();
-        chunk.dedup();
+        chunk.dedup_by_key(|p| place(*p));
         let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
         name.push(format!(".chunk-{}", chunks.len()));
         let chunk_path = path.with_file_name(name);
@@ -405,10 +444,10 @@ fn merge_chunks(
     let mut out = BufWriter::with_capacity(CHUNK_WRITER, File::create(target).map_err(|e| io(target, e))?);
     let (mut kept, mut last) = (0u64, None);
     while let Some(Reverse((x, i))) = heap.pop() {
-        if last != Some(x) {
+        if last != Some(place(x)) {
             out.write_all(&x.to_le_bytes()).map_err(|e| io(target, e))?;
             kept += 1;
-            last = Some(x);
+            last = Some(place(x));
         }
         if let Some(next) = readers[i].next()? {
             heap.push(Reverse((next, i)));
@@ -496,9 +535,11 @@ fn read_postings(path: &Path, postings: u64) -> Result<Vec<u64>, SearchError> {
     Ok(all)
 }
 
-/// The games of bucket `local` in a block's bytes, at most `max_game` each;
-/// `None` when the block does not hold them as written.
-pub fn bucket_games(block: &[u8], local: usize, max_game: u32) -> Option<Vec<u32>> {
+/// The games of bucket `local` in a block's bytes that hold a structure of
+/// print `print`, at most `max_game` each, only those that hold it beyond the
+/// tree's plies when `beyond`; `None` when the block does not hold them as
+/// written.
+pub fn bucket_games(block: &[u8], local: usize, max_game: u32, print: u8, beyond: bool) -> Option<Vec<u32>> {
     let mut at = 0;
     for _ in 0..local {
         let n = read_varint(block, &mut at)?;
@@ -507,29 +548,44 @@ pub fn bucket_games(block: &[u8], local: usize, max_game: u32) -> Option<Vec<u32
         }
     }
     let n = read_varint(block, &mut at)?;
-    // Each game takes a byte at least, so a damaged count never reserves
-    // more than the block's size.
-    if n > u64::from(max_game) || n > (block.len() - at) as u64 {
+    // A game comes once per print at most, and each posting takes a byte at
+    // least, so a damaged count never reserves more than the block's size.
+    if n > u64::from(max_game) << PRINT_BITS || n > (block.len() - at) as u64 {
         return None;
     }
     let mut games = Vec::new();
     games.try_reserve_exact(n as usize).ok()?;
-    let mut game = 0u64;
+    let (mut game, mut last_print) = (0u64, 0u64);
     for _ in 0..n {
-        let delta = read_varint(block, &mut at)?;
-        game = game.checked_add(delta)?;
-        if delta == 0 || game > u64::from(max_game) {
+        let v = read_varint(block, &mut at)?;
+        let (delta, p) = (v >> 8, v >> 1 & 0x7f);
+        // Games ascend, from 1, and so do the prints of one game.
+        if delta == 0 && (game == 0 || p <= last_print) {
             return None;
         }
-        games.push(game as u32);
+        game += delta;
+        if game > u64::from(max_game) {
+            return None;
+        }
+        last_print = p;
+        if p == u64::from(print) && (!beyond || v & 1 == 1) {
+            games.push(game as u32);
+        }
     }
     Some(games)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::indexdir::crc32;
+
+    /// A structure of bucket `bucket` among `1 << bits` with print `print`.
+    fn structure(bits: u8, bucket: u64, print: u64) -> u64 {
+        bucket << (64 - bits) | print << (64 - bits - PRINT_BITS)
+    }
 
     #[test]
     fn postings_come_back_per_bucket_in_game_order() {
@@ -537,17 +593,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bits = 14;
         let sink = Sink::create(&dir, bits, &Progress::default()).unwrap();
-        let posting = |bucket: u64, game: u64| bucket << 32 | game;
+        let s = |bucket: u64, print: u64| structure(bits, bucket, print);
         let last = (1u64 << bits) - 1;
-        // Two workers, out of order, with a game twice in one bucket.
-        sink.add(&mut vec![posting(5, 9), posting(last, 2), posting(5, 3)]).unwrap();
-        sink.add(&mut vec![posting(5, 9), posting(4096, 7), posting(0, 1)]).unwrap();
+        // Two workers, out of order, with a game twice in one bucket with
+        // one structure, once beyond the tree's plies, and a third time with
+        // another structure of the bucket.
+        sink.add(&mut vec![posting(s(5, 1), bits, 9, false), posting(s(last, 0), bits, 2, true)]).unwrap();
+        sink.add(&mut vec![posting(s(5, 1), bits, 3, true), posting(s(5, 1), bits, 9, true)]).unwrap();
+        sink.add(&mut vec![posting(s(5, 127), bits, 9, false), posting(s(256, 0), bits, 7, false)]).unwrap();
+        sink.add(&mut vec![posting(s(0, 0), bits, 1, true)]).unwrap();
         let parts = sink.finish().unwrap();
         let mut out = Vec::new();
         let (table, kept) =
             write_section(&parts, bits, &mut out, 1000, &dir.join("x"), &Progress::default(), 64 << 20).unwrap();
-        assert_eq!(kept, 5, "a game counts once per bucket");
-        assert_eq!(table.len(), 4 * DEEP_BLOCK_ENTRY);
+        assert_eq!(kept, 6, "a game counts once per structure print in a bucket");
+        assert_eq!(table.len(), 64 * DEEP_BLOCK_ENTRY);
         let block = |i: usize| {
             let e = &table[i * DEEP_BLOCK_ENTRY..];
             let off = u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize - 1000;
@@ -555,42 +615,61 @@ mod tests {
             assert_eq!(crc32(&out[off..off + len]), u32::from_le_bytes(e[12..16].try_into().unwrap()));
             out[off..off + len].to_vec()
         };
-        assert_eq!(bucket_games(&block(0), 5, 100), Some(vec![3, 9]));
-        assert_eq!(bucket_games(&block(0), 0, 100), Some(vec![1]));
-        assert_eq!(bucket_games(&block(0), 6, 100), Some(vec![]));
-        assert_eq!(bucket_games(&block(1), 0, 100), Some(vec![7]));
-        assert_eq!(bucket_games(&block(3), BLOCK_BUCKETS - 1, 100), Some(vec![2]));
+        assert_eq!(bucket_games(&block(0), 5, 100, 1, false), Some(vec![3, 9]));
+        assert_eq!(bucket_games(&block(0), 5, 100, 1, true), Some(vec![3, 9]), "held beyond once is beyond");
+        assert_eq!(bucket_games(&block(0), 5, 100, 127, false), Some(vec![9]));
+        assert_eq!(bucket_games(&block(0), 5, 100, 127, true), Some(vec![]));
+        assert_eq!(bucket_games(&block(0), 5, 100, 0, false), Some(vec![]));
+        assert_eq!(bucket_games(&block(0), 0, 100, 0, true), Some(vec![1]));
+        assert_eq!(bucket_games(&block(0), 6, 100, 0, false), Some(vec![]));
+        assert_eq!(bucket_games(&block(1), 0, 100, 0, false), Some(vec![7]));
+        assert_eq!(bucket_games(&block(1), 0, 100, 0, true), Some(vec![]));
+        assert_eq!(bucket_games(&block(63), BLOCK_BUCKETS - 1, 100, 0, true), Some(vec![2]));
         // A game past the database's last record is damage.
-        assert_eq!(bucket_games(&block(0), 5, 8), None);
-        // So is a delta that wraps around to a game already listed, and a
-        // count or a delta written past 64 bits, which would read as 0 or 5
-        // were the bits beyond cut off.
-        let mut wrap = Vec::new();
-        for v in [2, 5, u64::MAX - 2] {
-            varint(&mut wrap, v);
-        }
-        assert_eq!(bucket_games(&wrap, 0, 100), None);
+        assert_eq!(bucket_games(&block(0), 5, 8, 1, false), None);
+        // So is a delta that wraps around to a game already listed, a game
+        // listed again with the same print or a lower one, a first game of 0,
+        // and a count or a delta written past 64 bits, which would read as 0
+        // or 5 were the bits beyond cut off.
+        let bucket = |values: &[u64]| {
+            let mut b = Vec::new();
+            for &v in values {
+                varint(&mut b, v);
+            }
+            b
+        };
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8, u64::MAX - 2]), 0, 100, 0, false), None);
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 2, 2]), 0, 100, 1, false), None);
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 4, 2]), 0, 100, 1, false), None);
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 2, 4]), 0, 100, 1, false), Some(vec![5]));
+        // A database of one game lists it twice in a bucket where it holds
+        // two structures of different prints.
+        assert_eq!(bucket_games(&bucket(&[2, 1 << 8 | 2, 4]), 0, 1, 2, false), Some(vec![1]));
+        assert_eq!(bucket_games(&bucket(&[1, 2]), 0, 100, 1, false), None);
         let long = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
-        assert_eq!(bucket_games(&long, 0, 100), None);
+        assert_eq!(bucket_games(&long, 0, 100, 0, false), None);
         let mut delta = vec![1, 0x85];
         delta.extend(&long[1..]);
-        assert_eq!(bucket_games(&delta, 0, 100), None);
+        assert_eq!(bucket_games(&delta, 0, 100, 0, false), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Postings of `bits`-bit buckets, repeats among them, from a fixed seed.
+    /// Postings of `bits`-bit buckets from a fixed seed, marked or not; every
+    /// tenth is the one before it with the other mark.
     fn postings(bits: u8, n: usize) -> Vec<u64> {
         let mut x = 0x2545_f491_4f6c_dd1du64;
-        (0..n)
-            .map(|i| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                // Every tenth repeats the one before it.
-                let j = if i % 10 == 9 { x.wrapping_sub(1) } else { x };
-                ((j >> (64 - bits)) << 32) | ((j & 0x3ff) + 1)
-            })
-            .collect()
+        let mut all: Vec<u64> = Vec::with_capacity(n);
+        for i in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let p = match all.last() {
+                Some(&before) if i % 10 == 9 => before ^ 1,
+                _ => posting(x, bits, (x & 0x3ff) as u32 + 1, x >> 20 & 1 == 1),
+            };
+            all.push(p);
+        }
+        all
     }
 
     fn written(dir: &Path, bits: u8, all: &[u64], memory: usize) -> Result<(Vec<u8>, Vec<u8>, u64), SearchError> {
@@ -620,8 +699,27 @@ mod tests {
         assert_eq!(on_disk, in_memory);
         let mut unique = all.clone();
         unique.sort_unstable();
-        unique.dedup();
+        unique.dedup_by_key(|p| place(*p));
         assert_eq!(in_memory.2, unique.len() as u64);
+        // A bucket's games of a print come back, those marked alone when
+        // asked: every 40th print of a bucket is read back.
+        let (out, table, _) = &in_memory;
+        let mut kept: BTreeMap<(u64, u64), (Vec<u32>, Vec<u32>)> = BTreeMap::new();
+        for &p in &unique {
+            let games = kept.entry((bucket_of(p), p >> 1 & 0x7f)).or_default();
+            games.0.push((p >> 8) as u32);
+            if p & 1 == 0 {
+                games.1.push((p >> 8) as u32);
+            }
+        }
+        for (&(bucket, print), (all, marked)) in kept.iter().step_by(40) {
+            let e = &table[bucket as usize / BLOCK_BUCKETS * DEEP_BLOCK_ENTRY..];
+            let off = u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize;
+            let block = &out[off..off + u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize];
+            let local = bucket as usize % BLOCK_BUCKETS;
+            assert_eq!(bucket_games(block, local, 1024, print as u8, false).as_ref(), Some(all));
+            assert_eq!(bucket_games(block, local, 1024, print as u8, true).as_ref(), Some(marked));
+        }
         // Less than the least memory is refused at once, as is a partition
         // whose chunks could not each be read through a buffer.
         assert!(matches!(written(&base.join("less"), bits, &all, MIN_MEMORY - 1), Err(SearchError::TooLarge)));

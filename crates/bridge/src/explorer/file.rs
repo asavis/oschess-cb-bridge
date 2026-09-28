@@ -12,7 +12,7 @@ use crate::search::memory::{Hold, Refused};
 use super::deep::{BLOCK_BUCKETS, bucket_games};
 use super::format::{
     BLOCK_ENTRY, BLOCK_KEYS, Block, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MAX_DEEP_BITS,
-    MIN_DEEP_BITS, MIN_RECORD, Stats,
+    MIN_DEEP_BITS, MIN_RECORD, Stats, deep_bucket, deep_print,
 };
 
 /// Why an index file cannot be used.
@@ -65,6 +65,10 @@ impl IndexFile {
         {
             return Err(Bad::Corrupt("counts do not fit the file"));
         }
+        // A game is a record indexed: no count of games passes the records.
+        if header.games > (u64::from(header.last_record) + 1).saturating_sub(u64::from(header.first_record)) {
+            return Err(Bad::Corrupt("games"));
+        }
         let memory = Hold::reserve_quietly(
             table_len as usize + blocks as usize * std::mem::size_of::<Block>() + 2 * deep_table_len as usize,
         )
@@ -96,12 +100,16 @@ impl IndexFile {
         Ok(IndexFile { file, path: path.to_path_buf(), header, blocks: decoded, deep, _memory: memory })
     }
 
-    /// The games whose main line holds a structure of `bucket` past the
-    /// tree's pruning ply (#133): the candidates for a position the tree does
-    /// not hold. The block and the games, at most four bytes for each of its
-    /// bytes, are held in the search budget until the hold is dropped:
-    /// `Busy` when it has no room.
-    pub fn deep_games(&self, bucket: u32) -> Result<(Vec<u32>, Hold), Bad> {
+    /// The games whose main line holds `structure` past the tree's pruning
+    /// ply (#133), or only those that hold it beyond the tree's plies when
+    /// `beyond`, with the few of other structures of its bucket that share
+    /// its print: the candidates for a position that games reach beyond the
+    /// tree's plies (#146). The block and the games, at most four bytes for
+    /// each of its bytes, are held in the search budget until the hold is
+    /// dropped: `Busy` when it has no room.
+    pub fn deep_games(&self, structure: u64, beyond: bool) -> Result<(Vec<u32>, Hold), Bad> {
+        let bits = self.header.deep_bits;
+        let bucket = deep_bucket(structure, bits);
         let local = bucket as usize % BLOCK_BUCKETS;
         let Some(&(offset, len, crc)) = self.deep.get(bucket as usize / BLOCK_BUCKETS) else {
             return Err(Bad::Corrupt("deep bucket"));
@@ -114,7 +122,8 @@ impl IndexFile {
         if crc32(&buf) != crc {
             return Err(Bad::Corrupt("deep block"));
         }
-        let games = bucket_games(&buf, local, self.header.last_record).ok_or(Bad::Corrupt("deep block"))?;
+        let games = bucket_games(&buf, local, self.header.last_record, deep_print(structure, bits), beyond)
+            .ok_or(Bad::Corrupt("deep block"))?;
         Ok((games, memory))
     }
 
@@ -135,7 +144,7 @@ impl IndexFile {
         let Ok(at) = entries.binary_search_by_key(&key, |e| u64_at(e, 0)) else { return Ok(None) };
         let start = u32_at(&entries[at], 8) as usize;
         let record = data.get(start..).ok_or(Bad::Corrupt("record offset"))?;
-        Stats::decode(record).map(Some).ok_or(Bad::Corrupt("record"))
+        Stats::decode(record, self.header.games).map(Some).ok_or(Bad::Corrupt("record"))
     }
 }
 
