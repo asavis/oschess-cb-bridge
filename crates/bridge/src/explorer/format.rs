@@ -1,14 +1,17 @@
 //! The index file's layout (`docs/format-notes.md`, "Position index"): a
 //! header, blocks of sorted keys each followed by the records they point to,
-//! and a table of the blocks. Every part is covered by a CRC-32, so a torn or
-//! damaged file is rebuilt instead of misread.
+//! and a table of the blocks; then the deep section (#133): blocks of
+//! structure buckets, each with the games that hold such a structure past
+//! [`PRUNE_PLY`], and their table. Every part is covered by a CRC-32, so a
+//! torn or damaged file is rebuilt instead of misread.
 
-use chesscore::{Board, Move, Piece, Square};
+use chesscore::{Board, Color, Move, Piece, Square};
 
 use crate::indexdir::{crc32, u32_at, u64_at};
 
 pub const MAGIC: [u8; 8] = *b"OSCBIDX\0";
-pub const VERSION: u32 = 1;
+/// 2 added the deep section (#133).
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
@@ -29,8 +32,16 @@ pub const TOP_GAMES: usize = 12;
 /// Positions reached in the first `MAX_PLY` plies are indexed, with the moves
 /// played from them for plies below it.
 pub const MAX_PLY: u8 = 40;
-/// A position reached by one game only is dropped beyond this ply.
+/// A position reached by one game only is dropped beyond this ply. Every
+/// position past it is found through the deep section as well.
 pub const PRUNE_PLY: u8 = 20;
+/// Buckets per deep block: a lookup reads one block and walks to its bucket.
+pub const DEEP_BLOCK_BITS: u8 = 12;
+/// The fewest and the most bucket bits a deep section has.
+pub const MIN_DEEP_BITS: u8 = DEEP_BLOCK_BITS;
+pub const MAX_DEEP_BITS: u8 = 24;
+/// A deep block in its table: offset, length, CRC.
+pub const DEEP_BLOCK_ENTRY: usize = 16;
 /// What the index was built from and how.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -47,6 +58,13 @@ pub struct Header {
     pub table_offset: u64,
     pub table_crc: u32,
     pub file_len: u64,
+    /// The deep section: its buckets are the top `deep_bits` bits of a
+    /// [`structure`]; it starts right after the tree's table.
+    pub deep_bits: u8,
+    pub deep_postings: u64,
+    pub deep_offset: u64,
+    pub deep_table_offset: u64,
+    pub deep_table_crc: u32,
 }
 
 impl Header {
@@ -57,15 +75,20 @@ impl Header {
         b[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
         b[17] = self.max_ply;
         b[18] = self.prune_ply;
+        b[19] = self.deep_bits;
         b[20..24].copy_from_slice(&self.first_record.to_le_bytes());
         b[24..28].copy_from_slice(&self.last_record.to_le_bytes());
         b[32..40].copy_from_slice(&self.generation.to_le_bytes());
+        b[40..48].copy_from_slice(&self.deep_postings.to_le_bytes());
         b[48..56].copy_from_slice(&self.games.to_le_bytes());
         b[56..64].copy_from_slice(&self.keys.to_le_bytes());
         b[64..68].copy_from_slice(&self.blocks.to_le_bytes());
         b[72..80].copy_from_slice(&self.table_offset.to_le_bytes());
         b[80..84].copy_from_slice(&self.table_crc.to_le_bytes());
         b[88..96].copy_from_slice(&self.file_len.to_le_bytes());
+        b[96..104].copy_from_slice(&self.deep_offset.to_le_bytes());
+        b[104..112].copy_from_slice(&self.deep_table_offset.to_le_bytes());
+        b[112..116].copy_from_slice(&self.deep_table_crc.to_le_bytes());
         let crc = crc32(&b[..124]);
         b[124..128].copy_from_slice(&crc.to_le_bytes());
         b
@@ -91,6 +114,11 @@ impl Header {
             table_offset: u64_at(b, 72),
             table_crc: u32_at(b, 80),
             file_len: u64_at(b, 88),
+            deep_bits: b[19],
+            deep_postings: u64_at(b, 40),
+            deep_offset: u64_at(b, 96),
+            deep_table_offset: u64_at(b, 104),
+            deep_table_crc: u32_at(b, 112),
         })
     }
 }
@@ -303,6 +331,52 @@ pub fn read_varint(b: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
+impl Header {
+    /// The deep section's blocks.
+    pub fn deep_blocks(&self) -> u64 {
+        1u64 << self.deep_bits.saturating_sub(DEEP_BLOCK_BITS)
+    }
+}
+
+/// The bucket bits for a database of `records` records: about one bucket for
+/// every game, within [`MIN_DEEP_BITS`] and [`MAX_DEEP_BITS`], so that a
+/// small database's section stays small and a large one's buckets stay few
+/// games each.
+pub fn deep_bits(records: u32) -> u8 {
+    let log = 32 - records.max(1).leading_zeros();
+    (log as u8).clamp(MIN_DEEP_BITS, MAX_DEEP_BITS)
+}
+
+/// A hash of `board`'s structure: what only a pawn move or a capture
+/// changes, each side's pawns and its pieces by kind. A pawn never moves back
+/// and a man taken never comes back, so a game passes through each structure
+/// once, in one stretch of plies, and a position is found among the few games
+/// that hold its structure (#133). The pieces split what the pawns alone
+/// share widely: every pawnless ending has one pawn structure.
+pub fn structure(board: &Board) -> u64 {
+    let white = board.colored(Piece::Pawn, Color::White);
+    let black = board.colored(Piece::Pawn, Color::Black);
+    let mut pieces = 0u64;
+    for (i, piece) in [Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen].into_iter().enumerate() {
+        // At most ten of a kind, two and eight promoted pawns: four bits.
+        pieces |= u64::from(board.colored(piece, Color::White).count_ones()) << (8 * i);
+        pieces |= u64::from(board.colored(piece, Color::Black).count_ones()) << (8 * i + 4);
+    }
+    mix(white ^ mix(black ^ mix(pieces ^ 0x9e37_79b9_7f4a_7c15)))
+}
+
+/// The bucket of `structure` among `1 << bits`.
+pub fn deep_bucket(structure: u64, bits: u8) -> u32 {
+    (structure >> (64 - u32::from(bits))) as u32
+}
+
+/// The splitmix64 finaliser: every input bit reaches every output bit.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +404,11 @@ mod tests {
             table_offset: 4096,
             table_crc: 7,
             file_len: 9000,
+            deep_bits: 20,
+            deep_postings: 123_456,
+            deep_offset: 5000,
+            deep_table_offset: 8000,
+            deep_table_crc: 11,
         };
         let e = h.encode();
         assert_eq!(Header::decode(&e), Some(h));
@@ -348,5 +427,22 @@ mod tests {
         let king: Move = "a1b1".parse().unwrap();
         assert_eq!(unpack_move(&b, pack_move(king)), Some(king));
         assert_eq!(unpack_move(&b, NO_MOVE), None);
+    }
+
+    #[test]
+    fn a_structure_is_the_pawns_and_the_pieces_by_kind() {
+        let s = |fen: &str| structure(&Board::from_fen(fen).unwrap());
+        // Pieces elsewhere, the king too, or the other side to move: one structure.
+        let rooks = s("4k3/p7/8/8/8/8/P7/R3K3 w - - 0 1");
+        assert_eq!(s("3k4/p7/8/8/8/8/P7/4K2R b - - 0 1"), rooks);
+        // A piece of another kind, or of the other side.
+        assert_ne!(s("4k3/p7/8/8/8/8/P7/Q3K3 w - - 0 1"), rooks);
+        assert_ne!(s("r3k3/p7/8/8/8/8/P7/4K3 w - - 0 1"), rooks);
+        // A pawn one square on, or of the other side.
+        assert_ne!(s("4k3/p7/8/8/8/P7/8/R3K3 w - - 0 1"), rooks);
+        assert_ne!(s("4k3/P7/8/8/8/8/p7/R3K3 w - - 0 1"), rooks);
+        // Pawnless endings split by what is left.
+        assert_ne!(s("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"), s("4k3/8/8/8/8/8/8/Q3K3 w - - 0 1"));
+        assert_ne!(s("4k3/8/8/8/8/8/8/4K3 w - - 0 1"), s("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"));
     }
 }

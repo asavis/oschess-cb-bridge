@@ -1,7 +1,7 @@
 //! Where an index gets its games: the positions of each game's main line, as a
 //! small trait that each database format implements.
 
-use chesscore::{Board, Move};
+use chesscore::{Board, Color, Move, Piece};
 
 use cbformat::game::{GameResult, RecordKind};
 use cbformat::pgnfile::lex::{self, Lexer};
@@ -11,8 +11,50 @@ use cbformat::v2::{self, HEADER_RECORD_SIZE, MoveData, Record};
 use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 
-use super::format::{NO_MOVE, Outcome, pack_move};
+use super::format::{NO_MOVE, Outcome, PRUNE_PLY, pack_move, structure};
 use crate::store::{Head, Store};
+
+/// What a walk takes from each game's main line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The positions within the index's plies, for the tree.
+    Tree,
+    /// Those, and every [`structure`] the main line holds past
+    /// [`PRUNE_PLY`], for the deep section (#133): the whole line is read.
+    Build,
+    /// The first ply the main line reaches this position at, and the move
+    /// played from it.
+    Find(Target),
+}
+
+/// A position looked for in games: its key, and each side's men and pawns.
+/// A game only ever loses those, so a line left with fewer than the position
+/// has can no longer reach it, and its walk stops there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    key: u64,
+    counts: [u32; 4],
+}
+
+impl Target {
+    pub fn of(board: &Board) -> Target {
+        Target { key: board.hash(), counts: counts(board) }
+    }
+}
+
+/// Each side's men, then each side's pawns.
+fn counts(board: &Board) -> [u32; 4] {
+    [
+        board.colors(Color::White).count_ones(),
+        board.colors(Color::Black).count_ones(),
+        board.colored(Piece::Pawn, Color::White).count_ones(),
+        board.colored(Piece::Pawn, Color::Black).count_ones(),
+    ]
+}
+
+/// The most structures a main line holds: each change of one is a pawn
+/// moving forward or a capture, so no line holds more.
+const MAX_STRUCTURES: usize = 8 * 6 * 2 + 30 + 1;
 
 /// One game's contribution to the index.
 pub struct Line {
@@ -23,6 +65,22 @@ pub struct Line {
     /// Each position the main line reaches within the index's plies, once,
     /// with the move played from it (`NO_MOVE` at the end) and its ply.
     pub positions: Vec<(u64, u16, u8)>,
+    /// [`Mode::Build`]: the structures the main line holds past
+    /// [`PRUNE_PLY`], each once, in the order it reaches them. A structure
+    /// never comes back once it changed, so the last one is all a new one is
+    /// compared with.
+    pub structures: Vec<u64>,
+    /// [`Mode::Find`]: the move played from the position's first occurrence
+    /// (`NO_MOVE` at the line's end), once the line reached it.
+    pub found: Option<u16>,
+    pub mode: Mode,
+    /// The position the walk is at, noted before its move is played: its key
+    /// and, in [`Mode::Build`] past [`PRUNE_PLY`], its structure.
+    here: u64,
+    here_structure: u64,
+    /// [`Mode::Find`]: the position the walk is at has fewer men or pawns of
+    /// a side than the one looked for.
+    past: bool,
 }
 
 impl Line {
@@ -31,6 +89,47 @@ impl Line {
         if !self.positions.iter().any(|p| p.0 == key) {
             self.positions.push((key, mv, ply));
         }
+    }
+
+    /// Whether the walk reads the move played from the position at `ply`.
+    fn reads(&self, ply: u32, max_ply: u8) -> bool {
+        self.mode != Mode::Tree || ply < u32::from(max_ply)
+    }
+
+    /// Notes the position `board` at `ply`, before its move is played.
+    fn at(&mut self, board: &Board, ply: u32) {
+        self.here = board.hash();
+        match self.mode {
+            Mode::Build if ply > u32::from(PRUNE_PLY) => self.here_structure = structure(board),
+            Mode::Find(target) => {
+                self.past = counts(board).iter().zip(target.counts).any(|(&have, need)| have < need);
+            }
+            _ => {}
+        }
+    }
+
+    /// Takes the position noted at `ply`, with `mv` played from it
+    /// (`NO_MOVE` at the line's end); whether the walk goes on.
+    fn visit(&mut self, mv: u16, ply: u32, max_ply: u8) -> bool {
+        if let Mode::Find(target) = self.mode {
+            if self.here == target.key {
+                self.found = Some(mv);
+                return false;
+            }
+            return !self.past;
+        }
+        if ply <= u32::from(max_ply) {
+            // At the index's depth the position counts, and no move from it.
+            let mv = if ply < u32::from(max_ply) { mv } else { NO_MOVE };
+            self.reach(self.here, mv, ply as u8);
+        }
+        if self.mode == Mode::Build && ply > u32::from(PRUNE_PLY) {
+            let structure = self.here_structure;
+            if self.structures.last() != Some(&structure) && self.structures.len() < MAX_STRUCTURES {
+                self.structures.push(structure);
+            }
+        }
+        true
     }
 }
 
@@ -68,14 +167,26 @@ struct Records {
 }
 
 impl Workspace {
-    /// What a workspace takes: the buffers, and a line of at most 41 positions.
+    /// What a workspace takes: the buffers, a line of at most 41 positions
+    /// and its structures.
     pub const BYTES: usize = (RECORDS + 1)
         * (HEADER_RECORD_SIZE + std::mem::size_of::<Record>() + std::mem::size_of::<cbh::Record>() + 4)
         + MOVE_BYTES
         + lex::MAX_TAG_VALUE
         + lex::MAX_TAG_NAME
         + lex::MAX_SYMBOL
-        + 1024;
+        + 1024
+        + MAX_STRUCTURES * 8;
+
+    /// Sets what the walks take from each game from now on.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.line.mode = mode;
+    }
+
+    /// The last game's line, as the walk left it.
+    pub fn line(&self) -> &Line {
+        &self.line
+    }
 
     pub fn new() -> Option<Workspace> {
         let buf = |n: usize| {
@@ -85,6 +196,8 @@ impl Workspace {
         };
         let mut positions = Vec::new();
         positions.try_reserve_exact(64).ok()?;
+        let mut structures = Vec::new();
+        structures.try_reserve_exact(MAX_STRUCTURES).ok()?;
         let mut two_cbh = Vec::new();
         two_cbh.try_reserve_exact(RECORDS + 1).ok()?;
         let mut classic = Vec::new();
@@ -96,7 +209,18 @@ impl Workspace {
             records: Records { two_cbh, classic },
             moves: buf(MOVE_BYTES)?,
             later,
-            line: Line { number: 0, outcome: Outcome::Other, elo: 0, positions },
+            line: Line {
+                number: 0,
+                outcome: Outcome::Other,
+                elo: 0,
+                positions,
+                structures,
+                found: None,
+                mode: Mode::Tree,
+                here: 0,
+                here_structure: 0,
+                past: false,
+            },
             lexer: Lexer::new(),
             skipped: 0,
         })
@@ -396,18 +520,17 @@ fn walk(data: &MoveData<'_>, record: &Record, max_ply: u8, line: &mut Line) -> b
     }
     begin(line, record);
     let mut words = moves.main_line();
-    let mut ply = 0u8;
+    let mut ply = 0u32;
     loop {
-        let key = board.hash();
-        let played = if ply < max_ply { words.next() } else { None };
+        line.at(&board, ply);
+        let played = if line.reads(ply, max_ply) { words.next() } else { None };
         let mv = match played.map(|w| replay::play(&mut board, w)) {
             Some(Ok(Some(mv))) => Some(mv),
             // The end of the line, a null move, damage or the index's depth:
             // the position is reached, and no move from it is counted.
             _ => None,
         };
-        line.reach(key, mv.map_or(NO_MOVE, pack_move), ply);
-        if mv.is_none() {
+        if !line.visit(mv.map_or(NO_MOVE, pack_move), ply, max_ply) || mv.is_none() {
             return true;
         }
         ply += 1;
@@ -428,11 +551,12 @@ fn walk_classic(data: &cbh::MoveData<'_>, record: &cbh::Record, max_ply: u8, lin
         return false;
     }
     begin(line, record);
-    let mut main = MainLine { line, max_ply, ply: 0, at: board.hash(), pending: None, done: false };
+    line.at(&board, 0);
+    let mut main = MainLine { line, max_ply, ply: 0, pending: None, done: false };
     // Damage ends the line where it is: the positions before it are kept.
     let _ = cbh::walk(&moves, &mut main);
     if !main.done {
-        main.line.reach(main.at, NO_MOVE, main.ply);
+        main.line.visit(NO_MOVE, main.ply, main.max_ply);
     }
     true
 }
@@ -441,9 +565,7 @@ fn walk_classic(data: &cbh::MoveData<'_>, record: &cbh::Record, max_ply: u8, lin
 struct MainLine<'a> {
     line: &'a mut Line,
     max_ply: u8,
-    ply: u8,
-    /// The key of the position the main line has reached.
-    at: u64,
+    ply: u32,
     /// A main-line move announced and not yet played: it counts once it is,
     /// as an illegal move is reported before it is found to be one.
     pending: Option<u16>,
@@ -457,10 +579,10 @@ impl TreeVisitor for MainLine<'_> {
         if self.done {
             return;
         }
-        match mv.filter(|_| main_line && self.ply < self.max_ply) {
+        match mv.filter(|_| main_line && self.line.reads(self.ply, self.max_ply)) {
             Some(mv) => self.pending = Some(pack_move(mv)),
             None => {
-                self.line.reach(self.at, NO_MOVE, self.ply);
+                self.line.visit(NO_MOVE, self.ply, self.max_ply);
                 self.done = true;
             }
         }
@@ -468,9 +590,12 @@ impl TreeVisitor for MainLine<'_> {
 
     fn played(&mut self, after: &Board) {
         if let Some(mv) = self.pending.take() {
-            self.line.reach(self.at, mv, self.ply);
+            if !self.line.visit(mv, self.ply, self.max_ply) {
+                self.done = true;
+                return;
+            }
             self.ply += 1;
-            self.at = after.hash();
+            self.line.at(after, self.ply);
         }
     }
 }
@@ -484,23 +609,24 @@ fn walk_pgn(text: &[u8], r: &pgnfile::Record, max_ply: u8, line: &mut Line, lexe
         return false;
     }
     begin(line, r);
-    let (mut ply, mut chess960) = (0u8, false);
+    let (mut ply, mut chess960) = (0u32, false);
     let end = main_line(text, lexer, &mut |board, mv| {
-        if ply == 0 && line.positions.is_empty() && board.is_chess960() {
+        if ply == 0 && board.is_chess960() {
             chess960 = true;
             return false;
         }
-        match mv.filter(|_| ply < max_ply) {
+        line.at(board, ply);
+        match mv.filter(|_| line.reads(ply, max_ply)) {
             Some(mv) => {
-                line.reach(board.hash(), pack_move(mv), ply);
+                let more = line.visit(pack_move(mv), ply, max_ply);
                 ply += 1;
-                true
+                more
             }
             // The end of the line, the index's depth, a null move or a move
             // it cannot play: the position is reached, and no move from it is
             // counted.
             None => {
-                line.reach(board.hash(), NO_MOVE, ply);
+                line.visit(NO_MOVE, ply, max_ply);
                 false
             }
         }
@@ -514,6 +640,8 @@ fn begin(line: &mut Line, r: &impl Head) {
     line.outcome = outcome(r);
     line.elo = average_elo(r);
     line.positions.clear();
+    line.structures.clear();
+    line.found = None;
 }
 
 pub fn outcome(r: &impl Head) -> Outcome {

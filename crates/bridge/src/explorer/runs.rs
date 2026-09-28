@@ -15,9 +15,10 @@ use crate::search::SearchError;
 use crate::search::memory::{Cancel, Hold, Refused};
 use crate::search::workers::{self, threads};
 
+use super::deep::{self, Sink};
 use super::file::read_at;
-use super::format::Outcome;
-use super::source::{Line, Source, Workspace};
+use super::format::{MAX_PLY, Outcome, deep_bucket};
+use super::source::{Line, Mode, Source, Workspace};
 
 /// One game passing through one position, in 16 bytes: the key, the game and
 /// its outcome, and the move, ply and rating.
@@ -192,15 +193,17 @@ fn run_bytes(workers: usize) -> usize {
 }
 
 /// Writes the entries of records `first..=last` as sorted runs in `dir`, on at
-/// most half the shared workers, so that searches keep the rest.
+/// most half the shared workers, so that searches keep the rest. With `deep`,
+/// every game's structures past the tree's pruning ply go to it too (#133),
+/// which reads each main line to its end.
 pub fn write_runs(
     source: &dyn Source,
     first: u32,
     last: u32,
-    max_ply: u8,
     dir: &Path,
     progress: &Progress,
     limits: &Limits,
+    deep: Option<&Sink>,
 ) -> Result<Vec<Run>, SearchError> {
     if last < first {
         return Ok(Vec::new());
@@ -213,15 +216,21 @@ pub fn write_runs(
     // their entries and read buffers, so that searches keep the rest.
     let want = threads().div_ceil(2).min(total.div_ceil(4096) as usize).max(1);
     let per_worker = run_bytes(want);
-    let fit = limits.share / (per_worker + Workspace::BYTES);
+    let postings_bytes = if deep.is_some() { deep::WORKER_BYTES } else { 0 };
+    let fit = limits.share / (per_worker + Workspace::BYTES + postings_bytes);
     if fit == 0 {
         return Err(SearchError::TooLarge);
     }
     let want = want.min(fit).max(1);
     let runs = workers::run(want, 0, &Cancel::never(), |w| {
         // The entries, and the buffers games are read into, reserved first.
-        let hold = reserve(per_worker + Workspace::BYTES, progress)?;
+        let hold = reserve(per_worker + Workspace::BYTES + postings_bytes, progress)?;
         let mut work = Workspace::new().ok_or(Refused::Busy)?;
+        let mut postings: Vec<u64> = Vec::new();
+        if deep.is_some() {
+            work.set_mode(Mode::Build);
+            postings.try_reserve_exact(deep::WORKER_POSTINGS).map_err(|_| Refused::Busy)?;
+        }
         let capacity =
             (per_worker / std::mem::size_of::<Entry>()).min(limits.run_entries.unwrap_or(usize::MAX)).max(64);
         let mut buf: Vec<Entry> = Vec::new();
@@ -237,7 +246,7 @@ pub fn write_runs(
                 return Err(SearchError::Superseded);
             }
             let end = (next + 4095).min(hi);
-            source.lines(next as u32, end as u32, max_ply, &mut work, &mut |line: &Line| {
+            source.lines(next as u32, end as u32, MAX_PLY, &mut work, &mut |line: &Line| {
                 if failed.is_some() {
                     return;
                 }
@@ -250,6 +259,17 @@ pub fn write_runs(
                 for &(key, mv, ply) in &line.positions {
                     buf.push(Entry::new(key, line.number, line.outcome, mv, ply, line.elo));
                 }
+                if let Some(sink) = deep {
+                    if postings.len() + line.structures.len() > deep::WORKER_POSTINGS
+                        && let Err(e) = sink.add(&mut postings)
+                    {
+                        failed = Some(e);
+                        return;
+                    }
+                    for &s in &line.structures {
+                        postings.push(u64::from(deep_bucket(s, sink.bits())) << 32 | u64::from(line.number));
+                    }
+                }
             })?;
             progress.done.fetch_add(end - next + 1, Ordering::Relaxed);
             next = end + 1;
@@ -258,8 +278,11 @@ pub fn write_runs(
             return Err(e);
         }
         flush(&mut buf, dir, w.index, &mut runs)?;
+        if let Some(sink) = deep {
+            sink.add(&mut postings)?;
+        }
         progress.skipped.fetch_add(work.skipped, Ordering::Relaxed);
-        drop((buf, work, hold));
+        drop((buf, work, postings, hold));
         Ok(runs)
     })?;
     Ok(runs.into_iter().flatten().collect())

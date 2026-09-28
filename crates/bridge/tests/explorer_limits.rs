@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bridge::catalog::{Catalog, id_of};
-use bridge::explorer::format::{BLOCK_ENTRY, Header, MAX_PLY, PRUNE_PLY};
+use bridge::explorer::format::{BLOCK_ENTRY, DEEP_BLOCK_ENTRY, Header, MAX_PLY, MIN_DEEP_BITS, PRUNE_PLY};
 use cbformat::fixture::{Builder, TempDb, annotations, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
@@ -164,6 +164,7 @@ fn an_index_file_claiming_a_huge_table_is_rebuilt() {
     let generation = Catalog::new([cbh.clone()]).entries()[0].generation().unwrap();
     let blocks: u32 = 1 << 25;
     let table_offset = 1u64 << 30;
+    let deep_offset = table_offset + u64::from(blocks) * BLOCK_ENTRY as u64;
     let h = Header {
         max_ply: MAX_PLY,
         prune_ply: PRUNE_PLY,
@@ -175,7 +176,14 @@ fn an_index_file_claiming_a_huge_table_is_rebuilt() {
         blocks,
         table_offset,
         table_crc: 0,
-        file_len: table_offset + u64::from(blocks) * BLOCK_ENTRY as u64,
+        // A deep section of one empty block after the table, so that only the
+        // table's claim is wrong.
+        file_len: deep_offset + DEEP_BLOCK_ENTRY as u64,
+        deep_bits: MIN_DEEP_BITS,
+        deep_postings: 0,
+        deep_offset,
+        deep_table_offset: deep_offset,
+        deep_table_crc: 0,
     };
     std::fs::create_dir_all(home.join("index")).unwrap();
     let f = std::fs::File::create(home.join("index").join(format!("{}.idx", id_of(&cbh)))).unwrap();

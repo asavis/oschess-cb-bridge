@@ -11,12 +11,15 @@ use crate::catalog::Entry;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
+use crate::search::SearchError;
+use crate::search::memory::Cancel;
+use crate::search::workers::{self, threads};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
-use super::format::{Counts, MAX_PLY, Stats, TOP_GAMES, unpack_move};
+use super::format::{Counts, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, deep_bucket, structure, unpack_move};
 use super::runs::Progress;
-use super::source::average_elo;
+use super::source::{Mode, Source, Target, Workspace, average_elo};
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
@@ -41,7 +44,12 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     };
     let Some(shared) = app.catalog.get(&entry.id) else { return crate::reply::not_found() };
     match app.catalog.explorer.index(shared, &open) {
-        Lookup::Ready(loaded) => match loaded.lookup(board.hash()) {
+        Lookup::Ready(loaded) => match loaded.lookup(board.hash()).and_then(|stats| match stats {
+            Some(stats) => Ok(Some(stats)),
+            // The tree holds positions within its plies that more than one
+            // game reached; any other is looked for in its games (#133).
+            None => deep(&*open.db, &loaded, &board),
+        }) {
             Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
             Err(Bad::Busy) => busy(),
             Err(_) => {
@@ -102,16 +110,72 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
     top.dedup_by_key(|t| t.1);
     top.truncate(TOP_GAMES);
     let games = top.iter().map(|t| t.2.to_string());
-    let index = Obj::new()
-        .num("records", i64::from(loaded.records()))
-        .num("games", loaded.games() as i64)
-        .num("maxPly", i64::from(MAX_PLY))
-        .done();
+    let index = Obj::new().num("records", i64::from(loaded.records())).num("games", loaded.games() as i64).done();
     counts(Obj::new().str("generation", &format!("{:016x}", loaded.generation)), &stats.counts)
         .raw("moves", &json::array(moves))
         .raw("topGames", &json::array(games))
         .raw("index", &index)
         .done()
+}
+
+/// Candidates a worker replays at least, so that a small bucket takes one.
+const DEEP_GAMES_PER_WORKER: usize = 256;
+
+/// A position the tree does not hold: the games of its structure's bucket,
+/// replayed on at most half the shared workers, so that searches keep the
+/// rest, each counted once at the first ply its main line reaches the
+/// position, with the move played from there. `None` when none does.
+pub fn deep(db: &dyn Source, loaded: &Loaded, board: &Board) -> Result<Option<Stats>, Bad> {
+    let games = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
+    if games.is_empty() {
+        return Ok(None);
+    }
+    let target = Target::of(board);
+    let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
+    let found = workers::run(want, Workspace::BYTES, &Cancel::never(), |w| {
+        let mut work = Workspace::new().ok_or(SearchError::Busy)?;
+        work.set_mode(Mode::Find(target));
+        let per = games.len().div_ceil(w.count);
+        let mut found = Vec::new();
+        for &game in games.iter().skip(w.index * per).take(per) {
+            if w.stopped() {
+                return Err(SearchError::Superseded);
+            }
+            db.lines(game, game, MAX_PLY, &mut work, &mut |line| {
+                if let Some(mv) = line.found {
+                    found.push((mv, line.outcome, line.elo, line.number));
+                }
+            })?;
+        }
+        Ok(found)
+    })
+    .map_err(|e| match e {
+        SearchError::Read(e) => Bad::Io(std::io::Error::other(e.to_string())),
+        _ => Bad::Busy,
+    })?;
+    let mut stats = Stats::default();
+    let mut best: Vec<(u16, u32)> = Vec::new();
+    for (mv, outcome, elo, number) in found.into_iter().flatten() {
+        stats.counts.add(outcome);
+        if mv != NO_MOVE {
+            match stats.moves.iter_mut().find(|m| m.0 == mv) {
+                Some(m) => m.1.add(outcome),
+                None => {
+                    let mut c = Counts::default();
+                    c.add(outcome);
+                    stats.moves.push((mv, c));
+                }
+            }
+        }
+        best.push((elo, number));
+    }
+    if stats.counts.games == 0 {
+        return Ok(None);
+    }
+    stats.moves.sort_by_key(|m| std::cmp::Reverse(m.1.games));
+    best.sort_unstable_by_key(|&b| std::cmp::Reverse(b));
+    stats.top = best.iter().take(TOP_GAMES).map(|b| b.1).collect();
+    Ok(Some(stats))
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a

@@ -8,13 +8,14 @@
 
 mod answer;
 mod build;
+pub mod deep;
 pub mod file;
 pub mod format;
 pub mod rendered;
 pub mod runs;
 pub mod source;
 
-pub use answer::{render, route, uci};
+pub use answer::{deep, render, route, uci};
 pub use build::WRITER_BYTES;
 
 use std::collections::{HashMap, HashSet};

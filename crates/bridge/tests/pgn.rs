@@ -139,7 +139,7 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
     get_ready(port, &url.replace("{id}", &i2));
     let (status, body) = both(&url);
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains(r#""index":{"records":10,"games":10,"#), "{body}");
+    assert!(body.contains(r#""index":{"records":10,"games":10}"#), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -293,7 +293,7 @@ fn the_position_index_reads_main_lines() {
     assert!(body.contains(r#""games":3,"white":1,"draws":1,"black":1,"#), "{body}");
     assert!(body.contains(r#""uci":"e7e5","san":"e5","games":1,"white":1,"#), "{body}");
     assert!(body.contains(r#""uci":"c7c5","san":"c5","games":1,"white":0,"draws":0,"black":1"#), "{body}");
-    assert!(body.contains(r#""index":{"records":6,"games":4,"#), "{body}");
+    assert!(body.contains(r#""index":{"records":6,"games":4}"#), "{body}");
     // The variation's 2. Nf3 is not the main line's.
     let after_c5 = "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR%20w%20KQkq%20-%200%202";
     let (_, body) = get(port, &format!("/v1/databases/{id}/explorer?fen={after_c5}"));
