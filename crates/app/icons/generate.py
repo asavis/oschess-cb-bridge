@@ -17,7 +17,8 @@ writes, next to this script:
   logo, its tiles, and its app list and taskbar icons at their target sizes.
 
 The outputs are committed; run this again only when the logo or a colour
-changes. The oschess name and logo are not covered by the MIT licence (NOTICE).
+changes. The oschess name and logo are not covered by the AGPL-3.0 licence
+(NOTICE).
 """
 
 import math

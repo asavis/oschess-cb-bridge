@@ -157,7 +157,7 @@
   "settings.port.save": "Save",
   "settings.port.error": "A port is a number from 1024 to 65535.",
   "settings.error": "That did not work: {message}",
-  "settings.footer": "oschess bridge — open-source software (MIT)",
+  "settings.footer": "oschess bridge — open-source software (AGPL-3.0)",
 
   "firstRun.title": "The bridge is installed",
   "firstRun.subtitle": "The oschess bridge runs in the background — the mark by the clock.",

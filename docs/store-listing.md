@@ -39,7 +39,7 @@ Store's copy, which the Store updates.
 > цього комп’ютера. В інтернет він звертається лише тоді, коли ви просите
 > встановити Stockfish.
 >
-> Відкритий код, ліцензія MIT: https://github.com/asavis/oschess-cb-bridge
+> Відкритий код, ліцензія AGPL-3.0: https://github.com/asavis/oschess-cb-bridge
 
 **Можливості:**
 
@@ -74,7 +74,7 @@ Store's copy, which the Store updates.
 > computer's own address. It goes online only when you ask it to install
 > Stockfish.
 >
-> Open source under the MIT licence: https://github.com/asavis/oschess-cb-bridge
+> Open source under the AGPL-3.0 licence: https://github.com/asavis/oschess-cb-bridge
 
 **Features:**
 
