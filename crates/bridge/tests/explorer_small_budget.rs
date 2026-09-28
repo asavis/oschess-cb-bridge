@@ -178,9 +178,12 @@ fn a_deep_partition_larger_than_the_share_is_written_within_it() {
         let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sink = deep::Sink::create(&dir, 12, &Progress::default()).unwrap();
-        let bucket = 1234u64 << 32;
+        // A structure of bucket 1234, held beyond the tree's plies by every
+        // other game.
+        let structure = 1234u64 << 52;
         for first in (1..=games).step_by(100_000) {
-            sink.add(&mut (first..first + 100_000).map(|g| bucket | g).collect()).unwrap();
+            let postings = (first..first + 100_000).map(|g| deep::posting(structure, 12, g as u32, g % 2 == 0));
+            sink.add(&mut postings.collect()).unwrap();
         }
         let parts = sink.finish().unwrap();
         let mut out = Vec::new();

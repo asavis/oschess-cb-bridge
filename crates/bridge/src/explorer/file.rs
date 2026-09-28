@@ -12,7 +12,7 @@ use crate::search::memory::{Hold, Refused};
 use super::deep::{BLOCK_BUCKETS, bucket_games};
 use super::format::{
     BLOCK_ENTRY, BLOCK_KEYS, Block, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MAX_DEEP_BITS,
-    MIN_DEEP_BITS, MIN_RECORD, Stats,
+    MIN_DEEP_BITS, MIN_RECORD, Stats, deep_bucket, deep_print,
 };
 
 /// Why an index file cannot be used.
@@ -96,12 +96,16 @@ impl IndexFile {
         Ok(IndexFile { file, path: path.to_path_buf(), header, blocks: decoded, deep, _memory: memory })
     }
 
-    /// The games whose main line holds a structure of `bucket` past the
-    /// tree's pruning ply (#133): the candidates for a position that games
-    /// reach beyond the tree's plies (#146). The block and the games, at most
-    /// four bytes for each of its bytes, are held in the search budget until
-    /// the hold is dropped: `Busy` when it has no room.
-    pub fn deep_games(&self, bucket: u32) -> Result<(Vec<u32>, Hold), Bad> {
+    /// The games whose main line holds `structure` past the tree's pruning
+    /// ply (#133), or only those that hold it beyond the tree's plies when
+    /// `beyond`, with the few of other structures of its bucket that share
+    /// its print: the candidates for a position that games reach beyond the
+    /// tree's plies (#146). The block and the games, at most four bytes for
+    /// each of its bytes, are held in the search budget until the hold is
+    /// dropped: `Busy` when it has no room.
+    pub fn deep_games(&self, structure: u64, beyond: bool) -> Result<(Vec<u32>, Hold), Bad> {
+        let bits = self.header.deep_bits;
+        let bucket = deep_bucket(structure, bits);
         let local = bucket as usize % BLOCK_BUCKETS;
         let Some(&(offset, len, crc)) = self.deep.get(bucket as usize / BLOCK_BUCKETS) else {
             return Err(Bad::Corrupt("deep bucket"));
@@ -114,7 +118,8 @@ impl IndexFile {
         if crc32(&buf) != crc {
             return Err(Bad::Corrupt("deep block"));
         }
-        let games = bucket_games(&buf, local, self.header.last_record).ok_or(Bad::Corrupt("deep block"))?;
+        let games = bucket_games(&buf, local, self.header.last_record, deep_print(structure, bits), beyond)
+            .ok_or(Bad::Corrupt("deep block"))?;
         Ok((games, memory))
     }
 

@@ -367,30 +367,32 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   they all hold the same lines.
 - **What a game adds to the deep section** (#133): each structure (each
   side's pawns and its knights, bishops, rooks and queens counted) that its
-  main line holds at some ply beyond 20, once, to its bucket. Only a pawn move
-  or a capture changes a structure, and neither is undone, so a game holds
-  each one for a single stretch of plies. Every game that reaches a
-  position beyond ply 20 is found among the games of its structure's bucket,
-  by replaying their lines from the move stream: all of the position's games
-  when the tree does not hold it, and those that first reach it beyond
-  ply 40, which the tree did not count, when it does (#146). The pieces
-  matter: every pawnless ending shares one pawn structure, 186,041 games of
-  the Mega Database, and with the pieces counted the most crowded bucket,
-  bare kings, holds 38,367.
+  main line holds at some ply beyond 20, once, to its bucket, with the
+  structure's print and whether the line holds it at some ply beyond 40. Only
+  a pawn move or a capture changes a structure, and neither is undone, so a
+  game holds each one for a single stretch of plies. Every game that reaches
+  a position beyond ply 20 is found among the games of its structure's
+  bucket with its print, by replaying their lines from the move stream: all
+  of the position's games when the tree does not hold it, and those that
+  first reach it beyond ply 40, which the tree did not count, when it does
+  (#146). Such a game holds the structure beyond ply 40, so only the games
+  marked so are replayed then. The pieces matter: every pawnless ending
+  shares one pawn structure, 186,041 games of the Mega Database, and with the
+  pieces counted the most crowded bucket, bare kings, holds 38,367.
 - **Header** (128 bytes):
 
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBIDX\0` |
-  | 8 | 4 | format version, 3 |
+  | 8 | 4 | format version, 4 |
   | 12 | 4 | header length, 128 |
   | 17 | 1 | depth in plies, 40 |
   | 18 | 1 | pruning ply, 20 |
-  | 19 | 1 | deep bucket bits, 12 to 24 |
+  | 19 | 1 | deep bucket bits, 8 to 24 |
   | 20 | 4 | first record indexed |
   | 24 | 4 | last record indexed |
   | 32 | 8 | the database's generation when built |
-  | 40 | 8 | deep postings: a game once per bucket |
+  | 40 | 8 | deep postings: a game once per structure print in a bucket |
   | 48 | 8 | games indexed |
   | 56 | 8 | positions |
   | 64 | 4 | blocks |
@@ -422,15 +424,20 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   keys and data together (4 bytes each), 28 bytes a block.
 - **The deep section** follows the block table. A structure's bucket is the
   top *bits* bits (header byte 19) of a 64-bit hash of its two pawn
-  bitboards and its piece counts (`explorer::format::structure`). *bits* is the bit length of
-  the database's last record, from 12 to 24: about a bucket a game. The
-  buckets come in blocks of 4,096, back to back: for each bucket, the number
-  of its games, then the games in ascending order as the differences from
-  the previous one (the first from 0), all unsigned LEB128. Two structures can
-  share a bucket; a lookup replays the bucket's games and keeps those whose
-  main line reaches the position's key.
+  bitboards and its piece counts (`explorer::format::structure`), and its
+  print the 7 bits below them. *bits* is the bit length of the database's
+  last record, from 8 to 24: about a bucket a game. The buckets come in
+  blocks of 256, back to back, so that a lookup reads a few KiB: for each
+  bucket, the number of its postings, then each posting as one number, by
+  game, then print, in ascending order: the game's difference from the
+  previous posting's (the first from 0, and 0 only for a game's next print)
+  times 256, plus the print times 2, plus 1 when the game holds the structure
+  beyond ply 40; all unsigned LEB128. Structures that share a bucket are told
+  apart by their print, except one in 128; a lookup replays the games of its
+  bucket with its print, marked when the tree holds the position, and keeps
+  those whose main line reaches the position's key.
 - **The deep table** ends the file: for each deep block its offset (8 bytes),
-  length and CRC-32 (4 bytes each), 16 bytes a block, 2^(*bits* − 12)
+  length and CRC-32 (4 bytes each), 16 bytes a block, 2^(*bits* − 8)
   blocks.
 - **Checks.** On opening, before anything is allocated from the header's
   counts: the header's CRC, and counts that fit the file (the table between
@@ -440,9 +447,9 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   follow each other, in key order, with at most 4,096 keys and a little over
   1 MiB of records each, and deep blocks that follow each other from the deep
   section's offset to the deep table. On each lookup, the CRC of the block
-  read; a deep bucket's games must ascend and stay within the records
-  indexed. Any failure rebuilds the index. The table is held within the search
-  memory budget while the index is open.
+  read; a deep bucket's games must ascend, each game's prints too, and stay
+  within the records indexed. Any failure rebuilds the index. The table is
+  held within the search memory budget while the index is open.
 - **Deciding what to build.** An index and a move stream both built at the
   database's generation, with the same build id, are current; anything else
   rebuilds both. A crash between writing one and the other, or a file copied
@@ -477,13 +484,15 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   8 MiB, which holds the writer and 30 runs; a smaller share fails the build
   as too large rather than waiting for memory the build holds itself.
 - **The deep section's build** (#133). The same workers read every main line
-  to its end, not only its first 40 plies, and turn each structure it
-  holds past ply 20 into a posting, `bucket << 32 | game`, kept in a 1 MiB
-  buffer. A full buffer is sorted and appended to up to 256 partition files,
-  split by the bucket's top bits, each written through a 4 KiB buffer held in
-  the build's share while it reads. Once the tree is written, each partition in
-  turn is sorted and freed of repeated postings, and written as its deep
-  blocks, within what the build's share of the budget leaves beside the
+  to its end, not only its first 40 plies, and turn each structure it holds
+  past ply 20 into a posting, `bucket << 40 | game << 8 | print << 1`, plus 1
+  when the line holds it only within ply 40, kept in a 1 MiB buffer. A full
+  buffer is sorted and appended to up to 256 partition files, split by the
+  bucket's top bits, of 4,096 buckets at least, each written through a 4 KiB
+  buffer held in the build's share while it reads. Once the tree is written,
+  each partition in turn is sorted and freed of repeated postings, a game's
+  posting beyond ply 40 kept of the two with one print, and written as its
+  deep blocks, within what the build's share of the budget leaves beside the
   writer it holds. A partition that fits is sorted in memory. A larger one,
   such as the partition of a structure that most games hold, is sorted in
   chunks that fit, written apart and merged into one sorted file. Each of its
@@ -593,12 +602,13 @@ it means the same in any position and needs no board to decode.
   a pawn's move changes them, so they are counted again only then. Nothing
   is concluded from the pieces of each kind, which a promotion adds to. The
   moves are played without finding the pieces that give check, which only
-  legality needs (`chesscore::Replayer`). The bucket is replayed on at most
-  half the search workers, which take its games 64 at a time as they go, so
-  that a worker the machine runs less often takes fewer; each holds only what
-  it found, and a replay stops at its next game once its request is
-  superseded. Moves played as often are listed in the order of the first
-  game, by number, that played each.
+  legality needs (`chesscore::Replayer`). Up to 256 games are replayed on
+  the request's own thread, which takes less time than starting a worker
+  would. More are replayed on at most half the search workers, which take
+  them 64 at a time as they go, so that a worker the machine runs less often
+  takes fewer; each holds only what it found. A replay stops at its next
+  game once its request is superseded. Moves played as often are listed in
+  the order of the first game, by number, that played each.
 
 # The classic format (`.cbh`)
 

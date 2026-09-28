@@ -11,8 +11,10 @@ use crate::indexdir::{crc32, u32_at, u64_at};
 
 pub const MAGIC: [u8; 8] = *b"OSCBIDX\0";
 /// 2 added the deep section (#133); 3 the build id, which the move stream
-/// built with the index carries too (#145).
-pub const VERSION: u32 = 3;
+/// built with the index carries too (#145); 4 deep blocks of 256 buckets, and
+/// with each game its structure's print and whether it holds that structure
+/// beyond the tree's plies (#146).
+pub const VERSION: u32 = 4;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
@@ -36,8 +38,9 @@ pub const MAX_PLY: u8 = 40;
 /// A position reached by one game only is dropped beyond this ply. Every
 /// position past it is found through the deep section as well.
 pub const PRUNE_PLY: u8 = 20;
-/// Buckets per deep block: a lookup reads one block and walks to its bucket.
-pub const DEEP_BLOCK_BITS: u8 = 12;
+/// Buckets per deep block: a lookup reads one block, a few KiB, and walks to
+/// its bucket.
+pub const DEEP_BLOCK_BITS: u8 = 8;
 /// The fewest and the most bucket bits a deep section has.
 pub const MIN_DEEP_BITS: u8 = DEEP_BLOCK_BITS;
 pub const MAX_DEEP_BITS: u8 = 24;
@@ -379,6 +382,17 @@ pub fn structure(board: &Board) -> u64 {
 /// The bucket of `structure` among `1 << bits`.
 pub fn deep_bucket(structure: u64, bits: u8) -> u32 {
     (structure >> (64 - u32::from(bits))) as u32
+}
+
+/// The bits of a structure below its bucket's that the deep section keeps
+/// with each game: the games of another structure of the bucket are then
+/// left out without a replay, all but one in 128.
+pub const PRINT_BITS: u8 = 7;
+
+/// The print of `structure` in a bucket of `bits` bits: its [`PRINT_BITS`]
+/// bits below the bucket's.
+pub fn deep_print(structure: u64, bits: u8) -> u8 {
+    (structure >> (64 - u32::from(bits) - u32::from(PRINT_BITS))) as u8 & ((1 << PRINT_BITS) - 1)
 }
 
 /// The splitmix64 finaliser: every input bit reaches every output bit.

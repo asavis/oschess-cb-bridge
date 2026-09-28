@@ -16,12 +16,12 @@ use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
 use crate::rows::{Names, row_obj};
 use crate::search::SearchError;
-use crate::search::memory::Cancel;
+use crate::search::memory::{Cancel, Hold};
 use crate::search::workers::{self, threads};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
-use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, deep_bucket, structure, unpack_move};
+use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, structure, unpack_move};
 use super::runs::Progress;
 use super::source::average_elo;
 use super::stream::Target;
@@ -123,6 +123,8 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
 }
 
 /// Candidates a worker replays at least, so that a small bucket takes one.
+/// A bucket that one worker would take whole is replayed on the calling
+/// thread instead, which takes less time than starting a worker would.
 const DEEP_GAMES_PER_WORKER: usize = 256;
 /// Candidates a worker takes at a time: the workers share a bucket as they
 /// go, so that one the machine runs less often takes fewer.
@@ -214,16 +216,17 @@ impl Found {
 /// What the index answers for `board` (#146): the tree's record when it holds
 /// the position, and the games of the position's structure that the tree did
 /// not count, replayed from the move stream: all of them when the tree does
-/// not hold it, else those that reach it first beyond the tree's plies. The
-/// tree counted every other game that reaches it, once, at its first visit,
-/// so each game counts once, with the move it played from its first visit.
+/// not hold it, else those that reach it first beyond the tree's plies, which
+/// the deep section marks as holding its structure there. The tree counted
+/// every other game that reaches it, once, at its first visit, so each game
+/// counts once, with the move it played from its first visit.
 /// Counts add, moves add by code, and the notable games are the best of
 /// both, by rating, then number. `None` when no game reaches the position.
 /// Errors as [`deep`]'s.
 pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
     let Some(mut tree) = loaded.lookup(board.hash())? else { return deep(loaded, board, cancel) };
     let target = Target::of(board).beyond(loaded.base.header.max_ply);
-    let Some(found) = replay(loaded, board, &target, cancel)? else { return Ok(Some(tree)) };
+    let Some(found) = replay(loaded, board, &target, true, cancel)? else { return Ok(Some(tree)) };
     tree.counts.merge(&found.counts);
     for played in &found.moves {
         match tree.moves.iter_mut().find(|m| m.0 == played.mv) {
@@ -248,20 +251,41 @@ pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<S
 /// or not, as [`stats`] answers a position the tree does not hold: each
 /// counted once at the first ply its main line reaches the position, with the
 /// move played from there; the moves played as often in the order their first
-/// games have. `None` when none does. A worker stops at its next game once
+/// games have. `None` when none does. A replay stops at its next game once
 /// `cancel` is, and the answer is then `Busy`; a stream found damaged is
 /// `Corrupt`.
 pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
-    Ok(replay(loaded, board, &Target::of(board), cancel)?.map(Found::into_stats))
+    Ok(replay(loaded, board, &Target::of(board), false, cancel)?.map(Found::into_stats))
 }
 
-/// The games of `board`'s structure's bucket that reach `target`, replayed
-/// from the move stream on at most half the shared workers, so that searches
-/// keep the rest; `None` when none does.
-fn replay(loaded: &Loaded, board: &Board, target: &Target, cancel: &Cancel) -> Result<Option<Found>, Bad> {
-    let (games, _memory) = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
+/// The games that hold `board`'s structure, only those that hold it beyond
+/// the tree's plies when `beyond`, and that reach `target`, replayed from the
+/// move stream ([`IndexFile::deep_games`] names the candidates): on the
+/// calling thread when one worker would take them all, else on at most half
+/// the shared workers, so that searches keep the rest; `None` when none does.
+///
+/// [`IndexFile::deep_games`]: super::file::IndexFile::deep_games
+fn replay(
+    loaded: &Loaded,
+    board: &Board,
+    target: &Target,
+    beyond: bool,
+    cancel: &Cancel,
+) -> Result<Option<Found>, Bad> {
+    let (games, _memory) = loaded.base.deep_games(structure(board), beyond)?;
     if games.is_empty() {
         return Ok(None);
+    }
+    if games.len() <= DEEP_GAMES_PER_WORKER {
+        let _memory = Hold::reserve(Found::BYTES).map_err(|_| Bad::Busy)?;
+        let mut found = Found::new().ok_or(Bad::Busy)?;
+        for &game in &games {
+            if cancel.is_cancelled() {
+                return Err(Bad::Busy);
+            }
+            find(loaded, game, target, &mut found)?;
+        }
+        return Ok(Some(found).filter(|found| found.counts.games > 0));
     }
     let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
     let next = AtomicUsize::new(0);
@@ -274,14 +298,8 @@ fn replay(loaded: &Loaded, board: &Board, target: &Target, cancel: &Cancel) -> R
                 if w.stopped() || cancel.is_cancelled() {
                     return Err(SearchError::Superseded);
                 }
-                match loaded.stream.find(game, target) {
-                    Ok(Some(hit)) => {
-                        let mut counts = Counts::default();
-                        counts.add(hit.outcome);
-                        found.add(hit.mv, &counts, (hit.elo, game), game);
-                    }
-                    Ok(None) => {}
-                    Err(damaged) => return Ok(Err(damaged)),
+                if let Err(damaged) = find(loaded, game, target, &mut found) {
+                    return Ok(Err(damaged));
                 }
             }
         }
@@ -297,6 +315,17 @@ fn replay(loaded: &Loaded, board: &Board, target: &Target, cancel: &Cancel) -> R
         }
     }
     Ok(all.filter(|all| all.counts.games > 0))
+}
+
+/// Replays game `game`'s line to `target`, and adds the game to `found` when
+/// it reaches it.
+fn find(loaded: &Loaded, game: u32, target: &Target, found: &mut Found) -> Result<(), Bad> {
+    if let Some(hit) = loaded.stream.find(game, target)? {
+        let mut counts = Counts::default();
+        counts.add(hit.outcome);
+        found.add(hit.mv, &counts, (hit.elo, game), game);
+    }
+    Ok(())
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a
