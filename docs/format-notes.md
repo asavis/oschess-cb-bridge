@@ -468,8 +468,15 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   holds past ply 20 into a posting, `bucket << 32 | game`, kept in a 1 MiB
   buffer. A full buffer is sorted and appended to up to 256 partition files,
   split by the bucket's top bits. Once the tree is written, each partition in
-  turn is read, sorted and freed of repeated postings within the build's
-  share of the budget, and written as its deep blocks.
+  turn is sorted and freed of repeated postings, and written as its deep
+  blocks, within what the build's share of the budget leaves beside the
+  writer it holds. A partition that fits is sorted in memory. A larger one,
+  such as the partition of a structure that most games hold, is sorted in
+  chunks that fit, written apart and merged into one sorted file. Each of its
+  blocks is then read twice from that file, for its buckets' counts, then for
+  their games. Blocks are written as they are made, their CRC kept running. A
+  share too small to merge a partition's chunks, each through at least 4 KiB,
+  fails the build at once.
 
 # The classic format (`.cbh`)
 

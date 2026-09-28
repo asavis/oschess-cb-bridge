@@ -9,7 +9,7 @@ use bridge::catalog::Catalog;
 use bridge::explorer::Lookup;
 use bridge::explorer::format::MAX_PLY;
 use bridge::explorer::runs::{Limits, Progress, RUN_BUFFER, fan_ins};
-use bridge::explorer::{self, WRITER_BYTES, rendered};
+use bridge::explorer::{self, WRITER_BYTES, deep, rendered};
 use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
@@ -159,4 +159,41 @@ fn a_kept_index_without_memory_is_busy_not_built() {
     assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Ready(_)));
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written, "the file was rewritten");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The reviewer's shape for the deep section: one structure that every game
+/// holds, so that its partition, 12 MB, is larger than what the build's
+/// share leaves beside the writer it holds. The partition is sorted on disk
+/// within the share, at once, into the blocks an in-memory sort writes.
+#[test]
+fn a_deep_partition_larger_than_the_share_is_written_within_it() {
+    if !in_child("a_deep_partition_larger_than_the_share_is_written_within_it") {
+        return;
+    }
+    let games = 1_500_000u64;
+    let write = |name: &str, memory: usize| {
+        let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = deep::Sink::create(&dir, 12).unwrap();
+        let bucket = 1234u64 << 32;
+        for first in (1..=games).step_by(100_000) {
+            sink.add(&mut (first..first + 100_000).map(|g| bucket | g).collect()).unwrap();
+        }
+        let parts = sink.finish().unwrap();
+        let mut out = Vec::new();
+        let started = Instant::now();
+        let result = deep::write_section(&parts, 12, &mut out, 0, &dir.join("x"), &Progress::default(), memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+        (result.map(|(table, kept)| (out, table, kept)), started.elapsed())
+    };
+    let share = Limits::default().share;
+    let writer = Hold::reserve(WRITER_BYTES).unwrap();
+    let (within, took) = write("share", share - WRITER_BYTES);
+    assert!(took < Duration::from_secs(20), "no wait for memory the build holds: {took:?}");
+    let within = within.unwrap();
+    assert_eq!(within.2, games);
+    drop(writer);
+    assert_eq!(held(), 0);
+    let (in_memory, _) = write("memory", 64 << 20);
+    assert_eq!(within, in_memory.unwrap());
 }

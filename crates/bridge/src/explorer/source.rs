@@ -596,6 +596,12 @@ impl TreeVisitor for MainLine<'_> {
             self.line.at(after, self.ply);
         }
     }
+
+    /// Once the line is done the rest of the game is not decoded: a find
+    /// replays each candidate only as far as it has to.
+    fn stopped(&self) -> bool {
+        self.done
+    }
 }
 
 /// Fills `line` with the main line of a PGN game's text, as [`walk`] reads a
@@ -661,4 +667,32 @@ pub fn average_elo(r: &impl Head) -> u16 {
         _ => (w + b) / 2,
     };
     avg.min(4095) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::explorer::format::MAX_PLY;
+
+    /// A classic game's walk is told to stop once the position is found.
+    #[test]
+    fn a_classic_walk_stops_at_the_position_found() {
+        let mut work = Workspace::new().unwrap();
+        let start = Board::startpos();
+        let mut e4 = start.clone();
+        e4.play_checked("e2e4".parse().unwrap()).unwrap();
+        let mut e5 = e4.clone();
+        e5.play_checked("e7e5".parse().unwrap()).unwrap();
+        work.set_mode(Mode::Find(Target::of(&e4)));
+        work.line.at(&start, 0);
+        let mut main = MainLine { line: &mut work.line, max_ply: MAX_PLY, ply: 0, pending: None, done: false };
+        main.play(&start, Some("e2e4".parse().unwrap()), true);
+        main.played(&e4);
+        assert!(!main.stopped(), "not found yet");
+        let reply: Move = "e7e5".parse().unwrap();
+        main.play(&e4, Some(reply), true);
+        main.played(&e5);
+        assert!(main.stopped(), "found: the rest of the game is not decoded");
+        assert_eq!(work.line.found, Some(pack_move(reply)));
+    }
 }

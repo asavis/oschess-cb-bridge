@@ -120,6 +120,70 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
 
 /// Candidates a worker replays at least, so that a small bucket takes one.
 const DEEP_GAMES_PER_WORKER: usize = 256;
+/// Room for the moves played from a position: it has 218 legal moves at most.
+const MAX_MOVES: usize = 256;
+
+/// What a worker's replays found, the same few bytes however many games
+/// reach the position: their counts, the moves played with theirs, and the
+/// best games so far by average rating, then number.
+struct Found {
+    counts: Counts,
+    moves: Vec<(u16, Counts)>,
+    top: Vec<(u16, u32)>,
+}
+
+impl Found {
+    /// What one takes, reserved with its worker's buffers.
+    const BYTES: usize =
+        MAX_MOVES * std::mem::size_of::<(u16, Counts)>() + (TOP_GAMES + 1) * std::mem::size_of::<(u16, u32)>();
+
+    fn new() -> Option<Found> {
+        let mut moves = Vec::new();
+        moves.try_reserve_exact(MAX_MOVES).ok()?;
+        let mut top = Vec::new();
+        top.try_reserve_exact(TOP_GAMES + 1).ok()?;
+        Some(Found { counts: Counts::default(), moves, top })
+    }
+
+    /// Adds `counts` of games that played `mv` from the position (`NO_MOVE`
+    /// when they ended there), the best of them ranked `best`.
+    fn add(&mut self, mv: u16, counts: &Counts, best: (u16, u32)) {
+        self.counts.merge(counts);
+        self.add_move(mv, counts);
+        self.rank(best);
+    }
+
+    fn add_move(&mut self, mv: u16, counts: &Counts) {
+        if mv == NO_MOVE {
+            return;
+        }
+        if let Some(m) = self.moves.iter_mut().find(|m| m.0 == mv) {
+            m.1.merge(counts);
+        } else if self.moves.len() < MAX_MOVES {
+            // Every move played from one position is legal there, so the room
+            // is never short, and nothing grows past what was reserved.
+            self.moves.push((mv, *counts));
+        }
+    }
+
+    fn rank(&mut self, best: (u16, u32)) {
+        let at = self.top.partition_point(|&b| b > best);
+        if at < TOP_GAMES {
+            self.top.insert(at, best);
+            self.top.truncate(TOP_GAMES);
+        }
+    }
+
+    fn merge(&mut self, other: &Found) {
+        self.counts.merge(&other.counts);
+        for (mv, counts) in &other.moves {
+            self.add_move(*mv, counts);
+        }
+        for &best in &other.top {
+            self.rank(best);
+        }
+    }
+}
 
 /// A position the tree does not hold: the games of its structure's bucket,
 /// replayed on at most half the shared workers, so that searches keep the
@@ -132,18 +196,20 @@ pub fn deep(db: &dyn Source, loaded: &Loaded, board: &Board) -> Result<Option<St
     }
     let target = Target::of(board);
     let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
-    let found = workers::run(want, Workspace::BYTES, &Cancel::never(), |w| {
+    let parts = workers::run(want, Workspace::BYTES + Found::BYTES, &Cancel::never(), |w| {
         let mut work = Workspace::new().ok_or(SearchError::Busy)?;
         work.set_mode(Mode::Find(target));
+        let mut found = Found::new().ok_or(SearchError::Busy)?;
         let per = games.len().div_ceil(w.count);
-        let mut found = Vec::new();
         for &game in games.iter().skip(w.index * per).take(per) {
             if w.stopped() {
                 return Err(SearchError::Superseded);
             }
             db.lines(game, game, MAX_PLY, &mut work, &mut |line| {
                 if let Some(mv) = line.found {
-                    found.push((mv, line.outcome, line.elo, line.number));
+                    let mut counts = Counts::default();
+                    counts.add(line.outcome);
+                    found.add(mv, &counts, (line.elo, line.number));
                 }
             })?;
         }
@@ -153,29 +219,16 @@ pub fn deep(db: &dyn Source, loaded: &Loaded, board: &Board) -> Result<Option<St
         SearchError::Read(e) => Bad::Io(std::io::Error::other(e.to_string())),
         _ => Bad::Busy,
     })?;
-    let mut stats = Stats::default();
-    let mut best: Vec<(u16, u32)> = Vec::new();
-    for (mv, outcome, elo, number) in found.into_iter().flatten() {
-        stats.counts.add(outcome);
-        if mv != NO_MOVE {
-            match stats.moves.iter_mut().find(|m| m.0 == mv) {
-                Some(m) => m.1.add(outcome),
-                None => {
-                    let mut c = Counts::default();
-                    c.add(outcome);
-                    stats.moves.push((mv, c));
-                }
-            }
-        }
-        best.push((elo, number));
+    let mut parts = parts.into_iter();
+    let Some(mut all) = parts.next() else { return Ok(None) };
+    for part in parts {
+        all.merge(&part);
     }
-    if stats.counts.games == 0 {
+    if all.counts.games == 0 {
         return Ok(None);
     }
-    stats.moves.sort_by_key(|m| std::cmp::Reverse(m.1.games));
-    best.sort_unstable_by_key(|&b| std::cmp::Reverse(b));
-    stats.top = best.iter().take(TOP_GAMES).map(|b| b.1).collect();
-    Ok(Some(stats))
+    all.moves.sort_by_key(|m| std::cmp::Reverse(m.1.games));
+    Ok(Some(Stats { counts: all.counts, moves: all.moves, top: all.top.iter().map(|b| b.1).collect() }))
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a
@@ -207,4 +260,38 @@ fn top_game<S: Store>(db: &S, number: u32) -> Option<(u16, String)> {
         .str("result", r.result().pgn());
     let o = if year == 0 { o.raw("year", "null") } else { o.num("year", i64::from(year)) };
     Some((average_elo(&r), o.str("event", &event).done()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::explorer::format::Outcome;
+
+    /// However many games a worker finds, what it keeps stays within what it
+    /// reserved, and two workers' finds merge into the same answer as one's.
+    #[test]
+    fn found_games_are_added_up_in_the_room_reserved() {
+        let (a, b) = (Found::new().unwrap(), Found::new().unwrap());
+        let (mut one, mut halves) = (Found::new().unwrap(), [a, b]);
+        let (moves, top) = (one.moves.capacity(), one.top.capacity());
+        for n in 1..=50_000u32 {
+            let mut counts = Counts::default();
+            counts.add([Outcome::White, Outcome::Draw, Outcome::Black][n as usize % 3]);
+            let mv = if n % 7 == 0 { NO_MOVE } else { (n % 5) as u16 + 1 };
+            let best = ((n * 7919 % 3000) as u16, n);
+            one.add(mv, &counts, best);
+            halves[n as usize % 2].add(mv, &counts, best);
+        }
+        assert_eq!((one.moves.capacity(), one.top.capacity()), (moves, top), "nothing grew");
+        assert_eq!(one.counts.games, 50_000);
+        assert_eq!(one.moves.len(), 5);
+        assert_eq!(one.moves.iter().map(|m| m.1.games).sum::<u64>(), 50_000 - 50_000 / 7);
+        let [mut merged, other] = halves;
+        merged.merge(&other);
+        assert_eq!(merged.counts, one.counts);
+        assert_eq!(merged.top, one.top);
+        let mut expected: Vec<(u16, u32)> = (1..=50_000u32).map(|n| ((n * 7919 % 3000) as u16, n)).collect();
+        expected.sort_unstable_by(|x, y| y.cmp(x));
+        assert_eq!(one.top, expected[..TOP_GAMES]);
+    }
 }
