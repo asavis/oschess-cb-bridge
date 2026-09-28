@@ -10,49 +10,60 @@
 //! on an empty board, so it means the same in any position: the words of a
 //! classic database or a PGN file are those of the same moves, and one
 //! stream format serves all three.
+//!
+//! Each record carries a CRC-32 of itself and its tail, checked whenever it
+//! is read: a replay checks the few hundred bytes it reads and nothing else,
+//! and a build computes each CRC while the record is in its hands, then
+//! writes the file from start to end.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use chesscore::{Board, BoardBuilder, CastleSide, Color, Move, Piece, Square};
+use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Square};
 
 use cbformat::movetable::FIRST_PIECE_WORD;
 use cbformat::replay;
 
-use crate::indexdir::{crc32, u32_at, u64_at};
+use crate::indexdir::{crc32, crc32_update, u32_at, u64_at};
 use crate::search::SearchError;
-use crate::search::memory::{Cancel, Hold, Refused};
-use crate::search::workers::{self, threads};
+use crate::search::memory::{Hold, Refused};
 
 use super::file::{Bad, read_at, write_at};
 use super::format::{NO_MOVE, Outcome, pack_move};
 use super::map::Map;
-use super::runs::{Progress, io, reserve};
+use super::runs::io;
 use super::source::Line;
 
 pub const MAGIC: [u8; 8] = *b"OSCBMOV\0";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 128;
-/// The words of a line kept in its record's prefix slot: the tree's depth
-/// once #143 moves it to ply 20, and one more.
+/// The words of a line kept in its record's slot: the tree's depth once
+/// #143 moves it to ply 20, and one more.
 pub const PREFIX_WORDS: usize = 21;
 const PREFIX_BYTES: usize = 2 * PREFIX_WORDS;
-/// A record's directory entry.
-pub const ENTRY_BYTES: usize = 16;
+/// A record's slot: its directory entry, its prefix words, two zero bytes
+/// and its CRC, a cache line that no page boundary cuts.
+pub const SLOT_BYTES: usize = 64;
+/// Where a slot's prefix words start, and where its CRC is.
+const PREFIX_AT: usize = 16;
+const CRC_AT: usize = SLOT_BYTES - 4;
 /// A set-up start in a tail: 18 words.
 pub const SETUP_BYTES: usize = 36;
 /// The most plies of a line the stream keeps; the line ends there.
 pub const MAX_PLIES: usize = u16::MAX as usize;
-/// The bytes each CRC of the chunk table covers.
-pub const CHUNK: usize = 1 << 20;
-/// Records a worker writes at a time, as the build reads them.
+/// Everything appended to the file starts at a multiple of this.
+const ALIGN: u64 = SLOT_BYTES as u64;
+/// Records in a block: a worker writes the slots of one block at a time, as
+/// the build reads them, and the file's table gives where each block is.
 pub const BATCH: usize = 4096;
-/// A worker's part of a build: its tail chunk, a batch's directory entries,
-/// prefix slots and pending tails, and a line's words, which the walk keeps
+/// The tails a worker gathers before it appends them.
+pub const TAIL_BUFFER: usize = 1 << 20;
+/// A worker's part of a build: its tail buffer, a block's slots and pending
+/// tails, and a line's words, which the walk keeps
 /// ([`super::source::Workspace::keep_words`]).
-pub const WORKER_BYTES: usize = CHUNK + BATCH * (ENTRY_BYTES + PREFIX_BYTES + 4) + MAX_PLIES * 2;
+pub const WORKER_BYTES: usize = TAIL_BUFFER + BATCH * (SLOT_BYTES + 4) + MAX_PLIES * 2;
 
 /// Directory flags beside the outcome (bits 0-1) and the average rating
 /// (bits 2-13): a set-up start, and a game the index holds.
@@ -67,7 +78,7 @@ pub fn path_of(index: &Path) -> PathBuf {
 /// What the stream holds and where.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
-    /// Records `first_record..=last_record` have a directory entry each.
+    /// Records `first_record..=last_record` have a slot each.
     pub first_record: u32,
     pub last_record: u32,
     /// The database's generation when built.
@@ -76,10 +87,10 @@ pub struct Header {
     pub build_id: u64,
     pub games: u64,
     pub plies: u64,
-    pub tail_offset: u64,
-    pub tail_len: u64,
+    /// Where the table of blocks starts: the tails and the blocks of slots
+    /// lie between the header and it.
     pub table_offset: u64,
-    pub chunks: u32,
+    pub blocks: u32,
     pub table_crc: u32,
 }
 
@@ -96,11 +107,10 @@ impl Header {
         b[40..48].copy_from_slice(&self.build_id.to_le_bytes());
         b[48..56].copy_from_slice(&self.games.to_le_bytes());
         b[56..64].copy_from_slice(&self.plies.to_le_bytes());
-        b[64..72].copy_from_slice(&self.tail_offset.to_le_bytes());
-        b[72..80].copy_from_slice(&self.tail_len.to_le_bytes());
-        b[80..88].copy_from_slice(&self.table_offset.to_le_bytes());
-        b[88..92].copy_from_slice(&self.chunks.to_le_bytes());
-        b[92..96].copy_from_slice(&self.table_crc.to_le_bytes());
+        b[64..68].copy_from_slice(&(BATCH as u32).to_le_bytes());
+        b[72..80].copy_from_slice(&self.table_offset.to_le_bytes());
+        b[80..84].copy_from_slice(&self.blocks.to_le_bytes());
+        b[84..88].copy_from_slice(&self.table_crc.to_le_bytes());
         let crc = crc32(&b[..124]);
         b[124..128].copy_from_slice(&crc.to_le_bytes());
         b
@@ -113,6 +123,7 @@ impl Header {
             || u32_at(b, 8) != VERSION
             || u32_at(b, 12) as usize != HEADER_LEN
             || usize::from(b[16]) != PREFIX_WORDS
+            || u32_at(b, 64) as usize != BATCH
             || crc32(&b[..124]) != u32_at(b, 124)
         {
             return None;
@@ -124,21 +135,15 @@ impl Header {
             build_id: u64_at(b, 40),
             games: u64_at(b, 48),
             plies: u64_at(b, 56),
-            tail_offset: u64_at(b, 64),
-            tail_len: u64_at(b, 72),
-            table_offset: u64_at(b, 80),
-            chunks: u32_at(b, 88),
-            table_crc: u32_at(b, 92),
+            table_offset: u64_at(b, 72),
+            blocks: u32_at(b, 80),
+            table_crc: u32_at(b, 84),
         })
     }
 
-    /// The records with a directory entry.
+    /// The records with a slot.
     pub fn records(&self) -> u64 {
         records(self.first_record, self.last_record)
-    }
-
-    fn prefix_offset(&self) -> u64 {
-        prefix_offset(self.records())
     }
 }
 
@@ -146,21 +151,18 @@ fn records(first: u32, last: u32) -> u64 {
     (u64::from(last) + 1).saturating_sub(u64::from(first))
 }
 
-/// Where the prefix area starts, after the header and the directory.
-fn prefix_offset(records: u64) -> u64 {
-    HEADER_LEN as u64 + records * ENTRY_BYTES as u64
+/// The CRC of record `number` whose slot's first 60 bytes are `slot` and
+/// whose tail is `tail`: the number binds the record to its place.
+fn record_crc(number: u32, slot: &[u8], tail: &[u8]) -> u32 {
+    let c = crc32_update(!0, &number.to_le_bytes());
+    !crc32_update(crc32_update(c, slot), tail)
 }
 
-/// Where the tail area starts: 4-byte aligned after the prefix area.
-fn tail_offset(records: u64) -> u64 {
-    (prefix_offset(records) + records * PREFIX_BYTES as u64).next_multiple_of(4)
-}
-
-/// A record's directory entry.
+/// A record's directory entry, the first 16 bytes of its slot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Entry {
-    /// Where its tail starts, in words from the tail area's start: the set-up
-    /// start, then the words past its prefix slot.
+    /// Where its tail starts, in words from the file's start: the set-up
+    /// start, then the words past its prefix.
     pub tail: u32,
     pub plies: u16,
     pub flags: u16,
@@ -168,8 +170,8 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn encode(&self) -> [u8; ENTRY_BYTES] {
-        let mut b = [0u8; ENTRY_BYTES];
+    fn encode(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
         b[0..4].copy_from_slice(&self.tail.to_le_bytes());
         b[4..6].copy_from_slice(&self.plies.to_le_bytes());
         b[6..8].copy_from_slice(&self.flags.to_le_bytes());
@@ -205,11 +207,11 @@ impl Entry {
         self.flags >> 2 & 0xfff
     }
 
-    /// Where its tail lies in the tail area, in bytes, and its set-up bytes.
-    fn tail_span(&self) -> (u64, usize, usize) {
+    /// The bytes of its tail: its set-up start's, then its words past the
+    /// prefix's.
+    fn tail_bytes(&self) -> (usize, usize) {
         let setup = if self.setup() { SETUP_BYTES } else { 0 };
-        let past = usize::from(self.plies).saturating_sub(PREFIX_WORDS);
-        (2 * u64::from(self.tail), setup, setup + 2 * past)
+        (setup, setup + 2 * usize::from(self.plies).saturating_sub(PREFIX_WORDS))
     }
 }
 
@@ -259,9 +261,12 @@ impl Departures {
 /// The home pawns of `board`: white pawns on the second rank in bits 0-7,
 /// black pawns on the seventh in bits 8-15, a to h.
 pub(super) fn home_pawns(board: &Board) -> u16 {
-    let white = board.colored(Piece::Pawn, Color::White) >> 8 & 0xff;
-    let black = board.colored(Piece::Pawn, Color::Black) >> 48 & 0xff;
-    (white | black << 8) as u16
+    home_of(board.colored(Piece::Pawn, Color::White), board.colored(Piece::Pawn, Color::Black))
+}
+
+/// The home pawns among the `white` and `black` pawns.
+fn home_of(white: Bitboard, black: Bitboard) -> u16 {
+    (white >> 8 & 0xff | (black >> 48 & 0xff) << 8) as u16
 }
 
 /// A set-up start as the stream keeps it: 32 bytes of pieces from a1 to h8,
@@ -338,17 +343,19 @@ fn moves() -> &'static [Option<Move>] {
     MOVES.get_or_init(|| (0..FIRST_PIECE_WORD).map(replay::standard_move).collect())
 }
 
-/// The stream being written, `<id>.moves.partial`: each worker writes the
-/// directory entries and prefix slots of its records in place, and appends
-/// their tails in chunks, so that a game's tail is found only by its offset.
+/// The stream being written, `<id>.moves.partial`, from its start to its
+/// end: each worker appends its tails as they fill its buffer and the slots
+/// of each block it ends, so that a game's tail is found only by its offset
+/// and a block only by the table.
 pub struct Writer {
     file: File,
     path: PathBuf,
     first: u32,
     records: u64,
-    tail_offset: u64,
-    /// The words appended to the tail area.
-    tails: Mutex<u64>,
+    /// Where the next append goes: the end of what is appended.
+    end: Mutex<u64>,
+    /// Each block's offset once appended, 0 until then.
+    blocks: Vec<AtomicU64>,
     games: AtomicU64,
     plies: AtomicU64,
 }
@@ -356,16 +363,20 @@ pub struct Writer {
 impl Writer {
     /// A new stream at `path` for records `first..=last`.
     pub fn create(path: &Path, first: u32, last: u32) -> Result<Writer, SearchError> {
+        let records = records(first, last);
+        let count = usize::try_from(records.div_ceil(BATCH as u64)).map_err(|_| SearchError::TooLarge)?;
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(count).map_err(|_| SearchError::TooLarge)?;
+        blocks.extend((0..count).map(|_| AtomicU64::new(0)));
         let file =
             File::options().read(true).write(true).create(true).truncate(true).open(path).map_err(|e| io(path, e))?;
-        let records = records(first, last);
         Ok(Writer {
             file,
             path: path.to_path_buf(),
             first,
             records,
-            tail_offset: tail_offset(records),
-            tails: Mutex::new(0),
+            end: Mutex::new(HEADER_LEN as u64),
+            blocks,
             games: AtomicU64::new(0),
             plies: AtomicU64::new(0),
         })
@@ -381,43 +392,46 @@ impl Writer {
         }
         Some(Part {
             writer: self,
+            block: 0,
             first: 0,
             count: 0,
-            entries: buf(BATCH * ENTRY_BYTES)?,
-            prefixes: buf(BATCH * PREFIX_BYTES)?,
-            tail: buf(CHUNK)?,
+            slots: buf(BATCH * SLOT_BYTES)?,
+            tail: buf(TAIL_BUFFER)?,
             pending: buf(BATCH)?,
             games: 0,
             plies: 0,
         })
     }
 
-    /// Appends a worker's tail chunk; where it starts, in words from the tail
-    /// area's start.
-    fn append(&self, chunk: &[u8]) -> Result<u64, SearchError> {
-        let base = {
-            let mut tails = self.tails.lock().unwrap_or_else(|e| e.into_inner());
-            let base = *tails;
-            *tails += chunk.len() as u64 / 2;
-            base
+    /// Appends `bytes`, a multiple of [`ALIGN`] long, after what is
+    /// appended; where they start. Each append takes its place in turn and
+    /// is written at once, so the file grows from its start to its end.
+    fn append(&self, bytes: &[u8]) -> Result<u64, SearchError> {
+        debug_assert!((bytes.len() as u64).is_multiple_of(ALIGN));
+        let at = {
+            let mut end = self.end.lock().unwrap_or_else(|e| e.into_inner());
+            let at = *end;
+            *end += bytes.len() as u64;
+            at
         };
-        write_at(&self.file, self.tail_offset + 2 * base, chunk).map_err(|e| io(&self.path, e))?;
-        Ok(base)
+        write_at(&self.file, at, bytes).map_err(|e| io(&self.path, e))?;
+        Ok(at)
     }
 
     /// Ends the stream of the database at `generation`, built with
-    /// `build_id`: the CRC of each chunk, computed on up to half the workers,
-    /// their table after the tails, then the header. The file is not synced:
-    /// a torn one fails its CRCs and is rebuilt.
-    pub fn finish(self, generation: u64, build_id: u64, progress: &Progress) -> Result<Header, SearchError> {
-        let tail_len = 2 * *self.tails.lock().unwrap_or_else(|e| e.into_inner());
-        let table_offset = self.tail_offset + tail_len;
-        let chunks = (table_offset - HEADER_LEN as u64).div_ceil(CHUNK as u64);
-        let chunks = u32::try_from(chunks).map_err(|_| SearchError::TooLarge)?;
-        // The directory and prefixes are written whole, and the tails end
-        // here; only the alignment before the tails may be missing.
-        self.file.set_len(table_offset).map_err(|e| io(&self.path, e))?;
-        let table = self.crcs(chunks as usize, table_offset, progress)?;
+    /// `build_id`: the table of blocks after them, then the header. The file
+    /// is not synced: a torn one fails its CRCs and is rebuilt.
+    pub fn finish(self, generation: u64, build_id: u64) -> Result<Header, SearchError> {
+        let table_offset = *self.end.lock().unwrap_or_else(|e| e.into_inner());
+        let mut table = Vec::new();
+        table.try_reserve_exact(8 * self.blocks.len()).map_err(|_| SearchError::TooLarge)?;
+        for block in &self.blocks {
+            let at = block.load(Ordering::Relaxed);
+            if at == 0 {
+                return Err(io(&self.path, std::io::Error::other("a block of the move stream was not written")));
+            }
+            table.extend(at.to_le_bytes());
+        }
         write_at(&self.file, table_offset, &table).map_err(|e| io(&self.path, e))?;
         let header = Header {
             first_record: self.first,
@@ -426,63 +440,26 @@ impl Writer {
             build_id,
             games: self.games.load(Ordering::Relaxed),
             plies: self.plies.load(Ordering::Relaxed),
-            tail_offset: self.tail_offset,
-            tail_len,
             table_offset,
-            chunks,
+            blocks: u32::try_from(self.blocks.len()).map_err(|_| SearchError::TooLarge)?,
             table_crc: crc32(&table),
         };
         write_at(&self.file, 0, &header.encode()).map_err(|e| io(&self.path, e))?;
         Ok(header)
     }
-
-    /// The chunk table: the CRC of each chunk from the header to `end`, read
-    /// back by as many workers as half the budget's share holds a chunk for.
-    fn crcs(&self, chunks: usize, end: u64, progress: &Progress) -> Result<Vec<u8>, SearchError> {
-        let mut memory = reserve(CHUNK, progress)?;
-        let mut want = threads().div_ceil(2).min(chunks).max(1);
-        while want > 1 && memory.grow_quietly((want - 1) * CHUNK).is_err() {
-            want -= 1;
-        }
-        let parts = workers::run(want, 0, &Cancel::never(), |w| {
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(CHUNK).map_err(|_| Refused::Busy)?;
-            buf.resize(CHUNK, 0);
-            let mut crcs = Vec::new();
-            for c in (w.index..chunks).step_by(w.count) {
-                if w.stopped() || progress.stop.load(Ordering::Relaxed) {
-                    return Err(SearchError::Superseded);
-                }
-                let at = (HEADER_LEN + c * CHUNK) as u64;
-                let n = (end - at).min(CHUNK as u64) as usize;
-                read_at(&self.file, at, &mut buf[..n]).map_err(|e| io(&self.path, e))?;
-                crcs.push(crc32(&buf[..n]));
-            }
-            Ok(crcs)
-        })?;
-        let mut table = vec![0u8; 4 * chunks];
-        for (k, crcs) in parts.iter().enumerate() {
-            for (i, crc) in crcs.iter().enumerate() {
-                let c = k + i * parts.len();
-                table[4 * c..4 * c + 4].copy_from_slice(&crc.to_le_bytes());
-            }
-        }
-        drop(memory);
-        Ok(table)
-    }
 }
 
-/// A worker's part of the stream: one batch of records at a time.
+/// A worker's part of the stream: one block of records at a time.
 pub struct Part<'a> {
     writer: &'a Writer,
-    /// The batch's first record, and how many.
+    /// The block, its first record, and how many records it has.
+    block: usize,
     first: u32,
     count: usize,
-    entries: Vec<u8>,
-    prefixes: Vec<u8>,
-    /// Tails not yet appended, and the batch's entries whose tails they hold,
-    /// by their place in the batch: those entries count their offsets from
-    /// the chunk's start until it is appended.
+    slots: Vec<u8>,
+    /// Tails not yet appended, and the block's records whose tails they hold,
+    /// by their place in the block: their slots count their tail offsets from
+    /// the buffer's start, and lack their CRCs, until it is appended.
     tail: Vec<u8>,
     pending: Vec<u32>,
     games: u64,
@@ -490,34 +467,34 @@ pub struct Part<'a> {
 }
 
 impl Part<'_> {
-    /// Starts the batch of records `first..=last`, at most [`BATCH`]: none is
-    /// indexed until added.
+    /// Starts the block of records `first..=last`, at most [`BATCH`] of them
+    /// from the start of a block: none is indexed until added.
     pub fn begin(&mut self, first: u32, last: u32) {
+        let from = first.saturating_sub(self.writer.first) as usize;
+        debug_assert_eq!(from % BATCH, 0, "a block starts at a multiple of BATCH");
+        self.block = from / BATCH;
         self.first = first;
         self.count = (last.saturating_sub(first) as usize + 1).min(BATCH);
-        self.entries.clear();
-        self.entries.resize(self.count * ENTRY_BYTES, 0);
-        self.prefixes.clear();
-        self.prefixes.resize(self.count * PREFIX_BYTES, 0xff);
+        self.slots.clear();
+        self.slots.resize(self.count * SLOT_BYTES, 0);
+        for slot in self.slots.as_chunks_mut::<SLOT_BYTES>().0 {
+            slot[PREFIX_AT..PREFIX_AT + PREFIX_BYTES].fill(0xff);
+        }
     }
 
-    /// Adds `line`, a game of the batch that the index holds.
+    /// Adds `line`, a game of the block that the index holds.
     pub fn add(&mut self, line: &Line) -> Result<(), SearchError> {
         let Some(i) = line.number.checked_sub(self.first).map(|i| i as usize).filter(|&i| i < self.count) else {
             return Ok(());
         };
         let words = &line.words[..line.words.len().min(MAX_PLIES)];
-        let slot = &mut self.prefixes[i * PREFIX_BYTES..(i + 1) * PREFIX_BYTES];
-        for (to, w) in slot.as_chunks_mut::<2>().0.iter_mut().zip(words) {
-            *to = w.to_le_bytes();
-        }
         let past = &words[words.len().min(PREFIX_WORDS)..];
         let setup = line.setup.as_ref();
         let bytes = setup.map_or(0, |_| SETUP_BYTES) + 2 * past.len();
         let mut tail = 0;
         if bytes > 0 {
-            // A tail is at most 131,064 bytes: it always fits an empty chunk.
-            if self.tail.len() + bytes > CHUNK {
+            // A tail is at most 131,064 bytes: it always fits an empty buffer.
+            if self.tail.len() + bytes > TAIL_BUFFER {
                 self.flush()?;
             }
             tail = (self.tail.len() / 2) as u32;
@@ -535,38 +512,55 @@ impl Part<'_> {
         }
         let departures = if setup.is_some() { Departures::default() } else { line.departures };
         let entry = Entry { tail, plies: words.len() as u16, flags, departures };
-        self.entries[i * ENTRY_BYTES..(i + 1) * ENTRY_BYTES].copy_from_slice(&entry.encode());
+        let slot = &mut self.slots[i * SLOT_BYTES..(i + 1) * SLOT_BYTES];
+        slot[..PREFIX_AT].copy_from_slice(&entry.encode());
+        for (to, w) in slot[PREFIX_AT..PREFIX_AT + PREFIX_BYTES].as_chunks_mut::<2>().0.iter_mut().zip(words) {
+            *to = w.to_le_bytes();
+        }
         self.games += 1;
         self.plies += words.len() as u64;
         Ok(())
     }
 
-    /// Appends the tails gathered, and sets the offsets of the entries whose
-    /// tails they are.
+    /// Appends the tails gathered, and ends the slots of the records whose
+    /// tails they are: their offsets and their CRCs.
     fn flush(&mut self) -> Result<(), SearchError> {
         if self.tail.is_empty() {
             return Ok(());
         }
-        let base = self.writer.append(&self.tail)?;
+        let len = self.tail.len();
+        self.tail.resize(len.next_multiple_of(SLOT_BYTES), 0);
+        let base = self.writer.append(&self.tail)? / 2;
         for &i in &self.pending {
-            let at = i as usize * ENTRY_BYTES;
-            let tail = u32::try_from(base + u64::from(u32_at(&self.entries, at))).map_err(|_| SearchError::TooLarge)?;
-            self.entries[at..at + 4].copy_from_slice(&tail.to_le_bytes());
+            let slot = &mut self.slots[i as usize * SLOT_BYTES..(i as usize + 1) * SLOT_BYTES];
+            let entry = Entry::decode(slot);
+            let at = 2 * entry.tail as usize;
+            let tail = u32::try_from(base + u64::from(entry.tail)).map_err(|_| SearchError::TooLarge)?;
+            slot[0..4].copy_from_slice(&tail.to_le_bytes());
+            let bytes = self.tail.get(at..at + entry.tail_bytes().1).unwrap_or_default();
+            let crc = record_crc(self.first + i, &slot[..CRC_AT], bytes);
+            slot[CRC_AT..].copy_from_slice(&crc.to_le_bytes());
         }
         self.pending.clear();
         self.tail.clear();
         Ok(())
     }
 
-    /// Ends the batch: its tails appended, then its directory entries and
-    /// prefix slots written in place.
+    /// Ends the block: its tails appended, the CRCs of its other records,
+    /// then its slots appended and placed in the table.
     pub fn end(&mut self) -> Result<(), SearchError> {
         self.flush()?;
+        for (i, slot) in self.slots.as_chunks_mut::<SLOT_BYTES>().0.iter_mut().enumerate() {
+            if Entry::decode(slot).tail_bytes().1 == 0 {
+                let crc = record_crc(self.first + i as u32, &slot[..CRC_AT], &[]);
+                slot[CRC_AT..].copy_from_slice(&crc.to_le_bytes());
+            }
+        }
         let w = self.writer;
-        let at = u64::from(self.first.saturating_sub(w.first));
-        write_at(&w.file, HEADER_LEN as u64 + at * ENTRY_BYTES as u64, &self.entries).map_err(|e| io(&w.path, e))?;
-        write_at(&w.file, prefix_offset(w.records) + at * PREFIX_BYTES as u64, &self.prefixes)
-            .map_err(|e| io(&w.path, e))?;
+        let at = w.append(&self.slots)?;
+        if let Some(block) = w.blocks.get(self.block) {
+            block.store(at, Ordering::Relaxed);
+        }
         w.games.fetch_add(std::mem::take(&mut self.games), Ordering::Relaxed);
         w.plies.fetch_add(std::mem::take(&mut self.plies), Ordering::Relaxed);
         Ok(())
@@ -588,24 +582,21 @@ pub struct Target {
 
 impl Target {
     pub fn of(board: &Board) -> Target {
-        Target { key: board.hash(), counts: counts(board), home: home_pawns(board) }
+        let (white, black, pawns) = (board.colors(Color::White), board.colors(Color::Black), board.pieces(Piece::Pawn));
+        Target { key: board.hash(), counts: counts(white, black, pawns), home: home_of(pawns & white, pawns & black) }
     }
 
     /// Whether a line at `board` can no longer reach the position.
     fn passed(&self, board: &Board) -> bool {
-        counts(board).iter().zip(self.counts).any(|(&have, need)| have < need)
-            || home_pawns(board) & self.home != self.home
+        let (white, black, pawns) = (board.colors(Color::White), board.colors(Color::Black), board.pieces(Piece::Pawn));
+        counts(white, black, pawns).iter().zip(self.counts).any(|(&have, need)| have < need)
+            || home_of(pawns & white, pawns & black) & self.home != self.home
     }
 }
 
 /// Each side's men, then each side's pawns.
-fn counts(board: &Board) -> [u32; 4] {
-    [
-        board.colors(Color::White).count_ones(),
-        board.colors(Color::Black).count_ones(),
-        board.colored(Piece::Pawn, Color::White).count_ones(),
-        board.colored(Piece::Pawn, Color::Black).count_ones(),
-    ]
+fn counts(white: Bitboard, black: Bitboard, pawns: Bitboard) -> [u32; 4] {
+    [white.count_ones(), black.count_ones(), (pawns & white).count_ones(), (pawns & black).count_ones()]
 }
 
 /// A game whose line reaches a position: the move it played from its first
@@ -626,17 +617,16 @@ pub struct Game {
     pub words: Vec<u16>,
 }
 
-/// A stream mapped read-only. The header and the chunk table are checked
-/// when it opens; each chunk against its CRC the first time any reader
-/// touches it. The table and a bit per chunk are held in the search budget;
-/// the mapped file is the operating system's file cache, outside the budget.
+/// A stream mapped read-only. The header and the table of blocks are checked
+/// when it opens, and each record against its CRC whenever it is read. The
+/// table is held in the search budget; the mapped file is the operating
+/// system's file cache, outside the budget.
 pub struct Stream {
     pub path: PathBuf,
     pub header: Header,
     map: Map,
-    crcs: Vec<u32>,
-    /// A bit per chunk, set once its CRC matched.
-    checked: Vec<AtomicU64>,
+    /// Each block's offset.
+    blocks: Vec<u64>,
     _memory: Hold,
 }
 
@@ -647,20 +637,20 @@ impl Stream {
         let mut head = [0u8; HEADER_LEN];
         read_at(&file, 0, &mut head).map_err(Bad::Io)?;
         let header = Header::decode(&head).ok_or(Bad::Corrupt("stream header"))?;
-        let chunks = u64::from(header.chunks);
-        // Every area must be where the header's counts put it, and the file
-        // end with the table, before anything is allocated from them.
-        if header.tail_offset != tail_offset(header.records())
-            || header.tail_len % 2 != 0
-            || header.tail_offset.checked_add(header.tail_len) != Some(header.table_offset)
-            || header.table_offset.checked_add(4 * chunks) != Some(len)
-            || (header.table_offset - HEADER_LEN as u64).div_ceil(CHUNK as u64) != chunks
-            || header.games > header.records()
+        let (records, blocks) = (header.records(), u64::from(header.blocks));
+        // The table must end the file and have a block for every BATCH
+        // records, each of whose slots the file holds, before anything is
+        // allocated from the counts.
+        if blocks != records.div_ceil(BATCH as u64)
+            || header.table_offset.checked_add(8 * blocks) != Some(len)
+            || header.table_offset < HEADER_LEN as u64 + records * SLOT_BYTES as u64
+            || !header.table_offset.is_multiple_of(ALIGN)
+            || header.games > records
         {
             return Err(Bad::Corrupt("stream layout"));
         }
-        let (table_len, words) = (4 * chunks as usize, (chunks as usize).div_ceil(64));
-        let memory = Hold::reserve_quietly(table_len + 8 * words).map_err(|r| {
+        let table_len = 8 * blocks as usize;
+        let memory = Hold::reserve_quietly(2 * table_len).map_err(|r| {
             if r == Refused::TooLarge { Bad::Corrupt("stream table larger than memory") } else { Bad::Busy }
         })?;
         let mut table = Vec::new();
@@ -670,91 +660,69 @@ impl Stream {
         if crc32(&table) != header.table_crc {
             return Err(Bad::Corrupt("stream table"));
         }
-        let mut crcs = Vec::new();
-        crcs.try_reserve_exact(chunks as usize).map_err(|_| Bad::Busy)?;
-        crcs.extend(table.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(blocks as usize).map_err(|_| Bad::Busy)?;
+        for (b, at) in table.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
+            let slots = (records - b as u64 * BATCH as u64).min(BATCH as u64);
+            if at < HEADER_LEN as u64
+                || !at.is_multiple_of(ALIGN)
+                || at.checked_add(slots * SLOT_BYTES as u64).is_none_or(|end| end > header.table_offset)
+            {
+                return Err(Bad::Corrupt("stream layout"));
+            }
+            offsets.push(at);
+        }
         drop(table);
-        let mut checked = Vec::new();
-        checked.try_reserve_exact(words).map_err(|_| Bad::Busy)?;
-        checked.extend((0..words).map(|_| AtomicU64::new(0)));
         let size = usize::try_from(len).map_err(|_| Bad::Corrupt("stream larger than memory"))?;
         let map = Map::new(&file, size).map_err(Bad::Io)?;
-        Ok(Stream { path: path.to_path_buf(), header, map, crcs, checked, _memory: memory })
+        Ok(Stream { path: path.to_path_buf(), header, map, blocks: offsets, _memory: memory })
     }
 
-    /// Bytes `at..at + len` of the areas before the table, their chunks
-    /// checked first.
-    fn bytes(&self, at: u64, len: usize) -> Result<&[u8], Bad> {
-        let end = at
-            .checked_add(len as u64)
-            .filter(|&end| at >= HEADER_LEN as u64 && end <= self.header.table_offset)
-            .ok_or(Bad::Corrupt("stream range"))?;
-        if len > 0 {
-            let chunk = |b: u64| ((b - HEADER_LEN as u64) / CHUNK as u64) as usize;
-            for c in chunk(at)..=chunk(end - 1) {
-                self.check(c)?;
-            }
-        }
-        // Within the file: the table ends it.
-        Ok(&self.map.bytes()[at as usize..end as usize])
-    }
-
-    fn check(&self, chunk: usize) -> Result<(), Bad> {
-        let (Some(seen), Some(&crc)) = (self.checked.get(chunk / 64), self.crcs.get(chunk)) else {
-            return Err(Bad::Corrupt("stream chunk"));
-        };
-        let bit = 1u64 << (chunk % 64);
-        if seen.load(Ordering::Relaxed) & bit != 0 {
-            return Ok(());
-        }
-        let start = HEADER_LEN + chunk * CHUNK;
-        let end = (start + CHUNK).min(self.header.table_offset as usize);
-        if crc32(&self.map.bytes()[start..end]) != crc {
-            return Err(Bad::Corrupt("stream chunk"));
-        }
-        seen.fetch_or(bit, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Record `number`'s place among the directory's.
-    fn index(&self, number: u32) -> Result<u64, Bad> {
-        number
+    /// Record `number`, checked against its CRC.
+    fn record(&self, number: u32) -> Result<Record<'_>, Bad> {
+        let i = number
             .checked_sub(self.header.first_record)
             .map(u64::from)
             .filter(|&i| i < self.header.records())
-            .ok_or(Bad::Corrupt("stream record"))
-    }
-
-    fn entry_at(&self, i: u64) -> Result<Entry, Bad> {
-        Ok(Entry::decode(self.bytes(HEADER_LEN as u64 + i * ENTRY_BYTES as u64, ENTRY_BYTES)?))
+            .ok_or(Bad::Corrupt("stream record"))?;
+        let bytes = self.map.bytes();
+        // Every block's slots lie before the table, checked when it opened.
+        let at = self.blocks.get((i / BATCH as u64) as usize).map(|b| b + i % BATCH as u64 * SLOT_BYTES as u64);
+        let slot =
+            at.and_then(|at| bytes.get(at as usize..at as usize + SLOT_BYTES)).ok_or(Bad::Corrupt("stream record"))?;
+        let entry = Entry::decode(slot);
+        let (setup, len) = entry.tail_bytes();
+        let tail = if len == 0 {
+            &[][..]
+        } else {
+            let at = 2 * u64::from(entry.tail);
+            at.checked_add(len as u64)
+                .filter(|&end| at >= HEADER_LEN as u64 && end <= self.header.table_offset)
+                .and_then(|end| bytes.get(at as usize..end as usize))
+                .ok_or(Bad::Corrupt("stream tail"))?
+        };
+        if record_crc(number, &slot[..CRC_AT], tail) != u32_at(slot, CRC_AT) {
+            return Err(Bad::Corrupt("stream record"));
+        }
+        let plies = usize::from(entry.plies);
+        let (start, past) = tail.split_at(setup);
+        Ok(Record {
+            entry,
+            prefix: &slot[PREFIX_AT..PREFIX_AT + 2 * plies.min(PREFIX_WORDS)],
+            past,
+            setup: (setup > 0).then_some(start),
+        })
     }
 
     /// Record `number`'s directory entry.
     pub fn entry(&self, number: u32) -> Result<Entry, Bad> {
-        self.entry_at(self.index(number)?)
-    }
-
-    /// The line of `entry`, the `i`th record's.
-    fn line(&self, i: u64, entry: &Entry) -> Result<LineBytes<'_>, Bad> {
-        let plies = usize::from(entry.plies);
-        let prefix = self.bytes(self.header.prefix_offset() + i * PREFIX_BYTES as u64, 2 * plies.min(PREFIX_WORDS))?;
-        let (at, setup, len) = entry.tail_span();
-        if len == 0 {
-            return Ok(LineBytes { prefix, past: &[], setup: None });
-        }
-        if at.checked_add(len as u64).is_none_or(|end| end > self.header.tail_len) {
-            return Err(Bad::Corrupt("stream tail"));
-        }
-        let (start, past) = self.bytes(self.header.tail_offset + at, len)?.split_at(setup);
-        Ok(LineBytes { prefix, past, setup: (setup > 0).then_some(start) })
+        Ok(self.record(number)?.entry)
     }
 
     /// Game `number`'s line; its words empty when the index does not hold it.
     pub fn game(&self, number: u32) -> Result<Game, Bad> {
-        let i = self.index(number)?;
-        let entry = self.entry_at(i)?;
-        let line = self.line(i, &entry)?;
-        Ok(Game { entry, start: line.start()?, words: line.words().collect() })
+        let record = self.record(number)?;
+        Ok(Game { entry: record.entry, start: record.start()?, words: record.words().collect() })
     }
 
     /// Replays game `number`'s line to the first position that is `target`:
@@ -765,15 +733,14 @@ impl Stream {
     /// [`Target`]), and one whose home pawns left in an order the position
     /// does not allow is not played.
     pub fn find(&self, number: u32, target: &Target) -> Result<Option<Hit>, Bad> {
-        let i = self.index(number)?;
-        let entry = self.entry_at(i)?;
+        let record = self.record(number)?;
+        let entry = record.entry;
         if !entry.indexed() || (!entry.setup() && !entry.departures.allows(target.home)) {
             return Ok(None);
         }
-        let line = self.line(i, &entry)?;
-        let mut board = line.start()?.unwrap_or_else(|| standard().clone());
+        let mut board = record.start()?.unwrap_or_else(|| standard().clone());
         let moves = moves();
-        let mut words = line.words();
+        let mut words = record.words();
         loop {
             if target.passed(&board) {
                 return Ok(None);
@@ -791,15 +758,16 @@ impl Stream {
     }
 }
 
-/// A game's line in a stream: the words of its prefix slot, the words past
-/// it, and its set-up start.
-struct LineBytes<'a> {
+/// A record of a stream, checked: its entry, the words of its prefix, the
+/// words past it, and its set-up start.
+struct Record<'a> {
+    entry: Entry,
     prefix: &'a [u8],
     past: &'a [u8],
     setup: Option<&'a [u8]>,
 }
 
-impl LineBytes<'_> {
+impl Record<'_> {
     fn words(&self) -> impl Iterator<Item = u16> {
         self.prefix.as_chunks::<2>().0.iter().chain(self.past.as_chunks::<2>().0).map(|w| u16::from_le_bytes(*w))
     }
@@ -846,10 +814,8 @@ mod tests {
             build_id: 0x1234_5678_9abc_def0,
             games: 90,
             plies: 7000,
-            tail_offset: tail_offset(99),
-            tail_len: 4000,
-            table_offset: tail_offset(99) + 4000,
-            chunks: 1,
+            table_offset: 128 + 99 * 64 + 4032,
+            blocks: 1,
             table_crc: 7,
         };
         let e = h.encode();
@@ -857,13 +823,160 @@ mod tests {
         let mut bad = e;
         bad[44] ^= 1;
         assert_eq!(Header::decode(&bad), None, "the header's CRC covers the build id");
-        assert_eq!(tail_offset(99) % 4, 0);
-        assert_eq!(tail_offset(98), prefix_offset(98) + 98 * 42);
+        let mut v1 = e;
+        v1[8] = 1;
+        let crc = crc32(&v1[..124]);
+        v1[124..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(Header::decode(&v1), None, "a stream of another version");
         let entry =
             Entry { tail: 70_000, plies: 65_535, flags: INDEXED | SETUP | 2400 << 2 | 1, departures: Departures(5) };
         assert_eq!(Entry::decode(&entry.encode()), entry);
         assert!(entry.indexed() && entry.setup());
         assert_eq!((entry.elo(), entry.outcome()), (2400, Outcome::Draw));
+        assert_eq!(entry.tail_bytes(), (SETUP_BYTES, SETUP_BYTES + 2 * (65_535 - PREFIX_WORDS)));
+    }
+
+    /// Record `n`'s line in [`written`]: none for every seventh, which the
+    /// index does not hold; else up to 399 words, some from a set-up start.
+    fn line_of(n: u32) -> Option<(Vec<u16>, Option<[u8; SETUP_BYTES]>)> {
+        if n.is_multiple_of(7) {
+            return None;
+        }
+        let words = (0..n * 37 % 400).map(|k| (n.wrapping_mul(31) + k) as u16).collect();
+        let fen = "4k3/8/8/8/8/8/P7/4K3 w - - 0 1";
+        Some((words, n.is_multiple_of(11).then(|| setup_of(&Board::from_fen(fen).unwrap()))))
+    }
+
+    /// A stream of records `1..=records`, more than a block, written by two
+    /// workers whose appends interleave and whose blocks end in reverse
+    /// order; each block's tails fill the buffer more than once.
+    fn written(name: &str, records: u32) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("bridge-stream-{name}-{}", std::process::id()));
+        let writer = Writer::create(&path, 1, records).unwrap();
+        let (mut a, mut b) = (writer.part().unwrap(), writer.part().unwrap());
+        let split = BATCH as u32;
+        a.begin(1, split);
+        b.begin(split + 1, records);
+        for n in 1..=split {
+            for (part, number) in [(&mut a, n), (&mut b, n + split)] {
+                if let Some((words, setup)) = line_of(number).filter(|_| number <= records) {
+                    part.add(&Line::of(number, words, setup, Outcome::Draw)).unwrap();
+                }
+            }
+        }
+        b.end().unwrap();
+        a.end().unwrap();
+        drop((a, b));
+        let header = writer.finish(3, 9).unwrap();
+        assert_eq!((header.first_record, header.last_record, header.blocks), (1, records, 2));
+        path
+    }
+
+    /// Every record reads back as written, wherever its block and its tail
+    /// were appended, and the file ends with the table.
+    #[test]
+    fn a_stream_reads_back_as_written() {
+        let records = BATCH as u32 + 700;
+        let path = written("back", records);
+        let stream = Stream::open(&path).unwrap();
+        assert_eq!((stream.header.generation, stream.header.build_id), (3, 9));
+        assert!(stream.blocks[1] < stream.blocks[0], "the second block ended first");
+        let (mut games, mut plies) = (0, 0);
+        for n in 1..=records {
+            let game = stream.game(n).unwrap();
+            match line_of(n) {
+                Some((words, setup)) => {
+                    assert!(game.entry.indexed(), "{n}");
+                    assert_eq!(game.words, words, "{n}");
+                    assert_eq!(game.entry.setup(), setup.is_some(), "{n}");
+                    assert_eq!(game.start.map(|b| setup_of(&b)), setup, "{n}");
+                    assert_eq!(game.entry.outcome(), Outcome::Draw);
+                    games += 1;
+                    plies += words.len() as u64;
+                }
+                None => assert_eq!((game.entry, game.words.len()), (Entry::default(), 0), "{n}"),
+            }
+        }
+        assert_eq!((stream.header.games, stream.header.plies), (games, plies));
+        assert!(matches!(stream.game(0), Err(Bad::Corrupt(_))));
+        assert!(matches!(stream.game(records + 1), Err(Bad::Corrupt(_))));
+        drop(stream);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A byte changed anywhere a record reads, its slot, its CRC or its
+    /// tail, fails that record and no other; two slots swapped fail both.
+    /// A changed table, or a file cut short, does not open.
+    #[test]
+    fn a_damaged_record_is_never_read() {
+        let records = BATCH as u32 + 20;
+        let path = written("damage", records);
+        let good = std::fs::read(&path).unwrap();
+        let (slot_of, tail_of) = {
+            let stream = Stream::open(&path).unwrap();
+            let slot_of = |n: u32| {
+                let i = u64::from(n - 1);
+                (stream.blocks[(i / BATCH as u64) as usize] + i % BATCH as u64 * SLOT_BYTES as u64) as usize
+            };
+            let slots: Vec<usize> = (1..=records).map(slot_of).collect();
+            let tail = 2 * stream.entry(10).unwrap().tail as usize;
+            (slots, tail)
+        };
+        let damaged = |at: usize, what: &str| {
+            let bad = path.with_extension(what);
+            let mut bytes = good.clone();
+            bytes[at] ^= 0x10;
+            std::fs::write(&bad, &bytes).unwrap();
+            bad
+        };
+        // Game 10 has 370 words: its tail holds words 21 on.
+        assert_eq!(line_of(10).unwrap().0.len(), 370);
+        for (at, what) in [
+            (slot_of[9] + 5, "plies"),
+            (slot_of[9] + PREFIX_AT + 3, "prefix"),
+            (slot_of[9] + 58, "zero"),
+            (slot_of[9] + CRC_AT + 1, "crc"),
+            (tail_of + 600, "tail"),
+        ] {
+            let bad = damaged(at, what);
+            let stream = Stream::open(&bad).unwrap();
+            assert!(matches!(stream.game(10), Err(Bad::Corrupt(_))), "{what}");
+            assert!(matches!(stream.entry(10), Err(Bad::Corrupt(_))), "{what}");
+            let target = Target::of(standard());
+            assert!(matches!(stream.find(10, &target), Err(Bad::Corrupt(_))), "{what}");
+            assert!(stream.game(9).is_ok() && stream.game(11).is_ok(), "{what}");
+            drop(stream);
+            std::fs::remove_file(&bad).unwrap();
+        }
+        // A record the index does not hold is checked as well.
+        assert!(line_of(14).is_none());
+        let bad = damaged(slot_of[13] + 7, "unindexed");
+        assert!(matches!(Stream::open(&bad).unwrap().game(14), Err(Bad::Corrupt(_))));
+        std::fs::remove_file(&bad).unwrap();
+        // Two slots swapped: each is sound but not where it belongs.
+        let bad = path.with_extension("swapped");
+        let mut bytes = good.clone();
+        let (x, y) = (slot_of[1], slot_of[BATCH + 1]);
+        for k in 0..SLOT_BYTES {
+            bytes.swap(x + k, y + k);
+        }
+        std::fs::write(&bad, &bytes).unwrap();
+        let stream = Stream::open(&bad).unwrap();
+        assert!(matches!(stream.game(2), Err(Bad::Corrupt(_))));
+        assert!(matches!(stream.game(BATCH as u32 + 2), Err(Bad::Corrupt(_))));
+        drop(stream);
+        std::fs::remove_file(&bad).unwrap();
+        let table = Header::decode(&good).unwrap().table_offset as usize;
+        for (at, what) in [(table + 3, "table"), (40, "header")] {
+            let bad = damaged(at, what);
+            assert!(matches!(Stream::open(&bad), Err(Bad::Corrupt(_))), "{what}");
+            std::fs::remove_file(&bad).unwrap();
+        }
+        let bad = path.with_extension("short");
+        std::fs::write(&bad, &good[..good.len() - 8]).unwrap();
+        assert!(matches!(Stream::open(&bad), Err(Bad::Corrupt(_))));
+        std::fs::remove_file(&bad).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The home-pawn test lets through exactly the lines whose first pawns

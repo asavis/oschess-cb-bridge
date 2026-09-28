@@ -682,8 +682,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     table.row("index", "deep lookup, plies 30/60/90", &mut deep, &format!("{found} of {asked} found"));
     // The most crowded structure (#145): bare kings, which every game that
     // ends in them holds, all home pawns gone, so their bucket is replayed
-    // whole. The first answer also checks the CRCs of the stream's chunks
-    // it touches.
+    // whole.
     let bare = explorer(BARE_KINGS);
     let (mut first, mut crowded) = (Samples::default(), Samples::default());
     let games = first.get(&mut c, &bare, true).and_then(|a| number(&a, "games"));
@@ -956,16 +955,14 @@ mod tests {
             build_id: 2,
             games: 3,
             plies: 120,
-            tail_offset: 304,
-            tail_len: 10,
-            table_offset: 314,
-            chunks: 1,
+            table_offset: 320,
+            blocks: 1,
             table_crc: 0,
         };
         let mut bytes = h.encode().to_vec();
-        bytes.resize(318, 0);
+        bytes.resize(328, 0);
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(stream_counts(&path), "stream 3 games, 120 plies, 318 bytes");
+        assert_eq!(stream_counts(&path), "stream 3 games, 120 plies, 328 bytes");
         std::fs::write(&path, b"not a stream").unwrap();
         assert_eq!(stream_counts(&path), "no move stream");
         let _ = std::fs::remove_file(&path);

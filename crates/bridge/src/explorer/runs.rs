@@ -241,7 +241,8 @@ pub fn write_runs(
         let capacity = entries.min(limits.run_entries.unwrap_or(usize::MAX)).max(64);
         let mut buf: Vec<Entry> = Vec::new();
         buf.try_reserve_exact(capacity).map_err(|_| Refused::Busy)?;
-        let per = total.div_ceil(w.count as u64);
+        // Whole blocks of the stream each, so that each block is one worker's.
+        let per = total.div_ceil(w.count as u64).next_multiple_of(BATCH as u64);
         let lo = u64::from(first) + w.index as u64 * per;
         let hi = (lo + per - 1).min(u64::from(last));
         let mut runs = Vec::new();

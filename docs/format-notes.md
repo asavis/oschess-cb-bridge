@@ -453,10 +453,10 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   the key, the game number (30 bits) with its result (2), and the move (14),
   ply (6) and average rating (12). Each worker sorts its entries within its
   share of the search memory budget and writes them as runs. It writes each
-  batch's part of the move stream as it goes: its buffers, a 1 MiB chunk of
-  tails, a batch's directory entries and prefix slots and a line's words,
-  about 1.4 MiB, come out of its entries' share. Once the games are read, the
-  stream's chunks are read back on up to half the workers for their CRCs. The runs are then
+  block's part of the move stream as it goes: its buffers, 1 MiB of tails, a
+  block's slots and a line's words, about 1.4 MiB, come out of its entries'
+  share, and each worker's games start at a block's start. Nothing of the
+  stream is read back. The runs are then
   merged, each run with a 64 KiB read buffer: in passes of as many runs as half
   the budget holds, at most 256, until the final merge can take all that are
   left beside the writer's 6 MiB. That final merge adds up each position's
@@ -502,9 +502,11 @@ it means the same in any position and needs no board to decode.
   words are copied as stored, a Chess960 castling word in a standard game as
   the standard castling of its side; a classic game's or a PGN game's are the
   words of its moves (`cbformat::replay::word_of`). The same games in the
-  three formats give the same file, byte for byte past the generation and the
-  build id. A line ends where the index's ends: before a null move or damage,
-  or at 65,535 plies.
+  three formats give the same records; with one worker, as for a few thousand
+  games, the same file byte for byte past the generation and the build id,
+  since with more the order of tails and blocks follows the workers'
+  progress. A line ends where the index's ends: before a null move or
+  damage, or at 65,535 plies.
 - **Mapped read-only.** The bridge maps the file whole (`mmap`, or
   `MapViewOfFile` on Windows) and replays its words without legality checks.
   Its pages are the operating system's file cache, outside the search memory
@@ -519,7 +521,7 @@ it means the same in any position and needs no board to decode.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBMOV\0` |
-  | 8 | 4 | format version, 1 |
+  | 8 | 4 | format version, 2 |
   | 12 | 4 | header length, 128 |
   | 16 | 1 | prefix words per record, *W* = 21 |
   | 20 | 4 | first record, 1 |
@@ -528,47 +530,54 @@ it means the same in any position and needs no board to decode.
   | 40 | 8 | build id, as in the index's header |
   | 48 | 8 | games indexed |
   | 56 | 8 | plies stored |
-  | 64 | 8 | offset of the tail area |
-  | 72 | 8 | length of the tail area |
-  | 80 | 8 | offset of the chunk table |
-  | 88 | 4 | chunks |
-  | 92 | 4 | CRC-32 of the chunk table |
+  | 64 | 4 | records per block, *B* = 4,096 |
+  | 72 | 8 | offset of the block table |
+  | 80 | 4 | blocks, ⌈*R*/*B*⌉ |
+  | 84 | 4 | CRC-32 of the block table |
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
-  The other bytes are zero.
-- **Directory**, at 128: an entry of 16 bytes per record, record *r* at
-  128 + 16(*r* − 1):
+  The other bytes are zero. Version 1, whose directory, prefix and tail
+  areas lay apart with a CRC for each MiB, is rebuilt.
+- **Body**, from 128 to the block table: the tails and the blocks of slots,
+  each starting at a multiple of 64 bytes, in the order the build's workers
+  appended them. A worker takes the records of one block at a time and
+  gathers their tails, appending them when the next would pass 1 MiB and at
+  the block's end, then appends the block's slots, so the file is written
+  from its start to its end: a game's tail is found only by its offset, and
+  a block only by the table.
+- **Slot**, 64 bytes a record, *B* in a block, record *r* the
+  ((*r* − 1) mod *B*)th slot of block ⌊(*r* − 1)/*B*⌋:
 
   | Offset | Size | Field |
   |---|---|---|
-  | 0 | 4 | tail offset, in words from the tail area's start; meaningful when the line is longer than *W* or starts from a set-up position |
+  | 0 | 4 | tail offset, in words from the file's start; meaningful when the line is longer than *W* or starts from a set-up position |
   | 4 | 2 | plies stored |
   | 6 | 2 | bits 0-1: outcome (white, draw, black, other, as the index counts it); bits 2-13: average rating, as the index ranks by it; bit 14: set-up start; bit 15: indexed (a standard game, not deleted, whose moves could be read) |
   | 8 | 8 | home-pawn departures: bits 0-59 the first 15 home pawns to leave home, in order, 4 bits each (white a-h 0-7, black a-h 8-15); bits 60-63 how many, 15 meaning 15 or 16 |
+  | 16 | 42 | words 0 to *W* − 1 of its line, then `0xffff` after its end |
+  | 58 | 2 | zero |
+  | 60 | 4 | CRC-32 of the record's number (4 bytes), bytes 0-59 and its tail |
 
-  A record the index does not hold has an entry of zeros.
-- **Prefix area**, at 128 + 16*R*: a slot of *W* words per record, words 0 to
-  *W* − 1 of its line, then `0xffff` after its end: 42 bytes a record.
-- **Tail area**, 4-byte aligned after the prefix area. At a game's tail
-  offset: for a set-up start, 18 words describing it (32 bytes of pieces from
-  a1 to h8, a square in each half of a byte, low half first: 0 empty, 1-6
-  white pawn, knight, bishop, rook, queen, king, 9-14 the same for black; a
-  byte for the side to move, 0 white; a byte of castling rights, bits as in
+  A record the index does not hold has zeros for bytes 0-15 and no words.
+- **Tail**: for a set-up start, 18 words describing it (32 bytes of pieces
+  from a1 to h8, a square in each half of a byte, low half first: 0 empty,
+  1-6 white pawn, knight, bishop, rook, queen, king, 9-14 the same for black;
+  a byte for the side to move, 0 white; a byte of castling rights, bits as in
   the set-up section above; the en passant file 0-7 when a capture is
   possible, else 8; a zero byte); then words *W* to plies − 1. A start equal
-  to the standard one is no set-up. The build's workers write the directory
-  entries and prefix slots of their own records in place and append their
-  tails in chunks of at most 1 MiB, one batch of 4,096 records at a time, so
-  a game's tail is found only by its offset. A file takes 58 bytes a record
-  and 2 bytes for each ply past the 21st, 36 more for a set-up start, and its
-  chunk table.
-- **Chunk table**, at the end of the tails: a CRC-32 for each 1 MiB from
-  byte 128 to the end of the tails. The header's counts must place every
-  area where the record count puts it and end the file with the table, which
-  is checked against its CRC when the file opens. Each chunk is checked the
-  first time any reader touches it, and a bit per chunk, held in the search
-  memory budget with the table, records that it matched. A failure drops both
-  files, and the next request rebuilds them.
+  to the standard one is no set-up. A file takes 64 bytes a record and 2
+  bytes for each ply past the 21st, 36 more for a set-up start, up to 63
+  bytes of padding after each append of tails, and 8 bytes a block.
+- **Block table**, at the end of the body: the offset of each block's slots,
+  8 bytes each. The file must end with it, have a block for every *B*
+  records and room before the table for every record's slot, and each
+  block's slots must lie within the body at a multiple of 64 bytes; the
+  table is checked against its CRC when the file opens and held in the
+  search memory budget. A record is checked against its CRC whenever it is
+  read, its slot and its tail, which are all a replay reads: its number in
+  the CRC places it, so that a slot moved elsewhere fails too. A failure
+  drops both files, and the next request rebuilds them. A torn file, which
+  the build does not sync, fails the CRCs of the records it lost.
 - **Finding a position.** Of a bucket's games, a replay skips those the
   index does not hold, and a standard game whose home pawns left in an order
   the position does not allow: a pawn on its home square never came there and

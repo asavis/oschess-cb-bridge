@@ -50,6 +50,25 @@ pub struct Line {
 }
 
 impl Line {
+    /// Game `number`'s line of `words` from `setup`, as a walk leaves it, for
+    /// the tests of the move stream.
+    #[cfg(test)]
+    pub(super) fn of(number: u32, words: Vec<u16>, setup: Option<[u8; SETUP_BYTES]>, outcome: Outcome) -> Line {
+        Line {
+            number,
+            outcome,
+            elo: 2000,
+            positions: Vec::new(),
+            structures: Vec::new(),
+            words,
+            setup,
+            departures: Departures::default(),
+            here: 0,
+            here_structure: 0,
+            home: 0,
+        }
+    }
+
     /// Adds a position the first time the line reaches it.
     fn reach(&mut self, key: u64, mv: u16, ply: u8) {
         if !self.positions.iter().any(|p| p.0 == key) {

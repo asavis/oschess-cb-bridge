@@ -782,10 +782,11 @@ the oschess analysis panel shows it like its Lichess tabs.
   rebuilt. The Mega Database's index takes about 2.2 GB, 0.85
   GB of it the deep section, and its build needs about 11 GB of temporary
   space there (`<id>.build`,
-  `<id>.idx.partial`). Its move stream takes 58 bytes a game and 2 bytes for
-  each ply past the 21st, written in place as `<id>.moves.partial`. The stream
-  is mapped read-only: the operating system keeps as much of it in memory as
-  it can spare, outside the search memory. On Windows a build replaces a
+  `<id>.idx.partial`). Its move stream takes 64 bytes a game and 2 bytes for
+  each ply past the 21st, written from its start to its end as
+  `<id>.moves.partial`, each game with a CRC checked whenever it is
+  replayed. The stream is mapped read-only: the operating system keeps as
+  much of it in memory as it can spare, outside the search memory. On Windows a build replaces a
   stream still mapped by an answer in flight once that answer is done. When the bridge starts, after each change of the
   database list, and at least once a minute while the list is asked for, the
   folder is swept (#60):

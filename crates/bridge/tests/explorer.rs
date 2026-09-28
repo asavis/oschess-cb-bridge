@@ -1173,11 +1173,12 @@ fn answered(port: u16, path: &str) -> String {
     }
 }
 
-/// A stream whose chunk fails its CRC is found when a replay first reads it:
-/// the answer is `409` while both files are built again, and the next answers
-/// come from the new build.
+/// A stream record that fails its CRC, in its slot or in its tail, is found
+/// when a replay reads it: nothing is answered from it, the answer is `409`
+/// while both files are built again, and the next answers come from the new
+/// build.
 #[test]
-fn a_stream_chunk_that_fails_its_crc_is_rebuilt() {
+fn a_stream_record_that_fails_its_crc_is_rebuilt() {
     let db = deep_games("explorer-stream-crc");
     let dir = index_dir("stream-crc");
     let (port, id) = serve(&db, &dir);
@@ -1185,36 +1186,74 @@ fn a_stream_chunk_that_fails_its_crc_is_rebuilt() {
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after(&ucis).fen()));
     let found = r#""games":1,"white":1,"draws":0,"black":0"#;
     assert!(answered(port, &url).contains(found));
-    // A word of game 2's prefix slot, in the chunk every replay reads first.
     let path = dir.join("index").join(format!("{id}.moves"));
-    let before = std::fs::read(&path).unwrap();
-    let header = explorer::stream::Header::decode(&before).unwrap();
-    let at = 128 + 16 * header.records() as usize + 42 + 6;
-    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(at as u64)).unwrap();
-    file.write_all(&[before[at] ^ 0x5a]).unwrap();
-    drop(file);
-    // A bridge started now opens the files, whose header and table are sound,
-    // and finds the damage on the first replay.
-    let (port, _) = serve(&db, &dir);
-    let (status, body) = get(port, &url);
-    assert_eq!(status, 409, "{body}");
-    assert!(body.contains("rebuilt"), "{body}");
-    assert!(answered(port, &url).contains(found));
-    let after = explorer::stream::Header::decode(&std::fs::read(&path).unwrap()).unwrap();
-    assert_ne!(after.build_id, header.build_id, "built again");
-    let direct = {
-        let loaded = explorer::prepare(
-            &Database::open(db.dir().join("db.2cbh")).unwrap(),
-            after.generation,
-            &dir.join("index"),
-            &id,
-            &Progress::default(),
-        )
-        .unwrap();
-        loaded.stream.header
-    };
-    assert_eq!(direct, after, "the new files are kept");
+    for part in ["slot", "tail"] {
+        let before = std::fs::read(&path).unwrap();
+        let header = explorer::stream::Header::decode(&before).unwrap();
+        // Game 2's slot, 64 bytes into the only block, which the table at
+        // the file's end places: a word of its prefix, or of its tail.
+        let table = header.table_offset as usize;
+        let block = u64::from_le_bytes(before[table..table + 8].try_into().unwrap()) as usize;
+        let slot = block + 64;
+        let at = match part {
+            "slot" => slot + 16 + 6,
+            _ => 2 * u32::from_le_bytes(before[slot..slot + 4].try_into().unwrap()) as usize + 10,
+        };
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(at as u64)).unwrap();
+        file.write_all(&[before[at] ^ 0x5a]).unwrap();
+        drop(file);
+        // A bridge started now opens the files, whose header and table are
+        // sound, and finds the damage on the first replay.
+        let (port, _) = serve(&db, &dir);
+        let (status, body) = get(port, &url);
+        assert_eq!(status, 409, "{part}: {body}");
+        assert!(body.contains("rebuilt"), "{part}: {body}");
+        assert!(answered(port, &url).contains(found), "{part}");
+        let after = explorer::stream::Header::decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_ne!(after.build_id, header.build_id, "{part}: built again");
+        let direct = {
+            let loaded = explorer::prepare(
+                &Database::open(db.dir().join("db.2cbh")).unwrap(),
+                after.generation,
+                &dir.join("index"),
+                &id,
+                &Progress::default(),
+            )
+            .unwrap();
+            loaded.stream.header
+        };
+        assert_eq!(direct, after, "{part}: the new files are kept");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Games of three blocks, which the build's workers write in any order:
+/// every game's line reads back whole, and a position past the tree is found
+/// in all the games of every block that reach it.
+#[test]
+fn a_stream_of_many_blocks_holds_every_game() {
+    let games = 2 * explorer::stream::BATCH as u32 + 300;
+    let mut b = Builder::new();
+    let long = format!("e2e4 e7e5 {}d2d3", hops(15));
+    for n in 1..=games {
+        match n % 3 {
+            0 => game(&mut b, &long, 2, (2000, 2000)),
+            1 => game(&mut b, "d2d4 d7d5", 1, (2000, 2000)),
+            _ => game(&mut b, "e2e4", 0, (2000, 2000)),
+        };
+    }
+    let db = b.write("explorer-stream-blocks");
+    let dir = index_dir("stream-blocks");
+    let idx = prepared(&db, &dir);
+    assert_eq!((idx.stream.header.games, idx.stream.header.blocks), (u64::from(games), 3));
+    for n in 1..=games {
+        let ucis = ["", "d2d4 d7d5", "e2e4"][n as usize % 3];
+        let ucis = if ucis.is_empty() { long.as_str() } else { ucis };
+        assert_eq!(idx.stream.game(n).unwrap().words, stream_words(None, ucis), "game {n}");
+    }
+    let found = explorer::deep(&idx, &board_after(&long), &Cancel::never()).unwrap().unwrap();
+    assert_eq!(found.counts.games, u64::from(games / 3));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

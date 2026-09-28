@@ -87,7 +87,7 @@ fn build_in(
     let bits = sink.bits();
     let deep_parts = sink.finish()?;
     let build_id = stream::build_id();
-    writer.finish(plan.generation, build_id, progress)?;
+    writer.finish(plan.generation, build_id)?;
     let entries: u64 = runs.iter().map(|r| r.entries).sum();
     progress.start("merging", entries);
     let runs = runs::reduce(runs, work, progress, fan_ins)?;
