@@ -65,6 +65,10 @@ impl IndexFile {
         {
             return Err(Bad::Corrupt("counts do not fit the file"));
         }
+        // A game is a record indexed: no count of games passes the records.
+        if header.games > (u64::from(header.last_record) + 1).saturating_sub(u64::from(header.first_record)) {
+            return Err(Bad::Corrupt("games"));
+        }
         let memory = Hold::reserve_quietly(
             table_len as usize + blocks as usize * std::mem::size_of::<Block>() + 2 * deep_table_len as usize,
         )
@@ -140,7 +144,7 @@ impl IndexFile {
         let Ok(at) = entries.binary_search_by_key(&key, |e| u64_at(e, 0)) else { return Ok(None) };
         let start = u32_at(&entries[at], 8) as usize;
         let record = data.get(start..).ok_or(Bad::Corrupt("record offset"))?;
-        Stats::decode(record).map(Some).ok_or(Bad::Corrupt("record"))
+        Stats::decode(record, self.header.games).map(Some).ok_or(Bad::Corrupt("record"))
     }
 }
 

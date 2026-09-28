@@ -2,16 +2,19 @@
 //! worker. The budget is read once per process, so each test runs itself again
 //! in a child process with that budget set.
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge::catalog::Catalog;
 use bridge::explorer::Lookup;
-use bridge::explorer::format::MAX_PLY;
+use bridge::explorer::file::Bad;
+use bridge::explorer::format::{MAX_PLY, structure};
 use bridge::explorer::runs::{Limits, Progress, RUN_BUFFER, fan_ins};
 use bridge::explorer::{self, WRITER_BYTES, deep, rendered};
-use bridge::search::memory::{Hold, budget, held};
-use cbformat::fixture::{Builder, TempDb, quiet};
+use bridge::search::memory::{Cancel, Hold, budget, held};
+use bridge::search::workers::{self, WAIT, threads};
+use cbformat::fixture::{Builder, TempDb, quiet, words};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::v2::Database;
 use cbformat::view::Base;
@@ -219,5 +222,86 @@ fn a_deep_sinks_buffers_are_held_in_the_budget() {
     assert_eq!(held(), before + sink.bytes());
     sink.finish().unwrap();
     assert_eq!(held(), before);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Replays keep within the workers' limit (#146): with the one worker taken,
+/// a bucket small enough for the calling thread to replay waits for it as a
+/// bucket of the workers does, and both are answered busy once the wait is
+/// over; a superseded one at once. One that sees the worker come free
+/// answers.
+#[test]
+fn a_replay_on_the_calling_thread_waits_for_a_worker() {
+    if !in_child("a_replay_on_the_calling_thread_waits_for_a_worker") {
+        return;
+    }
+    assert_eq!(threads(), 1);
+    // 300 games of one line and 10 of another, 60 plies of knights out and
+    // back past the tree's pruning ply, each line alone in its structure.
+    let hops = "g1f3 g8f6 f3g1 f6g8 ".repeat(15);
+    let mut b = Builder::new();
+    let mut line = |ucis: String, games: usize| {
+        let mut board = Board::startpos();
+        let mut stream = vec![MOVES];
+        stream.extend(words(&mut board, &ucis));
+        stream.push(END_OF_LINE);
+        let at = b.moves(1, &stream);
+        for _ in 0..games {
+            b.game(at);
+        }
+        board
+    };
+    let pooled = line(format!("e2e4 e7e5 {hops}d2d3"), 300);
+    let inline = line(format!("d2d4 d7d5 {hops}e2e3"), 10);
+    let db = b.write("small-budget-workers");
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let dir = std::env::temp_dir().join(format!("bridge-small-budget-workers-{}", std::process::id()));
+    let idx = explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap();
+    // A worker takes 256 candidates at least: the calling thread replays 10.
+    let candidates = |board: &Board| idx.base.deep_games(structure(board), false).unwrap().0.len();
+    assert_eq!((candidates(&pooled), candidates(&inline)), (300, 10));
+    let games = |board: &Board, cancel: &Cancel| explorer::deep(&idx, board, cancel).map(|s| s.map(|s| s.counts.games));
+    assert_eq!(games(&pooled, &Cancel::never()).unwrap(), Some(300));
+    assert_eq!(games(&inline, &Cancel::never()).unwrap(), Some(10));
+
+    // An answer, and how long it took.
+    let waited = |board: &Board| {
+        let started = Instant::now();
+        (games(board, &Cancel::never()), started.elapsed())
+    };
+    std::thread::scope(|s| {
+        // A search holds the one worker until released, or until a failed
+        // check drops `release`.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let search = s.spawn(move || {
+            workers::run(1, 0, &Cancel::never(), |_| {
+                let _ = held.lock().unwrap().recv();
+                Ok(())
+            })
+        });
+        while workers::taken() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (a, b) = (s.spawn(|| waited(&inline)), s.spawn(|| waited(&pooled)));
+        for (what, (answer, took)) in [("inline", a.join().unwrap()), ("pooled", b.join().unwrap())] {
+            assert!(matches!(answer, Err(Bad::Busy)) && took >= WAIT, "{what}: {answer:?} after {took:?}");
+        }
+        let latest = Arc::new(AtomicU64::new(0));
+        let old = Cancel::newest(&latest);
+        let _newer = Cancel::newest(&latest);
+        let started = Instant::now();
+        assert!(matches!(games(&inline, &old), Err(Bad::Busy)));
+        assert!(started.elapsed() < WAIT / 2, "a superseded replay stops waiting");
+        // The worker comes free while a replay waits for it.
+        let waiting = s.spawn(|| games(&inline, &Cancel::never()));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!waiting.is_finished(), "the replay waits for the worker");
+        release.send(()).unwrap();
+        assert_eq!(waiting.join().unwrap().unwrap(), Some(10));
+        assert!(search.join().unwrap().is_ok());
+    });
+    assert_eq!(workers::taken(), 0, "every worker was returned");
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }

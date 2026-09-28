@@ -124,7 +124,8 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
 
 /// Candidates a worker replays at least, so that a small bucket takes one.
 /// A bucket that one worker would take whole is replayed on the calling
-/// thread instead, which takes less time than starting a worker would.
+/// thread instead, which takes less time than starting a worker would, as
+/// one of the shared workers all the same.
 const DEEP_GAMES_PER_WORKER: usize = 256;
 /// Candidates a worker takes at a time: the workers share a bucket as they
 /// go, so that one the machine runs less often takes fewer.
@@ -222,15 +223,16 @@ impl Found {
 /// counts once, with the move it played from its first visit.
 /// Counts add, moves add by code, and the notable games are the best of
 /// both, by rating, then number. `None` when no game reaches the position.
-/// Errors as [`deep`]'s.
+/// Errors as [`deep`]'s, and `Corrupt` when the sums count more games than
+/// the index holds.
 pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
     let Some(mut tree) = loaded.lookup(board.hash())? else { return deep(loaded, board, cancel) };
     let target = Target::of(board).beyond(loaded.base.header.max_ply);
     let Some(found) = replay(loaded, board, &target, true, cancel)? else { return Ok(Some(tree)) };
-    tree.counts.merge(&found.counts);
+    tree.counts = sum(&tree.counts, &found.counts, loaded.games())?;
     for played in &found.moves {
         match tree.moves.iter_mut().find(|m| m.0 == played.mv) {
-            Some(m) => m.1.merge(&played.counts),
+            Some(m) => m.1 = sum(&m.1, &played.counts, tree.counts.games)?,
             None => tree.moves.push((played.mv, played.counts)),
         }
     }
@@ -247,6 +249,13 @@ pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<S
     Ok(Some(tree))
 }
 
+/// `a` and `b` added, as counts of at most `games` games. Each game counts
+/// once, so anything more, a sum past 64 bits included, is damage that the
+/// checks of the tree's record alone could not see.
+fn sum(a: &Counts, b: &Counts, games: u64) -> Result<Counts, Bad> {
+    a.checked_merge(b).filter(|c| c.within(games)).ok_or(Bad::Corrupt("counts"))
+}
+
 /// The games of `board`'s structure that reach it, whether the tree holds it
 /// or not, as [`stats`] answers a position the tree does not hold: each
 /// counted once at the first ply its main line reaches the position, with the
@@ -261,8 +270,10 @@ pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<St
 /// The games that hold `board`'s structure, only those that hold it beyond
 /// the tree's plies when `beyond`, and that reach `target`, replayed from the
 /// move stream ([`IndexFile::deep_games`] names the candidates): on the
-/// calling thread when one worker would take them all, else on at most half
-/// the shared workers, so that searches keep the rest; `None` when none does.
+/// calling thread, taken as one of the shared workers, when one worker would
+/// take them all, else on at most half of them, so that searches keep the
+/// rest; `None` when none does. Either waits for its first worker as a
+/// search does, and is `Busy` when none comes free.
 ///
 /// [`IndexFile::deep_games`]: super::file::IndexFile::deep_games
 fn replay(
@@ -277,6 +288,8 @@ fn replay(
         return Ok(None);
     }
     if games.len() <= DEEP_GAMES_PER_WORKER {
+        // Requests at once never replay on more threads than the workers.
+        let _worker = workers::one(cancel).map_err(|_| Bad::Busy)?;
         let _memory = Hold::reserve(Found::BYTES).map_err(|_| Bad::Busy)?;
         let mut found = Found::new().ok_or(Bad::Busy)?;
         for &game in &games {

@@ -443,13 +443,18 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   counts: the header's CRC, and counts that fit the file (the table between
   its offset and the deep section; the deep table between its offset and the
   end of the file; 1 to 4,096 keys a block; for every key 12 bytes and a
-  record of at least 6 before the table). Then the tables' CRCs, blocks that
-  follow each other, in key order, with at most 4,096 keys and a little over
-  1 MiB of records each, and deep blocks that follow each other from the deep
-  section's offset to the deep table. On each lookup, the CRC of the block
-  read; a deep bucket's games must ascend, each game's prints too, and stay
-  within the records indexed. Any failure rebuilds the index. The table is
-  held within the search memory budget while the index is open.
+  record of at least 6 before the table), and no more games indexed than
+  records. Then the tables' CRCs, blocks that follow each other, in key
+  order, with at most 4,096 keys and a little over 1 MiB of records each,
+  and deep blocks that follow each other from the deep section's offset to
+  the deep table. On each lookup, the CRC of the block read; a record's
+  counts must hold no more games than the index, results adding up within
+  their games, and moves of no more games together than the position's, each
+  within its own games too; a deep bucket's games must ascend, each game's
+  prints too, and stay within the records indexed; and the counts of the
+  tree and of the games beyond it (#146) must add up within the index's
+  games, which each game counts once. Any failure rebuilds the index. The
+  table is held within the search memory budget while the index is open.
 - **Deciding what to build.** An index and a move stream both built at the
   database's generation, with the same build id, are current; anything else
   rebuilds both. A crash between writing one and the other, or a file copied

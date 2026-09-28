@@ -33,7 +33,7 @@ static TAKEN: Mutex<usize> = Mutex::new(0);
 static RETURNED: Condvar = Condvar::new();
 
 /// Workers a pass holds, returned when dropped.
-struct Slots(usize);
+pub struct Slots(usize);
 
 impl Slots {
     /// Returns the workers above `count`.
@@ -74,6 +74,14 @@ fn acquire(want: usize, cancel: &Cancel) -> Result<Slots, SearchError> {
         }
         taken = RETURNED.wait_timeout(taken, left.min(RECHECK)).unwrap_or_else(|e| e.into_inner()).0;
     }
+}
+
+/// One worker, for a pass so small that the calling thread runs it sooner
+/// than a worker started for it would. It counts as a started one does, is
+/// waited for as [`run`] waits for its first, up to [`WAIT`], then `Busy`,
+/// and is `Superseded` once `cancel` is; one free is taken under a lock.
+pub fn one(cancel: &Cancel) -> Result<Slots, SearchError> {
+    acquire(1, cancel)
 }
 
 /// Workers taken now, for tests and diagnostics.

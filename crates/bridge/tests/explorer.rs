@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::file::{Bad, IndexFile};
-use bridge::explorer::format::{BLOCK_ENTRY, Block, Counts, Header, pack_move};
+use bridge::explorer::format::{
+    BLOCK_ENTRY, Block, Counts, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, Stats, pack_move,
+};
 use bridge::explorer::runs::Progress;
 use bridge::explorer::{self, Loaded};
+use bridge::indexdir::crc32;
 use bridge::search::memory::Cancel;
 use cbformat::cbh;
 use cbformat::fixture::{Builder, TempDb, lid_header, quiet, sq, words};
@@ -1558,5 +1561,127 @@ fn a_set_up_game_reaching_a_tree_position_beyond_the_tree_is_counted() {
     );
     assert_eq!(all.top, vec![3, 2, 1, 4]);
     drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The index file at `path` with the record of position `key` replaced by
+/// `stats`, and the offsets, tables and CRCs after it written again to match:
+/// a file sound in every check but what that record counts.
+fn replace_record(path: &Path, key: u64, stats: &Stats) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut header = Header::decode(&bytes).unwrap();
+    let mut out = vec![0u8; HEADER_LEN];
+    let (mut table, mut replaced) = (Vec::new(), false);
+    for i in 0..header.blocks as usize {
+        let block = Block::decode(&bytes[header.table_offset as usize + i * BLOCK_ENTRY..]);
+        let (keys, data) = bytes[block.offset as usize..].split_at(block.keys as usize * KEY_ENTRY);
+        let (mut written, mut records) = (Vec::new(), Vec::new());
+        for entry in keys.chunks(KEY_ENTRY) {
+            let k = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            written.extend(k.to_le_bytes());
+            written.extend((records.len() as u32).to_le_bytes());
+            let at = u32::from_le_bytes(entry[8..].try_into().unwrap()) as usize;
+            let record = if k == key { stats.clone() } else { Stats::decode(&data[at..], header.games).unwrap() };
+            replaced |= k == key;
+            record.encode(&mut records);
+        }
+        written.extend(&records);
+        let offset = out.len() as u64;
+        Block { offset, data_len: records.len() as u32, crc: crc32(&written), ..block }.encode(&mut table);
+        out.extend(&written);
+    }
+    assert!(replaced, "the index holds the position");
+    let deep = &bytes[header.deep_offset as usize..header.deep_table_offset as usize];
+    header.table_offset = out.len() as u64;
+    header.table_crc = crc32(&table);
+    out.extend(&table);
+    let deep_offset = out.len() as u64;
+    out.extend(deep);
+    let mut deep_table = Vec::new();
+    for e in bytes[header.deep_table_offset as usize..].chunks(DEEP_BLOCK_ENTRY) {
+        let offset = u64::from_le_bytes(e[..8].try_into().unwrap()) - header.deep_offset + deep_offset;
+        deep_table.extend(offset.to_le_bytes());
+        deep_table.extend(&e[8..]);
+    }
+    header.deep_offset = deep_offset;
+    header.deep_table_offset = out.len() as u64;
+    header.deep_table_crc = crc32(&deep_table);
+    out.extend(&deep_table);
+    header.file_len = out.len() as u64;
+    out[..HEADER_LEN].copy_from_slice(&header.encode());
+    std::fs::write(path, out).unwrap();
+}
+
+/// A tree record that passes every CRC but counts what no sound index
+/// holds: more games than the index, results beyond their games, a move's
+/// too, moves of more games than the position's, or counts sound alone that
+/// pass the index's games once the games beyond the tree are added (#146),
+/// and a header that claims more games than records. Each is damage, never
+/// a panic or a sum cut to 64 bits: the answer is `Corrupt`, and the
+/// endpoint rebuilds the index and answers from the new one.
+#[test]
+fn counts_that_no_sound_index_holds_are_rebuilt() {
+    let mut b = Builder::new();
+    game(&mut b, "e2e4 e7e5 g1f3", 2, (2400, 2400));
+    game(&mut b, "e2e4 e7e5 f1c4", 1, (2200, 2200));
+    // At ply 42, after 40 plies of hops.
+    game(&mut b, &format!("{}e2e4 e7e5 g1f3", hops(10)), 0, (2500, 2500));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-bad-counts");
+    let dir = index_dir("bad-counts");
+    let board = board_after("e2e4 e7e5");
+    let idx = prepared(&db, &dir);
+    let tree = idx.lookup(board.hash()).unwrap().unwrap();
+    assert_eq!((idx.games(), tree.counts.games), (3, 2));
+    let all = Counts { games: 3, white: 1, draws: 1, black: 1 };
+    assert_eq!(explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap().counts, all);
+    let (path, build) = (idx.base.path.clone(), idx.base.header.build_id);
+    drop(idx);
+    let sound = std::fs::read(&path).unwrap();
+    let c = |games, white, draws, black| Counts { games, white, draws, black };
+    let max = c(u64::MAX, u64::MAX, 0, 0);
+    let (nf3, bc4) = (code("g1f3"), code("f1c4"));
+    for (counts, moves, alone, why) in [
+        // The reviewer's: the sum with the game beyond the tree passes 64 bits.
+        (max, vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))], false, "more games than the index"),
+        (c(2, 1, 1, 1), vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))], false, "results beyond the games"),
+        (c(2, 1, 1, 0), vec![(nf3, max), (bc4, c(1, 0, 1, 0))], false, "a move of more games than the position"),
+        (c(2, 1, 1, 0), vec![(nf3, c(1, 1, 0, 1)), (bc4, c(1, 0, 1, 0))], false, "a move's results beyond its games"),
+        (c(2, 1, 1, 0), vec![(nf3, c(2, 1, 0, 0)), (bc4, c(1, 0, 1, 0))], false, "moves of more games than it"),
+        // Sound alone: all three games, which the game beyond the tree passes.
+        (c(3, 1, 1, 1), vec![(nf3, c(2, 1, 0, 1)), (bc4, c(1, 0, 1, 0))], true, "a sum beyond the index's games"),
+    ] {
+        std::fs::write(&path, &sound).unwrap();
+        replace_record(&path, board.hash(), &Stats { counts, moves, top: tree.top.clone() });
+        let idx = prepared(&db, &dir);
+        assert_eq!(idx.base.header.build_id, build, "{why}: the file was kept");
+        assert_eq!(idx.lookup(board.hash()).is_ok(), alone, "{why}");
+        assert!(matches!(explorer::stats(&idx, &board, &Cancel::never()), Err(Bad::Corrupt(_))), "{why}");
+    }
+    // A header that claims more games than the records indexed, every
+    // record's count within them.
+    let mut header = Header::decode(&sound).unwrap();
+    header.games = 4;
+    let mut claims = sound.clone();
+    claims[..HEADER_LEN].copy_from_slice(&header.encode());
+    std::fs::write(&path, &claims).unwrap();
+    assert!(matches!(IndexFile::open(&path), Err(Bad::Corrupt(_))), "more games than records");
+
+    // Through the endpoint: `409` while the index is built again, then the
+    // new one's answer.
+    let (bridge, id) = serve(&db, &dir);
+    let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board.fen()));
+    let found = r#""games":3,"white":1,"draws":1,"black":1"#;
+    assert!(answered(bridge.port, &url).contains(found));
+    drop(bridge);
+    let path = dir.join("index").join(format!("{id}.idx"));
+    let moves = vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))];
+    replace_record(&path, board.hash(), &Stats { counts: max, moves, top: tree.top.clone() });
+    let (bridge, _) = serve(&db, &dir);
+    let (status, body) = get(bridge.port, &url);
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("rebuilt"), "{body}");
+    assert!(answered(bridge.port, &url).contains(found));
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
