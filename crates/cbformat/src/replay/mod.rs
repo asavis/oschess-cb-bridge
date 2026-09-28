@@ -164,6 +164,65 @@ pub fn to_move(board: &Board, word: u16) -> std::result::Result<Move, MoveError>
     }
 }
 
+/// The move `word` names in a standard game, read without a board: from, to
+/// and promotion for a normal move, and for castling the king onto its rook
+/// on their home squares, as [`Board::play_unchecked`] takes it. `None` for a
+/// null move, a Chess960 castling, or a word that names no move. A move
+/// stream replays words that were checked when it was written with it.
+pub fn standard_move(word: u16) -> Option<Move> {
+    match movetable::decode(word)? {
+        MoveWord::Normal { from, to, promotion, .. } => Some(Move::new(square(from), square(to), promotion.map(piece))),
+        MoveWord::Castle { color: c, side: s } => {
+            let rank = color(c).back_rank();
+            let rook = if s == CastleSide::Short { 7 } else { 0 };
+            Some(Move::new(Square::new(4, rank), Square::new(rook, rank), None))
+        }
+        MoveWord::Null | MoveWord::Castle960 { .. } => None,
+    }
+}
+
+/// The word that names `mv` in `board`, the inverse of [`to_move`]: a normal
+/// move names its piece, its squares, what it takes and its promotion;
+/// castling, the king onto its own rook, names its side. `None` when no word
+/// names the move, as for one from an empty square.
+pub fn word_of(board: &Board, mv: Move) -> Option<u16> {
+    let (p, c) = board.piece_at(mv.from)?;
+    let us = if c == CColor::White { Color::White } else { Color::Black };
+    if p == CPiece::King && board.colors(c) & mv.to.bit() != 0 {
+        let side = if mv.to.file() > mv.from.file() { CastleSide::Short } else { CastleSide::Long };
+        return movetable::encode(MoveWord::Castle { color: us, side });
+    }
+    let captured = match board.piece_at(mv.to).map(|(v, _)| v) {
+        Some(CPiece::Queen) => Captured::Queen,
+        Some(CPiece::Rook) => Captured::Rook,
+        Some(CPiece::Bishop) => Captured::Bishop,
+        Some(CPiece::Knight) => Captured::Knight,
+        Some(CPiece::Pawn) => Captured::Pawn,
+        Some(CPiece::King) => return None,
+        None if p == CPiece::Pawn && mv.from.file() != mv.to.file() => Captured::EnPassant,
+        None => Captured::Nothing,
+    };
+    movetable::encode(MoveWord::Normal {
+        color: us,
+        piece: table_piece(p),
+        from: mv.from.index() as movetable::Sq,
+        to: mv.to.index() as movetable::Sq,
+        captured,
+        promotion: mv.promotion.map(table_piece),
+    })
+}
+
+fn table_piece(p: CPiece) -> Piece {
+    match p {
+        CPiece::King => Piece::King,
+        CPiece::Queen => Piece::Queen,
+        CPiece::Knight => Piece::Knight,
+        CPiece::Bishop => Piece::Bishop,
+        CPiece::Rook => Piece::Rook,
+        CPiece::Pawn => Piece::Pawn,
+    }
+}
+
 /// Checks and plays `word` on `board`, including the null move. On error the
 /// board is unspecified and must be discarded.
 pub fn play(board: &mut Board, word: u16) -> std::result::Result<Option<Move>, MoveError> {
@@ -314,4 +373,43 @@ enum Step {
     /// A null move, with the position it produces. Boxed: null moves are rare
     /// and a board is large.
     Null(Box<Board>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every legal move of positions with castling both ways, en passant,
+    /// promotions with and without a capture, and captures of every kind has
+    /// a word that names it there and plays it back, and the word read
+    /// without a board is the same move.
+    #[test]
+    fn a_word_names_each_legal_move_and_plays_it_back() {
+        let mut seen = 0;
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N w - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+        ] {
+            let board = Board::from_fen(fen).unwrap();
+            for mv in board.legal_moves() {
+                let word = word_of(&board, mv).unwrap_or_else(|| panic!("{fen}: no word for {mv}"));
+                assert!(word < movetable::FIRST_CASTLE_960, "{fen}: {mv}");
+                assert_eq!(to_move(&board, word), Ok(mv), "{fen}: {mv}");
+                assert_eq!(standard_move(word), Some(mv), "{fen}: {mv}");
+                let (mut checked, mut unchecked) = (board.clone(), board.clone());
+                assert_eq!(play(&mut checked, word), Ok(Some(mv)));
+                unchecked.play_unchecked(mv);
+                assert_eq!(checked, unchecked, "{fen}: {mv}");
+                seen += 1;
+            }
+        }
+        assert!(seen > 150, "{seen}");
+        assert_eq!(standard_move(movetable::NULL_MOVE), None);
+        assert_eq!(standard_move(movetable::FIRST_CASTLE_960), None);
+        assert_eq!(standard_move(0), None);
+    }
 }
