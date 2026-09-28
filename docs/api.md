@@ -43,9 +43,9 @@ rules:
   values it does not know, a new indexing phase among them, and treats a
   documented field that is absent as unknown: the bridge is older than the
   field. An older bridge ignores a parameter it does not know, so every
-  parameter that narrows an answer is acknowledged in it (`line` in each row,
-  `position` in a list); a client that does not find the acknowledgement
-  treats the answer as not narrowed.
+  parameter that narrows an answer is acknowledged in it (as `line` is, in
+  each row); a client that does not find the acknowledgement treats the answer
+  as not narrowed.
 - **Bounded parameters, not constants.** Where an answer holds a number of
   items or plies that a screen may want more or fewer of, the number is a
   parameter with a default and a range given here, not a constant of the
