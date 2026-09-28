@@ -14,7 +14,9 @@ pub type Game = (u16, Arc<str>);
 /// map's slot.
 const ENTRY_OVERHEAD: usize = 96;
 
-/// The cap: a 64th of the budget, from 256 KiB to 8 MiB.
+/// The cap: a 64th of the budget, from 256 KiB to 8 MiB. It bounds the bytes,
+/// not the games: an entry is a whole `/games` row (#144), and a larger row
+/// makes fewer games fit, never more memory.
 pub fn cap() -> usize {
     (budget() / 64).clamp(256 << 10, 8 << 20)
 }
