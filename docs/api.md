@@ -634,9 +634,9 @@ alphabetical.
 
 ### `GET /v1/databases/{id}/explorer`
 
-For a position: the games in the database that reached it in their first 40
-plies, their results, the moves played from it, and its notable games. The
-reference tab of the oschess analysis panel shows it like its Lichess tabs.
+For a position: the games in the database that reached it, at any ply, their
+results, the moves played from it, and its notable games. The reference tab of
+the oschess analysis panel shows it like its Lichess tabs.
 
 | Parameter | Meaning |
 |---|---|
@@ -649,7 +649,7 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   "games": 5012345, "white": 1700000, "draws": 2100000, "black": 1212345,
   "moves": [ { "uci": "e2e4", "san": "e4", "games": 2305000, "white": 810000, "draws": 950000, "black": 545000 } ],
   "topGames": [ { "number": 1234, "white": "…", "black": "…", "whiteElo": 2882, "blackElo": 2800, "result": "1-0", "year": 2014, "event": "…" } ],
-  "index": { "records": 11966514, "games": 11959813, "maxPly": 40 }
+  "index": { "records": 11966514, "games": 11959813 }
 }
 ```
 
@@ -659,21 +659,38 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   position.
 - **Moves** are the moves played from the position, most played first, with
   the same counts. Their `games` can add up to less than the position's: games
-  that ended there, or reached it at the index's last ply, played no move from
-  it within the index. `uci` writes castling the standard way, `e1g1` and
-  `e1c1`; `san` is the move in SAN.
+  that ended there played no move from it. `uci` writes castling the standard
+  way, `e1g1` and `e1c1`; `san` is the move in SAN.
 - **`topGames`**: up to 12 games that reached the position, the highest
   average rating first (the known rating when only one is), then the latest.
   Names are cut at 200 characters as in list rows; `year` is `null` when the
   date has none.
-- **What is indexed.** The positions of each game's main line from its start to
-  ply 40, and the moves played from them up to ply 40: standard chess only,
-  from the standard start or a set-up position, without deleted games, guiding
-  texts or analyses. A game whose move record is over 2 MiB, the limit
-  `games/{number}` serves, or cannot be read, is left out. A position reached
-  by only one game beyond ply 20 is left out. A position the index does not hold is answered with zero counts and
-  empty lists. `index` says how far the index goes: the last record it covers,
-  the games it holds, and its depth.
+- **What is indexed.** Every position of each game's main line, to its end:
+  standard chess only, from the standard start or a set-up position, without
+  deleted games, guiding texts or analyses. A game whose move record is over
+  2 MiB, the limit `games/{number}` serves, or cannot be read, is left out.
+  `index` names the last record the index covers and the games it holds.
+- **How a position is found** (#133). The index has two parts:
+  - **A tree** holds the positions reached within the first 40 plies, each
+    with its counts, moves and notable games, beyond ply 20 only those that
+    more than one game reached. It answers such a position however many games
+    share it.
+  - **A deep section** holds, for every game, the structures its main line
+    reaches beyond ply 20: a structure is each side's pawns and its pieces by
+    kind, what only a pawn move or a capture changes. Neither is undone, so a
+    game holds each structure for one stretch of plies, and few games share a
+    deep one. A position the tree does not hold is looked for among the games
+    of its structure, which are replayed on at most half the search workers:
+    each game counts once, at the first ply its main line reaches the
+    position, with the move it played from there. On the Mega Database a
+    game's position the tree does not hold is answered in about a millisecond;
+    fewer than 1 in 100 share their structure with more than 4,096 games,
+    and the most crowded one, bare kings, takes about half a second.
+
+  A position no game reaches is answered with zero counts and empty lists. A
+  game that reaches a position the tree holds only beyond ply 40 is not
+  counted in it; the pawns make that rare, since such a position has the
+  pawns of an early ply.
 - **Chess960 is not indexed.** The Polyglot key the index uses names a
   castling right by its side, not by its rook, so two Chess960 positions that
   differ only in which rook may castle share a key. A FEN whose castling
@@ -700,7 +717,8 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   under `indexing`. A build that fails is answered `503 index_unavailable` for
   a minute, and the next request tries again.
 - **Changes.** The index belongs to the database's generation, and a change to
-  the database rebuilds its index, about 5 minutes for the Mega Database.
+  the database rebuilds its index, about half a minute for the Mega Database
+  on a quiet machine.
   Until the new index is ready the answer is `409` with `state: "indexing"`:
   an index is never answered for another generation than its own. Updating an
   index from the games appended to a database is a possible later
@@ -710,8 +728,9 @@ reference tab of the oschess analysis panel shows it like its Lichess tabs.
   database (`<id>.idx`); a PGN file's header index lives apart, in `pgn`
   ([PGN files](#pgn-files)). `docs/format-notes.md`,
   "Position index", describes them. A file that is damaged or of another
-  version is rebuilt. The Mega Database's index takes about 1.4 GB, and its
-  build needs about 8 GB of temporary space there (`<id>.build`,
+  version is rebuilt. The Mega Database's index takes about 2.2 GB, 0.85
+  GB of it the deep section, and its build needs about 11 GB of temporary
+  space there (`<id>.build`,
   `<id>.idx.partial`). When the bridge starts, after each change of the
   database list, and at least once a minute while the list is asked for, the
   folder is swept (#60):

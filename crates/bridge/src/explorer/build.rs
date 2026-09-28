@@ -11,12 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use crate::indexdir::crc32;
+use crate::indexdir::{crc32, u32_at};
 use crate::search::SearchError;
 use crate::search::memory::Cancel;
 use crate::search::workers::{self, threads};
 
-use super::format::{BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES};
+use super::deep;
+use super::format::{
+    BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, deep_bits,
+};
 use super::runs::{self, Entry, Limits, PARTS, Progress, RUN_BUFFER, Run, io};
 use super::source::Source;
 
@@ -67,8 +70,16 @@ fn build_in(
     // The merges fit the build's share with the writer's memory, so a merge
     // never waits for what the same build holds.
     let fan_ins = runs::fan_ins(limits.share, WRITER_BYTES)?;
+    // So does the deep section beside the writer (#133).
+    let deep_memory = limits.share.saturating_sub(WRITER_BYTES);
+    if deep_memory < deep::MIN_MEMORY {
+        return Err(SearchError::TooLarge);
+    }
     progress.start("reading", u64::from(plan.last.saturating_sub(plan.first) + 1));
-    let runs = runs::write_runs(source, plan.first, plan.last, MAX_PLY, work, progress, limits)?;
+    let sink = deep::Sink::create(work, deep_bits(plan.last), progress)?;
+    let runs = runs::write_runs(source, plan.first, plan.last, work, progress, limits, Some(&sink))?;
+    let bits = sink.bits();
+    let deep_parts = sink.finish()?;
     let entries: u64 = runs.iter().map(|r| r.entries).sum();
     progress.start("merging", entries);
     let runs = runs::reduce(runs, work, progress, fan_ins)?;
@@ -91,8 +102,13 @@ fn build_in(
         table_offset: 0,
         table_crc: 0,
         file_len: 0,
+        deep_bits: bits,
+        deep_postings: 0,
+        deep_offset: 0,
+        deep_table_offset: 0,
+        deep_table_crc: 0,
     };
-    let header = assemble(&parts, &partial, header)?;
+    let header = assemble(&parts, &deep_parts, &partial, header, progress, deep_memory)?;
     std::fs::rename(&partial, target).map_err(|e| io(target, e))?;
     Ok(header)
 }
@@ -188,8 +204,17 @@ fn merge_part(
 }
 
 /// Writes the index file at `path`: the header, the parts' blocks in key
-/// order, each part's file removed once copied, and the table of blocks.
-fn assemble(parts: &[Part], path: &Path, mut header: Header) -> Result<Header, SearchError> {
+/// order, each part's file removed once copied, the table of blocks, then the
+/// deep section from `deep`'s partitions (#133), within `deep_memory` bytes,
+/// and its table.
+fn assemble(
+    parts: &[Part],
+    deep: &[(PathBuf, u64)],
+    path: &Path,
+    mut header: Header,
+    progress: &Progress,
+    deep_memory: usize,
+) -> Result<Header, SearchError> {
     let mut out = BufWriter::with_capacity(1 << 20, File::create(path).map_err(|e| io(path, e))?);
     out.write_all(&[0u8; HEADER_LEN]).map_err(|e| io(path, e))?;
     let mut offset = HEADER_LEN as u64;
@@ -214,8 +239,16 @@ fn assemble(parts: &[Part], path: &Path, mut header: Header) -> Result<Header, S
     header.blocks = u32::try_from(blocks).map_err(|_| SearchError::TooLarge)?;
     header.table_offset = offset;
     header.table_crc = crc32(&table);
-    header.file_len = offset + table.len() as u64;
     out.write_all(&table).map_err(|e| io(path, e))?;
+    header.deep_offset = offset + table.len() as u64;
+    let (deep_table, postings) =
+        super::deep::write_section(deep, header.deep_bits, &mut out, header.deep_offset, path, progress, deep_memory)?;
+    let deep_len: u64 = deep_table.chunks(super::format::DEEP_BLOCK_ENTRY).map(|e| u64::from(u32_at(e, 8))).sum();
+    header.deep_postings = postings;
+    header.deep_table_offset = header.deep_offset + deep_len;
+    header.deep_table_crc = crc32(&deep_table);
+    header.file_len = header.deep_table_offset + deep_table.len() as u64;
+    out.write_all(&deep_table).map_err(|e| io(path, e))?;
     let mut file = out.into_inner().map_err(|e| io(path, e.into_error()))?;
     file.seek(SeekFrom::Start(0)).map_err(|e| io(path, e))?;
     file.write_all(&header.encode()).map_err(|e| io(path, e))?;
@@ -372,7 +405,7 @@ impl Writer {
 mod tests {
     use super::*;
     use crate::explorer::file::IndexFile;
-    use crate::explorer::format::{Outcome, PRUNE_PLY};
+    use crate::explorer::format::{MIN_DEEP_BITS, Outcome, PRUNE_PLY};
 
     /// Positions of every part, spread over three runs, merge part by part
     /// into one index: its table passes the checks of opening, and every
@@ -415,9 +448,15 @@ mod tests {
             table_offset: 0,
             table_crc: 0,
             file_len: 0,
+            deep_bits: MIN_DEEP_BITS,
+            deep_postings: 0,
+            deep_offset: 0,
+            deep_table_offset: 0,
+            deep_table_crc: 0,
         };
         let path = dir.join("index");
-        let header = assemble(&parts, &path, header).unwrap();
+        let deep = deep::Sink::create(&dir, MIN_DEEP_BITS, &Progress::default()).unwrap().finish().unwrap();
+        let header = assemble(&parts, &deep, &path, header, &Progress::default(), 64 << 20).unwrap();
         assert_eq!((header.games, header.keys), (u64::from(game), games_of.len() as u64));
         assert!(header.blocks as usize >= PARTS, "a part's blocks end with it");
         let file = IndexFile::open(&path).unwrap();

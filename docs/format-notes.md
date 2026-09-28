@@ -355,30 +355,46 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   are left out, since the key names a castling right by its side, not by its
   rook.
 - **What a game adds.** Each position of its main line from the start to
-  ply 40, once however often it is reached, with the move played from it up to
-  ply 40; a position reached again adds only the move from its first visit.
+  ply 40, once however often it is reached, with the move played from it, the
+  one from ply 40 included; a position reached again adds only the move from
+  its first visit.
   A null move or damaged moves end the line there; the position before them
   counts, and no move from it. A game whose move record is over 2 MiB, or
   cannot be read, adds nothing. A position reached by one game only beyond
   ply 20 is dropped.
+- **What a game adds to the deep section** (#133): each structure (each
+  side's pawns and its knights, bishops, rooks and queens counted) that its
+  main line holds at some ply beyond 20, once, to its bucket. Only a pawn move
+  or a capture changes a structure, and neither is undone, so a game holds
+  each one for a single stretch of plies. Every position the tree does not
+  hold is found among the games of its structure's bucket, by replaying them;
+  a replay stops once the game has fewer men or pawns of a side than the
+  position, which it can then never reach. The pieces matter: every pawnless
+  ending shares one pawn structure, 186,041 games of the Mega Database, and
+  with the pieces counted the most crowded bucket, bare kings, holds 38,367.
 - **Header** (128 bytes):
 
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBIDX\0` |
-  | 8 | 4 | format version, 1 |
+  | 8 | 4 | format version, 2 |
   | 12 | 4 | header length, 128 |
   | 17 | 1 | depth in plies, 40 |
   | 18 | 1 | pruning ply, 20 |
+  | 19 | 1 | deep bucket bits, 12 to 24 |
   | 20 | 4 | first record indexed |
   | 24 | 4 | last record indexed |
   | 32 | 8 | the database's generation when built |
+  | 40 | 8 | deep postings: a game once per bucket |
   | 48 | 8 | games indexed |
   | 56 | 8 | positions |
   | 64 | 4 | blocks |
   | 72 | 8 | offset of the block table |
   | 80 | 4 | CRC-32 of the block table |
   | 88 | 8 | file length |
+  | 96 | 8 | offset of the deep section, right after the block table |
+  | 104 | 8 | offset of the deep table |
+  | 112 | 4 | CRC-32 of the deep table |
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
   The other bytes are zero.
@@ -395,16 +411,31 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
     moving onto its rook) followed by its four counts;
   - the number of notable games, then their numbers, the highest average
     rating first, then the latest.
-- **The block table** ends the file: for each block its first key, offset (8
-  bytes each), number of keys, data length and the CRC-32 of its keys and data
-  together (4 bytes each), 28 bytes a block.
+- **The block table** follows the blocks: for each block its first key,
+  offset (8 bytes each), number of keys, data length and the CRC-32 of its
+  keys and data together (4 bytes each), 28 bytes a block.
+- **The deep section** follows the block table. A structure's bucket is the
+  top *bits* bits (header byte 19) of a 64-bit hash of its two pawn
+  bitboards and its piece counts (`explorer::format::structure`). *bits* is the bit length of
+  the database's last record, from 12 to 24: about a bucket a game. The
+  buckets come in blocks of 4,096, back to back: for each bucket, the number
+  of its games, then the games in ascending order as the differences from
+  the previous one (the first from 0), all unsigned LEB128. Two structures can
+  share a bucket; a lookup replays the bucket's games and keeps those whose
+  main line reaches the position's key.
+- **The deep table** ends the file: for each deep block its offset (8 bytes),
+  length and CRC-32 (4 bytes each), 16 bytes a block, 2^(*bits* − 12)
+  blocks.
 - **Checks.** On opening, before anything is allocated from the header's
   counts: the header's CRC, and counts that fit the file (the table between
-  its offset and the end of the file; 1 to 4,096 keys a block; for every key
-  12 bytes and a record of at least 6 before the table). Then the table's CRC,
-  and blocks that follow each other, in key order, with at most 4,096 keys and
-  a little over 1 MiB of records each. On each lookup, the CRC of the block
-  read. Any failure rebuilds the index. The table is held within the search
+  its offset and the deep section; the deep table between its offset and the
+  end of the file; 1 to 4,096 keys a block; for every key 12 bytes and a
+  record of at least 6 before the table). Then the tables' CRCs, blocks that
+  follow each other, in key order, with at most 4,096 keys and a little over
+  1 MiB of records each, and deep blocks that follow each other from the deep
+  section's offset to the deep table. On each lookup, the CRC of the block
+  read; a deep bucket's games must ascend and stay within the records
+  indexed. Any failure rebuilds the index. The table is held within the search
   memory budget while the index is open.
 - **Deciding what to build.** An index built at the database's generation is
   current; any other is rebuilt.
@@ -432,6 +463,21 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   their blocks. Half the budget is at least
   8 MiB, which holds the writer and 30 runs; a smaller share fails the build
   as too large rather than waiting for memory the build holds itself.
+- **The deep section's build** (#133). The same workers read every main line
+  to its end, not only its first 40 plies, and turn each structure it
+  holds past ply 20 into a posting, `bucket << 32 | game`, kept in a 1 MiB
+  buffer. A full buffer is sorted and appended to up to 256 partition files,
+  split by the bucket's top bits, each written through a 4 KiB buffer held in
+  the build's share while it reads. Once the tree is written, each partition in
+  turn is sorted and freed of repeated postings, and written as its deep
+  blocks, within what the build's share of the budget leaves beside the
+  writer it holds. A partition that fits is sorted in memory. A larger one,
+  such as the partition of a structure that most games hold, is sorted in
+  chunks that fit, written apart and merged into one sorted file. Each of its
+  blocks is then read twice from that file, for its buckets' counts, then for
+  their games. Blocks are written as they are made, their CRC kept running. A
+  share too small to merge a partition's chunks, each through at least 4 KiB,
+  fails the build at once.
 
 # The classic format (`.cbh`)
 
@@ -483,8 +529,11 @@ The reader was checked against:
   database, `0x0b` in another. The reader starts such a game with the right its
   castling uses added, when the king and the rook stand where the right needs
   them: their home squares, or in Chess960 the squares the record names
-  (`cbh::start_as_played`); otherwise the move is an error. The stored
-  byte itself is still reported by `GameMoves::start`.
+  (`cbh::start_as_played`); otherwise the move is an error. Finding the
+  right plays the game's moves, so a set-up whose kings and rooks could hold
+  no missing right is not played for it, and `cbh::walk_from` walks from a
+  start already found instead of finding it again. The stored byte itself is
+  still reported by `GameMoves::start`.
 - **Text encoding.** The description says ISO 8859-1. Names are read as
   Windows-1252, which ChessBase, a Windows program, means by the bytes
   0x80-0x9f. A database ChessBase converted from 2CBH holds names as UTF-8

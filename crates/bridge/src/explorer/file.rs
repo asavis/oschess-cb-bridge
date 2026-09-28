@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use crate::indexdir::{crc32, u32_at, u64_at};
 use crate::search::memory::{Hold, Refused};
 
-use super::format::{BLOCK_ENTRY, BLOCK_KEYS, Block, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MIN_RECORD, Stats};
+use super::deep::{BLOCK_BUCKETS, bucket_games};
+use super::format::{
+    BLOCK_ENTRY, BLOCK_KEYS, Block, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MAX_DEEP_BITS,
+    MIN_DEEP_BITS, MIN_RECORD, Stats,
+};
 
 /// Why an index file cannot be used.
 #[derive(Debug)]
@@ -29,6 +33,8 @@ pub struct IndexFile {
     pub path: PathBuf,
     pub header: Header,
     blocks: Vec<Block>,
+    /// The deep section's blocks (#133): offset, length and CRC of each.
+    deep: Vec<(u64, u32, u32)>,
     _memory: Hold,
 }
 
@@ -45,16 +51,24 @@ impl IndexFile {
         // each key a 12-byte entry and a record of at least MIN_RECORD bytes.
         let data = header.table_offset.checked_sub(HEADER_LEN as u64).ok_or(Bad::Corrupt("table offset"))?;
         let table_len = blocks.checked_mul(BLOCK_ENTRY as u64).ok_or(Bad::Corrupt("block count"))?;
+        if !(MIN_DEEP_BITS..=MAX_DEEP_BITS).contains(&header.deep_bits) {
+            return Err(Bad::Corrupt("deep bits"));
+        }
+        let deep_table_len = header.deep_blocks() * DEEP_BLOCK_ENTRY as u64;
         if header.file_len != len
-            || header.table_offset.checked_add(table_len) != Some(len)
+            || header.table_offset.checked_add(table_len) != Some(header.deep_offset)
+            || header.deep_table_offset.checked_add(deep_table_len) != Some(len)
+            || header.deep_table_offset < header.deep_offset
             || blocks > keys
             || keys > blocks.saturating_mul(BLOCK_KEYS as u64)
             || keys.checked_mul((KEY_ENTRY + MIN_RECORD) as u64).is_none_or(|b| b > data)
         {
             return Err(Bad::Corrupt("counts do not fit the file"));
         }
-        let memory = Hold::reserve_quietly(table_len as usize + blocks as usize * std::mem::size_of::<Block>())
-            .map_err(|r| if r == Refused::TooLarge { Bad::Corrupt("table larger than memory") } else { Bad::Busy })?;
+        let memory = Hold::reserve_quietly(
+            table_len as usize + blocks as usize * std::mem::size_of::<Block>() + 2 * deep_table_len as usize,
+        )
+        .map_err(|r| if r == Refused::TooLarge { Bad::Corrupt("table larger than memory") } else { Bad::Busy })?;
         let mut table = Vec::new();
         table.try_reserve_exact(table_len as usize).map_err(|_| Bad::Busy)?;
         table.resize(table_len as usize, 0);
@@ -78,7 +92,30 @@ impl IndexFile {
         if end != header.table_offset || sum != keys || !decoded.windows(2).all(|w| w[0].first_key < w[1].first_key) {
             return Err(Bad::Corrupt("block layout"));
         }
-        Ok(IndexFile { file, path: path.to_path_buf(), header, blocks: decoded, _memory: memory })
+        let deep = deep_table(&file, &header, deep_table_len)?;
+        Ok(IndexFile { file, path: path.to_path_buf(), header, blocks: decoded, deep, _memory: memory })
+    }
+
+    /// The games whose main line holds a structure of `bucket` past the
+    /// tree's pruning ply (#133): the candidates for a position the tree does
+    /// not hold. The block and the games, at most four bytes for each of its
+    /// bytes, are held in the search budget until the hold is dropped:
+    /// `Busy` when it has no room.
+    pub fn deep_games(&self, bucket: u32) -> Result<(Vec<u32>, Hold), Bad> {
+        let local = bucket as usize % BLOCK_BUCKETS;
+        let Some(&(offset, len, crc)) = self.deep.get(bucket as usize / BLOCK_BUCKETS) else {
+            return Err(Bad::Corrupt("deep bucket"));
+        };
+        let memory = Hold::reserve_quietly((len as usize).saturating_mul(5)).map_err(|_| Bad::Busy)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len as usize).map_err(|_| Bad::Busy)?;
+        buf.resize(len as usize, 0);
+        read_at(&self.file, offset, &mut buf).map_err(Bad::Io)?;
+        if crc32(&buf) != crc {
+            return Err(Bad::Corrupt("deep block"));
+        }
+        let games = bucket_games(&buf, local, self.header.last_record).ok_or(Bad::Corrupt("deep block"))?;
+        Ok((games, memory))
     }
 
     /// The position `key`, `None` when the index does not hold it.
@@ -100,6 +137,33 @@ impl IndexFile {
         let record = data.get(start..).ok_or(Bad::Corrupt("record offset"))?;
         Stats::decode(record).map(Some).ok_or(Bad::Corrupt("record"))
     }
+}
+
+/// The deep section's table, checked against its CRC and against the
+/// section it describes: blocks back to back from `deep_offset`.
+fn deep_table(file: &File, header: &Header, len: u64) -> Result<Vec<(u64, u32, u32)>, Bad> {
+    let mut table = Vec::new();
+    table.try_reserve_exact(len as usize).map_err(|_| Bad::Busy)?;
+    table.resize(len as usize, 0);
+    read_at(file, header.deep_table_offset, &mut table).map_err(Bad::Io)?;
+    if crc32(&table) != header.deep_table_crc {
+        return Err(Bad::Corrupt("deep table"));
+    }
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(header.deep_blocks() as usize).map_err(|_| Bad::Busy)?;
+    let mut end = header.deep_offset;
+    for e in table.as_chunks::<DEEP_BLOCK_ENTRY>().0 {
+        let (offset, block_len, crc) = (u64_at(e, 0), u32_at(e, 8), u32_at(e, 12));
+        if offset != end {
+            return Err(Bad::Corrupt("deep layout"));
+        }
+        end += u64::from(block_len);
+        blocks.push((offset, block_len, crc));
+    }
+    if end != header.deep_table_offset {
+        return Err(Bad::Corrupt("deep layout"));
+    }
+    Ok(blocks)
 }
 
 #[cfg(unix)]
@@ -137,6 +201,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("bridge-index-claims-{}", std::process::id()));
         let blocks: u32 = 1 << 25;
         let table_offset = 4096u64;
+        let deep_offset = table_offset + u64::from(blocks) * BLOCK_ENTRY as u64;
         let h = Header {
             max_ply: MAX_PLY,
             prune_ply: PRUNE_PLY,
@@ -148,7 +213,14 @@ mod tests {
             blocks,
             table_offset,
             table_crc: 0,
-            file_len: table_offset + u64::from(blocks) * BLOCK_ENTRY as u64,
+            // A deep section of one empty block after the table, so that only
+            // the table's claim is wrong.
+            file_len: deep_offset + DEEP_BLOCK_ENTRY as u64,
+            deep_bits: MIN_DEEP_BITS,
+            deep_postings: 0,
+            deep_offset,
+            deep_table_offset: deep_offset,
+            deep_table_crc: 0,
         };
         let f = File::create(&path).unwrap();
         f.set_len(h.file_len).unwrap();

@@ -106,7 +106,7 @@ fn a_classic_copy_answers_as_its_2cbh_copy() {
     }
     let (_, body) = get(port, &format!("/v1/databases/{ic}/explorer?fen={start_fen}"));
     // Games 1-7 and 10: not the guiding text, and not the deleted game.
-    assert!(body.contains(r#""index":{"records":10,"games":8,"#), "{body}");
+    assert!(body.contains(r#""index":{"records":10,"games":8}"#), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

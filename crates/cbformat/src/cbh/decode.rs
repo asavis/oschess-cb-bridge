@@ -312,10 +312,25 @@ impl<V: TreeVisitor> Walker<'_, V> {
 /// main line first at every position. The game starts from
 /// [`start_as_played`].
 pub fn walk(game: &GameMoves<'_>, visitor: &mut impl TreeVisitor) -> Result<TreeStats> {
-    run(game, &start_as_played(game)?, visitor).0
+    walk_from(game, &start_as_played(game)?, visitor)
+}
+
+/// [`walk`] from `start`, which [`start_as_played`] gave for this game: a
+/// caller that needs the start itself resolves it once, since resolving a
+/// set-up game can play all its moves.
+pub fn walk_from(game: &GameMoves<'_>, start: &Start, visitor: &mut impl TreeVisitor) -> Result<TreeStats> {
+    run(game, start, visitor).0
 }
 
 struct Silent;
+
+/// Each castling right with its bit in a set-up record.
+const RIGHTS: [(CColor, CastleSide, u8); 4] = [
+    (CColor::White, CastleSide::Long, 1),
+    (CColor::White, CastleSide::Short, 2),
+    (CColor::Black, CastleSide::Long, 4),
+    (CColor::Black, CastleSide::Short, 8),
+];
 
 impl TreeVisitor for Silent {
     fn play(&mut self, _: &Board, _: Option<Move>, _: bool) {}
@@ -331,18 +346,26 @@ impl TreeVisitor for Silent {
 pub fn start_as_played(game: &GameMoves<'_>) -> Result<Start> {
     let start = game.start()?;
     let Start::Setup(mut s) = start else { return Ok(start) };
+    // The rights the position lacks and could hold. Only these can be added,
+    // so once none is left the moves are not played to look for one: a
+    // set-up ending without its kings and rooks at home is never replayed.
+    let mut possible = 0u8;
+    for (color, side, bit) in RIGHTS {
+        let mut with = s.clone();
+        with.castling |= bit;
+        if s.castling & bit == 0
+            && start_board(&Start::Setup(with)).is_ok_and(|b| b.castling_rook(color, side).is_some())
+        {
+            possible |= bit;
+        }
+    }
     for _ in 0..4 {
-        if s.castling == 0x0f {
+        if possible & !s.castling == 0 {
             break;
         }
         let (result, missing) = run(game, &Start::Setup(s.clone()), &mut Silent);
         let Some((color, side)) = missing.filter(|_| result.is_err()) else { break };
-        let bit = match (color, side) {
-            (CColor::White, CastleSide::Long) => 1,
-            (CColor::White, CastleSide::Short) => 2,
-            (CColor::Black, CastleSide::Long) => 4,
-            (CColor::Black, CastleSide::Short) => 8,
-        };
+        let Some(&(_, _, bit)) = RIGHTS.iter().find(|r| r.0 == color && r.1 == side) else { break };
         if s.castling & bit != 0 {
             break;
         }

@@ -27,6 +27,8 @@ use bridge::catalog::{Catalog, id_of};
 use bridge::engine::{Engine, EngineConfig};
 use bridge::server;
 use cbformat::game::{Head, RecordKind};
+use cbformat::pgnfile::lex::Lexer;
+use cbformat::pgnfile::line::main_line;
 use cbformat::view::Base;
 use chesscore::Board;
 
@@ -588,6 +590,35 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     }
     let counts = format!("{} lookups, {played} plies played{stop}", lookups.times.len());
     table.row("index", "lookup per move", &mut lookups, &counts);
+    // Deep positions (#133): positions of games from across the database at
+    // plies 30, 60 and 90, past the tree's pruning ply and past its depth;
+    // each must find at least its own game.
+    let mut deep = Samples::default();
+    let (mut asked, mut found) = (0, 0);
+    let mut lexer = Lexer::new();
+    for k in 1..=8u64 {
+        let n = (records / 9 * k).max(1);
+        let Some((200, body)) = c.get(&format!("{base}/games/{n}"), true).ok() else { continue };
+        let Some(pgn) = strings(&body, "pgn").into_iter().next() else { continue };
+        let (mut fens, mut ply) = (Vec::new(), 0u32);
+        main_line(pgn.as_bytes(), &mut lexer, &mut |board, mv| {
+            if [30, 60, 90].contains(&ply) {
+                fens.push(board.fen());
+            }
+            ply += 1;
+            mv.is_some()
+        });
+        for fen in fens {
+            asked += 1;
+            if deep.get(&mut c, &explorer(&fen), true).is_some_and(|a| number(&a, "games").is_some_and(|g| g > 0)) {
+                found += 1;
+            }
+        }
+    }
+    if found < asked {
+        table.failed = true;
+    }
+    table.row("index", "deep lookup, plies 30/60/90", &mut deep, &format!("{found} of {asked} found"));
     drop(served);
     let t = Instant::now();
     let again = spawn(&o)?;

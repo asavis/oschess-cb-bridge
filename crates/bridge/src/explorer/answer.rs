@@ -11,12 +11,15 @@ use crate::catalog::Entry;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
+use crate::search::SearchError;
+use crate::search::memory::Cancel;
+use crate::search::workers::{self, threads};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
-use super::format::{Counts, MAX_PLY, Stats, TOP_GAMES, unpack_move};
+use super::format::{Counts, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, deep_bucket, structure, unpack_move};
 use super::runs::Progress;
-use super::source::average_elo;
+use super::source::{Mode, Source, Target, Workspace, average_elo};
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
@@ -41,7 +44,12 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     };
     let Some(shared) = app.catalog.get(&entry.id) else { return crate::reply::not_found() };
     match app.catalog.explorer.index(shared, &open) {
-        Lookup::Ready(loaded) => match loaded.lookup(board.hash()) {
+        Lookup::Ready(loaded) => match loaded.lookup(board.hash()).and_then(|stats| match stats {
+            Some(stats) => Ok(Some(stats)),
+            // The tree holds positions within its plies that more than one
+            // game reached; any other is looked for in its games (#133).
+            None => deep(&*open.db, &loaded, &board),
+        }) {
             Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
             Err(Bad::Busy) => busy(),
             Err(_) => {
@@ -102,16 +110,125 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
     top.dedup_by_key(|t| t.1);
     top.truncate(TOP_GAMES);
     let games = top.iter().map(|t| t.2.to_string());
-    let index = Obj::new()
-        .num("records", i64::from(loaded.records()))
-        .num("games", loaded.games() as i64)
-        .num("maxPly", i64::from(MAX_PLY))
-        .done();
+    let index = Obj::new().num("records", i64::from(loaded.records())).num("games", loaded.games() as i64).done();
     counts(Obj::new().str("generation", &format!("{:016x}", loaded.generation)), &stats.counts)
         .raw("moves", &json::array(moves))
         .raw("topGames", &json::array(games))
         .raw("index", &index)
         .done()
+}
+
+/// Candidates a worker replays at least, so that a small bucket takes one.
+const DEEP_GAMES_PER_WORKER: usize = 256;
+/// Room for the moves played from a position: it has 218 legal moves at most.
+const MAX_MOVES: usize = 256;
+
+/// What a worker's replays found, the same few bytes however many games
+/// reach the position: their counts, the moves played with theirs, and the
+/// best games so far by average rating, then number.
+struct Found {
+    counts: Counts,
+    moves: Vec<(u16, Counts)>,
+    top: Vec<(u16, u32)>,
+}
+
+impl Found {
+    /// What one takes, reserved with its worker's buffers.
+    const BYTES: usize =
+        MAX_MOVES * std::mem::size_of::<(u16, Counts)>() + (TOP_GAMES + 1) * std::mem::size_of::<(u16, u32)>();
+
+    fn new() -> Option<Found> {
+        let mut moves = Vec::new();
+        moves.try_reserve_exact(MAX_MOVES).ok()?;
+        let mut top = Vec::new();
+        top.try_reserve_exact(TOP_GAMES + 1).ok()?;
+        Some(Found { counts: Counts::default(), moves, top })
+    }
+
+    /// Adds `counts` of games that played `mv` from the position (`NO_MOVE`
+    /// when they ended there), the best of them ranked `best`.
+    fn add(&mut self, mv: u16, counts: &Counts, best: (u16, u32)) {
+        self.counts.merge(counts);
+        self.add_move(mv, counts);
+        self.rank(best);
+    }
+
+    fn add_move(&mut self, mv: u16, counts: &Counts) {
+        if mv == NO_MOVE {
+            return;
+        }
+        if let Some(m) = self.moves.iter_mut().find(|m| m.0 == mv) {
+            m.1.merge(counts);
+        } else if self.moves.len() < MAX_MOVES {
+            // Every move played from one position is legal there, so the room
+            // is never short, and nothing grows past what was reserved.
+            self.moves.push((mv, *counts));
+        }
+    }
+
+    fn rank(&mut self, best: (u16, u32)) {
+        let at = self.top.partition_point(|&b| b > best);
+        if at < TOP_GAMES {
+            self.top.insert(at, best);
+            self.top.truncate(TOP_GAMES);
+        }
+    }
+
+    fn merge(&mut self, other: &Found) {
+        self.counts.merge(&other.counts);
+        for (mv, counts) in &other.moves {
+            self.add_move(*mv, counts);
+        }
+        for &best in &other.top {
+            self.rank(best);
+        }
+    }
+}
+
+/// A position the tree does not hold: the games of its structure's bucket,
+/// replayed on at most half the shared workers, so that searches keep the
+/// rest, each counted once at the first ply its main line reaches the
+/// position, with the move played from there. `None` when none does.
+pub fn deep(db: &dyn Source, loaded: &Loaded, board: &Board) -> Result<Option<Stats>, Bad> {
+    let (games, _memory) = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
+    if games.is_empty() {
+        return Ok(None);
+    }
+    let target = Target::of(board);
+    let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
+    let parts = workers::run(want, Workspace::BYTES + Found::BYTES, &Cancel::never(), |w| {
+        let mut work = Workspace::new().ok_or(SearchError::Busy)?;
+        work.set_mode(Mode::Find(target));
+        let mut found = Found::new().ok_or(SearchError::Busy)?;
+        let per = games.len().div_ceil(w.count);
+        for &game in games.iter().skip(w.index * per).take(per) {
+            if w.stopped() {
+                return Err(SearchError::Superseded);
+            }
+            db.lines(game, game, MAX_PLY, &mut work, &mut |line| {
+                if let Some(mv) = line.found {
+                    let mut counts = Counts::default();
+                    counts.add(line.outcome);
+                    found.add(mv, &counts, (line.elo, line.number));
+                }
+            })?;
+        }
+        Ok(found)
+    })
+    .map_err(|e| match e {
+        SearchError::Read(e) => Bad::Io(std::io::Error::other(e.to_string())),
+        _ => Bad::Busy,
+    })?;
+    let mut parts = parts.into_iter();
+    let Some(mut all) = parts.next() else { return Ok(None) };
+    for part in parts {
+        all.merge(&part);
+    }
+    if all.counts.games == 0 {
+        return Ok(None);
+    }
+    all.moves.sort_by_key(|m| std::cmp::Reverse(m.1.games));
+    Ok(Some(Stats { counts: all.counts, moves: all.moves, top: all.top.iter().map(|b| b.1).collect() }))
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a
@@ -143,4 +260,38 @@ fn top_game<S: Store>(db: &S, number: u32) -> Option<(u16, String)> {
         .str("result", r.result().pgn());
     let o = if year == 0 { o.raw("year", "null") } else { o.num("year", i64::from(year)) };
     Some((average_elo(&r), o.str("event", &event).done()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::explorer::format::Outcome;
+
+    /// However many games a worker finds, what it keeps stays within what it
+    /// reserved, and two workers' finds merge into the same answer as one's.
+    #[test]
+    fn found_games_are_added_up_in_the_room_reserved() {
+        let (a, b) = (Found::new().unwrap(), Found::new().unwrap());
+        let (mut one, mut halves) = (Found::new().unwrap(), [a, b]);
+        let (moves, top) = (one.moves.capacity(), one.top.capacity());
+        for n in 1..=50_000u32 {
+            let mut counts = Counts::default();
+            counts.add([Outcome::White, Outcome::Draw, Outcome::Black][n as usize % 3]);
+            let mv = if n % 7 == 0 { NO_MOVE } else { (n % 5) as u16 + 1 };
+            let best = ((n * 7919 % 3000) as u16, n);
+            one.add(mv, &counts, best);
+            halves[n as usize % 2].add(mv, &counts, best);
+        }
+        assert_eq!((one.moves.capacity(), one.top.capacity()), (moves, top), "nothing grew");
+        assert_eq!(one.counts.games, 50_000);
+        assert_eq!(one.moves.len(), 5);
+        assert_eq!(one.moves.iter().map(|m| m.1.games).sum::<u64>(), 50_000 - 50_000 / 7);
+        let [mut merged, other] = halves;
+        merged.merge(&other);
+        assert_eq!(merged.counts, one.counts);
+        assert_eq!(merged.top, one.top);
+        let mut expected: Vec<(u16, u32)> = (1..=50_000u32).map(|n| ((n * 7919 % 3000) as u16, n)).collect();
+        expected.sort_unstable_by(|x, y| y.cmp(x));
+        assert_eq!(one.top, expected[..TOP_GAMES]);
+    }
 }

@@ -119,6 +119,10 @@ fn classic_database(name: &str) -> TempDb {
 }
 
 fn key_after(ucis: &str) -> u64 {
+    board_after(ucis).hash()
+}
+
+fn board_after(ucis: &str) -> Board {
     let mut b = Board::startpos();
     for u in ucis.split_whitespace() {
         let mut mv: Move = u.parse().unwrap();
@@ -127,7 +131,7 @@ fn key_after(ucis: &str) -> u64 {
         }
         b.play_checked(mv).unwrap();
     }
-    b.hash()
+    b
 }
 
 fn index_dir(name: &str) -> PathBuf {
@@ -389,7 +393,7 @@ fn the_endpoint_builds_then_answers() {
         body.contains(r#""games":5,"white":2,"draws":2,"black":1,"moves":[{"uci":"e2e4","san":"e4","games":3"#),
         "{body}"
     );
-    assert!(body.contains(r#""index":{"records":7,"games":5,"maxPly":40}"#), "{body}");
+    assert!(body.contains(r#""index":{"records":7,"games":5}"#), "{body}");
     // Castling is written as the king's two-square step.
     let before = "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
     let (status, body) = get(port, &url(before));
@@ -516,5 +520,178 @@ fn a_promotion_from_a_set_up_position() {
     let s = idx.lookup(before.hash()).unwrap().unwrap();
     assert_eq!(s.lookup_move("a7a8n"), Some(1));
     assert_eq!(s.lookup_move("a7a8q"), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Knights out and back, `n` times: plies of play that keep one structure.
+fn hops(n: usize) -> String {
+    "g1f3 g8f6 f3g1 f6g8 ".repeat(n)
+}
+
+/// Every position of every game is found, at any depth (#133): one game alone
+/// past the tree's pruning ply, one past its depth, one after captures that
+/// leave the pawns as they were, two games reaching one position by different
+/// move orders; and a position of the same structure that no game reached is
+/// not.
+#[test]
+fn every_position_of_every_game_is_found_at_any_depth() {
+    let line7 = "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7";
+    let long = format!("e2e4 e7e5 {}d2d3", hops(15));
+    let one = format!("e2e4 e7e5 {}a2a3 a7a6 h2h3", hops(12));
+    let other = format!("e2e4 e7e5 {}h2h3 a7a6 a2a3", hops(12));
+    let mut b = Builder::new();
+    game(&mut b, &format!("{line7} e1g1 d5c3 c1c3"), 1, (2200, 2200));
+    game(&mut b, &long, 2, (2500, 2400));
+    game(&mut b, &format!("{one} g8f6"), 1, (2300, 2300));
+    game(&mut b, &other, 0, (2100, 2000));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-deep");
+    let dir = index_dir("deep");
+    let idx = prepared(&db, &dir);
+    let base = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let find = |ucis: &str| {
+        let board = board_after(ucis);
+        assert!(idx.lookup(board.hash()).unwrap().is_none(), "the tree does not hold it: {ucis}");
+        explorer::deep(&base, &idx, &board).unwrap()
+    };
+
+    // Ply 21, reached by game 1 alone: the tree dropped it.
+    let alone = find(&format!("{line7} e1g1")).unwrap();
+    assert_eq!(alone.counts, Counts { games: 1, white: 0, draws: 1, black: 0 });
+    assert_eq!(alone.lookup_move("d5c3"), Some(1));
+    assert_eq!(alone.top, vec![1]);
+
+    // Two captures that leave the pawns as they were: each is a structure of
+    // its own, and game 1's last position is found in the last one.
+    let traded = find(&format!("{line7} e1g1 d5c3 c1c3")).unwrap();
+    assert_eq!(traded.counts, Counts { games: 1, white: 0, draws: 1, black: 0 });
+    assert!(traded.moves.is_empty());
+
+    // Ply 63, past the tree's depth: the game's last position, no move from it.
+    let deep = find(&long).unwrap();
+    assert_eq!(deep.counts, Counts { games: 1, white: 1, draws: 0, black: 0 });
+    assert!(deep.moves.is_empty());
+
+    // Ply 53 by two move orders: both games, the move each played from it, the
+    // better rated first.
+    let both = find(&one).unwrap();
+    assert_eq!(both.counts, Counts { games: 2, white: 0, draws: 1, black: 1 });
+    assert_eq!(both.lookup_move("g8f6"), Some(1));
+    assert_eq!(both.moves.len(), 1, "game 4 ends there");
+    assert_eq!(both.top, vec![3, 4]);
+    assert_eq!(find(&other).unwrap(), both, "one position, whichever order reached it");
+
+    // The same pawns with the knights elsewhere: games 3 and 4 share its
+    // bucket, and neither reaches it.
+    assert_eq!(find(&format!("{one} g8f6 g1f3")), None);
+
+    // Through the endpoint, as the analysis panel asks for it.
+    let (port, id) = serve(&db, &dir);
+    let fen = board_after(&one).fen();
+    let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        let (status, body) = get(port, &url);
+        if status == 200 {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "the index was not built: {body}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        body.contains(r#""games":2,"white":0,"draws":1,"black":1,"moves":[{"uci":"g8f6","san":"Nf6","games":1"#),
+        "{body}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A bucket of many games is replayed on several workers, and every game in
+/// it is counted once, whichever worker replayed it.
+#[test]
+fn a_crowded_bucket_is_counted_whole() {
+    let long = format!("e2e4 e7e5 {}d2d3", hops(15));
+    let n = 700;
+    let mut b = Builder::new();
+    for i in 0..n {
+        game(&mut b, &long, (i % 3) as u8, (2000 + i as i16, 2000));
+    }
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-crowded");
+    let dir = index_dir("crowded");
+    let idx = prepared(&db, &dir);
+    let base = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let board = board_after(&long);
+    assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree's depth");
+    let stats = explorer::deep(&base, &idx, &board).unwrap().unwrap();
+    assert_eq!(stats.counts.games, n as u64);
+    assert_eq!(stats.counts.white + stats.counts.draws + stats.counts.black, n as u64);
+    // The best rated first: the last games written.
+    assert_eq!(stats.top, (n as u32 - 11..=n as u32).rev().collect::<Vec<_>>());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The tree's last ply lists the moves played from it, as every other does.
+#[test]
+fn the_moves_from_the_trees_last_ply_are_listed() {
+    let forty = format!("e2e4 e7e5 {}a2a3 a7a6", hops(9));
+    assert_eq!(forty.split_whitespace().count(), usize::from(explorer::format::MAX_PLY));
+    let mut b = Builder::new();
+    game(&mut b, &format!("{forty} h2h3"), 1, (2200, 2200));
+    game(&mut b, &format!("{forty} g2g3"), 0, (2100, 2100));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-last-ply");
+    let dir = index_dir("last-ply");
+    let idx = prepared(&db, &dir);
+    let stats = idx.lookup(key_after(&forty)).unwrap().expect("two games reach it");
+    assert_eq!(stats.counts.games, 2);
+    assert_eq!(stats.lookup_move("h2h3"), Some(1));
+    assert_eq!(stats.lookup_move("g2g3"), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A classic set-up game is replayed only as far as the position looked for:
+/// its start is resolved once, and a position whose kings and rooks could
+/// never castle is not replayed to look for a right first. A position the
+/// games reach early is then found far faster than one they never reach,
+/// which every game is played to its end for.
+#[test]
+fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
+    let start = Board::from_fen("7k/8/8/8/8/8/P7/K7 w - - 0 1").unwrap();
+    let mut ucis = "a1b1 h8g8 b1a1 g8h8 ".repeat(10);
+    ucis.push_str("a2a3 h8g8 ");
+    ucis.push_str(&"a1b1 g8h8 b1a1 h8g8 ".repeat(5_000));
+    let toks: Vec<Tok<'_>> = ucis.split_whitespace().map(Tok::Mv).chain([Tok::End]).collect();
+    let stream = encode(&start, &toks, 0, false);
+    let white = [("a1", CPiece::King, CColor::White), ("a2", CPiece::Pawn, CColor::White)];
+    let position = start_position(&[white[0], white[1], ("h8", CPiece::King, CColor::Black)], false, 0, 0);
+    let mut b = fixture_cbh::Builder::new();
+    for _ in 0..16 {
+        b.game(&move_record(0x40, Some(&position), None, &stream))[0x1b] = 1;
+    }
+    let db = b.write("explorer-classic-setup");
+    let dir = index_dir("classic-setup");
+    let base = cbh::Database::open(db.dir().join("db.cbh")).unwrap();
+    let idx = explorer::prepare(&base, 1, &dir, "db", &Progress::default()).unwrap();
+    // Ply 41, after a2a3, beyond the tree; and the same men never so placed.
+    let mut reached = start.clone();
+    for uci in ucis.split_whitespace().take(41) {
+        reached.play_checked(uci.parse().unwrap()).unwrap();
+    }
+    let never = Board::from_fen("k7/8/8/8/8/P7/8/7K b - - 0 1").unwrap();
+    let time = |board: &Board| {
+        (0..3)
+            .map(|_| {
+                let at = Instant::now();
+                let stats = explorer::deep(&base, &idx, board).unwrap();
+                (at.elapsed(), stats.map(|s| s.counts.games))
+            })
+            .min()
+            .unwrap()
+    };
+    let (found, games) = time(&reached);
+    assert_eq!(games, Some(16));
+    let (missed, none) = time(&never);
+    assert_eq!(none, None);
+    assert!(found * 5 < missed, "found in {found:?}, missed in {missed:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
