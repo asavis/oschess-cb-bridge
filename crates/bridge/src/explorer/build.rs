@@ -76,7 +76,7 @@ fn build_in(
         return Err(SearchError::TooLarge);
     }
     progress.start("reading", u64::from(plan.last.saturating_sub(plan.first) + 1));
-    let sink = deep::Sink::create(work, deep_bits(plan.last))?;
+    let sink = deep::Sink::create(work, deep_bits(plan.last), progress)?;
     let runs = runs::write_runs(source, plan.first, plan.last, work, progress, limits, Some(&sink))?;
     let bits = sink.bits();
     let deep_parts = sink.finish()?;
@@ -455,7 +455,7 @@ mod tests {
             deep_table_crc: 0,
         };
         let path = dir.join("index");
-        let deep = deep::Sink::create(&dir, MIN_DEEP_BITS).unwrap().finish().unwrap();
+        let deep = deep::Sink::create(&dir, MIN_DEEP_BITS, &Progress::default()).unwrap().finish().unwrap();
         let header = assemble(&parts, &deep, &path, header, &Progress::default(), 64 << 20).unwrap();
         assert_eq!((header.games, header.keys), (u64::from(game), games_of.len() as u64));
         assert!(header.blocks as usize >= PARTS, "a part's blocks end with it");

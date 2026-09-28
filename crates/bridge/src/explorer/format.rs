@@ -323,6 +323,11 @@ pub fn read_varint(b: &[u8], at: &mut usize) -> Option<u64> {
     for shift in (0..64).step_by(7) {
         let byte = *b.get(*at)?;
         *at += 1;
+        // The tenth byte holds the top bit alone: anything more is damage,
+        // never a number cut to 64 bits.
+        if shift == 63 && byte > 1 {
+            return None;
+        }
         v |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(v);
@@ -427,6 +432,21 @@ mod tests {
         let king: Move = "a1b1".parse().unwrap();
         assert_eq!(unpack_move(&b, pack_move(king)), Some(king));
         assert_eq!(unpack_move(&b, NO_MOVE), None);
+    }
+
+    #[test]
+    fn varints_hold_64_bits_and_no_more() {
+        for v in [0, 1, 127, 128, 1 << 63, u64::MAX] {
+            let mut b = Vec::new();
+            varint(&mut b, v);
+            let mut at = 0;
+            assert_eq!((read_varint(&b, &mut at), at), (Some(v), b.len()), "{v}");
+        }
+        // A tenth byte of more than the top bit, or one that goes on.
+        let mut at = 0;
+        assert_eq!(read_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02], &mut at), None);
+        let mut at = 0;
+        assert_eq!(read_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x00], &mut at), None);
     }
 
     #[test]

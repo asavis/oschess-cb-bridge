@@ -467,7 +467,8 @@ data folder's `index` folder, `<id>.idx`. Integers are little-endian.
   to its end, not only its first 40 plies, and turn each structure it
   holds past ply 20 into a posting, `bucket << 32 | game`, kept in a 1 MiB
   buffer. A full buffer is sorted and appended to up to 256 partition files,
-  split by the bucket's top bits. Once the tree is written, each partition in
+  split by the bucket's top bits, each written through a 4 KiB buffer held in
+  the build's share while it reads. Once the tree is written, each partition in
   turn is sorted and freed of repeated postings, and written as its deep
   blocks, within what the build's share of the budget leaves beside the
   writer it holds. A partition that fits is sorted in memory. A larger one,

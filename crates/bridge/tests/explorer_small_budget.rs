@@ -174,7 +174,7 @@ fn a_deep_partition_larger_than_the_share_is_written_within_it() {
     let write = |name: &str, memory: usize| {
         let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let sink = deep::Sink::create(&dir, 12).unwrap();
+        let sink = deep::Sink::create(&dir, 12, &Progress::default()).unwrap();
         let bucket = 1234u64 << 32;
         for first in (1..=games).step_by(100_000) {
             sink.add(&mut (first..first + 100_000).map(|g| bucket | g).collect()).unwrap();
@@ -196,4 +196,22 @@ fn a_deep_partition_larger_than_the_share_is_written_within_it() {
     assert_eq!(held(), 0);
     let (in_memory, _) = write("memory", 64 << 20);
     assert_eq!(within, in_memory.unwrap());
+}
+
+/// The deep sink's partition buffers are held in the budget from the start
+/// of a build's reading until the partitions are closed.
+#[test]
+fn a_deep_sinks_buffers_are_held_in_the_budget() {
+    if !in_child("a_deep_sinks_buffers_are_held_in_the_budget") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bridge-small-budget-sink-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let before = held();
+    let sink = deep::Sink::create(&dir, 21, &Progress::default()).unwrap();
+    assert!(sink.bytes() > 0 && sink.bytes() <= 1 << 20, "{}", sink.bytes());
+    assert_eq!(held(), before + sink.bytes());
+    sink.finish().unwrap();
+    assert_eq!(held(), before);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

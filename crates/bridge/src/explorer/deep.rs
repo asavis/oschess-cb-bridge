@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
+use crate::search::memory::Hold;
 
 use super::format::{DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_DEEP_BITS, read_varint, varint};
 use super::runs::{Progress, io, reserve};
@@ -34,11 +35,16 @@ pub const WORKER_POSTINGS: usize = 1 << 17;
 /// What a worker's postings take.
 pub const WORKER_BYTES: usize = WORKER_POSTINGS * 8;
 
+/// What each partition file's writer buffers.
+const PART_BUFFER: usize = 4 << 10;
+
 /// The postings of one build, spread over partition files by bucket.
 pub struct Sink {
     bits: u8,
     part_bits: u8,
     parts: Vec<Mutex<Partition>>,
+    /// The partition files' buffers, held until [`Sink::finish`].
+    _memory: Hold,
 }
 
 struct Partition {
@@ -48,20 +54,27 @@ struct Partition {
 }
 
 impl Sink {
-    /// Partition files in `dir` for buckets of `bits` bits.
-    pub fn create(dir: &Path, bits: u8) -> Result<Sink, SearchError> {
+    /// Partition files in `dir` for buckets of `bits` bits, their buffers
+    /// held in the search budget first.
+    pub fn create(dir: &Path, bits: u8, progress: &Progress) -> Result<Sink, SearchError> {
         let part_bits = MAX_PART_BITS.min(bits.saturating_sub(DEEP_BLOCK_BITS));
+        let memory = reserve((1 << part_bits) * PART_BUFFER, progress)?;
         let mut parts = Vec::new();
         for p in 0..1usize << part_bits {
             let path = dir.join(format!("deep-{p}"));
-            let out = BufWriter::with_capacity(16 << 10, File::create(&path).map_err(|e| io(&path, e))?);
+            let out = BufWriter::with_capacity(PART_BUFFER, File::create(&path).map_err(|e| io(&path, e))?);
             parts.push(Mutex::new(Partition { path, out, postings: 0 }));
         }
-        Ok(Sink { bits, part_bits, parts })
+        Ok(Sink { bits, part_bits, parts, _memory: memory })
     }
 
     pub fn bits(&self) -> u8 {
         self.bits
+    }
+
+    /// What the partition files' buffers hold in the search budget.
+    pub fn bytes(&self) -> usize {
+        self.parts.len() * PART_BUFFER
     }
 
     /// Takes a worker's postings, emptying `postings`.
@@ -87,7 +100,8 @@ impl Sink {
     /// Closes the partition files: each one's path and postings, in bucket order.
     pub fn finish(self) -> Result<Vec<(PathBuf, u64)>, SearchError> {
         let mut done = Vec::new();
-        for part in self.parts {
+        let Sink { parts, _memory, .. } = self;
+        for part in parts {
             let Partition { path, out, postings } = part.into_inner().unwrap_or_else(|e| e.into_inner());
             out.into_inner().map_err(|e| io(&path, e.into_error()))?;
             done.push((path, postings));
@@ -522,7 +536,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-deep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bits = 14;
-        let sink = Sink::create(&dir, bits).unwrap();
+        let sink = Sink::create(&dir, bits, &Progress::default()).unwrap();
         let posting = |bucket: u64, game: u64| bucket << 32 | game;
         let last = (1u64 << bits) - 1;
         // Two workers, out of order, with a game twice in one bucket.
@@ -548,12 +562,19 @@ mod tests {
         assert_eq!(bucket_games(&block(3), BLOCK_BUCKETS - 1, 100), Some(vec![2]));
         // A game past the database's last record is damage.
         assert_eq!(bucket_games(&block(0), 5, 8), None);
-        // So is a delta that wraps around to a game already listed.
+        // So is a delta that wraps around to a game already listed, and a
+        // count or a delta written past 64 bits, which would read as 0 or 5
+        // were the bits beyond cut off.
         let mut wrap = Vec::new();
         for v in [2, 5, u64::MAX - 2] {
             varint(&mut wrap, v);
         }
         assert_eq!(bucket_games(&wrap, 0, 100), None);
+        let long = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert_eq!(bucket_games(&long, 0, 100), None);
+        let mut delta = vec![1, 0x85];
+        delta.extend(&long[1..]);
+        assert_eq!(bucket_games(&delta, 0, 100), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -574,7 +595,7 @@ mod tests {
 
     fn written(dir: &Path, bits: u8, all: &[u64], memory: usize) -> Result<(Vec<u8>, Vec<u8>, u64), SearchError> {
         std::fs::create_dir_all(dir).unwrap();
-        let sink = Sink::create(dir, bits).unwrap();
+        let sink = Sink::create(dir, bits, &Progress::default()).unwrap();
         for batch in all.chunks(7_000) {
             sink.add(&mut batch.to_vec()).unwrap();
         }

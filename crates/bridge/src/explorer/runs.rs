@@ -217,7 +217,9 @@ pub fn write_runs(
     let want = threads().div_ceil(2).min(total.div_ceil(4096) as usize).max(1);
     let per_worker = run_bytes(want);
     let postings_bytes = if deep.is_some() { deep::WORKER_BYTES } else { 0 };
-    let fit = limits.share / (per_worker + Workspace::BYTES + postings_bytes);
+    // The deep sink holds its buffers already; the workers share the rest.
+    let share = limits.share.checked_sub(deep.map_or(0, Sink::bytes)).ok_or(SearchError::TooLarge)?;
+    let fit = share / (per_worker + Workspace::BYTES + postings_bytes);
     if fit == 0 {
         return Err(SearchError::TooLarge);
     }
