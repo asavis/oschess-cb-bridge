@@ -262,6 +262,20 @@ impl Registry {
         *s = State::Idle;
     }
 
+    /// Drops every index held in memory and leaves its files as they are: the
+    /// next request opens them again. A build running goes on. Tests release a
+    /// bridge's indexes before they change or remove the files, which a
+    /// mapped move stream keeps from being replaced or removed on Windows.
+    pub fn release(&self) {
+        let states: Vec<Arc<Mutex<State>>> = lock(&self.states).values().cloned().collect();
+        for state in states {
+            let mut s = lock(&state);
+            if matches!(*s, State::Ready(_)) {
+                *s = State::Idle;
+            }
+        }
+    }
+
     /// The checks and builds running or waiting: database id, phase, done
     /// and total.
     pub fn building(&self) -> Vec<(String, &'static str, u64, u64)> {
@@ -439,7 +453,8 @@ mod tests {
 
     /// The index kept on disk for the database as it is answers the first
     /// request after the bridge starts at once, even while the queue runs
-    /// another database's build, and the file is only read.
+    /// another database's build, and the file is only read. Released, it is
+    /// held by the requests that took it alone.
     #[test]
     fn a_kept_index_answers_at_once_while_the_queue_builds() {
         let db = e4s("explorer-kept");
@@ -468,6 +483,9 @@ mod tests {
         // The next request finds it in memory.
         let Lookup::Ready(again) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!() };
         assert!(Arc::ptr_eq(&loaded, &again));
+        // The catalog holds it too, its stream mapped, until released.
+        catalog.explorer.release();
+        assert_eq!(Arc::strong_count(&loaded), 2, "held by the two requests alone");
         drop((loaded, again));
         std::fs::remove_dir_all(&dir).unwrap();
     }

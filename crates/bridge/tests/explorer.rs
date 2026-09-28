@@ -20,7 +20,7 @@ use cbformat::v2::Database;
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{get, policy};
+use common::{Served, get, policy};
 
 /// A standard game of `ucis` with `result` (0 black, 1 draw, 2 white) and
 /// ratings; its record, for further changes.
@@ -171,6 +171,7 @@ fn positions_moves_results_and_transpositions() {
     let line7 = "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7";
     assert!(idx.lookup(key_after(line7)).unwrap().is_some(), "ply 20 is kept");
     assert!(idx.lookup(key_after(&format!("{line7} e1g1"))).unwrap().is_none(), "ply 21 alone is dropped");
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -201,6 +202,7 @@ fn a_classic_copy_is_indexed_the_same() {
         }
     }
     assert!(compared > 40);
+    drop((two, classic));
     std::fs::remove_dir_all(&two_dir).unwrap();
     std::fs::remove_dir_all(&classic_dir).unwrap();
 }
@@ -243,6 +245,7 @@ fn the_move_record_limit_holds_on_both_reading_paths() {
                 let skipped = progress.skipped.load(std::sync::atomic::Ordering::Relaxed);
                 let want = if over == 1 { (0, 1) } else { (1, 0) };
                 assert_eq!((loaded.games(), skipped), want, "{format}, {over} over the limit, hole {hole}");
+                drop(loaded);
                 std::fs::remove_dir_all(&dir).unwrap();
             }
         }
@@ -290,11 +293,13 @@ fn a_damaged_index_is_refused_and_rebuilt() {
     std::fs::write(&path, &bytes).unwrap();
     let file = IndexFile::open(&path).unwrap();
     assert!(matches!(file.lookup(key_after("")), Err(Bad::Corrupt(_))), "the block's CRC catches it");
+    drop(file);
     std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
     assert!(matches!(IndexFile::open(&path), Err(Bad::Corrupt(_))), "a cut file is refused");
     // The next check builds it afresh.
     let idx = prepared(&db, &dir);
     assert_eq!(idx.lookup(key_after("")).unwrap().unwrap().counts.games, 5);
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -350,18 +355,20 @@ fn any_change_rebuilds_the_whole_index() {
         assert_eq!(grown.lookup(key_after(ucis)).unwrap(), cold.lookup(key_after(ucis)).unwrap(), "{ucis}");
     }
     assert_eq!(grown.lookup(key_after("")).unwrap().unwrap().counts, Counts { games: 7, white: 5, draws: 2, black: 0 });
+    drop((grown, cold));
     for dir in [dir, cold_dir] {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
-/// Serves `db`, with the indexes in `dir` as in a data folder; the port and
+/// Serves `db`, with the indexes in `dir` as in a data folder; the bridge,
+/// which a test drops before it changes or removes the files in `dir`, and
 /// the database's id.
-fn serve(db: &TempDb, dir: &Path) -> (u16, String) {
+fn serve(db: &TempDb, dir: &Path) -> (Served, String) {
     let path = db.dir().join("db.2cbh");
     let app = App::new("test", policy(), Catalog::new([path.clone()]));
     app.catalog.use_data_dir(dir);
-    (common::serve(app), id_of(&path))
+    (Served::new(app), id_of(&path))
 }
 
 fn fen_param(fen: &str) -> String {
@@ -372,7 +379,8 @@ fn fen_param(fen: &str) -> String {
 fn the_endpoint_builds_then_answers() {
     let db = database("explorer-http");
     let dir = index_dir("http");
-    let (port, id) = serve(&db, &dir);
+    let (bridge, id) = serve(&db, &dir);
+    let port = bridge.port;
     let url = |fen: &str| format!("/v1/databases/{id}/explorer?fen={}", fen_param(fen));
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     let (status, body) = get(port, &url(start));
@@ -454,6 +462,7 @@ fn the_endpoint_builds_then_answers() {
         assert!(body.contains(r#""parameter":"fen""#), "{body}");
     }
     assert_eq!(get(port, &format!("/v1/databases/0000000000000000/explorer?fen={}", fen_param(start))).0, 404);
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -520,7 +529,8 @@ fn every_notable_game_is_its_games_row_and_its_year() {
     let dir = index_dir("rows");
     let app = App::new("test", policy(), Catalog::new(paths.clone()));
     app.catalog.use_data_dir(&dir);
-    let port = common::serve(app);
+    let bridge = Served::new(app);
+    let port = bridge.port;
     // A PGN file is opened, and each index built, in the background.
     let ready = |path: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -560,6 +570,7 @@ fn every_notable_game_is_its_games_row_and_its_year() {
         assert!(eleven.contains(r#""event":"Riga Club Ch","site":"","date":"????.??.??","round":"3""#), "{eleven}");
         assert!(eleven.contains(r#""annotator":"Nimzowitsch, Aron""#), "{eleven}");
     }
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -570,20 +581,22 @@ fn a_restarted_bridge_answers_from_the_kept_index() {
     let db = database("explorer-restart");
     let dir = index_dir("restart");
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    let (port, id) = serve(&db, &dir);
+    let (first, id) = serve(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(start));
     let deadline = Instant::now() + Duration::from_secs(30);
-    while get(port, &url).0 != 200 {
+    while get(first.port, &url).0 != 200 {
         assert!(Instant::now() < deadline, "the index was not built");
         std::thread::sleep(Duration::from_millis(20));
     }
     let file = dir.join("index").join(format!("{id}.idx"));
     let written = std::fs::metadata(&file).unwrap().modified().unwrap();
-    let (port, _) = serve(&db, &dir);
-    let (status, body) = get(port, &url);
+    drop(first);
+    let (bridge, _) = serve(&db, &dir);
+    let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""games":5,"white":2,"draws":2,"black":1"#), "{body}");
     assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written, "the file was rewritten");
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -601,6 +614,7 @@ fn chess960_games_never_reach_the_index() {
     // not among the three games of 1.e4.
     let start = idx.lookup(key_after("")).unwrap().unwrap();
     assert_eq!(start.lookup_move("e2e4"), Some(3));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -637,6 +651,7 @@ fn a_promotion_from_a_set_up_position() {
     let s = idx.lookup(before.hash()).unwrap().unwrap();
     assert_eq!(s.lookup_move("a7a8n"), Some(1));
     assert_eq!(s.lookup_move("a7a8q"), None);
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -702,7 +717,8 @@ fn every_position_of_every_game_is_found_at_any_depth() {
     assert_eq!(find(&format!("{one} g8f6 g1f3")), None);
 
     // Through the endpoint, as the analysis panel asks for it.
-    let (port, id) = serve(&db, &dir);
+    let (bridge, id) = serve(&db, &dir);
+    let port = bridge.port;
     let fen = board_after(&one).fen();
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen));
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -718,6 +734,7 @@ fn every_position_of_every_game_is_found_at_any_depth() {
         body.contains(r#""games":2,"white":0,"draws":1,"black":1,"moves":[{"uci":"g8f6","san":"Nf6","games":1"#),
         "{body}"
     );
+    drop((idx, bridge));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -742,6 +759,7 @@ fn a_crowded_bucket_is_counted_whole() {
     assert_eq!(stats.counts.white + stats.counts.draws + stats.counts.black, n as u64);
     // The best rated first: the last games written.
     assert_eq!(stats.top, (n as u32 - 11..=n as u32).rev().collect::<Vec<_>>());
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -761,6 +779,7 @@ fn the_moves_from_the_trees_last_ply_are_listed() {
     assert_eq!(stats.counts.games, 2);
     assert_eq!(stats.lookup_move("h2h3"), Some(1));
     assert_eq!(stats.lookup_move("g2g3"), Some(1));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -808,6 +827,7 @@ fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
     let (missed, none) = time(&never);
     assert_eq!(none, None);
     assert!(found * 5 < missed, "found in {found:?}, missed in {missed:?}");
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -902,6 +922,7 @@ fn the_stream_holds_every_main_line_word() {
     let h = idx.stream.header;
     assert_eq!((h.first_record, h.last_record, h.games, h.plies), (1, 7, 5, plies));
     assert_eq!((h.generation, h.build_id), (idx.generation, idx.base.header.build_id));
+    drop(idx);
     // The deep fixture's long lines, each past its prefix slot.
     let long = format!("e2e4 e7e5 {}d2d3", hops(15));
     let mut b = Builder::new();
@@ -912,6 +933,7 @@ fn the_stream_holds_every_main_line_word() {
     let idx = prepared(&deep, &deep_dir);
     assert_eq!(idx.stream.game(1).unwrap().words, stream_words(None, &long));
     assert_eq!(idx.stream.game(2).unwrap().words.len(), 81);
+    drop(idx);
     for dir in [dir, deep_dir] {
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -944,6 +966,7 @@ fn a_set_up_start_is_stored_and_replayed() {
     let found = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
     assert_eq!(found.counts, Counts { games: 1, white: 0, draws: 1, black: 0 });
     assert_eq!(found.lookup_move("e8d8"), Some(1));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -971,6 +994,7 @@ fn a_null_move_and_damage_end_a_line() {
         assert!(stats.moves.is_empty(), "no move from the last position of {ucis}");
     }
     assert_eq!(idx.stream.header.plies, 4);
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1143,6 +1167,7 @@ fn every_format_gives_the_same_stream() {
         assert_eq!(other[48..124], reference[48..124], "the {format} header's counts and layout");
         assert_eq!(other[128..], reference[128..], "the {format} stream");
     }
+    drop(built);
     for dir in dirs {
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1181,11 +1206,14 @@ fn answered(port: u16, path: &str) -> String {
 fn a_stream_record_that_fails_its_crc_is_rebuilt() {
     let db = deep_games("explorer-stream-crc");
     let dir = index_dir("stream-crc");
-    let (port, id) = serve(&db, &dir);
+    let (bridge, id) = serve(&db, &dir);
     let ucis = format!("e2e4 e7e5 {}d2d3", hops(15));
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after(&ucis).fen()));
     let found = r#""games":1,"white":1,"draws":0,"black":0"#;
-    assert!(answered(port, &url).contains(found));
+    assert!(answered(bridge.port, &url).contains(found));
+    // Dropped, the bridge maps the stream no longer, which on Windows would
+    // keep the next bridge from replacing it.
+    drop(bridge);
     let path = dir.join("index").join(format!("{id}.moves"));
     for part in ["slot", "tail"] {
         let before = std::fs::read(&path).unwrap();
@@ -1205,11 +1233,11 @@ fn a_stream_record_that_fails_its_crc_is_rebuilt() {
         drop(file);
         // A bridge started now opens the files, whose header and table are
         // sound, and finds the damage on the first replay.
-        let (port, _) = serve(&db, &dir);
-        let (status, body) = get(port, &url);
+        let (bridge, _) = serve(&db, &dir);
+        let (status, body) = get(bridge.port, &url);
         assert_eq!(status, 409, "{part}: {body}");
         assert!(body.contains("rebuilt"), "{part}: {body}");
-        assert!(answered(port, &url).contains(found), "{part}");
+        assert!(answered(bridge.port, &url).contains(found), "{part}");
         let after = explorer::stream::Header::decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_ne!(after.build_id, header.build_id, "{part}: built again");
         let direct = {
@@ -1224,6 +1252,8 @@ fn a_stream_record_that_fails_its_crc_is_rebuilt() {
             loaded.stream.header
         };
         assert_eq!(direct, after, "{part}: the new files are kept");
+        // Dropped before the next part changes the stream it maps.
+        drop(bridge);
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1254,6 +1284,7 @@ fn a_stream_of_many_blocks_holds_every_game() {
     }
     let found = explorer::deep(&idx, &board_after(&long), &Cancel::never()).unwrap().unwrap();
     assert_eq!(found.counts.games, u64::from(games / 3));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1326,6 +1357,7 @@ fn positions_after_a_promotion_are_found() {
     let bishops = board_after(&format!("{before} b7a8b")).colored(CPiece::Bishop, CColor::White);
     const LIGHT: u64 = 0x55aa_55aa_55aa_55aa;
     assert_eq!((bishops & LIGHT).count_ones(), 2, "two bishops on light squares");
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1347,6 +1379,7 @@ fn a_superseded_replay_stops() {
     assert_eq!(explorer::deep(&idx, &board, &old).unwrap().unwrap().counts.games, 300);
     let _newer = Cancel::newest(&latest);
     assert!(matches!(explorer::deep(&idx, &board, &old), Err(Bad::Busy)));
+    drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
