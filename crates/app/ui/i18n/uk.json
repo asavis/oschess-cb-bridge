@@ -157,7 +157,7 @@
   "settings.port.save": "Зберегти",
   "settings.port.error": "Порт — це число від 1024 до 65535.",
   "settings.error": "Не вдалося: {message}",
-  "settings.footer": "oschess міст — програма з відкритим кодом (MIT)",
+  "settings.footer": "oschess міст — програма з відкритим кодом (AGPL-3.0)",
 
   "firstRun.title": "Міст встановлено",
   "firstRun.subtitle": "oschess міст працюватиме у фоні — знак біля годинника.",

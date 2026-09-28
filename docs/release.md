@@ -87,7 +87,7 @@ and links refer to it.
 SignPath Foundation signs open-source projects for free
 ([conditions](https://signpath.org/terms.html)). Before applying:
 
-- the licence is OSI-approved: MIT;
+- the licence is OSI-approved: AGPL-3.0-only;
 - every account with write access to this repository, the bots included, has
   two-factor authentication;
 - a first release is published, unsigned;

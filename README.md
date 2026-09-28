@@ -264,8 +264,15 @@ its files from your cloud storage, as opening them in any program does.
 
 ## Legal
 
-MIT licensed; see [LICENSE](LICENSE). The oschess name and logo, in
-`crates/app/icons` and `crates/app/ui/img`, are not covered by the MIT licence;
-see [crates/app/icons/NOTICE](crates/app/icons/NOTICE). ChessBase is a trademark of ChessBase
+Licensed under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`); see [LICENSE](LICENSE). Whoever distributes a program built
+from this code must release it under the same licence, with its source, and a
+modified version that people use over a network, as a service, must offer them
+its source too. Releases up to and including v1.0.3 were published under the
+MIT licence, and those releases keep it.
+
+The oschess name and logo, in `crates/app/icons` and `crates/app/ui/img`, are
+not covered by the AGPL-3.0 licence; see
+[crates/app/icons/NOTICE](crates/app/icons/NOTICE). ChessBase is a trademark of ChessBase
 GmbH. This project is not affiliated with, endorsed by or sponsored by
 ChessBase GmbH, and contains no ChessBase code or data.
