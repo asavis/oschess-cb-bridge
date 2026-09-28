@@ -249,7 +249,8 @@ fn top_game<S: Store>(db: &S, number: u32) -> Option<(u16, String)> {
     let r = db.record(number).ok()?;
     let name = |id: i64| db.player(id).ok().flatten().map(|p| clip(p.pgn())).unwrap_or_default();
     let event = db.tournament(r.tournament()).ok().flatten().map(|t| clip(t.title)).unwrap_or_default();
-    let year = r.played_date().year();
+    let date = r.played_date();
+    let year = date.year();
     let (white_elo, black_elo) = r.elo();
     let o = Obj::new()
         .num("number", i64::from(number))
@@ -259,7 +260,7 @@ fn top_game<S: Store>(db: &S, number: u32) -> Option<(u16, String)> {
         .num("blackElo", i64::from(black_elo.max(0)))
         .str("result", r.result().pgn());
     let o = if year == 0 { o.raw("year", "null") } else { o.num("year", i64::from(year)) };
-    Some((average_elo(&r), o.str("event", &event).done()))
+    Some((average_elo(&r), o.str("date", &date.pgn()).str("event", &event).done()))
 }
 
 #[cfg(test)]
