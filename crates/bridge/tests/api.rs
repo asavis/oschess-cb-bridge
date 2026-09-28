@@ -425,7 +425,7 @@ fn a_huge_shared_entity_does_not_blow_up_a_window() {
     let whites: Vec<&str> =
         w.body.split(r#""white":""#).skip(1).map(|s| s.split('"').next().unwrap()).take(2).collect();
     assert_eq!(whites[0], "", "a 1 MiB name record is not read");
-    assert_eq!(whites[1].chars().count(), bridge::api::MAX_FIELD_CHARS + 1);
+    assert_eq!(whites[1].chars().count(), bridge::rows::MAX_FIELD_CHARS + 1);
     assert!(whites[1].starts_with('L') && whites[1].ends_with('…'));
 }
 

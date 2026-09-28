@@ -26,9 +26,9 @@
 //!    names that differ in a known way in the suggested field are left out,
 //!    and a list may end sooner only where the bridge's limit cut it.
 //! 5. Explorer: the answers for sampled positions of the games' main lines,
-//!    field by field: counts, moves and the top games' numbers, ratings,
-//!    results and years must be equal; their names may differ only where the
-//!    game's names differ in a known way.
+//!    field by field: counts, moves and the top games' rows and years must be
+//!    equal; their names may differ only where the game's names differ in a
+//!    known way, as in rows.
 //!
 //! Nothing a database holds is printed: no name, no game, only counts. The
 //! scratch directory receives the position indexes. The exit status is 1 when
@@ -427,7 +427,8 @@ fn judge_answer(a: &Json, b: &Json, names: &Names) -> Verdict {
     if ta.len() != tb.len() {
         return Verdict::Different;
     }
-    let fields = [("white", WHITE), ("black", BLACK), ("event", EVENT)];
+    // A top game is a row (#144), with a row's name fields.
+    let fields: Vec<(&str, usize)> = FIELDS.iter().enumerate().map(|(i, f)| (*f, i)).collect();
     for (x, y) in ta.iter().zip(&tb) {
         let n = number_of(x);
         if n.is_none() || n != number_of(y) {

@@ -90,3 +90,19 @@ that has not decoded real databases is not ready.
   indexing on file-derived values, bounded allocation.
 - Findings about the format that differ from the published description go in
   [docs/format-notes.md](docs/format-notes.md) with the evidence counts.
+
+## API contract
+
+`docs/api.md` is the contract with oschess, and every change to it costs a
+release, a Store certification, and changes to the oschess client and its
+fake bridge. Its "Compatibility" section holds the rules; in short:
+
+- Send every record whole and as decoded: a game any answer names is a
+  `/games` row with all its fields. Never trim a record for one screen.
+- Only add fields. A removal or a new meaning is `/v2`.
+- Acknowledge in the answer every parameter that narrows it, so that a
+  client can tell an older bridge that ignored it.
+- Make a count or a depth that a screen might want to change a bounded
+  parameter, not a constant.
+
+A pull request that changes `docs/api.md` names the rule each change follows.

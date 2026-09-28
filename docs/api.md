@@ -16,12 +16,41 @@ with `404 not_found`.
   default port is **39581**; `port` in `bridge.toml` overrides it.
 - HTTP/1.1. `GET` and `OPTIONS` only. Requests carry no body.
 - Every response body is JSON, UTF-8, `Content-Type: application/json;
-  charset=utf-8`. Clients must ignore fields they do not know: fields are
-  added within version 1 without notice. A change that removes or reinterprets
-  a field is version 2, served under `/v2`.
+  charset=utf-8`. Clients must ignore fields they do not know; see
+  [Compatibility](#compatibility).
 - Limits: the request line and headers together at most 16 KiB; at most 32
   open connections; an idle connection is closed after 5 seconds and a
   request that has not arrived completely after 10 seconds is dropped.
+
+## Compatibility
+
+Version 1 changes only in ways a client written against an earlier text of
+this document keeps working with. The bridge and its clients hold to four
+rules:
+
+- **The bridge sends what it decoded.** A record is sent whole wherever an
+  answer names it: every game in an answer is a row of
+  `GET /v1/databases/{id}/games`, with all of that row's fields; an endpoint
+  may add fields to it but never leaves one out. Values are in the forms this
+  document defines (PGN text for dates, results, rounds and ECO codes,
+  `Last, First` for names, numbers as numbers), never localised, abbreviated
+  or chosen for one screen. The documented bounds, such as 200 characters for
+  a text field, are the only cuts.
+- **Fields are only added.** A field keeps its name, type and meaning within
+  version 1, and a bridge that once sent it goes on sending it. A change that
+  removes or reinterprets a field is version 2, served under `/v2`.
+- **Clients tolerate what is missing or new.** A client ignores fields and
+  values it does not know, a new indexing phase among them, and treats a
+  documented field that is absent as unknown: the bridge is older than the
+  field. An older bridge ignores a parameter it does not know, so every
+  parameter that narrows an answer is acknowledged in it (as `line` is, in
+  each row); a client that does not find the acknowledgement treats the answer
+  as not narrowed.
+- **Bounded parameters, not constants.** Where an answer holds a number of
+  items or plies that a screen may want more or fewer of, the number is a
+  parameter with a default and a range given here, not a constant of the
+  bridge; a value out of range is `400 bad_request`. The explorer's 12
+  notable games are a bound the position index itself sets.
 
 ## Access
 
@@ -648,7 +677,16 @@ the oschess analysis panel shows it like its Lichess tabs.
   "generation": "0a1b2c3d4e5f6071",
   "games": 5012345, "white": 1700000, "draws": 2100000, "black": 1212345,
   "moves": [ { "uci": "e2e4", "san": "e4", "games": 2305000, "white": 810000, "draws": 950000, "black": 545000 } ],
-  "topGames": [ { "number": 1234, "white": "…", "black": "…", "whiteElo": 2882, "blackElo": 2800, "result": "1-0", "year": 2014, "date": "2014.06.??", "event": "…" } ],
+  "topGames": [
+    {
+      "number": 1234, "kind": "game",
+      "white": "…", "whiteElo": 2882, "black": "…", "blackElo": 2800,
+      "result": "1-0", "moves": 41, "eco": "C65",
+      "event": "…", "site": "…", "date": "2014.06.??", "round": "5", "annotator": "",
+      "flags": { "deleted": false, "chess960": false },
+      "year": 2014
+    }
+  ],
   "index": { "records": 11966514, "games": 11959813 }
 }
 ```
@@ -663,9 +701,9 @@ the oschess analysis panel shows it like its Lichess tabs.
   way, `e1g1` and `e1c1`; `san` is the move in SAN.
 - **`topGames`**: up to 12 games that reached the position, the highest
   average rating first (the known rating when only one is), then the latest.
-  Names are cut at 200 characters as in list rows. `date` is the date as list
-  rows write it, `YYYY.MM.DD` with `?` for an unknown part; `year` is its year,
-  `null` when the date has none.
+  Each is a row of `GET /v1/databases/{id}/games`, with every field a row
+  has, and `year`: the year of its `date`, `null` when the date has none.
+  `year` stays for clients written before rows; `date` is the field to read.
 - **What is indexed.** Every position of each game's main line, to its end:
   standard chess only, from the standard start or a set-up position, without
   deleted games, guiding texts or analyses. A game whose move record is over

@@ -14,6 +14,7 @@
 //! A failed answer is counted as a failure and left out of the times, and any
 //! failure makes the command exit with status 1.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -382,6 +383,44 @@ fn strings(json: &[u8], key: &str) -> Vec<String> {
     out
 }
 
+/// The objects of the first array member `key` of a JSON text, each as its
+/// text: a scan that keeps to strings and nesting. Empty when there is none.
+fn objects(json: &[u8], key: &str) -> Vec<String> {
+    let text = String::from_utf8_lossy(json);
+    let open = format!("\"{key}\":[");
+    let Some(at) = text.find(&open) else { return Vec::new() };
+    let rest = &text[at + open.len()..];
+    let (mut out, mut depth, mut from, mut in_string, mut escaped) = (Vec::new(), 0u32, 0, false, false);
+    for (at, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ if in_string => {}
+            '{' => {
+                if depth == 0 {
+                    from = at;
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(rest[from..=at].to_string());
+                }
+            }
+            ']' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a `topGames` entry is `row`, member for member, and then `year`.
+fn row_and_year(entry: &str, row: &str) -> bool {
+    row.strip_suffix('}').and_then(|open| entry.strip_prefix(open)).is_some_and(|rest| rest.starts_with(",\"year\":"))
+}
+
 /// A query parameter's value, percent-encoded.
 fn encode(value: &str) -> String {
     value
@@ -574,8 +613,10 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let mut lookups = Samples::default();
     let mut played = 0;
     let mut stop = "";
+    let mut notable = Vec::new();
     for _ in 0..LOOKUPS {
         let Some(body) = lookups.get(&mut c, &explorer(&board.fen()), true) else { break };
+        notable.extend(objects(&body, "topGames"));
         let Some(uci) = strings(&body, "uci").into_iter().next() else {
             stop = ", no move from the last position";
             break;
@@ -619,6 +660,27 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         table.failed = true;
     }
     table.row("index", "deep lookup, plies 30/60/90", &mut deep, &format!("{found} of {asked} found"));
+    // Each notable game the lookups named is its `/games` row whole, then its
+    // year (#144): compared with its number's row, asked for once a number
+    // after the lookups, so that their times stay as they were.
+    let mut rows = Samples::default();
+    let mut fetched: HashMap<u64, Option<String>> = HashMap::new();
+    let mut whole = 0;
+    for entry in &notable {
+        let Some(n) = number(entry.as_bytes(), "number") else { continue };
+        let row = fetched.entry(n).or_insert_with(|| {
+            let body = rows.get(&mut c, &format!("{base}/games?offset={}&limit=1", n.saturating_sub(1)), true)?;
+            objects(&body, "rows").into_iter().next()
+        });
+        if row.as_deref().is_some_and(|row| row_and_year(entry, row)) {
+            whole += 1;
+        }
+    }
+    if whole < notable.len() {
+        table.failed = true;
+    }
+    let counts = format!("topGames entries with every row field: {whole} of {}", notable.len());
+    table.row("index", "notable games' rows", &mut rows, &counts);
     drop(served);
     let t = Instant::now();
     let again = spawn(&o)?;
@@ -798,6 +860,27 @@ mod tests {
         // A lone or broken surrogate is a replacement character, not a panic.
         assert_eq!(strings(br#"{"value":"\ud83d\u0041"}"#, "value"), ["\u{fffd}"]);
         assert_eq!(row_count(br#"{"total":9,"rows":[{"number":1,"a":2},{"number":7}]}"#), 2);
+    }
+
+    #[test]
+    fn notable_games_are_rows_and_their_year() {
+        let answer = br#"{"topGames":[{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"year":null},{"number":9,"year":1951}],"index":{"records":9}}"#;
+        let top = objects(answer, "topGames");
+        assert_eq!(
+            top,
+            [
+                r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"year":null}"#,
+                r#"{"number":9,"year":1951}"#
+            ]
+        );
+        assert!(objects(answer, "rows").is_empty());
+        let row = r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false}}"#;
+        assert_eq!(objects(format!(r#"{{"rows":[{row}]}}"#).as_bytes(), "rows"), [row]);
+        assert!(row_and_year(&top[0], row));
+        // A member left out or changed, or no year after the row's members.
+        assert!(!row_and_year(&top[0], r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":true}}"#));
+        assert!(!row_and_year(&top[0], r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"site":""}"#));
+        assert!(!row_and_year(row, row));
     }
 
     #[test]
