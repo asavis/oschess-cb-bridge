@@ -49,12 +49,7 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     };
     let Some(shared) = app.catalog.get(&entry.id) else { return crate::reply::not_found() };
     match app.catalog.explorer.index(shared, &open) {
-        Lookup::Ready(loaded) => match loaded.lookup(board.hash()).and_then(|stats| match stats {
-            Some(stats) => Ok(Some(stats)),
-            // The tree holds positions within its plies that more than one
-            // game reached; any other is looked for in its games (#133).
-            None => deep(&loaded, &board, &Cancel::never()),
-        }) {
+        Lookup::Ready(loaded) => match stats(&loaded, &board, &Cancel::never()) {
             Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
             Err(Bad::Busy) => busy(),
             Err(_) => {
@@ -206,21 +201,68 @@ impl Found {
             self.rank(best);
         }
     }
+
+    /// The answer of these games alone: the moves played as often in the
+    /// order their first games have.
+    fn into_stats(mut self) -> Stats {
+        self.moves.sort_unstable_by_key(|m| (std::cmp::Reverse(m.counts.games), m.first));
+        let moves = self.moves.iter().map(|m| (m.mv, m.counts)).collect();
+        Stats { counts: self.counts, moves, top: self.top.iter().map(|b| b.1).collect() }
+    }
 }
 
-/// A position the tree does not hold: the games of its structure's bucket,
-/// replayed from the move stream on at most half the shared workers, so that
-/// searches keep the rest, each counted once at the first ply its main line
-/// reaches the position, with the move played from there. `None` when none
-/// does. A worker stops at its next game once `cancel` is, and the answer is
-/// then `Busy`; a stream found damaged is `Corrupt`. The moves played as
-/// often come in the order their first games have.
+/// What the index answers for `board` (#146): the tree's record when it holds
+/// the position, and the games of the position's structure that the tree did
+/// not count, replayed from the move stream: all of them when the tree does
+/// not hold it, else those that reach it first beyond the tree's plies. The
+/// tree counted every other game that reaches it, once, at its first visit,
+/// so each game counts once, with the move it played from its first visit.
+/// Counts add, moves add by code, and the notable games are the best of
+/// both, by rating, then number. `None` when no game reaches the position.
+/// Errors as [`deep`]'s.
+pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
+    let Some(mut tree) = loaded.lookup(board.hash())? else { return deep(loaded, board, cancel) };
+    let target = Target::of(board).beyond(loaded.base.header.max_ply);
+    let Some(found) = replay(loaded, board, &target, cancel)? else { return Ok(Some(tree)) };
+    tree.counts.merge(&found.counts);
+    for played in &found.moves {
+        match tree.moves.iter_mut().find(|m| m.0 == played.mv) {
+            Some(m) => m.1.merge(&played.counts),
+            None => tree.moves.push((played.mv, played.counts)),
+        }
+    }
+    // Most played first, then by code, as the tree orders them.
+    tree.moves.sort_unstable_by(|a, b| b.1.games.cmp(&a.1.games).then(a.0.cmp(&b.0)));
+    // The tree ranks its games by the rating their stream entries keep.
+    let mut top = found.top;
+    for &game in &tree.top {
+        top.push((loaded.stream.entry(game)?.elo(), game));
+    }
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    top.truncate(TOP_GAMES);
+    tree.top = top.iter().map(|b| b.1).collect();
+    Ok(Some(tree))
+}
+
+/// The games of `board`'s structure that reach it, whether the tree holds it
+/// or not, as [`stats`] answers a position the tree does not hold: each
+/// counted once at the first ply its main line reaches the position, with the
+/// move played from there; the moves played as often in the order their first
+/// games have. `None` when none does. A worker stops at its next game once
+/// `cancel` is, and the answer is then `Busy`; a stream found damaged is
+/// `Corrupt`.
 pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
+    Ok(replay(loaded, board, &Target::of(board), cancel)?.map(Found::into_stats))
+}
+
+/// The games of `board`'s structure's bucket that reach `target`, replayed
+/// from the move stream on at most half the shared workers, so that searches
+/// keep the rest; `None` when none does.
+fn replay(loaded: &Loaded, board: &Board, target: &Target, cancel: &Cancel) -> Result<Option<Found>, Bad> {
     let (games, _memory) = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
     if games.is_empty() {
         return Ok(None);
     }
-    let target = Target::of(board);
     let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
     let next = AtomicUsize::new(0);
     let parts = workers::run(want, Found::BYTES, cancel, |w| {
@@ -232,7 +274,7 @@ pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<St
                 if w.stopped() || cancel.is_cancelled() {
                     return Err(SearchError::Superseded);
                 }
-                match loaded.stream.find(game, &target) {
+                match loaded.stream.find(game, target) {
                     Ok(Some(hit)) => {
                         let mut counts = Counts::default();
                         counts.add(hit.outcome);
@@ -254,10 +296,7 @@ pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<St
             None => all = Some(part),
         }
     }
-    let Some(mut all) = all.filter(|all| all.counts.games > 0) else { return Ok(None) };
-    all.moves.sort_unstable_by_key(|m| (std::cmp::Reverse(m.counts.games), m.first));
-    let moves = all.moves.iter().map(|m| (m.mv, m.counts)).collect();
-    Ok(Some(Stats { counts: all.counts, moves, top: all.top.iter().map(|b| b.1).collect() }))
+    Ok(all.filter(|all| all.counts.games > 0))
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a

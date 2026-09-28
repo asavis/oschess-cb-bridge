@@ -97,10 +97,10 @@ impl IndexFile {
     }
 
     /// The games whose main line holds a structure of `bucket` past the
-    /// tree's pruning ply (#133): the candidates for a position the tree does
-    /// not hold. The block and the games, at most four bytes for each of its
-    /// bytes, are held in the search budget until the hold is dropped:
-    /// `Busy` when it has no room.
+    /// tree's pruning ply (#133): the candidates for a position that games
+    /// reach beyond the tree's plies (#146). The block and the games, at most
+    /// four bytes for each of its bytes, are held in the search budget until
+    /// the hold is dropped: `Busy` when it has no room.
     pub fn deep_games(&self, bucket: u32) -> Result<(Vec<u32>, Hold), Bad> {
         let local = bucket as usize % BLOCK_BUCKETS;
         let Some(&(offset, len, crc)) = self.deep.get(bucket as usize / BLOCK_BUCKETS) else {

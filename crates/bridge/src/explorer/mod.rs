@@ -2,10 +2,11 @@
 //! (`docs/api.md`): for each position reached in the first plies of a
 //! database's games, the games through it, their results, the moves played
 //! from it and its notable games, and the games' main lines as a move stream
-//! to find any other position in. An index is built in the background the
-//! first time it is asked for and kept on disk in the bridge's data folder;
-//! a change to the database rebuilds it. An index kept on disk for the
-//! database as it is now answers from the first request, without a build.
+//! to find the games that reach a position beyond those plies in. An index is
+//! built in the background the first time it is asked for and kept on disk in
+//! the bridge's data folder; a change to the database rebuilds it. An index
+//! kept on disk for the database as it is now answers from the first
+//! request, without a build.
 
 mod answer;
 mod build;
@@ -18,7 +19,7 @@ pub mod runs;
 pub mod source;
 pub mod stream;
 
-pub use answer::{deep, render, route, uci};
+pub use answer::{deep, render, route, stats, uci};
 pub use build::WRITER_BYTES;
 
 use std::collections::{HashMap, HashSet};

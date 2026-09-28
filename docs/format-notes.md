@@ -369,11 +369,14 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   side's pawns and its knights, bishops, rooks and queens counted) that its
   main line holds at some ply beyond 20, once, to its bucket. Only a pawn move
   or a capture changes a structure, and neither is undone, so a game holds
-  each one for a single stretch of plies. Every position the tree does not
-  hold is found among the games of its structure's bucket, by replaying
-  their lines from the move stream. The pieces matter: every pawnless
-  ending shares one pawn structure, 186,041 games of the Mega Database, and
-  with the pieces counted the most crowded bucket, bare kings, holds 38,367.
+  each one for a single stretch of plies. Every game that reaches a
+  position beyond ply 20 is found among the games of its structure's bucket,
+  by replaying their lines from the move stream: all of the position's games
+  when the tree does not hold it, and those that first reach it beyond
+  ply 40, which the tree did not count, when it does (#146). The pieces
+  matter: every pawnless ending shares one pawn structure, 186,041 games of
+  the Mega Database, and with the pieces counted the most crowded bucket,
+  bare kings, holds 38,367.
 - **Header** (128 bytes):
 
   | Offset | Size | Field |

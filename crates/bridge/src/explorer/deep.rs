@@ -1,8 +1,9 @@
 //! The deep section of an index (#133): for each bucket of structures
 //! ([`super::format::structure`]), the games whose main line holds a
 //! structure of that bucket past [`super::format::PRUNE_PLY`]. The tree
-//! answers the positions it holds; a position it does not hold is looked for
-//! in the games of its structure's bucket, which are few, by replaying them.
+//! counts the games that reach a position it holds within its plies; any
+//! other game that reaches a position is looked for in the games of its
+//! structure's bucket, which are few, by replaying them (#146).
 //!
 //! A build hands each worker's postings (`bucket << 32 | game`) to a
 //! [`Sink`], which spreads them over partition files by the bucket's top

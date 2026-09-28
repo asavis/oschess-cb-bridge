@@ -712,21 +712,28 @@ the oschess analysis panel shows it like its Lichess tabs.
   a set-up position, without deleted games, guiding texts or analyses. A game whose move record is over
   2 MiB, the limit `games/{number}` serves, or cannot be read, is left out.
   `index` names the last record the index covers and the games it holds.
-- **How a position is found** (#133). The index has two parts:
+- **How a position is found** (#133, #146). The index has two parts:
   - **A tree** holds the positions reached within the first 40 plies, each
     with its counts, moves and notable games, beyond ply 20 only those that
-    more than one game reached. It answers such a position however many games
-    share it.
+    more than one game reached. It counts each game that reaches such a
+    position within those plies, however many share it.
   - **A deep section** holds, for every game, the structures its main line
     reaches beyond ply 20: a structure is each side's pawns and its pieces by
     kind, what only a pawn move or a capture changes. Neither is undone, so a
     game holds each structure for one stretch of plies, and few games share a
-    deep one. A position the tree does not hold is looked for among the games
-    of its structure, which are replayed on at most half the search workers:
-    each game counts once, at the first ply its main line reaches the
-    position, with the move it played from there. Fewer than 1 in 100 of the
-    Mega Database's positions share their structure with more than 4,096
-    games, and the most crowded structure, bare kings, with 38,367.
+    deep one. The games of a position's structure are replayed on at most
+    half the search workers: each game counts once, at the first ply its main
+    line reaches the position, with the move it played from there. Fewer than
+    1 in 100 of the Mega Database's positions share their structure with more
+    than 4,096 games, and the most crowded structure, bare kings, with 38,367.
+
+  The answer for a position is the tree's, and the games of its structure
+  that the tree did not count: all of them when the tree does not hold the
+  position, else those that first reach it beyond ply 40. A game that reaches
+  it beyond ply 20 holds its structure there, so no game is missed, and a game
+  that reaches it within ply 40 is the tree's, however often it comes back, so
+  none is counted twice. Their counts add, their moves add, and the notable
+  games are the best of both.
 
   The games are replayed from the index's **move stream** (#145), which holds
   every game's main line as the move codes of the 2CBH format, checked when
@@ -736,10 +743,7 @@ the oschess analysis panel shows it like its Lichess tabs.
   on a home square where the position has one; a game whose home pawns left
   in an order the position excludes is not replayed.
 
-  A position no game reaches is answered with zero counts and empty lists. A
-  game that reaches a position the tree holds only beyond ply 40 is not
-  counted in it; the pawns make that rare, since such a position has the
-  pawns of an early ply.
+  A position no game reaches is answered with zero counts and empty lists.
 - **Chess960 is not indexed.** The Polyglot key the index uses names a
   castling right by its side, not by its rook, so two Chess960 positions that
   differ only in which rook may castle share a key. A FEN whose castling
