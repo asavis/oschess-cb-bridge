@@ -338,9 +338,42 @@ impl Board {
     /// Plays a move known to be legal. An illegal move leaves the position
     /// unspecified but never panics.
     pub fn play_unchecked(&mut self, mv: Move) {
+        let Some((piece, recompute_checkers)) = self.move_pieces(mv) else { return };
+        if recompute_checkers {
+            self.refresh_checkers();
+            return;
+        }
+        let them = self.side;
+        let us = !them;
+        // A check now comes from the moved piece itself, or from a slider of
+        // ours the vacated square was blocking. Both are computed from the
+        // enemy king outwards, with masks rather than branches: which piece
+        // moved and whether it lines up with the king are unpredictable.
+        let king = self.king(them);
+        let occupied = self.occupied();
+        let landed = mv.promotion.unwrap_or(piece) as usize;
+        let to = mv.to.bit();
+        let d_to = attacks::direction(king, mv.to);
+        let along = attacks::ray(d_to, king, occupied) & to;
+        let direct = (along
+            & ((attacks::straight_mask(d_to) & MOVES_STRAIGHT[landed])
+                | (attacks::diagonal_mask(d_to) & MOVES_DIAGONAL[landed])))
+            | (attacks::knight(king) & to & IS_KNIGHT[landed])
+            | (attacks::pawn(them, king) & to & IS_PAWN[landed]);
+        let d_from = attacks::direction(king, mv.from);
+        let discovered = attacks::ray(d_from, king, occupied) & self.sliders(d_from) & self.colors(us);
+        self.checkers = direct | discovered;
+    }
+
+    /// Everything [`Board::play_unchecked`] does but finding the checkers:
+    /// the piece moved, and whether the checkers must be found in full, after
+    /// castling or en passant, which move or remove a second piece. `None`,
+    /// with nothing played, when no piece stands on the origin.
+    #[inline(always)]
+    fn move_pieces(&mut self, mv: Move) -> Option<(Piece, bool)> {
         let us = self.side;
         let them = !us;
-        let Some((piece, _)) = self.piece_at(mv.from) else { return };
+        let (piece, _) = self.piece_at(mv.from)?;
         self.ep_file = None;
         self.halfmove = self.halfmove.saturating_add(1);
         let back = us.back_rank();
@@ -398,29 +431,7 @@ impl Board {
         }
         self.side = them;
         self.key ^= KEYS[TURN];
-
-        if recompute_checkers {
-            self.refresh_checkers();
-            return;
-        }
-        // A check now comes from the moved piece itself, or from a slider of
-        // ours the vacated square was blocking. Both are computed from the
-        // enemy king outwards, with masks rather than branches: which piece
-        // moved and whether it lines up with the king are unpredictable.
-        let king = self.king(them);
-        let occupied = self.occupied();
-        let landed = mv.promotion.unwrap_or(piece) as usize;
-        let to = mv.to.bit();
-        let d_to = attacks::direction(king, mv.to);
-        let along = attacks::ray(d_to, king, occupied) & to;
-        let direct = (along
-            & ((attacks::straight_mask(d_to) & MOVES_STRAIGHT[landed])
-                | (attacks::diagonal_mask(d_to) & MOVES_DIAGONAL[landed])))
-            | (attacks::knight(king) & to & IS_KNIGHT[landed])
-            | (attacks::pawn(them, king) & to & IS_PAWN[landed]);
-        let d_from = attacks::direction(king, mv.from);
-        let discovered = attacks::ray(d_from, king, occupied) & self.sliders(d_from) & self.colors(us);
-        self.checkers = direct | discovered;
+        Some((piece, recompute_checkers))
     }
 
     /// The pieces that attack along direction `d`: rooks and queens on ranks
@@ -652,6 +663,58 @@ impl Board {
             key ^= KEYS[TURN];
         }
         key
+    }
+}
+
+/// A position that follows moves known to be legal, as a move stream holds
+/// them, faster than a [`Board`] does: it keeps the pieces, the key and all
+/// the key depends on, but not the pieces giving check, which only legality
+/// needs, so it answers no question of legality. For finding a position in
+/// many stored games.
+#[derive(Clone, Debug)]
+pub struct Replayer(Board);
+
+impl Replayer {
+    pub fn new(board: Board) -> Replayer {
+        Replayer(board)
+    }
+
+    /// Plays a move known to be legal, as [`Board::play_unchecked`] does.
+    #[inline]
+    pub fn play(&mut self, mv: Move) {
+        let _ = self.0.move_pieces(mv);
+    }
+
+    /// The Polyglot key of the position, as [`Board::hash`] gives it.
+    #[inline]
+    pub fn hash(&self) -> u64 {
+        self.0.hash()
+    }
+
+    #[inline]
+    pub fn side_to_move(&self) -> Color {
+        self.0.side
+    }
+
+    #[inline]
+    pub fn pieces(&self, piece: Piece) -> Bitboard {
+        self.0.pieces(piece)
+    }
+
+    #[inline]
+    pub fn colors(&self, color: Color) -> Bitboard {
+        self.0.colors(color)
+    }
+
+    #[inline]
+    pub fn colored(&self, piece: Piece, color: Color) -> Bitboard {
+        self.0.colored(piece, color)
+    }
+
+    /// The position as a [`Board`], its checkers found again.
+    pub fn board(mut self) -> Board {
+        self.0.refresh_checkers();
+        self.0
     }
 }
 

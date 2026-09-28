@@ -1,6 +1,6 @@
 //! `cozy-chess` as an oracle: the same positions, moves and verdicts.
 
-use chesscore::{Board, Move, Piece, Square};
+use chesscore::{Board, Color, Move, Piece, Replayer, Square};
 
 /// A small deterministic generator, so a failure reproduces.
 struct Rng(u64);
@@ -87,11 +87,28 @@ fn candidates(b: &Board, rng: &mut Rng, n: usize) -> Vec<Move> {
         .collect()
 }
 
+/// A [`Replayer`] that followed the same moves as `b`: the same pieces and
+/// key, and the same board once its checkers are found again.
+fn same_replayed(r: &Replayer, b: &Board, context: &str) {
+    assert_eq!(r.hash(), b.hash(), "replayed key, {context}");
+    assert_eq!(r.side_to_move(), b.side_to_move(), "replayed side, {context}");
+    for c in [Color::White, Color::Black] {
+        assert_eq!(r.colors(c), b.colors(c), "replayed men, {context}");
+        for p in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
+            assert_eq!(r.colored(p, c), b.colored(p, c), "replayed {p:?}, {context}");
+            assert_eq!(r.pieces(p), b.pieces(p), "replayed {p:?}, {context}");
+        }
+    }
+    assert_eq!(&r.clone().board(), b, "replayed board, {context}");
+}
+
 fn playout(start: Board, cozy: cozy_chess::Board, rng: &mut Rng, plies: usize, label: &str) {
     let (mut b, mut c) = (start, cozy);
+    let mut r = Replayer::new(b.clone());
     for ply in 0..plies {
         let context = format!("{label} ply {ply} {b}");
         same_position(&b, &c, &context);
+        same_replayed(&r, &b, &context);
         // Verdicts on arbitrary moves, the path a damaged record would take.
         for m in candidates(&b, rng, 24) {
             let theirs = m.to_string().parse::<cozy_chess::Move>().is_ok_and(|cm| c.is_legal(cm));
@@ -106,6 +123,7 @@ fn playout(start: Board, cozy: cozy_chess::Board, rng: &mut Rng, plies: usize, l
         }
         let m = moves[rng.below(moves.len())];
         b.play_checked(m).unwrap_or_else(|e| panic!("{m}: {e}, {context}"));
+        r.play(m);
         c.play(m.to_string().parse().unwrap());
     }
 }

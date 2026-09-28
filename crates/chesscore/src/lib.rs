@@ -15,7 +15,7 @@ mod setup;
 mod types;
 mod zobrist;
 
-pub use board::{Board, CastleSide, IllegalMove};
+pub use board::{Board, CastleSide, IllegalMove, Replayer};
 pub use fen::FenError;
 pub use setup::{BoardBuilder, SetupError};
 pub use types::{Bitboard, Color, Move, ParseError, Piece, Square, Squares, squares};
