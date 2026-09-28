@@ -586,10 +586,16 @@ it means the same in any position and needs no board to decode.
   themselves (Scid's home-pawn test). A set-up game is not tested so. A replay
   stops at the first ply whose key is the position's, and as soon as its line
   has fewer men or pawns of a side than the position, or lacks one of the
-  position's home pawns: a line only ever loses those. Nothing is concluded
-  from the pieces of each kind, which a promotion adds to. The bucket is
-  replayed on at most half the search workers, each holding only what it
-  found, and a replay stops at its next game once its request is superseded.
+  position's home pawns: a line only ever loses those, and only a capture or
+  a pawn's move changes them, so they are counted again only then. Nothing
+  is concluded from the pieces of each kind, which a promotion adds to. The
+  moves are played without finding the pieces that give check, which only
+  legality needs (`chesscore::Replayer`). The bucket is replayed on at most
+  half the search workers, which take its games 64 at a time as they go, so
+  that a worker the machine runs less often takes fewer; each holds only what
+  it found, and a replay stops at its next game once its request is
+  superseded. Moves played as often are listed in the order of the first
+  game, by number, that played each.
 
 # The classic format (`.cbh`)
 

@@ -1,6 +1,8 @@
 //! `GET /v1/databases/{id}/explorer?fen=`: the moves played from a position
 //! and its notable games, in the shape the oschess panel's explorer tabs use.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use chesscore::{Board, Move, Piece};
 
 use cbformat::game::RecordKind;
@@ -81,8 +83,8 @@ fn unsupported() -> Response {
 fn indexing(p: &Progress) -> Response {
     let progress = Obj::new()
         .str("phase", p.phase())
-        .num("done", p.done.load(std::sync::atomic::Ordering::Relaxed) as i64)
-        .num("total", p.total.load(std::sync::atomic::Ordering::Relaxed) as i64)
+        .num("done", p.done.load(Ordering::Relaxed) as i64)
+        .num("total", p.total.load(Ordering::Relaxed) as i64)
         .done();
     error_with(409, "database_unavailable", "The position index is being built", |o| {
         o.str("state", "indexing").raw("progress", &progress)
@@ -127,22 +129,34 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
 
 /// Candidates a worker replays at least, so that a small bucket takes one.
 const DEEP_GAMES_PER_WORKER: usize = 256;
+/// Candidates a worker takes at a time: the workers share a bucket as they
+/// go, so that one the machine runs less often takes fewer.
+const DEEP_GAMES_AT_ONCE: usize = 64;
 /// Room for the moves played from a position: it has 218 legal moves at most.
 const MAX_MOVES: usize = 256;
+
+/// A move played from the position: its counts, and the first game, by
+/// number, that played it, which orders moves played as often.
+#[derive(Clone, Copy)]
+struct Played {
+    mv: u16,
+    counts: Counts,
+    first: u32,
+}
 
 /// What a worker's replays found, the same few bytes however many games
 /// reach the position: their counts, the moves played with theirs, and the
 /// best games so far by average rating, then number.
 struct Found {
     counts: Counts,
-    moves: Vec<(u16, Counts)>,
+    moves: Vec<Played>,
     top: Vec<(u16, u32)>,
 }
 
 impl Found {
     /// What one takes, all a worker reserves.
     const BYTES: usize =
-        MAX_MOVES * std::mem::size_of::<(u16, Counts)>() + (TOP_GAMES + 1) * std::mem::size_of::<(u16, u32)>();
+        MAX_MOVES * std::mem::size_of::<Played>() + (TOP_GAMES + 1) * std::mem::size_of::<(u16, u32)>();
 
     fn new() -> Option<Found> {
         let mut moves = Vec::new();
@@ -153,23 +167,25 @@ impl Found {
     }
 
     /// Adds `counts` of games that played `mv` from the position (`NO_MOVE`
-    /// when they ended there), the best of them ranked `best`.
-    fn add(&mut self, mv: u16, counts: &Counts, best: (u16, u32)) {
+    /// when they ended there), the best of them ranked `best`, the first of
+    /// them by number `first`.
+    fn add(&mut self, mv: u16, counts: &Counts, best: (u16, u32), first: u32) {
         self.counts.merge(counts);
-        self.add_move(mv, counts);
+        self.add_move(Played { mv, counts: *counts, first });
         self.rank(best);
     }
 
-    fn add_move(&mut self, mv: u16, counts: &Counts) {
-        if mv == NO_MOVE {
+    fn add_move(&mut self, played: Played) {
+        if played.mv == NO_MOVE {
             return;
         }
-        if let Some(m) = self.moves.iter_mut().find(|m| m.0 == mv) {
-            m.1.merge(counts);
+        if let Some(m) = self.moves.iter_mut().find(|m| m.mv == played.mv) {
+            m.counts.merge(&played.counts);
+            m.first = m.first.min(played.first);
         } else if self.moves.len() < MAX_MOVES {
             // Every move played from one position is legal there, so the room
             // is never short, and nothing grows past what was reserved.
-            self.moves.push((mv, *counts));
+            self.moves.push(played);
         }
     }
 
@@ -183,8 +199,8 @@ impl Found {
 
     fn merge(&mut self, other: &Found) {
         self.counts.merge(&other.counts);
-        for (mv, counts) in &other.moves {
-            self.add_move(*mv, counts);
+        for &played in &other.moves {
+            self.add_move(played);
         }
         for &best in &other.top {
             self.rank(best);
@@ -197,7 +213,8 @@ impl Found {
 /// searches keep the rest, each counted once at the first ply its main line
 /// reaches the position, with the move played from there. `None` when none
 /// does. A worker stops at its next game once `cancel` is, and the answer is
-/// then `Busy`; a stream found damaged is `Corrupt`.
+/// then `Busy`; a stream found damaged is `Corrupt`. The moves played as
+/// often come in the order their first games have.
 pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
     let (games, _memory) = loaded.base.deep_games(deep_bucket(structure(board), loaded.base.header.deep_bits))?;
     if games.is_empty() {
@@ -205,21 +222,25 @@ pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<St
     }
     let target = Target::of(board);
     let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
+    let next = AtomicUsize::new(0);
     let parts = workers::run(want, Found::BYTES, cancel, |w| {
         let mut found = Found::new().ok_or(SearchError::Busy)?;
-        let per = games.len().div_ceil(w.count);
-        for &game in games.iter().skip(w.index * per).take(per) {
-            if w.stopped() || cancel.is_cancelled() {
-                return Err(SearchError::Superseded);
-            }
-            match loaded.stream.find(game, &target) {
-                Ok(Some(hit)) => {
-                    let mut counts = Counts::default();
-                    counts.add(hit.outcome);
-                    found.add(hit.mv, &counts, (hit.elo, game));
+        loop {
+            let from = next.fetch_add(DEEP_GAMES_AT_ONCE, Ordering::Relaxed);
+            let Some(taken) = games.get(from..(from + DEEP_GAMES_AT_ONCE).min(games.len())) else { break };
+            for &game in taken {
+                if w.stopped() || cancel.is_cancelled() {
+                    return Err(SearchError::Superseded);
                 }
-                Ok(None) => {}
-                Err(damaged) => return Ok(Err(damaged)),
+                match loaded.stream.find(game, &target) {
+                    Ok(Some(hit)) => {
+                        let mut counts = Counts::default();
+                        counts.add(hit.outcome);
+                        found.add(hit.mv, &counts, (hit.elo, game), game);
+                    }
+                    Ok(None) => {}
+                    Err(damaged) => return Ok(Err(damaged)),
+                }
             }
         }
         Ok(Ok(found))
@@ -234,8 +255,9 @@ pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<St
         }
     }
     let Some(mut all) = all.filter(|all| all.counts.games > 0) else { return Ok(None) };
-    all.moves.sort_by_key(|m| std::cmp::Reverse(m.1.games));
-    Ok(Some(Stats { counts: all.counts, moves: all.moves, top: all.top.iter().map(|b| b.1).collect() }))
+    all.moves.sort_unstable_by_key(|m| (std::cmp::Reverse(m.counts.games), m.first));
+    let moves = all.moves.iter().map(|m| (m.mv, m.counts)).collect();
+    Ok(Some(Stats { counts: all.counts, moves, top: all.top.iter().map(|b| b.1).collect() }))
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a
@@ -269,7 +291,8 @@ mod tests {
     use crate::explorer::format::Outcome;
 
     /// However many games a worker finds, what it keeps stays within what it
-    /// reserved, and two workers' finds merge into the same answer as one's.
+    /// reserved, and two workers' finds merge into the same answer as one's,
+    /// each move with the first game that played it.
     #[test]
     fn found_games_are_added_up_in_the_room_reserved() {
         let (a, b) = (Found::new().unwrap(), Found::new().unwrap());
@@ -280,17 +303,28 @@ mod tests {
             counts.add([Outcome::White, Outcome::Draw, Outcome::Black][n as usize % 3]);
             let mv = if n % 7 == 0 { NO_MOVE } else { (n % 5) as u16 + 1 };
             let best = ((n * 7919 % 3000) as u16, n);
-            one.add(mv, &counts, best);
-            halves[n as usize % 2].add(mv, &counts, best);
+            one.add(mv, &counts, best, n);
+            halves[n as usize % 2].add(mv, &counts, best, n);
         }
         assert_eq!((one.moves.capacity(), one.top.capacity()), (moves, top), "nothing grew");
         assert_eq!(one.counts.games, 50_000);
         assert_eq!(one.moves.len(), 5);
-        assert_eq!(one.moves.iter().map(|m| m.1.games).sum::<u64>(), 50_000 - 50_000 / 7);
+        assert_eq!(one.moves.iter().map(|m| m.counts.games).sum::<u64>(), 50_000 - 50_000 / 7);
+        // Move m is first played by game m - 1, and move 1 by game 5.
+        let firsts = |f: &Found| {
+            let mut v: Vec<(u16, u32, u64)> = f.moves.iter().map(|m| (m.mv, m.first, m.counts.games)).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            firsts(&one).iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(),
+            [(1, 5), (2, 1), (3, 2), (4, 3), (5, 4)]
+        );
         let [mut merged, other] = halves;
         merged.merge(&other);
         assert_eq!(merged.counts, one.counts);
         assert_eq!(merged.top, one.top);
+        assert_eq!(firsts(&merged), firsts(&one));
         let mut expected: Vec<(u16, u32)> = (1..=50_000u32).map(|n| ((n * 7919 % 3000) as u16, n)).collect();
         expected.sort_unstable_by(|x, y| y.cmp(x));
         assert_eq!(one.top, expected[..TOP_GAMES]);

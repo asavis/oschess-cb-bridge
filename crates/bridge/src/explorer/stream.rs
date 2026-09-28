@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Square};
+use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Replayer, Square};
 
 use cbformat::movetable::FIRST_PIECE_WORD;
 use cbformat::replay;
@@ -587,7 +587,7 @@ impl Target {
     }
 
     /// Whether a line at `board` can no longer reach the position.
-    fn passed(&self, board: &Board) -> bool {
+    fn passed(&self, board: &Replayer) -> bool {
         let (white, black, pawns) = (board.colors(Color::White), board.colors(Color::Black), board.pieces(Piece::Pawn));
         counts(white, black, pawns).iter().zip(self.counts).any(|(&have, need)| have < need)
             || home_of(pawns & white, pawns & black) & self.home != self.home
@@ -738,13 +738,13 @@ impl Stream {
         if !entry.indexed() || (!entry.setup() && !entry.departures.allows(target.home)) {
             return Ok(None);
         }
-        let mut board = record.start()?.unwrap_or_else(|| standard().clone());
+        let mut board = Replayer::new(record.start()?.unwrap_or_else(|| standard().clone()));
+        if target.passed(&board) {
+            return Ok(None);
+        }
         let moves = moves();
         let mut words = record.words();
         loop {
-            if target.passed(&board) {
-                return Ok(None);
-            }
             let mv = match words.next() {
                 Some(w) => Some(moves.get(usize::from(w)).copied().flatten().ok_or(Bad::Corrupt("stream word"))?),
                 None => None,
@@ -753,7 +753,14 @@ impl Stream {
                 return Ok(Some(Hit { mv: mv.map_or(NO_MOVE, pack_move), outcome: entry.outcome(), elo: entry.elo() }));
             }
             let Some(mv) = mv else { return Ok(None) };
-            board.play_unchecked(mv);
+            // Only a capture or a pawn's move changes what `passed` counts:
+            // the men of the side not moving, and the pawns.
+            let them = !board.side_to_move();
+            let before = (board.colors(them), board.pieces(Piece::Pawn));
+            board.play(mv);
+            if (board.colors(them), board.pieces(Piece::Pawn)) != before && target.passed(&board) {
+                return Ok(None);
+            }
         }
     }
 }
