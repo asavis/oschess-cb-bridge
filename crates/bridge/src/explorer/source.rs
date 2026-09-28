@@ -544,7 +544,9 @@ fn walk_classic(data: &cbh::MoveData<'_>, record: &cbh::Record, max_ply: u8, lin
     if moves.is_chess960() {
         return false;
     }
-    let Ok(board) = cbh::start_as_played(&moves).and_then(|s| start_board(&s)) else { return false };
+    // Resolved once: a set-up game's start can take a replay of all its moves.
+    let Ok(start) = cbh::start_as_played(&moves) else { return false };
+    let Ok(board) = start_board(&start) else { return false };
     if board.is_chess960() {
         return false;
     }
@@ -552,7 +554,7 @@ fn walk_classic(data: &cbh::MoveData<'_>, record: &cbh::Record, max_ply: u8, lin
     line.at(&board, 0);
     let mut main = MainLine { line, max_ply, ply: 0, pending: None, done: false };
     // Damage ends the line where it is: the positions before it are kept.
-    let _ = cbh::walk(&moves, &mut main);
+    let _ = cbh::walk_from(&moves, &start, &mut main);
     if !main.done {
         main.line.visit(NO_MOVE, main.ply, main.max_ply);
     }

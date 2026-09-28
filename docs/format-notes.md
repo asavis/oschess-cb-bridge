@@ -529,8 +529,11 @@ The reader was checked against:
   database, `0x0b` in another. The reader starts such a game with the right its
   castling uses added, when the king and the rook stand where the right needs
   them: their home squares, or in Chess960 the squares the record names
-  (`cbh::start_as_played`); otherwise the move is an error. The stored
-  byte itself is still reported by `GameMoves::start`.
+  (`cbh::start_as_played`); otherwise the move is an error. Finding the
+  right plays the game's moves, so a set-up whose kings and rooks could hold
+  no missing right is not played for it, and `cbh::walk_from` walks from a
+  start already found instead of finding it again. The stored byte itself is
+  still reported by `GameMoves::start`.
 - **Text encoding.** The description says ISO 8859-1. Names are read as
   Windows-1252, which ChessBase, a Windows program, means by the bytes
   0x80-0x9f. A database ChessBase converted from 2CBH holds names as UTF-8

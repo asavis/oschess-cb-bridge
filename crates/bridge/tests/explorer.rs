@@ -648,3 +648,50 @@ fn the_moves_from_the_trees_last_ply_are_listed() {
     assert_eq!(stats.lookup_move("g2g3"), Some(1));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A classic set-up game is replayed only as far as the position looked for:
+/// its start is resolved once, and a position whose kings and rooks could
+/// never castle is not replayed to look for a right first. A position the
+/// games reach early is then found far faster than one they never reach,
+/// which every game is played to its end for.
+#[test]
+fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
+    let start = Board::from_fen("7k/8/8/8/8/8/P7/K7 w - - 0 1").unwrap();
+    let mut ucis = "a1b1 h8g8 b1a1 g8h8 ".repeat(10);
+    ucis.push_str("a2a3 h8g8 ");
+    ucis.push_str(&"a1b1 g8h8 b1a1 h8g8 ".repeat(5_000));
+    let toks: Vec<Tok<'_>> = ucis.split_whitespace().map(Tok::Mv).chain([Tok::End]).collect();
+    let stream = encode(&start, &toks, 0, false);
+    let white = [("a1", CPiece::King, CColor::White), ("a2", CPiece::Pawn, CColor::White)];
+    let position = start_position(&[white[0], white[1], ("h8", CPiece::King, CColor::Black)], false, 0, 0);
+    let mut b = fixture_cbh::Builder::new();
+    for _ in 0..16 {
+        b.game(&move_record(0x40, Some(&position), None, &stream))[0x1b] = 1;
+    }
+    let db = b.write("explorer-classic-setup");
+    let dir = index_dir("classic-setup");
+    let base = cbh::Database::open(db.dir().join("db.cbh")).unwrap();
+    let idx = explorer::prepare(&base, 1, &dir, "db", &Progress::default()).unwrap();
+    // Ply 41, after a2a3, beyond the tree; and the same men never so placed.
+    let mut reached = start.clone();
+    for uci in ucis.split_whitespace().take(41) {
+        reached.play_checked(uci.parse().unwrap()).unwrap();
+    }
+    let never = Board::from_fen("k7/8/8/8/8/P7/8/7K b - - 0 1").unwrap();
+    let time = |board: &Board| {
+        (0..3)
+            .map(|_| {
+                let at = Instant::now();
+                let stats = explorer::deep(&base, &idx, board).unwrap();
+                (at.elapsed(), stats.map(|s| s.counts.games))
+            })
+            .min()
+            .unwrap()
+    };
+    let (found, games) = time(&reached);
+    assert_eq!(games, Some(16));
+    let (missed, none) = time(&never);
+    assert_eq!(none, None);
+    assert!(found * 5 < missed, "found in {found:?}, missed in {missed:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

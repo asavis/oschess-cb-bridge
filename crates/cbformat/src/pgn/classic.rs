@@ -53,6 +53,6 @@ pub fn classic_game_from(
         start: (start != Start::Standard).then(|| start_board(&start)).transpose()?,
         chess960: moves.is_chess960(),
     };
-    let text = write_tree(|tree| cbh::walk(moves, tree), annotations, PositionOrder::Stored, options)?;
+    let text = write_tree(|tree| cbh::walk_from(moves, &start, tree), annotations, PositionOrder::Stored, options)?;
     Ok(finish(&tags, &text, annotations))
 }
