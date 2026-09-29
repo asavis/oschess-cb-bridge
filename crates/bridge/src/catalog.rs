@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cbformat::view::Base;
 
@@ -100,8 +100,6 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub format: Format,
-    /// Set when the database left the list: it is then reported `missing`.
-    removed: AtomicBool,
     held: Arc<Held>,
     shared: Arc<Shared>,
 }
@@ -115,9 +113,12 @@ struct Shared {
 }
 
 /// What stays with a database when the list is read again or the window
-/// renames it: the open handle and the download.
+/// renames it: whether it is on the list, the open handle and the download.
+/// A job holding the entry of a database since renamed sees its removal too.
 #[derive(Default)]
 struct Held {
+    /// Set when the database left the list: it is then reported `missing`.
+    removed: AtomicBool,
     open: Mutex<Option<Opened>>,
     /// The download running or queued.
     running: Mutex<Option<Arc<Progress>>>,
@@ -134,6 +135,9 @@ struct Files {
     /// Some file is there but is not a regular file: a directory, a pipe or a
     /// device, which could block a reader or mislead it.
     irregular: bool,
+    /// When the file changed last that changed last, as its modification
+    /// time says.
+    modified: Option<SystemTime>,
 }
 
 impl Files {
@@ -153,7 +157,6 @@ impl Entry {
             name: listed.name,
             format: Format::of(&listed.path),
             path: listed.path,
-            removed: AtomicBool::new(false),
             held,
             shared: Arc::clone(shared),
         }
@@ -162,7 +165,7 @@ impl Entry {
     /// Whether the database is on the list; one that left it stays `missing`
     /// until the bridge restarts.
     pub fn listed(&self) -> bool {
-        !self.removed.load(Ordering::Relaxed)
+        !self.held.removed.load(Ordering::Relaxed)
     }
 
     /// The database's state, opening it if it is ready.
@@ -185,7 +188,7 @@ impl Entry {
     /// look at their metadata: `None` when the files were not looked at, for
     /// a database that left the list or is of another format (#67).
     pub fn open_sized(&self) -> (Result<Opened, State>, Option<u64>) {
-        if self.removed.load(Ordering::Relaxed) {
+        if self.held.removed.load(Ordering::Relaxed) {
             return (Err(State::Missing), None);
         }
         if self.format == Format::Other {
@@ -193,6 +196,18 @@ impl Entry {
         }
         let files = self.files();
         (self.open_files(&files), Some(files.size()))
+    }
+
+    /// [`Entry::open`], and when its files last changed, by their
+    /// modification times, from the same look at their metadata: what the
+    /// keeper of the position indexes asks (#149). `None` when that is not
+    /// known.
+    pub fn open_dated(&self) -> (Result<Opened, State>, Option<SystemTime>) {
+        if self.held.removed.load(Ordering::Relaxed) || self.format == Format::Other {
+            return (self.open(), None);
+        }
+        let files = self.files();
+        (self.open_files(&files), files.modified)
     }
 
     fn open_files(&self, files: &Files) -> Result<Opened, State> {
@@ -337,7 +352,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// PGN database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let mut hash = Hash::new();
-    let mut files = Files { generation: None, present: Vec::new(), irregular: false };
+    let mut files = Files { generation: None, present: Vec::new(), irregular: false, modified: None };
     let Some(format) = format.view() else { return files };
     // Every cache keyed on a PGN database's generation (the header index, the
     // heads and names files, the position index) is then built again once
@@ -353,6 +368,7 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
             }
             Ok(m) => {
                 hash.write_meta(&m);
+                files.modified = files.modified.max(m.modified().ok());
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
             }
@@ -561,11 +577,11 @@ impl Catalog {
                 Some(e) => Arc::new(Entry::new(item, &self.shared, Arc::clone(&e.held))),
                 None => Arc::new(Entry::new(item, &self.shared, Arc::default())),
             };
-            entry.removed.store(false, Ordering::Relaxed);
+            entry.held.removed.store(false, Ordering::Relaxed);
             entries.push(entry);
         }
         for e in old.iter().filter(|e| !seen.contains(&e.id)) {
-            e.removed.store(true, Ordering::Relaxed);
+            e.held.removed.store(true, Ordering::Relaxed);
             entries.push(Arc::clone(e));
         }
         entries

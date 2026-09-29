@@ -129,7 +129,7 @@ with them.
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
-| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer and the games of a position, `state: "indexing"` with `progress` while the position index is built |
+| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer and the games of a position, `state: "indexing"` with `progress` while the position index is built or waits to be built |
 | 409 | `superseded` | A newer search (`q` or `fen`) on the same database replaced this one while it ran; the page shows the newer answer |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
@@ -249,8 +249,13 @@ the bridge is too old; the app then offers the download link. `databases`
 counts the databases in each state; `opening` counts the PGN files being read
 for their header index (see [PGN files](#pgn-files)). `download` is there while databases are
 being downloaded: the bytes on this computer and in all, over all of them.
-`indexing` is there while position indexes are checked or built (see
-`GET /v1/databases/{id}/explorer`). `engine` names the engine the analysis
+`indexing` is there while position indexes are checked, built or waiting to
+be built (see `GET /v1/databases/{id}/explorer`). Each has the database
+`id`, its `phase`, and `done` of `total`. The phases are `waiting` (queued
+behind another build), `checking` (records), `reading` (records),
+`positions` (the tree's entries) and `structures` (the deep section's
+postings). A client shows a phase it does not know as it shows these.
+`engine` names the engine the analysis
 board can use (see `GET /v1/engine/analyze`), or is `null` when `bridge.toml`
 names none. The name is the one the engine gave for itself, or its file's
 name until it has run once. `threads` and `hash` (MB) are what an analysis
@@ -792,35 +797,68 @@ the oschess analysis panel shows it like its Lichess tabs.
   rights name rook files (Shredder-FEN, such as `4k3/8/8/8/8/8/8/4KR1R w F -`)
   or whose castling needs Chess960 rules is answered `422 unsupported` with
   `variant: "chess960"`, and so is `variant=chess960`.
-- **Building.** The first request for a database's positions is answered from
-  the index kept on disk when that index was built for the database as it is
-  now (see **Storage**): opening it reads its header and block table, and waits
-  for no build of another database. When the search memory has no room for
-  that table, the request is answered `503 busy` and the next one tries again.
-  Without such an index, the first request starts building it in the
-  background: on at most half of the search workers, within
+- **Building** (#149). The first request for a database's positions is
+  answered from the index kept on disk when that index was built for the
+  database as it is now (see **Storage**): opening it reads its header and
+  block table, and waits for no build of another database. When the search
+  memory has no room for that table, the request is answered `503 busy` and
+  the next one tries again. Otherwise the index is built in the background,
+  one database at a time, on at most half of the search workers and within
   half of the search memory budget, which it never takes from searches (while
-  searches hold memory, it takes less and runs more passes, and it waits for
-  the least it needs), and one database at a time. It reads move records
-  only, a few megabytes at a time, never annotations. The notable
-  games rendered for answers are kept for all databases together, within the
-  budget (a 64th of it, at most 8 MiB), and searches that need the memory
-  drop them. Until the index is ready, requests are answered
-  `409 database_unavailable` with `state: "indexing"` and
-  `progress: {"phase", "done", "total"}`, and only while a build runs or waits
-  to run; the phases are `checking` (records), `reading` (records),
-  `positions` (the tree's entries) and `structures` (the deep section's
-  postings), and a client shows any other as it shows these (see
-  "Compatibility"). `/v1/status` lists the builds under `indexing`. A build that fails is answered `503 index_unavailable` for
-  a minute, and the next request tries again.
+  searches hold memory, a build takes less and runs more passes, and it waits
+  for the least it needs).
+  - A database's index is built when its explorer or the games of one of its
+    positions are asked for. That build goes first, at below-normal priority,
+    and stops a background build of another database at its next batch,
+    which waits its turn again.
+  - It is also built, unasked, for each database in use whose index is not
+    of the database as it is now: once built, whenever the database changes.
+    A database is in use when its index is kept on disk, or its explorer or
+    the games of one of its positions were asked for since the bridge
+    started; the database with the most records is in use from the start. A
+    list of a database's games alone does not put it in use. Such a build
+    starts once the database has not changed for a minute, never while it is
+    kept only in the cloud, downloading, or a PGN file being opened, and on
+    Windows not while the computer runs on battery; it runs at the lowest
+    processor priority, below a requested build, with the normal disk
+    priority (`OSCHESS_BRIDGE_BACKGROUND_MODE=background` runs it in
+    Windows's background mode, which lowers its disk priority too). It gives
+    way to the answers about any database's games and positions (lists,
+    searches, sorts, a game, suggestions and explorer answers): while one
+    runs, the build waits between its batches until none runs, for at most
+    half a second at a time, so that it still ends if they never stop. A
+    requested build never gives way, and a background build that a request
+    for its database's positions makes the requested one gives way no
+    longer.
+
+  A build reads header and move records, a few megabytes at a time, never
+  annotations, and needs no temporary space. It needs free space of about 400
+  bytes a record, and 256 MiB beside them (about 5 GB for the Mega Database),
+  on the disk of the index folder, counting the database's former index
+  files, which it deletes first. With less, a request is answered
+  `503 index_unavailable` saying so, and the build of a database in use waits
+  for the database's next change. The notable games rendered for answers are
+  kept for all databases together, within the budget (a 64th of it, at most
+  8 MiB), and searches that need the memory drop them. Until the index is
+  ready, requests are answered `409 database_unavailable` with
+  `state: "indexing"` and `progress: {"phase", "done", "total"}`, and only
+  while a build runs or waits to run; the phases are `waiting` (queued behind
+  another build), `checking` (records), `reading` (records), `positions` (the
+  tree's entries) and `structures` (the deep section's postings), and a
+  client shows any other as it shows these (see "Compatibility").
+  `/v1/status` lists the builds under `indexing`. A build that fails is
+  answered `503 index_unavailable` for a minute, and the next request tries
+  again; a failed build of a database in use is not tried again unasked until
+  the database changes.
 - **Changes.** The index belongs to the database's generation, and a change to
   the database rebuilds its index, about half a minute for the Mega Database
-  on a quiet machine.
+  on a quiet machine: at the next request for its positions, or, for a
+  database in use, once it has not changed for a minute (see **Building**).
   Until the new index is ready the answer is `409` with `state: "indexing"`:
-  an index is never answered for another generation than its own. Updating an
-  index from the games appended to a database is a possible later
-  optimisation, only if its results can be shown equal to a build from
-  nothing.
+  an index is never answered for another generation than its own. Games
+  appended to a database are a change like any other. Updating an index from
+  the games appended to a database is a possible later optimisation, only if
+  its results can be shown equal to a build from nothing.
 - **Storage.** Index files live in the bridge's index folder, two per
   database: the index (`<id>.idx`) and its move stream (`<id>.moves`),
   built together. On Windows the folder is `%LOCALAPPDATA%\oschess

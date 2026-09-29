@@ -127,10 +127,13 @@ pub struct Background {
 }
 
 impl Background {
-    /// Serves `bridge` on a new thread. Take what else is needed from `bridge`,
-    /// such as the pairing link, before handing it over.
+    /// Serves `bridge` on a new thread, and keeps the position indexes of its
+    /// databases in use ([`crate::explorer::keeper`]). Take what else is
+    /// needed from `bridge`, such as the pairing link, before handing it over.
     pub fn serve(bridge: Bridge) -> std::io::Result<Background> {
         let Bridge { listeners, app, port, .. } = bridge;
+        // A serving bridge keeps the indexes of the databases in use (#149).
+        crate::explorer::keeper::start(&app);
         let stopped = Arc::new(Mutex::new(None));
         let (served, record) = (app.clone(), stopped.clone());
         std::thread::Builder::new().name("bridge-server".into()).stack_size(crate::THREAD_STACK).spawn(move || {
@@ -151,7 +154,8 @@ impl Background {
         let work = work_of(
             &databases,
             catalog.pgn().building(),
-            !catalog.explorer.building().is_empty(),
+            // A build that waits for its turn loses nothing.
+            catalog.explorer.building().iter().any(|b| b.1 != "waiting"),
             self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES),
         );
         Snapshot {

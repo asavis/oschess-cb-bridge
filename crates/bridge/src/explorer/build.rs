@@ -171,6 +171,12 @@ pub(super) struct Counted {
 /// games from the standard start reach first within [`tree::SHALLOW_PLY`]
 /// plies, unless they do not fold into the room a worker has for them, when
 /// the tree's passes collect them as they do the others.
+/// Games of a batch between two looks at foreground work (#149). A batch
+/// of the stream pass runs for milliseconds on every worker, which a cold
+/// search starting meanwhile would otherwise share whole; within it a
+/// background build gives way every so many games as well.
+const GIVE_WAY_EVERY: u32 = 256;
+
 fn read_games(
     source: &dyn Source,
     plan: &Plan,
@@ -260,22 +266,31 @@ fn read_games(
             }
         };
         loop {
+            // A background build gives way to foreground work before it
+            // takes its next batch, so that none waits for it (#149).
+            progress.give_way();
             // Whole blocks of the stream, so that each block is one worker's.
             let batch = next.fetch_add(1, Ordering::Relaxed);
             if batch >= batches {
                 break;
             }
-            if w.stopped() || progress.stop.load(Ordering::Relaxed) {
+            if w.stopped() || progress.stopped() {
                 return Err(SearchError::Superseded);
             }
             let lo = u64::from(plan.first) + batch * BATCH as u64;
             let hi = (lo + BATCH as u64 - 1).min(u64::from(plan.last));
             part.begin(lo as u32, hi as u32);
             let mut failed = None;
+            let mut since = 0;
             source.lines(lo as u32, hi as u32, MAX_PLY, &mut work, &mut |line: &Line| {
                 if failed.is_none() {
                     count(line);
                     failed = part.add(line).err();
+                }
+                since += 1;
+                if since == GIVE_WAY_EVERY {
+                    since = 0;
+                    progress.give_way();
                 }
             })?;
             match failed {
@@ -407,13 +422,15 @@ impl Out {
     fn create(path: &Path) -> Result<Out, SearchError> {
         let file = File::create(path).map_err(|e| io(path, e))?;
         // Without a second handle or a thread, the file is synced at the end
-        // alone.
+        // alone. The thread runs at the build's priority.
+        let priority = crate::machine::current();
         let behind = file.try_clone().ok().and_then(|synced| {
             let (ask, asked) = mpsc::sync_channel::<()>(1);
             let thread = std::thread::Builder::new()
                 .name("bridge-index-sync".into())
                 .stack_size(crate::THREAD_STACK)
                 .spawn(move || {
+                    crate::machine::follow(priority);
                     for () in asked {
                         // The sync that ends the build reports a failure.
                         let _ = synced.sync_data();

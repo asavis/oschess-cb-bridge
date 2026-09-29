@@ -186,6 +186,7 @@ pub fn serve_console(bridge: Bridge, show_token: bool) -> Result<(), String> {
     if show_token {
         println!("pairing link: {}", bridge.link);
     }
+    crate::explorer::keeper::start(&bridge.app);
     server::serve(bridge.listeners, bridge.app).map_err(|e| e.to_string())
 }
 

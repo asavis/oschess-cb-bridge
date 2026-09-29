@@ -150,6 +150,16 @@ it over HTTP as oschess does:
   first line, and the lines a second;
 - a small answer over a kept and over a new connection.
 
+With `--background`, the first bridge keeps its indexes as a serving bridge
+does (#149): the database, the largest one ready, has its position index
+built unasked from the bridge's start, while the flows run. Each sort and
+search row says whether the build still ran, and the time from the bridge's
+start to the index ready, with the mode it ran in
+(`OSCHESS_BRIDGE_BACKGROUND_MODE`), how long it gave way to the flows at most
+at a time, and its phases, replaces the build the first explorer request
+starts. Timed with and without it, the sorts and searches show what a
+background build costs them.
+
 The `--index` folder stands for the bridge's data folder: every index the
 child bridge builds, a PGN file's header index included, goes there as it
 would in the data folder, the position indexes in its `index` folder, and
@@ -185,7 +195,24 @@ every position the games reach in their first 20 plies, and every game's main
 line, from which the positions past them are found. For the Mega Database it
 takes about half a minute and some 4 GB, and no other room while it is built.
 Once kept, the index answers from the first request after the bridge starts,
-until the database changes.
+until the database changes. The bridge keeps the indexes of the databases in
+use up to date by itself (#149): those whose index is kept, or whose positions
+were asked for since it started, and the largest ready database from the
+start. Such a database's index is built in the background, at a low priority
+and not while the computer runs on battery, once the database has not changed
+for a minute; a request for another database's positions goes first. It gives
+way to the answers a user waits for: while a search, a sort, a list of games,
+a game, suggestions or an explorer answer runs, the build's threads wait
+between their batches until none runs, for at most half a second at a time,
+so that the build still ends if they never stop. A requested build never
+gives way. On Windows a background build runs at the lowest processor
+priority, below requested builds and the engine, and reads and writes at the
+normal disk and memory priority (`OSCHESS_BRIDGE_BACKGROUND_MODE=lowcpu`, the
+default). `OSCHESS_BRIDGE_BACKGROUND_MODE=background` runs it in Windows's
+background mode instead, which lowers its disk and memory priority too, for a
+computer where other programs' disk work matters more than how soon the index
+is ready: the build's gigabytes of reads and writes give way to theirs, and
+it takes longer. The mode applies to background builds on Windows alone.
 `cargo run --release -p bridge
 --example index_oracle -- <db.2cbh> <index dir>` builds one, timing each of
 its phases and passes, and checks it against a brute-force count, printing
