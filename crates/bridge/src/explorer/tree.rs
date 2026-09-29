@@ -232,12 +232,25 @@ impl Keys {
     /// The move `word` names, as the index packs it; `None` for a word that
     /// names no move of standard chess.
     pub(super) fn packed(&self, word: u16) -> Option<u16> {
-        self.steps.get(usize::from(word)).map(|s| s.mv).filter(|&mv| mv != NO_MOVE)
+        self.step(word).map(|s| s.mv)
     }
 
     /// Plays `word`, which [`Keys::packed`] took.
     pub(super) fn play(&mut self, word: u16) {
         let Some(&s) = self.steps.get(usize::from(word)) else { return };
+        self.apply(s);
+    }
+
+    /// What `word` does, the move it names among it; `None` for a word that
+    /// names no move of standard chess. One lookup gives both.
+    #[inline]
+    fn step(&self, word: u16) -> Option<Step> {
+        self.steps.get(usize::from(word)).copied().filter(|s| s.mv != NO_MOVE)
+    }
+
+    /// Plays step `s`.
+    #[inline(always)]
+    fn apply(&mut self, s: Step) {
         // Both sides' pawns at once, without a branch, as the deep section's
         // tracker plays them: all ones in `black` when black moves.
         let p = u64::from(s.pawns);
@@ -488,7 +501,6 @@ impl Pass<'_> {
             buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
             let mut scratch: Vec<Entry> = Vec::new();
             scratch.try_reserve_exact(FOLD_ENTRIES).map_err(|_| Refused::Busy)?;
-            let mut seen = [0u64; MAX_PLY as usize + 1];
             let mut taker = chunks.taker();
             loop {
                 // A background build gives way to foreground work before it
@@ -499,7 +511,7 @@ impl Pass<'_> {
                     return Err(SearchError::Superseded);
                 }
                 for game in lo..=hi {
-                    self.replay(game, &mut buf, cap, &mut scratch, &mut seen)?;
+                    self.replay(game, &mut buf, cap, &mut scratch)?;
                 }
             }
             buf.sort_unstable_by_key(|e| e.key);
@@ -511,15 +523,10 @@ impl Pass<'_> {
     /// Adds the entries of game `game`'s first positions that lie in the
     /// pass to `buf`: each position once, at its first visit, with the move
     /// played from there, as the walk that wrote the stream met them; but
-    /// for those the stream pass folded.
-    fn replay(
-        &self,
-        game: u32,
-        buf: &mut Vec<Entry>,
-        cap: usize,
-        scratch: &mut Vec<Entry>,
-        seen: &mut [u64; MAX_PLY as usize + 1],
-    ) -> Result<(), SearchError> {
+    /// for those the stream pass folded. The line's keys are followed first,
+    /// a lookup a ply, and a pass's parts hold few of them, so only those it
+    /// holds are looked for among the ones before.
+    fn replay(&self, game: u32, buf: &mut Vec<Entry>, cap: usize, scratch: &mut Vec<Entry>) -> Result<(), SearchError> {
         let path = &self.stream.path;
         let record = self.stream.written(game).map_err(|e| from_bad(path, e))?;
         let entry = record.entry;
@@ -531,34 +538,45 @@ impl Pass<'_> {
             Some(board) => Keys::of(board).ok_or_else(|| corrupt(path, "stream start"))?,
             None => standard_keys(),
         };
-        let mut words = record.words();
-        // The positions seen, and a bit of each key's low six: a key whose
-        // bit is clear is new, as nearly every one is.
-        let mut visited = 0;
-        let folded = if !self.folded.is_empty() && start.is_none() { usize::from(SHALLOW_PLY) + 1 } else { 0 };
-        for ply in 0..=usize::from(MAX_PLY) {
-            let key = line.hash();
-            let word = words.next();
-            let mv = match word {
-                Some(w) => line.packed(w).ok_or_else(|| corrupt(path, "stream word"))?,
-                None => NO_MOVE,
-            };
-            if !seen[..visited].contains(&key) {
-                seen[visited] = key;
-                visited += 1;
-                let part = self.part(key);
-                if ply >= folded && part >= self.first && part < self.hi.load(Ordering::Relaxed) {
-                    if buf.len() >= cap {
-                        make_room(buf, cap, scratch, self.first, self.hi, self.part_bits)?;
-                    }
-                    if part < self.hi.load(Ordering::Relaxed) {
-                        buf.push(Entry::new(key, game, entry.outcome(), mv, entry.elo()));
-                    }
-                }
+        // The positions to ply 20 and the moves played from them are the
+        // prefix's words, the last one's move its 21st.
+        const { assert!(stream::PREFIX_WORDS == MAX_PLY as usize + 1) };
+        let (words, _) = record.word_parts();
+        let mut keys = [0u64; MAX_PLY as usize + 1];
+        let mut moves = [NO_MOVE; MAX_PLY as usize + 1];
+        let mut reached = 0;
+        for (ply, (key, mv)) in keys.iter_mut().zip(&mut moves).enumerate() {
+            *key = line.hash();
+            reached = ply + 1;
+            let Some(w) = words.get(ply) else { break };
+            let s = line.step(u16::from_le_bytes(*w)).ok_or_else(|| corrupt(path, "stream word"))?;
+            *mv = s.mv;
+            if ply < usize::from(MAX_PLY) {
+                line.apply(s);
             }
-            match word {
-                Some(w) if ply < usize::from(MAX_PLY) => line.play(w),
-                _ => break,
+        }
+        let folded = if !self.folded.is_empty() && start.is_none() { usize::from(SHALLOW_PLY) + 1 } else { 0 };
+        // The plies whose positions lie in the pass's parts, without a branch
+        // a ply; the pass may end earlier as they are added, never later.
+        let hi = self.hi.load(Ordering::Relaxed);
+        let mut held = 0u32;
+        for (ply, &key) in keys.iter().enumerate().take(reached).skip(folded) {
+            let part = self.part(key);
+            held |= u32::from(part >= self.first && part < hi) << ply;
+        }
+        while held != 0 {
+            let ply = held.trailing_zeros() as usize;
+            held &= held - 1;
+            let key = keys[ply];
+            let part = self.part(key);
+            if part >= self.hi.load(Ordering::Relaxed) || keys[..ply].contains(&key) {
+                continue;
+            }
+            if buf.len() >= cap {
+                make_room(buf, cap, scratch, self.first, self.hi, self.part_bits)?;
+            }
+            if part < self.hi.load(Ordering::Relaxed) {
+                buf.push(Entry::new(key, game, entry.outcome(), moves[ply], entry.elo()));
             }
         }
         Ok(())
