@@ -556,9 +556,11 @@ The first window of a position reached by more than twelve games within its
 first 20 plies replays the first plies of the games that can reach it. On the
 Mega Database a first window of 200 rows sorted by date took about 65 ms for
 the start position (11,957,416 games) and 25-30 ms at plies 6 to 20, and a
-position beyond ply 20 about 4 ms. The result is kept with the latest searches,
-so the next windows of the same position, sort and `q` are read from it, in
-about 2 ms.
+position beyond ply 20 about 4 ms. The first such list after the bridge opens
+the index also checks those first plies against their CRCs, once: some 8 ms
+more for 12 million generated games on 16 threads. The result is kept with the
+latest searches, so the next windows of the same position, sort and `q` are
+read from it, in about 2 ms.
 
 ### `GET /v1/databases/{id}/games/{number}`
 
@@ -837,12 +839,13 @@ the oschess analysis panel shows it like its Lichess tabs.
   renamed at its end, and deletes the database's former files when it
   starts. The move stream takes 64 bytes a game and 2 bytes for each ply
   past the 21st, each game with a CRC checked whenever it is replayed; a list
-  of a position's games reads every game's first plies, and what it finds
-  there must be as many games as the index counts, else both files are built
-  again. For the Mega Database, the stream is some 2 GB, and its index about
-  as much, 0.85 GB of it the deep section. The stream is mapped read-only: the
-  operating system keeps as much of it in memory as it can spare, outside
-  the search memory.
+  of a position's games reads every game's first plies, 4,096 games at a
+  time with a CRC checked the first time a list reads them, and what it
+  finds there must be as many games as the index counts, else both files are
+  built again. For the Mega Database, the stream is some 2 GB, and its
+  index about as much, 0.85 GB of it the deep section. The stream is mapped
+  read-only: the operating system keeps as much of it in memory as it can
+  spare, outside the search memory.
   On Windows a build replaces a file still mapped by an answer in flight
   once that answer is done. When the bridge starts, after each change of the
   database list, and at least once a minute while the list is asked for, the

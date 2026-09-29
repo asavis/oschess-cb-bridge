@@ -624,7 +624,7 @@ it means the same in any position and needs no board to decode.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBMOV\0` |
-  | 8 | 4 | format version, 2 |
+  | 8 | 4 | format version, 3 |
   | 12 | 4 | header length, 128 |
   | 16 | 1 | prefix words per record, *W* = 21 |
   | 20 | 4 | first record, 1 |
@@ -640,7 +640,8 @@ it means the same in any position and needs no board to decode.
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
   The other bytes are zero. Version 1, whose directory, prefix and tail
-  areas lay apart with a CRC for each MiB, is rebuilt.
+  areas lay apart with a CRC for each MiB, and version 2, whose block table
+  held no CRCs of the blocks' slots, are rebuilt.
 - **Body**, from 128 to the block table: the tails and the blocks of slots,
   each starting at a multiple of 64 bytes, in the order the build's workers
   appended them. A worker takes the records of one block at a time and
@@ -670,18 +671,22 @@ it means the same in any position and needs no board to decode.
   possible, else 8; a zero byte); then words *W* to plies − 1. A start equal
   to the standard one is no set-up. A file takes 64 bytes a record and 2
   bytes for each ply past the 21st, 36 more for a set-up start, up to 63
-  bytes of padding after each append of tails, and 8 bytes a block.
-- **Block table**, at the end of the body: the offset of each block's slots,
-  8 bytes each. The file must end with it, have a block for every *B*
-  records and room before the table for every record's slot, and each
-  block's slots must lie within the body at a multiple of 64 bytes; the
-  table is checked against its CRC when the file opens and held in the
-  search memory budget. A record is checked against its CRC whenever an
-  answer reads it, its slot and its tail, which are all a replay reads: its
-  number in the CRC places it, so that a slot moved elsewhere fails too. The
-  build's passes read back the records they have just written without it, and
-  so does a list of a position's games its slots (below), whose CRCs cover
-  tails it does not read. A failure
+  bytes of padding after each append of tails, and 12 bytes a block.
+- **Block table**, at the end of the body: for each block the offset of its
+  slots (8 bytes) and the CRC-32 of the block's number from 0 (4 bytes) and
+  its slots (4 bytes), 12 bytes a block. The file must end with it, have a
+  block for every *B* records and room before the table for every record's
+  slot, and each block's slots must lie within the body at a multiple of 64
+  bytes; the table is checked against its CRC when the file opens and held
+  in the search memory budget. A record is checked against its CRC whenever
+  an answer reads it, its slot and its tail, which are all a replay reads:
+  its number in the CRC places it, so that a slot moved elsewhere fails too.
+  A list of a position's games (below) reads every slot and no tail, so it
+  checks each block against the block's CRC instead, the first time it reads
+  the block while the file is open: the block's number places it, and the
+  order of its slots each slot, so that a slot damaged, or moved within its
+  block or into another, fails the blocks it is in. The build's passes read
+  back the records they have just written without either CRC. A failure
   drops both files, and the next request rebuilds them. A torn file, which
   the build does not sync, fails the CRCs of the records it lost.
 - **Finding a position.** Of a bucket's games, a replay skips those the
@@ -706,15 +711,15 @@ it means the same in any position and needs no board to decode.
 - **Listing a position's games** (#148). The games that reach a position
   within the tree's plies are its notable games when it has 12 or fewer.
   Otherwise the search workers take the stream's blocks, 4,096 games at a
-  time, and read every slot: a standard game passes the home-pawn test above
-  on its entry, then its prefix words are followed to the tree's last ply,
-  its key alone, until it reaches the position or loses a home pawn the
-  position keeps; a set-up game's record is read whole, checked against its
-  CRC, and followed from its start. The games found must be as many as the
-  tree's record counts: a slot damaged so that its game is found or missed
-  wrongly changes the count by one, and a difference drops both files as a
-  failed CRC does. The games beyond the tree's plies are those the replay
-  above finds.
+  time, each checked against its CRC the first time a list reads it (see
+  the block table), and read every slot: a standard game passes the
+  home-pawn test above on its entry, then its prefix words are followed to
+  the tree's last ply, its key alone, until it reaches the position or
+  loses a home pawn the position keeps; a set-up game's record is read
+  whole, checked against its CRC, and followed from its start. The games
+  found must also be as many as the tree's record counts, and a difference
+  drops both files as a failed CRC does. The games beyond the tree's plies
+  are those the replay above finds.
 
 # The classic format (`.cbh`)
 

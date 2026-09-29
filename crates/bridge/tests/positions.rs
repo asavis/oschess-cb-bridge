@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
+use bridge::explorer::stream::{BATCH, Header, SLOT_BYTES, TABLE_ENTRY};
 use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, words};
 use cbformat::movetable::{self, Color, END_OF_LINE, MOVES, Piece};
@@ -578,39 +579,102 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A slot of the move stream damaged so that its game is no longer found is
-/// caught by the count, which the tree's record gives: the answer is `409`
-/// while the index is built again, and the next answers come from the new
-/// build.
-#[test]
-fn a_damaged_slot_is_caught_by_the_count_and_rebuilt() {
-    let (games, db, bridge, id, dir) = served("damaged");
-    let url = list(&id, &board_after("d2d4").fen(), "&limit=500");
-    let want = rows(&answered(bridge.port, &url));
-    assert!(want.len() > 12 && want.contains(&12), "{want:?}");
-    // Dropped, the bridge maps the stream no longer, which on Windows would
-    // keep it from being written.
+/// Where record `n`'s slot is in the move stream `bytes`: in its block, which
+/// the table at the file's end places.
+fn slot_at(bytes: &[u8], n: u32) -> usize {
+    let header = Header::decode(bytes).unwrap();
+    let i = (n - header.first_record) as usize;
+    let entry = header.table_offset as usize + i / BATCH * TABLE_ENTRY;
+    u64::from_le_bytes(bytes[entry..entry + 8].try_into().unwrap()) as usize + i % BATCH * SLOT_BYTES
+}
+
+/// With `bridge` dropped, which then maps the move stream no longer (on
+/// Windows it would keep it from being written), changes the stream of the
+/// index of `id` in `dir` with `damage` and serves `db` again: the list at
+/// `url` is answered `409` while both files are built again, then `want`
+/// from the new build. The new bridge.
+fn damaged(
+    bridge: Served,
+    (db, dir, id): (&TempDb, &Path, &str),
+    url: &str,
+    want: &[u32],
+    damage: impl FnOnce(&mut [u8]),
+) -> Served {
     drop(bridge);
     let path = dir.join("index").join(format!("{id}.moves"));
     let mut bytes = std::fs::read(&path).unwrap();
-    let header = bridge::explorer::stream::Header::decode(&bytes).unwrap();
-    // Game 12's slot in the only block, which the table at the file's end
-    // places: its first word, 1.d4, becomes 1.e4, while its entry still says
-    // that d2 left first.
-    let table = header.table_offset as usize;
-    let block = u64::from_le_bytes(bytes[table..table + 8].try_into().unwrap()) as usize;
-    let first = block + 11 * 64 + 16;
-    assert_eq!(&bytes[first..first + 2], &words(&mut Board::startpos(), "d2d4")[0].to_le_bytes());
-    bytes[first..first + 2].copy_from_slice(&words(&mut Board::startpos(), "e2e4")[0].to_le_bytes());
+    let before = Header::decode(&bytes).unwrap();
+    damage(&mut bytes);
     std::fs::write(&path, &bytes).unwrap();
-    let (bridge, _) = serve(&db, &dir);
-    let (status, body) = get(bridge.port, &url);
+    let (bridge, _) = serve(db, dir);
+    let (status, body) = get(bridge.port, url);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("rebuilt") && body.contains(r#""state":"indexing""#), "{body}");
-    assert_eq!(rows(&answered(bridge.port, &url)), want);
-    let after = bridge::explorer::stream::Header::decode(&std::fs::read(&path).unwrap()).unwrap();
-    assert_ne!(after.build_id, header.build_id, "built again");
+    assert_eq!(rows(&answered(bridge.port, url)), want);
+    let after = Header::decode(&std::fs::read(&path).unwrap()).unwrap();
+    assert_ne!(after.build_id, before.build_id, "built again");
+    bridge
+}
+
+/// A byte of a slot of the move stream damaged, in a block the list's scan
+/// reads, is never answered from, whether it changes which games are found
+/// or not: the answer is `409` while the index is built again, and the next
+/// answers come from the new build.
+#[test]
+fn a_damaged_slot_is_never_listed() {
+    let (games, db, mut bridge, id, dir) = served("damaged");
+    let url = list(&id, &board_after("d2d4").fen(), "&limit=500");
+    let want = rows(&answered(bridge.port, &url));
+    assert!(want.len() > 12 && want.contains(&12), "{want:?}");
     assert_eq!(want.len(), Reached::of(&games).games(&board_after("d2d4")).len());
+    let [d4, e4] = [words(&mut Board::startpos(), "d2d4")[0], words(&mut Board::startpos(), "e2e4")[0]];
+    // Game 12's slot, of the first block: its first word, 1.d4, becomes 1.e4
+    // while its entry still says that d2 left first, so that the game is
+    // missed; or its rating, its tenth word, which the scan never reaches
+    // for 1.d4, or its CRC, none of which changes what is found.
+    for k in [16, 7, 16 + 2 * 9, 60] {
+        bridge = damaged(bridge, (&db, &dir, &id), &url, &want, |bytes| {
+            let at = slot_at(bytes, 12) + k;
+            if k == 16 {
+                assert_eq!(&bytes[at..at + 2], &d4.to_le_bytes());
+                bytes[at..at + 2].copy_from_slice(&e4.to_le_bytes());
+            } else {
+                bytes[at] ^= 0x10;
+            }
+        });
+    }
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Two slots of the move stream exchanged, each sound but in the other's
+/// place, so that the games the scan finds are as many as the tree counts,
+/// but not the position's: within a block or across two, the list never
+/// answers from them, and is `409` while the index is built again, then the
+/// position's games.
+#[test]
+fn exchanged_slots_are_never_listed() {
+    // Records 1-13 play 1.e4, which the scan then finds, having more than
+    // twelve games; the others 1.d4, into a second block of the stream.
+    let n = BATCH as u32 + 26;
+    let games: Vec<Game> =
+        (1..=n).map(|r| Game::new(Kind::Game, None, if r <= 13 { "e2e4" } else { "d2d4" })).collect();
+    let db = database("positions-exchanged", &games);
+    let dir = index_dir("exchanged");
+    let (mut bridge, id) = serve(&db, &dir);
+    let url = list(&id, &board_after("e2e4").fen(), "&line=1");
+    let want: Vec<u32> = (1..=13).collect();
+    assert_eq!(rows(&answered(bridge.port, &url)), want);
+    // Game 1's slot with game 14's, in the first block, or with the first
+    // game's of the second.
+    for other in [14, BATCH as u32 + 1] {
+        bridge = damaged(bridge, (&db, &dir, &id), &url, &want, |bytes| {
+            let (x, y) = (slot_at(bytes, 1), slot_at(bytes, other));
+            for k in 0..SLOT_BYTES {
+                bytes.swap(x + k, y + k);
+            }
+        });
+    }
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -15,11 +15,13 @@
 //! Each record carries a CRC-32 of itself and its tail, checked whenever it
 //! is read: a replay checks the few hundred bytes it reads and nothing else,
 //! and a build computes each CRC while the record is in its hands, then
-//! writes the file from start to end.
+//! writes the file from start to end. Each block of slots has a CRC-32 of
+//! its number and its slots in the table, which a scan of every slot (#148)
+//! checks the first time it reads the block, once while the stream is open.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Replayer, Square};
@@ -38,7 +40,7 @@ use super::runs::io;
 use super::source::Line;
 
 pub const MAGIC: [u8; 8] = *b"OSCBMOV\0";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const HEADER_LEN: usize = 128;
 /// The words of a line kept in its record's slot: the tree's depth, 20 plies,
 /// and one more, the move from its last position.
@@ -59,6 +61,9 @@ const ALIGN: u64 = SLOT_BYTES as u64;
 /// Records in a block: a worker writes the slots of one block at a time, as
 /// the build reads them, and the file's table gives where each block is.
 pub const BATCH: usize = 4096;
+/// A block's entry in the table: where its slots start, 8 bytes, and their
+/// CRC, 4.
+pub const TABLE_ENTRY: usize = 12;
 /// The tails a worker gathers before it appends them.
 pub const TAIL_BUFFER: usize = 1 << 20;
 /// A worker's part of a build: its tail buffer, a block's slots and pending
@@ -157,6 +162,12 @@ fn records(first: u32, last: u32) -> u64 {
 fn record_crc(number: u32, slot: &[u8], tail: &[u8]) -> u32 {
     let c = crc32_update(!0, &number.to_le_bytes());
     !crc32_update(crc32_update(c, slot), tail)
+}
+
+/// The CRC of block `block` whose slots are `slots`: the number binds the
+/// block to its place, and the slots' order within it holds each in its own.
+fn block_crc(block: u32, slots: &[u8]) -> u32 {
+    !crc32_update(crc32_update(!0, &block.to_le_bytes()), slots)
 }
 
 /// A record's directory entry, the first 16 bytes of its slot.
@@ -355,8 +366,8 @@ pub struct Writer {
     records: u64,
     /// Where the next append goes: the end of what is appended.
     end: Mutex<u64>,
-    /// Each block's offset once appended, 0 until then.
-    blocks: Vec<AtomicU64>,
+    /// Each block's offset once appended, 0 until then, and its slots' CRC.
+    blocks: Vec<(AtomicU64, AtomicU32)>,
     games: AtomicU64,
     plies: AtomicU64,
 }
@@ -368,7 +379,7 @@ impl Writer {
         let count = usize::try_from(records.div_ceil(BATCH as u64)).map_err(|_| SearchError::TooLarge)?;
         let mut blocks = Vec::new();
         blocks.try_reserve_exact(count).map_err(|_| SearchError::TooLarge)?;
-        blocks.extend((0..count).map(|_| AtomicU64::new(0)));
+        blocks.extend((0..count).map(|_| (AtomicU64::new(0), AtomicU32::new(0))));
         let file =
             File::options().read(true).write(true).create(true).truncate(true).open(path).map_err(|e| io(path, e))?;
         Ok(Writer {
@@ -425,13 +436,14 @@ impl Writer {
     pub fn finish(self, generation: u64, build_id: u64) -> Result<Header, SearchError> {
         let table_offset = *self.end.lock().unwrap_or_else(|e| e.into_inner());
         let mut table = Vec::new();
-        table.try_reserve_exact(8 * self.blocks.len()).map_err(|_| SearchError::TooLarge)?;
-        for block in &self.blocks {
-            let at = block.load(Ordering::Relaxed);
+        table.try_reserve_exact(TABLE_ENTRY * self.blocks.len()).map_err(|_| SearchError::TooLarge)?;
+        for (at, crc) in &self.blocks {
+            let at = at.load(Ordering::Relaxed);
             if at == 0 {
                 return Err(io(&self.path, std::io::Error::other("a block of the move stream was not written")));
             }
             table.extend(at.to_le_bytes());
+            table.extend(crc.load(Ordering::Relaxed).to_le_bytes());
         }
         write_at(&self.file, table_offset, &table).map_err(|e| io(&self.path, e))?;
         let header = Header {
@@ -548,7 +560,7 @@ impl Part<'_> {
     }
 
     /// Ends the block: its tails appended, the CRCs of its other records,
-    /// then its slots appended and placed in the table.
+    /// then its slots appended and placed in the table with their CRC.
     pub fn end(&mut self) -> Result<(), SearchError> {
         self.flush()?;
         for (i, slot) in self.slots.as_chunks_mut::<SLOT_BYTES>().0.iter_mut().enumerate() {
@@ -558,9 +570,11 @@ impl Part<'_> {
             }
         }
         let w = self.writer;
+        let crc = block_crc(self.block as u32, &self.slots);
         let at = w.append(&self.slots)?;
-        if let Some(block) = w.blocks.get(self.block) {
+        if let Some((block, sum)) = w.blocks.get(self.block) {
             block.store(at, Ordering::Relaxed);
+            sum.store(crc, Ordering::Relaxed);
         }
         w.games.fetch_add(std::mem::take(&mut self.games), Ordering::Relaxed);
         w.plies.fetch_add(std::mem::take(&mut self.plies), Ordering::Relaxed);
@@ -633,16 +647,24 @@ pub struct Game {
 }
 
 /// A stream mapped read-only. The header and the table of blocks are checked
-/// when it opens, and each record against its CRC whenever it is read. The
-/// table is held in the search budget; the mapped file is the operating
-/// system's file cache, outside the budget.
+/// when it opens, each record against its CRC whenever it is read, and each
+/// block against its own the first time a scan reads it. The table is held
+/// in the search budget; the mapped file is the operating system's file
+/// cache, outside the budget.
 pub struct Stream {
     pub path: PathBuf,
     pub header: Header,
     map: Map,
-    /// Each block's offset.
-    blocks: Vec<u64>,
+    blocks: Vec<Block>,
     _memory: Hold,
+}
+
+/// A block of slots as the table gives it: where they start, their CRC, and
+/// whether a scan found them to match it.
+struct Block {
+    at: u64,
+    crc: u32,
+    sound: AtomicBool,
 }
 
 impl Stream {
@@ -657,15 +679,15 @@ impl Stream {
         // records, each of whose slots the file holds, before anything is
         // allocated from the counts.
         if blocks != records.div_ceil(BATCH as u64)
-            || header.table_offset.checked_add(8 * blocks) != Some(len)
+            || header.table_offset.checked_add(TABLE_ENTRY as u64 * blocks) != Some(len)
             || header.table_offset < HEADER_LEN as u64 + records * SLOT_BYTES as u64
             || !header.table_offset.is_multiple_of(ALIGN)
             || header.games > records
         {
             return Err(Bad::Corrupt("stream layout"));
         }
-        let table_len = 8 * blocks as usize;
-        let memory = Hold::reserve_quietly(2 * table_len).map_err(|r| {
+        let table_len = TABLE_ENTRY * blocks as usize;
+        let memory = Hold::reserve_quietly(table_len + blocks as usize * size_of::<Block>()).map_err(|r| {
             if r == Refused::TooLarge { Bad::Corrupt("stream table larger than memory") } else { Bad::Busy }
         })?;
         let mut table = Vec::new();
@@ -675,9 +697,10 @@ impl Stream {
         if crc32(&table) != header.table_crc {
             return Err(Bad::Corrupt("stream table"));
         }
-        let mut offsets = Vec::new();
-        offsets.try_reserve_exact(blocks as usize).map_err(|_| Bad::Busy)?;
-        for (b, at) in table.as_chunks::<8>().0.iter().map(|e| u64::from_le_bytes(*e)).enumerate() {
+        let mut placed = Vec::new();
+        placed.try_reserve_exact(blocks as usize).map_err(|_| Bad::Busy)?;
+        for (b, e) in table.as_chunks::<TABLE_ENTRY>().0.iter().enumerate() {
+            let (at, crc) = (u64_at(e, 0), u32_at(e, 8));
             let slots = (records - b as u64 * BATCH as u64).min(BATCH as u64);
             if at < HEADER_LEN as u64
                 || !at.is_multiple_of(ALIGN)
@@ -685,12 +708,12 @@ impl Stream {
             {
                 return Err(Bad::Corrupt("stream layout"));
             }
-            offsets.push(at);
+            placed.push(Block { at, crc, sound: AtomicBool::new(false) });
         }
         drop(table);
         let size = usize::try_from(len).map_err(|_| Bad::Corrupt("stream larger than memory"))?;
         let map = Map::new(&file, size).map_err(Bad::Io)?;
-        Ok(Stream { path: path.to_path_buf(), header, map, blocks: offsets, _memory: memory })
+        Ok(Stream { path: path.to_path_buf(), header, map, blocks: placed, _memory: memory })
     }
 
     /// Record `number`, checked against its CRC.
@@ -712,17 +735,25 @@ impl Stream {
     }
 
     /// The number of block `block`'s first record, and the slots of its
-    /// records in order, as a scan of every game reads them (#148): placed
-    /// within the file, but not checked against their CRCs, which cover their
+    /// records in order, as a scan of every game reads them (#148): checked
+    /// against the block's CRC the first time a scan reads them while the
+    /// stream is open, not against their records' CRCs, which cover their
     /// tails too, and which a scan of every slot would read whole.
     pub(super) fn slots(&self, block: usize) -> Result<(u32, impl Iterator<Item = Slot<'_>>), Bad> {
-        let &at = self.blocks.get(block).ok_or(Bad::Corrupt("stream block"))?;
+        let placed = self.blocks.get(block).ok_or(Bad::Corrupt("stream block"))?;
+        let at = placed.at as usize;
         // Every block but the last holds BATCH records; each block's slots lie
         // before the table, checked when it opened.
         let first = block as u64 * BATCH as u64;
         let count = self.header.records().saturating_sub(first).min(BATCH as u64) as usize;
-        let bytes =
-            self.map.bytes().get(at as usize..at as usize + count * SLOT_BYTES).ok_or(Bad::Corrupt("stream block"))?;
+        let bytes = self.map.bytes().get(at..at + count * SLOT_BYTES).ok_or(Bad::Corrupt("stream block"))?;
+        // A race of two scans checks the block twice, which is harmless.
+        if !placed.sound.load(Ordering::Relaxed) {
+            if block_crc(block as u32, bytes) != placed.crc {
+                return Err(Bad::Corrupt("stream block"));
+            }
+            placed.sound.store(true, Ordering::Relaxed);
+        }
         let number =
             u32::try_from(u64::from(self.header.first_record) + first).map_err(|_| Bad::Corrupt("stream block"))?;
         Ok((number, bytes.as_chunks::<SLOT_BYTES>().0.iter().map(Slot::of)))
@@ -737,7 +768,7 @@ impl Stream {
             .ok_or(Bad::Corrupt("stream record"))?;
         let bytes = self.map.bytes();
         // Every block's slots lie before the table, checked when it opened.
-        let at = self.blocks.get((i / BATCH as u64) as usize).map(|b| b + i % BATCH as u64 * SLOT_BYTES as u64);
+        let at = self.blocks.get((i / BATCH as u64) as usize).map(|b| b.at + i % BATCH as u64 * SLOT_BYTES as u64);
         let slot =
             at.and_then(|at| bytes.get(at as usize..at as usize + SLOT_BYTES)).ok_or(Bad::Corrupt("stream record"))?;
         let entry = Entry::decode(slot);
@@ -971,7 +1002,7 @@ mod tests {
         let path = written("back", records);
         let stream = Stream::open(&path).unwrap();
         assert_eq!((stream.header.generation, stream.header.build_id), (3, 9));
-        assert!(stream.blocks[1] < stream.blocks[0], "the second block ended first");
+        assert!(stream.blocks[1].at < stream.blocks[0].at, "the second block ended first");
         let (mut games, mut plies) = (0, 0);
         for n in 1..=records {
             let game = stream.game(n).unwrap();
@@ -1007,7 +1038,7 @@ mod tests {
             let stream = Stream::open(&path).unwrap();
             let slot_of = |n: u32| {
                 let i = u64::from(n - 1);
-                (stream.blocks[(i / BATCH as u64) as usize] + i % BATCH as u64 * SLOT_BYTES as u64) as usize
+                (stream.blocks[(i / BATCH as u64) as usize].at + i % BATCH as u64 * SLOT_BYTES as u64) as usize
             };
             let slots: Vec<usize> = (1..=records).map(slot_of).collect();
             let tail = 2 * stream.entry(10).unwrap().tail as usize;
@@ -1067,6 +1098,71 @@ mod tests {
         std::fs::write(&bad, &good[..good.len() - 8]).unwrap();
         assert!(matches!(Stream::open(&bad), Err(Bad::Corrupt(_))));
         std::fs::remove_file(&bad).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A scan reads a block's slots only when they match the block's CRC: a
+    /// byte changed in a slot, or two slots exchanged within a block or
+    /// across two, fail the blocks they are in and no other. A block found
+    /// sound is marked so, and one that fails is not.
+    #[test]
+    fn a_damaged_block_is_never_scanned() {
+        let records = BATCH as u32 + 20;
+        let path = written("blocks", records);
+        let good = std::fs::read(&path).unwrap();
+        let slot_of: Vec<usize> = {
+            let stream = Stream::open(&path).unwrap();
+            for block in 0..2 {
+                let (first, slots) = stream.slots(block).unwrap();
+                assert_eq!(first, 1 + (block * BATCH) as u32);
+                let entries: Vec<Entry> = slots.map(|s| s.entry).collect();
+                let numbers = first..(first + BATCH as u32).min(records + 1);
+                assert_eq!(entries, numbers.map(|n| stream.entry(n).unwrap()).collect::<Vec<_>>(), "{block}");
+                assert!(stream.blocks[block].sound.load(Ordering::Relaxed));
+            }
+            let slot_of = |n: u32| {
+                let i = (n - 1) as usize;
+                stream.blocks[i / BATCH].at as usize + i % BATCH * SLOT_BYTES
+            };
+            (1..=records).map(slot_of).collect()
+        };
+        enum Change {
+            Byte(u32, usize),
+            Exchange(u32, u32),
+        }
+        let last = BATCH as u32 + 3;
+        for (what, change, sound) in [
+            ("entry", Change::Byte(2, 5), [false, true]),
+            ("prefix", Change::Byte(2, PREFIX_AT + 3), [false, true]),
+            ("zero", Change::Byte(2, 58), [false, true]),
+            ("crc", Change::Byte(2, CRC_AT + 1), [false, true]),
+            ("last-block", Change::Byte(last, 0), [true, false]),
+            ("within", Change::Exchange(2, 9), [false, true]),
+            ("across", Change::Exchange(2, last), [false, false]),
+        ] {
+            let bad = path.with_extension(what);
+            let mut bytes = good.clone();
+            let slot = |n: u32| slot_of[n as usize - 1];
+            match change {
+                Change::Byte(n, k) => bytes[slot(n) + k] ^= 0x10,
+                Change::Exchange(x, y) => {
+                    for k in 0..SLOT_BYTES {
+                        bytes.swap(slot(x) + k, slot(y) + k);
+                    }
+                }
+            }
+            std::fs::write(&bad, &bytes).unwrap();
+            let stream = Stream::open(&bad).unwrap();
+            for (block, sound) in sound.into_iter().enumerate() {
+                assert_eq!(stream.slots(block).is_ok(), sound, "{what}, block {block}");
+                assert_eq!(stream.blocks[block].sound.load(Ordering::Relaxed), sound, "{what}, block {block}");
+                if !sound {
+                    assert!(matches!(stream.slots(block), Err(Bad::Corrupt(_))), "{what}: fails again");
+                }
+            }
+            drop(stream);
+            std::fs::remove_file(&bad).unwrap();
+        }
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -20,11 +20,14 @@
 //!     from its start. The standard start is found at the first ply of every
 //!     game from it, from its entry alone.
 //!
-//! The scan reads each game's slot without the CRC that covers it with its
-//! tail, which would mean reading every game whole. What it finds must be the
-//! count the tree's record gives, which its block's CRC covers: a slot damaged
-//! so that its game is found or missed wrongly changes that count by one, and
-//! the index is then dropped and built again, as for any damage found.
+//! The scan reads each game's slot, not the tail that its record's CRC
+//! covers too, which would mean reading every game whole: it checks each
+//! block of the stream's slots against the CRC of the block's number and its
+//! slots instead, the first time it reads the block while the stream is
+//! open, so that a slot damaged, or sound but in another record's place, is
+//! never read. What it finds must also be the count the tree's record gives,
+//! which its block's CRC in the index covers. A failure of either drops the
+//! index to be built again, as for any damage found.
 //!
 //! [`Departures::allows`]: super::stream::Departures::allows
 
