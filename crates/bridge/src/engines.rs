@@ -21,6 +21,9 @@ pub struct Found {
     pub path: PathBuf,
     /// Which program it came with: `ChessBase` or `Fritz`.
     pub source: &'static str,
+    /// For a build the bridge installed: its version, which names its folder
+    /// and finds its licence ([`crate::stockfish::licence`]).
+    pub version: Option<String>,
 }
 
 /// Where to look: the roaming application data folder and the Program Files
@@ -74,7 +77,12 @@ pub fn find(roots: &Roots) -> Vec<Found> {
                 continue;
             };
             for path in files(&folder).into_iter().filter(|p| is_stockfish(p)) {
-                add(Found { name: format!("Stockfish {version}"), path, source: BRIDGE });
+                add(Found {
+                    name: format!("Stockfish {version}"),
+                    path,
+                    source: BRIDGE,
+                    version: Some(version.into()),
+                });
             }
         }
     }
@@ -101,7 +109,7 @@ pub fn find(roots: &Roots) -> Vec<Found> {
                     candidates.extend(files(&sub));
                 }
                 for path in candidates.into_iter().filter(|p| is_stockfish(p)) {
-                    add(Found { name: engine_name(&path), source: source_of(&path), path });
+                    add(Found { name: engine_name(&path), source: source_of(&path), path, version: None });
                 }
             }
         }
@@ -174,7 +182,12 @@ fn read_uci(file: &Path) -> Option<Found> {
     }
     let path = PathBuf::from(filename.filter(|f| !f.is_empty())?);
     let name = name.filter(|n| !n.is_empty()).unwrap_or_else(|| engine_name(&path));
-    Some(Found { name: name.chars().take(100).collect(), source: source_of(&path).max(source_of(file)), path })
+    Some(Found {
+        name: name.chars().take(100).collect(),
+        source: source_of(&path).max(source_of(file)),
+        path,
+        version: None,
+    })
 }
 
 /// A `.uci` file's text: UTF-16 with its byte order mark, UTF-8 with or
@@ -257,6 +270,30 @@ mod tests {
         let names: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.source)).collect();
         assert_eq!(names, [("Stockfish 19", BRIDGE), ("Stockfish 16", "ChessBase")]);
         assert_eq!(found[0].path, installed);
+        let versions: Vec<Option<&str>> = found.iter().map(|f| f.version.as_deref()).collect();
+        assert_eq!(versions, [Some("19"), None], "only a build the bridge installed has a version");
+    }
+
+    /// A build laid out as `stockfish::install` lays it out is listed with the
+    /// version that finds its licence: the folder names are the bridge's own,
+    /// and nobody else parses them.
+    #[test]
+    fn a_build_the_bridge_installed_names_the_version_that_finds_its_licence() {
+        use crate::stockfish::{self, Arch, Build};
+        let t = Tree::new("licence");
+        let data = t.0.join("data");
+        let build = Build::for_arch(Arch::X86_64);
+        for file in [build.installed(&data), build.dir(&data).join(stockfish::LICENCE)] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"MZ").unwrap();
+        }
+        let found = find(&Roots { bridge_data: Some(data.clone()), ..Roots::default() });
+        assert_eq!(found.len(), 1);
+        let version = found[0].version.as_deref().expect("a version");
+        assert_eq!(version, build.version);
+        let licence = stockfish::licence(&data, version).expect("a Stockfish version");
+        assert_eq!(licence, build.dir(&data).join(stockfish::LICENCE));
+        assert!(licence.is_file());
     }
 
     #[test]
