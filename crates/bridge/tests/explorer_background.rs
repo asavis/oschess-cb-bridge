@@ -76,6 +76,15 @@ fn built_for(dir: &Path, id: &str) -> Option<u64> {
     Header::decode(&head).map(|h| h.generation)
 }
 
+/// Sets the modification time of every file in `dir` ten minutes back.
+fn backdate(dir: &Path) {
+    let a_while_ago = SystemTime::now() - Duration::from_secs(600);
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let file = std::fs::File::options().write(true).open(entry.unwrap().path()).unwrap();
+        file.set_modified(a_while_ago).unwrap();
+    }
+}
+
 /// The generation of the database at `path` now.
 fn generation(path: &Path) -> u64 {
     Catalog::new([path.to_path_buf()]).entries()[0].generation().unwrap()
@@ -115,16 +124,18 @@ impl Machine for Computer {
     }
 }
 
-/// A cloud provider keeping `files` in the cloud, which counts downloads.
+/// A cloud provider keeping `files` in the cloud, and every file while
+/// `everything` is set, which counts downloads.
 #[derive(Default)]
 struct Provider {
     files: HashSet<PathBuf>,
+    everything: AtomicBool,
     fetches: AtomicUsize,
 }
 
 impl Cloud for Provider {
     fn is_cloud_only(&self, path: &Path, _: &Metadata) -> bool {
-        self.files.contains(path)
+        self.everything.load(Ordering::SeqCst) || self.files.contains(path)
     }
 
     fn fetch(&self, _: &Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
@@ -473,11 +484,7 @@ fn a_background_build_waits_on_battery() {
 fn a_database_unchanged_for_the_quiet_period_is_built_at_the_first_look() {
     let db = copies("background-old", 10);
     let path = db.dir().join("db.2cbh");
-    let a_while_ago = SystemTime::now() - Duration::from_secs(600);
-    for entry in std::fs::read_dir(db.dir()).unwrap() {
-        let file = std::fs::File::options().write(true).open(entry.unwrap().path()).unwrap();
-        file.set_modified(a_while_ago).unwrap();
-    }
+    backdate(db.dir());
     let (id, dir) = (id_of(&path), data_dir("old"));
     let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
     // A tick and a quiet period of an hour: only the first look can build it.
@@ -486,6 +493,83 @@ fn a_database_unchanged_for_the_quiet_period_is_built_at_the_first_look() {
     wait("the index was not built at the first look", 60, || built_for(&dir, &id) == Some(generation(&path)));
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A database replaced while the bridge watches it waits for the quiet
+/// period, even when the replacement's files keep older modification times,
+/// as a synced or restored copy's do; then it is built.
+#[test]
+fn a_replaced_database_with_old_modification_times_waits_until_it_is_quiet() {
+    let db = copies("background-replaced", 10);
+    let path = db.dir().join("db.2cbh");
+    backdate(db.dir());
+    let (id, dir) = (id_of(&path), data_dir("replaced"));
+    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    let quiet = Duration::from_secs(3);
+    bridge.keep(quiet);
+    let first = generation(&path);
+    wait("the old database was not built at the first look", 60, || built_for(&dir, &id) == Some(first));
+    wait("the first build did not end", 60, || bridge.building().is_empty());
+    // A copy of more games, its files dated as long ago, moved over the old.
+    let next = copies("background-replaced-next", 11);
+    backdate(next.dir());
+    let replaced = Instant::now();
+    for entry in std::fs::read_dir(next.dir()).unwrap() {
+        let from = entry.unwrap().path();
+        std::fs::rename(&from, db.dir().join(from.file_name().unwrap())).unwrap();
+    }
+    let second = generation(&path);
+    assert_ne!(second, first);
+    while replaced.elapsed() < quiet / 2 {
+        assert_eq!(built_for(&dir, &id), Some(first), "rebuilt before the quiet period");
+        assert!(bridge.building().is_empty(), "queued before the quiet period: {:?}", bridge.building());
+        std::thread::sleep(TICK);
+    }
+    wait("the replaced database was not built once quiet", 60, || built_for(&dir, &id) == Some(second));
+    assert!(replaced.elapsed() >= quiet, "built after {:?}", replaced.elapsed());
+    drop(bridge);
+    drop(next);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A database queued for a background build that goes to the cloud while the
+/// build waits keeps its generation, yet is not read (#149): the build is
+/// dropped at its turn, and nothing is downloaded. Back on this computer, it
+/// is built.
+#[test]
+fn a_queued_background_build_is_dropped_when_its_database_goes_to_the_cloud() {
+    let root = data_dir("gone-cloud");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = copies("background-gone-cloud", 10);
+    let path = db.dir().join("db.2cbh");
+    let id = id_of(&path);
+    let config = root.join("bridge.toml");
+    std::fs::write(&config, format!("databases = ['{}']\n", path.display())).unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog =
+        Catalog::with_sources(Sources { config: Some(config.clone()), ..Sources::default() }, provider.clone());
+    let computer = Arc::new(Computer::default());
+    computer.battery.store(true, Ordering::SeqCst);
+    catalog.explorer.set_machine(computer.clone());
+    let bridge = Bridge::new(catalog, &root);
+    bridge.keep(Duration::ZERO);
+    // The only database is in use from the start; on battery its build waits.
+    wait("the background build was not queued", 60, || phase(bridge.port, &id).as_deref() == Some("waiting"));
+    let queued = generation(&path);
+    provider.everything.store(true, Ordering::SeqCst);
+    let entry = bridge.app.catalog.get(&id).unwrap();
+    assert!(entry.open().is_err(), "a cloud-only database opened");
+    assert_eq!(entry.generation(), Some(queued), "going to the cloud changed the generation");
+    computer.battery.store(false, Ordering::SeqCst);
+    wait("the build was not dropped", 60, || bridge.building().is_empty());
+    std::thread::sleep(TICK * 10);
+    assert!(built_for(&root, &id).is_none(), "a cloud-only database was read");
+    assert!(bridge.building().is_empty(), "queued while cloud-only: {:?}", bridge.building());
+    assert_eq!(provider.fetches.load(Ordering::SeqCst), 0, "the database was downloaded");
+    provider.everything.store(false, Ordering::SeqCst);
+    wait("the database was not built once back", 60, || built_for(&root, &id) == Some(queued));
+    drop(bridge);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// A background build gives way to a search (#149): while the search runs,

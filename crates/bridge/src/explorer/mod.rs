@@ -286,7 +286,9 @@ impl Registry {
     /// When its turn comes, a build of a database that changed since is
     /// dropped: the next request, or the keeper once the database is quiet,
     /// queues the build of its new generation. So is a background build of a
-    /// database that left the list. A build that would not fit the free space
+    /// database that left the list, or that can no longer be read without a
+    /// download: gone cloud-only, or downloading, which leave its generation
+    /// as it was. A build that would not fit the free space
     /// of the index folder's disk fails, and one stopped for a requested build
     /// of another database, or for battery power, waits for its turn again.
     fn queue(
@@ -305,7 +307,14 @@ impl Registry {
         let (machine, limits) = (self.builds.machine(), *lock(&self.limits));
         let (job_state, p, id) = (Arc::clone(state), Arc::clone(&progress), entry.id.clone());
         let work = move |kind: Kind| {
-            if entry.generation() != Some(generation) || (kind == Kind::Background && !entry.listed()) {
+            // Asked at every turn, a stopped build's too. A background build
+            // reads the database only while it opens at the build's
+            // generation: listed, wholly on this computer and not downloading.
+            let current = match kind {
+                Kind::Requested => entry.generation() == Some(generation),
+                Kind::Background => entry.open().is_ok_and(|now| now.generation == generation),
+            };
+            if !current {
                 *lock(&job_state) = State::Idle;
                 return Ran::Done;
             }

@@ -12,6 +12,8 @@
 //! PGN file waits until its header index is ready), and once it has had its
 //! generation for the quiet period: a database that keeps changing, as while
 //! ChessBase writes to it or a cloud provider syncs it, waits until it stops.
+//! A database first seen has had its generation since its files last
+//! changed; a change seen afterwards starts the quiet period afresh.
 //! A build that failed, or had no room on the disk, is not tried again in the
 //! background until the database changes.
 
@@ -148,9 +150,16 @@ impl Registry {
             let Ok(open) = open else { continue };
             let since = match seen.get(&entry.id) {
                 Some(s) if s.generation == open.generation => s.since,
-                // A generation first seen: the database has had it since its
+                // A generation that replaced one seen here is new now, whatever
+                // its files' modification times: a synced or restored copy
+                // keeps older ones.
+                Some(_) => {
+                    seen.insert(entry.id.clone(), Seen { generation: open.generation, since: now });
+                    now
+                }
+                // A database first seen has had its generation since its
                 // files last changed, as far as the quiet period goes back.
-                _ => {
+                None => {
                     let age = changed.and_then(|t| SystemTime::now().duration_since(t).ok()).unwrap_or_default();
                     let since = now.checked_sub(age.min(quiet)).unwrap_or(now);
                     seen.insert(entry.id.clone(), Seen { generation: open.generation, since });
