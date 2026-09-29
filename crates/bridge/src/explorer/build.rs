@@ -674,47 +674,79 @@ mod tests {
         assert_eq!(stuck.state.into_inner().unwrap().sink, [0, 1]);
     }
 
+    /// Whether this is the child that runs the test's body. The parent runs
+    /// the test `name` of this binary in a child process with `workers`
+    /// workers, which [`threads`] reads once a process, whatever the
+    /// computer's processors, and checks it passed within `limit`: a child
+    /// still running then is killed, and the test fails.
+    fn in_child(name: &str, workers: usize, limit: Duration) -> bool {
+        const CHILD: &str = "BRIDGE_BUILD_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let log = std::env::temp_dir().join(format!("bridge-build-child-{}.log", std::process::id()));
+        let file = File::create(&log).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("OSCHESS_BRIDGE_THREADS", workers.to_string())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        let Some(status) = status else { panic!("{name} did not end within {limit:?}:\n{text}") };
+        assert!(status.success() && text.contains("1 passed"), "{text}");
+        false
+    }
+
     /// A worker that panics before it hands over its unit stops the others
     /// (#172): one waiting for the room that unit would free stops, rather
-    /// than waiting for ever, and the panic reaches the pass's caller.
+    /// than waiting for ever, and the panic reaches the pass's caller. The
+    /// two workers it takes run in a child process, which has them however
+    /// many the computer or `OSCHESS_BRIDGE_THREADS` gives this one.
     #[test]
     fn a_worker_that_panics_stops_one_waiting_for_its_turn() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        let (ended, pass) = mpsc::channel();
-        std::thread::spawn(move || {
-            loop {
-                let place = |out: &mut Vec<usize>, unit: usize| {
-                    out.push(unit);
-                    Ok(())
-                };
-                // Room for one byte: unit 1 is kept, and unit 2 waits for unit 0.
-                let turns = Turns::new(3, 1, Vec::new(), &place, &|()| Ok(()));
-                let ran = catch_unwind(AssertUnwindSafe(|| {
-                    workers::run(2, 0, &Cancel::never(), |w| {
-                        if w.count < 2 {
-                            return Err(SearchError::Busy);
-                        }
-                        if w.index == 1 {
-                            turns.put(1, 1, 1, true, &|| w.stopped())?;
-                            return turns.put(2, 2, 1, true, &|| w.stopped());
-                        }
-                        while turns.state.lock().unwrap_or_else(|e| e.into_inner()).bytes == 0 {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        panic!("a bug in the worker making unit 0");
-                    })
-                }));
-                if !matches!(ran, Ok(Err(SearchError::Busy))) {
-                    let _ = ended.send(ran.is_err());
-                    return;
+        let name = "explorer::build::tests::a_worker_that_panics_stops_one_waiting_for_its_turn";
+        if !in_child(name, 2, Duration::from_secs(60)) {
+            return;
+        }
+        assert_eq!(threads(), 2);
+        let place = |out: &mut Vec<usize>, unit: usize| {
+            out.push(unit);
+            Ok(())
+        };
+        // Room for one byte: unit 1 is kept, and unit 2 waits for unit 0.
+        let turns = Turns::new(3, 1, Vec::new(), &place, &|()| Ok(()));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workers::run(2, 0, &Cancel::never(), |w| {
+                if w.count < 2 {
+                    return Err(SearchError::Busy);
                 }
-                // Fewer than two workers were free.
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-        let panicked = pass.recv_timeout(Duration::from_secs(30)).expect("the pass ended");
-        assert!(panicked, "the panic reached the caller");
+                if w.index == 1 {
+                    turns.put(1, 1, 1, true, &|| w.stopped())?;
+                    return turns.put(2, 2, 1, true, &|| w.stopped());
+                }
+                while turns.state.lock().unwrap_or_else(|e| e.into_inner()).bytes == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                panic!("a bug in the worker making unit 0");
+            })
+        }));
+        assert!(ran.is_err(), "the panic reached the caller: {:?}", ran.ok());
     }
 
     /// A worker whose buffer is full leaves the chunks to the others while
