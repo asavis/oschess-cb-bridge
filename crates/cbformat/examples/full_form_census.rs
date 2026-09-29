@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 
+use cbformat::fixture::{unbase64url, unpercent};
 use cbformat::game::{Annotation, Head, RecordKind};
 use cbformat::pgn::{self, Options};
 use cbformat::view::{Base, Format};
@@ -35,40 +36,6 @@ struct Totals {
     differing: u64,
     /// Decoded and recovered annotations, by kind.
     kinds: BTreeMap<String, (u64, u64)>,
-}
-
-fn unpercent(v: &str) -> Vec<u8> {
-    let b = v.as_bytes();
-    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
-    while i < b.len() {
-        match (b[i], v.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
-            (b'%', Some(x)) => {
-                out.push(x);
-                i += 3;
-            }
-            (c, _) => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-fn unbase64url(s: &str) -> Vec<u8> {
-    let value = |c: u8| match c {
-        b'A'..=b'Z' => c - b'A',
-        b'a'..=b'z' => c - b'a' + 26,
-        b'0'..=b'9' => c - b'0' + 52,
-        b'-' => 62,
-        _ => 63,
-    };
-    let mut out = Vec::new();
-    for chunk in s.as_bytes().chunks(4) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &c)| n | u32::from(value(c)) << (18 - 6 * i));
-        out.extend((0..chunk.len().saturating_sub(1)).map(|i| (n >> (16 - 8 * i)) as u8));
-    }
-    out
 }
 
 /// A command's `key=value` fields.
@@ -109,8 +76,10 @@ fn recovered(pgn: &str, format: Format) -> Vec<Item> {
         if let Some(rest) = body.strip_prefix("[%cbtext ") {
             let f = fields(rest.trim_end_matches(']'));
             let placement = if f.get("before") == Some(&"1") { "before" } else { "after" };
-            let lang = String::from_utf8_lossy(&unpercent(f.get("lang").unwrap_or(&""))).into_owned();
-            let item = (format!("text {lang} {placement}"), unpercent(f.get("value").unwrap_or(&"")));
+            // A value that does not decode is recovered empty, and so differs.
+            let value = |k: &str| f.get(k).and_then(|v| unpercent(v)).unwrap_or_default();
+            let lang = String::from_utf8_lossy(&value("lang")).into_owned();
+            let item = (format!("text {lang} {placement}"), value("value"));
             match texts.last_mut().filter(|_| last_visible && !f.contains_key("alone")) {
                 Some(visible) => *visible = item,
                 None => texts.push(item),
@@ -122,7 +91,7 @@ fn recovered(pgn: &str, format: Format) -> Vec<Item> {
         for cmd in body.split("[%").skip(1).map(|c| c.split(']').next().unwrap_or("")) {
             let (name, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
             let f = fields(rest);
-            let data = || f.get("data").map(|d| unbase64url(d)).unwrap_or_default();
+            let data = || f.get("data").and_then(|d| unbase64url(d)).unwrap_or_default();
             let item = match name {
                 "cbsymbols" | "cbsquares" | "cbarrows" => (name.trim_start_matches("cb").to_string(), data()),
                 "cbraw" => (f.get("type").unwrap_or(&"?").to_string(), data()),

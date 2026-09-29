@@ -1,4 +1,5 @@
-//! Small databases for tests, written to a temporary directory.
+//! Small databases for tests, written to a temporary directory, and the
+//! readings of the PGN written from them that the tests and examples share.
 //!
 //! Built only with the `fixture` feature, which the tests of this workspace
 //! enable; a release build never contains it.
@@ -8,7 +9,8 @@ use std::path::{Path, PathBuf};
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 use crate::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece, Sq};
-use crate::v2::checksum;
+use crate::pgn::{self, AnnotationStatus, Options};
+use crate::v2::{Database, checksum};
 
 /// A square from its name: `sq("e4")`.
 pub fn sq(name: &str) -> Sq {
@@ -251,6 +253,82 @@ impl Builder {
     }
 }
 
+/// A one-game database written as [`Builder::write`] writes it under `name`:
+/// a move record of variant 1 holding `words`, and the annotation record
+/// `content` when there is one.
+pub fn one_game(name: &str, words: &[u16], content: Option<&[u8]>) -> TempDb {
+    let mut b = Builder::new();
+    let moves = b.moves(1, words);
+    match content {
+        Some(c) => {
+            let a = b.annotations(c);
+            b.annotated_game(moves, a);
+        }
+        None => {
+            b.game(moves);
+        }
+    }
+    b.write(name)
+}
+
+/// Game 1 of `db` as PGN under `options`: its movetext, as [`pgn_movetext`]
+/// takes it, and how much of its annotations it holds.
+pub fn rendered(db: &TempDb, options: &Options) -> (String, AnnotationStatus) {
+    let db = Database::open(db.base()).unwrap();
+    let r = pgn::game_with(&db, 1, options).unwrap();
+    (pgn_movetext(&r.pgn), r.annotations)
+}
+
+/// The movetext of a PGN record of a game White won, as the builders of both
+/// formats write them: what follows the tags, without the result.
+pub fn pgn_movetext(pgn: &str) -> String {
+    pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string()
+}
+
+/// A value of the full PGN form percent-decoded, as its reader decodes it;
+/// `None` when a `%` is not followed by two hex digits.
+pub fn unpercent(v: &str) -> Option<Vec<u8>> {
+    let b = v.as_bytes();
+    let hex = |i: usize| b.get(i).and_then(|&c| char::from(c).to_digit(16));
+    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+    while i < b.len() {
+        if b[i] == b'%' {
+            out.push((hex(i + 1)? << 4 | hex(i + 2)?) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// The data of a full PGN form's command: base64 in the URL alphabet without
+/// padding. `None` for a character outside that alphabet, or for a length no
+/// encoding has.
+pub fn unbase64url(s: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    };
+    if s.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 2);
+    for chunk in s.as_bytes().chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= u32::from(value(c)?) << (18 - 6 * i);
+        }
+        out.extend((0..chunk.len() - 1).map(|i| (n >> (16 - 8 * i)) as u8));
+    }
+    Some(out)
+}
+
 /// Builds a `DBItems.cbini` database window list, item by item, in the layout
 /// `crate::dbitems` reads.
 #[derive(Default)]
@@ -354,6 +432,14 @@ pub fn symbols(on_move: u8, on_position: u8, prefix: u8) -> Vec<u8> {
     vec![3, 0, on_move, on_position, prefix]
 }
 
+/// An annotation of type `code` with `data`, its bytes after the type, as
+/// they are.
+pub fn other(code: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = code.to_le_bytes().to_vec();
+    v.extend(data);
+    v
+}
+
 /// A square numbered from 1, file by file, as annotations store it.
 fn cb_square(name: &str) -> u8 {
     let s = sq(name);
@@ -376,4 +462,24 @@ pub fn arrows(items: &[(u8, &str, &str)]) -> Vec<u8> {
     v.extend((data.len() as i32).to_le_bytes());
     v.extend(data);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_form_values_are_read_strictly() {
+        assert_eq!(unpercent("x%3By%3Dz%5D%7D%25%0A%20%C3%A9").unwrap(), "x;y=z]}%\n é".as_bytes());
+        assert_eq!(unpercent("a-b.c_d~e").unwrap(), b"a-b.c_d~e");
+        for bad in ["%", "%2", "a%2", "%+1", "%zz", "%é1"] {
+            assert_eq!(unpercent(bad), None, "{bad}");
+        }
+        for (text, data) in [("", &b""[..]), ("Zg", b"f"), ("Zm8", b"fo"), ("Zm9v", b"foo"), ("-_8", &[0xfb, 0xff])] {
+            assert_eq!(unbase64url(text).unwrap(), data, "{text}");
+        }
+        for bad in ["Z", "Zm9vY", "Zm9v=", "Zm+v", "Zm/v", "Zm9 "] {
+            assert_eq!(unbase64url(bad), None, "{bad}");
+        }
+    }
 }

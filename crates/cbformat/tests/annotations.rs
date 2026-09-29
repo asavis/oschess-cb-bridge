@@ -1,6 +1,6 @@
 //! Annotations placed by PGN-order position, with texts, symbols and graphics.
 
-use cbformat::fixture::{Builder, TempDb, annotations, arrows, quiet, squares, symbols, text};
+use cbformat::fixture::{Builder, annotations, arrows, one_game, quiet, rendered, squares, symbols, text};
 use cbformat::game::language;
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, AnnotationStatus, Options};
@@ -23,28 +23,6 @@ fn after(i: i32) -> (i32, Vec<Vec<u8>>) {
 fn render(name: &str, words: &[u16], content: &[u8], options: &Options) -> (String, AnnotationStatus) {
     let db = one_game(name, words, Some(content));
     rendered(&db, options)
-}
-
-fn one_game(name: &str, words: &[u16], content: Option<&[u8]>) -> TempDb {
-    let mut b = Builder::new();
-    let moves = b.moves(1, words);
-    match content {
-        Some(c) => {
-            let a = b.annotations(c);
-            b.annotated_game(moves, a);
-        }
-        None => {
-            b.game(moves);
-        }
-    }
-    b.write(name)
-}
-
-fn rendered(db: &TempDb, options: &Options) -> (String, AnnotationStatus) {
-    let db = Database::open(db.base()).unwrap();
-    let r = pgn::game_with(&db, 1, options).unwrap();
-    let movetext = r.pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string();
-    (movetext, r.annotations)
 }
 
 #[test]

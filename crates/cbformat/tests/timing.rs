@@ -2,12 +2,11 @@
 //! decoders of types 26, 21, 07 and 24, damaged payloads included, and how
 //! both PGN forms write them.
 
-use cbformat::fixture::{Builder, TempDb, annotations, quiet};
+use cbformat::fixture::{TempDb, annotations, one_game, other, pgn_movetext, quiet, rendered};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
 use cbformat::game::timing::{self, Evaluation, Score, Stage};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, Options};
-use cbformat::v2::Database;
 use chesscore::Board;
 
 /// Type-26 data in 2CBH layout from (value, depth, flag) entries.
@@ -47,12 +46,6 @@ fn control(stages: &[(i32, i32, u16, u8)]) -> Vec<u8> {
     }
     d.extend([0; 4]);
     d
-}
-
-fn other(code: u16, data: &[u8]) -> Vec<u8> {
-    let mut v = code.to_le_bytes().to_vec();
-    v.extend(data);
-    v
 }
 
 #[test]
@@ -144,11 +137,7 @@ fn every_time_the_bridge_writes() {
         (0, vec![other(0x07, &[0, 59, 59, 255])]),
         (1, vec![other(0x24, &control(&[(i32::MAX, 1, u16::MAX, 3)]))]),
     ]);
-    let mut b = Builder::new();
-    let moves = three_moves(&mut b);
-    let a = b.annotations(&content);
-    b.annotated_game(moves, a);
-    let db = b.write("timing-extremes");
+    let db = one_game("timing-extremes", &three_moves(), Some(&content));
     let full = render(&db, true);
     assert!(full.starts_with("{[%cbraw type=24;data="), "{full}");
     assert!(!full.contains("0.25"), "{full}");
@@ -157,24 +146,20 @@ fn every_time_the_bridge_writes() {
 }
 
 /// 1. e4 e5 2. Nf3
-fn three_moves(b: &mut Builder) -> i64 {
+fn three_moves() -> [u16; 5] {
     use Color::{Black as B, White as W};
-    b.moves(
-        1,
-        &[
-            movetable::MOVES,
-            quiet(W, Piece::Pawn, "e2", "e4"),
-            quiet(B, Piece::Pawn, "e7", "e5"),
-            quiet(W, Piece::Knight, "g1", "f3"),
-            movetable::END_OF_LINE,
-        ],
-    )
+    [
+        movetable::MOVES,
+        quiet(W, Piece::Pawn, "e2", "e4"),
+        quiet(B, Piece::Pawn, "e7", "e5"),
+        quiet(W, Piece::Knight, "g1", "f3"),
+        movetable::END_OF_LINE,
+    ]
 }
 
+/// The movetext of game 1, in the full form or not.
 fn render(db: &TempDb, full: bool) -> String {
-    let db = Database::open(db.base()).unwrap();
-    let r = pgn::game_with(&db, 1, &Options { full, ..Options::default() }).unwrap();
-    r.pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string()
+    rendered(db, &Options { full, ..Options::default() }).0
 }
 
 #[test]
@@ -186,11 +171,7 @@ fn both_forms_write_the_evaluations_and_the_full_form_the_moves_scores() {
         (0, vec![other(0x07, &[0, 12, 0, 0])]),
         (2, vec![other(0x21, &engine(-250, 0, 24)), other(0x07, &[0, 5, 1, 0])]),
     ]);
-    let mut b = Builder::new();
-    let moves = three_moves(&mut b);
-    let a = b.annotations(&content);
-    b.annotated_game(moves, a);
-    let db = b.write("timing-forms");
+    let db = one_game("timing-forms", &three_moves(), Some(&content));
     assert_eq!(render(&db, false), "{[%evp 0,3,15,32,-29997,32767]} 1. e4 e5 2. Nf3");
     let full = render(&db, true);
     assert!(full.starts_with("{[%evp 0,3,15,32,-29997,32767]} {[%cbraw type=26;data="), "the data is kept: {full}");
@@ -209,11 +190,7 @@ fn damaged_payloads_are_kept_raw() {
     let mut bad = evals_2cbh(&[(15, 20, 0), (32, 20, 0)]);
     bad[5] = 3;
     let content = annotations(&[(-1, vec![other(0x26, &bad)]), (0, vec![other(0x07, &[0, 75, 0, 0])])]);
-    let mut b = Builder::new();
-    let moves = three_moves(&mut b);
-    let a = b.annotations(&content);
-    b.annotated_game(moves, a);
-    let db = b.write("timing-damaged");
+    let db = one_game("timing-damaged", &three_moves(), Some(&content));
     assert_eq!(render(&db, false), "1. e4 e5 2. Nf3");
     let full = render(&db, true);
     assert!(!full.contains("[%evp") && !full.contains("[%eval") && !full.contains("[%emt"), "{full}");
@@ -238,7 +215,7 @@ fn a_classic_game_writes_the_same_evaluations() {
     let db = cbformat::cbh::Database::open(f.base()).unwrap();
     let render = |full: bool| {
         let r = pgn::classic_game_with(&db, 1, &Options { full, ..Options::default() }).unwrap();
-        r.pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string()
+        pgn_movetext(&r.pgn)
     };
     assert_eq!(render(false), "{[%evp 0,2,15,32,-29997]} 1. e4 e5");
     let full = render(true);

@@ -3,12 +3,15 @@
 //! command that keeps its data, and game quotations and medals in the reading
 //! form as ChessBase's own export writes them.
 
-use cbformat::fixture::{Builder, TempDb, annotations, arrows, quiet, squares, symbols, text};
+use cbformat::fixture::{
+    TempDb, annotations, arrows, bytes, one_game, other, pgn_movetext, quiet, rendered, squares, symbols, text,
+    unpercent,
+};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
-use cbformat::game::{Date, Quotation, language};
+use cbformat::game::{Date, GameAnnotations, Quotation, Unknown, language};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, AnnotationStatus, Options};
-use cbformat::v2::Database;
+use cbformat::v2::{Database, GameMoves};
 use chesscore::Board;
 
 use Color::{Black as B, White as W};
@@ -22,27 +25,9 @@ fn two_moves() -> [u16; 4] {
     [MOVES, quiet(W, Pawn, "e2", "e4"), quiet(B, Pawn, "e7", "e5"), END]
 }
 
-fn one_game(name: &str, words: &[u16], content: &[u8]) -> TempDb {
-    let mut b = Builder::new();
-    let moves = b.moves(1, words);
-    let a = b.annotations(content);
-    b.annotated_game(moves, a);
-    b.write(name)
-}
-
 /// The movetext and annotation status of game 1, in the full form or not.
 fn render(db: &TempDb, full: bool) -> (String, AnnotationStatus) {
-    let db = Database::open(db.base()).unwrap();
-    let r = pgn::game_with(&db, 1, &Options { full, ..Options::default() }).unwrap();
-    let movetext = r.pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string();
-    (movetext, r.annotations)
-}
-
-/// An annotation of type `code` with `data` after its type.
-fn other(code: u16, data: &[u8]) -> Vec<u8> {
-    let mut v = code.to_le_bytes().to_vec();
-    v.extend(data);
-    v
+    rendered(db, &Options { full, ..Options::default() })
 }
 
 fn int(n: usize) -> [u8; 4] {
@@ -168,7 +153,7 @@ fn every_language_is_a_comment_of_its_own() {
         (0, vec![text(false, language::GERMAN, "Zentrum"), squares(&[(2, "d5")]), arrows(&[(4, "g1", "f3")])]),
         (1, vec![text(false, 9, "other number")]),
     ]);
-    let db = one_game("full-languages", &two_moves(), &content);
+    let db = one_game("full-languages", &two_moves(), Some(&content));
     let (full, status) = render(&db, true);
     assert_eq!(
         full,
@@ -203,7 +188,7 @@ fn every_other_type_is_a_command_that_keeps_its_data() {
             other(0x16, &[0x10, 0x27, 0, 0]),
         ],
     )]);
-    let db = one_game("full-types", &two_moves(), &content);
+    let db = one_game("full-types", &two_moves(), Some(&content));
     let (full, status) = render(&db, true);
     assert_eq!(status, AnnotationStatus::Complete);
     let want = [
@@ -244,7 +229,7 @@ fn a_game_quotation_as_command_and_as_chessbase_writes_it() {
     ];
     let spec = Spec { moves: &moves, event: "Café; [a=b] 100%", ..Spec::default() };
     let content = annotations(&[(0, vec![text(false, language::ENGLISH, "see"), other(0x13, &quote_2cbh(&spec))])]);
-    let db = one_game("full-quote", &two_moves(), &content);
+    let db = one_game("full-quote", &two_moves(), Some(&content));
     let (reading, _) = render(&db, false);
     assert_eq!(reading, "1. e4 {see 1-0 Morphy,P (2690)-Anderssen,A (2600) Café; [a=b] 100% Paris 1858 (3)} 1... e5");
     let (full, _) = render(&db, true);
@@ -288,25 +273,25 @@ fn quotations_keep_what_is_not_decoded() {
     let db = one_game(
         "full-castles",
         &two_moves(),
-        &annotations(&[(0, vec![other(0x13, &quote_2cbh(&Spec { moves: &castles, ..Spec::default() }))])]),
+        Some(&annotations(&[(0, vec![other(0x13, &quote_2cbh(&Spec { moves: &castles, ..Spec::default() }))])])),
     );
     assert!(render(&db, true).0.contains("4.%20O-O;"));
     // A set-up start: the position is not understood, so the moves stay in the data.
     let set_up = quote_2cbh(&Spec { moves: &castles, set_up: true, ..Spec::default() });
     let q = Quotation::parse_2cbh(&set_up).unwrap();
     assert!(q.set_up && q.moves.is_empty());
-    let db = one_game("full-set-up", &two_moves(), &annotations(&[(0, vec![other(0x13, &set_up)])]));
+    let db = one_game("full-set-up", &two_moves(), Some(&annotations(&[(0, vec![other(0x13, &set_up)])])));
     let (full, _) = render(&db, true);
     assert!(full.contains("[%cbquote result=1-0;") && !full.contains("moves="), "{full}");
     // Moves that do not replay are left out too.
     let illegal = quote_2cbh(&Spec { moves: &[[sq("e2"), sq("e5")]], ..Spec::default() });
-    let db = one_game("full-illegal", &two_moves(), &annotations(&[(0, vec![other(0x13, &illegal)])]));
+    let db = one_game("full-illegal", &two_moves(), Some(&annotations(&[(0, vec![other(0x13, &illegal)])])));
     assert!(!render(&db, true).0.contains("moves="));
     // A layout not understood is kept raw.
     let db = one_game(
         "full-bad-quote",
         &two_moves(),
-        &annotations(&[(0, vec![other(0x13, &[1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 3, b'a', b'b'])])]),
+        Some(&annotations(&[(0, vec![other(0x13, &[1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 3, b'a', b'b'])])])),
     );
     assert!(Database::open(db.base()).is_ok());
 }
@@ -345,7 +330,7 @@ fn the_chessbase_text_follows_chessbase() {
 #[test]
 fn an_unknown_layout_keeps_the_rest_of_the_record() {
     let content = annotations(&[(0, vec![text(false, language::ENGLISH, "ok"), vec![0x1a, 0, 9, 8, 7]])]);
-    let db = one_game("full-rest", &two_moves(), &content);
+    let db = one_game("full-rest", &two_moves(), Some(&content));
     let (full, status) = render(&db, true);
     assert_eq!(status, AnnotationStatus::Incomplete { type_code: 0x1a });
     // The rest: what follows the type code, the end marker included.
@@ -358,7 +343,7 @@ fn annotations_past_the_end_follow_the_last_move_in_the_full_form() {
         (1, vec![text(false, language::ENGLISH, "last")]),
         (2, vec![text(true, language::GERMAN, "danach"), other(0x22, &[8, 0, 0, 0])]),
     ]);
-    let db = one_game("full-past-end", &two_moves(), &content);
+    let db = one_game("full-past-end", &two_moves(), Some(&content));
     assert_eq!(
         render(&db, true).0,
         "1. e4 e5 {[%lang en] last} {[%lang de] danach} {[%cbtext lang=de;before=1;value=danach]} {[%mdl 8]}"
@@ -385,7 +370,7 @@ fn a_classic_game_keeps_its_languages_quotations_and_data() {
     let db = cbformat::cbh::Database::open(f.base()).unwrap();
     let render = |full: bool| {
         let r = pgn::classic_game_with(&db, 1, &Options { full, ..Options::default() }).unwrap();
-        r.pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string()
+        pgn_movetext(&r.pgn)
     };
     assert_eq!(
         render(false),
@@ -399,23 +384,6 @@ fn a_classic_game_keeps_its_languages_quotations_and_data() {
     assert!(full.contains("date=1858.12.20;round=7;eco=A20;data=") && !full.contains("moves="), "{full}");
     // Classic layouts other than the quotation's are kept as their data.
     assert!(full.ends_with("[%mdl 4] [%cbraw type=18;data=Ag]}"), "{full}");
-}
-
-/// Percent-decoding, as a reader of the full form does it.
-fn unpercent(v: &str) -> String {
-    let b = v.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap());
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).unwrap()
 }
 
 /// The texts a reader recovers from a full form, in order: a `[%cbtext]`
@@ -433,7 +401,8 @@ fn recovered_texts(full: &str) -> Vec<(String, bool, String)> {
         if let Some(rest) = body.strip_prefix("[%cbtext ") {
             let fields: Vec<(&str, &str)> =
                 rest.trim_end_matches(']').split(';').map(|f| f.split_once('=').unwrap()).collect();
-            let get = |k: &str| fields.iter().find(|f| f.0 == k).map(|f| unpercent(f.1));
+            let get =
+                |k: &str| fields.iter().find(|f| f.0 == k).map(|f| String::from_utf8(unpercent(f.1).unwrap()).unwrap());
             let text = (get("lang").unwrap(), get("before").as_deref() == Some("1"), get("value").unwrap());
             match out.last_mut().filter(|_| last_visible && get("alone").is_none()) {
                 Some(visible) => *visible = text,
@@ -451,7 +420,7 @@ fn a_text_is_recovered_byte_for_byte() {
     let mut blocks: Vec<(i32, Vec<Vec<u8>>)> =
         originals.iter().map(|t| (0, vec![text(false, language::ENGLISH, t)])).collect();
     blocks.push((1, vec![text(true, language::GERMAN, "vor e5"), text(false, language::GERMAN, "")]));
-    let db = one_game("full-text-values", &two_moves(), &annotations(&blocks));
+    let db = one_game("full-text-values", &two_moves(), Some(&annotations(&blocks)));
     let (full, _) = render(&db, true);
     let mut want: Vec<(String, bool, String)> =
         originals.iter().map(|t| ("en".to_string(), false, t.to_string())).collect();
@@ -476,7 +445,7 @@ fn every_colour_and_game_symbols_are_kept() {
         (-1, vec![symbols(1, 10, 140), squares(&[(7, "a1")])]),
         (0, vec![squares(&[(2, "e4"), (7, "d5")]), arrows(&[(8, "b1", "c3")]), symbols(0, 14, 0)]),
     ]);
-    let db = one_game("full-colours", &two_moves(), &content);
+    let db = one_game("full-colours", &two_moves(), Some(&content));
     let (full, _) = render(&db, true);
     // The game comment: no NAG can stand before the first move, and colour 7
     // has no [%csl] letter; both are commands.
@@ -557,8 +526,44 @@ fn conforms(name: &str, body: &str) -> bool {
     }
 }
 
-#[test]
-fn every_command_keeps_to_its_grammar() {
+/// A training list: a count, then per item two bytes and a text.
+fn training_list(items: &[&str]) -> Vec<u8> {
+    let mut v = (items.len() as u16).to_le_bytes().to_vec();
+    for item in items {
+        v.extend([1, 0]);
+        v.extend(int(item.len()));
+        v.extend(item.as_bytes());
+    }
+    v
+}
+
+/// A training question of `variant` 1 or 2 (`docs/format-notes.md`): its
+/// header, 30 seconds, 5 points, the question and three responses, and two
+/// solutions in the variant's layout.
+fn training(variant: u8) -> Vec<u8> {
+    let mut v = vec![1, 1, variant, 0, 0, 0];
+    v.extend(int(30));
+    v.extend(5u16.to_le_bytes());
+    for list in [&["Which move?"][..], &["Nf3"], &["d4", "c4"], &[]] {
+        v.extend(training_list(list));
+    }
+    v.push(2);
+    for answer in ["Nf3", "d4"] {
+        if variant == 1 {
+            v.extend([sq("g1") + 1, sq("f3") + 1, 0, 0]);
+            v.extend(training_list(&[answer]));
+        } else {
+            v.push(3);
+            v.extend(training_list(&[answer]));
+            v.extend(training_list(&["Right", "again"]));
+        }
+    }
+    v
+}
+
+/// Annotations of every type whose layout the reader knows, with payloads
+/// the full form decodes, on the game (−1), on 1. e4 (0) and on 1... e5 (1).
+fn every_type() -> Vec<(i32, Vec<Vec<u8>>)> {
     let evaluations = [&[1u8][..], &int(10), &2u16.to_le_bytes(), &[20, 0, 18, 0], &[253, 255, 1, 1]].concat();
     let mut stages = vec![1u8];
     for (initial, increment, moves, kind) in [(540_000i32, 3000i32, 40u16, 1u8), (180_025, 3000, 1000, 3), (0, 0, 0, 0)]
@@ -570,13 +575,10 @@ fn every_command_keeps_to_its_grammar() {
     let link = [&[1u8][..], &int(url.len()), url.as_bytes(), &int(caption.len()), caption.as_bytes()].concat();
     let caption_v = "Vidé]";
     let video = [&[1u8, 0, 0, 0][..], &int(caption_v.len()), caption_v.as_bytes()].concat();
-    let training = [&[1u8, 1, 1, 0, 0, 0][..], &int(30), &5u16.to_le_bytes(), &[0; 8], &[0]].concat();
-    let quote = quote_2cbh(&Spec {
-        moves: &[[sq("e2"), sq("e4")], [sq("e7"), sq("e5")]],
-        event: "Café; [a=b] 100%",
-        ..Spec::default()
-    });
-    let content = annotations(&[
+    let moves = [[sq("e2"), sq("e4")], [sq("e7"), sq("e5")]];
+    let quote = quote_2cbh(&Spec { moves: &moves, event: "Café; [a=b] 100%", ..Spec::default() });
+    let set_up = quote_2cbh(&Spec { moves: &moves, set_up: true, ..Spec::default() });
+    vec![
         (
             -1,
             vec![
@@ -586,6 +588,8 @@ fn every_command_keeps_to_its_grammar() {
                 other(0x26, &evaluations),
                 other(0x24, &stages),
                 other(0x16, &[0x10, 0x27, 0, 0]),
+                other(0x17, &[0x20, 0x4e, 0, 0]),
+                other(0x08, &[1, 2, 3, 4]),
             ],
         ),
         (
@@ -604,16 +608,24 @@ fn every_command_keeps_to_its_grammar() {
                 other(0x23, &[1, 2, 3, 4]),
                 other(0x1c, &link),
                 other(0x20, &video),
-                other(0x09, &training),
+                other(0x09, &training(1)),
                 other(0x07, &[0, 12, 1, 0]),
                 other(0x21, &[0x06, 0xff, 0, 0, 0x18, 0]),
+                other(0x25, &[0, 1, 0, 0]),
+                other(0x27, &[1, 0]),
             ],
         ),
-    ]);
-    let all = one_game("grammar-all", &two_moves(), &content);
+        (1, vec![text(false, language::ENGLISH, "reply"), other(0x13, &set_up), other(0x09, &training(2))]),
+    ]
+}
+
+#[test]
+fn every_command_keeps_to_its_grammar() {
+    let content = annotations(&every_type());
+    let all = one_game("grammar-all", &two_moves(), Some(&content));
     let (full_all, status) = render(&all, true);
     assert_eq!(status, AnnotationStatus::Complete, "every synthetic annotation decodes: {full_all}");
-    let rest = one_game("grammar-rest", &two_moves(), &annotations(&[(0, vec![vec![0x1a, 0, 9, 8, 7]])]));
+    let rest = one_game("grammar-rest", &two_moves(), Some(&annotations(&[(0, vec![vec![0x1a, 0, 9, 8, 7]])])));
     let moves = move_record(0, None, None, &encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
     let quote_classic = quote_classic(&Spec::default());
     let items: Vec<(i32, u8, &[u8])> = vec![(0, 0x13, &quote_classic), (0, 0x18, &[2]), (0, 0x02, b"\x00\x91Nation")];
@@ -670,5 +682,53 @@ fn every_command_keeps_to_its_grammar() {
         ("other", "x"),
     ] {
         assert!(!conforms(name, body), "[%{name} {body}]");
+    }
+}
+
+/// Every one-byte change and every truncation of a record holding every type
+/// of known layout, and one of unknown layout, is decoded and written in both
+/// forms, or refused: never a panic. The types carry no length field, so a
+/// changed byte sends the parser into the middle of the next one.
+#[test]
+fn mutated_records_never_panic() {
+    let mut blocks = every_type();
+    // What follows a type of unknown layout is the record's undecoded rest.
+    blocks.push((1, vec![other(0x1a, &[9, 8, 7]), text(false, language::ENGLISH, "rest")]));
+    let content = annotations(&blocks);
+    let words = bytes(&two_moves());
+    let moves = GameMoves::parse(1, &words).unwrap();
+    let forms = [Options::default(), Options { full: true, ..Options::default() }];
+    let write = |content: &[u8]| {
+        let a = GameAnnotations::parse(content)?;
+        forms.iter().map(|options| pgn::movetext_annotated(&moves, &a, options)).collect::<cbformat::Result<Vec<_>>>()
+    };
+    // The record itself decodes up to the unknown type, and its two forms
+    // hold what every decoder makes of it.
+    let a = GameAnnotations::parse(&content).unwrap();
+    assert_eq!(a.stopped_at, Some(Unknown { position: 1, type_code: 0x1a }));
+    let written = write(&content).unwrap();
+    let [reading, full] = &written[..] else { panic!("two forms") };
+    assert_eq!(reading.matches("1-0 Morphy,P (2690)-Anderssen,A (2600)").count(), 2, "{reading}");
+    for command in [
+        "[%evp 0,1,20,-29997]",
+        "{[%eval -2.50] [%emt 0:01:12]}",
+        "[%cbtimecontrol kindA=1",
+        "[%cbtraining variant=1;seconds=30;points=5;",
+        "[%cbtraining variant=2;seconds=30;points=5;",
+        "moves=1.%20e4%20e5;",
+        "[%cblink url=",
+        "[%cbvideo language=0;caption=",
+        "[%cbrest type=1a;",
+    ] {
+        assert!(full.contains(command), "{command} in {full}");
+    }
+    assert_eq!(full.matches("[%cbquote ").count(), 2, "{full}");
+    for i in 0..content.len() {
+        for v in [0, 1, 0x7f, 0x80, 0xfe, 0xff, content[i] ^ 1, content[i] ^ 0x80] {
+            let mut m = content.clone();
+            m[i] = v;
+            let _ = write(&m);
+        }
+        let _ = write(&content[..i]);
     }
 }

@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 
+use cbformat::fixture::unbase64url;
 use cbformat::game::{Quotation, RecordKind};
 use cbformat::pgn::{self, Options};
 use cbformat::v2::Database;
@@ -360,28 +361,6 @@ fn texts_of(full: &str, keep: impl Fn(&str) -> bool) -> BTreeMap<usize, String> 
         }
     }
     out
-}
-
-fn unbase64url(s: &str) -> Option<Vec<u8>> {
-    let value = |c: u8| match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'-' => Some(62),
-        b'_' => Some(63),
-        _ => None,
-    };
-    let mut out = Vec::new();
-    for chunk in s.as_bytes().chunks(4) {
-        let mut n = 0u32;
-        for (i, &c) in chunk.iter().enumerate() {
-            n |= u32::from(value(c)?) << (18 - 6 * i);
-        }
-        for i in 0..chunk.len().saturating_sub(1) {
-            out.push((n >> (16 - 8 * i)) as u8);
-        }
-    }
-    Some(out)
 }
 
 /// Whether every move that differs is ChessBase naming the origin of a move

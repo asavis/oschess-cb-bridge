@@ -2,6 +2,7 @@
 //! written as PGN exactly as 2CBH annotations are.
 
 use cbformat::cbh::{Database, annotations};
+use cbformat::fixture::pgn_movetext;
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
 use cbformat::game::{Annotation, Arrow, Square, language};
 use cbformat::pgn::{self, AnnotationStatus, Options};
@@ -58,8 +59,7 @@ fn db(name: &str, moves: &[u8], items: &[(i32, u8, &[u8])]) -> (cbformat::fixtur
 
 fn movetext(db: &Database, options: &Options) -> (String, AnnotationStatus) {
     let r = pgn::classic_game_with(db, 1, options).unwrap();
-    let text = r.pgn.split("\n\n").nth(1).unwrap().trim_end().trim_end_matches("1-0").trim_end().to_string();
-    (text, r.annotations)
+    (pgn_movetext(&r.pgn), r.annotations)
 }
 
 #[test]

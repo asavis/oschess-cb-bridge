@@ -2,11 +2,13 @@
 //! incomplete output.
 
 use cbformat::Error;
-use cbformat::fixture::{Builder, TempDb, bytes, lid_header, quiet, sq};
+use cbformat::fixture::{self, Builder, TempDb, annotations, bytes, lid_header, quiet, sq, symbols, text};
+use cbformat::game::GameAnnotations;
 use cbformat::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece};
-use cbformat::pgn::{self, movetext_of};
-use cbformat::replay::walk_tree;
+use cbformat::pgn::{self, Options, movetext_of};
+use cbformat::replay::{start_board, walk_tree};
 use cbformat::v2::{Database, GameMoves};
+use chesscore::Board;
 
 const MOVES: u16 = movetable::MOVES;
 const END: u16 = movetable::END_OF_LINE;
@@ -114,6 +116,78 @@ fn king_taking_its_own_rook_is_not_castling() {
     let content = set_up(castle);
     let moves = GameMoves::parse(2, &content).unwrap();
     assert_eq!(movetext_of(&moves).unwrap(), "1. O-O");
+}
+
+/// A move record from a set-up position with every castling right and an en
+/// passant capture on offer, and variations nested two deep.
+fn set_up_with_variations() -> Vec<u8> {
+    use Color::{Black as B, White as W};
+    let piece = |c, p, at| movetable::encode_piece_word(c, p, sq(at)).unwrap();
+    let start = Board::from_fen("r3k2r/1P6/8/3pP3/8/8/8/R3K2R w KQkq d6 0 20").unwrap();
+    let main = fixture::words(&mut start.clone(), "e5d6 e8g8 b7b8q a8b8");
+    let mut board = start.clone();
+    let castle = fixture::words(&mut board, "e1c1");
+    let check = fixture::words(&mut board.clone(), "a8a1 c1d2");
+    let takes = fixture::words(&mut board, "h8h1 d1h1");
+    let mut w = vec![
+        movetable::START_POSITION,
+        20,      // move number
+        15 << 8, // white to move, every castling right
+        4,       // en passant on the d file
+        piece(W, Piece::King, "e1"),
+        piece(W, Piece::Rook, "a1"),
+        piece(W, Piece::Rook, "h1"),
+        piece(W, Piece::Pawn, "b7"),
+        piece(W, Piece::Pawn, "e5"),
+        piece(B, Piece::King, "e8"),
+        piece(B, Piece::Rook, "a8"),
+        piece(B, Piece::Rook, "h8"),
+        piece(B, Piece::Pawn, "d5"),
+        MOVES,
+        main[0],
+        ALT,
+    ];
+    w.extend(&main[1..]);
+    w.extend([NULL, END, castle[0], takes[0], ALT, takes[1], END]);
+    w.extend(check);
+    w.push(END);
+    bytes(&w)
+}
+
+/// Every one-byte change and every truncation of a move record with a set-up
+/// position and nested variations, read as normal chess and as Chess960, is
+/// walked to its end and written as PGN, annotated in the full form, or
+/// refused: never a panic.
+#[test]
+fn mutated_move_records_never_panic() {
+    let content = set_up_with_variations();
+    let moves = GameMoves::parse(1, &content).unwrap();
+    assert_eq!(
+        movetext_of(&moves).unwrap(),
+        "20. exd6 (20. O-O-O Rxh1 (20... Ra1+ 21. Kd2) 21. Rxh1) 20... O-O 21. b8=Q Raxb8 22. --"
+    );
+    let blocks: Vec<(i32, Vec<Vec<u8>>)> =
+        (-1..12).map(|p| (p, vec![text(false, 0, &format!("p{p}")), symbols(1, 14, 0)])).collect();
+    let notes = GameAnnotations::parse(&annotations(&blocks)).unwrap();
+    let full = Options { full: true, ..Options::default() };
+    let read = |content: &[u8]| {
+        for tag in [1, 2] {
+            let Ok(moves) = GameMoves::parse(tag, content) else { continue };
+            let _ = moves.start().and_then(|s| start_board(&s));
+            let _ = moves.main_line().count();
+            let _ = walk_tree(&moves, |_, _, _| {});
+            let _ = movetext_of(&moves);
+            let _ = pgn::movetext_annotated(&moves, &notes, &full);
+        }
+    };
+    for i in 0..content.len() {
+        for v in [0, 1, 0x7f, 0x80, 0xfe, 0xff, content[i] ^ 1, content[i] ^ 0x80] {
+            let mut m = content.clone();
+            m[i] = v;
+            read(&m);
+        }
+        read(&content[..i]);
+    }
 }
 
 // ------------------------------------------------------- whole databases
