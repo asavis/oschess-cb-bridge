@@ -109,16 +109,30 @@ pub fn u64_at(b: &[u8], at: usize) -> u64 {
     b.get(at..).and_then(|b| b.first_chunk()).map_or(0, |c| u64::from_le_bytes(*c))
 }
 
-/// CRC-32 (IEEE 802.3), as zlib and PNG compute it, eight bytes at a time:
-/// every index file is checked with it, each block of the position index and
-/// of the heads file as it is read.
+/// CRC-32 (IEEE 802.3), as zlib and PNG compute it: every index file is
+/// checked with it, each block of the position index and of the heads file as
+/// it is read.
 pub fn crc32(bytes: &[u8]) -> u32 {
     !crc32_update(!0, bytes)
 }
 
 /// Continues a CRC-32 over `bytes` from `state`, which starts at `!0`; the
-/// CRC of all the bytes so fed is `!state`.
+/// CRC of all the bytes so fed is `!state`. On a processor that multiplies
+/// without carries, 64 bytes at a time ([`clmul`]), and what is left eight
+/// bytes at a time from tables, as a short input is and as other processors
+/// take all of it.
 pub fn crc32_update(state: u32, bytes: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= clmul::LEAST && clmul::available() {
+        // SAFETY: the processor has the instructions `update` is compiled for.
+        let (state, rest) = unsafe { clmul::update(state, bytes) };
+        return crc32_tables(state, rest);
+    }
+    crc32_tables(state, bytes)
+}
+
+/// [`crc32_update`] eight bytes at a time, from tables.
+fn crc32_tables(state: u32, bytes: &[u8]) -> u32 {
     let t = &*TABLES;
     let mut c = state;
     let (chunks, rest) = bytes.as_chunks::<8>();
@@ -137,6 +151,86 @@ pub fn crc32_update(state: u32, bytes: &[u8]) -> u32 {
         c = t[0][((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
     }
     c
+}
+
+/// CRC-32 by carry-less multiplication, as Linux's `crc32-pclmul` computes
+/// it (Gopal et al., "Fast CRC Computation for Generic Polynomials Using
+/// PCLMULQDQ Instruction", Intel, 2009): four 16-byte lanes folded 64 bytes
+/// ahead at a time, folded into one, then reduced to 32 bits (Barrett). The
+/// constants are powers of x modulo the reflected polynomial.
+#[cfg(target_arch = "x86_64")]
+mod clmul {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_extract_epi32, _mm_set_epi32,
+        _mm_set_epi64x, _mm_srli_si128, _mm_xor_si128,
+    };
+
+    /// The least input folded: shorter ones go faster through the tables.
+    pub const LEAST: usize = 128;
+
+    /// x^(4*128+32) and x^(4*128-32), x^(128+32) and x^(128-32), x^64, the
+    /// polynomial, and the Barrett constant, all mod P(x) and reflected.
+    const K1: i64 = 0x1_5444_2bd4;
+    const K2: i64 = 0x1_c6e4_1596;
+    const K3: i64 = 0x1_7519_97d0;
+    const K4: i64 = 0x0_ccaa_009e;
+    const K5: i64 = 0x1_63cd_6124;
+    const POLY: i64 = 0x1_db71_0641;
+    const MU: i64 = 0x1_f701_1641;
+
+    /// Whether this processor has what [`update`] is compiled for.
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("pclmulqdq") && std::arch::is_x86_feature_detected!("sse4.1")
+    }
+
+    /// `state` continued over the whole 16-byte blocks of `bytes`, at least
+    /// [`LEAST`] bytes, and the bytes left after them.
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    pub fn update(state: u32, bytes: &[u8]) -> (u32, &[u8]) {
+        let (blocks, rest) = bytes.as_chunks::<16>();
+        let [a, b, c, d, more @ ..] = blocks else { return (state, bytes) };
+        let mut lanes = [load(a), load(b), load(c), load(d)];
+        lanes[0] = _mm_xor_si128(lanes[0], _mm_cvtsi32_si128(state as i32));
+        let ahead = _mm_set_epi64x(K2, K1);
+        let (quads, singles) = more.as_chunks::<4>();
+        for quad in quads {
+            for (lane, block) in lanes.iter_mut().zip(quad) {
+                *lane = fold(*lane, load(block), ahead);
+            }
+        }
+        let next = _mm_set_epi64x(K4, K3);
+        let [a, b, c, d] = lanes;
+        let mut x = fold(fold(fold(a, b, next), c, next), d, next);
+        for block in singles {
+            x = fold(x, load(block), next);
+        }
+        // 128 bits to 64, then 64 to 32.
+        let low32 = _mm_set_epi32(0, 0, 0, !0);
+        let x = _mm_xor_si128(_mm_clmulepi64_si128::<0x10>(x, next), _mm_srli_si128::<8>(x));
+        let x = _mm_xor_si128(
+            _mm_clmulepi64_si128::<0x00>(_mm_and_si128(x, low32), _mm_set_epi64x(0, K5)),
+            _mm_srli_si128::<4>(x),
+        );
+        let poly = _mm_set_epi64x(MU, POLY);
+        let t1 = _mm_clmulepi64_si128::<0x10>(_mm_and_si128(x, low32), poly);
+        let t2 = _mm_clmulepi64_si128::<0x00>(_mm_and_si128(t1, low32), poly);
+        (_mm_extract_epi32::<1>(_mm_xor_si128(x, t2)) as u32, rest)
+    }
+
+    /// `a` folded ahead onto `b` by the powers `k`.
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    fn fold(a: __m128i, b: __m128i, k: __m128i) -> __m128i {
+        _mm_xor_si128(_mm_xor_si128(b, _mm_clmulepi64_si128::<0x00>(a, k)), _mm_clmulepi64_si128::<0x11>(a, k))
+    }
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    fn load(b: &[u8; 16]) -> __m128i {
+        let (lo, hi) = b.split_at(8);
+        let half = |h: &[u8]| i64::from_le_bytes(h.try_into().unwrap_or_default());
+        _mm_set_epi64x(half(hi), half(lo))
+    }
 }
 
 static TABLES: LazyLock<[[u32; 256]; 8]> = LazyLock::new(|| {
@@ -193,6 +287,40 @@ mod tests {
             assert_eq!(crc32(&bytes[..len]), bytewise(&bytes[..len]), "{len}");
         }
         assert_eq!(!crc32_update(crc32_update(!0, &bytes[..13]), &bytes[13..]), crc32(&bytes));
+    }
+
+    /// Long inputs, which a processor that multiplies without carries folds
+    /// 64 bytes at a time, give the CRC eight bytes at a time from tables
+    /// gives, and a byte at a time: every length to 1,100 bytes, whole blocks
+    /// and their rests, from any state, fed whole or in two pieces.
+    #[test]
+    fn a_long_input_gives_the_same_crc() {
+        let bytewise = |mut c: u32, bytes: &[u8]| {
+            for &b in bytes {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            c
+        };
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let bytes: Vec<u8> = (0..70_000).map(|_| next() as u8).collect();
+        for len in (0..=1_100).chain([4_096, 65_536, 70_000]) {
+            let state = next() as u32;
+            let whole = crc32_update(state, &bytes[..len]);
+            assert_eq!(whole, crc32_tables(state, &bytes[..len]), "{len}");
+            assert_eq!(whole, bytewise(state, &bytes[..len]), "{len}");
+            let cut = len / 3;
+            assert_eq!(crc32_update(crc32_update(state, &bytes[..cut]), &bytes[cut..len]), whole, "{len} cut");
+        }
+        assert_eq!(crc32(&[b'1'; 200][..]), !bytewise(!0, &[b'1'; 200]));
     }
 
     /// Only a name the bridge writes is a database's file: 16 hex digits in
