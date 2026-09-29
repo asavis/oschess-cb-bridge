@@ -150,6 +150,14 @@ it over HTTP as oschess does:
   first line, and the lines a second;
 - a small answer over a kept and over a new connection.
 
+With `--background`, the first bridge keeps its indexes as a serving bridge
+does (#149): the database, the largest one ready, has its position index
+built unasked from the bridge's start, while the flows run. Each sort and
+search row says whether the build still ran, and the time from the bridge's
+start to the index ready, with its phases, replaces the build the first
+explorer request starts. Timed with and without it, the sorts and searches
+show what a background build costs them.
+
 The `--index` folder stands for the bridge's data folder: every index the
 child bridge builds, a PGN file's header index included, goes there as it
 would in the data folder, the position indexes in its `index` folder, and

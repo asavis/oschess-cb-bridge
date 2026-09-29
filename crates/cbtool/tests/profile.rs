@@ -107,3 +107,44 @@ fn notable_games_are_counted_as_whole_rows() {
     assert!(text.contains("passes 1, replay"), "{text}");
     assert!(out.status.success(), "{text}");
 }
+
+/// With `--background`, the bridge builds the position index unasked (#149):
+/// the flows wait for it rather than start it, time it from the bridge's
+/// start, and say of each sort and search whether the build still ran.
+#[test]
+fn the_background_build_is_timed_from_the_bridges_start() {
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    b.game(e4);
+    b.game(e4);
+    let db = b.write("cbtool-profile-background");
+    // Written a while ago, so quiet from the start.
+    let a_while_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    for entry in std::fs::read_dir(db.dir()).unwrap() {
+        let file = std::fs::File::options().write(true).open(entry.unwrap().path()).unwrap();
+        file.set_modified(a_while_ago).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(db.dir().join("db.2cbh"))
+        .arg("--index")
+        .arg(db.dir().join("index"))
+        .arg("--background")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("background build to ready"), "{text}");
+    assert!(text.contains("from the bridge's start, no position asked; stream 2 games"), "{text}");
+    assert!(!text.contains("build to first answer"), "{text}");
+    for phase in ["stream pass", "tree passes", "deep passes"] {
+        assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");
+    }
+    let timed = |l: &&str| (l.starts_with("sort ") || l.starts_with("search ")) && !l.contains(" suggested ");
+    for row in text.lines().filter(timed) {
+        assert!(row.ends_with("during the build") || row.ends_with("after the build"), "{row}");
+    }
+    assert!(out.status.success(), "{text}");
+}
