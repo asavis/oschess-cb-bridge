@@ -22,6 +22,8 @@
 //! (`OSCHESS_BRIDGE_BACKGROUND_MODE`) and how long it gave way to the flows at
 //! most at a time, replaces the build the first explorer request starts.
 
+mod json;
+
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -32,16 +34,19 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
-use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use bridge::engine::{Engine, EngineConfig};
 use bridge::explorer::runs::{PassTime, Timings};
+use bridge::search::heads;
 use bridge::server;
+use bridge::sources::Sources;
+use bridge::{folders, start};
 use cbformat::game::{Head, RecordKind};
 use cbformat::pgnfile::lex::Lexer;
 use cbformat::pgnfile::line::main_line;
 use cbformat::view::Base;
 use chesscore::Board;
+use json::Value;
 
 use super::AnyResult;
 
@@ -130,11 +135,12 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
         None => Engine::none(),
     };
     let policy = Policy { port, origins: DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect(), token: TOKEN.into() };
-    let app = App { engine, ..App::new("profile", policy, Catalog::new([PathBuf::from(db)])) };
-    // The `--index` folder stands for the data folder: every index the bridge
+    // Set up as a start sets a bridge up, serving the one database. The
+    // `--index` folder stands for the data folder: every index the bridge
     // builds goes there, never into the real data folder, whose indexes would
     // make the first answers warm.
-    app.catalog.use_data_dir(Path::new(index));
+    let sources = Sources { fixed: vec![PathBuf::from(db)], ..Sources::default() };
+    let app = start::setup(Path::new(index), "profile", policy, sources, engine);
     let mut out = std::io::stdout();
     writeln!(out, "port {port}")?;
     out.flush()?;
@@ -162,14 +168,16 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     Ok(true)
 }
 
-/// A bridge serving one database in a child process, killed when dropped,
-/// and the lines it prints after its port, each with when it came.
+/// A bridge serving one database in a child process, killed when dropped, the
+/// connection the flows ask it on, and the lines it prints after its port,
+/// each with when it came.
 struct Served {
     child: Child,
     /// Held open for the bridge's life: the bridge ends when it closes.
     _input: ChildStdin,
-    port: u16,
-    id: String,
+    c: Client,
+    /// It keeps its indexes as a bridge that serves does (#149).
+    background: bool,
     lines: mpsc::Receiver<(Instant, String)>,
     built: OnceCell<(Instant, Timings)>,
 }
@@ -195,15 +203,15 @@ impl Served {
     /// `/v1/status` lists the build in a phase other than `waiting`. A build
     /// not started yet, as while the keeper waits for the database to be
     /// quiet, or waiting for its turn, reads nothing.
-    fn build(&self, c: &mut Client, o: &Options) -> Option<Build> {
-        if !o.background {
+    fn build(&mut self) -> Option<Build> {
+        if !self.background {
             return None;
         }
         if self.built(Duration::ZERO).is_some() {
             return Some(Build::Built);
         }
-        Some(match c.get("/v1/status", true) {
-            Ok((200, body)) if strings(&body, "phase").iter().any(|p| p != "waiting") => Build::Running,
+        Some(match self.c.get("/v1/status", true) {
+            Ok((200, body)) if phases(&Value::of(&body)).iter().any(|p| *p != "waiting") => Build::Running,
             _ => Build::Idle,
         })
     }
@@ -269,13 +277,14 @@ fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
             }
         }
     });
-    Ok(Served { child, _input: input, port, id: id_of(&o.db), lines, built: OnceCell::new() })
+    Ok(Served { child, _input: input, c: Client::new(port), background, lines, built: OnceCell::new() })
 }
 
 /// A failed answer, by its status and the bridge's error code only: a code is
 /// a fixed identifier, and the rest of the answer may hold a name or a path.
 fn failure(status: u16, body: &[u8]) -> String {
-    let code = strings(body, "code").into_iter().next().unwrap_or_default();
+    let answer = Value::of(body);
+    let code = answer.get("error").get("code").str().unwrap_or_default();
     let code: String = code.chars().filter(|c| c.is_ascii_lowercase() || *c == '_').collect();
     if code.is_empty() { format!("{status}") } else { format!("{status} {code}") }
 }
@@ -457,101 +466,34 @@ impl Table {
     }
 }
 
-/// A number member `"key":123` of a JSON text.
-fn number(json: &[u8], key: &str) -> Option<u64> {
-    let text = std::str::from_utf8(json).ok()?;
-    let at = text.find(&format!("\"{key}\":"))? + key.len() + 3;
-    let digits: String = text[at..].chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+/// The whole number member `key` of an answer, such as a list's `total` or a
+/// position's `games`.
+fn count(body: &[u8], key: &str) -> Option<u64> {
+    Value::of(body).get(key).u64()
 }
 
-/// The rows of a games window.
-fn row_count(json: &[u8]) -> usize {
-    String::from_utf8_lossy(json).matches("{\"number\":").count()
+/// The records of database `id` in the database list.
+fn records_of(list: &[u8], id: &str) -> Option<u64> {
+    let list = Value::of(list);
+    let entry = list.get("databases").items().iter().find(|d| d.get("id").str() == Some(id))?;
+    entry.get("records").u64()
 }
 
-/// Every string member `"key":"…"` of a JSON text, unescaped.
-fn strings(json: &[u8], key: &str) -> Vec<String> {
-    let text = String::from_utf8_lossy(json);
-    let pat = format!("\"{key}\":\"");
-    let mut out = Vec::new();
-    let mut rest = &text[..];
-    while let Some(at) = rest.find(&pat) {
-        rest = &rest[at + pat.len()..];
-        let mut value = String::new();
-        let mut chars = rest.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' => break,
-                '\\' => match chars.next() {
-                    Some('n') => value.push('\n'),
-                    Some('t') => value.push('\t'),
-                    Some('r') => value.push('\r'),
-                    Some('b') => value.push('\u{8}'),
-                    Some('f') => value.push('\u{c}'),
-                    Some('u') => {
-                        let hex = |chars: &mut std::str::Chars<'_>| {
-                            let h: String = chars.by_ref().take(4).collect();
-                            u32::from_str_radix(&h, 16).ok()
-                        };
-                        let Some(mut code) = hex(&mut chars) else { break };
-                        if (0xd800..0xdc00).contains(&code) {
-                            // A surrogate pair: `\uD8xx\uDCxx`.
-                            let low = match (chars.next(), chars.next()) {
-                                (Some('\\'), Some('u')) => hex(&mut chars).filter(|l| (0xdc00..0xe000).contains(l)),
-                                _ => None,
-                            };
-                            code = low.map_or(0xfffd, |low| 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00));
-                        }
-                        value.push(char::from_u32(code).unwrap_or('\u{fffd}'));
-                    }
-                    Some(other) => value.push(other),
-                    None => break,
-                },
-                c => value.push(c),
-            }
-        }
-        out.push(value);
-    }
-    out
+/// The names a suggestion answer suggests.
+fn values(body: &[u8]) -> Vec<String> {
+    let answer = Value::of(body);
+    answer.get("suggestions").items().iter().filter_map(|s| s.get("value").str().map(str::to_string)).collect()
 }
 
-/// The objects of the first array member `key` of a JSON text, each as its
-/// text: a scan that keeps to strings and nesting. Empty when there is none.
-fn objects(json: &[u8], key: &str) -> Vec<String> {
-    let text = String::from_utf8_lossy(json);
-    let open = format!("\"{key}\":[");
-    let Some(at) = text.find(&open) else { return Vec::new() };
-    let rest = &text[at + open.len()..];
-    let (mut out, mut depth, mut from, mut in_string, mut escaped) = (Vec::new(), 0u32, 0, false, false);
-    for (at, c) in rest.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            _ if in_string => {}
-            '{' => {
-                if depth == 0 {
-                    from = at;
-                }
-                depth += 1;
-            }
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    out.push(rest[from..=at].to_string());
-                }
-            }
-            ']' if depth == 0 => break,
-            _ => {}
-        }
-    }
-    out
+/// The phases of the index builds `/v1/status` lists.
+fn phases(status: &Value) -> Vec<&str> {
+    status.get("indexing").items().iter().filter_map(|b| b.get("phase").str()).collect()
 }
 
-/// Whether a `topGames` entry is `row`, member for member, and then `year`.
-fn row_and_year(entry: &str, row: &str) -> bool {
-    row.strip_suffix('}').and_then(|open| entry.strip_prefix(open)).is_some_and(|rest| rest.starts_with(",\"year\":"))
+/// Whether a `topGames` entry is `row`, member for member, and its `year`.
+fn row_and_year(entry: &Value, row: &Value) -> bool {
+    let mut rest = entry.members().cloned().unwrap_or_default();
+    rest.remove("year").is_some() && row.members() == Some(&rest)
 }
 
 /// A query parameter's value, percent-encoded.
@@ -618,7 +560,7 @@ fn build_index(c: &mut Client, path: &str, polls: &mut u64) -> Result<(), String
             Ok((200, _)) => return Ok(()),
             // `409 database_unavailable` with `state: "indexing"` while the
             // index is built; `503 index_unavailable` when its build failed.
-            Ok((409, body)) if strings(&body, "state").iter().any(|s| s == "indexing") => {
+            Ok((409, body)) if Value::of(&body).get("error").get("state").str() == Some("indexing") => {
                 *polls += 1;
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -656,353 +598,455 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         return Err("--index must name a new or empty folder, so that the index build is measured".into());
     }
     std::fs::create_dir_all(&o.index)?;
-    let mut table = Table::default();
     println!("{:<12} {:<30} {:>3} {:>10} {:>10} {:>10}  counts", "flow", "case", "n", "median ms", "min ms", "max ms");
+    let id = id_of(&o.db);
+    let mut p = Profile { base: format!("/v1/databases/{id}"), id, o, table: Table::default() };
 
-    // Opening: the bridge starts, then its first answers open the database.
+    // The first bridge: the flows that open the database and fill its caches,
+    // and the position index's build.
     let launched = Instant::now();
-    let served = spawn(&o, o.background)?;
-    let start = ms(launched.elapsed());
-    let base = format!("/v1/databases/{}", served.id);
-    let mut c = Client::new(served.port);
-    let mut first = Samples::default();
-    let status = first.get(&mut c, "/v1/status", true);
-    table.once("opening", "bridge process start", start, "");
-    // With `--background`, the phases of the build already listed.
-    let phases = match status {
-        Some(body) if o.background => format!("indexing: {}", strings(&body, "phase").join(" ")),
-        _ => String::new(),
-    };
-    table.row("opening", "first status", &mut first, &phases);
-    let mut first_list = Samples::default();
-    let records = first_list.get(&mut c, "/v1/databases", true).and_then(|list| number(&list, "records"));
-    let Some(records) = records else {
-        table.row("opening", "first database list", &mut first_list, "the database is not ready");
-        return Ok(false);
-    };
-    table.row("opening", "first database list", &mut first_list, &format!("{records} records"));
-    for (case, path) in [("status", "/v1/status"), ("database list", "/v1/databases")] {
-        let mut s = Samples::default();
-        for _ in 0..RUNS {
-            s.get(&mut c, path, true);
-        }
-        table.row("opening", case, &mut s, "");
+    let mut served = spawn(&p.o, p.o.background)?;
+    let Some(records) = p.opening(&mut served, ms(launched.elapsed())) else { return Ok(false) };
+    p.sorts(&mut served);
+    p.windows(&mut served, records);
+    let player = p.suggestions(&mut served);
+    let searches = p.searches(&mut served, player);
+    p.pgn(&mut served)?;
+    p.index(&mut served, launched, records);
+    drop(served);
+
+    // New bridges, their caches empty, on the files the first one wrote.
+    let mut again = p.new_bridge()?;
+    p.with_heads(&mut again, &searches);
+    p.with_names(&searches)?;
+    if p.o.engine.is_some() {
+        p.engines(&mut again)?;
+    }
+    p.http(&mut again);
+    Ok(!p.table.failed)
+}
+
+/// What the flows share: the options, the table printed, and the database,
+/// which has the same id in every bridge.
+struct Profile {
+    o: Options,
+    table: Table,
+    id: String,
+    /// `/v1/databases/{id}`.
+    base: String,
+}
+
+/// The searches the flows time, by name and query.
+type Searches = Vec<(&'static str, String)>;
+
+/// The positions whose games are listed, by case: its name, what its first
+/// window takes at most, and its positions in FEN.
+type Positions = Vec<(String, u32, Vec<String>)>;
+
+/// `path` asked once, while the bridge's caches are cold for it, then
+/// [`RUNS`] times cached: the samples of each, and the cold answer when it
+/// succeeded.
+fn cold_then_cached(c: &mut Client, path: &str) -> (Samples, Option<Vec<u8>>, Samples) {
+    let mut cold = Samples::default();
+    let body = cold.get(c, path, true);
+    let mut cached = Samples::default();
+    for _ in 0..RUNS {
+        cached.get(c, path, true);
+    }
+    (cold, body, cached)
+}
+
+impl Profile {
+    /// A new bridge that builds no index unasked: its caches empty, and the
+    /// index folder holding what the bridges before it wrote.
+    fn respawn(&self) -> AnyResult<Served> {
+        spawn(&self.o, false)
     }
 
-    // Sorts: the first order of each key over all records, then cached.
-    for key in SORT_KEYS {
-        let path = format!("{base}/games?sort={key}&limit=500");
-        let before = served.build(&mut c, &o);
+    /// The position `fen` in the explorer.
+    fn explorer(&self, fen: &str) -> String {
+        format!("{}/explorer?fen={}", self.base, encode(fen))
+    }
+
+    /// Where the bridges keep the position index and the heads and names
+    /// files: the index folder of their data folder, `--index`.
+    fn index_folder(&self) -> PathBuf {
+        folders::index_dir(&self.o.index)
+    }
+
+    /// A row of `path` asked once, cold.
+    fn cold(&mut self, served: &mut Served, flow: &str, case: &str, path: &str, counts: &str) {
         let mut cold = Samples::default();
-        let total = cold.get(&mut c, &path, true).and_then(|body| number(&body, "total"));
-        let mut warm = Samples::default();
-        for _ in 0..RUNS {
-            warm.get(&mut c, &path, true);
-        }
-        let during = during(before, served.build(&mut c, &o));
-        let rows = total.map_or(String::new(), |t| format!("{t} rows"));
-        table.row("sort", &format!("{key} cold"), &mut cold, &format!("{rows}{during}"));
-        table.row("sort", &format!("{key} cached"), &mut warm, during.trim_start_matches(", "));
+        cold.get(&mut served.c, path, true);
+        self.table.row(flow, case, &mut cold, counts);
     }
 
-    // Windows of 500 rows at the start, the middle and the end, with and
-    // without the main line.
-    let last = records.saturating_sub(500);
-    for (place, offset) in [("start", 0), ("middle", records / 2), ("end", last)] {
-        for (form, extra) in [("", ""), (" line=60", "&line=60")] {
-            let path = format!("{base}/games?offset={offset}&limit=500{extra}");
+    /// The rows of a sort or a search, `path`: its first answer, cold, with
+    /// the answer's `total` counted as `what`, then the cached ones, each
+    /// saying what it saw of the build.
+    fn sort_or_search(&mut self, served: &mut Served, flow: &str, name: &str, path: &str, what: &str) {
+        let before = served.build();
+        let (mut cold, body, mut cached) = cold_then_cached(&mut served.c, path);
+        let during = during(before, served.build());
+        let total = body.and_then(|b| count(&b, "total")).map_or(String::new(), |t| format!("{t} {what}"));
+        self.table.row(flow, &format!("{name} cold"), &mut cold, &format!("{total}{during}"));
+        self.table.row(flow, &format!("{name} cached"), &mut cached, during.trim_start_matches(", "));
+    }
+
+    /// Opening: the bridge started in `start` ms, then its first answers open
+    /// the database. Its records; `None` when it is not ready.
+    fn opening(&mut self, served: &mut Served, start: f64) -> Option<u64> {
+        let mut first = Samples::default();
+        let status = first.get(&mut served.c, "/v1/status", true);
+        self.table.once("opening", "bridge process start", start, "");
+        // With `--background`, the phases of the build already listed.
+        let indexing = match status {
+            Some(body) if self.o.background => format!("indexing: {}", phases(&Value::of(&body)).join(" ")),
+            _ => String::new(),
+        };
+        self.table.row("opening", "first status", &mut first, &indexing);
+        let mut first_list = Samples::default();
+        let records = first_list.get(&mut served.c, "/v1/databases", true).and_then(|list| records_of(&list, &self.id));
+        let Some(records) = records else {
+            self.table.row("opening", "first database list", &mut first_list, "the database is not ready");
+            return None;
+        };
+        self.table.row("opening", "first database list", &mut first_list, &format!("{records} records"));
+        for (case, path) in [("status", "/v1/status"), ("database list", "/v1/databases")] {
             let mut s = Samples::default();
-            let mut rows = None;
             for _ in 0..RUNS {
-                if let Some(body) = s.get(&mut c, &path, true) {
-                    rows.get_or_insert(row_count(&body));
+                s.get(&mut served.c, path, true);
+            }
+            self.table.row("opening", case, &mut s, "");
+        }
+        Some(records)
+    }
+
+    /// Sorts: the first order of each key over all records, then cached.
+    fn sorts(&mut self, served: &mut Served) {
+        for key in SORT_KEYS {
+            let path = format!("{}/games?sort={key}&limit=500", self.base);
+            self.sort_or_search(served, "sort", key, &path, "rows");
+        }
+    }
+
+    /// Windows of 500 rows at the start, the middle and the end of the
+    /// `records`, with and without the main line.
+    fn windows(&mut self, served: &mut Served, records: u64) {
+        let last = records.saturating_sub(500);
+        for (place, offset) in [("start", 0), ("middle", records / 2), ("end", last)] {
+            for (form, extra) in [("", ""), (" line=60", "&line=60")] {
+                let path = format!("{}/games?offset={offset}&limit=500{extra}", self.base);
+                let mut s = Samples::default();
+                let mut rows = None;
+                for _ in 0..RUNS {
+                    if let Some(body) = s.get(&mut served.c, &path, true) {
+                        rows.get_or_insert_with(|| Value::of(&body).get("rows").items().len());
+                    }
+                }
+                let counts = rows.map_or(String::new(), |r| format!("{r} rows"));
+                self.table.row("window", &format!("{place}{form}"), &mut s, &counts);
+            }
+        }
+    }
+
+    /// Player suggestions for prefixes of one to three letters. The first
+    /// request of a field builds its name tables. The first player suggested
+    /// for `m`.
+    fn suggestions(&mut self, served: &mut Served) -> Option<String> {
+        let mut player = None;
+        for (i, prefix) in ["m", "mo", "mor"].iter().enumerate() {
+            let path = format!("{}/suggest?field=player&prefix={prefix}", self.base);
+            let mut first = Samples::default();
+            let mut body = first.get(&mut served.c, &path, true);
+            if i == 0 {
+                player = body.as_deref().and_then(|b| values(b).into_iter().next());
+                self.table.row("suggest", "player, first ever", &mut first, "");
+            }
+            // A longer prefix's first answer is not timed apart, but its failure
+            // counts with the cached ones.
+            let failures = if i == 0 { Vec::new() } else { first.failures };
+            let mut s = Samples { times: Vec::new(), failures };
+            for _ in 0..RUNS {
+                let answer = s.get(&mut served.c, &path, true);
+                body = body.or(answer);
+            }
+            let names = body.map_or(String::new(), |b| format!("{} names", values(&b).len()));
+            self.table.row("suggest", &format!("player, {} letters", prefix.len()), &mut s, &names);
+        }
+        player
+    }
+
+    /// Searches by qualifier, cold and then cached. The names come from the
+    /// suggestions, `player`'s above and an event's asked for here, and are
+    /// not printed.
+    fn searches(&mut self, served: &mut Served, player: Option<String>) -> Searches {
+        let mut events = Samples::default();
+        let event = events
+            .get(&mut served.c, &format!("{}/suggest?field=event&prefix=o", self.base), true)
+            .and_then(|b| values(&b).into_iter().next());
+        let mut searches = vec![("date", "date:2020".to_string())];
+        match &player {
+            Some(p) => searches.extend(["player", "white", "black"].map(|q| (q, format!("{q}:\"{p}\"")))),
+            None => self.table.row("search", "player", &mut Samples::default(), "no player suggested for m"),
+        }
+        match &event {
+            Some(e) => searches.push(("event", format!("event:\"{e}\""))),
+            None => self.table.row("search", "event", &mut events, "no event suggested for o"),
+        }
+        for (name, q) in &searches {
+            let path = format!("{}/games?limit=500&q={}", self.base, encode(q));
+            self.sort_or_search(served, "search", name, &path, "matches");
+        }
+        searches
+    }
+
+    /// One game as PGN: the first game, and the most annotated one of the
+    /// first records, in the reading and the full form.
+    fn pgn(&mut self, served: &mut Served) -> AnyResult<()> {
+        let (first_game, annotated, notes) = scan_games(&self.o)?;
+        for (which, number) in [("first game", first_game), ("most annotated", annotated)] {
+            for (form, extra) in [("reading", ""), ("full", "?annotations=full")] {
+                let path = format!("{}/games/{number}{extra}", self.base);
+                let (mut cold, body, mut warm) = cold_then_cached(&mut served.c, &path);
+                let bytes = body.map(|b| b.len());
+                let mut counts = bytes.map_or(String::new(), |b| format!("{b} bytes"));
+                if number == annotated && bytes.is_some() {
+                    counts = format!("{counts}, {notes} annotations");
+                }
+                self.table.row("pgn", &format!("{which}, {form} cold"), &mut cold, &counts);
+                self.table.row("pgn", &format!("{which}, {form}"), &mut warm, "");
+            }
+        }
+        Ok(())
+    }
+
+    /// The position index: its build in the new folder, a lookup per move
+    /// along the most played line, deep and crowded positions, the games of
+    /// positions, and the notable games' rows. The index folder is measured
+    /// while the build writes it (#147): at its largest, and once the build
+    /// is done. With `--background`, the build the bridge started unasked is
+    /// waited for instead, from the bridge's start, `launched`, to the index
+    /// ready (#149).
+    fn index(&mut self, served: &mut Served, launched: Instant, records: u64) {
+        let folder = self.index_folder();
+        if self.o.background {
+            background_build(&mut self.table, served, &self.id, launched, &folder);
+        } else {
+            let start = self.explorer(START_FEN);
+            requested_build(&mut self.table, served, &self.id, &start, &folder);
+        }
+        let (mut listed, notable) = self.lookups(served);
+        listed.extend(self.deep(served, records));
+        self.crowded(served);
+        list_positions(&mut self.table, &mut served.c, &self.base, &listed);
+        self.notable_rows(served, &notable);
+    }
+
+    /// A lookup per move along the most played line: the positions of the
+    /// line whose games are listed, and the notable games the lookups named.
+    fn lookups(&mut self, served: &mut Served) -> (Positions, Vec<Value>) {
+        let mut board = Board::startpos();
+        let mut lookups = Samples::default();
+        let mut played = 0;
+        let mut stop = "";
+        let mut notable = Vec::new();
+        // The positions of the line whose games are listed, by ply.
+        let mut listed: Positions =
+            LIST_LINE_PLIES.iter().map(|p| (format!("line ply {p}"), LIST_LINE_TARGET_MS, Vec::new())).collect();
+        for _ in 0..LOOKUPS {
+            if let Some(at) = LIST_LINE_PLIES.iter().position(|&p| p == played) {
+                listed[at].2.push(board.fen());
+            }
+            let Some(body) = lookups.get(&mut served.c, &self.explorer(&board.fen()), true) else { break };
+            let answer = Value::of(&body);
+            notable.extend_from_slice(answer.get("topGames").items());
+            let Some(uci) = answer.get("moves").items().first().and_then(|m| m.get("uci").str()) else {
+                stop = ", no move from the last position";
+                break;
+            };
+            let Some(mv) = find_move(&board, uci) else {
+                stop = ", a named move is not legal here";
+                self.table.failed = true;
+                break;
+            };
+            board.play_unchecked(mv);
+            played += 1;
+        }
+        let counts = format!("{} lookups, {played} plies played{stop}", lookups.times.len());
+        self.table.row("index", "lookup per move", &mut lookups, &counts);
+        (listed, notable)
+    }
+
+    /// Deep positions (#133): positions of games from across the `records`
+    /// at plies 30, 60 and 90, past the tree's pruning ply and past its
+    /// depth; each must find at least its own game. Their positions at plies
+    /// 40 and 80, whose games are listed.
+    fn deep(&mut self, served: &mut Served, records: u64) -> Positions {
+        let mut deep = Samples::default();
+        let (mut asked, mut found) = (0, 0);
+        let mut lexer = Lexer::new();
+        let mut sampled: Positions = LIST_SAMPLED_PLIES
+            .iter()
+            .map(|p| (format!("sampled ply {p}"), LIST_SAMPLED_TARGET_MS, Vec::new()))
+            .collect();
+        for k in 1..=8u64 {
+            let n = (records / 9 * k).max(1);
+            let Some((200, body)) = served.c.get(&format!("{}/games/{n}", self.base), true).ok() else { continue };
+            let game = Value::of(&body);
+            let Some(pgn) = game.get("pgn").str() else { continue };
+            let (mut fens, mut ply) = (Vec::new(), 0u32);
+            main_line(pgn.as_bytes(), &mut lexer, &mut |board, mv| {
+                if [30, 60, 90].contains(&ply) {
+                    fens.push(board.fen());
+                }
+                if let Some(at) = LIST_SAMPLED_PLIES.iter().position(|&p| p == ply) {
+                    sampled[at].2.push(board.fen());
+                }
+                ply += 1;
+                mv.is_some()
+            });
+            for fen in fens {
+                asked += 1;
+                let answer = deep.get(&mut served.c, &self.explorer(&fen), true);
+                if answer.is_some_and(|a| count(&a, "games").is_some_and(|g| g > 0)) {
+                    found += 1;
                 }
             }
-            let counts = rows.map_or(String::new(), |r| format!("{r} rows"));
-            table.row("window", &format!("{place}{form}"), &mut s, &counts);
+        }
+        if found < asked {
+            self.table.failed = true;
+        }
+        self.table.row("index", "deep lookup, plies 30/60/90", &mut deep, &format!("{found} of {asked} found"));
+        sampled
+    }
+
+    /// The most crowded structure (#145): bare kings, which every game that
+    /// ends in them holds, all home pawns gone, so their bucket is replayed
+    /// whole.
+    fn crowded(&mut self, served: &mut Served) {
+        let (mut first, body, mut crowded) = cold_then_cached(&mut served.c, &self.explorer(BARE_KINGS));
+        let games = body.and_then(|b| count(&b, "games")).map_or(String::new(), |g| format!("{g} games reach it"));
+        self.table.row("index", "crowded structure, first", &mut first, &games);
+        self.table.row("index", "crowded structure", &mut crowded, "");
+    }
+
+    /// Each notable game the lookups named is its `/games` row whole, then its
+    /// year (#144): compared with its number's row, asked for once a number
+    /// after the lookups, so that their times stay as they were.
+    fn notable_rows(&mut self, served: &mut Served, notable: &[Value]) {
+        let mut rows = Samples::default();
+        let mut fetched: HashMap<u64, Option<Value>> = HashMap::new();
+        let mut whole = 0;
+        for entry in notable {
+            let Some(n) = entry.get("number").u64() else { continue };
+            let row = fetched.entry(n).or_insert_with(|| {
+                let path = format!("{}/games?offset={}&limit=1", self.base, n.saturating_sub(1));
+                let body = rows.get(&mut served.c, &path, true)?;
+                Value::of(&body).get("rows").items().first().cloned()
+            });
+            if row.as_ref().is_some_and(|row| row_and_year(entry, row)) {
+                whole += 1;
+            }
+        }
+        if whole < notable.len() {
+            self.table.failed = true;
+        }
+        let counts = format!("topGames entries with every row field: {whole} of {}", notable.len());
+        self.table.row("index", "notable games' rows", &mut rows, &counts);
+    }
+
+    /// A new bridge, once the first has ended, timed to its first answer
+    /// from the position index the first one built.
+    fn new_bridge(&mut self) -> AnyResult<Served> {
+        let t = Instant::now();
+        let mut again = self.respawn()?;
+        let mut open = Samples::default();
+        open.get(&mut again.c, &self.explorer(START_FEN), true);
+        let took = ms(t.elapsed());
+        if open.failures.is_empty() {
+            self.table.once("index", "new bridge, first answer", took, "");
+        } else {
+            self.table.row("index", "new bridge, first answer", &mut open, "");
+        }
+        Ok(again)
+    }
+
+    /// The heads file (#106): the first bridge built it after its first sort.
+    /// A new one, `again`, its caches empty, answers its first sorts,
+    /// suggestion and searches from it.
+    fn with_heads(&mut self, again: &mut Served, searches: &[(&str, String)]) {
+        let heads = heads::path(&self.index_folder(), &self.id);
+        let present = if heads.exists() { "from the heads file" } else { "no heads file" };
+        for key in SORT_KEYS {
+            let path = format!("{}/games?sort={key}&limit=500", self.base);
+            self.cold(again, "sort+heads", &format!("{key} cold"), &path, present);
+        }
+        let path = format!("{}/suggest?field=player&prefix=m", self.base);
+        self.cold(again, "suggest+heads", "player, first ever", &path, present);
+        for (name, q) in searches {
+            let path = format!("{}/games?limit=500&q={}", self.base, encode(q));
+            self.cold(again, "search+heads", &format!("{name} cold"), &path, present);
         }
     }
 
-    // Player suggestions for prefixes of one to three letters. The first
-    // request of a field builds its name tables.
-    let mut player = None;
-    for (i, prefix) in ["m", "mo", "mor"].iter().enumerate() {
-        let path = format!("{base}/suggest?field=player&prefix={prefix}");
-        let mut first = Samples::default();
-        let mut body = first.get(&mut c, &path, true);
-        if i == 0 {
-            player = body.as_ref().and_then(|b| strings(b, "value").into_iter().next());
-            table.row("suggest", "player, first ever", &mut first, "");
+    /// The names files (#108): the second bridge wrote its name tables beside
+    /// the heads file. New bridges read them from there for their first sort
+    /// by white, suggestion and player search.
+    fn with_names(&mut self, searches: &[(&str, String)]) -> AnyResult<()> {
+        let heads = heads::path(&self.index_folder(), &self.id);
+        let names: Vec<PathBuf> = ["players", "tournaments"].iter().map(|k| heads.with_extension(k)).collect();
+        let waited = Instant::now();
+        while !names.iter().all(|p| p.exists()) && waited.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(100));
         }
-        // A longer prefix's first answer is not timed apart, but its failure
-        // counts with the cached ones.
-        let failures = if i == 0 { Vec::new() } else { first.failures };
-        let mut s = Samples { times: Vec::new(), failures };
-        for _ in 0..RUNS {
-            let answer = s.get(&mut c, &path, true);
-            body = body.or(answer);
+        let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
+        let mut third = self.respawn()?;
+        for key in ["white", "tournament"] {
+            let path = format!("{}/games?sort={key}&limit=500", self.base);
+            self.cold(&mut third, "sort+names", &format!("{key} cold"), &path, have);
         }
-        let names = body.map_or(String::new(), |b| format!("{} names", strings(&b, "value").len()));
-        table.row("suggest", &format!("player, {} letters", prefix.len()), &mut s, &names);
+        let mut fourth = self.respawn()?;
+        let path = format!("{}/suggest?field=player&prefix=m", self.base);
+        self.cold(&mut fourth, "suggest+names", "player, first after start", &path, have);
+        if let Some((_, q)) = searches.iter().find(|(name, _)| *name == "player") {
+            let mut fifth = self.respawn()?;
+            let path = format!("{}/games?limit=500&q={}", self.base, encode(q));
+            self.cold(&mut fifth, "search+names", "player, first after start", &path, have);
+        }
+        Ok(())
     }
-    let mut events = Samples::default();
-    let event = events
-        .get(&mut c, &format!("{base}/suggest?field=event&prefix=o"), true)
-        .and_then(|b| strings(&b, "value").into_iter().next());
 
-    // Searches by qualifier, cold and then cached. The names come from the
-    // suggestions above and are not printed.
-    let mut searches = vec![("date", "date:2020".to_string())];
-    match &player {
-        Some(p) => searches.extend(["player", "white", "black"].map(|q| (q, format!("{q}:\"{p}\"")))),
-        None => table.row("search", "player", &mut Samples::default(), "no player suggested for m"),
-    }
-    match &event {
-        Some(e) => searches.push(("event", format!("event:\"{e}\""))),
-        None => table.row("search", "event", &mut events, "no event suggested for o"),
-    }
-    for (name, q) in &searches {
-        let path = format!("{base}/games?limit=500&q={}", encode(q));
-        let before = served.build(&mut c, &o);
-        let mut cold = Samples::default();
-        let total = cold.get(&mut c, &path, true).and_then(|body| number(&body, "total"));
+    /// The engine: the first line of a 5-second search on `again`, and the
+    /// lines a second after it; then a new bridge whose engine is warmed up
+    /// first (#110), as the web app does when an analysis page opens: the
+    /// warm-up, then the first line.
+    fn engines(&mut self, again: &mut Served) -> AnyResult<()> {
+        engine(&mut self.table, &mut again.c, "first line");
+        let mut warmed = self.respawn()?;
         let mut warm = Samples::default();
-        for _ in 0..RUNS {
-            warm.get(&mut c, &path, true);
-        }
-        let during = during(before, served.build(&mut c, &o));
-        let matches = total.map_or(String::new(), |t| format!("{t} matches"));
-        table.row("search", &format!("{name} cold"), &mut cold, &format!("{matches}{during}"));
-        table.row("search", &format!("{name} cached"), &mut warm, during.trim_start_matches(", "));
+        warm.get(&mut warmed.c, "/v1/engine/warm", true);
+        self.table.row("engine", "warm-up to ready", &mut warm, "");
+        engine(&mut self.table, &mut warmed.c, "first line after a warm-up");
+        Ok(())
     }
 
-    // One game as PGN: the first game, and the most annotated one of the first
-    // records, in the reading and the full form.
-    let (first_game, annotated, notes) = scan_games(&o)?;
-    for (which, number) in [("first game", first_game), ("most annotated", annotated)] {
-        for (form, extra) in [("reading", ""), ("full", "?annotations=full")] {
-            let path = format!("{base}/games/{number}{extra}");
-            let mut cold = Samples::default();
-            let bytes = cold.get(&mut c, &path, true).map(|b| b.len());
-            let mut warm = Samples::default();
-            for _ in 0..RUNS {
-                warm.get(&mut c, &path, true);
+    /// HTTP: a small answer over one kept connection, and over a new one each.
+    fn http(&mut self, served: &mut Served) {
+        for (case, keep) in [("keep-alive", true), ("new connection", false)] {
+            let mut s = Samples::default();
+            for _ in 0..200 {
+                s.get(&mut served.c, "/v1/status", keep);
             }
-            let mut counts = bytes.map_or(String::new(), |b| format!("{b} bytes"));
-            if number == annotated && bytes.is_some() {
-                counts = format!("{counts}, {notes} annotations");
-            }
-            table.row("pgn", &format!("{which}, {form} cold"), &mut cold, &counts);
-            table.row("pgn", &format!("{which}, {form}"), &mut warm, "");
+            self.table.row("http", &format!("status, {case}"), &mut s, "");
         }
     }
-
-    // The position index: its build in the new folder, a lookup per move
-    // along the most played line, and opening it again in a new bridge. The
-    // index folder is measured while the build writes it (#147): at its
-    // largest, and once the build is done. With `--background`, the build
-    // the bridge started unasked is waited for instead, from the bridge's
-    // start to the index ready (#149).
-    let explorer = |fen: &str| format!("{base}/explorer?fen={}", encode(fen));
-    let folder = o.index.join("index");
-    if o.background {
-        background_build(&mut table, &served, launched, &folder);
-    } else {
-        requested_build(&mut table, &mut c, &served, &explorer(START_FEN), &folder);
-    }
-    let mut board = Board::startpos();
-
-    let mut lookups = Samples::default();
-    let mut played = 0;
-    let mut stop = "";
-    let mut notable = Vec::new();
-    // The positions of the line whose games are listed below, by ply.
-    let mut listed: Vec<(String, u32, Vec<String>)> =
-        LIST_LINE_PLIES.iter().map(|p| (format!("line ply {p}"), LIST_LINE_TARGET_MS, Vec::new())).collect();
-    for _ in 0..LOOKUPS {
-        if let Some(at) = LIST_LINE_PLIES.iter().position(|&p| p == played) {
-            listed[at].2.push(board.fen());
-        }
-        let Some(body) = lookups.get(&mut c, &explorer(&board.fen()), true) else { break };
-        notable.extend(objects(&body, "topGames"));
-        let Some(uci) = strings(&body, "uci").into_iter().next() else {
-            stop = ", no move from the last position";
-            break;
-        };
-        let Some(mv) = find_move(&board, &uci) else {
-            stop = ", a named move is not legal here";
-            table.failed = true;
-            break;
-        };
-        board.play_unchecked(mv);
-        played += 1;
-    }
-    let counts = format!("{} lookups, {played} plies played{stop}", lookups.times.len());
-    table.row("index", "lookup per move", &mut lookups, &counts);
-    // Deep positions (#133): positions of games from across the database at
-    // plies 30, 60 and 90, past the tree's pruning ply and past its depth;
-    // each must find at least its own game. Their positions at plies 40 and
-    // 80 are kept for the lists below.
-    let mut deep = Samples::default();
-    let (mut asked, mut found) = (0, 0);
-    let mut lexer = Lexer::new();
-    let mut sampled: Vec<(String, u32, Vec<String>)> =
-        LIST_SAMPLED_PLIES.iter().map(|p| (format!("sampled ply {p}"), LIST_SAMPLED_TARGET_MS, Vec::new())).collect();
-    for k in 1..=8u64 {
-        let n = (records / 9 * k).max(1);
-        let Some((200, body)) = c.get(&format!("{base}/games/{n}"), true).ok() else { continue };
-        let Some(pgn) = strings(&body, "pgn").into_iter().next() else { continue };
-        let (mut fens, mut ply) = (Vec::new(), 0u32);
-        main_line(pgn.as_bytes(), &mut lexer, &mut |board, mv| {
-            if [30, 60, 90].contains(&ply) {
-                fens.push(board.fen());
-            }
-            if let Some(at) = LIST_SAMPLED_PLIES.iter().position(|&p| p == ply) {
-                sampled[at].2.push(board.fen());
-            }
-            ply += 1;
-            mv.is_some()
-        });
-        for fen in fens {
-            asked += 1;
-            if deep.get(&mut c, &explorer(&fen), true).is_some_and(|a| number(&a, "games").is_some_and(|g| g > 0)) {
-                found += 1;
-            }
-        }
-    }
-    if found < asked {
-        table.failed = true;
-    }
-    table.row("index", "deep lookup, plies 30/60/90", &mut deep, &format!("{found} of {asked} found"));
-    // The most crowded structure (#145): bare kings, which every game that
-    // ends in them holds, all home pawns gone, so their bucket is replayed
-    // whole.
-    let bare = explorer(BARE_KINGS);
-    let (mut first, mut crowded) = (Samples::default(), Samples::default());
-    let games = first.get(&mut c, &bare, true).and_then(|a| number(&a, "games"));
-    for _ in 0..RUNS {
-        crowded.get(&mut c, &bare, true);
-    }
-    let games = games.map_or(String::new(), |g| format!("{g} games reach it"));
-    table.row("index", "crowded structure, first", &mut first, &games);
-    table.row("index", "crowded structure", &mut crowded, "");
-    listed.extend(sampled);
-    list_positions(&mut table, &mut c, &base, &listed);
-    // Each notable game the lookups named is its `/games` row whole, then its
-    // year (#144): compared with its number's row, asked for once a number
-    // after the lookups, so that their times stay as they were.
-    let mut rows = Samples::default();
-    let mut fetched: HashMap<u64, Option<String>> = HashMap::new();
-    let mut whole = 0;
-    for entry in &notable {
-        let Some(n) = number(entry.as_bytes(), "number") else { continue };
-        let row = fetched.entry(n).or_insert_with(|| {
-            let body = rows.get(&mut c, &format!("{base}/games?offset={}&limit=1", n.saturating_sub(1)), true)?;
-            objects(&body, "rows").into_iter().next()
-        });
-        if row.as_deref().is_some_and(|row| row_and_year(entry, row)) {
-            whole += 1;
-        }
-    }
-    if whole < notable.len() {
-        table.failed = true;
-    }
-    let counts = format!("topGames entries with every row field: {whole} of {}", notable.len());
-    table.row("index", "notable games' rows", &mut rows, &counts);
-    drop(served);
-    let t = Instant::now();
-    let again = spawn(&o, false)?;
-    let mut fresh_client = Client::new(again.port);
-    let mut open = Samples::default();
-    open.get(&mut fresh_client, &format!("/v1/databases/{}/explorer?fen={}", again.id, encode(START_FEN)), true);
-    let took = ms(t.elapsed());
-    if open.failures.is_empty() {
-        table.once("index", "new bridge, first answer", took, "");
-    } else {
-        table.row("index", "new bridge, first answer", &mut open, "");
-    }
-
-    // The heads file (#106): the first bridge built it after its first sort.
-    // The new one, its caches empty, answers its first sorts, suggestion and
-    // searches from it.
-    let heads = o.index.join("index").join(format!("{}.heads", again.id));
-    let present = if heads.exists() { "from the heads file" } else { "no heads file" };
-    let base = format!("/v1/databases/{}", again.id);
-    for key in SORT_KEYS {
-        let mut cold = Samples::default();
-        cold.get(&mut fresh_client, &format!("{base}/games?sort={key}&limit=500"), true);
-        table.row("sort+heads", &format!("{key} cold"), &mut cold, present);
-    }
-    let mut suggestion = Samples::default();
-    suggestion.get(&mut fresh_client, &format!("{base}/suggest?field=player&prefix=m"), true);
-    table.row("suggest+heads", "player, first ever", &mut suggestion, present);
-    for (name, q) in &searches {
-        let mut cold = Samples::default();
-        cold.get(&mut fresh_client, &format!("{base}/games?limit=500&q={}", encode(q)), true);
-        table.row("search+heads", &format!("{name} cold"), &mut cold, present);
-    }
-
-    // The names files (#108): the bridge above wrote its name tables beside
-    // the heads file. A third bridge reads them from there for its first sort
-    // by white, suggestion and player search.
-    let names: Vec<PathBuf> = ["players", "tournaments"].iter().map(|k| heads.with_extension(k)).collect();
-    let waited = Instant::now();
-    while !names.iter().all(|p| p.exists()) && waited.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
-    let third = spawn(&o, false)?;
-    let mut third_client = Client::new(third.port);
-    let base = format!("/v1/databases/{}", third.id);
-    for key in ["white", "tournament"] {
-        let mut cold = Samples::default();
-        cold.get(&mut third_client, &format!("{base}/games?sort={key}&limit=500"), true);
-        table.row("sort+names", &format!("{key} cold"), &mut cold, have);
-    }
-    let fourth = spawn(&o, false)?;
-    let mut fourth_client = Client::new(fourth.port);
-    let base = format!("/v1/databases/{}", fourth.id);
-    let mut suggestion = Samples::default();
-    suggestion.get(&mut fourth_client, &format!("{base}/suggest?field=player&prefix=m"), true);
-    table.row("suggest+names", "player, first after start", &mut suggestion, have);
-    if let Some((_, q)) = searches.iter().find(|(name, _)| *name == "player") {
-        let fifth = spawn(&o, false)?;
-        let mut fifth_client = Client::new(fifth.port);
-        let mut cold = Samples::default();
-        let path = format!("/v1/databases/{}/games?limit=500&q={}", fifth.id, encode(q));
-        cold.get(&mut fifth_client, &path, true);
-        table.row("search+names", "player, first after start", &mut cold, have);
-    }
-
-    // The engine, when one is given: the first line of a 5-second search, and
-    // the lines a second after it.
-    if o.engine.is_some() {
-        engine(&mut table, &mut fresh_client, "first line");
-        // A new bridge whose engine is warmed up first (#110), as the web app
-        // does when an analysis page opens: the warm-up, then the first line.
-        let warmed = spawn(&o, false)?;
-        let mut warm_client = Client::new(warmed.port);
-        let mut warm = Samples::default();
-        warm.get(&mut warm_client, "/v1/engine/warm", true);
-        table.row("engine", "warm-up to ready", &mut warm, "");
-        engine(&mut table, &mut warm_client, "first line after a warm-up");
-    }
-
-    // HTTP: a small answer over one kept connection, and over a new one each.
-    for (case, keep) in [("keep-alive", true), ("new connection", false)] {
-        let mut s = Samples::default();
-        for _ in 0..200 {
-            s.get(&mut fresh_client, "/v1/status", keep);
-        }
-        table.row("http", &format!("status, {case}"), &mut s, "");
-    }
-    Ok(!table.failed)
 }
 
 /// The build the first explorer request starts, `path`, timed to its first
 /// answer, with the index folder sampled while the build writes it, and the
 /// build's phases.
-fn requested_build(table: &mut Table, c: &mut Client, served: &Served, path: &str, folder: &Path) {
+fn requested_build(table: &mut Table, served: &mut Served, id: &str, path: &str, folder: &Path) {
     let building = std::sync::atomic::AtomicBool::new(true);
     let t = Instant::now();
     let mut polls = 0u64;
@@ -1015,15 +1059,15 @@ fn requested_build(table: &mut Table, c: &mut Client, served: &Served, path: &st
             }
             peak.max(folder_bytes(folder))
         });
-        let built = build_index(c, path, &mut polls);
+        let built = build_index(&mut served.c, path, &mut polls);
         building.store(false, std::sync::atomic::Ordering::Relaxed);
         (built, sampler.join().unwrap_or(0))
     });
     match built {
         Ok(()) => {
             let took = ms(t.elapsed());
-            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
-            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
+            let stream = stream_counts(&folder.join(format!("{id}.moves")));
+            let index = std::fs::metadata(folder.join(format!("{id}.idx"))).map_or(0, |m| m.len());
             let sizes =
                 format!("index {index} bytes, folder at most {peak} bytes, {} bytes after", folder_bytes(folder));
             table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}, {sizes}"));
@@ -1039,11 +1083,11 @@ fn requested_build(table: &mut Table, c: &mut Client, served: &Served, path: &st
 /// The build the bridge started unasked, with `--background` (#149): the time
 /// from the bridge's start, `launched`, to the index ready, the mode it ran
 /// in and its patience, and the build's phases.
-fn background_build(table: &mut Table, served: &Served, launched: Instant, folder: &Path) {
+fn background_build(table: &mut Table, served: &Served, id: &str, launched: Instant, folder: &Path) {
     match served.built(BACKGROUND_WAIT) {
         Some((at, t)) => {
-            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
-            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
+            let stream = stream_counts(&folder.join(format!("{id}.moves")));
+            let index = std::fs::metadata(folder.join(format!("{id}.idx"))).map_or(0, |m| m.len());
             // The bridge has this process's environment, and so its mode.
             let mode = bridge::machine::background_mode().0;
             let patience = bridge::explorer::schedule::PATIENCE.as_millis();
@@ -1070,12 +1114,12 @@ fn list_positions(table: &mut Table, c: &mut Client, base: &str, cases: &[(Strin
         let (mut equal, mut totals) = (0, Vec::new());
         for fen in fens {
             let path = format!("{base}/games?fen={}&sort=date&limit=200", encode(fen));
-            let total = first.get(c, &path, true).and_then(|body| number(&body, "total"));
+            let total = first.get(c, &path, true).and_then(|body| count(&body, "total"));
             for _ in 0..RUNS {
                 next.get(c, &format!("{path}&offset=200"), true);
             }
             let games = match c.get(&format!("{base}/explorer?fen={}", encode(fen)), true) {
-                Ok((200, body)) => number(&body, "games"),
+                Ok((200, body)) => count(&body, "games"),
                 _ => None,
             };
             if total.is_some() && total == games {
@@ -1108,12 +1152,14 @@ fn engine(table: &mut Table, c: &mut Client, first_case: &str) {
     let mut done = false;
     let status = c.stream("/v1/engine/analyze?movetime=5000&stream=profile", &mut |line| {
         let at = ms(t.elapsed());
-        if line.starts_with(b"{\"info\"") {
+        let answer = Value::of(line);
+        let has = |key| answer.members().is_some_and(|m| m.contains_key(key));
+        if has("info") {
             first.get_or_insert(at);
             last = Some(at);
             lines += 1;
             true
-        } else if line.starts_with(b"{\"bestmove\"") {
+        } else if has("bestmove") {
             last = Some(at);
             done = true;
             false
@@ -1179,36 +1225,46 @@ fn scan_games(o: &Options) -> AnyResult<(u32, u32, usize)> {
 mod tests {
     use super::*;
 
+    /// The answers are read by member name (#191): a member written first
+    /// reads as one written last, and a count is never taken from a nested
+    /// member of the same name.
     #[test]
-    fn json_members() {
-        let json = br#"{"total":1234,"rows":[{"value":"Tal, Mikhail"},{"value":"Caf\u00e9 \"X\" \ud83d\ude00"}]}"#;
-        assert_eq!(number(json, "total"), Some(1234));
-        assert_eq!(number(json, "none"), None);
-        assert_eq!(strings(json, "value"), ["Tal, Mikhail", "Caf\u{e9} \"X\" \u{1f600}"]);
-        // A lone or broken surrogate is a replacement character, not a panic.
-        assert_eq!(strings(br#"{"value":"\ud83d\u0041"}"#, "value"), ["\u{fffd}"]);
-        assert_eq!(row_count(br#"{"total":9,"rows":[{"number":1,"a":2},{"number":7}]}"#), 2);
+    fn answers_are_read_by_member_name() {
+        let window = br#"{"rows":[{"white":"A","number":1,"total":3},{"number":7}],"total":9,"offset":0}"#;
+        assert_eq!(count(window, "total"), Some(9));
+        assert_eq!(count(window, "none"), None);
+        assert_eq!(Value::of(window).get("rows").items().len(), 2);
+        let list = br#"{"databases":[{"records":5,"id":"other"},{"state":"ready","records":12,"id":"x"}]}"#;
+        assert_eq!(records_of(list, "x"), Some(12));
+        assert_eq!(records_of(list, "y"), None);
+        let suggested =
+            br#"{"suggestions":[{"label":"Tal","value":"Tal, Mikhail","games":3},{"value":"Caf\u00e9"}],"field":"player"}"#;
+        assert_eq!(values(suggested), ["Tal, Mikhail", "Caf\u{e9}"]);
+        let status =
+            br#"{"indexing":[{"total":9,"phase":"waiting","id":"a"},{"phase":"reading","id":"b"}],"bridge":{}}"#;
+        assert_eq!(phases(&Value::of(status)), ["waiting", "reading"]);
+        assert!(phases(&Value::of(br#"{"bridge":{"api":1}}"#)).is_empty());
     }
 
     #[test]
     fn notable_games_are_rows_and_their_year() {
-        let answer = br#"{"topGames":[{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"year":null},{"number":9,"year":1951}],"index":{"records":9}}"#;
-        let top = objects(answer, "topGames");
-        assert_eq!(
-            top,
-            [
-                r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"year":null}"#,
-                r#"{"number":9,"year":1951}"#
-            ]
+        let answer = Value::of(
+            br#"{"topGames":[{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"year":null},{"number":9,"year":1951}],"index":{"records":9}}"#,
         );
-        assert!(objects(answer, "rows").is_empty());
-        let row = r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false}}"#;
-        assert_eq!(objects(format!(r#"{{"rows":[{row}]}}"#).as_bytes(), "rows"), [row]);
-        assert!(row_and_year(&top[0], row));
-        // A member left out or changed, or no year after the row's members.
-        assert!(!row_and_year(&top[0], r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":true}}"#));
-        assert!(!row_and_year(&top[0], r#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"site":""}"#));
-        assert!(!row_and_year(row, row));
+        let top = answer.get("topGames").items();
+        assert_eq!(top.len(), 2);
+        let row = Value::of(br#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false}}"#);
+        assert!(row_and_year(&top[0], &row));
+        // The same members in another order.
+        let reordered = Value::of(br#"{"year":null,"flags":{"deleted":false},"white":"A \"}{[\\","number":7}"#);
+        assert!(row_and_year(&reordered, &row));
+        // A member left out, changed or added, or no year.
+        let other = |text: &[u8]| !row_and_year(&top[0], &Value::of(text));
+        assert!(other(br#"{"number":7,"white":"A \"}{[\\"}"#));
+        assert!(other(br#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":true}}"#));
+        assert!(other(br#"{"number":7,"white":"A \"}{[\\","flags":{"deleted":false},"site":""}"#));
+        assert!(!row_and_year(&row, &row));
+        assert!(!row_and_year(&top[1], &row));
     }
 
     #[test]
@@ -1223,6 +1279,8 @@ mod tests {
     fn a_failure_shows_only_its_status_and_code() {
         let body = br#"{"error":{"code":"index_failed","message":"PRIVATE_SENTINEL at C:\\Users\\x"}}"#;
         assert_eq!(failure(409, body), "409 index_failed");
+        let reordered = br#"{"error":{"state":"indexing","message":"PRIVATE_SENTINEL","code":"index_failed"}}"#;
+        assert_eq!(failure(409, reordered), "409 index_failed");
         assert_eq!(failure(503, b"<html>C:\\secret</html>"), "503");
         assert_eq!(failure(422, br#"{"error":{"code":"C:\\Users\\x"}}"#), "422 sersx");
     }
