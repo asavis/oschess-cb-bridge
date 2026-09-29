@@ -5,9 +5,11 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::foreground;
+use crate::machine::{self, Priority};
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
 
@@ -75,9 +77,8 @@ impl Entry {
     }
 }
 
-/// How far a build has come: records read, then entries and postings
-/// written.
-#[derive(Default)]
+/// How far a build has come: waiting for its turn, then records read, then
+/// entries and postings written.
 pub struct Progress {
     pub phase: Mutex<&'static str>,
     pub done: AtomicU64,
@@ -91,7 +92,36 @@ pub struct Progress {
     pub deep_passes: AtomicU64,
     /// Where the build's time went.
     pub timings: Mutex<Timings>,
+    /// Set to stop the build at its next batch (#149), through
+    /// [`Progress::ask_stop`].
     pub stop: AtomicBool,
+    /// The priority its threads run at, as a [`Priority`] code: a request
+    /// for the database raises a background build's while it runs.
+    pub priority: AtomicU8,
+    /// How long each of its threads gives way to foreground work at most, at
+    /// a time, in microseconds ([`Progress::give_way`]): a background
+    /// build's patience; 0 for a build that never gives way, as a requested
+    /// one (#149).
+    patience: AtomicU64,
+}
+
+/// A build that waits for its turn.
+impl Default for Progress {
+    fn default() -> Progress {
+        Progress {
+            phase: Mutex::new("waiting"),
+            done: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            positions: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            tree_passes: AtomicU64::new(0),
+            deep_passes: AtomicU64::new(0),
+            timings: Mutex::default(),
+            stop: AtomicBool::new(false),
+            priority: AtomicU8::new(Priority::Normal as u8),
+            patience: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Progress {
@@ -113,6 +143,63 @@ impl Progress {
     /// Where the build's time went, so far.
     pub fn timings(&self) -> Timings {
         self.timings.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether the build was asked to stop, which each of its threads asks
+    /// between batches; the thread takes the build's priority as it asks.
+    pub fn stopped(&self) -> bool {
+        machine::follow(Priority::from_code(self.priority.load(Ordering::Relaxed)));
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Asks the build to stop at its next batch: a thread giving way to
+    /// foreground work stops at once.
+    pub fn ask_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        foreground::wake();
+    }
+
+    /// Has the build's threads give way to foreground work for at most
+    /// `patience` at a time from their next batch on; never, from now on,
+    /// with none (#149).
+    pub fn set_patience(&self, patience: Duration) {
+        let micros = u64::try_from(patience.as_micros()).unwrap_or(u64::MAX);
+        self.patience.store(micros, Ordering::Relaxed);
+        foreground::wake();
+    }
+
+    /// How long the build's threads give way to foreground work at most, at a
+    /// time; none for a build that never gives way.
+    pub fn patience(&self) -> Duration {
+        Duration::from_micros(self.patience.load(Ordering::Relaxed))
+    }
+
+    /// Gives way to foreground work (#149), as each of the build's threads
+    /// does before it takes its next batch: while searches, sorts, lists or
+    /// explorer answers run ([`foreground`]), the thread of a build with
+    /// patience waits for them to end, for at most its patience at a time;
+    /// then it goes on with one batch whatever runs, so that the build ends
+    /// even while they never do. It waits no longer once the build is asked
+    /// to stop, or has no patience left, as a requested build has none.
+    pub fn give_way(&self) {
+        let patience = self.patience.load(Ordering::Relaxed);
+        if patience == 0 || !foreground::running() {
+            return;
+        }
+        foreground::wait(Duration::from_micros(patience), &|| {
+            self.patience.load(Ordering::Relaxed) == 0 || self.stop.load(Ordering::Relaxed)
+        });
+    }
+
+    /// Makes the progress of a build that stopped before it was done that of
+    /// one that waits for its turn again, with nothing done.
+    pub fn again(&self) {
+        self.start("waiting", 0);
+        for count in [&self.positions, &self.skipped, &self.tree_passes, &self.deep_passes] {
+            count.store(0, Ordering::Relaxed);
+        }
+        *self.timings.lock().unwrap_or_else(|e| e.into_inner()) = Timings::default();
+        self.stop.store(false, Ordering::Relaxed);
     }
 }
 
@@ -293,7 +380,7 @@ pub fn grow(hold: &mut Hold, more: usize, progress: &Progress) -> Result<(), Sea
     loop {
         match hold.grow_quietly(more) {
             Ok(()) => return Ok(()),
-            Err(Refused::Busy) if Instant::now() < deadline && !progress.stop.load(Ordering::Relaxed) => {
+            Err(Refused::Busy) if Instant::now() < deadline && !progress.stopped() => {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(refused) => return Err(refused.into()),
@@ -321,7 +408,65 @@ impl Default for Limits {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    /// A thread of a build with patience gives way while foreground work
+    /// runs, until the work ends, the build is asked to stop or is left
+    /// without patience, whichever comes first; one of a build without
+    /// patience goes on at once, and one with little waits no longer (#149).
+    #[test]
+    fn a_build_with_patience_gives_way_to_foreground_work() {
+        let _serial = foreground::tests::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let soon = Duration::from_secs(30);
+        let progress = Arc::new(Progress::default());
+        let giving = |progress: &Arc<Progress>| {
+            let progress = Arc::clone(progress);
+            std::thread::spawn(move || progress.give_way())
+        };
+        // Held until a build that gives way has waited a while.
+        let held = |waiting: &std::thread::JoinHandle<()>| {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!waiting.is_finished(), "went on while foreground work ran");
+        };
+        let working = foreground::begin();
+        let started = Instant::now();
+        progress.give_way();
+        assert!(started.elapsed() < soon, "no patience, no wait");
+
+        // Until the work ends.
+        progress.set_patience(Duration::from_secs(3600));
+        assert_eq!(progress.patience(), Duration::from_secs(3600));
+        let waiting = giving(&progress);
+        held(&waiting);
+        drop(working);
+        waiting.join().unwrap();
+
+        // Until the build is left without patience, as a request leaves it.
+        let working = foreground::begin();
+        let waiting = giving(&progress);
+        held(&waiting);
+        progress.set_patience(Duration::ZERO);
+        waiting.join().unwrap();
+
+        // Until the build is asked to stop.
+        progress.set_patience(Duration::from_secs(3600));
+        let waiting = giving(&progress);
+        held(&waiting);
+        progress.ask_stop();
+        waiting.join().unwrap();
+        assert!(progress.stopped());
+
+        // For its patience at most.
+        progress.again();
+        progress.set_patience(Duration::from_millis(50));
+        let started = Instant::now();
+        progress.give_way();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(50) && waited < soon, "{waited:?}");
+        drop(working);
+    }
 
     /// A build's timings read back from their line, and nothing else.
     #[test]

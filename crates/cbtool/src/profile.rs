@@ -13,12 +13,21 @@
 //! caches are empty; the operating system may still hold the files in memory.
 //! A failed answer is counted as a failure and left out of the times, and any
 //! failure makes the command exit with status 1.
+//!
+//! With `--background`, the first bridge keeps its indexes as a bridge that
+//! serves does (#149): the database, the largest one ready, has its position
+//! index built unasked from the start, while the flows run. Each sort and
+//! search row says whether the build still ran when it was done, and the time
+//! from the bridge's start to the index ready, with the mode the build ran in
+//! (`OSCHESS_BRIDGE_BACKGROUND_MODE`) and how long it gave way to the flows at
+//! most at a time, replaces the build the first explorer request starts.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -71,36 +80,49 @@ const SORT_KEYS: [&str; 12] = [
 const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 /// Bare kings in two corners: the most crowded structure of a large database.
 const BARE_KINGS: &str = "7k/8/8/8/8/8/8/K7 w - - 0 1";
+/// How long the flows wait for the index built unasked, with `--background`.
+const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
 
 struct Options {
     db: PathBuf,
     index: PathBuf,
     engine: Option<PathBuf>,
+    /// The first bridge builds the position index unasked (#149).
+    background: bool,
 }
 
 fn options(args: &[String]) -> AnyResult<Options> {
     let mut db = None;
-    let (mut index, mut engine) = (None, None);
+    let (mut index, mut engine, mut background) = (None, None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--index" => index = it.next().map(PathBuf::from),
             "--engine" => engine = it.next().map(PathBuf::from),
+            "--background" => background = true,
             _ if db.is_none() => db = Some(PathBuf::from(a)),
             _ => return Err("unexpected argument".into()),
         }
     }
     let db = db.ok_or("no database given")?;
     let index = index.ok_or("--index <dir> is required: the indexes are built there")?;
-    Ok(Options { db, index, engine })
+    Ok(Options { db, index, engine, background })
 }
 
-/// `cbtool profile-serve <db> <index> [<engine>]`: the bridge `profile` asks,
-/// in a process of its own. It prints `port <n>` and serves until killed;
-/// once it has built the database's position index, it prints `built`, then
-/// where the build's time went ([`Timings::line`]).
+/// `cbtool profile-serve <db> <index> [--background] [<engine>]`: the bridge
+/// `profile` asks, in a process of its own. It prints `port <n>` and serves
+/// until killed, or until its input ends: when the `profile` that started it
+/// ends, however it ends. Once it has built the database's position index, it
+/// prints `built`, then where the build's time went ([`Timings::line`]). With
+/// `--background`, it keeps its indexes as a bridge that serves does (#149).
 pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
-    let [db, index, rest @ ..] = args else { return Err("profile-serve <db> <index> [<engine>]".into()) };
+    let [db, index, rest @ ..] = args else {
+        return Err("profile-serve <db> <index> [--background] [<engine>]".into());
+    };
+    let (background, rest) = match rest {
+        [flag, rest @ ..] if flag == "--background" => (true, rest),
+        _ => (false, rest),
+    };
     let listeners = server::bind(0)?;
     let port = listeners[0].local_addr()?.port();
     let engine = match rest.first() {
@@ -117,6 +139,13 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     writeln!(out, "port {port}")?;
     out.flush()?;
     let app = Arc::new(app);
+    std::thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        std::process::exit(0);
+    });
+    if background {
+        bridge::explorer::keeper::start(&app);
+    }
     let watched = Arc::clone(&app);
     let id = id_of(Path::new(db));
     std::thread::spawn(move || {
@@ -134,25 +163,71 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
 }
 
 /// A bridge serving one database in a child process, killed when dropped,
-/// and the lines it prints after its port.
+/// and the lines it prints after its port, each with when it came.
 struct Served {
     child: Child,
+    /// Held open for the bridge's life: the bridge ends when it closes.
+    _input: ChildStdin,
     port: u16,
     id: String,
-    lines: mpsc::Receiver<String>,
+    lines: mpsc::Receiver<(Instant, String)>,
+    built: OnceCell<(Instant, Timings)>,
 }
 
 impl Served {
-    /// Where the time of the bridge's build of the position index went, once
-    /// it tells, waiting `wait` at most.
-    fn built(&self, wait: Duration) -> Option<Timings> {
+    /// When the bridge told it had built the position index, and where the
+    /// build's time went, once it tells, waiting `wait` at most.
+    fn built(&self, wait: Duration) -> Option<&(Instant, Timings)> {
         let until = Instant::now() + wait;
-        loop {
-            let line = self.lines.recv_timeout(until.saturating_duration_since(Instant::now())).ok()?;
+        while self.built.get().is_none() {
+            let Ok((at, line)) = self.lines.recv_timeout(until.saturating_duration_since(Instant::now())) else {
+                break;
+            };
             if let Some(t) = line.strip_prefix("built ").and_then(Timings::parse) {
-                return Some(t);
+                let _ = self.built.set((at, t));
             }
         }
+        self.built.get()
+    }
+
+    /// With `--background`, the state of the position index's build now, by
+    /// the bridge's own word: built once it has said so, else running while
+    /// `/v1/status` lists the build in a phase other than `waiting`. A build
+    /// not started yet, as while the keeper waits for the database to be
+    /// quiet, or waiting for its turn, reads nothing.
+    fn build(&self, c: &mut Client, o: &Options) -> Option<Build> {
+        if !o.background {
+            return None;
+        }
+        if self.built(Duration::ZERO).is_some() {
+            return Some(Build::Built);
+        }
+        Some(match c.get("/v1/status", true) {
+            Ok((200, body)) if strings(&body, "phase").iter().any(|p| p != "waiting") => Build::Running,
+            _ => Build::Idle,
+        })
+    }
+}
+
+/// The position index's build as a row sees it (#149).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Build {
+    Idle,
+    Running,
+    Built,
+}
+
+/// What a row's counts say of the build, from its state before the row's
+/// first request and after its last: only a row the build ran through from
+/// its start to its end was taken during the build. Nothing without
+/// `--background`.
+fn during(before: Option<Build>, after: Option<Build>) -> &'static str {
+    match (before, after) {
+        (None, _) | (_, None) => "",
+        (Some(Build::Running), Some(Build::Running)) => ", during the build",
+        (Some(Build::Built), _) => ", after the build",
+        (Some(Build::Idle), Some(Build::Idle)) => ", before the build",
+        _ => ", partly during the build",
     }
 }
 
@@ -163,18 +238,24 @@ impl Drop for Served {
     }
 }
 
-fn spawn(o: &Options) -> AnyResult<Served> {
+/// A bridge serving `o`'s database; one that keeps its indexes when
+/// `background`.
+fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
     let mut command = Command::new(std::env::current_exe()?);
     command.arg("profile-serve").arg(&o.db).arg(&o.index);
+    if background {
+        command.arg("--background");
+    }
     if let Some(exe) = &o.engine {
         command.arg(exe);
     }
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let input = child.stdin.take();
     let mut line = String::new();
     let mut out = child.stdout.take().map(BufReader::new);
     let read = out.as_mut().is_some_and(|out| out.read_line(&mut line).is_ok());
     let port = line.trim().strip_prefix("port ").and_then(|p| p.parse().ok()).filter(|_| read);
-    let (Some(port), Some(out)) = (port, out) else {
+    let (Some(port), Some(out), Some(input)) = (port, out, input) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err("the bridge did not start".into());
@@ -183,12 +264,12 @@ fn spawn(o: &Options) -> AnyResult<Served> {
     let (send, lines) = mpsc::channel();
     std::thread::spawn(move || {
         for line in out.lines().map_while(Result::ok) {
-            if send.send(line).is_err() {
+            if send.send((Instant::now(), line)).is_err() {
                 return;
             }
         }
     });
-    Ok(Served { child, port, id: id_of(&o.db), lines })
+    Ok(Served { child, _input: input, port, id: id_of(&o.db), lines, built: OnceCell::new() })
 }
 
 /// A failed answer, by its status and the bridge's error code only: a code is
@@ -579,15 +660,20 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     println!("{:<12} {:<30} {:>3} {:>10} {:>10} {:>10}  counts", "flow", "case", "n", "median ms", "min ms", "max ms");
 
     // Opening: the bridge starts, then its first answers open the database.
-    let t = Instant::now();
-    let served = spawn(&o)?;
-    let start = ms(t.elapsed());
+    let launched = Instant::now();
+    let served = spawn(&o, o.background)?;
+    let start = ms(launched.elapsed());
     let base = format!("/v1/databases/{}", served.id);
     let mut c = Client::new(served.port);
     let mut first = Samples::default();
-    first.get(&mut c, "/v1/status", true);
+    let status = first.get(&mut c, "/v1/status", true);
     table.once("opening", "bridge process start", start, "");
-    table.row("opening", "first status", &mut first, "");
+    // With `--background`, the phases of the build already listed.
+    let phases = match status {
+        Some(body) if o.background => format!("indexing: {}", strings(&body, "phase").join(" ")),
+        _ => String::new(),
+    };
+    table.row("opening", "first status", &mut first, &phases);
     let mut first_list = Samples::default();
     let records = first_list.get(&mut c, "/v1/databases", true).and_then(|list| number(&list, "records"));
     let Some(records) = records else {
@@ -606,14 +692,17 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     // Sorts: the first order of each key over all records, then cached.
     for key in SORT_KEYS {
         let path = format!("{base}/games?sort={key}&limit=500");
+        let before = served.build(&mut c, &o);
         let mut cold = Samples::default();
         let total = cold.get(&mut c, &path, true).and_then(|body| number(&body, "total"));
         let mut warm = Samples::default();
         for _ in 0..RUNS {
             warm.get(&mut c, &path, true);
         }
-        table.row("sort", &format!("{key} cold"), &mut cold, &total.map_or(String::new(), |t| format!("{t} rows")));
-        table.row("sort", &format!("{key} cached"), &mut warm, "");
+        let during = during(before, served.build(&mut c, &o));
+        let rows = total.map_or(String::new(), |t| format!("{t} rows"));
+        table.row("sort", &format!("{key} cold"), &mut cold, &format!("{rows}{during}"));
+        table.row("sort", &format!("{key} cached"), &mut warm, during.trim_start_matches(", "));
     }
 
     // Windows of 500 rows at the start, the middle and the end, with and
@@ -674,19 +763,17 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     }
     for (name, q) in &searches {
         let path = format!("{base}/games?limit=500&q={}", encode(q));
+        let before = served.build(&mut c, &o);
         let mut cold = Samples::default();
         let total = cold.get(&mut c, &path, true).and_then(|body| number(&body, "total"));
         let mut warm = Samples::default();
         for _ in 0..RUNS {
             warm.get(&mut c, &path, true);
         }
-        table.row(
-            "search",
-            &format!("{name} cold"),
-            &mut cold,
-            &total.map_or(String::new(), |t| format!("{t} matches")),
-        );
-        table.row("search", &format!("{name} cached"), &mut warm, "");
+        let during = during(before, served.build(&mut c, &o));
+        let matches = total.map_or(String::new(), |t| format!("{t} matches"));
+        table.row("search", &format!("{name} cold"), &mut cold, &format!("{matches}{during}"));
+        table.row("search", &format!("{name} cached"), &mut warm, during.trim_start_matches(", "));
     }
 
     // One game as PGN: the first game, and the most annotated one of the first
@@ -713,41 +800,18 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     // The position index: its build in the new folder, a lookup per move
     // along the most played line, and opening it again in a new bridge. The
     // index folder is measured while the build writes it (#147): at its
-    // largest, and once the build is done.
+    // largest, and once the build is done. With `--background`, the build
+    // the bridge started unasked is waited for instead, from the bridge's
+    // start to the index ready (#149).
     let explorer = |fen: &str| format!("{base}/explorer?fen={}", encode(fen));
     let folder = o.index.join("index");
-    let building = std::sync::atomic::AtomicBool::new(true);
-    let t = Instant::now();
-    let mut polls = 0u64;
-    let (built, peak) = std::thread::scope(|s| {
-        let sampler = s.spawn(|| {
-            let mut peak = 0;
-            while building.load(std::sync::atomic::Ordering::Relaxed) {
-                peak = peak.max(folder_bytes(&folder));
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            peak.max(folder_bytes(&folder))
-        });
-        let built = build_index(&mut c, &explorer(START_FEN), &mut polls);
-        building.store(false, std::sync::atomic::Ordering::Relaxed);
-        (built, sampler.join().unwrap_or(0))
-    });
-    match built {
-        Ok(()) => {
-            let took = ms(t.elapsed());
-            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
-            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
-            let sizes =
-                format!("index {index} bytes, folder at most {peak} bytes, {} bytes after", folder_bytes(&folder));
-            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}, {sizes}"));
-            match served.built(Duration::from_secs(10)) {
-                Some(t) => build_phases(&mut table, &t),
-                None => table.failure("index", "build phases", "not told"),
-            }
-        }
-        Err(why) => table.failure("index", "build to first answer", &why),
+    if o.background {
+        background_build(&mut table, &served, launched, &folder);
+    } else {
+        requested_build(&mut table, &mut c, &served, &explorer(START_FEN), &folder);
     }
     let mut board = Board::startpos();
+
     let mut lookups = Samples::default();
     let mut played = 0;
     let mut stop = "";
@@ -847,7 +911,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     table.row("index", "notable games' rows", &mut rows, &counts);
     drop(served);
     let t = Instant::now();
-    let again = spawn(&o)?;
+    let again = spawn(&o, false)?;
     let mut fresh_client = Client::new(again.port);
     let mut open = Samples::default();
     open.get(&mut fresh_client, &format!("/v1/databases/{}/explorer?fen={}", again.id, encode(START_FEN)), true);
@@ -887,7 +951,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         std::thread::sleep(Duration::from_millis(100));
     }
     let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
-    let third = spawn(&o)?;
+    let third = spawn(&o, false)?;
     let mut third_client = Client::new(third.port);
     let base = format!("/v1/databases/{}", third.id);
     for key in ["white", "tournament"] {
@@ -895,14 +959,14 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         cold.get(&mut third_client, &format!("{base}/games?sort={key}&limit=500"), true);
         table.row("sort+names", &format!("{key} cold"), &mut cold, have);
     }
-    let fourth = spawn(&o)?;
+    let fourth = spawn(&o, false)?;
     let mut fourth_client = Client::new(fourth.port);
     let base = format!("/v1/databases/{}", fourth.id);
     let mut suggestion = Samples::default();
     suggestion.get(&mut fourth_client, &format!("{base}/suggest?field=player&prefix=m"), true);
     table.row("suggest+names", "player, first after start", &mut suggestion, have);
     if let Some((_, q)) = searches.iter().find(|(name, _)| *name == "player") {
-        let fifth = spawn(&o)?;
+        let fifth = spawn(&o, false)?;
         let mut fifth_client = Client::new(fifth.port);
         let mut cold = Samples::default();
         let path = format!("/v1/databases/{}/games?limit=500&q={}", fifth.id, encode(q));
@@ -916,7 +980,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         engine(&mut table, &mut fresh_client, "first line");
         // A new bridge whose engine is warmed up first (#110), as the web app
         // does when an analysis page opens: the warm-up, then the first line.
-        let warmed = spawn(&o)?;
+        let warmed = spawn(&o, false)?;
         let mut warm_client = Client::new(warmed.port);
         let mut warm = Samples::default();
         warm.get(&mut warm_client, "/v1/engine/warm", true);
@@ -933,6 +997,65 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         table.row("http", &format!("status, {case}"), &mut s, "");
     }
     Ok(!table.failed)
+}
+
+/// The build the first explorer request starts, `path`, timed to its first
+/// answer, with the index folder sampled while the build writes it, and the
+/// build's phases.
+fn requested_build(table: &mut Table, c: &mut Client, served: &Served, path: &str, folder: &Path) {
+    let building = std::sync::atomic::AtomicBool::new(true);
+    let t = Instant::now();
+    let mut polls = 0u64;
+    let (built, peak) = std::thread::scope(|s| {
+        let sampler = s.spawn(|| {
+            let mut peak = 0;
+            while building.load(std::sync::atomic::Ordering::Relaxed) {
+                peak = peak.max(folder_bytes(folder));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            peak.max(folder_bytes(folder))
+        });
+        let built = build_index(c, path, &mut polls);
+        building.store(false, std::sync::atomic::Ordering::Relaxed);
+        (built, sampler.join().unwrap_or(0))
+    });
+    match built {
+        Ok(()) => {
+            let took = ms(t.elapsed());
+            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
+            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
+            let sizes =
+                format!("index {index} bytes, folder at most {peak} bytes, {} bytes after", folder_bytes(folder));
+            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}, {sizes}"));
+            match served.built(Duration::from_secs(10)) {
+                Some((_, t)) => build_phases(table, t),
+                None => table.failure("index", "build phases", "not told"),
+            }
+        }
+        Err(why) => table.failure("index", "build to first answer", &why),
+    }
+}
+
+/// The build the bridge started unasked, with `--background` (#149): the time
+/// from the bridge's start, `launched`, to the index ready, the mode it ran
+/// in and its patience, and the build's phases.
+fn background_build(table: &mut Table, served: &Served, launched: Instant, folder: &Path) {
+    match served.built(BACKGROUND_WAIT) {
+        Some((at, t)) => {
+            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
+            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
+            // The bridge has this process's environment, and so its mode.
+            let mode = bridge::machine::background_mode().0;
+            let patience = bridge::explorer::schedule::PATIENCE.as_millis();
+            let counts = format!(
+                "from the bridge's start, no position asked, mode {mode}, giving way {patience} ms at most; \
+                 {stream}, index {index} bytes"
+            );
+            table.once("index", "background build to ready", ms(at.duration_since(launched)), &counts);
+            build_phases(table, t);
+        }
+        None => table.failure("index", "background build to ready", "not built"),
+    }
 }
 
 /// The games of a position (#148), for each case's positions: the first

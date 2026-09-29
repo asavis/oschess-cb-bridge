@@ -12,6 +12,7 @@ use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
 use crate::engine::{self, Engine, Limit, Search};
 use crate::explorer;
+use crate::foreground;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
@@ -118,9 +119,15 @@ fn route(app: &App, req: &Request) -> Response {
     }
 }
 
+/// The answer `f` gives about database `id`, `404` when it is not listed.
+/// It is work a user waits for: background builds give way to it while it
+/// runs (#149).
 fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Response {
     match app.catalog.get(id) {
-        Some(entry) => f(&entry),
+        Some(entry) => {
+            let _working = foreground::begin();
+            f(&entry)
+        }
         None => not_found(),
     }
 }
@@ -289,6 +296,11 @@ fn database_changing() -> Response {
 }
 
 fn games(app: &App, entry: &Entry, req: &Request) -> Response {
+    // The games of a position mark the database in use (#149); a list alone
+    // does not.
+    if req.param("fen").is_some() {
+        app.catalog.explorer.mark_in_use(&entry.id);
+    }
     let offset = match req.param("offset").map(str::parse::<u64>) {
         None => 0,
         Some(Ok(n)) => n,

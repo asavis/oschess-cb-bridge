@@ -32,9 +32,10 @@ const USAGE: &str = "usage:
                                            (dir: the ChessBase documents folder)
   cbtool bridge [--database <path>]... [--show-token] [--new-token]
                                            run the oschess bridge in this console
-  cbtool profile <db> --index <dir> [--engine <exe>]
+  cbtool profile <db> --index <dir> [--engine <exe>] [--background]
                                            time the bridge's flows against <db> (#83):
-                                           timings and counts only
+                                           timings and counts only; with --background,
+                                           while the bridge builds its index unasked
 
 <db> is a 2CBH (.2cbh) or classic (.cbh) database. info and verify also read a
 PGN file (.pgn), as the bridge serves it; --code-page N reads its text that is

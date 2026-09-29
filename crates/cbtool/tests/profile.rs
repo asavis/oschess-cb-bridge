@@ -115,3 +115,98 @@ fn notable_games_are_counted_as_whole_rows() {
     assert!(text.contains("no such position"), "{text}");
     assert!(out.status.success(), "{text}");
 }
+
+/// With `--background`, the bridge builds the position index unasked (#149):
+/// the flows wait for it rather than start it, time it from the bridge's
+/// start, and say of each sort and search whether the build still ran.
+#[test]
+fn the_background_build_is_timed_from_the_bridges_start() {
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    b.game(e4);
+    b.game(e4);
+    let db = b.write("cbtool-profile-background");
+    // Written a while ago, so quiet from the start.
+    let a_while_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    for entry in std::fs::read_dir(db.dir()).unwrap() {
+        let file = std::fs::File::options().write(true).open(entry.unwrap().path()).unwrap();
+        file.set_modified(a_while_ago).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(db.dir().join("db.2cbh"))
+        .arg("--index")
+        .arg(db.dir().join("index"))
+        .arg("--background")
+        .env("OSCHESS_BRIDGE_BACKGROUND_MODE", "background")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("background build to ready"), "{text}");
+    let row = "from the bridge's start, no position asked, mode background, giving way 500 ms at most; stream 2 games";
+    assert!(text.contains(row), "{text}");
+    assert!(!text.contains("build to first answer"), "{text}");
+    for phase in ["stream pass", "tree passes", "deep passes"] {
+        assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");
+    }
+    let labels = ["before the build", "partly during the build", "during the build", "after the build"];
+    for row in text.lines().filter(timed) {
+        assert!(labels.iter().any(|l| row.ends_with(l)), "{row}");
+    }
+    assert!(out.status.success(), "{text}");
+}
+
+/// The sorts and searches of a profile, with a database written just now.
+fn timed(l: &&str) -> bool {
+    (l.starts_with("sort ") || l.starts_with("search ")) && !l.contains(" suggested ")
+}
+
+/// A database written just now waits out the keeper's quiet period, a minute,
+/// before its build starts (#149): the sorts and searches the profile times
+/// meanwhile ran beside no build, and say so. The profile is stopped once it
+/// has printed them, and the bridge it started ends with it.
+#[test]
+fn rows_taken_before_the_background_build_starts_say_so() {
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    b.game(e4);
+    b.game(e4);
+    let db = b.write("cbtool-profile-background-recent");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(db.dir().join("db.2cbh"))
+        .arg("--index")
+        .arg(db.dir().join("index"))
+        .arg("--background")
+        .env("OSCHESS_BRIDGE_BACKGROUND_MODE", "background")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The flow after the searches is the games' PGN.
+    let mut lines = Vec::new();
+    for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
+        let pgn = line.starts_with("pgn ");
+        lines.push(line);
+        if pgn {
+            break;
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let text = lines.join("\n");
+    assert!(lines.iter().any(|l| l.starts_with("pgn ")), "{text}");
+    let rows: Vec<&str> = text.lines().filter(timed).collect();
+    assert!(rows.iter().any(|r| r.starts_with("search ")), "{text}");
+    for row in rows {
+        assert!(row.ends_with(" before the build"), "{row}");
+    }
+}
