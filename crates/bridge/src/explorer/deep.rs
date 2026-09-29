@@ -800,8 +800,11 @@ fn write_blocks(
             };
             let mut bytes = Vec::new();
             let (low, high) = (from >> GAME_BITS, (to - 1) >> GAME_BITS);
-            room.count(&heads);
-            let mut gathered = low;
+            // The postings of one worker are put as they lie, in order; those
+            // of several are gathered a run of buckets at a time.
+            let one = heads.len() <= 1;
+            room.count(if one { &[] } else { &heads });
+            let mut gathered = if one { u64::MAX } else { low };
             for bucket in low..=high {
                 if bucket >= gathered {
                     gathered = room.gather(&mut heads, bucket, high);
