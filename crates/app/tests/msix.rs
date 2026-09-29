@@ -47,8 +47,9 @@ fn every_image_the_manifest_names_is_drawn() {
         let file = image.strip_prefix(r"Assets\").expect("an image in Assets");
         assert!(drawn.join(file).is_file(), "icons/msix/{file}");
     }
-    // Windows takes the app list and taskbar icons from these; without them it
-    // scales the 44-pixel one.
+    // Windows takes the app list and taskbar icons from these, found through
+    // the resources.pri scripts/msix.py writes; without them it lays the
+    // 44-pixel one on a plate of the accent colour.
     for size in [16, 24, 32, 48, 256] {
         let file = format!("Square44x44Logo.targetsize-{size}_altform-unplated.png");
         assert!(drawn.join(&file).is_file(), "icons/msix/{file}");
