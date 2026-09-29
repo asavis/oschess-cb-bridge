@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cbformat::view::Base;
 
@@ -134,6 +134,9 @@ struct Files {
     /// Some file is there but is not a regular file: a directory, a pipe or a
     /// device, which could block a reader or mislead it.
     irregular: bool,
+    /// When the file changed last that changed last, as its modification
+    /// time says.
+    modified: Option<SystemTime>,
 }
 
 impl Files {
@@ -193,6 +196,18 @@ impl Entry {
         }
         let files = self.files();
         (self.open_files(&files), Some(files.size()))
+    }
+
+    /// [`Entry::open`], and when its files last changed, by their
+    /// modification times, from the same look at their metadata: what the
+    /// keeper of the position indexes asks (#149). `None` when that is not
+    /// known.
+    pub fn open_dated(&self) -> (Result<Opened, State>, Option<SystemTime>) {
+        if self.removed.load(Ordering::Relaxed) || self.format == Format::Other {
+            return (self.open(), None);
+        }
+        let files = self.files();
+        (self.open_files(&files), files.modified)
     }
 
     fn open_files(&self, files: &Files) -> Result<Opened, State> {
@@ -337,7 +352,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// PGN database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let mut hash = Hash::new();
-    let mut files = Files { generation: None, present: Vec::new(), irregular: false };
+    let mut files = Files { generation: None, present: Vec::new(), irregular: false, modified: None };
     let Some(format) = format.view() else { return files };
     // Every cache keyed on a PGN database's generation (the header index, the
     // heads and names files, the position index) is then built again once
@@ -353,6 +368,7 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
             }
             Ok(m) => {
                 hash.write_meta(&m);
+                files.modified = files.modified.max(m.modified().ok());
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
             }

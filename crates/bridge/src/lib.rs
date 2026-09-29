@@ -24,6 +24,7 @@ pub mod http;
 pub mod indexdir;
 pub mod json;
 pub mod log;
+pub mod machine;
 pub mod pairing;
 pub mod pgnindex;
 pub mod reply;

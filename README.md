@@ -185,7 +185,12 @@ every position the games reach in their first 20 plies, and every game's main
 line, from which the positions past them are found. For the Mega Database it
 takes about half a minute and some 4 GB, and no other room while it is built.
 Once kept, the index answers from the first request after the bridge starts,
-until the database changes.
+until the database changes. The bridge keeps the indexes of the databases in
+use up to date by itself (#149): those whose index is kept, or whose positions
+were asked for since it started, and the largest ready database from the
+start. Such a database's index is built in the background, at a low priority
+and not while the computer runs on battery, once the database has not changed
+for a minute; a request for another database's positions goes first.
 `cargo run --release -p bridge
 --example index_oracle -- <db.2cbh> <index dir>` builds one, timing each of
 its phases and passes, and checks it against a brute-force count, printing

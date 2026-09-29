@@ -5,9 +5,10 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::machine::{self, Priority};
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
 
@@ -74,9 +75,8 @@ impl Entry {
     }
 }
 
-/// How far a build has come: records read, then entries and postings
-/// written.
-#[derive(Default)]
+/// How far a build has come: waiting for its turn, then records read, then
+/// entries and postings written.
 pub struct Progress {
     pub phase: Mutex<&'static str>,
     pub done: AtomicU64,
@@ -90,7 +90,29 @@ pub struct Progress {
     pub deep_passes: AtomicU64,
     /// Where the build's time went.
     pub timings: Mutex<Timings>,
+    /// Set to stop the build at its next batch (#149).
     pub stop: AtomicBool,
+    /// The priority its threads run at, as a [`Priority`] code: a request
+    /// for the database raises a background build's while it runs.
+    pub priority: AtomicU8,
+}
+
+/// A build that waits for its turn.
+impl Default for Progress {
+    fn default() -> Progress {
+        Progress {
+            phase: Mutex::new("waiting"),
+            done: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            positions: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            tree_passes: AtomicU64::new(0),
+            deep_passes: AtomicU64::new(0),
+            timings: Mutex::default(),
+            stop: AtomicBool::new(false),
+            priority: AtomicU8::new(Priority::Normal as u8),
+        }
+    }
 }
 
 impl Progress {
@@ -112,6 +134,24 @@ impl Progress {
     /// Where the build's time went, so far.
     pub fn timings(&self) -> Timings {
         self.timings.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether the build was asked to stop, which each of its threads asks
+    /// between batches; the thread takes the build's priority as it asks.
+    pub fn stopped(&self) -> bool {
+        machine::follow(Priority::from_code(self.priority.load(Ordering::Relaxed)));
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Makes the progress of a build that stopped before it was done that of
+    /// one that waits for its turn again, with nothing done.
+    pub fn again(&self) {
+        self.start("waiting", 0);
+        for count in [&self.positions, &self.skipped, &self.tree_passes, &self.deep_passes] {
+            count.store(0, Ordering::Relaxed);
+        }
+        *self.timings.lock().unwrap_or_else(|e| e.into_inner()) = Timings::default();
+        self.stop.store(false, Ordering::Relaxed);
     }
 }
 
@@ -276,7 +316,7 @@ pub fn grow(hold: &mut Hold, more: usize, progress: &Progress) -> Result<(), Sea
     loop {
         match hold.grow_quietly(more) {
             Ok(()) => return Ok(()),
-            Err(Refused::Busy) if Instant::now() < deadline && !progress.stop.load(Ordering::Relaxed) => {
+            Err(Refused::Busy) if Instant::now() < deadline && !progress.stopped() => {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(refused) => return Err(refused.into()),

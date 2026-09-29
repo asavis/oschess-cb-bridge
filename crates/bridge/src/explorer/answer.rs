@@ -28,6 +28,9 @@ use super::stream::Target;
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
+    // Asked for its explorer, the database is in use: the keeper rebuilds
+    // its index when it changes (#149).
+    app.catalog.explorer.mark_in_use(&entry.id);
     if req.param("variant").is_some_and(|v| v != "standard") {
         return unsupported();
     }

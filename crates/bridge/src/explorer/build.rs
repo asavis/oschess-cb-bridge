@@ -262,7 +262,7 @@ fn read_games(
             if batch >= batches {
                 break;
             }
-            if w.stopped() || progress.stop.load(Ordering::Relaxed) {
+            if w.stopped() || progress.stopped() {
                 return Err(SearchError::Superseded);
             }
             let lo = u64::from(plan.first) + batch * BATCH as u64;
@@ -404,13 +404,15 @@ impl Out {
     fn create(path: &Path) -> Result<Out, SearchError> {
         let file = File::create(path).map_err(|e| io(path, e))?;
         // Without a second handle or a thread, the file is synced at the end
-        // alone.
+        // alone. The thread runs at the build's priority.
+        let priority = crate::machine::current();
         let behind = file.try_clone().ok().and_then(|synced| {
             let (ask, asked) = mpsc::sync_channel::<()>(1);
             let thread = std::thread::Builder::new()
                 .name("bridge-index-sync".into())
                 .stack_size(crate::THREAD_STACK)
                 .spawn(move || {
+                    crate::machine::follow(priority);
                     for () in asked {
                         // The sync that ends the build reports a failure.
                         let _ = synced.sync_data();

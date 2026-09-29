@@ -288,6 +288,11 @@ fn database_changing() -> Response {
 }
 
 fn games(app: &App, entry: &Entry, req: &Request) -> Response {
+    // The games of a position mark the database in use (#149); a list alone
+    // does not.
+    if req.param("fen").is_some() {
+        app.catalog.explorer.mark_in_use(&entry.id);
+    }
     let offset = match req.param("offset").map(str::parse::<u64>) {
         None => 0,
         Some(Ok(n)) => n,

@@ -373,7 +373,7 @@ impl Pass<'_> {
             kept.buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
             let mut taker = chunks.taker();
             while let Some((lo, hi)) = taker.take(kept.buf.len() + spare > cap) {
-                if w.stopped() || self.progress.stop.load(Ordering::Relaxed) {
+                if w.stopped() || self.progress.stopped() {
                     return Err(SearchError::Superseded);
                 }
                 for game in lo..=hi {
@@ -564,7 +564,7 @@ fn write_blocks(
     let (rest, split) = (pass.rest.load(Ordering::Relaxed), Mutex::new(None));
     let miscounted = || corrupt(&pass.stream.path, "the move stream does not replay to the postings it counted");
     workers::run(want, 0, &Cancel::never(), |w| {
-        let stopped = || w.stopped() || progress.stop.load(Ordering::Relaxed);
+        let stopped = || w.stopped() || progress.stopped();
         let mut heads: Vec<&[u64]> = Vec::new();
         heads.try_reserve_exact(buffers.len()).map_err(|_| Refused::Busy)?;
         let mut gathered: Vec<u64> = Vec::new();

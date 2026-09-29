@@ -470,7 +470,7 @@ impl Pass<'_> {
             let mut seen = [0u64; MAX_PLY as usize + 1];
             let mut taker = chunks.taker();
             while let Some((lo, hi)) = taker.take(buf.len() + spare > cap) {
-                if w.stopped() || self.progress.stop.load(Ordering::Relaxed) {
+                if w.stopped() || self.progress.stopped() {
                     return Err(SearchError::Superseded);
                 }
                 for game in lo..=hi {
@@ -700,7 +700,7 @@ fn write_parts(
     let turns = Turns::new(end - first, want * OUT_BYTES, sink, &place, &write);
     let progress = pass.progress;
     workers::run(want, 0, &Cancel::never(), |w| {
-        let stopped = || w.stopped() || progress.stop.load(Ordering::Relaxed);
+        let stopped = || w.stopped() || progress.stopped();
         let mut made = Blocks::new().ok_or(Refused::Busy)?;
         let mut agg = Aggregate::new().ok_or(Refused::Busy)?;
         let mut heads: Vec<&[Entry]> = Vec::new();

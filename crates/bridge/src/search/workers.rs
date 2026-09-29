@@ -142,6 +142,9 @@ pub fn run<T: Send>(
     let count = slots.0;
     let stop = AtomicBool::new(false);
     let task = &task;
+    // The workers run at the caller's priority: an index build's in the
+    // background, a search's at the normal one (#149).
+    let priority = crate::machine::current();
     let results: Vec<Result<T, SearchError>> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         if handles.try_reserve_exact(count).is_err() {
@@ -153,6 +156,7 @@ pub fn run<T: Send>(
                 .name("bridge-search".into())
                 .stack_size(crate::THREAD_STACK)
                 .spawn_scoped(s, move || {
+                    crate::machine::follow(priority);
                     let result = task(&worker);
                     if result.is_err() {
                         worker.stop.store(true, Ordering::Relaxed);
@@ -301,6 +305,19 @@ mod tests {
         assert!(got.iter().enumerate().all(|(i, &(index, _))| i == index));
         let failed = run(4, 0, &Cancel::never(), |w| if w.index == 0 { Err(SearchError::Busy) } else { Ok(()) });
         assert!(matches!(failed, Err(SearchError::Busy)));
+    }
+
+    /// A pass's workers run at the priority of the thread that started it
+    /// (#149): an index build's workers in the background, and a search's at
+    /// the normal priority, whatever builds ran before.
+    #[test]
+    fn workers_run_at_the_callers_priority() {
+        use crate::machine::{Priority, at, current};
+        for priority in [Priority::Background, Priority::BelowNormal, Priority::Normal] {
+            let _at = at(priority);
+            let got = run(4, 0, &Cancel::never(), |_| Ok(current())).ok().unwrap();
+            assert!(got.iter().all(|&p| p == priority), "{priority:?}: {got:?}");
+        }
     }
 
     #[test]
