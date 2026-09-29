@@ -152,9 +152,61 @@ fn the_background_build_is_timed_from_the_bridges_start() {
     for phase in ["stream pass", "tree passes", "deep passes"] {
         assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");
     }
-    let timed = |l: &&str| (l.starts_with("sort ") || l.starts_with("search ")) && !l.contains(" suggested ");
+    let labels = ["before the build", "partly during the build", "during the build", "after the build"];
     for row in text.lines().filter(timed) {
-        assert!(row.ends_with("during the build") || row.ends_with("after the build"), "{row}");
+        assert!(labels.iter().any(|l| row.ends_with(l)), "{row}");
     }
     assert!(out.status.success(), "{text}");
+}
+
+/// The sorts and searches of a profile, with a database written just now.
+fn timed(l: &&str) -> bool {
+    (l.starts_with("sort ") || l.starts_with("search ")) && !l.contains(" suggested ")
+}
+
+/// A database written just now waits out the keeper's quiet period, a minute,
+/// before its build starts (#149): the sorts and searches the profile times
+/// meanwhile ran beside no build, and say so. The profile is stopped once it
+/// has printed them, and the bridge it started ends with it.
+#[test]
+fn rows_taken_before_the_background_build_starts_say_so() {
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    b.game(e4);
+    b.game(e4);
+    let db = b.write("cbtool-profile-background-recent");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(db.dir().join("db.2cbh"))
+        .arg("--index")
+        .arg(db.dir().join("index"))
+        .arg("--background")
+        .env("OSCHESS_BRIDGE_BACKGROUND_MODE", "background")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The flow after the searches is the games' PGN.
+    let mut lines = Vec::new();
+    for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
+        let pgn = line.starts_with("pgn ");
+        lines.push(line);
+        if pgn {
+            break;
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let text = lines.join("\n");
+    assert!(lines.iter().any(|l| l.starts_with("pgn ")), "{text}");
+    let rows: Vec<&str> = text.lines().filter(timed).collect();
+    assert!(rows.iter().any(|r| r.starts_with("search ")), "{text}");
+    for row in rows {
+        assert!(row.ends_with(" before the build"), "{row}");
+    }
 }

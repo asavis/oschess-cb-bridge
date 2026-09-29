@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -111,8 +111,9 @@ fn options(args: &[String]) -> AnyResult<Options> {
 
 /// `cbtool profile-serve <db> <index> [--background] [<engine>]`: the bridge
 /// `profile` asks, in a process of its own. It prints `port <n>` and serves
-/// until killed; once it has built the database's position index, it prints
-/// `built`, then where the build's time went ([`Timings::line`]). With
+/// until killed, or until its input ends: when the `profile` that started it
+/// ends, however it ends. Once it has built the database's position index, it
+/// prints `built`, then where the build's time went ([`Timings::line`]). With
 /// `--background`, it keeps its indexes as a bridge that serves does (#149).
 pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     let [db, index, rest @ ..] = args else {
@@ -138,6 +139,10 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     writeln!(out, "port {port}")?;
     out.flush()?;
     let app = Arc::new(app);
+    std::thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        std::process::exit(0);
+    });
     if background {
         bridge::explorer::keeper::start(&app);
     }
@@ -161,6 +166,8 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
 /// and the lines it prints after its port, each with when it came.
 struct Served {
     child: Child,
+    /// Held open for the bridge's life: the bridge ends when it closes.
+    _input: ChildStdin,
     port: u16,
     id: String,
     lines: mpsc::Receiver<(Instant, String)>,
@@ -183,14 +190,44 @@ impl Served {
         self.built.get()
     }
 
-    /// With `--background`, whether the build of the position index still
-    /// runs: `, during the build` or `, after the build` for a row's counts.
-    fn during(&self, o: &Options) -> &'static str {
-        match (o.background, self.built(Duration::ZERO)) {
-            (false, _) => "",
-            (true, None) => ", during the build",
-            (true, Some(_)) => ", after the build",
+    /// With `--background`, the state of the position index's build now, by
+    /// the bridge's own word: built once it has said so, else running while
+    /// `/v1/status` lists the build in a phase other than `waiting`. A build
+    /// not started yet, as while the keeper waits for the database to be
+    /// quiet, or waiting for its turn, reads nothing.
+    fn build(&self, c: &mut Client, o: &Options) -> Option<Build> {
+        if !o.background {
+            return None;
         }
+        if self.built(Duration::ZERO).is_some() {
+            return Some(Build::Built);
+        }
+        Some(match c.get("/v1/status", true) {
+            Ok((200, body)) if strings(&body, "phase").iter().any(|p| p != "waiting") => Build::Running,
+            _ => Build::Idle,
+        })
+    }
+}
+
+/// The position index's build as a row sees it (#149).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Build {
+    Idle,
+    Running,
+    Built,
+}
+
+/// What a row's counts say of the build, from its state before the row's
+/// first request and after its last: only a row the build ran through from
+/// its start to its end was taken during the build. Nothing without
+/// `--background`.
+fn during(before: Option<Build>, after: Option<Build>) -> &'static str {
+    match (before, after) {
+        (None, _) | (_, None) => "",
+        (Some(Build::Running), Some(Build::Running)) => ", during the build",
+        (Some(Build::Built), _) => ", after the build",
+        (Some(Build::Idle), Some(Build::Idle)) => ", before the build",
+        _ => ", partly during the build",
     }
 }
 
@@ -212,12 +249,13 @@ fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
     if let Some(exe) = &o.engine {
         command.arg(exe);
     }
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let input = child.stdin.take();
     let mut line = String::new();
     let mut out = child.stdout.take().map(BufReader::new);
     let read = out.as_mut().is_some_and(|out| out.read_line(&mut line).is_ok());
     let port = line.trim().strip_prefix("port ").and_then(|p| p.parse().ok()).filter(|_| read);
-    let (Some(port), Some(out)) = (port, out) else {
+    let (Some(port), Some(out), Some(input)) = (port, out, input) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err("the bridge did not start".into());
@@ -231,7 +269,7 @@ fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
             }
         }
     });
-    Ok(Served { child, port, id: id_of(&o.db), lines, built: OnceCell::new() })
+    Ok(Served { child, _input: input, port, id: id_of(&o.db), lines, built: OnceCell::new() })
 }
 
 /// A failed answer, by its status and the bridge's error code only: a code is
@@ -654,13 +692,14 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     // Sorts: the first order of each key over all records, then cached.
     for key in SORT_KEYS {
         let path = format!("{base}/games?sort={key}&limit=500");
+        let before = served.build(&mut c, &o);
         let mut cold = Samples::default();
         let total = cold.get(&mut c, &path, true).and_then(|body| number(&body, "total"));
         let mut warm = Samples::default();
         for _ in 0..RUNS {
             warm.get(&mut c, &path, true);
         }
-        let during = served.during(&o);
+        let during = during(before, served.build(&mut c, &o));
         let rows = total.map_or(String::new(), |t| format!("{t} rows"));
         table.row("sort", &format!("{key} cold"), &mut cold, &format!("{rows}{during}"));
         table.row("sort", &format!("{key} cached"), &mut warm, during.trim_start_matches(", "));
@@ -724,13 +763,14 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     }
     for (name, q) in &searches {
         let path = format!("{base}/games?limit=500&q={}", encode(q));
+        let before = served.build(&mut c, &o);
         let mut cold = Samples::default();
         let total = cold.get(&mut c, &path, true).and_then(|body| number(&body, "total"));
         let mut warm = Samples::default();
         for _ in 0..RUNS {
             warm.get(&mut c, &path, true);
         }
-        let during = served.during(&o);
+        let during = during(before, served.build(&mut c, &o));
         let matches = total.map_or(String::new(), |t| format!("{t} matches"));
         table.row("search", &format!("{name} cold"), &mut cold, &format!("{matches}{during}"));
         table.row("search", &format!("{name} cached"), &mut warm, during.trim_start_matches(", "));
