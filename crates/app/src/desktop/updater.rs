@@ -1,16 +1,20 @@
-//! Updates on Windows: the updater plugin, a look for a new version a minute
-//! after the start and every six hours while «Update automatically» is on, and
-//! a look on request from the menu or the settings. A new version downloads at
-//! once and installs when the bridge is idle: its installer runs without a
-//! window, replaces the app and starts it again, and the new start says so.
+//! Updates on Windows: a look for a new version a minute after the start and
+//! every six hours while «Update automatically» is on, and a look on request
+//! from the menu or the settings. In the direct channel the updater plugin
+//! looks: a new version downloads at once and installs when the bridge is
+//! idle, as its installer runs without a window, replaces the app and starts
+//! it again. In the Store channel the Store API looks (`store_updates`, #153).
+//! Either way the new start says so.
 
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use tauri::plugin::TauriPlugin;
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
+use super::server::Shared;
 use super::shared;
 use crate::{prefs, updates};
 
@@ -22,6 +26,15 @@ const IDLE_POLL: Duration = Duration::from_secs(30);
 /// One look or install at a time; a look on request waits for a running one.
 static GATE: updates::Gate = updates::Gate::new();
 
+/// When this process started looking for updates, at the app's start.
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// How long the app has run, as far as a Store install's restart needs to
+/// know (`updates::RESTARTABLE_AFTER`).
+pub(super) fn alive() -> Duration {
+    STARTED.get_or_init(Instant::now).elapsed()
+}
+
 /// The updater plugin, when `config` holds a real key; `None` keeps the
 /// updater out, and nothing looks for updates. The plugin gets the key as
 /// checked, without surrounding space, never the raw configuration value.
@@ -30,15 +43,16 @@ pub fn plugin<R: Runtime>(config: &tauri::Config) -> Option<TauriPlugin<R, tauri
     Some(tauri_plugin_updater::Builder::new().pubkey(key).build())
 }
 
-/// Whether this build looks for updates: its configuration holds a real key,
-/// and it is not the Store's package, which the Store updates.
+/// Whether this build looks for updates: the Store's package always does,
+/// through the Store; a direct one when its configuration holds a real key.
 pub fn enabled(app: &AppHandle) -> bool {
-    !super::channel().is_store() && updates::public_key(app.config().plugins.0.get("updater")).is_some()
+    super::channel().is_store() || updates::public_key(app.config().plugins.0.get("updater")).is_some()
 }
 
 /// Says «updated to X» when this start follows an update, and starts the
 /// automatic looks.
 pub fn start(app: &AppHandle) {
+    STARTED.get_or_init(Instant::now);
     let shared = shared(app);
     if let Some(version) = shared.dir().ok().and_then(|dir| updates::updated(&dir, env!("CARGO_PKG_VERSION"))) {
         let title = shared.strings.fill("toast.updated.title", &[("version", &version)]);
@@ -92,22 +106,22 @@ fn look(app: &AppHandle, asked: bool) {
 /// only when there was nothing to install or something failed. [`look`] logs
 /// the error as it is, so no error of this crate's own names a path.
 fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
+    if super::channel().is_store() {
+        return super::store_updates::look_and_install(app, asked);
+    }
     let shared = shared(app);
     let strings = &shared.strings;
     let found = tauri::async_runtime::block_on(async { app.updater()?.check().await }).map_err(|e| e.to_string())?;
     let Some(update) = found else {
         if asked {
-            let title = strings.get("toast.update.latest.title").to_string();
-            notify(app, title, &strings.fill("toast.update.latest.body", &[("version", env!("CARGO_PKG_VERSION"))]));
+            notify_latest(app);
         }
         return Ok(());
     };
     // The download checks the signature; an installer the key did not sign
     // never runs.
     let bytes = tauri::async_runtime::block_on(update.download(|_, _| {}, || {})).map_err(|e| e.to_string())?;
-    while !updates::idle(&shared.view(), super::commands::installing()) {
-        std::thread::sleep(IDLE_POLL);
-    }
+    wait_idle(&shared);
     if asked {
         notify(app, strings.fill("toast.update.installing", &[("version", &update.version)]), "");
     }
@@ -118,7 +132,21 @@ fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
     installed.map_err(|e| e.to_string())
 }
 
-fn notify(app: &AppHandle, title: String, body: &str) {
+/// Waits until an install would lose no work (`updates::idle`).
+pub(super) fn wait_idle(shared: &Shared) {
+    while !updates::idle(&shared.view(), super::commands::installing()) {
+        std::thread::sleep(IDLE_POLL);
+    }
+}
+
+/// Says this version is the newest, after a look the user asked for.
+pub(super) fn notify_latest(app: &AppHandle) {
+    let strings = &shared(app).strings;
+    let title = strings.get("toast.update.latest.title").to_string();
+    notify(app, title, &strings.fill("toast.update.latest.body", &[("version", env!("CARGO_PKG_VERSION"))]));
+}
+
+pub(super) fn notify(app: &AppHandle, title: String, body: &str) {
     let mut toast = app.notification().builder().title(title);
     if !body.is_empty() {
         toast = toast.body(body);
