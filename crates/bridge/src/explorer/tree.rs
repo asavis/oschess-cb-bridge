@@ -37,7 +37,7 @@ use super::format::{
     BLOCK_DATA, BLOCK_ENTRY, BLOCK_KEYS, Block, Counts, KEY_ENTRY, MAX_BLOCK_DATA, MAX_PLY, NO_MOVE, TOP_GAMES,
     encode_record, pack_move, part_of,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, Room, grow, reserve};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, Room, grow};
 use super::stream::{self, Stream};
 
 /// A position's run of entries this long or shorter is left as it is when a
@@ -390,12 +390,15 @@ pub(super) fn write(
     if room < least {
         return Err(SearchError::TooLarge);
     }
-    let (_memory, want, room) = Room { fixed: 0, each: WORKER_BYTES, workers: want, least, room }.reserve(progress)?;
+    // The table's first room is reserved with the passes', so that the
+    // entries never take the room the table then waits for.
+    let (_memory, want, room) =
+        Room { fixed: table_bytes, each: WORKER_BYTES, workers: want, least, room }.reserve(progress)?;
     let capacity = room / ENTRY_BYTES;
     let want = want.min(capacity / MIN_WORKER_ENTRIES);
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
-    let table_memory = reserve(table_bytes, progress)?;
+    let table_memory = Hold::default();
     let mut sink = Sink { at: out.offset, table, table_memory, keys: 0, blocks: 0, games: 0, progress };
     let mut first = 0;
     while first < counts.len() {
@@ -635,6 +638,8 @@ struct Sink<'a> {
     /// Where the next part's bytes go.
     at: u64,
     table: Vec<u8>,
+    /// What the table holds beyond its first room, which the passes' hold
+    /// holds.
     table_memory: Hold,
     keys: u64,
     blocks: u64,

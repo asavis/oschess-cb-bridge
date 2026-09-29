@@ -116,18 +116,23 @@ fn files(dir: &Path) -> [PathBuf; 2] {
 /// `.partial` files, which become the index, nor holds more of the budget
 /// than its share. Games that all play one line fold their crowded positions
 /// as the passes collect them; games that part ways fill many parts of the
-/// keys and many buckets, and a pass ends inside a block of the deep section.
+/// keys and many buckets, and a pass ends inside a block of the deep section,
+/// or inside a bucket that alone fills it.
 #[test]
 fn many_passes_write_the_files_of_one() {
     if !in_child("many_passes_write_the_files_of_one") {
         return;
     }
     assert_eq!((budget(), threads()), (16 << 20, 1));
-    // Each of the one line's structures is 2,000 postings of a bucket, and
-    // some of its blocks hold more than a pass: a pass ends inside them.
-    let dbs =
-        [(pawns("small-budget-one-line", 2_000), 32 << 10), (random_games("small-budget-lines", 1_500, 7), 128 << 10)];
-    for (db, pass) in dbs {
+    // Each of the one line's structures is 2,000 postings of a bucket: some
+    // of its blocks hold more than a pass of 32 KiB, which ends inside them,
+    // and each bucket more than a pass of 8 KiB, 1,024 postings, which ends
+    // at a game of it.
+    let dbs = [
+        (pawns("small-budget-one-line", 2_000), &[32 << 10, 8 << 10][..]),
+        (random_games("small-budget-lines", 1_500, 7), &[128 << 10][..]),
+    ];
+    for (db, pass) in dbs.iter().flat_map(|(db, sizes)| sizes.iter().map(move |&size| (db, size))) {
         let d = Database::open(db.dir().join("db.2cbh")).unwrap();
         let one = watched(&d, "one", &Limits::default()).unwrap();
         assert_eq!(passes(&one.progress), (1, 1), "one pass of each kind");
@@ -160,9 +165,8 @@ fn many_passes_write_the_files_of_one() {
     assert_eq!(held(), 0, "the builds returned what they held, and the indexes their tables");
 }
 
-/// A share too small for a pass of the stream, or a crowded structure's
-/// bucket that alone fills a pass, is refused as too large at once, rather
-/// than waiting for memory the build holds itself.
+/// A share too small for a pass of the stream is refused as too large at
+/// once, rather than waiting for memory the build holds itself.
 #[test]
 fn a_share_too_small_is_refused_at_once() {
     if !in_child("a_share_too_small_is_refused_at_once") {
@@ -170,20 +174,13 @@ fn a_share_too_small_is_refused_at_once() {
     }
     let db = pawns("small-budget-refused", 2_000);
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    for (name, limits) in [
-        ("share", Limits { share: 1 << 20, pass_bytes: None }),
-        // Every game holds every structure of the line: 2,000 postings a
-        // bucket, of which a pass holds 1,024.
-        ("bucket", Limits { pass_bytes: Some(8 << 10), ..Limits::default() }),
-    ] {
-        let started = Instant::now();
-        let refused = watched(&d, name, &limits).err().unwrap();
-        assert!(refused.contains("too small") && started.elapsed() < Duration::from_secs(10), "{name}: {refused}");
-        let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-        assert!(left.is_empty(), "{name}: a failed build leaves nothing");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
+    let started = Instant::now();
+    let refused = watched(&d, "share", &Limits { share: 1 << 20, pass_bytes: None }).err().unwrap();
+    assert!(refused.contains("too small") && started.elapsed() < Duration::from_secs(10), "{refused}");
+    let dir = std::env::temp_dir().join(format!("bridge-small-budget-share-{}", std::process::id()));
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert!(left.is_empty(), "a failed build leaves nothing");
+    std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(held(), 0);
 }
 

@@ -494,7 +494,9 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   2. **The tree's passes** (phase `positions`, in entries). A pass takes as
      many parts of the keys, in order, as 97% of the room left in the
      build's share holds of their entries, but for those the stream pass
-     folded, one part at least. An entry is 16 bytes: the key, the game
+     folded, one part at least. The room is reserved together with the
+     workers' buffers for making blocks and the table of the tree's blocks,
+     so that the table never waits for memory the entries took. An entry is 16 bytes: the key, the game
      number (30 bits) with its result (2), and the move (14 bits) and average
      rating (12). Each worker replays the first 21 positions of the games it
      takes, a few hundred at a time, from the stream just written, mapped,
@@ -537,10 +539,21 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      tree's do. A full buffer is sorted and freed of repeats, a game's
      posting beyond ply 20 kept of two with one print; one still three
      quarters full ends the pass at the bucket that keeps about half of it,
-     which may lie inside a deep block, which the next pass goes on with. A
-     bucket whose postings alone fill a worker's buffer fails the build as
-     too large: at the smallest budget, 16 MiB, one of a few hundred thousand
-     games. The blocks are written as the tree's parts are.
+     which may lie inside a deep block, which the next pass goes on with.
+     When the pass's first bucket alone holds that half, as a structure that
+     hundreds of thousands of games hold does at a small budget, the pass
+     ends at the game of that bucket that keeps it, and the next pass goes
+     on with the bucket's later games. Each pass counts its first bucket's
+     postings from where it starts, a game and print once, wherever it
+     ends: the bucket's count, written by its first pass; the later passes
+     write its postings on from the game written last, so that the bytes are
+     those of a pass that holds the bucket whole, and the postings of its
+     passes must add up to that count, else the build fails. A game holds
+     at most 127 structures, half a worker's least room, so no bucket is too
+     large for the share. The blocks are written as the
+     tree's parts are, handed over in pieces of at most a megabyte, inside a
+     bucket too, so that a crowded bucket takes no more memory than a worker
+     holds for its bytes.
   4. **The end.** The tables and the header are written and the index file
      synced; what each pass wrote was synced behind the build, on a thread
      of its own, so that this sync waits for the last pass's bytes alone. The

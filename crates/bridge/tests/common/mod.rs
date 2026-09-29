@@ -439,6 +439,13 @@ impl ClassicIds {
 /// from a few, so that games share their openings and then part ways, as a
 /// real database's do, reaching many positions and structures.
 pub fn random_games(name: &str, games: usize, seed: u64) -> TempDb {
+    let mut b = Builder::new();
+    add_random_games(&mut b, games, seed);
+    b.write(name)
+}
+
+/// Adds the games of [`random_games`] to `b`.
+pub fn add_random_games(b: &mut Builder, games: usize, seed: u64) {
     let mut x = seed | 1;
     let mut next = move || {
         x ^= x << 13;
@@ -446,7 +453,6 @@ pub fn random_games(name: &str, games: usize, seed: u64) -> TempDb {
         x ^= x << 17;
         x
     };
-    let mut b = Builder::new();
     for g in 0..games {
         let mut board = Board::startpos();
         let mut words = vec![MOVES];
@@ -468,7 +474,6 @@ pub fn random_games(name: &str, games: usize, seed: u64) -> TempDb {
         let elo = 1500 + (next() % 1300) as i16;
         rec[0x60..0x62].copy_from_slice(&elo.to_le_bytes());
     }
-    b.write(name)
 }
 
 /// The bytes of the index file or move stream at `path` without its build

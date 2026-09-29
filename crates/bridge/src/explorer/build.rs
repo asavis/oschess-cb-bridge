@@ -532,10 +532,10 @@ impl<'a, T, M, W> Turns<'a, T, M, W> {
         (unit < self.units).then_some(unit as usize)
     }
 
-    /// Hands over `made`, `bytes` long, a piece of `unit`, the last one when
-    /// `last`, to be placed and written. A worker waiting for room stops,
-    /// `Superseded`, once `stopped`, as every worker does after another one
-    /// failed.
+    /// Hands over `made`, which holds `bytes` of memory, a piece of `unit`,
+    /// the last one when `last`, to be placed and written. A worker waiting
+    /// for room stops, `Superseded`, once `stopped`, as every worker does
+    /// after another one failed.
     pub fn put(
         &self,
         unit: usize,
