@@ -807,6 +807,40 @@ fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The starts a stream keeps are given up when a list needs their room: the
+/// standard start's games are listed whole whenever the budget left holds
+/// the list and the position's set, by the first scan, which finds the
+/// starts, and by those after it (#142, review of #163).
+#[test]
+fn kept_starts_give_way_to_a_list() {
+    if !in_child("kept_starts_give_way_to_a_list") {
+        return;
+    }
+    const GAMES: usize = 100_000;
+    let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-starts-room", &games);
+    let dir = index_dir("starts-room");
+    let (bridge, id) = serve(&db, &dir);
+    // The index built without a list, so that no scan has found the starts.
+    answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(START)));
+    for sort in ["number", "number-desc"] {
+        // Room for the list, 400 KB, the set, 12.5 KB, and a little more:
+        // not for the starts besides, 25 KB.
+        let free = GAMES * 4 + GAMES / 8 + (8 << 10);
+        let taken = loop {
+            if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
+                break hold;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let body = at_once(bridge.port, &list(&id, START, &format!("&sort={sort}")));
+        assert_eq!(number(&body, "total"), GAMES as u64, "{sort}");
+        drop(taken);
+    }
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// With the search memory all but a little taken, a list of a position's
 /// games is answered `503 busy`, or answered whole when what is left holds
 /// it, whichever step runs short: never a panic, never another error.

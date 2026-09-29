@@ -31,7 +31,7 @@
 //!
 //! The first scan while the stream is open also notes which games start
 //! from the standard position and which from a set-up one, and the stream
-//! keeps them, when the search budget has room (#142). A scan for the
+//! keeps them while the search budget has room for them (#142). A scan for the
 //! standard start then takes the first as they are, every one of them
 //! reaching it at its first ply, and replays the set-up ones alone, instead
 //! of reading every slot.
@@ -165,7 +165,7 @@ fn scan(stream: &Stream, board: &Board, members: &Members, cancel: &Cancel) -> R
         && home == u16::MAX
         && let Some(starts) = stream.starts()
     {
-        return from_start(stream, starts, (key, home), members, cancel);
+        return from_start(stream, &starts, (key, home), members, cancel);
     }
     let finding = stream.find_starts();
     let blocks = stream.header.blocks as usize;

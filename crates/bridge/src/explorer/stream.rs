@@ -19,12 +19,13 @@
 //! its number and its slots in the table, which a scan of every slot (#148)
 //! checks the first time it reads the block, once while the stream is open.
 //! That scan also finds which games start from the standard position and
-//! which from a set-up one, which the stream keeps (#142).
+//! which from a set-up one, which the stream keeps until the search budget
+//! runs short (#142).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Replayer, Square};
 
@@ -32,7 +33,7 @@ use cbformat::movetable::FIRST_PIECE_WORD;
 use cbformat::replay;
 
 use crate::indexdir::{crc32, crc32_update, u32_at, u64_at};
-use crate::search::memory::{Hold, Refused};
+use crate::search::memory::{Evict, Hold, Refused, register};
 use crate::search::{Adding, Members, SearchError};
 
 use super::file::{Bad, read_at, write_at};
@@ -651,15 +652,28 @@ pub struct Game {
 /// A stream mapped read-only. The header and the table of blocks are checked
 /// when it opens, each record against its CRC whenever it is read, and each
 /// block against its own the first time a scan reads it. The table and the
-/// starts are held in the search budget; the mapped file is the operating
-/// system's file cache, outside the budget.
+/// starts are held in the search budget, the starts until the budget runs
+/// short; the mapped file is the operating system's file cache, outside the
+/// budget.
 pub struct Stream {
     pub path: PathBuf,
     pub header: Header,
     map: Map,
     blocks: Vec<Block>,
-    starts: OnceLock<Starts>,
+    starts: Arc<KeptStarts>,
     _memory: Hold,
+}
+
+/// The starts a stream keeps, which it gives up when the search budget runs
+/// short, as any cache does: a scan then reads every slot again, and finds
+/// them again when it has room for them.
+#[derive(Default)]
+struct KeptStarts(Mutex<Option<Arc<Starts>>>);
+
+impl Evict for KeptStarts {
+    fn evict(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// The starts of the games the index holds, as the first scan of every slot
@@ -752,7 +766,10 @@ impl Stream {
         drop(table);
         let size = usize::try_from(len).map_err(|_| Bad::Corrupt("stream larger than memory"))?;
         let map = Map::new(&file, size).map_err(Bad::Io)?;
-        Ok(Stream { path: path.to_path_buf(), header, map, blocks: placed, starts: OnceLock::new(), _memory: memory })
+        let starts = Arc::new(KeptStarts::default());
+        let weak: Weak<dyn Evict> = Arc::downgrade(&(Arc::clone(&starts) as Arc<dyn Evict>));
+        register(weak);
+        Ok(Stream { path: path.to_path_buf(), header, map, blocks: placed, starts, _memory: memory })
     }
 
     /// Record `number`, checked against its CRC.
@@ -798,17 +815,18 @@ impl Stream {
         Ok((number, bytes.as_chunks::<SLOT_BYTES>().0.iter().map(Slot::of)))
     }
 
-    /// The starts of the games, once a scan of every slot has found them.
-    pub(super) fn starts(&self) -> Option<&Starts> {
-        self.starts.get()
+    /// The starts of the games, once a scan of every slot has found them,
+    /// and while the stream keeps them.
+    pub(super) fn starts(&self) -> Option<Arc<Starts>> {
+        self.starts.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Room for the starts of the games, which a scan of every slot finds
     /// block by block, the stream then keeping them ([`Stream::keep`]):
-    /// `None` once it keeps them, or when the search budget has no room for
+    /// `None` while it keeps them, or when the search budget has no room for
     /// them now, which they never take from what searches retained.
     pub(super) fn find_starts(&self) -> Option<Starts> {
-        if self.starts.get().is_some() {
+        if self.starts().is_some() {
             return None;
         }
         let len = self.header.last_record as usize + 1;
@@ -819,7 +837,7 @@ impl Stream {
     /// found to match the block's CRC; of two scans that found them at once,
     /// the first's.
     pub(super) fn keep(&self, starts: Starts) {
-        let _ = self.starts.set(starts);
+        self.starts.0.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| Arc::new(starts));
     }
 
     /// The slot and the tail of record `number`, within the file.
