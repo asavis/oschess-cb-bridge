@@ -16,9 +16,10 @@ use serde_json::Value;
 
 use crate::status::{Theme, Tray, icon_file, icon_size};
 
-/// A file of the app's crate, by its path from the crate's folder.
+/// A file of the app's crate, by its path from the crate's folder, with
+/// its lines ending in `\n`: a Windows checkout ends them in `\r\n`.
 fn app_file(path: &str) -> String {
-    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect(path)
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect(path).replace("\r\n", "\n")
 }
 
 /// `text` without its comment lines.
