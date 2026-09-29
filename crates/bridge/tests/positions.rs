@@ -771,6 +771,42 @@ fn in_child(name: &str) -> bool {
     false
 }
 
+/// A list of a position's games in a sort order that is kept is answered
+/// whole whenever the budget left holds the list itself: the lists the
+/// workers may gather its parts into first are a saving, which never makes
+/// the list busy nor evicts the order (#142, review of #163).
+#[test]
+fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
+    if !in_child("a_list_in_a_kept_order_needs_no_room_but_its_own") {
+        return;
+    }
+    const GAMES: u32 = 12_000;
+    let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-tight", &games);
+    let dir = index_dir("tight");
+    let (bridge, id) = serve(&db, &dir);
+    let e4 = board_after("e2e4").fen();
+    // The index built and its stream scanned once; the order by White kept.
+    assert_eq!(number(&answered(bridge.port, &list(&id, &e4, "&sort=number")), "total"), u64::from(GAMES));
+    at_once(bridge.port, &format!("/v1/databases/{id}/games?sort=white&limit=1"));
+    // Room for the list, 48 KB, and a little more, but not for part lists
+    // besides it, twice as much again.
+    let free = GAMES as usize * 4 + (32 << 10);
+    let taken = loop {
+        if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
+            break hold;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let kept = held();
+    let body = at_once(bridge.port, &list(&id, &e4, "&sort=white"));
+    assert_eq!(number(&body, "total"), u64::from(GAMES));
+    assert!(held() >= kept, "nothing retained was evicted");
+    drop(taken);
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// With the search memory all but a little taken, a list of a position's
 /// games is answered `503 busy`, or answered whole when what is left holds
 /// it, whichever step runs short: never a panic, never another error.

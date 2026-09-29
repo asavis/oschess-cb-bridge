@@ -397,7 +397,9 @@ const PART_NUMBERS: usize = 1 << 16;
 /// Members from which the workers gather a list in two passes, which take no
 /// room but the list's. Fewer are listed in number order on the calling
 /// thread, and in another order in one pass, each part into a list of its
-/// own, which starting the workers once more would cost more than.
+/// own, which starting the workers once more would cost more than, when the
+/// budget has room for those lists besides without evicting anything; else
+/// in two passes too.
 const MANY_MEMBERS: usize = 1 << 21;
 
 /// The `count` records of `members` in `sort` order: in number order, the
@@ -438,9 +440,11 @@ fn members_in<S: Store>(
                 numbers.iter().take(PART_NUMBERS).copied().filter(|&n| members.contains(n))
             };
             let parts = order.len().div_ceil(PART_NUMBERS);
-            if count < MANY_MEMBERS {
-                // The parts' lists, each at most twice what it holds.
-                let _lists = Hold::reserve(count * 8 + parts * LEAST_LIST * 4)?;
+            // The parts' lists, each at most twice what it holds, are a
+            // saving that never takes the room of what searches retained.
+            if count < MANY_MEMBERS
+                && let Ok(_lists) = Hold::reserve_quietly(count * 8 + parts * LEAST_LIST * 4)
+            {
                 let lists = each_part(parts, ctl.cancel, |i| list(part(i)))?;
                 out.extend(lists.iter().flatten().take(count));
             } else {
