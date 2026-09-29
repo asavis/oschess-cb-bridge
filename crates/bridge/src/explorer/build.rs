@@ -674,6 +674,49 @@ mod tests {
         assert_eq!(stuck.state.into_inner().unwrap().sink, [0, 1]);
     }
 
+    /// A worker that panics before it hands over its unit stops the others
+    /// (#172): one waiting for the room that unit would free stops, rather
+    /// than waiting for ever, and the panic reaches the pass's caller.
+    #[test]
+    fn a_worker_that_panics_stops_one_waiting_for_its_turn() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (ended, pass) = mpsc::channel();
+        std::thread::spawn(move || {
+            loop {
+                let place = |out: &mut Vec<usize>, unit: usize| {
+                    out.push(unit);
+                    Ok(())
+                };
+                // Room for one byte: unit 1 is kept, and unit 2 waits for unit 0.
+                let turns = Turns::new(3, 1, Vec::new(), &place, &|()| Ok(()));
+                let ran = catch_unwind(AssertUnwindSafe(|| {
+                    workers::run(2, 0, &Cancel::never(), |w| {
+                        if w.count < 2 {
+                            return Err(SearchError::Busy);
+                        }
+                        if w.index == 1 {
+                            turns.put(1, 1, 1, true, &|| w.stopped())?;
+                            return turns.put(2, 2, 1, true, &|| w.stopped());
+                        }
+                        while turns.state.lock().unwrap_or_else(|e| e.into_inner()).bytes == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        panic!("a bug in the worker making unit 0");
+                    })
+                }));
+                if !matches!(ran, Ok(Err(SearchError::Busy))) {
+                    let _ = ended.send(ran.is_err());
+                    return;
+                }
+                // Fewer than two workers were free.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let panicked = pass.recv_timeout(Duration::from_secs(30)).expect("the pass ended");
+        assert!(panicked, "the panic reached the caller");
+    }
+
     /// A worker whose buffer is full leaves the chunks to the others while
     /// another takes them, and the last one taking them goes on, full or not,
     /// one that starts late among them.
