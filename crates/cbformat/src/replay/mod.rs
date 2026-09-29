@@ -115,7 +115,90 @@ fn setup_board(s: &Setup) -> Result<Board> {
 /// piece (or nothing) on the destination, en passant available, a castling
 /// right. Legality itself is checked when the move is played, by [`play`] or
 /// [`walk`]. The null move is not handled here.
+///
+/// A normal move word, nearly every word a game holds, is checked from its
+/// entry in a table of four bytes a word ([`normals`]), a lookup and a few
+/// tests; any other word, or one that does not agree with the position, is
+/// decoded in full ([`decode_move`]), which gives the error.
 pub fn to_move(board: &Board, word: u16) -> std::result::Result<Move, MoveError> {
+    let n = normals().get(usize::from(word)).copied().unwrap_or(0);
+    if n & NORMAL != 0 {
+        let (from, to) =
+            (Square::new(n as u8 & 7, (n >> 3) as u8 & 7), Square::new((n >> 6) as u8 & 7, (n >> 9) as u8 & 7));
+        let (piece, color) =
+            (PIECES[(n >> 12 & 7) as usize], if n & BLACK == 0 { CColor::White } else { CColor::Black });
+        let captured = (n >> 16 & 7) as usize;
+        let holds = if captured == 0 {
+            board.occupied() & to.bit() == 0
+        } else {
+            board.colored(PIECES[captured - 1], !color) & to.bit() != 0
+        };
+        if board.side_to_move() == color
+            && board.colored(piece, color) & from.bit() != 0
+            && board.colors(color) & to.bit() == 0
+            && holds
+            && (n & EN_PASSANT == 0 || board.en_passant() == Some(to))
+        {
+            let promotion = (n >> 20 & 7) as usize;
+            return Ok(Move::new(from, to, (promotion != 0).then(|| PIECES[promotion - 1])));
+        }
+    }
+    decode_move(board, word)
+}
+
+/// A normal move word's entry in [`normals`]: its origin (bits 0-5), its
+/// destination (6-11), its piece (12-14, as [`CPiece::index`]), black
+/// (15), the piece it takes plus one (16-18, 0 for none), en passant (19),
+/// the piece a pawn becomes plus one (20-22, 0 for none), and a normal move
+/// word (23), which every other word's entry, 0, is not.
+const BLACK: u32 = 1 << 15;
+const EN_PASSANT: u32 = 1 << 19;
+const NORMAL: u32 = 1 << 23;
+/// The pieces by index, and two more, so that three bits always name one.
+const PIECES: [CPiece; 8] = [
+    CPiece::Pawn,
+    CPiece::Knight,
+    CPiece::Bishop,
+    CPiece::Rook,
+    CPiece::Queen,
+    CPiece::King,
+    CPiece::Pawn,
+    CPiece::Pawn,
+];
+
+/// The entry of each word below the Chess960 castlings.
+fn normals() -> &'static [u32] {
+    static NORMALS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    NORMALS.get_or_init(|| {
+        (0..movetable::FIRST_CASTLE_960)
+            .map(|word| match movetable::decode(word) {
+                Some(MoveWord::Normal { color: c, piece: p, from, to, captured, promotion }) => {
+                    let taken = match captured {
+                        Captured::Nothing | Captured::EnPassant => 0,
+                        Captured::Queen => CPiece::Queen.index() as u32 + 1,
+                        Captured::Knight => CPiece::Knight.index() as u32 + 1,
+                        Captured::Bishop => CPiece::Bishop.index() as u32 + 1,
+                        Captured::Rook => CPiece::Rook.index() as u32 + 1,
+                        Captured::Pawn => CPiece::Pawn.index() as u32 + 1,
+                    };
+                    u32::from(from & 63)
+                        | u32::from(to & 63) << 6
+                        | (piece(p).index() as u32) << 12
+                        | if c == Color::Black { BLACK } else { 0 }
+                        | taken << 16
+                        | if captured == Captured::EnPassant { EN_PASSANT } else { 0 }
+                        | promotion.map_or(0, |p| piece(p).index() as u32 + 1) << 20
+                        | NORMAL
+                }
+                _ => 0,
+            })
+            .collect()
+    })
+}
+
+/// [`to_move`] from the word decoded in full: the reference, and the error
+/// of any word that does not agree with the position.
+fn decode_move(board: &Board, word: u16) -> std::result::Result<Move, MoveError> {
     let decoded = movetable::decode(word).ok_or(MoveError::NotAMoveWord(word))?;
     match decoded {
         MoveWord::Null => Err(MoveError::NullMove),
@@ -411,5 +494,52 @@ mod tests {
         assert_eq!(standard_move(movetable::NULL_MOVE), None);
         assert_eq!(standard_move(movetable::FIRST_CASTLE_960), None);
         assert_eq!(standard_move(0), None);
+    }
+
+    /// Every word, in positions with castling both ways, en passant,
+    /// promotions with and without a capture, checks, and those of random
+    /// games, gives from its table entry what the word decoded in full
+    /// gives: the move, or the same error.
+    #[test]
+    fn a_words_entry_agrees_with_the_word_decoded() {
+        let mut boards: Vec<Board> = [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N w - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1",
+            "4k3/8/8/1b6/8/8/8/4K2R w K - 0 1",
+        ]
+        .iter()
+        .map(|fen| Board::from_fen(fen).unwrap())
+        .collect();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..8 {
+            let mut board = Board::startpos();
+            for _ in 0..90 {
+                let moves = board.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                board.play_unchecked(moves[(x % moves.len() as u64) as usize]);
+                if x.is_multiple_of(7) {
+                    boards.push(board.clone());
+                }
+            }
+        }
+        assert!(boards.len() > 60, "{}", boards.len());
+        let mut agreed = 0;
+        for board in &boards {
+            for word in 0..=u16::MAX {
+                let full = decode_move(board, word);
+                assert_eq!(to_move(board, word), full, "{word:#06x} in {board:?}");
+                agreed += u32::from(full.is_ok());
+            }
+        }
+        assert!(agreed > 1_000, "{agreed}");
     }
 }

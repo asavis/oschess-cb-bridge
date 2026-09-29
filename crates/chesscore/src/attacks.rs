@@ -5,7 +5,7 @@
 //! the lowest set bit for directions that increase the square index and the
 //! highest for those that decrease it.
 
-use crate::types::{Bitboard, Color, Square};
+use crate::types::{Bitboard, Color, Piece, Square};
 
 const fn leaper(deltas: &[(i8, i8)]) -> [Bitboard; 64] {
     let mut t = [0; 64];
@@ -63,6 +63,38 @@ const RAYS: [[Bitboard; 64]; 9] = {
     }
     t
 };
+
+/// The squares each piece but a pawn reaches from each square on an empty
+/// board, by [`Piece::index`]; none for a pawn, whose moves depend on what
+/// stands around it.
+static EMPTY_BOARD: [[Bitboard; 64]; 6] = {
+    let mut t = [[0; 64]; 6];
+    let mut sq = 0;
+    while sq < 64 {
+        let (mut straight, mut diagonal, mut d) = (0, 0, 0);
+        while d < 8 {
+            if d % 2 == 0 {
+                straight |= RAYS[d][sq];
+            } else {
+                diagonal |= RAYS[d][sq];
+            }
+            d += 1;
+        }
+        t[1][sq] = KNIGHT[sq];
+        t[2][sq] = diagonal;
+        t[3][sq] = straight;
+        t[4][sq] = straight | diagonal;
+        t[5][sq] = KING[sq];
+        sq += 1;
+    }
+    t
+};
+
+/// The squares `piece`, not a pawn, reaches from `sq` on an empty board.
+#[inline]
+pub(crate) fn empty_board(piece: Piece, sq: Square) -> Bitboard {
+    EMPTY_BOARD[piece.index()][sq.index()]
+}
 
 /// The squares strictly between two squares on a common line, or none.
 static BETWEEN: [[Bitboard; 64]; 64] = {

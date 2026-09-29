@@ -313,6 +313,36 @@ fn a_connection_serves_several_requests() {
     assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
 }
 
+/// Answers on a kept connection come at once (#142): one after another, 20
+/// round trips take milliseconds. An answer written in two pieces waited for
+/// the client's delayed acknowledgement, 40 ms each on Linux.
+#[test]
+fn answers_on_a_kept_connection_come_without_delay() {
+    let db = database("api-no-delay", 1, 0, 0);
+    let p = start(&db, vec![], None).port;
+    let one = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
+    let mut s = std::io::BufReader::new(TcpStream::connect(("127.0.0.1", p)).unwrap());
+    let started = std::time::Instant::now();
+    for _ in 0..20 {
+        s.get_mut().write_all(one.as_bytes()).unwrap();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut s, &mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("Content-Length: ") {
+                length = v.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        s.read_exact(&mut body).unwrap();
+    }
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(400), "20 answers took {took:?}");
+}
+
 /// A `.2lid` with six entity types (players, tournaments, sources, the unused
 /// type 3, teams, game tags), `count` entities each in containers of `size`
 /// bytes, holding `entities` as (type, id, record after its length field).

@@ -500,13 +500,13 @@ impl Board {
             return Err(IllegalMove::Occupied);
         }
         let occupied = self.occupied();
-        let reachable = match piece {
-            Piece::Pawn => self.pawn_reaches(mv, occupied)?,
-            Piece::Knight => attacks::knight(mv.from) & mv.to.bit() != 0,
-            Piece::Bishop => attacks::bishop(mv.from, occupied) & mv.to.bit() != 0,
-            Piece::Rook => attacks::rook(mv.from, occupied) & mv.to.bit() != 0,
-            Piece::Queen => attacks::queen(mv.from, occupied) & mv.to.bit() != 0,
-            Piece::King => attacks::king(mv.from) & mv.to.bit() != 0,
+        // A piece but a pawn reaches a square among its moves on an empty
+        // board when nothing stands between, which nothing does for a knight
+        // or a king: two lookups, and no branch on which piece it is.
+        let reachable = if piece == Piece::Pawn {
+            self.pawn_reaches(mv, occupied)?
+        } else {
+            attacks::empty_board(piece, mv.from) & mv.to.bit() != 0 && attacks::between(mv.from, mv.to) & occupied == 0
         };
         if !reachable {
             return Err(IllegalMove::Unreachable);

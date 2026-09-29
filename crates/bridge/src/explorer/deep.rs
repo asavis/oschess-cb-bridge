@@ -46,7 +46,7 @@ use crate::search::workers::{self, threads};
 use super::build::{Chunks, Out, PLANNED, Turns, corrupt, from_bad};
 use super::format::{
     DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, PRUNE_PLY, STRUCTURE_PIECES, deep_bucket, deep_print,
-    piece_shift, read_varint, structure_of, varint,
+    piece_shift, read_varint, structure_of, structures_in_vectors, structures_of, varint,
 };
 use super::runs::{Limits, PassTime, Progress, Room};
 use super::source::MAX_STRUCTURES;
@@ -62,7 +62,8 @@ const MIN_WORKER_POSTINGS: usize = 2 * MAX_STRUCTURES;
 /// handed over once it holds half of it, even inside a bucket, and so never
 /// grows past it.
 const OUT_BYTES: usize = 1 << 20;
-/// The postings of a bucket gathered to be sorted, at most.
+/// The postings of a run of a block's buckets gathered to be sorted, at
+/// most ([`Gathered`]).
 const GATHERED: usize = 4096;
 /// What a worker holds besides its postings: the bytes it makes, its share
 /// of those kept, and a block's buffers to merge.
@@ -107,76 +108,125 @@ fn block_point(block: u64) -> u64 {
     block << (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)
 }
 
-/// What a move word does to a structure, from the move table, in 64 bits,
-/// so that a word is played without a branch: the square a pawn leaves
-/// (bits 0-5), the square it reaches (6-11), whether the word names a move
-/// (12), a black one (13), whether a pawn leaves its square (14) and reaches
-/// the other one (15), the square of a pawn it takes (16-21) and whether it
-/// takes one (22), whether the structure changes (23), and the change to the
-/// pieces' counts (32-63, signed): a piece taken, a pawn promoted.
-#[derive(Clone, Copy, Default)]
-struct Effect(u64);
+/// What a move word does to a structure, from the move table, so that a
+/// word is played without a branch: the pawns it takes off their squares or
+/// puts on theirs, white's then black's, which a xor applies; the change to
+/// the pieces' counts, a piece taken or a pawn promoted, which a wrapping add
+/// applies; and whether it may change the structure ([`CHANGED`]) and names
+/// a move of standard chess ([`NAMED`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct Effect {
+    pawns: [u64; 2],
+    pieces: u64,
+    flags: u64,
+}
 
-const MOVE: u64 = 1 << 12;
+/// An [`Effect`] flag: a pawn's move or a capture.
+const CHANGED: u64 = 1;
+/// An [`Effect`] flag: a word that names a move of standard chess.
+const NAMED: u64 = 2;
 
-/// The effect of each word below the Chess960 castlings.
-fn effects() -> &'static [Effect] {
-    static EFFECTS: OnceLock<Vec<Effect>> = OnceLock::new();
-    EFFECTS.get_or_init(|| {
-        let kind = |p: movetable::Piece| match p {
-            movetable::Piece::Knight => 0,
-            movetable::Piece::Bishop => 1,
-            movetable::Piece::Rook => 2,
-            _ => 3,
-        };
-        (0..FIRST_CASTLE_960)
-            .map(|word| match movetable::decode(word) {
-                Some(MoveWord::Normal { color, piece, from, to, captured, promotion }) => {
-                    let (us, them) = match color {
-                        movetable::Color::White => (Color::White, Color::Black),
-                        movetable::Color::Black => (Color::Black, Color::White),
-                    };
-                    let pawn = piece == movetable::Piece::Pawn;
-                    let (from, to) = (u64::from(from & 63), u64::from(to & 63));
-                    // The pawn taken en passant stands beside the one that
-                    // takes it: on the rank it leaves, the file it reaches.
-                    let taken_pawn = match captured {
-                        Captured::Pawn => Some(to),
-                        Captured::EnPassant => Some(from & 56 | to & 7),
-                        _ => None,
-                    };
-                    let taken_piece = match captured {
-                        Captured::Knight => Some(movetable::Piece::Knight),
-                        Captured::Bishop => Some(movetable::Piece::Bishop),
-                        Captured::Rook => Some(movetable::Piece::Rook),
-                        Captured::Queen => Some(movetable::Piece::Queen),
-                        _ => None,
-                    };
-                    let mut delta = 0i64;
-                    if let Some(p) = taken_piece {
-                        delta -= 1 << piece_shift(kind(p), them);
-                    }
-                    if let Some(p) = promotion.filter(|_| pawn) {
-                        delta += 1 << piece_shift(kind(p), us);
-                    }
-                    let changes = pawn || captured != Captured::Nothing;
-                    Effect(
-                        from | to << 6
-                            | MOVE
-                            | u64::from(us == Color::Black) << 13
-                            | u64::from(pawn) << 14
-                            | u64::from(pawn && promotion.is_none()) << 15
-                            | taken_pawn.unwrap_or(0) << 16
-                            | u64::from(taken_pawn.is_some()) << 22
-                            | u64::from(changes) << 23
-                            | (delta as i32 as u32 as u64) << 32,
-                    )
-                }
-                Some(MoveWord::Castle { .. }) => Effect(MOVE),
-                _ => Effect::default(),
-            })
-            .collect()
-    })
+/// Room for the distinct effects of the move table's words, a power of two
+/// so that an index needs no check: its 45,357 words below the Chess960
+/// castlings have 1,282.
+const EFFECTS: usize = 2048;
+
+/// The index of each word's effect among the distinct ones, 0 for a word
+/// that names no move of standard chess, and the effects: two lookups a
+/// word, into tables of 2 bytes a word and 32 an effect of which 131 KB are
+/// in use, which a core's cache holds, where an effect a word would take
+/// 1.4 MB.
+fn effects() -> (&'static [u16; 1 << 16], &'static [Effect; EFFECTS]) {
+    type Tables = (Box<[u16; 1 << 16]>, Box<[Effect; EFFECTS]>);
+    static TABLES: OnceLock<Tables> = OnceLock::new();
+    let (of, effects) = TABLES.get_or_init(|| {
+        let (mut of, mut effects) = (vec![0u16; 1 << 16], vec![Effect::default()]);
+        let mut index = std::collections::HashMap::new();
+        for word in 0..FIRST_CASTLE_960 {
+            if let Some(e) = effect_of(word) {
+                of[usize::from(word)] = *index.entry(e).or_insert_with(|| {
+                    effects.push(e);
+                    effects.len() as u16 - 1
+                });
+            }
+        }
+        assert!(effects.len() <= EFFECTS, "{} effects", effects.len());
+        effects.resize(EFFECTS, Effect::default());
+        let boxed = |v: Vec<u16>| v.into_boxed_slice().try_into().expect("a word's index each");
+        (boxed(of), effects.into_boxed_slice().try_into().expect("room for every effect"))
+    });
+    (of, effects)
+}
+
+/// What `word` does to a structure; `None` when it names no move of standard
+/// chess.
+fn effect_of(word: u16) -> Option<Effect> {
+    let kind = |p: movetable::Piece| match p {
+        movetable::Piece::Knight => 0,
+        movetable::Piece::Bishop => 1,
+        movetable::Piece::Rook => 2,
+        _ => 3,
+    };
+    match movetable::decode(word)? {
+        MoveWord::Normal { color, piece, from, to, captured, promotion } => {
+            let (us, them) = match color {
+                movetable::Color::White => (Color::White, Color::Black),
+                movetable::Color::Black => (Color::Black, Color::White),
+            };
+            let pawn = piece == movetable::Piece::Pawn;
+            let (from, to) = (u64::from(from & 63), u64::from(to & 63));
+            let mut pawns = [0; 2];
+            // A pawn leaves its square, and stands on the other one unless it
+            // becomes a piece there.
+            if pawn {
+                pawns[us.index()] = 1 << from | u64::from(promotion.is_none()) << to;
+            }
+            // The pawn taken en passant stands beside the one that takes it:
+            // on the rank it leaves, the file it reaches.
+            pawns[them.index()] = match captured {
+                Captured::Pawn => 1 << to,
+                Captured::EnPassant => 1 << (from & 56 | to & 7),
+                _ => 0,
+            };
+            let taken_piece = match captured {
+                Captured::Knight => Some(movetable::Piece::Knight),
+                Captured::Bishop => Some(movetable::Piece::Bishop),
+                Captured::Rook => Some(movetable::Piece::Rook),
+                Captured::Queen => Some(movetable::Piece::Queen),
+                _ => None,
+            };
+            let mut delta = 0i64;
+            if let Some(p) = taken_piece {
+                delta -= 1 << piece_shift(kind(p), them);
+            }
+            if let Some(p) = promotion.filter(|_| pawn) {
+                delta += 1 << piece_shift(kind(p), us);
+            }
+            let changes = pawn || captured != Captured::Nothing;
+            Some(Effect { pawns, pieces: delta as u64, flags: NAMED | if changes { CHANGED } else { 0 } })
+        }
+        MoveWord::Castle { .. } => Some(Effect { flags: NAMED, ..Effect::default() }),
+        _ => None,
+    }
+}
+
+/// The words a line's replay plays at a time past the tree's plies, noting
+/// the changes of its structure ([`Tracker::play_noting`]).
+const CHANGES: usize = 64;
+
+/// The parts of a line's structure after each word of a run that may have
+/// changed it, each part in an array of its own, so that their structures
+/// are hashed several at a time ([`structures_of`]).
+struct Changes {
+    white: [u64; CHANGES],
+    black: [u64; CHANGES],
+    pieces: [u64; CHANGES],
+}
+
+impl Default for Changes {
+    fn default() -> Changes {
+        Changes { white: [0; CHANGES], black: [0; CHANGES], pieces: [0; CHANGES] }
+    }
 }
 
 /// A line's structure followed through its move words alone: each side's
@@ -184,11 +234,12 @@ fn effects() -> &'static [Effect] {
 /// hashes them. A word names the piece it moves, what it takes and what a
 /// pawn becomes, and the stream's words were checked when it was written, so
 /// no board is needed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Tracker {
     pawns: [u64; 2],
     pieces: u64,
-    effects: &'static [Effect],
+    of: &'static [u16; 1 << 16],
+    effects: &'static [Effect; EFFECTS],
 }
 
 impl PartialEq for Tracker {
@@ -197,9 +248,9 @@ impl PartialEq for Tracker {
     }
 }
 
-impl std::fmt::Debug for Effect {
+impl std::fmt::Debug for Tracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Effect({:#x})", self.0)
+        f.debug_struct("Tracker").field("pawns", &self.pawns).field("pieces", &self.pieces).finish()
     }
 }
 
@@ -212,7 +263,20 @@ impl Tracker {
             }
         }
         let pawns = |color| board.colored(Piece::Pawn, color);
-        Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, effects: effects() }
+        let (of, effects) = effects();
+        Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, of, effects }
+    }
+
+    /// The standard start's, counted once.
+    pub fn standard() -> Tracker {
+        static STANDARD: OnceLock<Tracker> = OnceLock::new();
+        *STANDARD.get_or_init(|| Tracker::of(stream::standard()))
+    }
+
+    /// The effect of `word`.
+    #[inline(always)]
+    fn effect(&self, word: u16) -> &'static Effect {
+        &self.effects[usize::from(self.of[usize::from(word)]) & (EFFECTS - 1)]
     }
 
     /// Plays `word`: whether the structure may have changed, which only a
@@ -220,23 +284,63 @@ impl Tracker {
     /// of standard chess.
     #[inline]
     pub fn play(&mut self, word: u16) -> Option<bool> {
-        let e = self.effects.get(usize::from(word))?.0;
-        if e & MOVE == 0 {
+        let e = self.effect(word);
+        if e.flags & NAMED == 0 {
             return None;
         }
-        // Both sides' pawns at once, without a branch or an index, so that
-        // they stay in registers: all ones in `black` when black moves.
-        let black = (e >> 13 & 1).wrapping_neg();
-        let taken = (e >> 22 & 1) << (e >> 16 & 63);
-        let left = (e >> 14 & 1) << (e & 63);
-        let reached = (e >> 15 & 1) << (e >> 6 & 63);
-        let [white_pawns, black_pawns] = self.pawns;
-        self.pawns = [
-            white_pawns & !(left & !black | taken & black) | reached & !black,
-            black_pawns & !(left & black | taken & !black) | reached & black,
-        ];
-        self.pieces = self.pieces.wrapping_add((e >> 32) as u32 as i32 as i64 as u64);
-        Some(e >> 23 & 1 != 0)
+        self.apply(e);
+        Some(e.flags & CHANGED != 0)
+    }
+
+    /// Plays `words`, as [`Tracker::play`] plays each, without a branch a
+    /// word: `None` when one names no move of standard chess.
+    #[inline]
+    fn play_all(&mut self, words: &[[u8; 2]]) -> Option<()> {
+        let mut named = NAMED;
+        for w in words {
+            let e = self.effect(u16::from_le_bytes(*w));
+            named &= e.flags;
+            self.apply(e);
+        }
+        (named & NAMED != 0).then_some(())
+    }
+
+    /// [`Tracker::play_noting`], not inlined, so that the few registers it
+    /// plays in are all its own, when the changes' structures are hashed
+    /// apart from it, in vectors.
+    #[inline(never)]
+    fn play_noting_apart(&mut self, words: &[[u8; 2]], changes: &mut Changes) -> Option<usize> {
+        self.play_noting(words, changes)
+    }
+
+    /// Plays `words`, [`CHANGES`] at most, and notes in `changes` the parts
+    /// of the structure after each word that may have changed it, a pawn's
+    /// move or a capture: without a branch a word, since which words do is
+    /// unpredictable. The changes noted; `None` when a word names no move of
+    /// standard chess.
+    #[inline(always)]
+    fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut Changes) -> Option<usize> {
+        let (mut noted, mut named) = (0, NAMED);
+        for w in words {
+            let e = self.effect(u16::from_le_bytes(*w));
+            named &= e.flags;
+            self.apply(e);
+            // No more noted than words played, so within `changes`.
+            let at = noted & (CHANGES - 1);
+            (changes.white[at], changes.black[at], changes.pieces[at]) = (self.pawns[0], self.pawns[1], self.pieces);
+            noted += (e.flags & CHANGED) as usize;
+        }
+        (named & NAMED != 0).then_some(noted)
+    }
+
+    /// Plays effect `e`, as [`Tracker::play`] does: a pawn leaves a square it
+    /// stands on and reaches one no pawn of its side stands on, and one taken
+    /// stood where it is taken, as the words were checked.
+    #[inline(always)]
+    fn apply(&mut self, e: &Effect) {
+        self.pawns[0] ^= e.pawns[0];
+        self.pawns[1] ^= e.pawns[1];
+        self.pieces = self.pieces.wrapping_add(e.pieces);
     }
 
     pub fn structure(&self) -> u64 {
@@ -349,18 +453,24 @@ struct Split {
 }
 
 /// A worker's postings in a pass: its buffer of `cap`, and those of the
-/// pass's first bucket it counted ([`Pass::rest`]).
+/// pass's first bucket it counted ([`Pass::rest`]); and what the replay of a
+/// line notes as it goes, the changes of a run of words, their structures,
+/// and the postings that lie in the pass.
 struct Kept {
     buf: Vec<u64>,
     cap: usize,
     rest: u64,
+    changes: Changes,
+    structures: [u64; CHANGES],
+    found: [u64; MAX_STRUCTURES],
 }
 
-/// What the replay of a line has kept: its structures, and the prints of
-/// those in the pass's first bucket.
+/// What the replay of a line has found: its structures, those of them that
+/// lie in the pass, and the prints of those in the pass's first bucket.
 #[derive(Default)]
 struct Replayed {
     structures: usize,
+    found: usize,
     prints: u128,
 }
 
@@ -374,7 +484,14 @@ impl Pass<'_> {
         let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
         workers::run(want, 0, &Cancel::never(), |w| {
             let cap = self.capacity / w.count;
-            let mut kept = Kept { buf: Vec::new(), cap, rest: 0 };
+            let mut kept = Kept {
+                buf: Vec::new(),
+                cap,
+                rest: 0,
+                changes: Changes::default(),
+                structures: [0; CHANGES],
+                found: [0; MAX_STRUCTURES],
+            };
             kept.buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
             let mut taker = chunks.taker();
             loop {
@@ -400,7 +517,8 @@ impl Pass<'_> {
     /// Adds the postings of game `game`'s structures past the tree's plies
     /// that lie in the pass to `kept`: each once, in the order its line holds
     /// them, as the walk that wrote the stream met them, and marked when the
-    /// line holds it beyond [`MAX_PLY`].
+    /// line holds it beyond [`MAX_PLY`], as it holds every one past the
+    /// tree's plies.
     fn replay(&self, game: u32, kept: &mut Kept) -> Result<(), SearchError> {
         let path = &self.stream.path;
         let record = self.stream.written(game).map_err(|e| from_bad(path, e))?;
@@ -409,67 +527,139 @@ impl Pass<'_> {
             return Ok(());
         }
         let start = record.start().map_err(|e| from_bad(path, e))?;
-        let mut line = Tracker::of(start.as_ref().unwrap_or_else(|| stream::standard()));
+        let mut line = start.as_ref().map_or_else(Tracker::standard, Tracker::of);
         let word = || corrupt(path, "stream word");
-        let mut words = record.words();
-        // The tree's plies hold no structure of the section.
-        for w in words.by_ref().take(usize::from(PRUNE_PLY) + 1) {
-            line.play(w).ok_or_else(word)?;
-        }
-        // The structure held from ply 21, and the last ply it was held at.
-        let mut held = (line.structure(), u32::from(PRUNE_PLY) + 1);
+        // The tree's plies hold no structure of the section: they are the
+        // prefix's words, and the words past it follow ply 21, beyond the
+        // tree's plies.
+        const { assert!(stream::PREFIX_WORDS == PRUNE_PLY as usize + 1 && PRUNE_PLY >= MAX_PLY) };
+        let (prefix, past) = record.word_parts();
+        line.play_all(prefix).ok_or_else(word)?;
+        let within = Within::of(self.lo, self.hi.load(Ordering::Relaxed), self.bits, game);
+        let mut held = line.structure();
         let mut replayed = Replayed::default();
-        for (ply, w) in (u32::from(PRUNE_PLY) + 2..).zip(words) {
-            if line.play(w).ok_or_else(word)? {
-                let s = line.structure();
-                if s != held.0 {
-                    self.add(held.0, held.1, game, &mut replayed, kept)?;
-                    held.0 = s;
+        if structures_in_vectors() {
+            for words in past.chunks(CHANGES) {
+                let noted = line.play_noting_apart(words, &mut kept.changes).ok_or_else(word)?;
+                let (c, structures) = (&kept.changes, &mut kept.structures);
+                structures_of(&c.white, &c.black, &c.pieces, noted, structures);
+                held = find_changed(&structures[..noted], held, &within, &mut replayed, &mut kept.found);
+            }
+        } else {
+            for words in past.chunks(CHANGES) {
+                let noted = line.play_noting(words, &mut kept.changes).ok_or_else(word)?;
+                let c = &kept.changes;
+                for ((&w, &b), &p) in c.white.iter().zip(&c.black).zip(&c.pieces).take(noted) {
+                    let s = structure_of(w, b, p);
+                    if s != held {
+                        find(held, &within, &mut replayed, &mut kept.found);
+                        held = s;
+                    }
                 }
             }
-            held.1 = ply;
         }
-        self.add(held.0, held.1, game, &mut replayed, kept)
-    }
-
-    /// Adds game `game`'s posting of `structure`, held last at ply `last`, when
-    /// it lies in the pass: the line's first [`MAX_STRUCTURES`] structures, as
-    /// the walk kept them. One of the pass's first bucket is counted, once per
-    /// print, wherever the pass ends.
-    fn add(
-        &self,
-        structure: u64,
-        last: u32,
-        game: u32,
-        replayed: &mut Replayed,
-        kept: &mut Kept,
-    ) -> Result<(), SearchError> {
-        if replayed.structures >= MAX_STRUCTURES {
-            return Ok(());
+        find(held, &within, &mut replayed, &mut kept.found);
+        if replayed.prints != 0 {
+            kept.rest += u64::from(replayed.prints.count_ones());
         }
-        replayed.structures += 1;
-        let at = u64::from(deep_bucket(structure, self.bits)) << GAME_BITS | u64::from(game);
-        if at < self.lo {
-            return Ok(());
-        }
-        if at >> GAME_BITS == self.lo >> GAME_BITS {
-            let print = 1u128 << deep_print(structure, self.bits);
-            if replayed.prints & print == 0 {
-                replayed.prints |= print;
-                kept.rest += 1;
+        for i in 0..replayed.found {
+            let p = kept.found[i];
+            if point(p) >= self.hi.load(Ordering::Relaxed) {
+                continue;
             }
-        }
-        if at >= self.hi.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if kept.buf.len() >= kept.cap {
-            make_room(&mut kept.buf, kept.cap, self.lo, self.hi)?;
-        }
-        if at < self.hi.load(Ordering::Relaxed) {
-            kept.buf.push(posting(structure, self.bits, game, last > u32::from(MAX_PLY)));
+            if kept.buf.len() >= kept.cap {
+                make_room(&mut kept.buf, kept.cap, self.lo, self.hi)?;
+            }
+            if point(p) < self.hi.load(Ordering::Relaxed) {
+                kept.buf.push(p);
+            }
         }
         Ok(())
     }
+}
+
+/// The buckets whose point of a game lies in a pass: those from `first` on,
+/// `span` of them; the pass's first bucket, when the game's point there
+/// counts ([`Pass::rest`]), else none; the game as a posting holds it; and
+/// the shift that takes a structure's bucket and print.
+struct Within {
+    first: u64,
+    span: u64,
+    counted: u64,
+    game: u64,
+    shift: u32,
+}
+
+impl Within {
+    /// The buckets of `bits` bits whose point of game `game` lies from `lo`
+    /// on and before `hi`: the pass as far as it reached when the game's line
+    /// began, as `hi` only comes down, and each posting found is looked at
+    /// again as it is kept.
+    fn of(lo: u64, hi: u64, bits: u8, game: u32) -> Within {
+        let g = u64::from(game);
+        let (lo_game, hi_game) = (lo & ((1 << GAME_BITS) - 1), hi & ((1 << GAME_BITS) - 1));
+        // A point `bucket << GAME_BITS | g` is at `lo` or past it when the
+        // bucket is past `lo`'s, or `lo`'s with `g` at `lo`'s game or past
+        // it; likewise before `hi`.
+        let first = (lo >> GAME_BITS) + u64::from(g < lo_game);
+        let end = (hi >> GAME_BITS) + u64::from(g < hi_game);
+        let counted = if g >= lo_game { lo >> GAME_BITS } else { u64::MAX };
+        let shift = 64 - u32::from(bits) - u32::from(PRINT_BITS);
+        Within { first, span: end.saturating_sub(first), counted, game: g << 8, shift }
+    }
+}
+
+/// Notes a line's posting of `structure` in `found` when it lies `within`
+/// the pass: the line's first [`MAX_STRUCTURES`] structures, as the walk kept
+/// them, without a branch on where the structure's bucket lies, which is
+/// unpredictable. One of the pass's first bucket is counted, once per print,
+/// wherever the pass ends.
+#[inline(always)]
+fn find(structure: u64, within: &Within, replayed: &mut Replayed, found: &mut [u64; MAX_STRUCTURES]) {
+    if replayed.structures >= MAX_STRUCTURES {
+        return;
+    }
+    replayed.structures += 1;
+    // The structure's bucket, then its print, as [`posting`] takes them.
+    let x = structure >> within.shift;
+    let (bucket, print) = (x >> PRINT_BITS, x & ((1 << PRINT_BITS) - 1));
+    if bucket == within.counted {
+        count_print(replayed, print);
+    }
+    // Fewer found than structures, so within `found`; beyond the tree's
+    // plies, as [`posting`] marks it.
+    if let Some(f) = found.get_mut(replayed.found) {
+        *f = bucket << 40 | within.game | print << 1;
+    }
+    replayed.found += usize::from(bucket.wrapping_sub(within.first) < within.span);
+}
+
+/// Notes a line's postings of the structures it held before each of
+/// `structures`, the ones the changes of a run of its words lead to, from
+/// `held` on, as [`find`] does: the structure held after them. Not inlined,
+/// so that the registers it finds in are its own.
+#[inline(never)]
+fn find_changed(
+    structures: &[u64],
+    mut held: u64,
+    within: &Within,
+    replayed: &mut Replayed,
+    found: &mut [u64; MAX_STRUCTURES],
+) -> u64 {
+    for &s in structures {
+        if s != held {
+            find(held, within, replayed, found);
+            held = s;
+        }
+    }
+    held
+}
+
+/// Counts `print` among the prints of a line's structures in the pass's
+/// first bucket, which few lines hold.
+#[cold]
+fn count_print(replayed: &mut Replayed, print: u64) {
+    replayed.prints |= 1 << print;
 }
 
 /// Makes room in `buf`, a worker's full buffer of `cap` postings in a pass of
@@ -576,8 +766,7 @@ fn write_blocks(
         let stopped = || w.stopped() || progress.stopped();
         let mut heads: Vec<&[u64]> = Vec::new();
         heads.try_reserve_exact(buffers.len()).map_err(|_| Refused::Busy)?;
-        let mut gathered: Vec<u64> = Vec::new();
-        gathered.try_reserve_exact(GATHERED).map_err(|_| Refused::Busy)?;
+        let mut room = Gathered::new(GATHERED)?;
         loop {
             // A background build gives way to foreground work before it
             // takes its next block, so that none waits for it (#149).
@@ -611,7 +800,15 @@ fn write_blocks(
             };
             let mut bytes = Vec::new();
             let (low, high) = (from >> GAME_BITS, (to - 1) >> GAME_BITS);
+            // The postings of one worker are put as they lie, in order; those
+            // of several are gathered a run of buckets at a time.
+            let one = heads.len() <= 1;
+            room.count(if one { &[] } else { &heads });
+            let mut gathered = if one { u64::MAX } else { low };
             for bucket in low..=high {
+                if bucket >= gathered {
+                    gathered = room.gather(&mut heads, bucket, high);
+                }
                 let (starts, ends) = (from <= bucket << GAME_BITS, to >= (bucket + 1) << GAME_BITS);
                 // Only the pass's first bucket ends inside it ([`make_room`]).
                 let count = match (starts, ends) {
@@ -619,7 +816,7 @@ fn write_blocks(
                     (true, false) => Count::First(rest),
                     (false, _) => Count::After(pass.split.last),
                 };
-                let (n, last) = put_bucket(&mut heads, bucket, count, &mut bytes, &mut gathered, &mut hand)?;
+                let (n, last) = put_bucket(&mut heads, bucket, count, &mut bytes, room.bucket(bucket), &mut hand)?;
                 kept.set(kept.get() + n);
                 // A bucket's count is its postings in every part.
                 let left = match count {
@@ -660,23 +857,108 @@ enum Count {
     After(u64),
 }
 
-/// Puts bucket `bucket`'s postings, which lie first in the sorted `heads`,
-/// to `out`, taking them off the heads: what `count` says, then each by game
-/// from the one before, handing `out` over whenever it holds half of
-/// [`OUT_BYTES`] before another. Returns the postings put and the last game.
-/// A game's postings all come from one worker's buffer, so none repeats
-/// another's, and a bucket's postings gathered from every head and sorted
-/// are in the order of the heads merged: a bucket that fits `gathered`'s
-/// capacity is sorted there, a larger one merged.
+/// A worker's room for putting a block's buckets: the block's postings
+/// counted by bucket, and those of a run of its buckets gathered from the
+/// heads, `room` at most, each bucket's together, where each starts, and the
+/// run's buckets.
+struct Gathered {
+    counts: [usize; BLOCK_BUCKETS],
+    starts: [usize; BLOCK_BUCKETS],
+    postings: Vec<u64>,
+    room: usize,
+    first: u64,
+    end: u64,
+}
+
+/// A bucket's place among its block's.
+fn local(bucket: u64) -> usize {
+    bucket as usize & (BLOCK_BUCKETS - 1)
+}
+
+impl Gathered {
+    /// Room for `room` postings.
+    fn new(room: usize) -> Result<Gathered, SearchError> {
+        let mut postings = Vec::new();
+        postings.try_reserve_exact(room).map_err(|_| Refused::Busy)?;
+        Ok(Gathered { counts: [0; BLOCK_BUCKETS], starts: [0; BLOCK_BUCKETS], postings, room, first: 0, end: 0 })
+    }
+
+    /// Counts the postings of one block in `heads` by bucket, and gathers
+    /// none yet.
+    fn count(&mut self, heads: &[&[u64]]) {
+        self.counts.fill(0);
+        for &p in heads.iter().flat_map(|h| h.iter()) {
+            self.counts[local(bucket_of(p))] += 1;
+        }
+        (self.first, self.end) = (0, 0);
+    }
+
+    /// Gathers the postings of the buckets from `bucket` on, to `high` at
+    /// most, that the room holds together, which lie first in the sorted
+    /// `heads`, and takes them off the heads: each head's once, by bucket.
+    /// A bucket that alone does not fit is left in the heads, to be merged.
+    /// The bucket after them.
+    fn gather(&mut self, heads: &mut [&[u64]], bucket: u64, high: u64) -> u64 {
+        let (mut end, mut total) = (bucket, 0);
+        while end <= high && total + self.counts[local(end)] <= self.room {
+            self.starts[local(end)] = total;
+            total += self.counts[local(end)];
+            end += 1;
+        }
+        (self.first, self.end) = (bucket, end);
+        if end == bucket {
+            return bucket + 1;
+        }
+        self.postings.clear();
+        self.postings.resize(total, 0);
+        let mut at = self.starts;
+        for h in heads.iter_mut() {
+            let k = h.iter().take_while(|&&p| bucket_of(p) < end).count();
+            for &p in &h[..k] {
+                let i = &mut at[local(bucket_of(p))];
+                if let Some(to) = self.postings.get_mut(*i) {
+                    *to = p;
+                }
+                *i += 1;
+            }
+            *h = &h[k..];
+        }
+        end
+    }
+
+    /// Bucket `bucket`'s postings, sorted, when they were gathered.
+    fn bucket(&mut self, bucket: u64) -> Option<&[u64]> {
+        if !(self.first..self.end).contains(&bucket) {
+            return None;
+        }
+        let at = self.starts[local(bucket)];
+        let postings = self.postings.get_mut(at..at + self.counts[local(bucket)])?;
+        postings.sort_unstable();
+        Some(postings)
+    }
+}
+
+/// Puts bucket `bucket`'s postings to `out`: those `gathered`, sorted, or
+/// else those which lie first in the sorted `heads`, taken off the heads.
+/// Writes what `count` says, then each by game from the one before, handing
+/// `out` over whenever it holds half of [`OUT_BYTES`] before another.
+/// Returns the postings put and the last game. A game's postings all come
+/// from one worker's buffer, so none repeats another's, and a bucket's
+/// postings gathered from every head and sorted are in the order of the
+/// heads merged: a bucket that fits a worker's room is gathered and sorted
+/// there ([`Gathered`]), a larger one merged.
 fn put_bucket(
     heads: &mut [&[u64]],
     bucket: u64,
     count: Count,
     out: &mut Vec<u8>,
-    gathered: &mut Vec<u64>,
+    gathered: Option<&[u64]>,
     hand: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), SearchError>,
 ) -> Result<(u64, u64), SearchError> {
-    let n: usize = heads.iter().map(|h| h.iter().take_while(|&&p| bucket_of(p) == bucket).count()).sum();
+    let n: usize = match gathered {
+        Some(postings) => postings.len(),
+        None => heads.iter().map(|h| h.iter().take_while(|&&p| bucket_of(p) == bucket).count()).sum(),
+    };
     let mut last = match count {
         Count::Whole => {
             varint(out, n as u64);
@@ -697,15 +979,8 @@ fn put_bucket(
         last = game;
         Ok::<(), SearchError>(())
     };
-    if n <= gathered.capacity() {
-        gathered.clear();
-        for h in heads.iter_mut() {
-            let k = h.iter().take_while(|&&p| bucket_of(p) == bucket).count();
-            gathered.extend_from_slice(&h[..k]);
-            *h = &h[k..];
-        }
-        gathered.sort_unstable();
-        for &x in gathered.iter() {
+    if let Some(postings) = gathered {
+        for &x in postings {
             put(x, out)?;
         }
     } else {
@@ -794,22 +1069,26 @@ mod tests {
         // Game 9's two postings of one print lie in different buffers here
         // only for the test: a build replays each game on one worker.
         b.retain(|&p| !(bucket_of(p) == 5 && p >> 8 & 0xffff_ffff == 9 && p >> 1 & 0x7f == 1));
-        // Each bucket sorted where it is gathered, or merged from the heads.
+        // Each bucket sorted where it is gathered, with others or alone, or
+        // merged from the heads, as a block's buckets are put.
         let mut outs = Vec::new();
-        for gathered in [Vec::with_capacity(8), Vec::new()] {
-            let mut gathered = gathered;
+        for room in [8, 2, 0] {
+            let mut room = Gathered::new(room).unwrap();
             let mut heads: Vec<&[u64]> = vec![&a, &b];
-            let mut out = Vec::new();
-            let mut kept = 0;
+            let (mut out, mut kept, mut gathered) = (Vec::new(), 0, 0);
+            room.count(&heads);
             for bucket in 0..BLOCK_BUCKETS as u64 {
+                if bucket >= gathered {
+                    gathered = room.gather(&mut heads, bucket, BLOCK_BUCKETS as u64 - 1);
+                }
                 let hand = &mut |_: &mut Vec<u8>| Ok(());
-                kept += put_bucket(&mut heads, bucket, Count::Whole, &mut out, &mut gathered, hand).unwrap().0;
+                kept += put_bucket(&mut heads, bucket, Count::Whole, &mut out, room.bucket(bucket), hand).unwrap().0;
             }
             assert_eq!(kept, 5);
             assert!(heads.iter().all(|h| h.is_empty()));
             outs.push(out);
         }
-        assert_eq!(outs[0], outs[1]);
+        assert!(outs[0] == outs[1] && outs[1] == outs[2]);
         let out = outs.swap_remove(0);
         assert_eq!(bucket_games(&out, 5, 100, 1, false), Some(vec![3, 9]));
         assert_eq!(bucket_games(&out, 5, 100, 1, true), Some(vec![3]));
@@ -885,6 +1164,49 @@ mod tests {
         assert!(matches!(make_room(&mut one, 64, at(256, 7), &hi), Err(SearchError::TooLarge)));
     }
 
+    /// A line's structures are found in a pass as their points say: from
+    /// `lo` on and before `hi`, either of which may lie inside a bucket, each
+    /// as [`posting`] makes it, and those of the pass's first bucket from
+    /// `lo` on counted once per print.
+    #[test]
+    fn a_line_finds_the_postings_that_lie_in_the_pass() {
+        let bits = 10;
+        let at = |bucket: u64, game: u64| bucket << GAME_BITS | game;
+        let passes = [
+            (at(0, 0), at(1 << bits, 0)),
+            (at(300, 0), at(301, 0)),
+            (at(300, 50), at(300, 70)),
+            (at(300, 50), at(302, 60)),
+            (at(299, 1), at(1 << bits, 0)),
+        ];
+        let mut found = [0; MAX_STRUCTURES];
+        let (mut kept, mut counted) = (0, 0);
+        for (lo, hi) in passes {
+            for bucket in [0, 1, 298, 299, 300, 301, 302, 303, (1 << bits) - 1] {
+                for game in [1, 49, 50, 51, 59, 60, 61, 69, 70, 71, 1_000_000] {
+                    for print in [0, 1, 126, 127] {
+                        let structure = structure_in(bits, bucket, print) | 0x1234_5678 >> bits;
+                        let mut replayed = Replayed::default();
+                        find(structure, &Within::of(lo, hi, bits, game as u32), &mut replayed, &mut found);
+                        let point = at(bucket, game);
+                        let first = point >> GAME_BITS == lo >> GAME_BITS && point >= lo;
+                        let what = format!("bucket {bucket} game {game} print {print} in {lo:#x}..{hi:#x}");
+                        assert_eq!(replayed.found, usize::from((lo..hi).contains(&point)), "{what}");
+                        assert_eq!(found[0], posting(structure, bits, game as u32, true), "{what}");
+                        assert_eq!(replayed.prints, u128::from(first) << print, "{what}");
+                        kept += replayed.found;
+                        counted += usize::from(first);
+                    }
+                }
+            }
+        }
+        assert!(kept > 100 && counted > 20, "{kept} {counted}");
+        // A line's structures past the most the walk kept are not found.
+        let mut replayed = Replayed { structures: MAX_STRUCTURES, ..Replayed::default() };
+        find(structure_in(bits, 5, 0), &Within::of(0, at(1 << bits, 0), bits, 1), &mut replayed, &mut found);
+        assert_eq!((replayed.found, replayed.structures), (0, MAX_STRUCTURES));
+    }
+
     /// A crowded bucket is handed over in pieces as it is put, none of which
     /// grows past [`OUT_BYTES`], and which together read back as the bucket's
     /// postings; a bucket split among three passes, each going on from the
@@ -904,7 +1226,7 @@ mod tests {
             }
         }
         let all: u64 = buffers.iter().map(|b| b.len() as u64).sum();
-        let mut gathered = Vec::with_capacity(GATHERED);
+        let mut room = Gathered::new(GATHERED).unwrap();
         // Puts the bucket's postings from point `from` to `to` after
         // `bytes`, as `count` says: the postings put, the last game, and the
         // pieces handed over.
@@ -924,7 +1246,9 @@ mod tests {
                 pieces += 1;
                 Ok(())
             };
-            let (n, last) = put_bucket(&mut heads, bucket, count, &mut out, &mut gathered, &mut hand).unwrap();
+            room.count(&heads);
+            assert_eq!(room.gather(&mut heads, bucket, bucket), bucket + 1);
+            let (n, last) = put_bucket(&mut heads, bucket, count, &mut out, room.bucket(bucket), &mut hand).unwrap();
             assert!(out.capacity() <= OUT_BYTES, "{} bytes held at once", out.capacity());
             bytes.extend(out);
             (n, last, pieces)
@@ -985,8 +1309,77 @@ mod tests {
                 }
             }
         }
+        assert_eq!(Tracker::standard(), Tracker::of(&Board::startpos()));
         assert_eq!(Tracker::of(&Board::startpos()).play(0), None, "word 0 names no move");
         assert_eq!(Tracker::of(&Board::startpos()).play(movetable::NULL_MOVE), None);
         assert_eq!(Tracker::of(&Board::startpos()).play(FIRST_CASTLE_960), None);
+    }
+
+    /// Each word's effect is looked up as it is made from the word, and a
+    /// word that names no move of standard chess, a Chess960 castling among
+    /// them, looks up none.
+    #[test]
+    fn each_word_looks_up_its_effect() {
+        let tracker = Tracker::of(&Board::startpos());
+        let mut named = 0;
+        for word in 0..=u16::MAX {
+            let made = if word < FIRST_CASTLE_960 { effect_of(word) } else { None };
+            named += usize::from(made.is_some());
+            assert_eq!(made.unwrap_or_default(), *tracker.effect(word), "{word:#x}");
+        }
+        assert!(named > 40_000, "{named}");
+    }
+
+    /// Words played a run at a time note the parts after each word that may
+    /// change the structure, as the words played one at a time say, and
+    /// lead to the same structure played all at once, over random games long
+    /// enough to promote; a run with a word that names no move fails.
+    #[test]
+    fn a_run_of_words_notes_each_change() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut changed = 0;
+        for _ in 0..60 {
+            let mut board = Board::startpos();
+            let mut words = Vec::new();
+            for _ in 0..300 {
+                let moves = board.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let mv = moves[(x % moves.len() as u64) as usize];
+                words.push(cbformat::replay::word_of(&board, mv).unwrap());
+                board.play_unchecked(mv);
+            }
+            let mut one = Tracker::of(&Board::startpos());
+            let mut expected = Vec::new();
+            for &w in &words {
+                if one.play(w).unwrap() {
+                    expected.push((one.pawns, one.pieces));
+                }
+            }
+            let bytes: Vec<[u8; 2]> = words.iter().map(|w| w.to_le_bytes()).collect();
+            let (mut run, mut noted) = (Tracker::of(&Board::startpos()), Vec::new());
+            let mut changes = Changes::default();
+            for words in bytes.chunks(CHANGES) {
+                let n = run.play_noting(words, &mut changes).unwrap();
+                let c = &changes;
+                noted.extend((0..n).map(|i| ([c.white[i], c.black[i]], c.pieces[i])));
+            }
+            assert_eq!(noted, expected);
+            assert_eq!(run, one);
+            let mut all = Tracker::of(&Board::startpos());
+            assert_eq!(all.play_all(&bytes), Some(()));
+            assert_eq!(all, one);
+            changed += noted.len();
+        }
+        assert!(changed > 1_000, "{changed}");
+        let mut run = Tracker::of(&Board::startpos());
+        let mut changes = Changes::default();
+        let e2e4 = cbformat::replay::word_of(&Board::startpos(), "e2e4".parse().unwrap()).unwrap();
+        assert_eq!(run.play_noting(&[e2e4.to_le_bytes(), [0, 0]], &mut changes), None);
+        assert_eq!(run.play_all(&[e2e4.to_le_bytes(), FIRST_CASTLE_960.to_le_bytes()]), None);
     }
 }

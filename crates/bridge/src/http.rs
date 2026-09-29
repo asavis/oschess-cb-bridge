@@ -2,7 +2,7 @@
 //! responses, persistent connections, and bodies of JSON lines streamed as
 //! chunks.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -88,6 +88,10 @@ pub struct Conn {
 
 impl Conn {
     pub fn new(stream: TcpStream) -> Self {
+        // An answer's head and body are written at once, so nothing is gained
+        // by holding a small segment back for the client's delayed
+        // acknowledgement, which costs 40 ms a request on Linux (#142).
+        let _ = stream.set_nodelay(true);
         Conn { stream, buf: Vec::new() }
     }
 
@@ -170,10 +174,26 @@ impl Conn {
             response.body.len(),
             if keep_alive { "keep-alive" } else { "close" }
         ));
-        self.stream.write_all(head.as_bytes())?;
-        self.stream.write_all(response.body.as_bytes())?;
+        write_both(&mut self.stream, head.as_bytes(), response.body.as_bytes())?;
         self.stream.flush()
     }
+}
+
+/// Writes `head` then `body` as one vectored write, so that they usually leave
+/// in the same segments, without copying the body: an answer's memory is
+/// reserved once, for the body (#142).
+fn write_both(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::Result<()> {
+    let mut slices = [IoSlice::new(head), IoSlice::new(body)];
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        match stream.write_vectored(rest) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => IoSlice::advance_slices(&mut rest, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Where a streamed body goes, one line at a time.
