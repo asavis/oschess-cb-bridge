@@ -894,6 +894,13 @@ impl<'a> Record<'a> {
         self.prefix.as_chunks::<2>().0.iter().chain(self.past.as_chunks::<2>().0).map(|w| u16::from_le_bytes(*w))
     }
 
+    /// The words of its prefix, then those past it, as stored: a replay that
+    /// takes them a slice at a time needs no test a word of which part it is
+    /// in.
+    pub fn word_parts(&self) -> (&'a [[u8; 2]], &'a [[u8; 2]]) {
+        (self.prefix.as_chunks::<2>().0, self.past.as_chunks::<2>().0)
+    }
+
     /// The set-up start; `None` for the standard one.
     pub fn start(&self) -> Result<Option<Board>, Bad> {
         self.setup.map(|s| board_of(s).ok_or(Bad::Corrupt("stream set-up"))).transpose()
