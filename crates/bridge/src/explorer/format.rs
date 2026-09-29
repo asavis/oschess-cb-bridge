@@ -434,7 +434,147 @@ pub fn piece_shift(i: usize, color: Color) -> u32 {
 /// counted `pieces` ([`piece_shift`]), as [`structure`] gives a board's: a
 /// build follows the three through a line's words without a board.
 pub fn structure_of(white: u64, black: u64, pieces: u64) -> u64 {
-    mix(white ^ mix(black ^ mix(pieces ^ 0x9e37_79b9_7f4a_7c15)))
+    mix(white ^ mix(black ^ mix(pieces ^ STRUCTURE_SEED)))
+}
+
+/// What [`structure_of`] starts from.
+const STRUCTURE_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Whether this processor hashes structures in vectors
+/// ([`structures_of`]).
+pub fn structures_in_vectors() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return wide::has_avx512() || wide::has_avx2();
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+/// The [`structure_of`] of each of the first `n` of `white`, `black` and
+/// `pieces` taken together, into `out`, in vectors: eight at a time on a
+/// processor with AVX-512 (`avx512f` and `avx512dq`), four at a time on one
+/// with AVX2. Each is three rounds of [`mix`], whose multiplications a
+/// processor makes one after another, and a build hashes a structure in each
+/// of its deep passes: in vectors, several at once. Whether it hashed them:
+/// on a processor with neither it hashes nothing, since hashing each where
+/// it is needed is quicker there than storing them. `N` is a multiple of
+/// eight, and the lanes past `n` of the last vector are hashed too, from
+/// whatever the arrays hold there.
+pub fn structures_of<const N: usize>(
+    white: &[u64; N],
+    black: &[u64; N],
+    pieces: &[u64; N],
+    n: usize,
+    out: &mut [u64; N],
+) -> bool {
+    const { assert!(N.is_multiple_of(8)) };
+    let n = n.min(N);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if wide::has_avx512() {
+            // SAFETY: the processor has the instructions it is compiled for.
+            unsafe { wide::structures8(white, black, pieces, n, out) };
+            return true;
+        }
+        if wide::has_avx2() {
+            // SAFETY: as above.
+            unsafe { wide::structures4(white, black, pieces, n, out) };
+            return true;
+        }
+    }
+    let _ = (white, black, pieces, n, out);
+    false
+}
+
+/// [`structures_of`] in vectors: [`mix`] on four lanes, whose 64-bit
+/// multiplications AVX2 makes of three 32-bit ones each, or on eight, which
+/// AVX-512 multiplies whole.
+#[cfg(target_arch = "x86_64")]
+mod wide {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi64x,
+        _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_xor_si256, _mm512_loadu_si512,
+        _mm512_mullo_epi64, _mm512_set1_epi64, _mm512_srli_epi64, _mm512_storeu_si512, _mm512_xor_si512,
+    };
+
+    use super::{MIX_1, MIX_2, STRUCTURE_SEED};
+
+    pub fn has_avx512() -> bool {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512dq")
+    }
+
+    pub fn has_avx2() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    #[target_feature(enable = "avx512f,avx512dq")]
+    pub fn structures8<const N: usize>(
+        white: &[u64; N],
+        black: &[u64; N],
+        pieces: &[u64; N],
+        n: usize,
+        out: &mut [u64; N],
+    ) {
+        let seed = _mm512_set1_epi64(STRUCTURE_SEED as i64);
+        let (w, b, p) = (white.as_chunks::<8>().0, black.as_chunks::<8>().0, pieces.as_chunks::<8>().0);
+        for (i, o) in out.as_chunks_mut::<8>().0.iter_mut().enumerate().take(n.div_ceil(8)) {
+            // SAFETY: each chunk holds the eight lanes loaded or stored.
+            let load = |c: &[u64; 8]| unsafe { _mm512_loadu_si512(c.as_ptr().cast()) };
+            let s = mix8(_mm512_xor_si512(
+                load(&w[i]),
+                mix8(_mm512_xor_si512(load(&b[i]), mix8(_mm512_xor_si512(load(&p[i]), seed)))),
+            ));
+            // SAFETY: as above.
+            unsafe { _mm512_storeu_si512(o.as_mut_ptr().cast(), s) };
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    fn mix8(z: __m512i) -> __m512i {
+        let z = _mm512_mullo_epi64(_mm512_xor_si512(z, _mm512_srli_epi64::<30>(z)), _mm512_set1_epi64(MIX_1 as i64));
+        let z = _mm512_mullo_epi64(_mm512_xor_si512(z, _mm512_srli_epi64::<27>(z)), _mm512_set1_epi64(MIX_2 as i64));
+        _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub fn structures4<const N: usize>(
+        white: &[u64; N],
+        black: &[u64; N],
+        pieces: &[u64; N],
+        n: usize,
+        out: &mut [u64; N],
+    ) {
+        let seed = _mm256_set1_epi64x(STRUCTURE_SEED as i64);
+        let (w, b, p) = (white.as_chunks::<4>().0, black.as_chunks::<4>().0, pieces.as_chunks::<4>().0);
+        for (i, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate().take(n.div_ceil(4)) {
+            // SAFETY: each chunk holds the four lanes loaded or stored.
+            let load = |c: &[u64; 4]| unsafe { _mm256_loadu_si256(c.as_ptr().cast()) };
+            let s = mix4(_mm256_xor_si256(
+                load(&w[i]),
+                mix4(_mm256_xor_si256(load(&b[i]), mix4(_mm256_xor_si256(load(&p[i]), seed)))),
+            ));
+            // SAFETY: as above.
+            unsafe { _mm256_storeu_si256(o.as_mut_ptr().cast(), s) };
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn mix4(z: __m256i) -> __m256i {
+        let z = times4(_mm256_xor_si256(z, _mm256_srli_epi64::<30>(z)), MIX_1);
+        let z = times4(_mm256_xor_si256(z, _mm256_srli_epi64::<27>(z)), MIX_2);
+        _mm256_xor_si256(z, _mm256_srli_epi64::<31>(z))
+    }
+
+    /// `a` times `k`, lane by lane, modulo 2^64: the low halves' product,
+    /// plus each low half times the other's high half, shifted up.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn times4(a: __m256i, k: u64) -> __m256i {
+        let (low, high) = (_mm256_set1_epi64x((k & 0xffff_ffff) as i64), _mm256_set1_epi64x((k >> 32) as i64));
+        let cross = _mm256_add_epi64(_mm256_mul_epu32(_mm256_srli_epi64::<32>(a), low), _mm256_mul_epu32(a, high));
+        _mm256_add_epi64(_mm256_mul_epu32(a, low), _mm256_slli_epi64::<32>(cross))
+    }
 }
 
 /// The bits of a key that name its part for a database of `records`
@@ -468,10 +608,14 @@ pub fn deep_print(structure: u64, bits: u8) -> u8 {
 
 /// The splitmix64 finaliser: every input bit reaches every output bit.
 fn mix(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z = (z ^ (z >> 30)).wrapping_mul(MIX_1);
+    z = (z ^ (z >> 27)).wrapping_mul(MIX_2);
     z ^ (z >> 31)
 }
+
+/// [`mix`]'s multipliers.
+const MIX_1: u64 = 0xbf58_476d_1ce4_e5b9;
+const MIX_2: u64 = 0x94d0_49bb_1331_11eb;
 
 #[cfg(test)]
 mod tests {
@@ -577,5 +721,48 @@ mod tests {
         // Pawnless endings split by what is left.
         assert_ne!(s("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"), s("4k3/8/8/8/8/8/8/Q3K3 w - - 0 1"));
         assert_ne!(s("4k3/8/8/8/8/8/8/4K3 w - - 0 1"), s("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"));
+    }
+
+    /// Structures hashed several at a time are those hashed one at a time,
+    /// however many there are, on each path this processor can take.
+    #[test]
+    fn structures_hashed_together_are_those_hashed_alone() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut parts = [[0u64; 64]; 3];
+        for v in parts.iter_mut().flatten() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *v = x;
+        }
+        let [white, black, pieces] = &parts;
+        let alone: Vec<u64> = (0..64).map(|i| structure_of(white[i], black[i], pieces[i])).collect();
+        type Path = fn(&[u64; 64], &[u64; 64], &[u64; 64], usize, &mut [u64; 64]);
+        let mut paths: Vec<(&str, Path)> = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if wide::has_avx2() {
+                // SAFETY: the processor has the instructions it is compiled for.
+                paths.push(("four at a time", |w, b, p, n, o| unsafe { wide::structures4(w, b, p, n, o) }));
+            }
+            if wide::has_avx512() {
+                // SAFETY: as above.
+                paths.push(("eight at a time", |w, b, p, n, o| unsafe { wide::structures8(w, b, p, n, o) }));
+            }
+        }
+        for (name, path) in paths {
+            for n in 0..=64 {
+                let mut out = [0; 64];
+                path(white, black, pieces, n, &mut out);
+                assert_eq!(out[..n], alone[..n], "{name}, {n}");
+            }
+        }
+        let mut out = [0; 64];
+        if structures_of(white, black, pieces, 64, &mut out) {
+            assert_eq!(out[..], alone[..], "whichever this processor takes");
+        }
+        // The standard start's structure, from its parts.
+        let start = Board::startpos();
+        assert_eq!(structure(&start), structure_of(0xff00, 0xff << 48, 0x1122_2222));
     }
 }

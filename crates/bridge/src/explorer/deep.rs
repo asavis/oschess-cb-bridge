@@ -46,7 +46,7 @@ use crate::search::workers::{self, threads};
 use super::build::{Chunks, Out, PLANNED, Turns, corrupt, from_bad};
 use super::format::{
     DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, PRUNE_PLY, STRUCTURE_PIECES, deep_bucket, deep_print,
-    piece_shift, read_varint, structure_of, varint,
+    piece_shift, read_varint, structure_of, structures_in_vectors, structures_of, varint,
 };
 use super::runs::{Limits, PassTime, Progress, Room};
 use super::source::MAX_STRUCTURES;
@@ -214,11 +214,19 @@ fn effect_of(word: u16) -> Option<Effect> {
 /// the changes of its structure ([`Tracker::play_noting`]).
 const CHANGES: usize = 64;
 
-/// The parts of a line's structure after a word that may have changed it.
-#[derive(Clone, Copy, Default)]
-struct Change {
-    pawns: [u64; 2],
-    pieces: u64,
+/// The parts of a line's structure after each word of a run that may have
+/// changed it, each part in an array of its own, so that their structures
+/// are hashed several at a time ([`structures_of`]).
+struct Changes {
+    white: [u64; CHANGES],
+    black: [u64; CHANGES],
+    pieces: [u64; CHANGES],
+}
+
+impl Default for Changes {
+    fn default() -> Changes {
+        Changes { white: [0; CHANGES], black: [0; CHANGES], pieces: [0; CHANGES] }
+    }
 }
 
 /// A line's structure followed through its move words alone: each side's
@@ -297,20 +305,29 @@ impl Tracker {
         (named & NAMED != 0).then_some(())
     }
 
+    /// [`Tracker::play_noting`], not inlined, so that the few registers it
+    /// plays in are all its own, when the changes' structures are hashed
+    /// apart from it, in vectors.
+    #[inline(never)]
+    fn play_noting_apart(&mut self, words: &[[u8; 2]], changes: &mut Changes) -> Option<usize> {
+        self.play_noting(words, changes)
+    }
+
     /// Plays `words`, [`CHANGES`] at most, and notes in `changes` the parts
     /// of the structure after each word that may have changed it, a pawn's
     /// move or a capture: without a branch a word, since which words do is
     /// unpredictable. The changes noted; `None` when a word names no move of
     /// standard chess.
-    #[inline]
-    fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut [Change; CHANGES]) -> Option<usize> {
+    #[inline(always)]
+    fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut Changes) -> Option<usize> {
         let (mut noted, mut named) = (0, NAMED);
         for w in words {
             let e = self.effect(u16::from_le_bytes(*w));
             named &= e.flags;
             self.apply(e);
             // No more noted than words played, so within `changes`.
-            changes[noted & (CHANGES - 1)] = Change { pawns: self.pawns, pieces: self.pieces };
+            let at = noted & (CHANGES - 1);
+            (changes.white[at], changes.black[at], changes.pieces[at]) = (self.pawns[0], self.pawns[1], self.pieces);
             noted += (e.flags & CHANGED) as usize;
         }
         (named & NAMED != 0).then_some(noted)
@@ -437,13 +454,14 @@ struct Split {
 
 /// A worker's postings in a pass: its buffer of `cap`, and those of the
 /// pass's first bucket it counted ([`Pass::rest`]); and what the replay of a
-/// line notes as it goes, the changes of a run of words and the postings
-/// that lie in the pass.
+/// line notes as it goes, the changes of a run of words, their structures,
+/// and the postings that lie in the pass.
 struct Kept {
     buf: Vec<u64>,
     cap: usize,
     rest: u64,
-    changes: [Change; CHANGES],
+    changes: Changes,
+    structures: [u64; CHANGES],
     found: [u64; MAX_STRUCTURES],
 }
 
@@ -470,7 +488,8 @@ impl Pass<'_> {
                 buf: Vec::new(),
                 cap,
                 rest: 0,
-                changes: [Change::default(); CHANGES],
+                changes: Changes::default(),
+                structures: [0; CHANGES],
                 found: [0; MAX_STRUCTURES],
             };
             kept.buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
@@ -519,13 +538,23 @@ impl Pass<'_> {
         let within = Within::of(self.lo, self.hi.load(Ordering::Relaxed), self.bits, game);
         let mut held = line.structure();
         let mut replayed = Replayed::default();
-        for words in past.chunks(CHANGES) {
-            let noted = line.play_noting(words, &mut kept.changes).ok_or_else(word)?;
-            for c in &kept.changes[..noted] {
-                let s = structure_of(c.pawns[0], c.pawns[1], c.pieces);
-                if s != held {
-                    find(held, &within, &mut replayed, &mut kept.found);
-                    held = s;
+        if structures_in_vectors() {
+            for words in past.chunks(CHANGES) {
+                let noted = line.play_noting_apart(words, &mut kept.changes).ok_or_else(word)?;
+                let (c, structures) = (&kept.changes, &mut kept.structures);
+                structures_of(&c.white, &c.black, &c.pieces, noted, structures);
+                held = find_changed(&structures[..noted], held, &within, &mut replayed, &mut kept.found);
+            }
+        } else {
+            for words in past.chunks(CHANGES) {
+                let noted = line.play_noting(words, &mut kept.changes).ok_or_else(word)?;
+                let c = &kept.changes;
+                for ((&w, &b), &p) in c.white.iter().zip(&c.black).zip(&c.pieces).take(noted) {
+                    let s = structure_of(w, b, p);
+                    if s != held {
+                        find(held, &within, &mut replayed, &mut kept.found);
+                        held = s;
+                    }
                 }
             }
         }
@@ -603,6 +632,27 @@ fn find(structure: u64, within: &Within, replayed: &mut Replayed, found: &mut [u
         *f = bucket << 40 | within.game | print << 1;
     }
     replayed.found += usize::from(bucket.wrapping_sub(within.first) < within.span);
+}
+
+/// Notes a line's postings of the structures it held before each of
+/// `structures`, the ones the changes of a run of its words lead to, from
+/// `held` on, as [`find`] does: the structure held after them. Not inlined,
+/// so that the registers it finds in are its own.
+#[inline(never)]
+fn find_changed(
+    structures: &[u64],
+    mut held: u64,
+    within: &Within,
+    replayed: &mut Replayed,
+    found: &mut [u64; MAX_STRUCTURES],
+) -> u64 {
+    for &s in structures {
+        if s != held {
+            find(held, within, replayed, found);
+            held = s;
+        }
+    }
+    held
 }
 
 /// Counts `print` among the prints of a line's structures in the pass's
@@ -1309,10 +1359,11 @@ mod tests {
             }
             let bytes: Vec<[u8; 2]> = words.iter().map(|w| w.to_le_bytes()).collect();
             let (mut run, mut noted) = (Tracker::of(&Board::startpos()), Vec::new());
-            let mut changes = [Change::default(); CHANGES];
+            let mut changes = Changes::default();
             for words in bytes.chunks(CHANGES) {
                 let n = run.play_noting(words, &mut changes).unwrap();
-                noted.extend(changes[..n].iter().map(|c| (c.pawns, c.pieces)));
+                let c = &changes;
+                noted.extend((0..n).map(|i| ([c.white[i], c.black[i]], c.pieces[i])));
             }
             assert_eq!(noted, expected);
             assert_eq!(run, one);
@@ -1323,7 +1374,7 @@ mod tests {
         }
         assert!(changed > 1_000, "{changed}");
         let mut run = Tracker::of(&Board::startpos());
-        let mut changes = [Change::default(); CHANGES];
+        let mut changes = Changes::default();
         let e2e4 = cbformat::replay::word_of(&Board::startpos(), "e2e4".parse().unwrap()).unwrap();
         assert_eq!(run.play_noting(&[e2e4.to_le_bytes(), [0, 0]], &mut changes), None);
         assert_eq!(run.play_all(&[e2e4.to_le_bytes(), FIRST_CASTLE_960.to_le_bytes()]), None);
