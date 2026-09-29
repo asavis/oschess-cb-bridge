@@ -372,7 +372,11 @@ impl Pass<'_> {
             let mut kept = Kept { buf: Vec::new(), cap, rest: 0 };
             kept.buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
             let mut taker = chunks.taker();
-            while let Some((lo, hi)) = taker.take(kept.buf.len() + spare > cap) {
+            loop {
+                // A background build gives way to foreground work before it
+                // takes its next chunk, so that none waits for it (#149).
+                self.progress.give_way();
+                let Some((lo, hi)) = taker.take(kept.buf.len() + spare > cap) else { break };
                 if w.stopped() || self.progress.stopped() {
                     return Err(SearchError::Superseded);
                 }
@@ -569,7 +573,11 @@ fn write_blocks(
         heads.try_reserve_exact(buffers.len()).map_err(|_| Refused::Busy)?;
         let mut gathered: Vec<u64> = Vec::new();
         gathered.try_reserve_exact(GATHERED).map_err(|_| Refused::Busy)?;
-        while let Some(unit) = turns.take() {
+        loop {
+            // A background build gives way to foreground work before it
+            // takes its next block, so that none waits for it (#149).
+            progress.give_way();
+            let Some(unit) = turns.take() else { break };
             if stopped() {
                 return Err(SearchError::Superseded);
             }

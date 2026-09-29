@@ -779,7 +779,14 @@ the oschess analysis panel shows it like its Lichess tabs.
     Windows not while the computer runs on battery; it runs at the lowest
     processor priority, below a requested build, with the normal disk
     priority (`OSCHESS_BRIDGE_BACKGROUND_MODE=background` runs it in
-    Windows's background mode, which lowers its disk priority too).
+    Windows's background mode, which lowers its disk priority too). It gives
+    way to the answers about any database's games and positions (lists,
+    searches, sorts, a game, suggestions and explorer answers): while one
+    runs, the build waits between its batches until none runs, for at most
+    half a second at a time, so that it still ends if they never stop. A
+    requested build never gives way, and a background build that a request
+    for its database's positions makes the requested one gives way no
+    longer.
 
   A build reads header and move records, a few megabytes at a time, never
   annotations, and needs no temporary space. It needs free space of about 400

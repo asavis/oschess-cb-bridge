@@ -11,6 +11,7 @@ use crate::access::{Policy, Verdict, cors};
 use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
 use crate::engine::{self, Engine, Limit, Search};
+use crate::foreground;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
@@ -117,9 +118,15 @@ fn route(app: &App, req: &Request) -> Response {
     }
 }
 
+/// The answer `f` gives about database `id`, `404` when it is not listed.
+/// It is work a user waits for: background builds give way to it while it
+/// runs (#149).
 fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Response {
     match app.catalog.get(id) {
-        Some(entry) => f(&entry),
+        Some(entry) => {
+            let _working = foreground::begin();
+            f(&entry)
+        }
         None => not_found(),
     }
 }

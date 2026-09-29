@@ -72,7 +72,11 @@ fn acquire(want: usize, cancel: &Cancel) -> Result<Slots, SearchError> {
         if left.is_zero() {
             return Err(SearchError::Busy);
         }
-        taken = RETURNED.wait_timeout(taken, left.min(RECHECK)).unwrap_or_else(|e| e.into_inner()).0;
+        // A background build may hold the workers: it does not give way to
+        // the work of a thread that waits for them (#149).
+        taken = crate::foreground::aside(|| RETURNED.wait_timeout(taken, left.min(RECHECK)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 

@@ -469,7 +469,11 @@ impl Pass<'_> {
             scratch.try_reserve_exact(FOLD_ENTRIES).map_err(|_| Refused::Busy)?;
             let mut seen = [0u64; MAX_PLY as usize + 1];
             let mut taker = chunks.taker();
-            while let Some((lo, hi)) = taker.take(buf.len() + spare > cap) {
+            loop {
+                // A background build gives way to foreground work before it
+                // takes its next chunk, so that none waits for it (#149).
+                self.progress.give_way();
+                let Some((lo, hi)) = taker.take(buf.len() + spare > cap) else { break };
                 if w.stopped() || self.progress.stopped() {
                     return Err(SearchError::Superseded);
                 }
@@ -705,7 +709,11 @@ fn write_parts(
         let mut agg = Aggregate::new().ok_or(Refused::Busy)?;
         let mut heads: Vec<&[Entry]> = Vec::new();
         heads.try_reserve_exact(buffers.len() + 1).map_err(|_| Refused::Busy)?;
-        while let Some(unit) = turns.take() {
+        loop {
+            // A background build gives way to foreground work before it
+            // takes its next part, so that none waits for it (#149).
+            progress.give_way();
+            let Some(unit) = turns.take() else { break };
             if stopped() {
                 return Err(SearchError::Superseded);
             }

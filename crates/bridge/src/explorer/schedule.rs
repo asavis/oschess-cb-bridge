@@ -6,6 +6,14 @@
 //! battery. A background build's threads run at the priority of work nothing
 //! waits for ([`machine::background`]), a requested build's below the normal
 //! priority.
+//!
+//! A background build also gives way to the work a user waits for
+//! ([`crate::foreground`]): while a search, sort, list or explorer answer
+//! runs, each of its threads waits before its next batch until none runs,
+//! for at most [`PATIENCE`] at a time, then goes on with one batch whatever
+//! runs; under foreground work that never ends, a build still ends, a batch
+//! per thread every [`PATIENCE`]. A requested build never gives way: it is
+//! the work a request waits for.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +27,13 @@ use super::runs::Progress;
 /// How often a background build waiting for mains power looks again, unless
 /// something wakes it sooner ([`Scheduler::poke`]).
 const POWER_RECHECK: Duration = Duration::from_secs(10);
+
+/// How long each thread of a background build gives way to foreground work
+/// at most, at a time, before it goes on with one batch whatever runs: long
+/// enough for a search, a sort or an explorer answer to run without a batch
+/// started beside it, short enough that a build under foreground work that
+/// never ends still ends (#149).
+pub const PATIENCE: Duration = Duration::from_millis(500);
 
 /// Why a build is queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +50,16 @@ impl Kind {
         match self {
             Kind::Requested => Priority::BelowNormal,
             Kind::Background => machine::background(),
+        }
+    }
+
+    /// How long its threads give way to foreground work at most, at a time,
+    /// when a background build's give way for `patience`: that long for a
+    /// background build, never for a requested one.
+    fn patience(self, patience: Duration) -> Duration {
+        match self {
+            Kind::Requested => Duration::ZERO,
+            Kind::Background => patience,
         }
     }
 }
@@ -82,6 +107,8 @@ pub struct Scheduler {
     /// Told when a build is queued, and when the power may have changed.
     changed: Condvar,
     machine: Mutex<Arc<dyn Machine>>,
+    /// How long a background build's threads give way at a time.
+    patience: Mutex<Duration>,
     /// Starting the thread fails, for tests.
     refuse: AtomicBool,
 }
@@ -92,6 +119,7 @@ impl Default for Scheduler {
             queues: Mutex::default(),
             changed: Condvar::new(),
             machine: Mutex::new(Arc::new(System)),
+            patience: Mutex::new(PATIENCE),
             refuse: AtomicBool::new(false),
         }
     }
@@ -107,6 +135,18 @@ impl Scheduler {
     pub fn set_machine(&self, machine: Arc<dyn Machine>) {
         *lock(&self.machine) = machine;
         self.poke();
+    }
+
+    /// How long a background build's threads give way to foreground work at
+    /// most, at a time: [`PATIENCE`] unless set.
+    pub fn patience(&self) -> Duration {
+        *lock(&self.patience)
+    }
+
+    /// Sets how long a background build's threads give way to foreground
+    /// work at most, at a time, from the next build on. Tests set it.
+    pub fn set_patience(&self, patience: Duration) {
+        *lock(&self.patience) = patience;
     }
 
     /// Queues the build of database `id`, which reports on `progress`, as
@@ -158,8 +198,9 @@ impl Scheduler {
     /// Makes the build of `id`, waiting or running, a requested one, since a
     /// request now waits for it: a waiting one goes after the requested ones,
     /// before the background ones, and stops a background build of another
-    /// database; a running one goes on at a requested build's priority, and
-    /// is no longer stopped for another request.
+    /// database; a running one goes on at a requested build's priority, gives
+    /// way to foreground work no longer, and is no longer stopped for another
+    /// request.
     pub fn promote(&self, id: &str) {
         let mut q = lock(&self.queues);
         if let Some(at) = q.background.iter().position(|j| j.id == id) {
@@ -172,6 +213,7 @@ impl Scheduler {
         } else if let Some(running) = q.running.as_mut().filter(|r| r.id == id && r.kind == Kind::Background) {
             running.kind = Kind::Requested;
             running.progress.priority.store(Kind::Requested.priority() as u8, Ordering::Relaxed);
+            running.progress.set_patience(Duration::ZERO);
         }
     }
 
@@ -180,7 +222,7 @@ impl Scheduler {
     pub fn pause(&self) {
         let q = lock(&self.queues);
         if let Some(running) = q.running.as_ref().filter(|r| r.kind == Kind::Background) {
-            running.progress.stop.store(true, Ordering::Relaxed);
+            running.progress.ask_stop();
         }
     }
 
@@ -194,10 +236,11 @@ impl Scheduler {
         self.refuse.store(refuse, Ordering::Relaxed);
     }
 
-    /// The next build to run, marked running: the first requested one, else
-    /// the first background one unless the computer runs on battery, when the
-    /// thread waits for mains power or a requested build. `None`, the thread
-    /// marked ended, once both queues are empty.
+    /// The next build to run, marked running, its progress at its kind's
+    /// priority and patience: the first requested one, else the first
+    /// background one unless the computer runs on battery, when the thread
+    /// waits for mains power or a requested build. `None`, the thread marked
+    /// ended, once both queues are empty.
     fn next(&self) -> Option<Job> {
         let mut q = lock(&self.queues);
         let job = loop {
@@ -217,6 +260,10 @@ impl Scheduler {
             q = self.changed.wait_timeout(q, POWER_RECHECK).unwrap_or_else(|e| e.into_inner()).0;
         };
         q.running = Some(Running { id: job.id.clone(), kind: job.kind, progress: Arc::clone(&job.progress) });
+        // Under the lock, so that a request that promotes the build from now
+        // on has the last word.
+        job.progress.priority.store(job.kind.priority() as u8, Ordering::Relaxed);
+        job.progress.set_patience(job.kind.patience(self.patience()));
         Some(job)
     }
 
@@ -226,11 +273,9 @@ impl Scheduler {
         // thread.
         let _exit = Exit(self);
         while let Some(mut job) = self.next() {
-            let priority = job.kind.priority();
-            job.progress.priority.store(priority as u8, Ordering::Relaxed);
             let kind = job.kind;
             let ran = {
-                let _at = machine::at(priority);
+                let _at = machine::at(kind.priority());
                 // A panicking build must not end the thread.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.work)(kind)))
             };
@@ -256,7 +301,7 @@ impl Scheduler {
 /// `id`, which a request waits for.
 fn preempt(q: &Queues, id: &str) {
     if let Some(running) = q.running.as_ref().filter(|r| r.kind == Kind::Background && r.id != id) {
-        running.progress.stop.store(true, Ordering::Relaxed);
+        running.progress.ask_stop();
     }
 }
 
@@ -426,6 +471,38 @@ mod tests {
         assert_eq!(next(&events), ("a", background_priority(), "run"));
         release.send(()).unwrap();
         assert_eq!(next(&events), ("a", background_priority(), "done"));
+    }
+
+    /// A background build gives way to foreground work for the scheduler's
+    /// patience from its start, a requested build never, and a background
+    /// build that a request promotes while it runs no longer (#149).
+    #[test]
+    fn only_a_background_build_gives_way() {
+        let scheduler = Arc::new(Scheduler::default());
+        assert_eq!(scheduler.patience(), PATIENCE);
+        let patience = Duration::from_millis(70);
+        scheduler.set_patience(patience);
+        let (tx, events) = mpsc::channel();
+        let (release_a, held_a) = mpsc::channel();
+        let a = Arc::new(Progress::default());
+        assert_eq!(a.patience(), Duration::ZERO, "a build not yet run");
+        assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), build("a", &tx, &a, Some(held_a))));
+        assert_eq!(next(&events), ("a", background_priority(), "run"));
+        assert_eq!(a.patience(), patience);
+        scheduler.promote("a");
+        assert_eq!(a.patience(), Duration::ZERO);
+        // Its thread takes the requested priority at its next batch.
+        std::thread::sleep(Duration::from_millis(50));
+        release_a.send(()).unwrap();
+        assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
+        let (release_b, held_b) = mpsc::channel();
+        let b = Arc::new(Progress::default());
+        b.set_patience(PATIENCE);
+        assert!(scheduler.submit("b", Kind::Requested, Arc::clone(&b), build("b", &tx, &b, Some(held_b))));
+        assert_eq!(next(&events), ("b", Priority::BelowNormal, "run"));
+        assert_eq!(b.patience(), Duration::ZERO);
+        release_b.send(()).unwrap();
+        assert_eq!(next(&events), ("b", Priority::BelowNormal, "done"));
     }
 
     /// A thread that cannot start leaves no build waiting, and the next

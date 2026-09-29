@@ -19,8 +19,8 @@
 //! index built unasked from the start, while the flows run. Each sort and
 //! search row says whether the build still ran when it was done, and the time
 //! from the bridge's start to the index ready, with the mode the build ran in
-//! (`OSCHESS_BRIDGE_BACKGROUND_MODE`), replaces the build the first explorer
-//! request starts.
+//! (`OSCHESS_BRIDGE_BACKGROUND_MODE`) and how long it gave way to the flows at
+//! most at a time, replaces the build the first explorer request starts.
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -973,7 +973,7 @@ fn requested_build(table: &mut Table, c: &mut Client, served: &Served, path: &st
 
 /// The build the bridge started unasked, with `--background` (#149): the time
 /// from the bridge's start, `launched`, to the index ready, the mode it ran
-/// in, and the build's phases.
+/// in and its patience, and the build's phases.
 fn background_build(table: &mut Table, served: &Served, launched: Instant, folder: &Path) {
     match served.built(BACKGROUND_WAIT) {
         Some((at, t)) => {
@@ -981,8 +981,11 @@ fn background_build(table: &mut Table, served: &Served, launched: Instant, folde
             let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
             // The bridge has this process's environment, and so its mode.
             let mode = bridge::machine::background_mode().0;
-            let counts =
-                format!("from the bridge's start, no position asked, mode {mode}; {stream}, index {index} bytes");
+            let patience = bridge::explorer::schedule::PATIENCE.as_millis();
+            let counts = format!(
+                "from the bridge's start, no position asked, mode {mode}, giving way {patience} ms at most; \
+                 {stream}, index {index} bytes"
+            );
             table.once("index", "background build to ready", ms(at.duration_since(launched)), &counts);
             build_phases(table, t);
         }

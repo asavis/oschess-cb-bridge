@@ -1,8 +1,9 @@
 //! The position indexes of the databases in use, kept up to date in the
 //! background (#149): the keeper that queues their builds, the queues that
-//! run requested builds before background ones, and what `/v1/status` and the
-//! explorer say meanwhile. Every bridge here has its keeper look every 50 ms,
-//! with the quiet period each test sets.
+//! run requested builds before background ones, background builds that give
+//! way to searches, and what `/v1/status` and the explorer say meanwhile.
+//! Every bridge here has its keeper look every 50 ms, with the quiet period
+//! each test sets.
 
 use std::collections::HashSet;
 use std::fs::Metadata;
@@ -18,6 +19,7 @@ use bridge::explorer::format::{HEADER_LEN, Header};
 use bridge::explorer::runs::Limits;
 use bridge::fetch::Cloud;
 use bridge::machine::Machine;
+use bridge::search::Indexes;
 use bridge::sources::Sources;
 use cbformat::fixture::{Builder, TempDb, pgn_file};
 use cbformat::movetable::{END_OF_LINE, MOVES};
@@ -160,7 +162,21 @@ impl Bridge {
     fn building(&self) -> Vec<(String, &'static str, u64, u64)> {
         self.app.catalog.explorer.building()
     }
+
+    /// The indexes searches on database `id` use, where a test holds them.
+    fn indexes(&self, id: &str) -> Arc<Indexes> {
+        self.app.catalog.get(id).unwrap().open().ok().unwrap().indexes
+    }
+
+    /// Sends a search on database `id` from a thread of its own.
+    fn search(&self, id: &str) -> std::thread::JoinHandle<(u16, String)> {
+        let (port, path) = (self.port, format!("/v1/databases/{id}/games?q=x"));
+        std::thread::spawn(move || get(port, &path))
+    }
 }
+
+/// How long a test waits for a search to be held.
+const ARRIVAL: Duration = Duration::from_secs(30);
 
 impl Drop for Bridge {
     fn drop(&mut self) {
@@ -468,6 +484,97 @@ fn a_database_unchanged_for_the_quiet_period_is_built_at_the_first_look() {
     bridge.app.catalog.explorer.set_keeping(Duration::from_secs(3600), Duration::from_secs(60));
     bridge::explorer::keeper::start(&bridge.app);
     wait("the index was not built at the first look", 60, || built_for(&dir, &id) == Some(generation(&path)));
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A background build gives way to a search (#149): while the search runs,
+/// the build waits before its first batch, not a record read; once the
+/// search ends, it goes on at once, long before its patience runs out, and
+/// the index is built.
+#[test]
+fn a_background_build_gives_way_to_a_search() {
+    let db = copies("background-gives-way", 20);
+    let path = db.dir().join("db.2cbh");
+    let (id, dir) = (id_of(&path), data_dir("gives-way"));
+    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    bridge.app.catalog.explorer.set_patience(Duration::from_secs(120));
+    let indexes = bridge.indexes(&id);
+    let held = indexes.gate().hold(1);
+    let search = bridge.search(&id);
+    assert!(held.arrived(1, ARRIVAL));
+    bridge.keep(Duration::ZERO);
+    wait("the background build did not start", 60, || phase(bridge.port, &id).as_deref() == Some("reading"));
+    // Twenty games take milliseconds to build.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(bridge.building(), [(id.clone(), "reading", 0, 20)], "it went on while the search ran");
+    assert!(built_for(&dir, &id).is_none());
+    drop(held);
+    let (status, body) = search.join().unwrap();
+    assert_eq!(status, 200, "{body}");
+    wait("the build did not go on once the search ended", 60, || built_for(&dir, &id) == Some(generation(&path)));
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A requested build never gives way (#149): while a search runs and the
+/// background build of one database gives way to it, a request for another
+/// database's positions stops that build and is built; a request for the
+/// first database's positions then makes its build a requested one, which
+/// goes on and is built. The search runs all along, and both builds are
+/// done long before a background build's patience would run out.
+#[test]
+fn a_requested_build_does_not_give_way() {
+    let (large, small) = (copies("background-no-way-large", 40), copies("background-no-way-small", 10));
+    let paths = [large.dir().join("db.2cbh"), small.dir().join("db.2cbh")];
+    let (a, b) = (id_of(&paths[0]), id_of(&paths[1]));
+    let dir = data_dir("no-way");
+    let bridge = Bridge::new(Catalog::new(paths.clone()), &dir);
+    bridge.app.catalog.explorer.set_patience(Duration::from_secs(120));
+    let indexes = bridge.indexes(&b);
+    let held = indexes.gate().hold(1);
+    let search = bridge.search(&b);
+    assert!(held.arrived(1, ARRIVAL));
+    // The largest database is in use from the start: its build gives way.
+    bridge.keep(Duration::ZERO);
+    wait("the background build did not start", 60, || phase(bridge.port, &a).as_deref() == Some("reading"));
+    wait("the requested build did not answer", 60, || bridge.explorer(&b).0 == 200);
+    assert!(built_for(&dir, &a).is_none(), "the background build went on");
+    wait("the promoted build did not answer", 60, || bridge.explorer(&a).0 == 200);
+    assert!(!search.is_finished(), "the search ended");
+    drop(held);
+    let (status, body) = search.join().unwrap();
+    assert_eq!(status, 200, "{body}");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A background build ends under foreground work that never does (#149):
+/// each of its threads gives way for its patience at most, then goes on with
+/// one batch and gives way again. Its five kinds of pass (the stream pass,
+/// the tree's replays and writes, the deep section's replays and writes)
+/// each wait their whole patience at least once, one after the other.
+#[test]
+fn a_background_build_ends_while_a_search_never_does() {
+    let db = copies("background-starved", 300);
+    let path = db.dir().join("db.2cbh");
+    let (id, dir) = (id_of(&path), data_dir("starved"));
+    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    let patience = Duration::from_millis(50);
+    bridge.app.catalog.explorer.set_patience(patience);
+    let indexes = bridge.indexes(&id);
+    let held = indexes.gate().hold(1);
+    let search = bridge.search(&id);
+    assert!(held.arrived(1, ARRIVAL));
+    let started = Instant::now();
+    bridge.keep(Duration::ZERO);
+    wait("the build did not end while the search ran", 60, || built_for(&dir, &id) == Some(generation(&path)));
+    let took = started.elapsed();
+    assert!(took >= patience * 5, "it gave way less than its patience per pass: {took:?}");
+    assert!(!search.is_finished(), "the search ended");
+    drop(held);
+    let (status, body) = search.join().unwrap();
+    assert_eq!(status, 200, "{body}");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }

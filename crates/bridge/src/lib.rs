@@ -20,6 +20,7 @@ pub mod engines;
 pub mod explorer;
 pub mod fetch;
 pub mod files;
+pub mod foreground;
 pub mod http;
 pub mod indexdir;
 pub mod json;

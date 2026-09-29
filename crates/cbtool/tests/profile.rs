@@ -138,7 +138,8 @@ fn the_background_build_is_timed_from_the_bridges_start() {
         .unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("background build to ready"), "{text}");
-    assert!(text.contains("from the bridge's start, no position asked, mode background; stream 2 games"), "{text}");
+    let row = "from the bridge's start, no position asked, mode background, giving way 500 ms at most; stream 2 games";
+    assert!(text.contains(row), "{text}");
     assert!(!text.contains("build to first answer"), "{text}");
     for phase in ["stream pass", "tree passes", "deep passes"] {
         assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");

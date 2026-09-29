@@ -55,7 +55,13 @@ pub const BACKGROUND_MODE: &str = "OSCHESS_BRIDGE_BACKGROUND_MODE";
 ///   such as the search budget's or a database file's handles, with it.
 /// - `background`: Windows's background mode, which lowers the disk and
 ///   memory priority too, so that the build's gigabytes of reads and writes
-///   give way to other programs' and take longer.
+///   give way to other programs' and take longer: for a computer where other
+///   programs' disk work matters more than how soon an index is ready.
+///
+/// In both, a background build gives way to the bridge's own searches and
+/// answers between its batches ([`crate::foreground`]); the priority is what
+/// it runs at beside other programs, and beside those answers once its
+/// patience runs out.
 pub const MODES: [(&str, Priority); 2] = [("lowcpu", Priority::Lowest), ("background", Priority::Background)];
 
 /// The mode of work nothing waits for, as [`BACKGROUND_MODE`] chose it when

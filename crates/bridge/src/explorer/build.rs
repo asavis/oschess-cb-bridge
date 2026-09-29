@@ -257,6 +257,9 @@ fn read_games(
             }
         };
         loop {
+            // A background build gives way to foreground work before it
+            // takes its next batch, so that none waits for it (#149).
+            progress.give_way();
             // Whole blocks of the stream, so that each block is one worker's.
             let batch = next.fetch_add(1, Ordering::Relaxed);
             if batch >= batches {

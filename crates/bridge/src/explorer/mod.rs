@@ -222,6 +222,13 @@ impl Registry {
         self.builds.set_machine(machine);
     }
 
+    /// Sets how long the threads of a background build give way to
+    /// foreground work at most, at a time, from the next build on:
+    /// [`schedule::PATIENCE`] unless set. Tests set it.
+    pub fn set_patience(&self, patience: Duration) {
+        self.builds.set_patience(patience);
+    }
+
     /// Sets what builds may use from now on, as [`prepare_with`] takes it.
     /// Tests make builds of few games take many passes with it.
     pub fn set_limits(&self, limits: Limits) {
