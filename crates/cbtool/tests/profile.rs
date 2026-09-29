@@ -105,5 +105,13 @@ fn notable_games_are_counted_as_whole_rows() {
         assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");
     }
     assert!(text.contains("passes 1, replay"), "{text}");
+    // The games of the line's start are listed (#148), as many as the
+    // explorer counts; the line ends before its sixth ply, and no game is
+    // long enough to be sampled.
+    assert!(text.contains("total = explorer's games for 1 of 1; totals 2;"), "{text}");
+    for case in ["line ply 6", "line ply 20", "sampled ply 40", "sampled ply 80"] {
+        assert!(text.contains(&format!("{case}, first page")), "{case}\n{text}");
+    }
+    assert!(text.contains("no such position"), "{text}");
     assert!(out.status.success(), "{text}");
 }
