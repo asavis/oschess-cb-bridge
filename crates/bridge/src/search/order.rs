@@ -1,10 +1,5 @@
 //! Sort orders: every record number, in the order of one key.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::collections::binary_heap::PeekMut;
-use std::sync::Mutex;
-
 use cbformat::game::Eco;
 
 use super::SearchError;
@@ -17,8 +12,6 @@ use crate::store::{Head, Store};
 
 /// Records a merging worker takes at least; a smaller order merges on one.
 const MERGE_PART_MIN: usize = 1 << 18;
-/// Records merged between two cancellation checks.
-const MERGE_CHECK: usize = 1 << 20;
 
 /// The ranks a key needs besides the record: players' and annotators' name
 /// orders (one where annotators are players), and the joint name order of
@@ -140,66 +133,11 @@ pub fn build<S: Store>(
 }
 
 /// Merges `runs`, each sorted, into `out` as record numbers in the order of
-/// their packed keys, in up to `parts` parts on the workers. Every key holds
-/// its record's number and so is unique: splitters sampled evenly from every
-/// run cut the keys into ranges of values, and each range of every run merges
-/// into its own part of `out`.
+/// their packed keys, in up to `parts` parts on the workers
+/// ([`workers::merge_ranges`]). Every key holds its record's number and so is
+/// unique: the order is the same in any number of parts.
 fn merge(runs: &[Vec<u64>], parts: usize, cancel: &Cancel, out: &mut [u32]) -> Result<(), SearchError> {
-    let mut samples: Vec<u64> =
-        runs.iter().filter(|r| !r.is_empty()).flat_map(|r| (1..parts).map(move |j| r[j * r.len() / parts])).collect();
-    samples.sort_unstable();
-    let splitters: Vec<u64> = match samples.len() {
-        0 => Vec::new(),
-        n => (1..parts).map(|k| samples[k * n / parts]).collect(),
-    };
-    // Where each part starts in each run; the last row is where the runs end.
-    let mut starts = vec![vec![0; runs.len()]];
-    starts.extend(splitters.iter().map(|&s| runs.iter().map(|r| r.partition_point(|&x| x < s)).collect()));
-    starts.push(runs.iter().map(Vec::len).collect());
-    let merge_part = |k: usize, part: &mut [u32], stopped: &dyn Fn() -> bool| -> Result<(), SearchError> {
-        let (from, to) = (&starts[k], &starts[k + 1]);
-        let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> =
-            (0..runs.len()).filter(|&r| from[r] < to[r]).map(|r| Reverse((runs[r][from[r]], r, from[r]))).collect();
-        let mut i = 0;
-        // The least head is taken and its run's next key put in its place,
-        // which sifts the heap once where a pop and a push would twice.
-        while let Some(mut least) = heap.peek_mut() {
-            let Reverse((packed, r, at)) = *least;
-            if i % MERGE_CHECK == 0 && stopped() {
-                return Err(SearchError::Superseded);
-            }
-            part[i] = packed as u32;
-            i += 1;
-            if at + 1 < to[r] {
-                *least = Reverse((runs[r][at + 1], r, at + 1));
-            } else {
-                PeekMut::pop(least);
-            }
-        }
-        Ok(())
-    };
-    let parts = splitters.len() + 1;
-    if parts == 1 {
-        return merge_part(0, out, &|| cancel.is_cancelled());
-    }
-    let mut slots = Vec::with_capacity(parts);
-    let mut rest = out;
-    for k in 0..parts {
-        let len = (0..runs.len()).map(|r| starts[k + 1][r] - starts[k][r]).sum();
-        let (part, tail) = std::mem::take(&mut rest).split_at_mut(len);
-        slots.push(Mutex::new(Some(part)));
-        rest = tail;
-    }
-    workers::run(parts, 0, cancel, |w| {
-        for k in (w.index..parts).step_by(w.count) {
-            let part = slots[k].lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some(part) = part {
-                merge_part(k, part, &|| w.stopped() || cancel.is_cancelled())?;
-            }
-        }
-        Ok(())
-    })?;
-    Ok(())
+    workers::merge_ranges(runs, parts, &u64::cmp, cancel, out, |packed| packed as u32)
 }
 
 #[cfg(test)]

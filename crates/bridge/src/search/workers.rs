@@ -3,7 +3,7 @@
 //! and their batch buffers are reserved in the search budget before they are
 //! allocated.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -216,15 +216,65 @@ pub fn run<T: Send>(
     }
 }
 
+/// Parts `0..count` of a pass, which its workers take one at a time, each the
+/// next that no worker has taken yet, so that a worker whose parts take less
+/// time takes more of them.
+pub struct Parts {
+    next: AtomicUsize,
+    count: usize,
+}
+
+impl Parts {
+    pub fn new(count: usize) -> Parts {
+        Parts { next: AtomicUsize::new(0), count }
+    }
+
+    /// The part `w` takes next; `None` once every part is taken, and
+    /// `Superseded` once another worker failed or `cancel` is.
+    pub fn take(&self, w: &Worker<'_>, cancel: &Cancel) -> Result<Option<usize>, SearchError> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        if i >= self.count {
+            return Ok(None);
+        }
+        if w.stopped() || cancel.is_cancelled() {
+            return Err(SearchError::Superseded);
+        }
+        Ok(Some(i))
+    }
+}
+
+/// `task` for each of `parts` parts on the workers, a part at a time
+/// ([`Parts`]): what it returned for each, in part order. `Superseded` once
+/// `cancel` is.
+pub fn each<T: Send>(
+    parts: usize,
+    cancel: &Cancel,
+    task: impl Fn(usize) -> Result<T, SearchError> + Sync,
+) -> Result<Vec<T>, SearchError> {
+    let taken = Parts::new(parts);
+    let done = run(threads().min(parts).max(1), 0, cancel, |w| {
+        let mut done = Vec::new();
+        while let Some(i) = taken.take(w, cancel)? {
+            done.push((i, task(i)?));
+        }
+        Ok(done)
+    })?;
+    let mut done: Vec<(usize, T)> = done.into_iter().flatten().collect();
+    done.sort_unstable_by_key(|d| d.0);
+    Ok(done.into_iter().map(|d| d.1).collect())
+}
+
 /// Items a sorting worker takes at least; fewer are sorted on one thread.
 const SORT_PART_MIN: usize = 1 << 15;
 
 /// Sorts `items` by `cmp` on the workers, with a second buffer as long as
 /// `items`, which the caller holds in the budget: each worker sorts a chunk,
-/// splitters sampled evenly from the sorted chunks cut them into ranges, and
-/// each range of every chunk merges into its own part of the second buffer,
+/// and the sorted chunks merge into the second buffer ([`merge_ranges`]),
 /// which becomes `items`. Items that `cmp` calls equal come in any order.
-pub fn sort_by<T, F>(items: &mut Vec<T>, cmp: &F) -> Result<(), SearchError>
+/// `Superseded` once `cancel` is: the workers look before each chunk they
+/// sort and as they merge, and a sort small enough for one thread looks once
+/// it is done.
+pub fn sort_by<T, F>(items: &mut Vec<T>, cmp: &F, cancel: &Cancel) -> Result<(), SearchError>
 where
     T: Copy + Send + Sync,
     F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
@@ -233,60 +283,141 @@ where
     let parts = threads().min(n / SORT_PART_MIN).max(1);
     if parts == 1 {
         items.sort_unstable_by(cmp);
-        return Ok(());
+        return match cancel.is_cancelled() {
+            true => Err(SearchError::Superseded),
+            false => Ok(()),
+        };
     }
     let per = n.div_ceil(parts);
     let chunks: Vec<Mutex<Option<&mut [T]>>> = items.chunks_mut(per).map(|c| Mutex::new(Some(c))).collect();
-    run(parts, 0, &Cancel::never(), |w| {
-        for k in (w.index..chunks.len()).step_by(w.count) {
-            if let Some(chunk) = chunks[k].lock().unwrap_or_else(|e| e.into_inner()).take() {
-                chunk.sort_unstable_by(cmp);
-            }
+    each(chunks.len(), cancel, |k| {
+        if let Some(chunk) = chunks[k].lock().unwrap_or_else(|e| e.into_inner()).take() {
+            chunk.sort_unstable_by(cmp);
         }
         Ok(())
     })?;
     drop(chunks);
-    let chunks: Vec<&[T]> = items.chunks(per).collect();
-    let mut samples: Vec<T> = chunks.iter().flat_map(|c| (1..parts).map(move |j| c[j * c.len() / parts])).collect();
-    samples.sort_unstable_by(cmp);
-    let splitters: Vec<T> = (1..parts).map(|k| samples[k * samples.len() / parts]).collect();
-    // Where each range starts in each chunk; the last row is where they end.
-    let mut starts = vec![vec![0; chunks.len()]];
-    starts.extend(splitters.iter().map(|s| chunks.iter().map(|c| c.partition_point(|x| cmp(x, s).is_lt())).collect()));
-    starts.push(chunks.iter().map(|c| c.len()).collect());
     let mut sorted: Vec<T> = Vec::new();
     sorted.try_reserve_exact(n).map_err(|_| Refused::Busy)?;
     sorted.extend_from_slice(items);
-    let mut ranges = Vec::with_capacity(parts);
-    let mut rest = sorted.as_mut_slice();
+    let chunks: Vec<&[T]> = items.chunks(per).collect();
+    merge_ranges(&chunks, parts, cmp, cancel, &mut sorted, |x| x)?;
+    drop(chunks);
+    *items = sorted;
+    Ok(())
+}
+
+/// Items a part merges between two looks whether the pass was superseded.
+const MERGE_CHECK: usize = 1 << 20;
+
+/// Merges `runs`, each sorted by `cmp`, into `out`, as long as all of them,
+/// each item as `map` makes it, in up to `parts` parts on the workers:
+/// splitters sampled evenly from every run cut the items into ranges of
+/// values, and each range of every run merges into its own part of `out`.
+/// Items that `cmp` calls equal come in any order. One part merges on the
+/// calling thread. Every [`MERGE_CHECK`] items a part looks whether another
+/// failed or `cancel` superseded the pass, and it is then `Superseded`.
+pub fn merge_ranges<T, U, R, F, M>(
+    runs: &[R],
+    parts: usize,
+    cmp: &F,
+    cancel: &Cancel,
+    out: &mut [U],
+    map: M,
+) -> Result<(), SearchError>
+where
+    T: Copy + Sync,
+    U: Send,
+    R: AsRef<[T]> + Sync,
+    F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
+    M: Fn(T) -> U + Sync,
+{
+    let mut samples: Vec<T> = runs
+        .iter()
+        .map(R::as_ref)
+        .filter(|r| !r.is_empty())
+        .flat_map(|r| (1..parts).map(move |j| r[j * r.len() / parts]))
+        .collect();
+    samples.sort_unstable_by(cmp);
+    let splitters: Vec<T> = match samples.len() {
+        0 => Vec::new(),
+        n => (1..parts).map(|k| samples[k * n / parts]).collect(),
+    };
+    // Where each part starts in each run; the last row is where the runs end.
+    let mut starts = vec![vec![0; runs.len()]];
+    starts.extend(
+        splitters.iter().map(|s| runs.iter().map(|r| r.as_ref().partition_point(|x| cmp(x, s).is_lt())).collect()),
+    );
+    starts.push(runs.iter().map(|r| r.as_ref().len()).collect());
+    let merge_part = |k: usize, part: &mut [U], stopped: &dyn Fn() -> bool| -> Result<(), SearchError> {
+        let (from, to) = (&starts[k], &starts[k + 1]);
+        // The head of each run's range, with its run and place: in order,
+        // they are a heap of the least first.
+        let mut heap: Vec<(T, usize, usize)> =
+            (0..runs.len()).filter(|&r| from[r] < to[r]).map(|r| (runs[r].as_ref()[from[r]], r, from[r])).collect();
+        heap.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+        for (i, slot) in part.iter_mut().enumerate() {
+            let Some(&(least, r, at)) = heap.first() else { break };
+            if i % MERGE_CHECK == 0 && stopped() {
+                return Err(SearchError::Superseded);
+            }
+            *slot = map(least);
+            // The least head is taken and its run's next item put in its
+            // place, which sifts the heap once where a pop and a push would
+            // twice.
+            if at + 1 < to[r] {
+                heap[0] = (runs[r].as_ref()[at + 1], r, at + 1);
+            } else {
+                heap.swap_remove(0);
+            }
+            sift_down(&mut heap, cmp);
+        }
+        Ok(())
+    };
+    let parts = splitters.len() + 1;
+    if parts == 1 {
+        return merge_part(0, out, &|| cancel.is_cancelled());
+    }
+    let mut slots = Vec::with_capacity(parts);
+    let mut rest = out;
     for k in 0..parts {
-        let len = (0..chunks.len()).map(|c| starts[k + 1][c] - starts[k][c]).sum();
-        let (range, tail) = std::mem::take(&mut rest).split_at_mut(len);
-        ranges.push(Mutex::new(Some(range)));
+        let len = (0..runs.len()).map(|r| starts[k + 1][r] - starts[k][r]).sum();
+        let (part, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        slots.push(Mutex::new(Some(part)));
         rest = tail;
     }
-    run(parts, 0, &Cancel::never(), |w| {
+    run(parts, 0, cancel, |w| {
         for k in (w.index..parts).step_by(w.count) {
-            let Some(out) = ranges[k].lock().unwrap_or_else(|e| e.into_inner()).take() else { continue };
-            let (mut at, to) = (starts[k].clone(), &starts[k + 1]);
-            for slot in out.iter_mut() {
-                // The least head of the chunks: few, so looked through in turn.
-                let mut best: Option<usize> = None;
-                for c in 0..chunks.len() {
-                    if at[c] < to[c] && best.is_none_or(|b| cmp(&chunks[c][at[c]], &chunks[b][at[b]]).is_lt()) {
-                        best = Some(c);
-                    }
-                }
-                let Some(b) = best else { break };
-                *slot = chunks[b][at[b]];
-                at[b] += 1;
+            let part = slots[k].lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(part) = part {
+                merge_part(k, part, &|| w.stopped() || cancel.is_cancelled())?;
             }
         }
         Ok(())
     })?;
-    drop(ranges);
-    *items = sorted;
     Ok(())
+}
+
+/// Moves the first head of `heap`, a heap by `cmp` of the least first but
+/// for that head, down past each lesser child to its place.
+fn sift_down<T: Copy, F: Fn(&T, &T) -> std::cmp::Ordering>(heap: &mut [(T, usize, usize)], cmp: &F) {
+    let Some(&moved) = heap.first() else { return };
+    let (end, mut hole) = (heap.len(), 0);
+    loop {
+        let mut child = 2 * hole + 1;
+        if child >= end {
+            break;
+        }
+        if child + 1 < end {
+            child += usize::from(cmp(&heap[child + 1].0, &heap[child].0).is_lt());
+        }
+        if !cmp(&heap[child].0, &moved.0).is_lt() {
+            break;
+        }
+        heap[hole] = heap[child];
+        hole = child;
+    }
+    heap[hole] = moved;
 }
 
 #[cfg(test)]
@@ -309,8 +440,28 @@ mod tests {
                 .collect();
             let mut want = items.clone();
             want.sort_unstable();
-            sort_by(&mut items, &|a: &(u32, u32), b: &(u32, u32)| a.cmp(b)).unwrap();
+            sort_by(&mut items, &|a: &(u32, u32), b: &(u32, u32)| a.cmp(b), &Cancel::never()).unwrap();
             assert_eq!(items, want, "{n} items");
+        }
+    }
+
+    /// A sort superseded while it runs stops, whether the workers sort it or
+    /// one thread does (#179).
+    #[test]
+    fn a_sort_superseded_while_it_runs_stops() {
+        let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        for n in [7, SORT_PART_MIN * 2 + 3, 300_001] {
+            let cancel = Cancel::newest(&latest);
+            let compared = AtomicUsize::new(0);
+            // Its first comparison starts a newer search.
+            let cmp = |a: &u32, b: &u32| {
+                if compared.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Cancel::newest(&latest);
+                }
+                a.cmp(b)
+            };
+            let mut items: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+            assert!(matches!(sort_by(&mut items, &cmp, &cancel), Err(SearchError::Superseded)), "{n} items");
         }
     }
 

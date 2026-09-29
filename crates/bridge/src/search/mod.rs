@@ -23,7 +23,7 @@ pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use cbformat::view::Base;
@@ -186,8 +186,9 @@ impl Indexes {
             if order::build_bytes(db.record_count()) > memory::budget() {
                 return Err(SearchError::TooLarge);
             }
-            let player_ranks =
-                || cached(&self.player_ranks, || joint_ranks(&[&*self.names(db, Kind::Players, ctl.cancel)?]));
+            let player_ranks = || {
+                cached(&self.player_ranks, || joint_ranks(&[&*self.names(db, Kind::Players, ctl.cancel)?], ctl.cancel))
+            };
             let players = match sort.key {
                 SortKey::White | SortKey::Black => Some(player_ranks()?),
                 SortKey::Annotator if S::ANNOTATORS_ARE_PLAYERS => Some(player_ranks()?),
@@ -196,14 +197,14 @@ impl Indexes {
             let annotators = match sort.key {
                 SortKey::Annotator if S::ANNOTATORS_ARE_PLAYERS => players.clone(),
                 SortKey::Annotator => Some(cached(&self.annotator_ranks, || {
-                    joint_ranks(&[&*self.names(db, Kind::Annotators, ctl.cancel)?])
+                    joint_ranks(&[&*self.names(db, Kind::Annotators, ctl.cancel)?], ctl.cancel)
                 })?),
                 _ => None,
             };
             let events = match sort.key {
                 SortKey::Tournament => Some(cached(&self.event_ranks, || {
                     let tournaments = self.names(db, Kind::Tournaments, ctl.cancel)?;
-                    joint_ranks(&[&*tournaments, &*self.names(db, Kind::Titles, ctl.cancel)?])
+                    joint_ranks(&[&*tournaments, &*self.names(db, Kind::Titles, ctl.cancel)?], ctl.cancel)
                 })?),
                 _ => None,
             };
@@ -430,7 +431,7 @@ fn members_in<S: Store>(
         Sort { key: SortKey::Number, descending } => {
             const WORDS: usize = PART_NUMBERS / 64;
             let parts = members.words().div_ceil(WORDS);
-            let sizes = each_part(parts, ctl.cancel, |i| Ok(members.count_in(i * WORDS..(i + 1) * WORDS)))?;
+            let sizes = workers::each(parts, ctl.cancel, |i| Ok(members.count_in(i * WORDS..(i + 1) * WORDS)))?;
             gather(&mut out, count, &sizes, descending, ctl.cancel, |i| members.iter_in(i * WORDS..(i + 1) * WORDS))?;
         }
         _ => {
@@ -445,10 +446,10 @@ fn members_in<S: Store>(
             if count < MANY_MEMBERS
                 && let Ok(_lists) = Hold::reserve_quietly(count * 8 + parts * LEAST_LIST * 4)
             {
-                let lists = each_part(parts, ctl.cancel, |i| list(part(i)))?;
+                let lists = workers::each(parts, ctl.cancel, |i| list(part(i)))?;
                 out.extend(lists.iter().flatten().take(count));
             } else {
-                let sizes = each_part(parts, ctl.cancel, |i| Ok(part(i).count()))?;
+                let sizes = workers::each(parts, ctl.cancel, |i| Ok(part(i).count()))?;
                 gather(&mut out, count, &sizes, false, ctl.cancel, part)?;
             }
         }
@@ -469,32 +470,6 @@ fn list(numbers: impl Iterator<Item = u32>) -> Result<Vec<u32>, SearchError> {
         list.push(n);
     }
     Ok(list)
-}
-
-/// `task` for each of `parts` parts on the workers, a part at a time: what it
-/// returned for each, in part order. `Superseded` once `cancel` is.
-fn each_part<T: Send>(
-    parts: usize,
-    cancel: &Cancel,
-    task: impl Fn(usize) -> Result<T, SearchError> + Sync,
-) -> Result<Vec<T>, SearchError> {
-    let next = AtomicUsize::new(0);
-    let done = workers::run(workers::threads().min(parts).max(1), 0, cancel, |w| {
-        let mut done = Vec::new();
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= parts {
-                return Ok(done);
-            }
-            if w.stopped() || cancel.is_cancelled() {
-                return Err(SearchError::Superseded);
-            }
-            done.push((i, task(i)?));
-        }
-    })?;
-    let mut done: Vec<(usize, T)> = done.into_iter().flatten().collect();
-    done.sort_unstable_by_key(|d| d.0);
-    Ok(done.into_iter().map(|d| d.1).collect())
 }
 
 /// Fills `out`, which has room for `count`, with the first `count` numbers of
@@ -527,7 +502,7 @@ fn gather<I: Iterator<Item = u32>>(
         places.push(Mutex::new(place));
         rest = after;
     }
-    each_part(sizes.len(), cancel, |i| {
+    workers::each(sizes.len(), cancel, |i| {
         let mut place = places[i].lock().unwrap_or_else(|e| e.into_inner());
         let n = place.len();
         match descending {
@@ -652,7 +627,7 @@ mod tests {
         }
         const WORDS: usize = PART_NUMBERS / 64;
         let parts = set.words().div_ceil(WORDS);
-        let sizes = each_part(parts, &cancel, |i| Ok(set.count_in(i * WORDS..(i + 1) * WORDS))).unwrap();
+        let sizes = workers::each(parts, &cancel, |i| Ok(set.count_in(i * WORDS..(i + 1) * WORDS))).unwrap();
         assert_eq!(sizes.len(), 5);
         assert_eq!(sizes[1], 0);
         for (count, descending) in [(numbers.len(), false), (numbers.len(), true), (20_000, false), (20_000, true)] {
@@ -670,7 +645,7 @@ mod tests {
             let numbers = order.get(i * PART_NUMBERS..).unwrap_or(&[]);
             numbers.iter().take(PART_NUMBERS).copied().filter(|&n| set.contains(n))
         };
-        let sizes = each_part(order.len().div_ceil(PART_NUMBERS), &cancel, |i| Ok(part(i).count())).unwrap();
+        let sizes = workers::each(order.len().div_ceil(PART_NUMBERS), &cancel, |i| Ok(part(i).count())).unwrap();
         let mut out = Vec::with_capacity(numbers.len());
         gather(&mut out, numbers.len(), &sizes, false, &cancel, part).unwrap();
         assert_eq!(out, numbers.iter().rev().copied().collect::<Vec<_>>());
