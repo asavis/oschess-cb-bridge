@@ -36,6 +36,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
+      # Lists the ci workflow's runs for the tagged commit.
+      actions: read
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -51,6 +53,31 @@ jobs:
             echo "::error::$GITHUB_REF_NAME is not on main: releases are made only from reviewed commits"
             exit 1
           fi
+      - name: CI passed for the tagged commit
+        # ci.yml's run after the merge, the newest if it ran more than once
+        # (a re-run is the same run). A run that has not finished, or has not
+        # started, fails here as a failed one does: once ci has passed,
+        # re-run this workflow's failed jobs (docs/release.md).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          run=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --limit 1 \
+            --json status,conclusion,url --jq '.[] | "\(.status)|\(.conclusion // "")|\(.url)"')
+          if [ -z "$run" ]; then
+            echo "::error::ci has no run for $GITHUB_SHA yet: a release is made only from a commit whose ci run on main passed (docs/release.md)"
+            exit 1
+          fi
+          IFS='|' read -r status conclusion url <<< "$run"
+          if [ "$status" != completed ]; then
+            echo "::error::ci for $GITHUB_SHA has not finished ($status, $url): once it passes, re-run this workflow's failed jobs (docs/release.md)"
+            exit 1
+          fi
+          if [ "$conclusion" != success ]; then
+            echo "::error::ci for $GITHUB_SHA ended in $conclusion, not success ($url): a release is made only from a commit whose ci run on main passed (docs/release.md)"
+            exit 1
+          fi
+          echo "ci passed for $GITHUB_SHA: $url"
       - name: The updater key and its public half agree
         env:
           HAS_UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}

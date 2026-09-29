@@ -9,7 +9,7 @@ publishes the draft.
 |---|---|
 | `oschess-bridge-setup.exe` | The per-user NSIS installer: no administrator, `%LOCALAPPDATA%\oschess bridge`, Ukrainian or English. |
 | `oschess-bridge.exe` | The same app without the installer. |
-| `SHA256SUMS.txt` | The SHA-256 of both; the release notes list them too. |
+| `SHA256SUMS.txt` | The SHA-256 of `oschess-bridge-setup.exe`, `oschess-bridge.exe` and, when it is attached, `oschess-bridge.msix`; the release notes list them too. |
 | `latest.json`, `oschess-bridge-setup.exe.sig` | What installed apps read to update themselves; made only while the updater secret is set (see [The updater key](#the-updater-key)). |
 | `oschess-bridge.msix` | The Microsoft Store package, unsigned, for Partner Center; attached only while the Store identity is set (see [Microsoft Store](#microsoft-store)). |
 
@@ -18,7 +18,8 @@ own-runners rule in [CLAUDE.md](../CLAUDE.md), because SignPath requires every
 job before a signing request to run there. Only a version tag starts it. Its
 jobs, in order:
 
-1. **build**: checks that the tag is on `main`, that it names the version in
+1. **build**: checks that the tag is on `main`, that the `ci` workflow's run
+   for the tagged commit passed, that the tag names the version in
    `crates/app/Cargo.toml`, and that the updater secret and the public key in
    `crates/app/tauri.conf.json` agree. It then builds `oschess-bridge.exe`
    with the Tauri CLI named in the workflow (`TAURI_CLI_VERSION`, the CLI of the
@@ -46,13 +47,21 @@ last, over the installer as users download it.
    a pull request that is reviewed and merged like any other. That version is
    the installer's, the one the updater compares, and the one the tag must
    name.
-2. Tag the merged commit on `main` and push the tag:
+2. Wait until the `ci` run of the merged commit has passed (Actions → ci, or
+   `gh run list -w ci.yml -c <commit>`), then tag that commit on `main` and
+   push the tag:
 
    ```
    git fetch origin main
    git tag -a v0.2.0 -m "oschess bridge 0.2.0" origin/main
    git push origin v0.2.0
    ```
+
+   The build job fails unless the tagged commit's newest `ci` run has
+   passed. Once that run passes, whether it had not started or finished yet,
+   or had failed or been cancelled and was re-run (a queued run is cancelled
+   when a later merge's run takes its place), re-run the release's failed
+   jobs. When `main` needs a fix, delete the tag and tag again as below.
 
 3. Follow the run under Actions → release. With signing on, approve both
    signing requests in SignPath; each job waits an hour for its approval.
