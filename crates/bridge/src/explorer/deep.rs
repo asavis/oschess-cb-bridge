@@ -107,76 +107,106 @@ fn block_point(block: u64) -> u64 {
     block << (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)
 }
 
-/// What a move word does to a structure, from the move table, in 64 bits,
-/// so that a word is played without a branch: the square a pawn leaves
-/// (bits 0-5), the square it reaches (6-11), whether the word names a move
-/// (12), a black one (13), whether a pawn leaves its square (14) and reaches
-/// the other one (15), the square of a pawn it takes (16-21) and whether it
-/// takes one (22), whether the structure changes (23), and the change to the
-/// pieces' counts (32-63, signed): a piece taken, a pawn promoted.
-#[derive(Clone, Copy, Default)]
-struct Effect(u64);
+/// What a move word does to a structure, from the move table, so that a
+/// word is played without a branch: the pawns it takes off their squares or
+/// puts on theirs, white's then black's, which a xor applies; the change to
+/// the pieces' counts, a piece taken or a pawn promoted, which a wrapping add
+/// applies; and whether it may change the structure ([`CHANGED`]) and names
+/// a move of standard chess ([`NAMED`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct Effect {
+    pawns: [u64; 2],
+    pieces: u64,
+    flags: u64,
+}
 
-const MOVE: u64 = 1 << 12;
+/// An [`Effect`] flag: a pawn's move or a capture.
+const CHANGED: u64 = 1;
+/// An [`Effect`] flag: a word that names a move of standard chess.
+const NAMED: u64 = 2;
 
-/// The effect of each word below the Chess960 castlings.
-fn effects() -> &'static [Effect] {
-    static EFFECTS: OnceLock<Vec<Effect>> = OnceLock::new();
-    EFFECTS.get_or_init(|| {
-        let kind = |p: movetable::Piece| match p {
-            movetable::Piece::Knight => 0,
-            movetable::Piece::Bishop => 1,
-            movetable::Piece::Rook => 2,
-            _ => 3,
-        };
-        (0..FIRST_CASTLE_960)
-            .map(|word| match movetable::decode(word) {
-                Some(MoveWord::Normal { color, piece, from, to, captured, promotion }) => {
-                    let (us, them) = match color {
-                        movetable::Color::White => (Color::White, Color::Black),
-                        movetable::Color::Black => (Color::Black, Color::White),
-                    };
-                    let pawn = piece == movetable::Piece::Pawn;
-                    let (from, to) = (u64::from(from & 63), u64::from(to & 63));
-                    // The pawn taken en passant stands beside the one that
-                    // takes it: on the rank it leaves, the file it reaches.
-                    let taken_pawn = match captured {
-                        Captured::Pawn => Some(to),
-                        Captured::EnPassant => Some(from & 56 | to & 7),
-                        _ => None,
-                    };
-                    let taken_piece = match captured {
-                        Captured::Knight => Some(movetable::Piece::Knight),
-                        Captured::Bishop => Some(movetable::Piece::Bishop),
-                        Captured::Rook => Some(movetable::Piece::Rook),
-                        Captured::Queen => Some(movetable::Piece::Queen),
-                        _ => None,
-                    };
-                    let mut delta = 0i64;
-                    if let Some(p) = taken_piece {
-                        delta -= 1 << piece_shift(kind(p), them);
-                    }
-                    if let Some(p) = promotion.filter(|_| pawn) {
-                        delta += 1 << piece_shift(kind(p), us);
-                    }
-                    let changes = pawn || captured != Captured::Nothing;
-                    Effect(
-                        from | to << 6
-                            | MOVE
-                            | u64::from(us == Color::Black) << 13
-                            | u64::from(pawn) << 14
-                            | u64::from(pawn && promotion.is_none()) << 15
-                            | taken_pawn.unwrap_or(0) << 16
-                            | u64::from(taken_pawn.is_some()) << 22
-                            | u64::from(changes) << 23
-                            | (delta as i32 as u32 as u64) << 32,
-                    )
-                }
-                Some(MoveWord::Castle { .. }) => Effect(MOVE),
-                _ => Effect::default(),
-            })
-            .collect()
-    })
+/// Room for the distinct effects of the move table's words, a power of two
+/// so that an index needs no check: its 45,357 words below the Chess960
+/// castlings have 1,282.
+const EFFECTS: usize = 2048;
+
+/// The index of each word's effect among the distinct ones, 0 for a word
+/// that names no move of standard chess, and the effects: two lookups a
+/// word, into tables of 2 bytes a word and 32 an effect of which 131 KB are
+/// in use, which a core's cache holds, where an effect a word would take
+/// 1.4 MB.
+fn effects() -> (&'static [u16; 1 << 16], &'static [Effect; EFFECTS]) {
+    type Tables = (Box<[u16; 1 << 16]>, Box<[Effect; EFFECTS]>);
+    static TABLES: OnceLock<Tables> = OnceLock::new();
+    let (of, effects) = TABLES.get_or_init(|| {
+        let (mut of, mut effects) = (vec![0u16; 1 << 16], vec![Effect::default()]);
+        let mut index = std::collections::HashMap::new();
+        for word in 0..FIRST_CASTLE_960 {
+            if let Some(e) = effect_of(word) {
+                of[usize::from(word)] = *index.entry(e).or_insert_with(|| {
+                    effects.push(e);
+                    effects.len() as u16 - 1
+                });
+            }
+        }
+        assert!(effects.len() <= EFFECTS, "{} effects", effects.len());
+        effects.resize(EFFECTS, Effect::default());
+        let boxed = |v: Vec<u16>| v.into_boxed_slice().try_into().expect("a word's index each");
+        (boxed(of), effects.into_boxed_slice().try_into().expect("room for every effect"))
+    });
+    (of, effects)
+}
+
+/// What `word` does to a structure; `None` when it names no move of standard
+/// chess.
+fn effect_of(word: u16) -> Option<Effect> {
+    let kind = |p: movetable::Piece| match p {
+        movetable::Piece::Knight => 0,
+        movetable::Piece::Bishop => 1,
+        movetable::Piece::Rook => 2,
+        _ => 3,
+    };
+    match movetable::decode(word)? {
+        MoveWord::Normal { color, piece, from, to, captured, promotion } => {
+            let (us, them) = match color {
+                movetable::Color::White => (Color::White, Color::Black),
+                movetable::Color::Black => (Color::Black, Color::White),
+            };
+            let pawn = piece == movetable::Piece::Pawn;
+            let (from, to) = (u64::from(from & 63), u64::from(to & 63));
+            let mut pawns = [0; 2];
+            // A pawn leaves its square, and stands on the other one unless it
+            // becomes a piece there.
+            if pawn {
+                pawns[us.index()] = 1 << from | u64::from(promotion.is_none()) << to;
+            }
+            // The pawn taken en passant stands beside the one that takes it:
+            // on the rank it leaves, the file it reaches.
+            pawns[them.index()] = match captured {
+                Captured::Pawn => 1 << to,
+                Captured::EnPassant => 1 << (from & 56 | to & 7),
+                _ => 0,
+            };
+            let taken_piece = match captured {
+                Captured::Knight => Some(movetable::Piece::Knight),
+                Captured::Bishop => Some(movetable::Piece::Bishop),
+                Captured::Rook => Some(movetable::Piece::Rook),
+                Captured::Queen => Some(movetable::Piece::Queen),
+                _ => None,
+            };
+            let mut delta = 0i64;
+            if let Some(p) = taken_piece {
+                delta -= 1 << piece_shift(kind(p), them);
+            }
+            if let Some(p) = promotion.filter(|_| pawn) {
+                delta += 1 << piece_shift(kind(p), us);
+            }
+            let changes = pawn || captured != Captured::Nothing;
+            Some(Effect { pawns, pieces: delta as u64, flags: NAMED | if changes { CHANGED } else { 0 } })
+        }
+        MoveWord::Castle { .. } => Some(Effect { flags: NAMED, ..Effect::default() }),
+        _ => None,
+    }
 }
 
 /// The words a line's replay plays at a time past the tree's plies, noting
@@ -195,11 +225,12 @@ struct Change {
 /// hashes them. A word names the piece it moves, what it takes and what a
 /// pawn becomes, and the stream's words were checked when it was written, so
 /// no board is needed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Tracker {
     pawns: [u64; 2],
     pieces: u64,
-    effects: &'static [Effect],
+    of: &'static [u16; 1 << 16],
+    effects: &'static [Effect; EFFECTS],
 }
 
 impl PartialEq for Tracker {
@@ -208,9 +239,9 @@ impl PartialEq for Tracker {
     }
 }
 
-impl std::fmt::Debug for Effect {
+impl std::fmt::Debug for Tracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Effect({:#x})", self.0)
+        f.debug_struct("Tracker").field("pawns", &self.pawns).field("pieces", &self.pieces).finish()
     }
 }
 
@@ -223,7 +254,14 @@ impl Tracker {
             }
         }
         let pawns = |color| board.colored(Piece::Pawn, color);
-        Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, effects: effects() }
+        let (of, effects) = effects();
+        Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, of, effects }
+    }
+
+    /// The effect of `word`.
+    #[inline(always)]
+    fn effect(&self, word: u16) -> &'static Effect {
+        &self.effects[usize::from(self.of[usize::from(word)]) & (EFFECTS - 1)]
     }
 
     /// Plays `word`: whether the structure may have changed, which only a
@@ -231,12 +269,12 @@ impl Tracker {
     /// of standard chess.
     #[inline]
     pub fn play(&mut self, word: u16) -> Option<bool> {
-        let e = self.effects.get(usize::from(word))?.0;
-        if e & MOVE == 0 {
+        let e = self.effect(word);
+        if e.flags & NAMED == 0 {
             return None;
         }
         self.apply(e);
-        Some(e >> 23 & 1 != 0)
+        Some(e.flags & CHANGED != 0)
     }
 
     /// Plays `words` and notes in `changes` the parts of the structure after
@@ -245,34 +283,26 @@ impl Tracker {
     /// changes noted; `None` when a word names no move of standard chess.
     #[inline]
     fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut [Change; CHANGES]) -> Option<usize> {
-        let (mut noted, mut named) = (0, MOVE);
+        let (mut noted, mut named) = (0, NAMED);
         for w in words.iter().take(CHANGES) {
-            let e = self.effects.get(usize::from(u16::from_le_bytes(*w))).map_or(0, |e| e.0);
-            named &= e;
+            let e = self.effect(u16::from_le_bytes(*w));
+            named &= e.flags;
             self.apply(e);
-            if let Some(c) = changes.get_mut(noted) {
-                *c = Change { pawns: self.pawns, pieces: self.pieces };
-            }
-            noted += (e >> 23 & 1) as usize;
+            // No more noted than words played, so within `changes`.
+            changes[noted & (CHANGES - 1)] = Change { pawns: self.pawns, pieces: self.pieces };
+            noted += (e.flags & CHANGED) as usize;
         }
-        (named & MOVE != 0).then_some(noted)
+        (named & NAMED != 0).then_some(noted)
     }
 
-    /// Plays effect `e`, as [`Tracker::play`] does.
+    /// Plays effect `e`, as [`Tracker::play`] does: a pawn leaves a square it
+    /// stands on and reaches one no pawn of its side stands on, and one taken
+    /// stood where it is taken, as the words were checked.
     #[inline(always)]
-    fn apply(&mut self, e: u64) {
-        // Both sides' pawns at once, without a branch or an index, so that
-        // they stay in registers: all ones in `black` when black moves.
-        let black = (e >> 13 & 1).wrapping_neg();
-        let taken = (e >> 22 & 1) << (e >> 16 & 63);
-        let left = (e >> 14 & 1) << (e & 63);
-        let reached = (e >> 15 & 1) << (e >> 6 & 63);
-        let [white_pawns, black_pawns] = self.pawns;
-        self.pawns = [
-            white_pawns & !(left & !black | taken & black) | reached & !black,
-            black_pawns & !(left & black | taken & !black) | reached & black,
-        ];
-        self.pieces = self.pieces.wrapping_add((e >> 32) as u32 as i32 as i64 as u64);
+    fn apply(&mut self, e: &Effect) {
+        self.pawns[0] ^= e.pawns[0];
+        self.pawns[1] ^= e.pawns[1];
+        self.pieces = self.pieces.wrapping_add(e.pieces);
     }
 
     pub fn structure(&self) -> u64 {
@@ -1040,6 +1070,21 @@ mod tests {
         assert_eq!(Tracker::of(&Board::startpos()).play(0), None, "word 0 names no move");
         assert_eq!(Tracker::of(&Board::startpos()).play(movetable::NULL_MOVE), None);
         assert_eq!(Tracker::of(&Board::startpos()).play(FIRST_CASTLE_960), None);
+    }
+
+    /// Each word's effect is looked up as it is made from the word, and a
+    /// word that names no move of standard chess, a Chess960 castling among
+    /// them, looks up none.
+    #[test]
+    fn each_word_looks_up_its_effect() {
+        let tracker = Tracker::of(&Board::startpos());
+        let mut named = 0;
+        for word in 0..=u16::MAX {
+            let made = if word < FIRST_CASTLE_960 { effect_of(word) } else { None };
+            named += usize::from(made.is_some());
+            assert_eq!(made.unwrap_or_default(), *tracker.effect(word), "{word:#x}");
+        }
+        assert!(named > 40_000, "{named}");
     }
 
     /// Words played a run at a time note the parts after each word that may

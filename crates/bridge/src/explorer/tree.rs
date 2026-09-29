@@ -69,13 +69,13 @@ pub const WORKER_BYTES: usize = BLOCK_KEYS * KEY_ENTRY + MAX_BLOCK_DATA + 2 * OU
 /// What a move word does to a position's key, from the move table, in 16
 /// bytes, one lookup a ply: the key's change (the piece off its square and
 /// onto the other, the piece taken, a pawn promoted, the rook of a castling,
-/// and the side to move); the pawns it moves and takes, as the deep section's
-/// [`deep::Tracker`] has them: the square a pawn leaves (bits 0-5), the
-/// square it reaches (6-11), the square of a pawn taken (12-17), whether each
-/// is so (18-20), and whether black moves (21); the move as the index packs
-/// it, [`NO_MOVE`] for a word that names no move of standard chess; the
-/// castling rights the move ends ([`Keys::rights`]); and the square a pawn
-/// steps two squares to, plus one, else 0.
+/// and the side to move); the pawns it moves and takes, which the deep
+/// section's [`deep::Tracker`] follows too: the square a pawn leaves (bits
+/// 0-5), the square it reaches (6-11), the square of a pawn taken (12-17),
+/// whether each is so (18-20), and whether black moves (21); the move as the
+/// index packs it, [`NO_MOVE`] for a word that names no move of standard
+/// chess; the castling rights the move ends ([`Keys::rights`]); and the
+/// square a pawn steps two squares to, plus one, else 0.
 ///
 /// [`deep::Tracker`]: super::deep::Tracker
 #[derive(Clone, Copy, Default)]
