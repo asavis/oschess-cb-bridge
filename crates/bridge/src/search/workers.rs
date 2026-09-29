@@ -266,29 +266,38 @@ pub fn each<T: Send>(
 
 /// Items a sorting worker takes at least; fewer are sorted on one thread.
 const SORT_PART_MIN: usize = 1 << 15;
+/// Items a chunk of a sort holds at most, whatever the number of workers:
+/// a sort looks whether it was superseded between chunks, so that one worker
+/// never sorts a long list whole before it looks.
+const SORT_CHUNK_MAX: usize = 1 << 18;
 
 /// Sorts `items` by `cmp` on the workers, with a second buffer as long as
-/// `items`, which the caller holds in the budget: each worker sorts a chunk,
+/// `items`, which the caller holds in the budget: the workers sort it in
+/// chunks, at least one for each and at most [`SORT_CHUNK_MAX`] items each,
 /// and the sorted chunks merge into the second buffer ([`merge_ranges`]),
 /// which becomes `items`. Items that `cmp` calls equal come in any order.
-/// `Superseded` once `cancel` is: the workers look before each chunk they
-/// sort and as they merge, and a sort small enough for one thread looks once
-/// it is done.
+/// `Superseded` once `cancel` is: a sort looks before it starts, the workers
+/// before each chunk they sort and as they merge, and a sort of one chunk,
+/// which the calling thread sorts, once it is done.
 pub fn sort_by<T, F>(items: &mut Vec<T>, cmp: &F, cancel: &Cancel) -> Result<(), SearchError>
 where
     T: Copy + Send + Sync,
     F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
 {
+    if cancel.is_cancelled() {
+        return Err(SearchError::Superseded);
+    }
     let n = items.len();
     let parts = threads().min(n / SORT_PART_MIN).max(1);
-    if parts == 1 {
+    let count = parts.max(n.div_ceil(SORT_CHUNK_MAX));
+    if count == 1 {
         items.sort_unstable_by(cmp);
         return match cancel.is_cancelled() {
             true => Err(SearchError::Superseded),
             false => Ok(()),
         };
     }
-    let per = n.div_ceil(parts);
+    let per = n.div_ceil(count);
     let chunks: Vec<Mutex<Option<&mut [T]>>> = items.chunks_mut(per).map(|c| Mutex::new(Some(c))).collect();
     each(chunks.len(), cancel, |k| {
         if let Some(chunk) = chunks[k].lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -477,6 +486,69 @@ mod tests {
             let mut items: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
             assert!(matches!(sort_by(&mut items, &cmp, &cancel), Err(SearchError::Superseded)), "{n} items");
         }
+    }
+
+    /// Whether this is the child that runs the test `name` of this binary.
+    /// The parent runs it in a child process with one worker, which
+    /// [`threads`] reads once a process, whatever the computer's processors,
+    /// and checks it passed.
+    fn in_child_with_one_worker(name: &str) -> bool {
+        const CHILD: &str = "BRIDGE_WORKERS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("OSCHESS_BRIDGE_THREADS", "1")
+            .output()
+            .unwrap();
+        let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        false
+    }
+
+    /// A long sort on one worker stops once superseded, before it starts or
+    /// while it runs, instead of sorting the whole list first (review of
+    /// #220): it sorts a chunk at a time and looks between them. Counted by
+    /// its comparisons.
+    #[test]
+    fn a_long_sort_on_one_worker_stops_once_superseded() {
+        if !in_child_with_one_worker("search::workers::tests::a_long_sort_on_one_worker_stops_once_superseded") {
+            return;
+        }
+        assert_eq!(threads(), 1);
+        let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let numbers: Vec<u64> = (0..1_000_003u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
+        // A sort of the numbers that a newer search supersedes at its
+        // comparison `at`, before it starts at 0, or never: what it answered,
+        // how many comparisons it made, and the numbers as it left them.
+        let sort = |at: Option<usize>| {
+            let cancel = Cancel::newest(&latest);
+            if at == Some(0) {
+                Cancel::newest(&latest);
+            }
+            let compared = AtomicUsize::new(0);
+            let cmp = |a: &u64, b: &u64| {
+                if Some(compared.fetch_add(1, Ordering::Relaxed) + 1) == at {
+                    Cancel::newest(&latest);
+                }
+                a.cmp(b)
+            };
+            let mut items = numbers.clone();
+            let got = sort_by(&mut items, &cmp, &cancel);
+            (got, compared.into_inner(), items)
+        };
+        let (got, whole, items) = sort(None);
+        let mut want = numbers.clone();
+        want.sort_unstable();
+        assert!(got.is_ok() && items == want, "not superseded, it sorts them all");
+        let (got, early, _) = sort(Some(101));
+        assert!(matches!(got, Err(SearchError::Superseded)));
+        // The chunk it was sorting, one of four, and nothing after.
+        assert!(early < whole / 3, "{early} of {whole} comparisons");
+        let (got, before, _) = sort(Some(0));
+        assert!(matches!(got, Err(SearchError::Superseded)) && before == 0, "{before} comparisons");
     }
 
     #[test]
