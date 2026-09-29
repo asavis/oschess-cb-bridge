@@ -112,15 +112,7 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     let first_run = !token::exists(dir);
     let config =
         config::load(&dir.join("bridge.toml")).map_err(|e| Failed { shown: e.to_string(), logged: e.logged() })?;
-    let mut origins: Vec<String> = DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect();
-    origins.extend(config.origins);
-    let web = config.web.trim_end_matches('/');
-    if !origins.iter().any(|o| o == web) {
-        return Err(Failed {
-            shown: format!("web = \"{}\" in bridge.toml is not an allowed origin", config.web),
-            logged: "web in bridge.toml is not an allowed origin".into(),
-        });
-    }
+    let (origins, web) = allowed(&config)?;
     // The port first: a second instance stops here, before it could replace the
     // token the running one still accepts.
     let listeners = server::bind(config.port).map_err(|e| Failed::plain(format!("port {}: {e}", config.port)))?;
@@ -158,6 +150,53 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     app.catalog.explorer.set_dir(index);
     app.catalog.sweep_indexes();
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
+}
+
+/// The origins the bridge serves under `config`, oschess's own first, and the
+/// site its pairing link opens: `web` without a trailing slash, which must be
+/// one of them, since the link carries the token there. The one rule for a
+/// start and for a pairing read without one (#183).
+fn allowed(config: &config::Config) -> Result<(Vec<String>, &str), Failed> {
+    let mut origins: Vec<String> = DEFAULT_ORIGINS.iter().map(|o| o.to_string()).collect();
+    origins.extend(config.origins.iter().cloned());
+    let web = config.web.trim_end_matches('/');
+    if !origins.iter().any(|o| o == web) {
+        return Err(Failed {
+            shown: format!("web = \"{}\" in bridge.toml is not an allowed origin", config.web),
+            logged: "web in bridge.toml is not an allowed origin".into(),
+        });
+    }
+    Ok((origins, web))
+}
+
+/// What a browser pairs with: the token, and the pairing link that carries
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pairing {
+    pub token: String,
+    /// It contains the token: it is shown only on request and never logged.
+    pub link: String,
+}
+
+/// The pairing of the bridge whose data folder is `dir`, read while it does
+/// not serve: the stored token and the link a start would make with it. A
+/// site that is not an allowed origin gets no link, as a start refuses it.
+/// The token is never created here: the start that creates it is the first
+/// run (#183).
+pub fn pairing(dir: &Path) -> Result<Pairing, String> {
+    let config = config::load_or_create(&dir.join("bridge.toml"))?;
+    let (_, web) = allowed(&config).map_err(|f| f.shown)?;
+    let token = token::load(dir)
+        .map_err(|e| format!("pairing token in {}: {e}", dir.display()))?
+        .ok_or("no pairing token yet: the bridge makes it when it first starts")?;
+    Ok(Pairing { link: pairing::link(web, &token, config.port), token })
+}
+
+/// The oschess site the pairing link of the bridge in `dir` opens, under the
+/// rule of [`pairing`], for a page that carries no token.
+pub fn site(dir: &Path) -> Result<String, String> {
+    let config = config::load_or_create(&dir.join("bridge.toml"))?;
+    allowed(&config).map(|(_, web)| web.to_string()).map_err(|f| f.shown)
 }
 
 /// The message for an option error: the error, then how to call `program`.
@@ -262,6 +301,41 @@ mod tests {
         let e = prepare(&dir, &Options::default()).err().unwrap();
         assert!(e.contains("not an allowed origin"), "{e}");
         assert!(!token::exists(&dir), "a refused start creates no token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read without a start, the pairing is the one the start makes, and a
+    /// read before the first start creates no token: the start after it is
+    /// still the first run (#183).
+    #[test]
+    fn the_pairing_read_without_a_start_is_the_starts() {
+        let _log = log::testing::hold();
+        let dir = folder("pairing", Some("https://staging.oschess.org/"));
+        let e = pairing(&dir).err().unwrap();
+        assert!(e.starts_with("no pairing token yet"), "{e}");
+        assert!(!token::exists(&dir), "reading the pairing creates no token");
+        assert_eq!(site(&dir).unwrap(), "https://staging.oschess.org");
+        let bridge = prepare(&dir, &Options::default()).unwrap();
+        assert!(bridge.first_run);
+        assert!(bridge.link.starts_with("https://staging.oschess.org/library?"));
+        assert_eq!(pairing(&dir).unwrap(), Pairing { token: bridge.token.clone(), link: bridge.link.clone() });
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A site the start refuses gets no pairing link, even with a token
+    /// stored, nor is it the site of a page without one (#183).
+    #[test]
+    fn a_refused_site_gets_no_pairing_link() {
+        let dir = folder("pairing-foreign", Some("file:///C:/Windows/"));
+        let e = pairing(&dir).err().unwrap();
+        assert!(e.contains("not an allowed origin"), "{e}");
+        assert!(!token::exists(&dir), "a refused read creates no token");
+        token::replace(&dir).unwrap();
+        let e = pairing(&dir).err().unwrap();
+        assert!(e.contains("not an allowed origin"), "{e}");
+        let e = site(&dir).err().unwrap();
+        assert!(e.contains("not an allowed origin"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

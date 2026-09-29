@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bridge::config::{self, DEFAULT_PORT};
 use bridge::snapshot::Background;
 use bridge::start::{self, Options};
-use bridge::{pairing, server, token};
+use bridge::{pairing, server};
 
 use crate::i18n::Strings;
 use crate::status::{Problem, View};
@@ -107,23 +107,23 @@ impl Shared {
         *self.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
     }
 
-    /// The pairing code and link: the serving bridge's, else the stored ones.
+    /// The pairing code and link: the serving bridge's, else the stored ones
+    /// under the rule of a start (#183): none for a site that is not an
+    /// allowed origin, and none before a start created the code.
     pub fn pairing(&self) -> Result<Pairing, String> {
         if let Some(r) = &self.running {
             return Ok(Pairing { code: r.token.clone(), link: r.link.clone() });
         }
-        let dir = self.dir()?;
-        let config = config::load_or_create(&dir.join("bridge.toml"))?;
-        let code = token::load_or_create(&dir).map_err(|e| e.to_string())?;
-        let link = pairing::link(&config.web, &code, config.port);
-        Ok(Pairing { code, link })
+        let pairing = start::pairing(&self.dir()?)?;
+        Ok(Pairing { code: pairing.token, link: pairing.link })
     }
 
     /// The oschess page the bridge's section is on, without the pairing
-    /// fragment, for when the pairing cannot be read.
+    /// fragment, for when the pairing cannot be read: on the site of
+    /// `bridge.toml` when it is an allowed origin, else on oschess.org.
     pub fn section_url(&self) -> String {
-        let config = self.config_path().and_then(|path| config::load_or_create(&path));
-        pairing::section(config.as_ref().map_or(pairing::DEFAULT_WEB, |c| c.web.as_str()))
+        let site = self.dir().and_then(|dir| start::site(&dir));
+        pairing::section(site.as_deref().unwrap_or(pairing::DEFAULT_WEB))
     }
 
     pub fn dir(&self) -> Result<PathBuf, String> {

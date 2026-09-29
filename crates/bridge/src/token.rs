@@ -54,10 +54,19 @@ pub fn exists(dir: &Path) -> bool {
 
 /// The token stored in `dir`, created on first use.
 pub fn load_or_create(dir: &Path) -> io::Result<String> {
+    match load(dir)? {
+        Some(token) => Ok(token),
+        None => replace(dir),
+    }
+}
+
+/// The token stored in `dir`, or `None` when there is none yet. It never
+/// creates one: that is left to the bridge's first start (#183).
+pub fn load(dir: &Path) -> io::Result<Option<String>> {
     match std::fs::read_to_string(dir.join(TOKEN_FILE)) {
-        Ok(text) if is_valid(text.trim()) => Ok(text.trim().to_string()),
+        Ok(text) if is_valid(text.trim()) => Ok(Some(text.trim().to_string())),
         Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "the stored pairing token is malformed")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => replace(dir),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -125,9 +134,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-token-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!exists(&dir));
+        assert_eq!(load(&dir).unwrap(), None);
+        assert!(!exists(&dir), "reading creates no token");
         let first = load_or_create(&dir).unwrap();
         assert!(exists(&dir));
         assert!(is_valid(&first));
+        assert_eq!(load(&dir).unwrap().as_deref(), Some(first.as_str()));
         assert_eq!(load_or_create(&dir).unwrap(), first);
         let second = replace(&dir).unwrap();
         assert_ne!(second, first);
@@ -143,6 +155,7 @@ mod tests {
         }
         std::fs::write(dir.join(TOKEN_FILE), "short").unwrap();
         assert!(load_or_create(&dir).is_err());
+        assert!(load(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
