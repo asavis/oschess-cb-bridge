@@ -497,10 +497,7 @@ impl Pass<'_> {
         for w in prefix {
             line.play(u16::from_le_bytes(*w)).ok_or_else(word)?;
         }
-        // The pass's points as far as it reached when the line began: `hi`
-        // only comes down, and each posting found is looked at again as it
-        // is kept.
-        let span = self.hi.load(Ordering::Relaxed).saturating_sub(self.lo);
+        let within = Within::of(self.lo, self.hi.load(Ordering::Relaxed), self.bits, game);
         let mut held = line.structure();
         let mut replayed = Replayed::default();
         for words in past.chunks(CHANGES) {
@@ -508,12 +505,12 @@ impl Pass<'_> {
             for c in &kept.changes[..noted] {
                 let s = structure_of(c.pawns[0], c.pawns[1], c.pieces);
                 if s != held {
-                    self.find(held, game, span, &mut replayed, &mut kept.found);
+                    find(held, &within, &mut replayed, &mut kept.found);
                     held = s;
                 }
             }
         }
-        self.find(held, game, span, &mut replayed, &mut kept.found);
+        find(held, &within, &mut replayed, &mut kept.found);
         kept.rest += u64::from(replayed.prints.count_ones());
         for i in 0..replayed.found {
             let p = kept.found[i];
@@ -529,29 +526,69 @@ impl Pass<'_> {
         }
         Ok(())
     }
+}
 
-    /// Notes game `game`'s posting of `structure` in `found` when it lies in
-    /// the pass's `span` of points from `lo`: the line's first
-    /// [`MAX_STRUCTURES`] structures, as the walk kept them, without a
-    /// branch on where the structure's bucket lies, which is unpredictable.
-    /// One of the pass's first bucket is counted, once per print, wherever
-    /// the pass ends.
-    #[inline(always)]
-    fn find(&self, structure: u64, game: u32, span: u64, replayed: &mut Replayed, found: &mut [u64; MAX_STRUCTURES]) {
-        if replayed.structures >= MAX_STRUCTURES {
-            return;
-        }
-        replayed.structures += 1;
-        let at = u64::from(deep_bucket(structure, self.bits)) << GAME_BITS | u64::from(game);
-        if at >> GAME_BITS == self.lo >> GAME_BITS && at >= self.lo {
-            replayed.prints |= 1u128 << deep_print(structure, self.bits);
-        }
-        // Fewer found than structures, so within `found`.
-        if let Some(f) = found.get_mut(replayed.found) {
-            *f = posting(structure, self.bits, game, true);
-        }
-        replayed.found += usize::from(at.wrapping_sub(self.lo) < span);
+/// The buckets whose point of a game lies in a pass: those from `first` on,
+/// `span` of them; the pass's first bucket, when the game's point there
+/// counts ([`Pass::rest`]), else none; the game as a posting holds it; and
+/// the shift that takes a structure's bucket and print.
+struct Within {
+    first: u64,
+    span: u64,
+    counted: u64,
+    game: u64,
+    shift: u32,
+}
+
+impl Within {
+    /// The buckets of `bits` bits whose point of game `game` lies from `lo`
+    /// on and before `hi`: the pass as far as it reached when the game's line
+    /// began, as `hi` only comes down, and each posting found is looked at
+    /// again as it is kept.
+    fn of(lo: u64, hi: u64, bits: u8, game: u32) -> Within {
+        let g = u64::from(game);
+        let (lo_game, hi_game) = (lo & ((1 << GAME_BITS) - 1), hi & ((1 << GAME_BITS) - 1));
+        // A point `bucket << GAME_BITS | g` is at `lo` or past it when the
+        // bucket is past `lo`'s, or `lo`'s with `g` at `lo`'s game or past
+        // it; likewise before `hi`.
+        let first = (lo >> GAME_BITS) + u64::from(g < lo_game);
+        let end = (hi >> GAME_BITS) + u64::from(g < hi_game);
+        let counted = if g >= lo_game { lo >> GAME_BITS } else { u64::MAX };
+        let shift = 64 - u32::from(bits) - u32::from(PRINT_BITS);
+        Within { first, span: end.saturating_sub(first), counted, game: g << 8, shift }
     }
+}
+
+/// Notes a line's posting of `structure` in `found` when it lies `within`
+/// the pass: the line's first [`MAX_STRUCTURES`] structures, as the walk kept
+/// them, without a branch on where the structure's bucket lies, which is
+/// unpredictable. One of the pass's first bucket is counted, once per print,
+/// wherever the pass ends.
+#[inline(always)]
+fn find(structure: u64, within: &Within, replayed: &mut Replayed, found: &mut [u64; MAX_STRUCTURES]) {
+    if replayed.structures >= MAX_STRUCTURES {
+        return;
+    }
+    replayed.structures += 1;
+    // The structure's bucket, then its print, as [`posting`] takes them.
+    let x = structure >> within.shift;
+    let (bucket, print) = (x >> PRINT_BITS, x & ((1 << PRINT_BITS) - 1));
+    if bucket == within.counted {
+        count_print(replayed, print);
+    }
+    // Fewer found than structures, so within `found`; beyond the tree's
+    // plies, as [`posting`] marks it.
+    if let Some(f) = found.get_mut(replayed.found) {
+        *f = bucket << 40 | within.game | print << 1;
+    }
+    replayed.found += usize::from(bucket.wrapping_sub(within.first) < within.span);
+}
+
+/// Counts `print` among the prints of a line's structures in the pass's
+/// first bucket, which few lines hold.
+#[cold]
+fn count_print(replayed: &mut Replayed, print: u64) {
+    replayed.prints |= 1 << print;
 }
 
 /// Makes room in `buf`, a worker's full buffer of `cap` postings in a pass of
@@ -965,6 +1002,49 @@ mod tests {
         // One game of 64 prints, in a buffer smaller than a worker's least.
         let mut one: Vec<u64> = (0..64).map(|print| posting(structure_in(bits, 256, print), bits, 7, true)).collect();
         assert!(matches!(make_room(&mut one, 64, at(256, 7), &hi), Err(SearchError::TooLarge)));
+    }
+
+    /// A line's structures are found in a pass as their points say: from
+    /// `lo` on and before `hi`, either of which may lie inside a bucket, each
+    /// as [`posting`] makes it, and those of the pass's first bucket from
+    /// `lo` on counted once per print.
+    #[test]
+    fn a_line_finds_the_postings_that_lie_in_the_pass() {
+        let bits = 10;
+        let at = |bucket: u64, game: u64| bucket << GAME_BITS | game;
+        let passes = [
+            (at(0, 0), at(1 << bits, 0)),
+            (at(300, 0), at(301, 0)),
+            (at(300, 50), at(300, 70)),
+            (at(300, 50), at(302, 60)),
+            (at(299, 1), at(1 << bits, 0)),
+        ];
+        let mut found = [0; MAX_STRUCTURES];
+        let (mut kept, mut counted) = (0, 0);
+        for (lo, hi) in passes {
+            for bucket in [0, 1, 298, 299, 300, 301, 302, 303, (1 << bits) - 1] {
+                for game in [1, 49, 50, 51, 59, 60, 61, 69, 70, 71, 1_000_000] {
+                    for print in [0, 1, 126, 127] {
+                        let structure = structure_in(bits, bucket, print) | 0x1234_5678 >> bits;
+                        let mut replayed = Replayed::default();
+                        find(structure, &Within::of(lo, hi, bits, game as u32), &mut replayed, &mut found);
+                        let point = at(bucket, game);
+                        let first = point >> GAME_BITS == lo >> GAME_BITS && point >= lo;
+                        let what = format!("bucket {bucket} game {game} print {print} in {lo:#x}..{hi:#x}");
+                        assert_eq!(replayed.found, usize::from((lo..hi).contains(&point)), "{what}");
+                        assert_eq!(found[0], posting(structure, bits, game as u32, true), "{what}");
+                        assert_eq!(replayed.prints, u128::from(first) << print, "{what}");
+                        kept += replayed.found;
+                        counted += usize::from(first);
+                    }
+                }
+            }
+        }
+        assert!(kept > 100 && counted > 20, "{kept} {counted}");
+        // A line's structures past the most the walk kept are not found.
+        let mut replayed = Replayed { structures: MAX_STRUCTURES, ..Replayed::default() };
+        find(structure_in(bits, 5, 0), &Within::of(0, at(1 << bits, 0), bits, 1), &mut replayed, &mut found);
+        assert_eq!((replayed.found, replayed.structures), (0, MAX_STRUCTURES));
     }
 
     /// A crowded bucket is handed over in pieces as it is put, none of which
