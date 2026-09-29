@@ -579,6 +579,39 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A superseded request gets `409 superseded` even when its result is kept:
+/// the kept result would answer before any game is looked at, and so before
+/// any other check could stop it (#148).
+#[test]
+fn a_superseded_request_is_not_answered_from_kept_results() {
+    let games = games();
+    let db = database("positions-streams-kept", &games);
+    let dir = index_dir("streams-kept");
+    let path = db.dir().join("db.2cbh");
+    let app = App::new("test", policy(), Catalog::new([path.clone()]));
+    app.catalog.use_data_dir(&dir);
+    let (port, app) = serve_shared(app);
+    let id = id_of(&path);
+    let d4 = board_after("d2d4").fen();
+    // The result of 1.d4, in the default order, kept.
+    answered(port, &list(&id, &d4, ""));
+    let indexes = app.catalog.get(&id).unwrap().open().unwrap().indexes;
+    let held = indexes.gate().hold(1);
+    let older = {
+        let path = list(&id, &d4, "&stream=tab");
+        std::thread::spawn(move || get(port, &path))
+    };
+    assert!(held.arrived(1, Duration::from_secs(30)));
+    let (status, body) = get(port, &list(&id, &board_after("e2e4").fen(), "&stream=tab"));
+    assert_eq!(status, 200, "{body}");
+    drop(held);
+    let (status, body) = older.join().unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(r#""code":"superseded""#), "{body}");
+    app.catalog.explorer.release();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Where record `n`'s slot is in the move stream `bytes`: in its block, which
 /// the table at the file's end places.
 fn slot_at(bytes: &[u8], n: u32) -> usize {

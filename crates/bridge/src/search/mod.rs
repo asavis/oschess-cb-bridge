@@ -366,6 +366,12 @@ fn select_in<S: Store>(
         .find(|k| k.query == key && k.position == at)
         .map(|k| (k.numbers.clone(), k.games));
     if let Some((numbers, games)) = kept {
+        // A kept result answers at once, but not a request a newer one in its
+        // stream has superseded meanwhile: that one gets `409 superseded`
+        // whether or not its result was kept (#148).
+        if cancel.is_cancelled() {
+            return Err(SearchError::Superseded);
+        }
         return Ok((Selection::Numbers(numbers), sort, games));
     }
     let members = position.map(|p| p.games(&cancel)).transpose()?;
