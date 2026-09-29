@@ -87,6 +87,8 @@ const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 
 const BARE_KINGS: &str = "7k/8/8/8/8/8/8/K7 w - - 0 1";
 /// How long the flows wait for the index built unasked, with `--background`.
 const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
+/// How long a bridge is given to finish writing its files before it ends.
+const WRITES_WAIT: Duration = Duration::from_secs(60);
 
 struct Options {
     db: PathBuf,
@@ -592,6 +594,13 @@ fn fresh(dir: &Path) -> bool {
     }
 }
 
+/// Whether a file is being written in the index folder `dir`: every index,
+/// heads and names file is written as a partial file, renamed once whole.
+fn writing(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".partial")))
+}
+
 pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let o = options(args)?;
     if !fresh(&o.index) {
@@ -613,16 +622,16 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let searches = p.searches(&mut served, player);
     p.pgn(&mut served)?;
     p.index(&mut served, launched, records);
-    drop(served);
 
-    // New bridges, their caches empty, on the files the first one wrote.
-    let mut again = p.new_bridge()?;
+    // New bridges, their caches empty, on the files the ones before wrote:
+    // each replaces the one before (#191).
+    let mut again = p.new_bridge(served)?;
     p.with_heads(&mut again, &searches);
-    p.with_names(&searches)?;
+    let mut last = p.with_names(again, &searches)?;
     if p.o.engine.is_some() {
-        p.engines(&mut again)?;
+        last = p.engines(last)?;
     }
-    p.http(&mut again);
+    p.http(&mut last);
     Ok(!p.table.failed)
 }
 
@@ -657,10 +666,27 @@ fn cold_then_cached(c: &mut Client, path: &str) -> (Samples, Option<Vec<u8>>, Sa
 }
 
 impl Profile {
-    /// A new bridge that builds no index unasked: its caches empty, and the
-    /// index folder holding what the bridges before it wrote.
-    fn respawn(&self) -> AnyResult<Served> {
+    /// A new bridge in place of `before`, which ends first: one that builds
+    /// no index unasked, its caches empty, and the index folder holding what
+    /// the bridges before it wrote.
+    fn respawn(&self, before: Served) -> AnyResult<Served> {
+        self.end(before);
         spawn(&self.o, false)
+    }
+
+    /// Ends `bridge` once it has written its files, as its index builds and
+    /// the name tables it read write them, waiting [`WRITES_WAIT`] at most
+    /// (#191). Every bridge keeps its indexes in the `--index` folder and
+    /// sweeps it as it starts, of the partial files that only the process
+    /// writing them can tell from abandoned ones: one bridge runs at a time,
+    /// and the next one finds the files whole.
+    fn end(&self, bridge: Served) {
+        let dirs = [self.index_folder(), folders::pgn_dir(&self.o.index)];
+        let waited = Instant::now();
+        while dirs.iter().any(|d| writing(d)) && waited.elapsed() < WRITES_WAIT {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(bridge);
     }
 
     /// The position `fen` in the explorer.
@@ -956,11 +982,12 @@ impl Profile {
         self.table.row("index", "notable games' rows", &mut rows, &counts);
     }
 
-    /// A new bridge, once the first has ended, timed to its first answer
-    /// from the position index the first one built.
-    fn new_bridge(&mut self) -> AnyResult<Served> {
+    /// A new bridge in place of the `first`, timed from once the first has
+    /// ended to its first answer from the position index the first one built.
+    fn new_bridge(&mut self, first: Served) -> AnyResult<Served> {
+        self.end(first);
         let t = Instant::now();
-        let mut again = self.respawn()?;
+        let mut again = spawn(&self.o, false)?;
         let mut open = Samples::default();
         open.get(&mut again.c, &self.explorer(START_FEN), true);
         let took = ms(t.elapsed());
@@ -990,10 +1017,11 @@ impl Profile {
         }
     }
 
-    /// The names files (#108): the second bridge wrote its name tables beside
-    /// the heads file. New bridges read them from there for their first sort
-    /// by white, suggestion and player search.
-    fn with_names(&mut self, searches: &[(&str, String)]) -> AnyResult<()> {
+    /// The names files (#108): the second bridge, `again`, wrote its name
+    /// tables beside the heads file. The bridges that replace it read them
+    /// from there for their first sort by white, suggestion and player
+    /// search. The last of them.
+    fn with_names(&mut self, again: Served, searches: &[(&str, String)]) -> AnyResult<Served> {
         let heads = heads::path(&self.index_folder(), &self.id);
         let names: Vec<PathBuf> = ["players", "tournaments"].iter().map(|k| heads.with_extension(k)).collect();
         let waited = Instant::now();
@@ -1001,34 +1029,35 @@ impl Profile {
             std::thread::sleep(Duration::from_millis(100));
         }
         let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
-        let mut third = self.respawn()?;
+        let mut third = self.respawn(again)?;
         for key in ["white", "tournament"] {
             let path = format!("{}/games?sort={key}&limit=500", self.base);
             self.cold(&mut third, "sort+names", &format!("{key} cold"), &path, have);
         }
-        let mut fourth = self.respawn()?;
+        let mut fourth = self.respawn(third)?;
         let path = format!("{}/suggest?field=player&prefix=m", self.base);
         self.cold(&mut fourth, "suggest+names", "player, first after start", &path, have);
-        if let Some((_, q)) = searches.iter().find(|(name, _)| *name == "player") {
-            let mut fifth = self.respawn()?;
-            let path = format!("{}/games?limit=500&q={}", self.base, encode(q));
-            self.cold(&mut fifth, "search+names", "player, first after start", &path, have);
-        }
-        Ok(())
+        let Some((_, q)) = searches.iter().find(|(name, _)| *name == "player") else { return Ok(fourth) };
+        let mut fifth = self.respawn(fourth)?;
+        let path = format!("{}/games?limit=500&q={}", self.base, encode(q));
+        self.cold(&mut fifth, "search+names", "player, first after start", &path, have);
+        Ok(fifth)
     }
 
-    /// The engine: the first line of a 5-second search on `again`, and the
-    /// lines a second after it; then a new bridge whose engine is warmed up
-    /// first (#110), as the web app does when an analysis page opens: the
-    /// warm-up, then the first line.
-    fn engines(&mut self, again: &mut Served) -> AnyResult<()> {
-        engine(&mut self.table, &mut again.c, "first line");
-        let mut warmed = self.respawn()?;
+    /// The engine, on new bridges in place of `before`, whose engine has not
+    /// run: on the first, the first line of a 5-second search and the lines
+    /// a second after it; on the second, whose engine is warmed up first
+    /// (#110) as the web app does when an analysis page opens, the warm-up,
+    /// then the first line. The second.
+    fn engines(&mut self, before: Served) -> AnyResult<Served> {
+        let mut cold = self.respawn(before)?;
+        engine(&mut self.table, &mut cold.c, "first line");
+        let mut warmed = self.respawn(cold)?;
         let mut warm = Samples::default();
         warm.get(&mut warmed.c, "/v1/engine/warm", true);
         self.table.row("engine", "warm-up to ready", &mut warm, "");
         engine(&mut self.table, &mut warmed.c, "first line after a warm-up");
-        Ok(())
+        Ok(warmed)
     }
 
     /// HTTP: a small answer over one kept connection, and over a new one each.
@@ -1356,5 +1385,21 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bridge ends once no file of its index folders is partial (#191).
+    #[test]
+    fn a_partial_file_is_one_being_written() {
+        let dir = std::env::temp_dir().join(format!("cbtool-profile-writing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!writing(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        for whole in ["0123456789abcdef.idx", "0123456789abcdef.heads", "0123456789abcdef.annotators"] {
+            std::fs::write(dir.join(whole), b"x").unwrap();
+        }
+        assert!(!writing(&dir));
+        std::fs::write(dir.join("0123456789abcdef.annotators.partial"), b"x").unwrap();
+        assert!(writing(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
