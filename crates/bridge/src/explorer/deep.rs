@@ -258,6 +258,12 @@ impl Tracker {
         Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, of, effects }
     }
 
+    /// The standard start's, counted once.
+    pub fn standard() -> Tracker {
+        static STANDARD: OnceLock<Tracker> = OnceLock::new();
+        *STANDARD.get_or_init(|| Tracker::of(stream::standard()))
+    }
+
     /// The effect of `word`.
     #[inline(always)]
     fn effect(&self, word: u16) -> &'static Effect {
@@ -487,7 +493,7 @@ impl Pass<'_> {
             return Ok(());
         }
         let start = record.start().map_err(|e| from_bad(path, e))?;
-        let mut line = Tracker::of(start.as_ref().unwrap_or_else(|| stream::standard()));
+        let mut line = start.as_ref().map_or_else(Tracker::standard, Tracker::of);
         let word = || corrupt(path, "stream word");
         // The tree's plies hold no structure of the section: they are the
         // prefix's words, and the words past it follow ply 21, beyond the
@@ -511,7 +517,9 @@ impl Pass<'_> {
             }
         }
         find(held, &within, &mut replayed, &mut kept.found);
-        kept.rest += u64::from(replayed.prints.count_ones());
+        if replayed.prints != 0 {
+            kept.rest += u64::from(replayed.prints.count_ones());
+        }
         for i in 0..replayed.found {
             let p = kept.found[i];
             if point(p) >= self.hi.load(Ordering::Relaxed) {
@@ -1147,6 +1155,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(Tracker::standard(), Tracker::of(&Board::startpos()));
         assert_eq!(Tracker::of(&Board::startpos()).play(0), None, "word 0 names no move");
         assert_eq!(Tracker::of(&Board::startpos()).play(movetable::NULL_MOVE), None);
         assert_eq!(Tracker::of(&Board::startpos()).play(FIRST_CASTLE_960), None);
