@@ -445,12 +445,15 @@ impl Catalog {
         &self.shared.pgn
     }
 
-    /// Keeps the indexes in `dir` as the bridge's data folder keeps them: the
-    /// position indexes, with the heads and names files, in its `index`
-    /// folder, and the header indexes of PGN files in its `pgn` folder.
+    /// Keeps the indexes where the bridge whose data folder is `dir` keeps
+    /// them ([`crate::folders`]): the position indexes, with the heads and
+    /// names files, in its index folder, apart from the data folder where
+    /// that roams (#147), and the header indexes of PGN files in its `pgn`
+    /// folder. A start sets its data folder here too, so a tool or a test
+    /// that gives its own keeps its indexes where a start would (#175).
     pub fn use_data_dir(&self, dir: &Path) {
-        self.explorer.set_dir(dir.join("index"));
-        self.shared.pgn.set_dir(dir.join("pgn"));
+        self.explorer.set_dir(crate::folders::index_dir(dir));
+        self.shared.pgn.set_dir(crate::folders::pgn_dir(dir));
     }
 
     /// Sets a function called each time the sources have been read, before

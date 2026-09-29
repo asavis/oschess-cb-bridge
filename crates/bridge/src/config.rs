@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 use crate::pairing::DEFAULT_WEB;
 
+/// The file's name in the data folder.
+pub const FILE_NAME: &str = "bridge.toml";
+
 pub const DEFAULT_PORT: u16 = 39581;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,31 +180,43 @@ fn read_file(path: &Path) -> Result<Option<Config>, Error> {
     parse_text(&text).map(Some).map_err(|e| error(Why::Syntax(e)))
 }
 
-/// `bridge.toml` as the running bridge follows it (#70): the database list
-/// and the engine each ask it for the settings in force.
+/// `bridge.toml` as the running bridge follows it (#70): one for the bridge,
+/// which the database list and the engine share, each asking it for the
+/// settings in force (#175).
 ///
-/// The file is read again whenever its size or modification time changes.
-/// There is one rule for what a read means:
+/// The file is read again whenever its size or modification time changes,
+/// by whichever reader looks first. There is one rule for what a read means:
 /// - a missing file is the defaults;
 /// - a file that cannot be read or parsed leaves the last good settings in
-///   force, and is read again at the next look, as access may return.
+///   force, and is read again at the next look, as access may return. It
+///   is logged once for each revision, however often it is read, so that a
+///   broken file changed into another broken one is logged again.
+#[derive(Debug)]
 pub struct Watched {
     path: PathBuf,
     last: std::sync::Mutex<Last>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Last {
     /// The file's signature when it was last read without error.
     signature: Option<u64>,
     config: Config,
-    /// Whether a read has succeeded yet.
-    read: bool,
-    /// Whether the last read failed; its error has been logged.
-    failing: bool,
+    /// How many reads have changed the settings; the first that succeeds
+    /// counts as one.
+    changes: u64,
+    /// The signature of the revision whose failed read was logged last;
+    /// `None` once a read succeeds.
+    failed: Option<u64>,
 }
 
-/// The settings in force, and whether a read just changed them.
+/// What one reader of a [`Watched`] file has seen of its changes: nothing
+/// before its first look.
+#[derive(Default)]
+pub struct Seen(u64);
+
+/// The settings in force, and whether they changed since the reader last
+/// looked.
 pub struct Look {
     pub config: Config,
     pub changed: bool,
@@ -217,28 +232,32 @@ impl Watched {
     }
 
     /// The settings in force, after reading the file again if it changed.
-    /// The first read that succeeds counts as a change.
-    pub fn look(&self) -> Look {
+    /// `seen` is the reader's own, which the look brings up to date: each
+    /// reader learns of a change once, whichever of them read it. The first
+    /// read that succeeds counts as a change.
+    pub fn look(&self, seen: &mut Seen) -> Look {
         let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let signature = crate::sources::signature(Some(&self.path));
-        if last.signature == Some(signature) {
-            return Look { config: last.config.clone(), changed: false };
-        }
-        match read_file(&self.path) {
-            Ok(read) => {
-                let next = read.unwrap_or_default();
-                let changed = !last.read || next != last.config;
-                (last.config, last.signature, last.read, last.failing) = (next, Some(signature), true, false);
-                Look { config: last.config.clone(), changed }
-            }
-            Err(e) => {
-                if !last.failing {
-                    crate::log!("{}; keeping the settings read before", e.logged());
+        if last.signature != Some(signature) {
+            match read_file(&self.path) {
+                Ok(read) => {
+                    let next = read.unwrap_or_default();
+                    if last.changes == 0 || next != last.config {
+                        (last.config, last.changes) = (next, last.changes + 1);
+                    }
+                    (last.signature, last.failed) = (Some(signature), None);
                 }
-                (last.signature, last.failing) = (None, true);
-                Look { config: last.config.clone(), changed: false }
+                Err(e) => {
+                    if last.failed != Some(signature) {
+                        crate::log!("{}; keeping the settings read before", e.logged());
+                    }
+                    (last.signature, last.failed) = (None, Some(signature));
+                }
             }
         }
+        let changed = seen.0 != last.changes;
+        seen.0 = last.changes;
+        Look { config: last.config.clone(), changed }
     }
 }
 
@@ -691,6 +710,40 @@ mod tests {
             (e.to_string(), e.logged()),
             (format!("{}: not a regular file", folder.display()), "bridge.toml: not a regular file".into())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The readers of one file, as the database list and the engine are,
+    /// each learn of a change once, whichever of them read it (#175); a file
+    /// that cannot be parsed keeps the settings read before, for all of them.
+    #[test]
+    fn every_reader_learns_of_a_change_once() {
+        // The broken file is logged: not into the file of a test that counts
+        // its lines.
+        let _log = crate::log::testing::hold();
+        let dir = std::env::temp_dir().join(format!("bridge-config-readers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        std::fs::write(&path, "port = 40000\n").unwrap();
+        let file = Watched::new(path.clone());
+        let (mut list, mut engine) = (Seen::default(), Seen::default());
+        let look = |seen: &mut Seen| {
+            let look = file.look(seen);
+            (look.config.port, look.changed)
+        };
+        assert_eq!(look(&mut list), (40000, true));
+        assert_eq!(look(&mut engine), (40000, true), "the first read is a change for each reader");
+        assert_eq!(look(&mut list), (40000, false));
+        // Each text of another length than the one before, so that its
+        // signature changes whatever the clock.
+        std::fs::write(&path, "port = 4000\n").unwrap();
+        assert_eq!(look(&mut engine), (4000, true));
+        assert_eq!(look(&mut engine), (4000, false));
+        assert_eq!(look(&mut list), (4000, true), "a change the other reader read is one all the same");
+        std::fs::write(&path, "port = \n").unwrap();
+        assert_eq!(look(&mut list), (4000, false));
+        assert_eq!(look(&mut engine), (4000, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

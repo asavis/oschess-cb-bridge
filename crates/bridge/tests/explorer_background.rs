@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
+use bridge::config::Watched;
 use bridge::explorer::format::{HEADER_LEN, Header};
 use bridge::explorer::runs::Limits;
 use bridge::fetch::Cloud;
@@ -321,8 +322,8 @@ fn nothing_is_built_in_the_background_for_a_cloud_only_unlisted_or_opening_datab
     list(&paths.iter().collect::<Vec<_>>());
     let files = std::fs::read_dir(cloud.dir()).unwrap().map(|e| e.unwrap().path()).collect();
     let provider = Arc::new(Provider { files, ..Provider::default() });
-    let catalog =
-        Catalog::with_sources(Sources { config: Some(config.clone()), ..Sources::default() }, provider.clone());
+    let sources = Sources { config: Some(Arc::new(Watched::new(config.clone()))), ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, provider.clone());
     assert_eq!(catalog.entries().len(), 4);
     // The PGN file's header index waits behind another build.
     let (release, held) = mpsc::channel::<()>();
@@ -548,8 +549,8 @@ fn a_queued_background_build_is_dropped_when_its_database_goes_to_the_cloud() {
     let config = root.join("bridge.toml");
     std::fs::write(&config, format!("databases = ['{}']\n", path.display())).unwrap();
     let provider = Arc::new(Provider::default());
-    let catalog =
-        Catalog::with_sources(Sources { config: Some(config.clone()), ..Sources::default() }, provider.clone());
+    let sources = Sources { config: Some(Arc::new(Watched::new(config.clone()))), ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, provider.clone());
     let computer = Arc::new(Computer::default());
     computer.battery.store(true, Ordering::SeqCst);
     catalog.explorer.set_machine(computer.clone());

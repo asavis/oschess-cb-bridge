@@ -12,7 +12,7 @@ use crate::catalog::Catalog;
 use crate::engine::Engine;
 use crate::fetch::System;
 use crate::sources::Sources;
-use crate::{config, documents, log, pairing, server, token};
+use crate::{config, documents, folders, log, pairing, server, token};
 
 /// The options every way of starting the bridge takes.
 pub const OPTIONS: &str = "[--database <path>]... [--show-token] [--new-token]
@@ -58,7 +58,7 @@ impl Options {
 
 /// The data folder, or an error that says how to set one.
 pub fn data_dir() -> Result<PathBuf, String> {
-    token::data_dir().ok_or_else(|| "no data folder: set OSCHESS_BRIDGE_HOME".to_string())
+    folders::data_dir().ok_or_else(|| "no data folder: set OSCHESS_BRIDGE_HOME".to_string())
 }
 
 /// A bridge ready to serve: its port bound and its token read.
@@ -110,8 +110,8 @@ impl Failed {
 /// [`prepare`], its failure kept whole for the log.
 fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     let first_run = !token::exists(dir);
-    let config =
-        config::load(&dir.join("bridge.toml")).map_err(|e| Failed { shown: e.to_string(), logged: e.logged() })?;
+    let config_path = dir.join(config::FILE_NAME);
+    let config = config::load(&config_path).map_err(|e| Failed { shown: e.to_string(), logged: e.logged() })?;
     let (origins, web) = allowed(&config)?;
     // The port first: a second instance stops here, before it could replace the
     // token the running one still accepts.
@@ -119,18 +119,19 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     let token = if options.new_token { token::replace(dir) } else { token::load_or_create(dir) }.map_err(|e| {
         Failed { shown: format!("pairing token in {}: {e}", dir.display()), logged: format!("the pairing token: {e}") }
     })?;
-    // The databases of bridge.toml are read by the catalog, again whenever
-    // the file changes.
-    let config_path = dir.join("bridge.toml");
+    // The port, the origins and the site are read once, above. The databases
+    // and the engine follow the file while the bridge runs, through one
+    // reader of it, so that a file that cannot be read is logged once
+    // (#175).
+    let file = Arc::new(config::Watched::new(config_path));
     let sources = Sources {
         chessbase: documents::chessbase_folder(),
-        config: Some(config_path.clone()),
+        config: Some(Arc::clone(&file)),
         fixed: options.databases.clone(),
     };
     let link = pairing::link(web, &token, config.port);
     let app = App {
-        // The engine follows bridge.toml, as the databases do.
-        engine: Engine::from_config_file(config_path),
+        engine: Engine::from_config_file(file),
         ..App::new(
             options.version.unwrap_or(env!("CARGO_PKG_VERSION")),
             Policy { port: config.port, origins, token: token.clone() },
@@ -141,13 +142,12 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
     // The indexes are kept apart from the data folder where it roams (#147).
     // Those kept in it before are rebuilt anyway, for the index's new
     // version, so they go, once.
-    let index = token::index_dir(dir);
-    if index != dir.join("index") {
-        crate::indexdir::sweep_moved(&dir.join("index"), |name| {
+    let before = dir.join("index");
+    if app.catalog.explorer.dir().is_some_and(|index| index != before) {
+        crate::indexdir::sweep_moved(&before, |name| {
             crate::explorer::is_index_file(name) || crate::search::heads::entry_id(name).is_some()
         });
     }
-    app.catalog.explorer.set_dir(index);
     app.catalog.sweep_indexes();
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
 }
@@ -184,7 +184,7 @@ pub struct Pairing {
 /// The token is never created here: the start that creates it is the first
 /// run (#183).
 pub fn pairing(dir: &Path) -> Result<Pairing, String> {
-    let config = config::load_or_create(&dir.join("bridge.toml"))?;
+    let config = config::load_or_create(&dir.join(config::FILE_NAME))?;
     let (_, web) = allowed(&config).map_err(|f| f.shown)?;
     let token = token::load(dir)
         .map_err(|e| format!("pairing token in {}: {e}", dir.display()))?
@@ -195,7 +195,7 @@ pub fn pairing(dir: &Path) -> Result<Pairing, String> {
 /// The oschess site the pairing link of the bridge in `dir` opens, under the
 /// rule of [`pairing`], for a page that carries no token.
 pub fn site(dir: &Path) -> Result<String, String> {
-    let config = config::load_or_create(&dir.join("bridge.toml"))?;
+    let config = config::load_or_create(&dir.join(config::FILE_NAME))?;
     allowed(&config).map(|(_, web)| web.to_string()).map_err(|f| f.shown)
 }
 
@@ -389,5 +389,74 @@ mod tests {
         }
         assert!(!text.contains(dir.to_str().unwrap()), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file broken while the bridge runs is logged once for each broken
+    /// revision, though the database list and the engine both follow it and
+    /// look at it again and again (#175): a broken file changed into another
+    /// broken one is logged again, so that the log says what is wrong now.
+    #[test]
+    fn a_broken_file_is_logged_once_for_each_change() {
+        let _log = log::testing::hold();
+        let dir = folder("broken", None);
+        let bridge = prepare(&dir, &Options::default()).unwrap();
+        let path = dir.join(config::FILE_NAME);
+        let good = std::fs::read(&path).unwrap();
+        // Replaced whole, so that no look reads it half written; each text of
+        // another length than the one before, so that its signature changes
+        // whatever the clock.
+        let replace = |text: &[u8]| crate::files::write_atomic(&path, text).unwrap();
+        let logged = || {
+            // Each looks more than once, as requests and the engine's own
+            // looks do.
+            for _ in 0..2 {
+                bridge.app.catalog.entries();
+                bridge.app.engine.is_configured();
+            }
+            let text = std::fs::read_to_string(dir.join(log::FILE_NAME)).unwrap();
+            text.lines().filter(|l| l.contains("keeping the settings read before")).count()
+        };
+        replace(b"port = \n");
+        assert_eq!(logged(), 1);
+        replace(b"databases = [unquoted]\n");
+        assert_eq!(logged(), 2, "another broken revision is another line");
+        replace(&good);
+        assert_eq!(logged(), 2, "a good file is no line");
+        replace(b"Jane = 1\n");
+        assert_eq!(logged(), 3);
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catalog given a data folder alone keeps its indexes where a start
+    /// from that folder keeps them (#147, #175): a folder of the tests' or
+    /// the tools' own, in its `index` and `pgn`; the default data folder,
+    /// which only a real start uses, on Windows in the local application data
+    /// folder, unless `OSCHESS_BRIDGE_HOME` names it.
+    #[test]
+    fn a_data_folder_keeps_its_indexes_where_a_start_does() {
+        let _log = log::testing::hold();
+        let dir = folder("indexes", None);
+        let started = prepare(&dir, &Options::default()).unwrap();
+        let alone = Catalog::new(Vec::new());
+        alone.use_data_dir(&dir);
+        let kept = |catalog: &Catalog| (catalog.explorer.dir(), catalog.pgn().dir());
+        assert_eq!(kept(&started.app.catalog), (Some(dir.join("index")), Some(dir.join("pgn"))));
+        assert_eq!(kept(&alone), kept(&started.app.catalog));
+        drop(started);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Only named: nothing is written there.
+        let Some(data) = folders::data_dir() else { return };
+        let alone = Catalog::new(Vec::new());
+        alone.use_data_dir(&data);
+        let var = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+        let index = match var("LOCALAPPDATA") {
+            Some(local) if cfg!(windows) && var("OSCHESS_BRIDGE_HOME").is_none() => {
+                PathBuf::from(local).join("oschess bridge").join("index")
+            }
+            _ => data.join("index"),
+        };
+        assert_eq!(kept(&alone), (Some(index), Some(data.join("pgn"))));
     }
 }

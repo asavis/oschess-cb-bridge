@@ -52,7 +52,7 @@ fn the_tray_follows_the_catalog() {
     let config_path = dir.join("bridge.toml");
     list(&config_path, &[&good]);
 
-    let sources = Sources { config: Some(config_path.clone()), ..Sources::default() };
+    let sources = Sources { config: Some(Arc::new(config::Watched::new(config_path.clone()))), ..Sources::default() };
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
     let token = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ".to_string();

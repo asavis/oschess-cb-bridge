@@ -4,7 +4,7 @@
 //! from it and its notable games, and the games' main lines as a move stream
 //! to find the games that reach a position beyond those plies in. An index is
 //! built the first time it is asked for, and kept on disk in the bridge's
-//! index folder ([`crate::token::index_dir`]); a change to the database
+//! index folder ([`crate::folders::index_dir`]); a change to the database
 //! rebuilds it, at the next request, or in the background for a database in
 //! use ([`keeper`]). An index kept on disk for the database as it is now
 //! answers from the first request, without a build.
@@ -198,9 +198,9 @@ impl Registry {
     }
 
     /// Where index files are kept: the data folder's index folder
-    /// ([`crate::token::index_dir`]) unless set.
+    /// ([`crate::folders::index_dir`]) unless set.
     pub fn dir(&self) -> Option<PathBuf> {
-        lock(&self.dir).clone().or_else(|| crate::token::data_dir().map(|d| crate::token::index_dir(&d)))
+        lock(&self.dir).clone().or_else(|| crate::folders::data_dir().map(|d| crate::folders::index_dir(&d)))
     }
 
     fn state(&self, id: &str) -> Arc<Mutex<State>> {

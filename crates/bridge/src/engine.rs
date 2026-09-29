@@ -207,8 +207,9 @@ pub struct Engine {
 
 struct Shared {
     idle: Duration,
-    /// The configuration file the engine follows; `None` for a fixed one.
-    file: Option<crate::config::Watched>,
+    /// The configuration file the engine follows, as the database list does
+    /// (#175); `None` for a fixed one.
+    file: Option<Arc<crate::config::Watched>>,
     current: Mutex<Current>,
     /// The analyses running now, and when the newest began (#61).
     analyses: AtomicUsize,
@@ -228,6 +229,8 @@ impl Drop for Running<'_> {
 struct Current {
     config: Option<EngineConfig>,
     inner: Option<Arc<Inner>>,
+    /// What the engine has seen of the changes of the file it follows.
+    seen: crate::config::Seen,
 }
 
 struct Inner {
@@ -263,7 +266,7 @@ impl Engine {
 
     fn fixed(config: Option<EngineConfig>, idle: Duration) -> Self {
         let inner = config.clone().map(|c| Inner::start(c, idle));
-        let current = Current { config, inner };
+        let current = Current { config, inner, ..Current::default() };
         let shared = Shared {
             idle,
             file: None,
@@ -274,20 +277,20 @@ impl Engine {
         Engine { shared: Arc::new(shared) }
     }
 
-    /// The engine the `bridge.toml` at `path` names, read again whenever the
+    /// The engine the `bridge.toml` `file` names, read again whenever the
     /// file changes, as `config::Watched` reads it: a file that cannot be read
     /// or parsed keeps the engine it named before, and no file is the defaults,
     /// no engine. The file is looked at every [`CONFIG_POLL`] as well, so a
     /// changed engine stops the running search at once, not at the next call.
-    pub fn from_config_file(path: PathBuf) -> Self {
-        Self::following(path, CONFIG_POLL)
+    pub fn from_config_file(file: Arc<crate::config::Watched>) -> Self {
+        Self::following(file, CONFIG_POLL)
     }
 
     /// [`Engine::from_config_file`] looking at the file every `poll` (tests).
-    pub fn following(path: PathBuf, poll: Duration) -> Self {
+    pub fn following(file: Arc<crate::config::Watched>, poll: Duration) -> Self {
         let shared = Shared {
             idle: IDLE,
-            file: Some(crate::config::Watched::new(path)),
+            file: Some(file),
             current: Mutex::default(),
             analyses: AtomicUsize::new(0),
             began: Mutex::new(None),
@@ -311,8 +314,8 @@ impl Engine {
     /// that search lets it go.
     fn current(&self) -> Option<Arc<Inner>> {
         let mut current = lock(&self.shared.current);
-        if let Some(watched) = &self.shared.file {
-            let look = watched.look();
+        if let Some(file) = &self.shared.file {
+            let look = file.look(&mut current.seen);
             if look.changed {
                 let config = look.config;
                 let next = config.engine.map(|p| EngineConfig::new(p, config.engine_threads, config.engine_hash));
