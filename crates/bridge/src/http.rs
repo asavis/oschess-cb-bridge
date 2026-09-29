@@ -88,6 +88,10 @@ pub struct Conn {
 
 impl Conn {
     pub fn new(stream: TcpStream) -> Self {
+        // Each answer is written whole, so nothing is gained by holding a
+        // small segment back for the client's delayed acknowledgement, which
+        // costs 40 ms a request on Linux (#142).
+        let _ = stream.set_nodelay(true);
         Conn { stream, buf: Vec::new() }
     }
 
@@ -170,8 +174,10 @@ impl Conn {
             response.body.len(),
             if keep_alive { "keep-alive" } else { "close" }
         ));
-        self.stream.write_all(head.as_bytes())?;
-        self.stream.write_all(response.body.as_bytes())?;
+        // One write: the head and the body leave in the same segments.
+        let mut out = head.into_bytes();
+        out.extend_from_slice(response.body.as_bytes());
+        self.stream.write_all(&out)?;
         self.stream.flush()
     }
 }
