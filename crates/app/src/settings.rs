@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bridge::config::Config;
+use bridge::sources;
 use serde::Serialize;
 
 /// A command's failure, in the one shape the settings window translates: the
@@ -64,19 +65,10 @@ fn extra(path: &Path) -> Extra {
     }
 }
 
-/// The regular `.2cbh`, `.cbh` and `.pgn` files directly in `folder`, as the
-/// bridge serves a folder.
+/// The databases directly in `folder`, by the bridge's own rule for a folder
+/// it serves ([`sources::expand`], #185); none when it cannot be read.
 pub fn databases_in(folder: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(folder) else { return 0 };
-    entries
-        .flatten()
-        .filter(|e| {
-            let path = e.path();
-            let ext = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-            matches!(ext.as_deref(), Some("2cbh" | "cbh" | "pgn"))
-                && std::fs::metadata(&path).is_ok_and(|m| m.is_file())
-        })
-        .count()
+    sources::expand(folder).map_or(0, |listed| listed.len())
 }
 
 /// `config` with `path` added at the end; unchanged when it is there already.
