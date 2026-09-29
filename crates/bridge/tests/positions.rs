@@ -284,6 +284,15 @@ fn answered(port: u16, path: &str) -> String {
     }
 }
 
+/// The answer to `path` once the index is built: `200` at once, never the
+/// `409` of a scan that found the index damaged and builds it again, after
+/// which [`answered`] would take the new build's answer.
+fn at_once(port: u16, path: &str) -> String {
+    let (status, body) = get(port, path);
+    assert_eq!(status, 200, "{path}: {body}");
+    body
+}
+
 /// The first number member `"key":123` of a JSON text.
 fn number(body: &str, key: &str) -> u64 {
     let pat = format!("\"{key}\":");
@@ -386,8 +395,8 @@ fn every_position_lists_the_games_a_replay_finds() {
     for (board, ply) in positions.values() {
         let fen = board.fen();
         let want = reached.games(board);
-        let body = answered(bridge.port, &list(&id, &fen, "&limit=500"));
-        let explorer = answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen)));
+        let body = at_once(bridge.port, &list(&id, &fen, "&limit=500"));
+        let explorer = at_once(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen)));
         let got = rows(&body);
         assert_eq!(got.iter().copied().collect::<BTreeSet<_>>(), want, "{fen}");
         assert!(got.windows(2).all(|w| w[0] < w[1]), "in number order, each once: {fen}");
@@ -400,6 +409,35 @@ fn every_position_lists_the_games_a_replay_finds() {
     }
     assert!(positions.len() > 1000, "{} positions", positions.len());
     assert!(crowded > 20 && few > 500 && beyond > 500, "{crowded} crowded, {few} of few games, {beyond} beyond");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The first scan of the stream reads every slot, and notes which games start
+/// from the standard position and which from a set-up one (#142); a scan for
+/// the standard start after it takes the first as they are and replays the
+/// others, and finds the games the first found, at once, a set-up game that
+/// comes home among them. The scans of other positions read every slot.
+#[test]
+fn the_start_after_the_first_scan_lists_what_it_listed() {
+    let games = games();
+    let reached = Reached::of(&games);
+    let db = database("positions-starts", &games);
+    let dir = index_dir("starts");
+    let (bridge, id) = serve(&db, &dir);
+    let boards = [Board::startpos(), board_after("d2d4 d7d5 c2c4 e7e6"), board_after("d2d4")];
+    assert!(reached.games(&boards[0]).contains(&57), "the set-up game that comes home");
+    for (round, sort) in ["number", "white"].into_iter().enumerate() {
+        for (i, board) in boards.iter().enumerate() {
+            let fen = board.fen();
+            let want = reached.games(board);
+            assert!(want.len() > 12, "{fen}: a scan finds its games");
+            // The first builds the index, then scans every slot.
+            let path = list(&id, &fen, &format!("&limit=500&sort={sort}"));
+            let body = if round + i == 0 { answered(bridge.port, &path) } else { at_once(bridge.port, &path) };
+            assert_eq!(rows(&body).into_iter().collect::<BTreeSet<_>>(), want, "{fen} by {sort}");
+        }
+    }
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -731,6 +769,76 @@ fn in_child(name: &str) -> bool {
     let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && text.contains("1 passed"), "{text}");
     false
+}
+
+/// A list of a position's games in a sort order that is kept is answered
+/// whole whenever the budget left holds the list itself: the lists the
+/// workers may gather its parts into first are a saving, which never makes
+/// the list busy nor evicts the order (#142, review of #163).
+#[test]
+fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
+    if !in_child("a_list_in_a_kept_order_needs_no_room_but_its_own") {
+        return;
+    }
+    const GAMES: u32 = 12_000;
+    let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-tight", &games);
+    let dir = index_dir("tight");
+    let (bridge, id) = serve(&db, &dir);
+    let e4 = board_after("e2e4").fen();
+    // The index built and its stream scanned once; the order by White kept.
+    assert_eq!(number(&answered(bridge.port, &list(&id, &e4, "&sort=number")), "total"), u64::from(GAMES));
+    at_once(bridge.port, &format!("/v1/databases/{id}/games?sort=white&limit=1"));
+    // Room for the list, 48 KB, and a little more, but not for part lists
+    // besides it, twice as much again.
+    let free = GAMES as usize * 4 + (32 << 10);
+    let taken = loop {
+        if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
+            break hold;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let kept = held();
+    let body = at_once(bridge.port, &list(&id, &e4, "&sort=white"));
+    assert_eq!(number(&body, "total"), u64::from(GAMES));
+    assert!(held() >= kept, "nothing retained was evicted");
+    drop(taken);
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The starts a stream keeps are given up when a list needs their room: the
+/// standard start's games are listed whole whenever the budget left holds
+/// the list and the position's set, by the first scan, which finds the
+/// starts, and by those after it (#142, review of #163).
+#[test]
+fn kept_starts_give_way_to_a_list() {
+    if !in_child("kept_starts_give_way_to_a_list") {
+        return;
+    }
+    const GAMES: usize = 100_000;
+    let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-starts-room", &games);
+    let dir = index_dir("starts-room");
+    let (bridge, id) = serve(&db, &dir);
+    // The index built without a list, so that no scan has found the starts.
+    answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(START)));
+    for sort in ["number", "number-desc"] {
+        // Room for the list, 400 KB, the set, 12.5 KB, and a little more:
+        // not for the starts besides, 25 KB.
+        let free = GAMES * 4 + GAMES / 8 + (8 << 10);
+        let taken = loop {
+            if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
+                break hold;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let body = at_once(bridge.port, &list(&id, START, &format!("&sort={sort}")));
+        assert_eq!(number(&body, "total"), GAMES as u64, "{sort}");
+        drop(taken);
+    }
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// With the search memory all but a little taken, a list of a position's

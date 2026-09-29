@@ -29,6 +29,13 @@
 //! which its block's CRC in the index covers. A failure of either drops the
 //! index to be built again, as for any damage found.
 //!
+//! The first scan while the stream is open also notes which games start
+//! from the standard position and which from a set-up one, and the stream
+//! keeps them while the search budget has room for them (#142). A scan for the
+//! standard start then takes the first as they are, every one of them
+//! reaching it at its first ply, and replays the set-up ones alone, instead
+//! of reading every slot.
+//!
 //! [`Departures::allows`]: super::stream::Departures::allows
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,7 +50,7 @@ use super::Loaded;
 use super::answer::{Keep, replay_with};
 use super::file::Bad;
 use super::format::{MAX_PLY, Stats, TOP_GAMES};
-use super::stream::{Hit, Slot, Stream, Target, home_pawns};
+use super::stream::{Hit, Slot, Starts, Stream, Target, home_pawns};
 use super::tree::{Keys, standard_keys};
 
 /// The games of `board` in the index `loaded`, as a list narrows to them.
@@ -149,9 +156,18 @@ fn within(
 /// The games of `stream` that reach `board` within the tree's plies, added
 /// to `members`: how many. The workers take a block of the stream, 4,096
 /// games, at a time, and look whether the request was superseded before
-/// each.
+/// each. The first scan notes the starts of every game as it reads their
+/// slots, and the stream keeps them once it has read every block; a scan
+/// for the standard start then reads them instead ([`from_start`]).
 fn scan(stream: &Stream, board: &Board, members: &Members, cancel: &Cancel) -> Result<u64, SearchError> {
     let (key, home) = (board.hash(), home_pawns(board));
+    if key == standard_keys().hash()
+        && home == u16::MAX
+        && let Some(starts) = stream.starts()
+    {
+        return from_start(stream, &starts, (key, home), members, cancel);
+    }
+    let finding = stream.find_starts();
     let blocks = stream.header.blocks as usize;
     let next = AtomicUsize::new(0);
     let found = workers::run(threads().min(blocks).max(1), 0, cancel, |w| {
@@ -165,14 +181,60 @@ fn scan(stream: &Stream, board: &Board, members: &Members, cancel: &Cancel) -> R
                 return Err(SearchError::Superseded);
             }
             let (first, slots) = stream.slots(block).map_err(damaged)?;
+            let mut noting = finding.as_ref().map(Starts::noting);
             for (number, slot) in (first..).zip(slots) {
+                if let Some(noting) = &mut noting {
+                    noting.note(number, &slot.entry);
+                }
                 if reaches(stream, number, &slot, key, home).map_err(damaged)? && members.insert(number) {
                     found += 1;
                 }
             }
         }
     })?;
+    if let Some(starts) = finding {
+        stream.keep(starts);
+    }
     Ok(found.iter().sum())
+}
+
+/// Words of the set-up games' numbers a worker takes at a time: 4,096 games.
+const SET_UP_WORDS: usize = 64;
+
+/// The games that reach the standard start, of key `key` and home pawns
+/// `home`, within the tree's plies, added to `members` from the starts the
+/// first scan found: how many. Every game from the standard start reaches it at its
+/// first ply, as [`reaches`] finds from its entry alone, and the set-up games
+/// are replayed, as the scan replays them, the workers taking 4,096 of them
+/// at a time.
+fn from_start(
+    stream: &Stream,
+    starts: &Starts,
+    (key, home): (u64, u16),
+    members: &Members,
+    cancel: &Cancel,
+) -> Result<u64, SearchError> {
+    let standard = members.union(&starts.standard);
+    let parts = starts.set_up.words().div_ceil(SET_UP_WORDS);
+    let next = AtomicUsize::new(0);
+    let found = workers::run(threads().min(parts).max(1), 0, cancel, |w| {
+        let mut found = 0u64;
+        loop {
+            let part = next.fetch_add(1, Ordering::Relaxed);
+            if part >= parts {
+                return Ok(found);
+            }
+            if w.stopped() || cancel.is_cancelled() {
+                return Err(SearchError::Superseded);
+            }
+            for number in starts.set_up.iter_in(part * SET_UP_WORDS..(part + 1) * SET_UP_WORDS) {
+                if set_up_reaches(stream, number, key, home).map_err(damaged)? && members.insert(number) {
+                    found += 1;
+                }
+            }
+        }
+    })?;
+    Ok(standard + found.iter().sum::<u64>())
 }
 
 /// Whether record `number`, whose slot is `slot`, is a game that reaches the
@@ -189,6 +251,12 @@ fn reaches(stream: &Stream, number: u32, slot: &Slot<'_>, key: u64, home: u16) -
             false => Ok(false),
         };
     }
+    set_up_reaches(stream, number, key, home)
+}
+
+/// Whether record `number`, a set-up game the index holds, reaches the
+/// position as [`reaches`] finds.
+fn set_up_reaches(stream: &Stream, number: u32, key: u64, home: u16) -> Result<bool, Bad> {
     // A set-up game's start is in its tail: its record is read whole, and
     // checked against its CRC. The Mega Database has a few thousand.
     let record = stream.record(number)?;

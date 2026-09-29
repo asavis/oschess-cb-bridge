@@ -18,11 +18,14 @@
 //! writes the file from start to end. Each block of slots has a CRC-32 of
 //! its number and its slots in the table, which a scan of every slot (#148)
 //! checks the first time it reads the block, once while the stream is open.
+//! That scan also finds which games start from the standard position and
+//! which from a set-up one, which the stream keeps until the search budget
+//! runs short (#142).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Replayer, Square};
 
@@ -30,8 +33,8 @@ use cbformat::movetable::FIRST_PIECE_WORD;
 use cbformat::replay;
 
 use crate::indexdir::{crc32, crc32_update, u32_at, u64_at};
-use crate::search::SearchError;
-use crate::search::memory::{Hold, Refused};
+use crate::search::memory::{Evict, Hold, Refused, register};
+use crate::search::{Adding, Members, SearchError};
 
 use super::file::{Bad, read_at, write_at};
 use super::format::{NO_MOVE, Outcome, pack_move};
@@ -648,15 +651,65 @@ pub struct Game {
 
 /// A stream mapped read-only. The header and the table of blocks are checked
 /// when it opens, each record against its CRC whenever it is read, and each
-/// block against its own the first time a scan reads it. The table is held
-/// in the search budget; the mapped file is the operating system's file
-/// cache, outside the budget.
+/// block against its own the first time a scan reads it. The table and the
+/// starts are held in the search budget, the starts until the budget runs
+/// short; the mapped file is the operating system's file cache, outside the
+/// budget.
 pub struct Stream {
     pub path: PathBuf,
     pub header: Header,
     map: Map,
     blocks: Vec<Block>,
+    starts: Arc<KeptStarts>,
     _memory: Hold,
+}
+
+/// The starts a stream keeps, which it gives up when the search budget runs
+/// short, as any cache does: a scan then reads every slot again, and finds
+/// them again when it has room for them.
+#[derive(Default)]
+struct KeptStarts(Mutex<Option<Arc<Starts>>>);
+
+impl Evict for KeptStarts {
+    fn evict(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The starts of the games the index holds, as the first scan of every slot
+/// while the stream is open finds them (#142): the games from the standard
+/// start, and those from a set-up one. Every game from the standard start
+/// reaches it at its first ply, so that a scan for it reads nothing more of
+/// them, and replays the set-up ones alone: 3 MB for the Mega Database,
+/// whose slots are 768 MB.
+pub(super) struct Starts {
+    pub standard: Members,
+    pub set_up: Members,
+}
+
+impl Starts {
+    /// Where a scan notes the starts of a block's games.
+    pub fn noting(&self) -> Noting<'_> {
+        Noting { standard: Adding::to(&self.standard), set_up: Adding::to(&self.set_up) }
+    }
+}
+
+/// The starts of a block's games, noted a word of numbers at a time as a
+/// scan reads their slots in order.
+pub(super) struct Noting<'a> {
+    standard: Adding<'a>,
+    set_up: Adding<'a>,
+}
+
+impl Noting<'_> {
+    /// Notes the start of game `number`, whose entry is `entry`.
+    pub fn note(&mut self, number: u32, entry: &Entry) {
+        match (entry.indexed(), entry.setup()) {
+            (true, false) => self.standard.add(number),
+            (true, true) => self.set_up.add(number),
+            (false, _) => {}
+        }
+    }
 }
 
 /// A block of slots as the table gives it: where they start, their CRC, and
@@ -713,7 +766,10 @@ impl Stream {
         drop(table);
         let size = usize::try_from(len).map_err(|_| Bad::Corrupt("stream larger than memory"))?;
         let map = Map::new(&file, size).map_err(Bad::Io)?;
-        Ok(Stream { path: path.to_path_buf(), header, map, blocks: placed, _memory: memory })
+        let starts = Arc::new(KeptStarts::default());
+        let weak: Weak<dyn Evict> = Arc::downgrade(&(Arc::clone(&starts) as Arc<dyn Evict>));
+        register(weak);
+        Ok(Stream { path: path.to_path_buf(), header, map, blocks: placed, starts, _memory: memory })
     }
 
     /// Record `number`, checked against its CRC.
@@ -757,6 +813,31 @@ impl Stream {
         let number =
             u32::try_from(u64::from(self.header.first_record) + first).map_err(|_| Bad::Corrupt("stream block"))?;
         Ok((number, bytes.as_chunks::<SLOT_BYTES>().0.iter().map(Slot::of)))
+    }
+
+    /// The starts of the games, once a scan of every slot has found them,
+    /// and while the stream keeps them.
+    pub(super) fn starts(&self) -> Option<Arc<Starts>> {
+        self.starts.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Room for the starts of the games, which a scan of every slot finds
+    /// block by block, the stream then keeping them ([`Stream::keep`]):
+    /// `None` while it keeps them, or when the search budget has no room for
+    /// them now, which they never take from what searches retained.
+    pub(super) fn find_starts(&self) -> Option<Starts> {
+        if self.starts().is_some() {
+            return None;
+        }
+        let len = self.header.last_record as usize + 1;
+        Some(Starts { standard: Members::new_quietly(len).ok()?, set_up: Members::new_quietly(len).ok()? })
+    }
+
+    /// Keeps the starts a scan of every slot found, each block's from slots
+    /// found to match the block's CRC; of two scans that found them at once,
+    /// the first's.
+    pub(super) fn keep(&self, starts: Starts) {
+        self.starts.0.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| Arc::new(starts));
     }
 
     /// The slot and the tail of record `number`, within the file.
