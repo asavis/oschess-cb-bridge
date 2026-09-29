@@ -23,7 +23,7 @@ pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use cbformat::view::Base;
@@ -392,9 +392,19 @@ fn select_in<S: Store>(
     Ok((Selection::Numbers(numbers), sort, games))
 }
 
+/// Numbers of a set or of a sort order that a worker passes at a time.
+const PART_NUMBERS: usize = 1 << 16;
+/// Members from which the workers gather a list in two passes, which take no
+/// room but the list's. Fewer are listed in number order on the calling
+/// thread, and in another order in one pass, each part into a list of its
+/// own, which starting the workers once more would cost more than.
+const MANY_MEMBERS: usize = 1 << 21;
+
 /// The `count` records of `members` in `sort` order: in number order, the
 /// set's own; in any other, the key's whole order passed through the set,
-/// which costs the same for any set.
+/// which costs the same for any set. The workers pass a part of either at a
+/// time (#142), and for many members count what each part holds first, then
+/// copy it to its place.
 fn members_in<S: Store>(
     db: &S,
     idx: &Indexes,
@@ -409,15 +419,120 @@ fn members_in<S: Store>(
     out.try_reserve_exact(count).map_err(|_| Refused::Busy)?;
     match sort {
         _ if count == 0 => {}
-        Sort { key: SortKey::Number, descending } => {
+        Sort { key: SortKey::Number, descending } if count < MANY_MEMBERS => {
             out.extend(members.iter().take(count));
             if descending {
                 out.reverse();
             }
         }
-        _ => out.extend(idx.order(db, ctl, sort)?.iter().copied().filter(|&n| members.contains(n)).take(count)),
+        Sort { key: SortKey::Number, descending } => {
+            const WORDS: usize = PART_NUMBERS / 64;
+            let parts = members.words().div_ceil(WORDS);
+            let sizes = each_part(parts, ctl.cancel, |i| Ok(members.count_in(i * WORDS..(i + 1) * WORDS)))?;
+            gather(&mut out, count, &sizes, descending, ctl.cancel, |i| members.iter_in(i * WORDS..(i + 1) * WORDS))?;
+        }
+        _ => {
+            let order = idx.order(db, ctl, sort)?;
+            let part = |i: usize| {
+                let numbers = order.get(i * PART_NUMBERS..).unwrap_or(&[]);
+                numbers.iter().take(PART_NUMBERS).copied().filter(|&n| members.contains(n))
+            };
+            let parts = order.len().div_ceil(PART_NUMBERS);
+            if count < MANY_MEMBERS {
+                // The parts' lists, each at most twice what it holds.
+                let _lists = Hold::reserve(count * 8 + parts * LEAST_LIST * 4)?;
+                let lists = each_part(parts, ctl.cancel, |i| list(part(i)))?;
+                out.extend(lists.iter().flatten().take(count));
+            } else {
+                let sizes = each_part(parts, ctl.cancel, |i| Ok(part(i).count()))?;
+                gather(&mut out, count, &sizes, false, ctl.cancel, part)?;
+            }
+        }
     }
     Ok(Held::new(out, hold))
+}
+
+/// The room a part's list takes at least once it holds a number.
+const LEAST_LIST: usize = 64;
+
+/// `numbers` in a list, allocated fallibly as it grows.
+fn list(numbers: impl Iterator<Item = u32>) -> Result<Vec<u32>, SearchError> {
+    let mut list = Vec::new();
+    for n in numbers {
+        if list.len() == list.capacity() {
+            list.try_reserve(list.capacity().max(LEAST_LIST)).map_err(|_| Refused::Busy)?;
+        }
+        list.push(n);
+    }
+    Ok(list)
+}
+
+/// `task` for each of `parts` parts on the workers, a part at a time: what it
+/// returned for each, in part order. `Superseded` once `cancel` is.
+fn each_part<T: Send>(
+    parts: usize,
+    cancel: &Cancel,
+    task: impl Fn(usize) -> Result<T, SearchError> + Sync,
+) -> Result<Vec<T>, SearchError> {
+    let next = AtomicUsize::new(0);
+    let done = workers::run(workers::threads().min(parts).max(1), 0, cancel, |w| {
+        let mut done = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= parts {
+                return Ok(done);
+            }
+            if w.stopped() || cancel.is_cancelled() {
+                return Err(SearchError::Superseded);
+            }
+            done.push((i, task(i)?));
+        }
+    })?;
+    let mut done: Vec<(usize, T)> = done.into_iter().flatten().collect();
+    done.sort_unstable_by_key(|d| d.0);
+    Ok(done.into_iter().map(|d| d.1).collect())
+}
+
+/// Fills `out`, which has room for `count`, with the first `count` numbers of
+/// the parts that `part` gives, whose sizes are `sizes`, in order, and then
+/// reversed when `descending`: each part is copied on the workers to its own
+/// place, after the parts before it, or before them when `descending`.
+fn gather<I: Iterator<Item = u32>>(
+    out: &mut Vec<u32>,
+    count: usize,
+    sizes: &[usize],
+    descending: bool,
+    cancel: &Cancel,
+    part: impl Fn(usize) -> I + Sync,
+) -> Result<(), SearchError> {
+    let total = sizes.iter().sum::<usize>().min(count);
+    out.resize(total, 0);
+    // Each part's place, cut at `total`, in part order.
+    let mut places: Vec<Mutex<&mut [u32]>> = Vec::new();
+    places.try_reserve_exact(sizes.len()).map_err(|_| Refused::Busy)?;
+    let mut rest: &mut [u32] = out;
+    for &size in sizes {
+        let size = size.min(rest.len());
+        let (place, after) = match descending {
+            false => rest.split_at_mut(size),
+            true => {
+                let (before, place) = rest.split_at_mut(rest.len() - size);
+                (place, before)
+            }
+        };
+        places.push(Mutex::new(place));
+        rest = after;
+    }
+    each_part(sizes.len(), cancel, |i| {
+        let mut place = places[i].lock().unwrap_or_else(|e| e.into_inner());
+        let n = place.len();
+        match descending {
+            false => place.iter_mut().zip(part(i)).for_each(|(o, x)| *o = x),
+            true => place.iter_mut().rev().zip(part(i).take(n)).for_each(|(o, x)| *o = x),
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Appends to a vector whose growth is reserved in the budget first.
@@ -512,4 +627,48 @@ fn search<S: Store>(
     }
     hold.shrink(out.capacity() * 4);
     Ok(Held::new(out, hold))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parts gathered on the workers keep their order, reversed when asked,
+    /// and the first `count` numbers only; a part the set leaves empty takes
+    /// no place.
+    #[test]
+    fn parts_are_gathered_in_order() {
+        let cancel = Cancel::never();
+        let set = Members::new(5 * PART_NUMBERS).unwrap();
+        let numbers: Vec<u32> = (0..5 * PART_NUMBERS as u32)
+            .filter(|n| n % 7 == 3 && !(PART_NUMBERS as u32..2 * PART_NUMBERS as u32).contains(n))
+            .collect();
+        for &n in &numbers {
+            set.insert(n);
+        }
+        const WORDS: usize = PART_NUMBERS / 64;
+        let parts = set.words().div_ceil(WORDS);
+        let sizes = each_part(parts, &cancel, |i| Ok(set.count_in(i * WORDS..(i + 1) * WORDS))).unwrap();
+        assert_eq!(sizes.len(), 5);
+        assert_eq!(sizes[1], 0);
+        for (count, descending) in [(numbers.len(), false), (numbers.len(), true), (20_000, false), (20_000, true)] {
+            let mut out = Vec::with_capacity(count);
+            gather(&mut out, count, &sizes, descending, &cancel, |i| set.iter_in(i * WORDS..(i + 1) * WORDS)).unwrap();
+            let mut want: Vec<u32> = numbers.iter().copied().take(count).collect();
+            if descending {
+                want.reverse();
+            }
+            assert_eq!(out, want, "{count} {descending}");
+        }
+        // A sort order passed through the set: every number, in its own order.
+        let order: Vec<u32> = (0..5 * PART_NUMBERS as u32).rev().collect();
+        let part = |i: usize| {
+            let numbers = order.get(i * PART_NUMBERS..).unwrap_or(&[]);
+            numbers.iter().take(PART_NUMBERS).copied().filter(|&n| set.contains(n))
+        };
+        let sizes = each_part(order.len().div_ceil(PART_NUMBERS), &cancel, |i| Ok(part(i).count())).unwrap();
+        let mut out = Vec::with_capacity(numbers.len());
+        gather(&mut out, numbers.len(), &sizes, false, &cancel, part).unwrap();
+        assert_eq!(out, numbers.iter().rev().copied().collect::<Vec<_>>());
+    }
 }

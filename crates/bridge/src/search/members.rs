@@ -94,6 +94,13 @@ impl Members {
         self.iter_in(0..self.words.len())
     }
 
+    /// How many numbers the set holds in the words `words`.
+    pub fn count_in(&self, words: Range<usize>) -> usize {
+        let end = words.end.min(self.words.len());
+        let start = words.start.min(end);
+        self.words[start..end].iter().map(|w| w.load(Ordering::Relaxed).count_ones() as usize).sum()
+    }
+
     /// The numbers the set holds in the words `words`, ascending.
     pub fn iter_in(&self, words: Range<usize>) -> impl Iterator<Item = u32> + '_ {
         let end = words.end.min(self.words.len());
@@ -198,6 +205,7 @@ mod tests {
         assert_eq!(set.iter_in(1..2).collect::<Vec<_>>(), [64, 100]);
         assert_eq!(set.iter_in(2..9).collect::<Vec<_>>(), [128, 129]);
         assert_eq!(set.iter_in(5..9).count(), 0);
+        assert_eq!((set.count_in(1..2), set.count_in(0..9), set.count_in(7..9)), (2, 8, 0));
         assert_eq!(set.words(), 3);
         let added = Members::new(200).unwrap();
         {
