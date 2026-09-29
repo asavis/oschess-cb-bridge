@@ -94,8 +94,8 @@ pub fn taken() -> usize {
 }
 
 /// What a worker is given: its number and the number of workers, a flag that
-/// any worker raises when it fails and every worker checks between batches,
-/// and room for its batch buffer, already reserved.
+/// any worker raises when it fails or panics and every worker checks between
+/// batches, and room for its batch buffer, already reserved.
 pub struct Worker<'a> {
     pub index: usize,
     pub count: usize,
@@ -118,13 +118,29 @@ impl Worker<'_> {
     }
 }
 
+/// Raises the workers' stop flag as a worker panics, as a worker that fails
+/// raises it, before the pass waits for the workers to end: another worker
+/// waiting for what the panicked one would have made, as an index build's
+/// worker waits for its turn to write, then stops rather than waiting for
+/// ever, and the panic reaches the caller (#172).
+struct Unwinding<'a>(&'a AtomicBool);
+
+impl Drop for Unwinding<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Runs `task` on up to `want` workers, each with `workspace` bytes of buffer
 /// reserved in the budget, and returns their results in worker order. The
 /// workers it asks for take at most half the budget with their buffers and one
 /// [`step`] each of what they build, so the other half stays for the rest of
 /// what they build, and with little budget left it runs on fewer, down to one. When not even one buffer fits now, or a worker
 /// cannot be started, it answers `Busy`; a buffer larger than the whole budget
-/// is `TooLarge`. The first failure stops the other workers.
+/// is `TooLarge`. The first failure stops the other workers, and so does a
+/// worker's panic, which then reaches the caller once they have stopped.
 pub fn run<T: Send>(
     want: usize,
     workspace: usize,
@@ -160,6 +176,7 @@ pub fn run<T: Send>(
                 .name("bridge-search".into())
                 .stack_size(crate::THREAD_STACK)
                 .spawn_scoped(s, move || {
+                    let _bug = Unwinding(worker.stop);
                     crate::machine::follow(priority);
                     let result = task(&worker);
                     if result.is_err() {
