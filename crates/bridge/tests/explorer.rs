@@ -328,13 +328,21 @@ fn any_change_rebuilds_the_whole_index() {
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
     let progress = Progress::default();
     let first = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
-    assert_eq!(progress.phase(), "merging", "built");
+    assert_eq!(progress.phase(), "structures", "built");
     assert_eq!(first.lookup(key_after("")).unwrap().unwrap().lookup_move("e2e4"), Some(5));
+    // Where the build's time went, a pass at a time.
+    let timings = first.built.clone().unwrap();
+    assert_eq!(timings, progress.timings());
+    let passes = (timings.tree.len() as u64, timings.deep.len() as u64);
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(passes, (progress.tree_passes.load(relaxed), progress.deep_passes.load(relaxed)));
+    assert_eq!(passes, (1, 1));
     drop(first);
     // The same generation: the file on disk is used.
     let progress = Progress::default();
     let again = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
     assert_eq!(progress.phase(), "checking", "not built again");
+    assert!(again.built.is_none());
     drop((again, d));
     // Only a move changed, 1.e4 to 1.d4 in a record of the same length: every
     // header record is as before, and the new generation rebuilds it all.
@@ -344,7 +352,7 @@ fn any_change_rebuilds_the_whole_index() {
     let d = Database::open(db2.dir().join("db.2cbh")).unwrap();
     let progress = Progress::default();
     let moved = explorer::prepare(&d, 2, &dir, "db", &progress).unwrap();
-    assert_eq!(progress.phase(), "merging", "built again");
+    assert_eq!(progress.phase(), "structures", "built again");
     let start = moved.lookup(key_after("")).unwrap().unwrap();
     assert_eq!((start.lookup_move("e2e4"), start.lookup_move("d2d4")), (Some(4), Some(1)));
     drop((moved, d));
@@ -664,7 +672,7 @@ fn hops(n: usize) -> String {
 }
 
 /// Every position of every game is found, at any depth (#133): one game alone
-/// past the tree's pruning ply, one past its depth, one after captures that
+/// just past the tree's depth, one far past it, one after captures that
 /// leave the pawns as they were, two games reaching one position by different
 /// move orders; and a position of the same structure that no game reached is
 /// not.
@@ -689,7 +697,7 @@ fn every_position_of_every_game_is_found_at_any_depth() {
         explorer::deep(&idx, &board, &Cancel::never()).unwrap()
     };
 
-    // Ply 21, reached by game 1 alone: the tree dropped it.
+    // Ply 21, reached by game 1 alone, the first past the tree.
     let alone = find(&format!("{line7} e1g1")).unwrap();
     assert_eq!(alone.counts, Counts { games: 1, white: 0, draws: 1, black: 0 });
     assert_eq!(alone.lookup_move("d5c3"), Some(1));
@@ -769,16 +777,16 @@ fn a_crowded_bucket_is_counted_whole() {
 /// The tree's last ply lists the moves played from it, as every other does.
 #[test]
 fn the_moves_from_the_trees_last_ply_are_listed() {
-    let forty = format!("e2e4 e7e5 {}a2a3 a7a6", hops(9));
-    assert_eq!(forty.split_whitespace().count(), usize::from(explorer::format::MAX_PLY));
+    let last = format!("e2e4 e7e5 {}a2a3 a7a6", hops(4));
+    assert_eq!(last.split_whitespace().count(), usize::from(explorer::format::MAX_PLY));
     let mut b = Builder::new();
-    game(&mut b, &format!("{forty} h2h3"), 1, (2200, 2200));
-    game(&mut b, &format!("{forty} g2g3"), 0, (2100, 2100));
+    game(&mut b, &format!("{last} h2h3"), 1, (2200, 2200));
+    game(&mut b, &format!("{last} g2g3"), 0, (2100, 2100));
     b.lid(lid_header(1024, 1));
     let db = b.write("explorer-last-ply");
     let dir = index_dir("last-ply");
     let idx = prepared(&db, &dir);
-    let stats = idx.lookup(key_after(&forty)).unwrap().expect("two games reach it");
+    let stats = idx.lookup(key_after(&last)).unwrap().expect("two games reach it");
     assert_eq!(stats.counts.games, 2);
     assert_eq!(stats.lookup_move("h2h3"), Some(1));
     assert_eq!(stats.lookup_move("g2g3"), Some(1));
@@ -1001,6 +1009,54 @@ fn a_null_move_and_damage_end_a_line() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A database without records, and one whose only game the index leaves
+/// out, build an index of nothing, which answers every position with no
+/// games.
+#[test]
+fn a_database_without_indexed_games_builds_an_empty_index() {
+    let mut chess960 = Builder::new();
+    let mut board = Board::startpos();
+    let mut stream = vec![movetable::START_POSITION, 518, MOVES];
+    stream.extend(words(&mut board, "e2e4"));
+    stream.push(END_OF_LINE);
+    let at = chess960.moves(2, &stream);
+    chess960.game(at);
+    for (name, b) in [("empty", Builder::new()), ("chess960-only", chess960)] {
+        let db = b.write(&format!("explorer-{name}"));
+        let dir = index_dir(name);
+        let idx = prepared(&db, &dir);
+        assert_eq!((idx.games(), idx.base.header.keys, idx.base.header.blocks), (0, 0, 0), "{name}");
+        let start = Board::startpos();
+        assert_eq!(explorer::stats(&idx, &start, &Cancel::never()).unwrap(), None, "{name}");
+        drop(idx);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// A line longer than the stream keeps ends at its 65,535th ply, in the
+/// stream as in the index, whose passes replay it to there: its last
+/// position, past the tree, is found with no move from it.
+#[test]
+fn the_longest_line_is_replayed_to_its_end() {
+    // Knights out and back to ply 65,532, then 1.d4 Nf6 2.Bf4: the line's
+    // last position, at ply 65,535; 2...e6 is not kept.
+    let ucis = format!("{}d2d4 g8f6 c1f4 e7e6", hops(16_383));
+    let mut b = Builder::new();
+    game(&mut b, &ucis, 2, (2200, 2200));
+    b.lid(lid_header(1024, 1));
+    let db = b.write("explorer-longest-line");
+    let dir = index_dir("longest-line");
+    let idx = prepared(&db, &dir);
+    assert_eq!(idx.stream.entry(1).unwrap().plies, u16::MAX);
+    let last = board_after(&format!("{}d2d4 g8f6 c1f4", hops(16_383)));
+    assert!(idx.lookup(last.hash()).unwrap().is_none(), "past the tree");
+    let found = explorer::deep(&idx, &last, &Cancel::never()).unwrap().unwrap();
+    assert_eq!(found.counts, Counts { games: 1, white: 1, draws: 0, black: 0 });
+    assert!(found.moves.is_empty(), "the line ends there");
+    drop(idx);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A game in the three formats: its start (the standard one without), its
 /// moves in UCI with "--" for a null move, its result (0 black, 1 draw, 2
 /// white) and ratings.
@@ -1177,7 +1233,7 @@ fn every_format_gives_the_same_stream() {
 }
 
 /// The games of [`every_position_of_every_game_is_found_at_any_depth`]: one
-/// alone past the tree's pruning ply, and one past its depth.
+/// alone just past the tree's depth, and one far past it.
 fn deep_games(name: &str) -> TempDb {
     let line7 = "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5 g5e7 d8e7";
     let mut b = Builder::new();
@@ -1309,7 +1365,7 @@ fn files_from_different_builds_are_rebuilt() {
         std::fs::copy(other.join(name), dir.join(name)).unwrap();
         let progress = Progress::default();
         let again = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
-        assert_eq!(progress.phase(), "merging", "{name} of another build: built again");
+        assert_eq!(progress.phase(), "structures", "{name} of another build: built again");
         assert_eq!(again.stream.header.build_id, again.base.header.build_id);
         let alone = explorer::deep(&again, &board_after(&format!("e2e4 e7e5 {}d2d3", hops(15))), &Cancel::never());
         assert_eq!(alone.unwrap().unwrap().counts.games, 1);
@@ -1318,7 +1374,7 @@ fn files_from_different_builds_are_rebuilt() {
     std::fs::remove_file(dir.join("db.moves")).unwrap();
     let progress = Progress::default();
     drop(explorer::prepare(&d, 1, &dir, "db", &progress).unwrap());
-    assert_eq!(progress.phase(), "merging");
+    assert_eq!(progress.phase(), "structures");
     // Both as built: used as they are.
     let progress = Progress::default();
     drop(explorer::prepare(&d, 1, &dir, "db", &progress).unwrap());
@@ -1435,23 +1491,23 @@ fn code(uci: &str) -> u16 {
 /// A tree position that other games reach only beyond the tree's plies
 /// counts them too, each with the move it played from there (#146): counts
 /// add, moves add by code, most played first, then by code, and the notable
-/// games are the best of both. So does one the tree holds past its pruning
-/// ply, which two games reach within it. The start, which the long games
-/// reach again and again beyond the tree, counts each game once.
+/// games are the best of both. So does one deeper in the tree, which two
+/// games reach within it. The start, which the long games reach again and
+/// again up to the tree's last ply, counts each game once.
 #[test]
 fn a_tree_position_counts_the_games_that_reach_it_only_beyond_the_tree() {
-    let beyond = format!("{}e2e4 e7e5", hops(10));
-    // After 1.d4 d5 and 14 hops, 16. a3 a6: first reached at ply 32.
-    let late = format!("d2d4 d7d5 {}a2a3 a7a6", hops(7));
+    let beyond = format!("{}e2e4 e7e5", hops(5));
+    // After 1.d4 d5 and 4 hops, 6. a3 a6: first reached at ply 12.
+    let late = format!("d2d4 d7d5 {}a2a3 a7a6", hops(2));
     let mut b = Builder::new();
     game(&mut b, "e2e4 e7e5 g1f3", 2, (2400, 2400));
     game(&mut b, "e2e4 e7e5 f1c4", 1, (2200, 2200));
-    // Ply 42, after 40 plies of hops that never leave the start's structure.
+    // Ply 22, after 20 plies of hops that never leave the start's structure.
     game(&mut b, &format!("{beyond} g1f3"), 0, (2500, 2500));
     game(&mut b, &format!("{beyond} d2d4"), 2, (2300, 2300));
     game(&mut b, &format!("{late} c1f4"), 1, (2000, 2000));
     game(&mut b, &format!("{late} c2c4"), 1, (2000, 2000));
-    // Ply 44.
+    // Ply 24.
     game(&mut b, &format!("{}{late} e2e3", hops(3)), 2, (2100, 2100));
     b.lid(lid_header(1024, 1));
     let db = b.write("explorer-beyond");
@@ -1466,7 +1522,7 @@ fn a_tree_position_counts_the_games_that_reach_it_only_beyond_the_tree() {
     assert_eq!(all.moves[0].1, Counts { games: 2, white: 1, draws: 0, black: 1 }, "game 1's and game 3's");
     assert_eq!(all.top, vec![3, 1, 4, 2]);
 
-    // Held past ply 20, as two games reach it at ply 32; game 7 at ply 44.
+    // Two games reach it at ply 12; game 7 at ply 24.
     let board = board_after(&late);
     assert_eq!(idx.lookup(board.hash()).unwrap().unwrap().counts.games, 2);
     let all = explorer::stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
@@ -1527,8 +1583,8 @@ fn a_game_reaching_a_position_within_and_beyond_the_tree_counts_once() {
 }
 
 /// A set-up game is counted in a tree position it reaches from its own start
-/// only beyond the tree's plies, at ply 41, the first beyond them; one that
-/// reaches it within them, at ply 37, is counted by the tree alone (#146).
+/// only beyond the tree's plies, at ply 21, the first beyond them; one that
+/// reaches it within them, at ply 17, is counted by the tree alone (#146).
 #[test]
 fn a_set_up_game_reaching_a_tree_position_beyond_the_tree_is_counted() {
     // 1.e4 e5 2.Nf3, black to move, knights out and back from there.
@@ -1537,7 +1593,7 @@ fn a_set_up_game_reaching_a_tree_position_beyond_the_tree_is_counted() {
     let mut b = Builder::new();
     game(&mut b, "e2e4 e7e5 g1f3 g8f6 b1c3", 2, (2200, 2200));
     game(&mut b, "e2e4 e7e5 g1f3 g8f6 f3e5", 1, (2300, 2300));
-    for (cycles, next, result, elo) in [(10, "d2d3", 0u8, 2500i16), (9, "d2d4", 2, 0)] {
+    for (cycles, next, result, elo) in [(5, "d2d3", 0u8, 2500i16), (4, "d2d4", 2, 0)] {
         let at = b.moves(1, &move_words(Some(&fen), &format!("{}g8f6 {next}", cycle.repeat(cycles))));
         let rec = b.game(at);
         rec[0x58] = result;

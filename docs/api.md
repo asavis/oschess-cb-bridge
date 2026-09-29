@@ -712,11 +712,10 @@ the oschess analysis panel shows it like its Lichess tabs.
   a set-up position, without deleted games, guiding texts or analyses. A game whose move record is over
   2 MiB, the limit `games/{number}` serves, or cannot be read, is left out.
   `index` names the last record the index covers and the games it holds.
-- **How a position is found** (#133, #146). The index has two parts:
-  - **A tree** holds the positions reached within the first 40 plies, each
-    with its counts, moves and notable games, beyond ply 20 only those that
-    more than one game reached. It counts each game that reaches such a
-    position within those plies, however many share it.
+- **How a position is found** (#133, #146, #147). The index has two parts:
+  - **A tree** holds every position reached within the first 20 plies, each
+    with its counts, moves and notable games. It counts each game that
+    reaches such a position within those plies, however many share it.
   - **A deep section** holds, for every game, the structures its main line
     reaches beyond ply 20: a structure is each side's pawns and its pieces by
     kind, what only a pawn move or a capture changes. Neither is undone, so a
@@ -729,9 +728,9 @@ the oschess analysis panel shows it like its Lichess tabs.
 
   The answer for a position is the tree's, and the games of its structure
   that the tree did not count: all of them when the tree does not hold the
-  position, else those that first reach it beyond ply 40. A game that reaches
+  position, else those that first reach it beyond ply 20. A game that reaches
   it beyond ply 20 holds its structure there, so no game is missed, and a game
-  that reaches it within ply 40 is the tree's, however often it comes back, so
+  that reaches it within ply 20 is the tree's, however often it comes back, so
   none is counted twice. Their counts add, their moves add, and the notable
   games are the best of both.
 
@@ -757,17 +756,19 @@ the oschess analysis panel shows it like its Lichess tabs.
   that table, the request is answered `503 busy` and the next one tries again.
   Without such an index, the first request starts building it in the
   background: on at most half of the search workers, within
-  half of the search memory budget, which it never takes from searches (it
-  waits for memory searches hold), and one database at a time. It reads move
-  records only, a few megabytes at a time, never annotations. The notable
+  half of the search memory budget, which it never takes from searches (while
+  searches hold memory, it takes less and runs more passes, and it waits for
+  the least it needs), and one database at a time. It reads move records
+  only, a few megabytes at a time, never annotations. The notable
   games rendered for answers are kept for all databases together, within the
   budget (a 64th of it, at most 8 MiB), and searches that need the memory
   drop them. Until the index is ready, requests are answered
   `409 database_unavailable` with `state: "indexing"` and
   `progress: {"phase", "done", "total"}`, and only while a build runs or waits
-  to run; the phases are `checking` (records), `reading` (records) and
-  `merging` (entries). `/v1/status` lists the builds
-  under `indexing`. A build that fails is answered `503 index_unavailable` for
+  to run; the phases are `checking` (records), `reading` (records),
+  `positions` (the tree's entries) and `structures` (the deep section's
+  postings), and a client shows any other as it shows these (see
+  "Compatibility"). `/v1/status` lists the builds under `indexing`. A build that fails is answered `503 index_unavailable` for
   a minute, and the next request tries again.
 - **Changes.** The index belongs to the database's generation, and a change to
   the database rebuilds its index, about half a minute for the Mega Database
@@ -777,21 +778,29 @@ the oschess analysis panel shows it like its Lichess tabs.
   index from the games appended to a database is a possible later
   optimisation, only if its results can be shown equal to a build from
   nothing.
-- **Storage.** Index files live in the data folder's `index` folder, two per
+- **Storage.** Index files live in the bridge's index folder, two per
   database: the index (`<id>.idx`) and its move stream (`<id>.moves`),
-  built together; a PGN file's header index lives apart, in `pgn`
-  ([PGN files](#pgn-files)). `docs/format-notes.md`,
-  "Position index" and "Move stream", describes them. A file that is damaged
-  or of another version, or an index and a stream of different builds, are
-  rebuilt. The Mega Database's index takes about 2.2 GB, 0.85
-  GB of it the deep section, and its build needs about 11 GB of temporary
-  space there (`<id>.build`,
-  `<id>.idx.partial`). Its move stream takes 64 bytes a game and 2 bytes for
-  each ply past the 21st, written from its start to its end as
-  `<id>.moves.partial`, each game with a CRC checked whenever it is
-  replayed. The stream is mapped read-only: the operating system keeps as
-  much of it in memory as it can spare, outside the search memory. On Windows a build replaces a
-  stream still mapped by an answer in flight once that answer is done. When the bridge starts, after each change of the
+  built together. On Windows the folder is `%LOCALAPPDATA%\oschess
+  bridge\index`, apart from the data folder, since `%APPDATA%` roams with
+  the user's profile (#147); elsewhere, and wherever `OSCHESS_BRIDGE_HOME`
+  sets the data folder, it is the data folder's `index`. The heads and names
+  files of the databases' searches live there too; a PGN file's header index
+  lives in the data folder's `pgn` ([PGN files](#pgn-files)). A bridge that
+  keeps its indexes apart deletes, when it starts, the files it kept in the
+  data folder's `index` before, which a new version of the index would
+  rebuild anyway, and the folder once nothing else is in it.
+  `docs/format-notes.md`, "Position index" and "Move stream", describes the
+  files. A file that is damaged or of another version, or an index and a
+  stream of different builds, are rebuilt. A build needs no room but its
+  files': it writes them as `<id>.moves.partial` and `<id>.idx.partial`,
+  renamed at its end, and deletes the database's former files when it
+  starts. The move stream takes 64 bytes a game and 2 bytes for each ply
+  past the 21st, each game with a CRC checked whenever it is replayed; for
+  the Mega Database, some 2 GB, and its index about as much, 0.85 GB of it
+  the deep section. The stream is mapped read-only: the operating system
+  keeps as much of it in memory as it can spare, outside the search memory.
+  On Windows a build replaces a file still mapped by an answer in flight
+  once that answer is done. When the bridge starts, after each change of the
   database list, and at least once a minute while the list is asked for, the
   folder is swept (#60):
   - a build's leftovers go at once unless that build is running;

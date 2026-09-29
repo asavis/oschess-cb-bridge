@@ -1,7 +1,7 @@
 //! Where an index gets its games: the positions of each game's main line, as a
 //! small trait that each database format implements.
 
-use chesscore::{Board, Move};
+use chesscore::{Board, Move, Piece};
 
 use cbformat::game::{GameResult, RecordKind};
 use cbformat::movetable::{self, FIRST_CASTLE_960, MoveWord};
@@ -18,7 +18,7 @@ use crate::store::{Head, Store};
 
 /// The most structures a main line holds: each change of one is a pawn
 /// moving forward or a capture, so no line holds more.
-const MAX_STRUCTURES: usize = 8 * 6 * 2 + 30 + 1;
+pub(super) const MAX_STRUCTURES: usize = 8 * 6 * 2 + 30 + 1;
 
 /// One game's contribution to the index. Its main line is read to its end,
 /// or to [`MAX_PLIES`], where the move stream ends it.
@@ -28,11 +28,13 @@ pub struct Line {
     /// The average rating of the two players, or the one known; 0 with none.
     pub elo: u16,
     /// Each position the main line reaches within the index's plies, once,
-    /// with the move played from it (`NO_MOVE` at the end) and its ply.
+    /// with the move played from it (`NO_MOVE` at the end) and its ply: a
+    /// build counts them, and replays them from the move stream (#147).
     pub positions: Vec<(u64, u16, u8)>,
     /// The structures the main line holds past [`PRUNE_PLY`], each once, in
-    /// the order it reaches them. A structure never comes back once it
-    /// changed, so the last one is all a new one is compared with.
+    /// the order it reaches them, which a build counts as well. A structure
+    /// never comes back once it changed, so the last one is all a new one is
+    /// compared with.
     pub structures: Vec<u64>,
     /// The first of the structures that the line holds beyond the index's
     /// plies, which the ones after it follow; `None` when the line ends
@@ -52,6 +54,9 @@ pub struct Line {
     here: u64,
     here_structure: u64,
     home: u16,
+    /// The pawns and the men the structure noted last was found for, which
+    /// it stays while they do.
+    structure_of: Option<(u64, u32)>,
 }
 
 impl Line {
@@ -72,6 +77,7 @@ impl Line {
             here: 0,
             here_structure: 0,
             home: 0,
+            structure_of: None,
         }
     }
 
@@ -99,7 +105,13 @@ impl Line {
     fn at(&mut self, board: &Board, ply: u32) {
         self.here = board.hash();
         if ply > u32::from(PRUNE_PLY) {
-            self.here_structure = structure(board);
+            // Only a pawn's move or a capture changes a structure, and each
+            // changes the pawns or the men.
+            let now = (board.pieces(Piece::Pawn), board.occupied().count_ones());
+            if self.structure_of != Some(now) {
+                self.structure_of = Some(now);
+                self.here_structure = structure(board);
+            }
         }
         let home = stream::home_pawns(board);
         let mut left = self.home & !home;
@@ -167,7 +179,7 @@ struct Records {
 }
 
 impl Workspace {
-    /// What a workspace takes: the buffers, a line of at most 41 positions
+    /// What a workspace takes: the buffers, a line of at most 21 positions
     /// and its structures. Its words, once kept ([`Workspace::keep_words`]),
     /// are counted in [`stream::WORKER_BYTES`].
     pub const BYTES: usize = (RECORDS + 1)
@@ -225,6 +237,7 @@ impl Workspace {
                 here: 0,
                 here_structure: 0,
                 home: 0,
+                structure_of: None,
             },
             lexer: Lexer::new(),
             skipped: 0,
@@ -683,6 +696,7 @@ fn begin(line: &mut Line, r: &impl Head) {
     line.words.clear();
     line.setup = None;
     line.departures = Departures::default();
+    line.structure_of = None;
 }
 
 pub fn outcome(r: &impl Head) -> Outcome {

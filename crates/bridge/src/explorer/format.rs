@@ -2,7 +2,7 @@
 //! header, blocks of sorted keys each followed by the records they point to,
 //! and a table of the blocks; then the deep section (#133): blocks of
 //! structure buckets, each with the games that hold such a structure past
-//! [`PRUNE_PLY`], and their table. Every part is covered by a CRC-32, so a
+//! [`MAX_PLY`], and their table. Every part is covered by a CRC-32, so a
 //! torn or damaged file is rebuilt instead of misread.
 
 use chesscore::{Board, Color, Move, Piece, Square};
@@ -13,8 +13,9 @@ pub const MAGIC: [u8; 8] = *b"OSCBIDX\0";
 /// 2 added the deep section (#133); 3 the build id, which the move stream
 /// built with the index carries too (#145); 4 deep blocks of 256 buckets, and
 /// with each game its structure's print and whether it holds that structure
-/// beyond the tree's plies (#146).
-pub const VERSION: u32 = 4;
+/// beyond the tree's plies (#146); 5 the tree to ply 20 in full, its blocks
+/// ending where the build's parts of the keys end (#147).
+pub const VERSION: u32 = 5;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
@@ -32,12 +33,13 @@ pub const KEY_ENTRY: usize = 12;
 pub const BLOCK_ENTRY: usize = 28;
 /// The notable games kept per position.
 pub const TOP_GAMES: usize = 12;
-/// Positions reached in the first `MAX_PLY` plies are indexed, with the moves
-/// played from them.
-pub const MAX_PLY: u8 = 40;
-/// A position reached by one game only is dropped beyond this ply. Every
-/// position past it is found through the deep section as well.
-pub const PRUNE_PLY: u8 = 20;
+/// Positions reached in the first `MAX_PLY` plies are indexed, every one of
+/// them, with the moves played from them. Every position past it is found
+/// through the deep section.
+pub const MAX_PLY: u8 = 20;
+/// The ply beyond which a position reached by one game only would be
+/// dropped: the tree's depth, so that none is (#147).
+pub const PRUNE_PLY: u8 = MAX_PLY;
 /// Buckets per deep block: a lookup reads one block, a few KiB, and walks to
 /// its bucket.
 pub const DEEP_BLOCK_BITS: u8 = 8;
@@ -200,11 +202,16 @@ pub struct Counts {
 
 impl Counts {
     pub fn add(&mut self, outcome: Outcome) {
-        self.games += 1;
+        self.add_games(outcome, 1);
+    }
+
+    /// Adds `games` games that ended with `outcome`.
+    pub fn add_games(&mut self, outcome: Outcome, games: u64) {
+        self.games += games;
         match outcome {
-            Outcome::White => self.white += 1,
-            Outcome::Draw => self.draws += 1,
-            Outcome::Black => self.black += 1,
+            Outcome::White => self.white += games,
+            Outcome::Draw => self.draws += games,
+            Outcome::Black => self.black += games,
             Outcome::Other => {}
         }
     }
@@ -248,21 +255,7 @@ impl Stats {
     /// Appends the record: counts, moves (most played first), notable games,
     /// each number as an unsigned LEB128 varint.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let counts = |out: &mut Vec<u8>, c: &Counts| {
-            for v in [c.games, c.white, c.draws, c.black] {
-                varint(out, v);
-            }
-        };
-        counts(out, &self.counts);
-        varint(out, self.moves.len() as u64);
-        for (code, c) in &self.moves {
-            out.extend(code.to_le_bytes());
-            counts(out, c);
-        }
-        varint(out, self.top.len() as u64);
-        for &g in &self.top {
-            varint(out, u64::from(g));
-        }
+        encode_record(out, &self.counts, &self.moves, self.top.iter().copied());
     }
 
     /// The record at the start of `b`, in an index of `games` games; `None`
@@ -296,6 +289,31 @@ impl Stats {
             top.push(u32::try_from(read_varint(b, &mut at)?).ok()?);
         }
         Some(Stats { counts: total, moves, top })
+    }
+}
+
+/// Appends the record of a position with `counts`, `moves` in their order
+/// and the notable games `top`, as [`Stats::encode`] does.
+pub fn encode_record(
+    out: &mut Vec<u8>,
+    counts: &Counts,
+    moves: &[(u16, Counts)],
+    top: impl ExactSizeIterator<Item = u32>,
+) {
+    let put = |out: &mut Vec<u8>, c: &Counts| {
+        for v in [c.games, c.white, c.draws, c.black] {
+            varint(out, v);
+        }
+    };
+    put(out, counts);
+    varint(out, moves.len() as u64);
+    for (code, c) in moves {
+        out.extend(code.to_le_bytes());
+        put(out, c);
+    }
+    varint(out, top.len() as u64);
+    for g in top {
+        varint(out, u64::from(g));
     }
 }
 
@@ -391,15 +409,45 @@ pub fn deep_bits(records: u32) -> u8 {
 /// that hold its structure (#133). The pieces split what the pawns alone
 /// share widely: every pawnless ending has one pawn structure.
 pub fn structure(board: &Board) -> u64 {
-    let white = board.colored(Piece::Pawn, Color::White);
-    let black = board.colored(Piece::Pawn, Color::Black);
     let mut pieces = 0u64;
-    for (i, piece) in [Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen].into_iter().enumerate() {
-        // At most ten of a kind, two and eight promoted pawns: four bits.
-        pieces |= u64::from(board.colored(piece, Color::White).count_ones()) << (8 * i);
-        pieces |= u64::from(board.colored(piece, Color::Black).count_ones()) << (8 * i + 4);
+    for (i, piece) in STRUCTURE_PIECES.into_iter().enumerate() {
+        for color in [Color::White, Color::Black] {
+            pieces += u64::from(board.colored(piece, color).count_ones()) << piece_shift(i, color);
+        }
     }
+    let pawns = |color| board.colored(Piece::Pawn, color);
+    structure_of(pawns(Color::White), pawns(Color::Black), pieces)
+}
+
+/// The pieces a structure counts, by kind, in the order of their counts.
+pub const STRUCTURE_PIECES: [Piece; 4] = [Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen];
+
+/// Where the count of `color`'s pieces of kind `i` of [`STRUCTURE_PIECES`]
+/// lies among a structure's counts: four bits each, which hold at most ten
+/// of a kind, two and eight promoted pawns, and the fifteen of a set-up
+/// position.
+pub fn piece_shift(i: usize, color: Color) -> u32 {
+    8 * i as u32 + if color == Color::White { 0 } else { 4 }
+}
+
+/// The structure of white pawns `white`, black pawns `black` and the pieces
+/// counted `pieces` ([`piece_shift`]), as [`structure`] gives a board's: a
+/// build follows the three through a line's words without a board.
+pub fn structure_of(white: u64, black: u64, pieces: u64) -> u64 {
     mix(white ^ mix(black ^ mix(pieces ^ 0x9e37_79b9_7f4a_7c15)))
+}
+
+/// The bits of a key that name its part for a database of `records`
+/// records: about 256 records a part, from 16 to 65,536 parts. A build
+/// writes the tree part by part, on its workers at once, and a block of the
+/// tree ends where a part ends (#147).
+pub fn part_bits(records: u32) -> u8 {
+    deep_bits(records).saturating_sub(DEEP_BLOCK_BITS).clamp(4, 16)
+}
+
+/// The part of the keys, of `bits` bits, that `key` lies in.
+pub fn part_of(key: u64, bits: u8) -> usize {
+    (key >> (64 - u32::from(bits))) as usize
 }
 
 /// The bucket of `structure` among `1 << bits`.

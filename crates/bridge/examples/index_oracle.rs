@@ -6,7 +6,8 @@
 //! cargo run --release -p bridge --example index_oracle -- <db.2cbh> <index dir> [positions] [seed] [--keep]
 //! ```
 //!
-//! 1. Builds the index cold, timing it and reading the process's peak memory.
+//! 1. Builds the index cold, timing it, each of its phases and passes too,
+//!    and reading the process's peak memory.
 //! 2. Samples positions: a seeded choice of a ply from 0 to [`SAMPLE_PLIES`],
 //!    then of a game whose main line reaches it, 2,000 positions unless told.
 //! 3. Counts every sampled position over the whole database by walking each
@@ -259,24 +260,35 @@ fn main() {
     // With `--keep`, an index built before is checked and reused, as the
     // bridge does; otherwise it is built afresh.
     if !args.iter().any(|a| a == "--keep") {
-        let _ = std::fs::remove_file(dir.join("oracle.idx"));
+        let (index, stream) = explorer::paths(dir, "oracle");
+        let _ = std::fs::remove_file(index);
+        let _ = std::fs::remove_file(stream);
     }
     let progress = Progress::default();
     let t = Instant::now();
     let loaded = explorer::prepare(&db, 0, dir, "oracle", &progress).expect("build");
     let build_s = t.elapsed().as_secs_f64();
-    let size = std::fs::metadata(&loaded.base.path).map(|m| m.len()).unwrap_or(0);
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
     println!("records {n}");
     println!("games indexed {}", loaded.games());
+    println!("games left out (move record unreadable or over 2 MiB) {}", progress.skipped.load(relaxed));
+    println!("positions within ply {MAX_PLY} {}", loaded.base.header.keys);
+    println!("deep postings {}", loaded.base.header.deep_postings);
     println!(
-        "games left out (move record unreadable or over 2 MiB) {}",
-        progress.skipped.load(std::sync::atomic::Ordering::Relaxed)
+        "passes: tree {}, deep section {}",
+        progress.tree_passes.load(relaxed),
+        progress.deep_passes.load(relaxed)
     );
-    println!("entries (game, position) {}", progress.total.load(std::sync::atomic::Ordering::Relaxed));
-    println!("distinct positions {}", progress.positions.load(std::sync::atomic::Ordering::Relaxed));
-    println!("positions kept {}", loaded.base.header.keys);
-    println!("index file {:.1} MB", size as f64 / 1e6);
+    println!("index file {} bytes, move stream {} bytes", size(&loaded.base.path), size(&loaded.stream.path));
     println!("cold build {build_s:.1} s, peak RSS {} MB", peak_rss_mb());
+    let timings = progress.timings();
+    println!("build phases: {timings}");
+    for (name, passes) in [("tree", &timings.tree), ("deep section", &timings.deep)] {
+        let each: Vec<String> =
+            passes.iter().map(|p| format!("{:.2}+{:.2}", p.replay.as_secs_f64(), p.write.as_secs_f64())).collect();
+        println!("  {name} passes, replay+write s: {}", each.join(" "));
+    }
 
     // Sample positions: a random ply, then a random game whose main line
     // reaches it, so that every ply is sampled as often.

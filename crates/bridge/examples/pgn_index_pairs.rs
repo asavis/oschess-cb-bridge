@@ -106,8 +106,8 @@ fn main() {
     println!("first differing games {first:?}");
     let _ = std::fs::remove_file(&head);
     for id in ["pairs-2cbh", "pairs-pgn"] {
-        let (file, work) = explorer::paths(dir, id);
+        let (file, stream) = explorer::paths(dir, id);
         let _ = std::fs::remove_file(file);
-        let _ = std::fs::remove_dir_all(work);
+        let _ = std::fs::remove_file(stream);
     }
 }

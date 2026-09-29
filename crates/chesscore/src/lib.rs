@@ -13,7 +13,7 @@ mod fen;
 mod movegen;
 mod setup;
 mod types;
-mod zobrist;
+pub mod zobrist;
 
 pub use board::{Board, CastleSide, IllegalMove, Replayer};
 pub use fen::FenError;

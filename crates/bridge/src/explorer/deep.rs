@@ -1,6 +1,6 @@
 //! The deep section of an index (#133): for each bucket of structures
 //! ([`super::format::structure`]), the games whose main line holds a
-//! structure of that bucket past [`super::format::PRUNE_PLY`], each with the
+//! structure of that bucket past [`super::format::MAX_PLY`], each with the
 //! structure's print ([`deep_print`]) and marked when the game holds it
 //! beyond the tree's plies. The tree counts the games that reach a position
 //! it holds within its plies; any other game that reaches a position is
@@ -9,45 +9,68 @@
 //! reaches it, so only the games with the structure's print are replayed,
 //! and for a position the tree holds only those marked.
 //!
-//! A build hands each worker's postings ([`posting`]) to a [`Sink`], which
-//! spreads them over partition files by the bucket's top bits.
-//! [`write_section`] then sorts one partition at a time, in memory when it
-//! fits the build's share and in chunks on disk when not, and writes its
-//! buckets in order: per block of [`BLOCK_BUCKETS`] buckets, each bucket's
+//! A build writes the section in passes over the move stream it has just
+//! written (#147), a range of buckets at a time, as many as the build's share
+//! of the budget holds. Each worker replays the whole lines of the games it
+//! takes, following only their structures through the move words
+//! ([`Tracker`]), and keeps the postings ([`posting`]) of the pass's buckets in
+//! a buffer of its own, sorted and freed of repeats when it fills; when that
+//! leaves too little room, the pass ends at an earlier bucket for every
+//! worker, or, when the pass's first bucket alone fills the room, at a game
+//! of that bucket, and the next pass goes on with the bucket's later games.
+//! The workers then take the pass's blocks in order, each merging one
+//! block's postings from every buffer, and write them once the blocks before
+//! have been placed: per block of [`BLOCK_BUCKETS`] buckets, each bucket's
 //! posting count and its postings by game, then print, each a varint of the
 //! game's difference from the one before, shifted left by eight, the print
-//! and the mark; the block covered by a CRC-32 in the section's table.
+//! and the mark; the block covered by a CRC-32 in the section's table. A
+//! pass may end inside a block, and inside a bucket, which the next one goes
+//! on with: the bucket's count is the one its first pass counted, and its
+//! postings go on from the game written last, so that any number of passes
+//! writes the same bytes.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+use chesscore::{Board, Color, Piece};
+
+use cbformat::movetable::{self, Captured, FIRST_CASTLE_960, MoveWord};
 
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
-use crate::search::memory::Hold;
+use crate::search::memory::{Cancel, Refused};
+use crate::search::workers::{self, threads};
 
+use super::build::{Chunks, Out, PLANNED, Turns, corrupt, from_bad};
 use super::format::{
-    DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_DEEP_BITS, PRINT_BITS, deep_bucket, deep_print, read_varint, varint,
+    DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, PRUNE_PLY, STRUCTURE_PIECES, deep_bucket, deep_print,
+    piece_shift, read_varint, structure_of, varint,
 };
-use super::runs::{Progress, io, reserve};
+use super::runs::{Limits, PassTime, Progress, Room};
+use super::source::MAX_STRUCTURES;
+use super::stream::{self, Stream};
 
 /// Buckets per block.
 pub const BLOCK_BUCKETS: usize = 1 << DEEP_BLOCK_BITS;
-/// The most partitions a build spreads its postings over.
-const MAX_PART_BITS: u8 = 8;
-/// A partition's fewest buckets, 4,096, whole blocks, so that a small
-/// database's build keeps few files open.
-const MIN_PART_BUCKET_BITS: u8 = 12;
-/// A worker's postings kept before they go to the partitions.
-pub const WORKER_POSTINGS: usize = 1 << 17;
-/// What a worker's postings take.
-pub const WORKER_BYTES: usize = WORKER_POSTINGS * 8;
-
-/// What each partition file's writer buffers.
-const PART_BUFFER: usize = 4 << 10;
+/// The least room a worker's postings take: twice a game's most, so that a
+/// pass that ends at a game keeps some.
+const MIN_WORKER_POSTINGS: usize = 2 * MAX_STRUCTURES;
+/// The bytes of blocks a worker makes and hands over at once at most, and
+/// its share of those kept until their turn to be written comes: a piece is
+/// handed over once it holds half of it, even inside a bucket, and so never
+/// grows past it.
+const OUT_BYTES: usize = 1 << 20;
+/// The postings of a bucket gathered to be sorted, at most.
+const GATHERED: usize = 4096;
+/// What a worker holds besides its postings: the bytes it makes, its share
+/// of those kept, and a block's buffers to merge.
+pub const WORKER_BYTES: usize = 2 * OUT_BYTES + (1 << 10) + 8 * GATHERED;
+/// The bits of a game in a point of the section: `bucket << 32 | game`,
+/// where a pass starts and ends. A bucket's first point is its game 0, which
+/// no game is.
+const GAME_BITS: u32 = 32;
 
 /// Game `game` holds `structure`, of a bucket of `bits` bits, `beyond` the
 /// tree's plies or only within them: `bucket << 40 | game << 8 | print << 1`,
@@ -64,475 +87,628 @@ fn bucket_of(p: u64) -> u64 {
     p >> 40
 }
 
+/// A posting's bucket and game: the point it lies at.
+fn point(p: u64) -> u64 {
+    p >> 8
+}
+
+/// A posting's game.
+fn game_of(p: u64) -> u64 {
+    p >> 8 & 0xffff_ffff
+}
+
 /// A posting's bucket, game and print, apart from its mark.
 fn place(p: u64) -> u64 {
     p >> 1
 }
 
-/// The postings of one build, spread over partition files by bucket.
-pub struct Sink {
-    bits: u8,
-    part_bits: u8,
-    parts: Vec<Mutex<Partition>>,
-    /// The partition files' buffers, held until [`Sink::finish`].
-    _memory: Hold,
+/// The first point of block `block`.
+fn block_point(block: u64) -> u64 {
+    block << (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)
 }
 
-struct Partition {
-    path: PathBuf,
-    out: BufWriter<File>,
-    postings: u64,
+/// What a move word does to a structure, from the move table, in 64 bits,
+/// so that a word is played without a branch: the square a pawn leaves
+/// (bits 0-5), the square it reaches (6-11), whether the word names a move
+/// (12), a black one (13), whether a pawn leaves its square (14) and reaches
+/// the other one (15), the square of a pawn it takes (16-21) and whether it
+/// takes one (22), whether the structure changes (23), and the change to the
+/// pieces' counts (32-63, signed): a piece taken, a pawn promoted.
+#[derive(Clone, Copy, Default)]
+struct Effect(u64);
+
+const MOVE: u64 = 1 << 12;
+
+/// The effect of each word below the Chess960 castlings.
+fn effects() -> &'static [Effect] {
+    static EFFECTS: OnceLock<Vec<Effect>> = OnceLock::new();
+    EFFECTS.get_or_init(|| {
+        let kind = |p: movetable::Piece| match p {
+            movetable::Piece::Knight => 0,
+            movetable::Piece::Bishop => 1,
+            movetable::Piece::Rook => 2,
+            _ => 3,
+        };
+        (0..FIRST_CASTLE_960)
+            .map(|word| match movetable::decode(word) {
+                Some(MoveWord::Normal { color, piece, from, to, captured, promotion }) => {
+                    let (us, them) = match color {
+                        movetable::Color::White => (Color::White, Color::Black),
+                        movetable::Color::Black => (Color::Black, Color::White),
+                    };
+                    let pawn = piece == movetable::Piece::Pawn;
+                    let (from, to) = (u64::from(from & 63), u64::from(to & 63));
+                    // The pawn taken en passant stands beside the one that
+                    // takes it: on the rank it leaves, the file it reaches.
+                    let taken_pawn = match captured {
+                        Captured::Pawn => Some(to),
+                        Captured::EnPassant => Some(from & 56 | to & 7),
+                        _ => None,
+                    };
+                    let taken_piece = match captured {
+                        Captured::Knight => Some(movetable::Piece::Knight),
+                        Captured::Bishop => Some(movetable::Piece::Bishop),
+                        Captured::Rook => Some(movetable::Piece::Rook),
+                        Captured::Queen => Some(movetable::Piece::Queen),
+                        _ => None,
+                    };
+                    let mut delta = 0i64;
+                    if let Some(p) = taken_piece {
+                        delta -= 1 << piece_shift(kind(p), them);
+                    }
+                    if let Some(p) = promotion.filter(|_| pawn) {
+                        delta += 1 << piece_shift(kind(p), us);
+                    }
+                    let changes = pawn || captured != Captured::Nothing;
+                    Effect(
+                        from | to << 6
+                            | MOVE
+                            | u64::from(us == Color::Black) << 13
+                            | u64::from(pawn) << 14
+                            | u64::from(pawn && promotion.is_none()) << 15
+                            | taken_pawn.unwrap_or(0) << 16
+                            | u64::from(taken_pawn.is_some()) << 22
+                            | u64::from(changes) << 23
+                            | (delta as i32 as u32 as u64) << 32,
+                    )
+                }
+                Some(MoveWord::Castle { .. }) => Effect(MOVE),
+                _ => Effect::default(),
+            })
+            .collect()
+    })
 }
 
-impl Sink {
-    /// Partition files in `dir` for buckets of `bits` bits, their buffers
-    /// held in the search budget first.
-    pub fn create(dir: &Path, bits: u8, progress: &Progress) -> Result<Sink, SearchError> {
-        let part_bits = MAX_PART_BITS.min(bits.saturating_sub(MIN_PART_BUCKET_BITS));
-        let memory = reserve((1 << part_bits) * PART_BUFFER, progress)?;
-        let mut parts = Vec::new();
-        for p in 0..1usize << part_bits {
-            let path = dir.join(format!("deep-{p}"));
-            let out = BufWriter::with_capacity(PART_BUFFER, File::create(&path).map_err(|e| io(&path, e))?);
-            parts.push(Mutex::new(Partition { path, out, postings: 0 }));
-        }
-        Ok(Sink { bits, part_bits, parts, _memory: memory })
-    }
+/// A line's structure followed through its move words alone: each side's
+/// pawns and its pieces counted by kind, as [`super::format::structure`]
+/// hashes them. A word names the piece it moves, what it takes and what a
+/// pawn becomes, and the stream's words were checked when it was written, so
+/// no board is needed.
+#[derive(Clone, Copy, Debug)]
+pub struct Tracker {
+    pawns: [u64; 2],
+    pieces: u64,
+    effects: &'static [Effect],
+}
 
-    pub fn bits(&self) -> u8 {
-        self.bits
+impl PartialEq for Tracker {
+    fn eq(&self, other: &Tracker) -> bool {
+        (self.pawns, self.pieces) == (other.pawns, other.pieces)
     }
+}
 
-    /// What the partition files' buffers hold in the search budget.
-    pub fn bytes(&self) -> usize {
-        self.parts.len() * PART_BUFFER
+impl std::fmt::Debug for Effect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Effect({:#x})", self.0)
     }
+}
 
-    /// Takes a worker's postings, emptying `postings`.
-    pub fn add(&self, postings: &mut Vec<u64>) -> Result<(), SearchError> {
-        postings.sort_unstable();
-        let shift = 40 + u32::from(self.bits - self.part_bits);
-        let mut rest = &postings[..];
-        while let Some(&first) = rest.first() {
-            let part = (first >> shift) as usize;
-            let n = rest.partition_point(|&p| (p >> shift) as usize == part);
-            let mut target = self.parts[part].lock().unwrap_or_else(|e| e.into_inner());
-            let Partition { path, out, postings: count } = &mut *target;
-            for p in &rest[..n] {
-                out.write_all(&p.to_le_bytes()).map_err(|e| io(path, e))?;
+impl Tracker {
+    pub fn of(board: &Board) -> Tracker {
+        let mut pieces = 0u64;
+        for (i, piece) in STRUCTURE_PIECES.into_iter().enumerate() {
+            for color in [Color::White, Color::Black] {
+                pieces += u64::from(board.colored(piece, color).count_ones()) << piece_shift(i, color);
             }
-            *count += n as u64;
-            rest = &rest[n..];
         }
-        postings.clear();
-        Ok(())
+        let pawns = |color| board.colored(Piece::Pawn, color);
+        Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, effects: effects() }
     }
 
-    /// Closes the partition files: each one's path and postings, in bucket order.
-    pub fn finish(self) -> Result<Vec<(PathBuf, u64)>, SearchError> {
-        let mut done = Vec::new();
-        let Sink { parts, _memory, .. } = self;
-        for part in parts {
-            let Partition { path, out, postings } = part.into_inner().unwrap_or_else(|e| e.into_inner());
-            out.into_inner().map_err(|e| io(&path, e.into_error()))?;
-            done.push((path, postings));
+    /// Plays `word`: whether the structure may have changed, which only a
+    /// pawn's move or a capture does; `None` for a word that names no move
+    /// of standard chess.
+    #[inline]
+    pub fn play(&mut self, word: u16) -> Option<bool> {
+        let e = self.effects.get(usize::from(word))?.0;
+        if e & MOVE == 0 {
+            return None;
         }
-        Ok(done)
+        // Both sides' pawns at once, without a branch or an index, so that
+        // they stay in registers: all ones in `black` when black moves.
+        let black = (e >> 13 & 1).wrapping_neg();
+        let taken = (e >> 22 & 1) << (e >> 16 & 63);
+        let left = (e >> 14 & 1) << (e & 63);
+        let reached = (e >> 15 & 1) << (e >> 6 & 63);
+        let [white_pawns, black_pawns] = self.pawns;
+        self.pawns = [
+            white_pawns & !(left & !black | taken & black) | reached & !black,
+            black_pawns & !(left & black | taken & !black) | reached & black,
+        ];
+        self.pieces = self.pieces.wrapping_add((e >> 32) as u32 as i32 as i64 as u64);
+        Some(e >> 23 & 1 != 0)
+    }
+
+    pub fn structure(&self) -> u64 {
+        structure_of(self.pawns[0], self.pawns[1], self.pieces)
     }
 }
 
-/// Block bytes gathered before they are written.
-const PENDING: usize = 64 << 10;
-/// What writing the section holds whatever the postings: the block bytes
-/// gathered, a block's bucket counts and the table at its largest.
-pub const FIXED_BYTES: usize =
-    PENDING + BLOCK_BUCKETS * 8 + (1 << (MAX_DEEP_BITS - DEEP_BLOCK_BITS)) * DEEP_BLOCK_ENTRY;
-/// The buffer of a sorted chunk's writer, and of the merged file's.
-const CHUNK_WRITER: usize = 64 << 10;
-/// What a partition is read through.
-const READ_BUFFER: usize = 64 << 10;
-/// The least a merge reads at a time from each sorted chunk.
-const MIN_BUFFER: usize = 4 << 10;
-/// The least memory the section is written in: its fixed part, and room to
-/// sort and merge at least two chunks.
-pub const MIN_MEMORY: usize = FIXED_BYTES + CHUNK_WRITER + READ_BUFFER + 2 * (MIN_BUFFER + 16);
+/// The deep section as written: its postings, and where its table is.
+pub(super) struct Section {
+    pub postings: u64,
+    pub table_offset: u64,
+    pub table_crc: u32,
+}
 
-/// Writes the section's blocks to `out`, which is at `offset` in the index
-/// file, from `parts` in bucket order, each removed once written, holding at
-/// most `memory` bytes of the search budget at once. A partition whose
-/// postings fit is sorted in memory; a larger one in sorted chunks on disk,
-/// merged into one file that its blocks are then read from. Returns the table
-/// of blocks and the postings kept, a game once per structure print in a
-/// bucket, marked when any of its postings there is.
-pub fn write_section(
-    parts: &[(PathBuf, u64)],
+/// Writes the deep section of the games in `stream` to `out`, of buckets of
+/// `bits` bits, then its table, within `share` bytes of the budget: `counts`
+/// holds the postings of each block as the stream's pass counted them.
+/// Returns the postings kept, a game once per structure print in a bucket,
+/// marked when any of its postings there is.
+pub(super) fn write(
+    stream: &Stream,
+    counts: &[u64],
     bits: u8,
-    out: &mut impl Write,
-    offset: u64,
-    target: &Path,
+    out: &mut Out,
     progress: &Progress,
-    memory: usize,
-) -> Result<(Vec<u8>, u64), SearchError> {
-    let room = memory.checked_sub(FIXED_BYTES).filter(|_| memory >= MIN_MEMORY).ok_or(SearchError::TooLarge)?;
-    let _fixed = reserve(FIXED_BYTES, progress)?;
-    let blocks = 1usize << (bits - DEEP_BLOCK_BITS);
-    let blocks_per_part = blocks / parts.len().max(1);
-    let mut w = Blocks {
-        out,
-        target,
-        offset,
-        table: Vec::with_capacity(blocks * DEEP_BLOCK_ENTRY),
-        pending: Vec::with_capacity(PENDING),
-        start: offset,
-        crc: !0,
-    };
-    let mut kept = 0u64;
-    for (p, (path, postings)) in parts.iter().enumerate() {
-        let first = p * blocks_per_part;
-        if postings.saturating_mul(8) <= (room - READ_BUFFER) as u64 {
-            let _memory = reserve(*postings as usize * 8 + READ_BUFFER, progress)?;
-            let mut all = read_postings(path, *postings)?;
-            let _ = std::fs::remove_file(path);
-            all.sort_unstable();
-            all.dedup_by_key(|p| place(*p));
-            kept += all.len() as u64;
-            w.write_slice(&all, first, blocks_per_part, path)?;
-        } else {
-            let sorted = merged_path(path);
-            let written = sort_on_disk(path, *postings, room, progress).and_then(|count| {
-                let _ = std::fs::remove_file(path);
-                let _memory = reserve(room, progress)?;
-                w.write_file(&sorted, count, first, blocks_per_part, room / 2)
-            });
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(&sorted);
-            kept += written?;
+    share: usize,
+    limits: &Limits,
+) -> Result<Section, SearchError> {
+    progress.start("structures", counts.iter().sum());
+    let table_bytes = counts.len() * DEEP_BLOCK_ENTRY;
+    // Half the workers at most, as many as the share holds beside a quarter
+    // of it for the postings, one at least.
+    let games = stream.header.records();
+    let fit = (share.saturating_sub(table_bytes) / 4 * 3 / WORKER_BYTES).max(1);
+    let want = threads().div_ceil(2).min(games.div_ceil(64) as usize).min(fit).max(1);
+    let room = share.checked_sub(table_bytes + want * WORKER_BYTES).ok_or(SearchError::TooLarge)?;
+    let room = room.min(limits.pass_bytes.unwrap_or(usize::MAX));
+    let least = MIN_WORKER_POSTINGS * 8;
+    if room < least {
+        return Err(SearchError::TooLarge);
+    }
+    let (_memory, want, room) =
+        Room { fixed: table_bytes, each: WORKER_BYTES, workers: want, least, room }.reserve(progress)?;
+    let capacity = room / 8;
+    let want = want.min(capacity / MIN_WORKER_POSTINGS);
+    let mut table = Vec::new();
+    table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
+    let mut sink = Sink { at: out.offset, table, start: 0, crc: !0, postings: 0 };
+    let (mut lo, mut split) = (0, Split::default());
+    while lo < block_point(counts.len() as u64) {
+        // As many blocks as the room holds, but for a little, one at least,
+        // the one the last pass ended in counted whole.
+        let mut end = (lo >> (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)) as usize;
+        let first = end;
+        let mut planned = 0;
+        while end < counts.len() && (end == first || planned + counts[end] <= (capacity * PLANNED / 100) as u64) {
+            planned += counts[end];
+            end += 1;
         }
+        let hi = AtomicU64::new(block_point(end as u64));
+        progress.deep_passes.fetch_add(1, Ordering::Relaxed);
+        let rest = AtomicU64::new(0);
+        let pass = Pass { stream, bits, lo, hi: &hi, split, rest, capacity, planned, progress };
+        let started = Instant::now();
+        let buffers = pass.collect(want)?;
+        let replayed = Instant::now();
+        let hi = hi.load(Ordering::Relaxed);
+        split = write_blocks(&buffers, &pass, hi, counts, &mut sink, out, want)?.unwrap_or_default();
+        out.sync_behind();
+        let time = PassTime { replay: replayed - started, write: replayed.elapsed() };
+        progress.time(|t| t.deep.push(time));
+        lo = hi;
     }
-    Ok((w.table, kept))
+    out.offset = sink.at;
+    let table_offset = out.offset;
+    out.put(&sink.table)?;
+    Ok(Section { postings: sink.postings, table_offset, table_crc: !crc32_update(!0, &sink.table) })
 }
 
-/// The blocks as they are written: each block's bytes go out as they come,
-/// and its offset, length and CRC go to the table once it ends.
-struct Blocks<'a, W: Write> {
-    out: &'a mut W,
-    target: &'a Path,
-    offset: u64,
-    table: Vec<u8>,
-    pending: Vec<u8>,
-    start: u64,
-    crc: u32,
+/// One pass: the points ([`GAME_BITS`]) from `lo` to `hi`, `hi` lowered by a
+/// worker whose postings do not fit.
+struct Pass<'a> {
+    stream: &'a Stream,
+    bits: u8,
+    lo: u64,
+    hi: &'a AtomicU64,
+    /// Where the pass before ended, when inside the bucket that `lo` lies
+    /// in.
+    split: Split,
+    /// The postings of the bucket that `lo` lies in from `lo` on, each once,
+    /// whatever the pass ends at: the bucket's count when the pass starts it.
+    rest: AtomicU64,
+    /// The postings all workers' buffers hold together, and those planned.
+    capacity: usize,
+    planned: u64,
+    progress: &'a Progress,
 }
 
-impl<W: Write> Blocks<'_, W> {
-    fn begin(&mut self) {
-        self.start = self.offset;
-        self.crc = !0;
-    }
-
-    fn put(&mut self, v: u64) -> Result<(), SearchError> {
-        varint(&mut self.pending, v);
-        // A varint takes ten bytes at most: the room reserved is never passed.
-        if self.pending.len() + 10 > PENDING {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Puts posting `x` of a bucket whose game before was `last`, which is
-    /// 0 for its first: the game as its difference, shifted left by eight,
-    /// the structure's print in bits 1-7, and 1 in bit 0 when the game holds
-    /// it beyond the tree's plies. Returns the game.
-    fn put_game(&mut self, x: u64, last: u64) -> Result<u64, SearchError> {
-        let game = x >> 8 & 0xffff_ffff;
-        self.put((game - last) << 8 | x & 0xfe | !x & 1)?;
-        Ok(game)
-    }
-
-    fn flush(&mut self) -> Result<(), SearchError> {
-        self.out.write_all(&self.pending).map_err(|e| io(self.target, e))?;
-        self.crc = crc32_update(self.crc, &self.pending);
-        self.offset += self.pending.len() as u64;
-        self.pending.clear();
-        Ok(())
-    }
-
-    fn end(&mut self) -> Result<(), SearchError> {
-        self.flush()?;
-        let len = u32::try_from(self.offset - self.start).map_err(|_| SearchError::TooLarge)?;
-        self.table.extend(self.start.to_le_bytes());
-        self.table.extend(len.to_le_bytes());
-        self.table.extend((!self.crc).to_le_bytes());
-        Ok(())
-    }
-
-    /// Blocks `first..first + count` from a partition's sorted postings.
-    fn write_slice(&mut self, all: &[u64], first: usize, count: usize, path: &Path) -> Result<(), SearchError> {
-        let mut rest = all;
-        for b in first..first + count {
-            let first_bucket = (b * BLOCK_BUCKETS) as u64;
-            self.begin();
-            for bucket in first_bucket..first_bucket + BLOCK_BUCKETS as u64 {
-                let n = rest.partition_point(|&x| bucket_of(x) == bucket);
-                self.put(n as u64)?;
-                let mut last = 0u64;
-                for &x in &rest[..n] {
-                    last = self.put_game(x, last)?;
-                }
-                rest = &rest[n..];
-            }
-            self.end()?;
-        }
-        if !rest.is_empty() {
-            return Err(outside(path));
-        }
-        Ok(())
-    }
-
-    /// Blocks `first..first + count` from the `postings` sorted in the file
-    /// at `path`, read twice per block through buffers of `buffer` bytes:
-    /// once for its buckets' counts, then for their games. Returns the
-    /// postings written.
-    fn write_file(
-        &mut self,
-        path: &Path,
-        postings: u64,
-        first: usize,
-        count: usize,
-        buffer: usize,
-    ) -> Result<u64, SearchError> {
-        let mut counts = Vec::new();
-        counts.try_reserve_exact(BLOCK_BUCKETS).map_err(|_| SearchError::Busy)?;
-        counts.resize(BLOCK_BUCKETS, 0u64);
-        let mut ahead = PostingReader::open(path, buffer)?;
-        let mut games = PostingReader::open(path, buffer)?;
-        let mut at = 0u64;
-        for b in first..first + count {
-            let first_bucket = (b * BLOCK_BUCKETS) as u64;
-            counts.fill(0);
-            let mut in_block = 0u64;
-            while let Some(x) = ahead.peek()? {
-                let local = bucket_of(x).checked_sub(first_bucket).ok_or_else(|| outside(path))?;
-                if local >= BLOCK_BUCKETS as u64 {
-                    break;
-                }
-                counts[local as usize] += 1;
-                ahead.next()?;
-                in_block += 1;
-            }
-            games.seek(at)?;
-            self.begin();
-            for &n in &counts {
-                self.put(n)?;
-                let mut last = 0u64;
-                for _ in 0..n {
-                    let x = games.next()?.ok_or_else(|| outside(path))?;
-                    last = self.put_game(x, last)?;
-                }
-            }
-            self.end()?;
-            at += in_block;
-        }
-        if at != postings {
-            return Err(outside(path));
-        }
-        Ok(at)
-    }
+/// A bucket that a pass ended inside: the game it put last, and the postings
+/// of the bucket's count left for the passes after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Split {
+    last: u64,
+    left: u64,
 }
 
-fn outside(path: &Path) -> SearchError {
-    io(path, std::io::Error::other("a posting lies outside its partition"))
-}
-
-fn merged_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(".sorted");
-    path.with_file_name(name)
-}
-
-/// Sorts the partition at `path`, too large for `room` bytes, into the file
-/// at [`merged_path`], each game's postings kept as [`write_section`] keeps
-/// them: chunks that fit `room` beside a reader and a writer are sorted and
-/// written apart, then merged, each read through an equal share of `room`. Returns the postings kept. A
-/// partition whose merge would read through less than [`MIN_BUFFER`] a chunk
-/// is `TooLarge` at once.
-fn sort_on_disk(path: &Path, postings: u64, room: usize, progress: &Progress) -> Result<u64, SearchError> {
-    let cap = ((room - CHUNK_WRITER - READ_BUFFER) / 8) as u64;
-    let k = postings.div_ceil(cap) as usize;
-    let buffer = merge_buffer(room, k).ok_or(SearchError::TooLarge)?;
-    let mut chunks = Vec::new();
-    let result = sort_chunks(path, postings, cap as usize, room, progress, &mut chunks)
-        .and_then(|()| merge_chunks(&chunks, &merged_path(path), buffer, room, progress));
-    for (chunk, _) in &chunks {
-        let _ = std::fs::remove_file(chunk);
-    }
-    result
-}
-
-/// What a merge of `k` chunks reads each through within `room` beside its
-/// writer and heap, a whole number of postings; `None` under [`MIN_BUFFER`].
-fn merge_buffer(room: usize, k: usize) -> Option<usize> {
-    let each = room.checked_sub(CHUNK_WRITER + k * 16)? / k.max(1) / 8 * 8;
-    (each >= MIN_BUFFER).then_some(each)
-}
-
-fn sort_chunks(
-    path: &Path,
-    postings: u64,
+/// A worker's postings in a pass: its buffer of `cap`, and those of the
+/// pass's first bucket it counted ([`Pass::rest`]).
+struct Kept {
+    buf: Vec<u64>,
     cap: usize,
-    room: usize,
-    progress: &Progress,
-    chunks: &mut Vec<(PathBuf, u64)>,
-) -> Result<(), SearchError> {
-    let _memory = reserve(room, progress)?;
-    let mut file = File::open(path).map_err(|e| io(path, e))?;
-    if file.metadata().map_err(|e| io(path, e))?.len() != postings * 8 {
-        return Err(io(path, std::io::Error::other("a deep partition has the wrong length")));
+    rest: u64,
+}
+
+/// What the replay of a line has kept: its structures, and the prints of
+/// those in the pass's first bucket.
+#[derive(Default)]
+struct Replayed {
+    structures: usize,
+    prints: u128,
+}
+
+impl Pass<'_> {
+    /// Each worker's postings of the pass, sorted and freed of repeats, of
+    /// up to `want` workers.
+    fn collect(&self, want: usize) -> Result<Vec<Vec<u64>>, SearchError> {
+        let (first, last) = (self.stream.header.first_record, self.stream.header.last_record);
+        let chunks = Chunks::new(first, last, want);
+        // Room for twice what a chunk adds, about.
+        let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
+        workers::run(want, 0, &Cancel::never(), |w| {
+            let cap = self.capacity / w.count;
+            let mut kept = Kept { buf: Vec::new(), cap, rest: 0 };
+            kept.buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
+            let mut taker = chunks.taker();
+            while let Some((lo, hi)) = taker.take(kept.buf.len() + spare > cap) {
+                if w.stopped() || self.progress.stop.load(Ordering::Relaxed) {
+                    return Err(SearchError::Superseded);
+                }
+                for game in lo..=hi {
+                    self.replay(game, &mut kept)?;
+                }
+            }
+            self.rest.fetch_add(kept.rest, Ordering::Relaxed);
+            let mut buf = kept.buf;
+            buf.sort_unstable();
+            buf.dedup_by_key(|p| place(*p));
+            Ok(buf)
+        })
     }
-    let mut chunk: Vec<u64> = Vec::new();
-    chunk.try_reserve_exact(cap).map_err(|_| SearchError::Busy)?;
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(READ_BUFFER).map_err(|_| SearchError::Busy)?;
-    buf.resize(READ_BUFFER, 0);
-    let mut left = postings;
-    while left > 0 {
-        let n = left.min(cap as u64);
-        chunk.clear();
-        let mut bytes = n as usize * 8;
-        while bytes > 0 {
-            let m = bytes.min(READ_BUFFER);
-            file.read_exact(&mut buf[..m]).map_err(|e| io(path, e))?;
-            chunk.extend(buf[..m].as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)));
-            bytes -= m;
+
+    /// Adds the postings of game `game`'s structures past the tree's plies
+    /// that lie in the pass to `kept`: each once, in the order its line holds
+    /// them, as the walk that wrote the stream met them, and marked when the
+    /// line holds it beyond [`MAX_PLY`].
+    fn replay(&self, game: u32, kept: &mut Kept) -> Result<(), SearchError> {
+        let path = &self.stream.path;
+        let record = self.stream.written(game).map_err(|e| from_bad(path, e))?;
+        let entry = record.entry;
+        if !entry.indexed() || entry.plies <= u16::from(PRUNE_PLY) {
+            return Ok(());
         }
-        chunk.sort_unstable();
-        chunk.dedup_by_key(|p| place(*p));
-        let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-        name.push(format!(".chunk-{}", chunks.len()));
-        let chunk_path = path.with_file_name(name);
-        chunks.push((chunk_path.clone(), chunk.len() as u64));
-        let file = File::create(&chunk_path).map_err(|e| io(&chunk_path, e))?;
-        let mut out = BufWriter::with_capacity(CHUNK_WRITER, file);
-        for x in &chunk {
-            out.write_all(&x.to_le_bytes()).map_err(|e| io(&chunk_path, e))?;
+        let start = record.start().map_err(|e| from_bad(path, e))?;
+        let mut line = Tracker::of(start.as_ref().unwrap_or_else(|| stream::standard()));
+        let word = || corrupt(path, "stream word");
+        let mut words = record.words();
+        // The tree's plies hold no structure of the section.
+        for w in words.by_ref().take(usize::from(PRUNE_PLY) + 1) {
+            line.play(w).ok_or_else(word)?;
         }
-        out.into_inner().map_err(|e| io(&chunk_path, e.into_error()))?;
-        left -= n;
+        // The structure held from ply 21, and the last ply it was held at.
+        let mut held = (line.structure(), u32::from(PRUNE_PLY) + 1);
+        let mut replayed = Replayed::default();
+        for (ply, w) in (u32::from(PRUNE_PLY) + 2..).zip(words) {
+            if line.play(w).ok_or_else(word)? {
+                let s = line.structure();
+                if s != held.0 {
+                    self.add(held.0, held.1, game, &mut replayed, kept)?;
+                    held.0 = s;
+                }
+            }
+            held.1 = ply;
+        }
+        self.add(held.0, held.1, game, &mut replayed, kept)
+    }
+
+    /// Adds game `game`'s posting of `structure`, held last at ply `last`, when
+    /// it lies in the pass: the line's first [`MAX_STRUCTURES`] structures, as
+    /// the walk kept them. One of the pass's first bucket is counted, once per
+    /// print, wherever the pass ends.
+    fn add(
+        &self,
+        structure: u64,
+        last: u32,
+        game: u32,
+        replayed: &mut Replayed,
+        kept: &mut Kept,
+    ) -> Result<(), SearchError> {
+        if replayed.structures >= MAX_STRUCTURES {
+            return Ok(());
+        }
+        replayed.structures += 1;
+        let at = u64::from(deep_bucket(structure, self.bits)) << GAME_BITS | u64::from(game);
+        if at < self.lo {
+            return Ok(());
+        }
+        if at >> GAME_BITS == self.lo >> GAME_BITS {
+            let print = 1u128 << deep_print(structure, self.bits);
+            if replayed.prints & print == 0 {
+                replayed.prints |= print;
+                kept.rest += 1;
+            }
+        }
+        if at >= self.hi.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if kept.buf.len() >= kept.cap {
+            make_room(&mut kept.buf, kept.cap, self.lo, self.hi)?;
+        }
+        if at < self.hi.load(Ordering::Relaxed) {
+            kept.buf.push(posting(structure, self.bits, game, last > u32::from(MAX_PLY)));
+        }
+        Ok(())
+    }
+}
+
+/// Makes room in `buf`, a worker's full buffer of `cap` postings in a pass of
+/// the points from `lo` to `hi`: its postings sorted and freed of repeats,
+/// and when they still take three quarters of it, the pass ended for every
+/// worker where about half are kept: at a bucket, which may lie inside a
+/// block, or, when the pass's first bucket holds that half, at a game of
+/// that bucket. A game holds half a worker's least room of postings at most
+/// ([`MIN_WORKER_POSTINGS`]), so that a pass always keeps some; one that
+/// alone left no room would be too large for the share.
+fn make_room(buf: &mut Vec<u64>, cap: usize, lo: u64, hi: &AtomicU64) -> Result<(), SearchError> {
+    buf.sort_unstable();
+    let end = hi.load(Ordering::Relaxed);
+    buf.truncate(buf.partition_point(|&p| point(p) < end));
+    buf.dedup_by_key(|p| place(*p));
+    if buf.len() > cap / 4 * 3 {
+        let middle = buf[cap / 2];
+        let cut = if bucket_of(middle) > lo >> GAME_BITS {
+            bucket_of(middle) << GAME_BITS
+        } else {
+            point(middle).max(lo + 1)
+        };
+        hi.fetch_min(cut, Ordering::Relaxed);
+        buf.truncate(buf.partition_point(|&p| point(p) < cut));
+        if buf.len() > cap - cap / 8 {
+            return Err(SearchError::TooLarge);
+        }
     }
     Ok(())
 }
 
-fn merge_chunks(
-    chunks: &[(PathBuf, u64)],
-    target: &Path,
-    buffer: usize,
-    room: usize,
-    progress: &Progress,
-) -> Result<u64, SearchError> {
-    let _memory = reserve(room, progress)?;
-    let mut readers = Vec::new();
-    readers.try_reserve_exact(chunks.len()).map_err(|_| SearchError::Busy)?;
-    let mut heap = BinaryHeap::new();
-    heap.try_reserve_exact(chunks.len()).map_err(|_| SearchError::Busy)?;
-    for (i, (chunk, _)) in chunks.iter().enumerate() {
-        let mut r = PostingReader::open(chunk, buffer)?;
-        if let Some(x) = r.next()? {
-            heap.push(Reverse((x, i)));
-        }
-        readers.push(r);
-    }
-    let mut out = BufWriter::with_capacity(CHUNK_WRITER, File::create(target).map_err(|e| io(target, e))?);
-    let (mut kept, mut last) = (0u64, None);
-    while let Some(Reverse((x, i))) = heap.pop() {
-        if last != Some(place(x)) {
-            out.write_all(&x.to_le_bytes()).map_err(|e| io(target, e))?;
-            kept += 1;
-            last = Some(place(x));
-        }
-        if let Some(next) = readers[i].next()? {
-            heap.push(Reverse((next, i)));
-        }
-    }
-    out.into_inner().map_err(|e| io(target, e.into_error()))?;
-    Ok(kept)
+/// Where the section's blocks go, one after another; a block begun in one
+/// pass may end in the next.
+struct Sink {
+    /// Where the next bytes go.
+    at: u64,
+    table: Vec<u8>,
+    /// Where the block being placed starts, and its CRC so far.
+    start: u64,
+    crc: u32,
+    postings: u64,
 }
 
-/// Postings read in order from a file through a buffer of a fixed size.
-struct PostingReader {
-    file: File,
-    path: PathBuf,
-    buf: Vec<u8>,
-    at: usize,
-    end: usize,
+/// Bytes of a block, made and handed over: its first when `begins`, its last
+/// when `ends`, `whole` the CRC of a whole block made at once; the postings
+/// they hold, and the postings the stream's pass counted in the block when
+/// they end it.
+struct Made {
+    bytes: Vec<u8>,
+    begins: bool,
+    ends: bool,
+    whole: Option<u32>,
+    kept: u64,
+    done: u64,
 }
 
-impl PostingReader {
-    fn open(path: &Path, buffer: usize) -> Result<PostingReader, SearchError> {
-        let file = File::open(path).map_err(|e| io(path, e))?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(buffer).map_err(|_| SearchError::Busy)?;
-        buf.resize(buffer / 8 * 8, 0);
-        Ok(PostingReader { file, path: path.to_path_buf(), buf, at: 0, end: 0 })
+impl Sink {
+    /// Places the bytes `made` after those placed, and ends their block in
+    /// the table when they end it: the bytes, and where they go.
+    fn place(&mut self, made: Made, progress: &Progress) -> Result<(u64, Vec<u8>), SearchError> {
+        if made.begins {
+            self.start = self.at;
+            self.crc = !0;
+        }
+        if made.whole.is_none() {
+            self.crc = crc32_update(self.crc, &made.bytes);
+        }
+        let at = self.at;
+        self.at += made.bytes.len() as u64;
+        self.postings += made.kept;
+        if made.ends {
+            let len = u32::try_from(self.at - self.start).map_err(|_| SearchError::TooLarge)?;
+            self.table.extend(self.start.to_le_bytes());
+            self.table.extend(len.to_le_bytes());
+            self.table.extend(made.whole.unwrap_or(!self.crc).to_le_bytes());
+            progress.done.fetch_add(made.done, Ordering::Relaxed);
+        }
+        Ok((at, made.bytes))
     }
+}
 
-    /// Goes to the posting at `index`.
-    fn seek(&mut self, index: u64) -> Result<(), SearchError> {
-        self.file.seek(SeekFrom::Start(index * 8)).map_err(|e| io(&self.path, e))?;
-        self.at = 0;
-        self.end = 0;
-        Ok(())
-    }
-
-    fn peek(&mut self) -> Result<Option<u64>, SearchError> {
-        if self.at == self.end {
-            self.end = read_full(&mut self.file, &mut self.buf).map_err(|e| io(&self.path, e))?;
-            self.at = 0;
-            if !self.end.is_multiple_of(8) {
-                return Err(io(&self.path, std::io::Error::other("a deep file ends inside a posting")));
+/// Writes the postings of the sorted `buffers` from `pass.lo` to `hi` on up
+/// to `want` workers, block by block, in order. A bucket that `hi` lies
+/// inside is the pass's first ([`make_room`]): returns it, split.
+fn write_blocks(
+    buffers: &[Vec<u64>],
+    pass: &Pass<'_>,
+    hi: u64,
+    counts: &[u64],
+    sink: &mut Sink,
+    out: &Out,
+    want: usize,
+) -> Result<Option<Split>, SearchError> {
+    let block_bits = u32::from(DEEP_BLOCK_BITS) + GAME_BITS;
+    let first = pass.lo >> block_bits;
+    let units = ((hi - 1) >> block_bits) - first + 1;
+    let progress = pass.progress;
+    let place = |sink: &mut &mut Sink, made: Made| sink.place(made, progress);
+    let write = |(at, bytes): (u64, Vec<u8>)| out.write(at, &bytes);
+    let turns = Turns::new(units as usize, want * OUT_BYTES, sink, &place, &write);
+    let (rest, split) = (pass.rest.load(Ordering::Relaxed), Mutex::new(None));
+    let miscounted = || corrupt(&pass.stream.path, "the move stream does not replay to the postings it counted");
+    workers::run(want, 0, &Cancel::never(), |w| {
+        let stopped = || w.stopped() || progress.stop.load(Ordering::Relaxed);
+        let mut heads: Vec<&[u64]> = Vec::new();
+        heads.try_reserve_exact(buffers.len()).map_err(|_| Refused::Busy)?;
+        let mut gathered: Vec<u64> = Vec::new();
+        gathered.try_reserve_exact(GATHERED).map_err(|_| Refused::Busy)?;
+        while let Some(unit) = turns.take() {
+            if stopped() {
+                return Err(SearchError::Superseded);
             }
+            let block = first + unit as u64;
+            let (block_lo, block_hi) = (block_point(block), block_point(block + 1));
+            let (from, to) = (pass.lo.max(block_lo), hi.min(block_hi));
+            heads.clear();
+            for b in buffers {
+                let at = b.partition_point(|&p| point(p) < from);
+                let end = at + b[at..].partition_point(|&p| point(p) < to);
+                if end > at {
+                    heads.push(&b[at..end]);
+                }
+            }
+            // The bytes made, handed over in pieces, each ended by a bucket
+            // or, inside a crowded one, by half of `OUT_BYTES`: its first of
+            // the block when `begins`, and the postings of the buckets it
+            // ends. What a piece holds in the budget is its allocation.
+            let (begins, kept) = (Cell::new(from == block_lo), Cell::new(0));
+            let mut hand = |bytes: &mut Vec<u8>| {
+                let bytes = std::mem::take(bytes);
+                let held = bytes.capacity();
+                let made =
+                    Made { bytes, begins: begins.replace(false), ends: false, whole: None, kept: kept.take(), done: 0 };
+                turns.put(unit, made, held, false, &stopped)
+            };
+            let mut bytes = Vec::new();
+            let (low, high) = (from >> GAME_BITS, (to - 1) >> GAME_BITS);
+            for bucket in low..=high {
+                let (starts, ends) = (from <= bucket << GAME_BITS, to >= (bucket + 1) << GAME_BITS);
+                // Only the pass's first bucket ends inside it ([`make_room`]).
+                let count = match (starts, ends) {
+                    (true, true) => Count::Whole,
+                    (true, false) => Count::First(rest),
+                    (false, _) => Count::After(pass.split.last),
+                };
+                let (n, last) = put_bucket(&mut heads, bucket, count, &mut bytes, &mut gathered, &mut hand)?;
+                kept.set(kept.get() + n);
+                // A bucket's count is its postings in every part.
+                let left = match count {
+                    Count::Whole => 0,
+                    Count::First(all) => all.checked_sub(n).ok_or_else(miscounted)?,
+                    Count::After(_) => pass.split.left.checked_sub(n).ok_or_else(miscounted)?,
+                };
+                if !ends {
+                    *split.lock().unwrap_or_else(|e| e.into_inner()) = Some(Split { last, left });
+                } else if left != 0 {
+                    return Err(miscounted());
+                }
+                if bytes.len() >= OUT_BYTES / 2 && bucket < high {
+                    hand(&mut bytes)?;
+                }
+            }
+            let (begins, ends) = (begins.get(), to == block_hi);
+            let whole = (begins && ends).then(|| !crc32_update(!0, &bytes));
+            let done = if ends { counts.get(block as usize).copied().unwrap_or(0) } else { 0 };
+            let held = bytes.capacity();
+            turns.put(unit, Made { bytes, begins, ends, whole, kept: kept.get(), done }, held, true, &stopped)?;
         }
-        Ok((self.at < self.end)
-            .then(|| u64::from_le_bytes(self.buf[self.at..self.at + 8].try_into().unwrap_or_default())))
-    }
-
-    fn next(&mut self) -> Result<Option<u64>, SearchError> {
-        let x = self.peek()?;
-        if x.is_some() {
-            self.at += 8;
-        }
-        Ok(x)
-    }
+        Ok(())
+    })?;
+    Ok(split.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Fills `buf` as far as the file goes; the bytes read.
-fn read_full(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut n = 0;
-    while n < buf.len() {
-        match file.read(&mut buf[n..])? {
-            0 => break,
-            m => n += m,
-        }
-    }
-    Ok(n)
+/// What a pass puts before a bucket's postings.
+#[derive(Clone, Copy, Debug)]
+enum Count {
+    /// Their count: the pass holds the bucket whole.
+    Whole,
+    /// The count of all the bucket's postings, of which the pass holds the
+    /// first.
+    First(u64),
+    /// Nothing: the bucket goes on from a pass before, whose last game was
+    /// this one.
+    After(u64),
 }
 
-fn read_postings(path: &Path, postings: u64) -> Result<Vec<u64>, SearchError> {
-    let mut file = File::open(path).map_err(|e| io(path, e))?;
-    let len = file.metadata().map_err(|e| io(path, e))?.len();
-    if len != postings * 8 {
-        return Err(io(path, std::io::Error::other("a deep partition has the wrong length")));
+/// Puts bucket `bucket`'s postings, which lie first in the sorted `heads`,
+/// to `out`, taking them off the heads: what `count` says, then each by game
+/// from the one before, handing `out` over whenever it holds half of
+/// [`OUT_BYTES`] before another. Returns the postings put and the last game.
+/// A game's postings all come from one worker's buffer, so none repeats
+/// another's, and a bucket's postings gathered from every head and sorted
+/// are in the order of the heads merged: a bucket that fits `gathered`'s
+/// capacity is sorted there, a larger one merged.
+fn put_bucket(
+    heads: &mut [&[u64]],
+    bucket: u64,
+    count: Count,
+    out: &mut Vec<u8>,
+    gathered: &mut Vec<u64>,
+    hand: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), SearchError>,
+) -> Result<(u64, u64), SearchError> {
+    let n: usize = heads.iter().map(|h| h.iter().take_while(|&&p| bucket_of(p) == bucket).count()).sum();
+    let mut last = match count {
+        Count::Whole => {
+            varint(out, n as u64);
+            0
+        }
+        Count::First(all) => {
+            varint(out, all);
+            0
+        }
+        Count::After(last) => last,
+    };
+    let mut put = |x: u64, out: &mut Vec<u8>| {
+        if out.len() >= OUT_BYTES / 2 {
+            hand(out)?;
+        }
+        let game = game_of(x);
+        varint(out, (game - last) << 8 | x & 0xfe | !x & 1);
+        last = game;
+        Ok::<(), SearchError>(())
+    };
+    if n <= gathered.capacity() {
+        gathered.clear();
+        for h in heads.iter_mut() {
+            let k = h.iter().take_while(|&&p| bucket_of(p) == bucket).count();
+            gathered.extend_from_slice(&h[..k]);
+            *h = &h[k..];
+        }
+        gathered.sort_unstable();
+        for &x in gathered.iter() {
+            put(x, out)?;
+        }
+    } else {
+        for _ in 0..n {
+            // The least head: few, so looked through in turn.
+            let Some(h) =
+                heads.iter_mut().filter(|h| h.first().is_some_and(|&p| bucket_of(p) == bucket)).min_by_key(|h| h[0])
+            else {
+                break;
+            };
+            let x = h[0];
+            *h = &h[1..];
+            put(x, out)?;
+        }
     }
-    let mut all = Vec::new();
-    all.try_reserve_exact(postings as usize).map_err(|_| SearchError::TooLarge)?;
-    let mut buf = vec![0u8; READ_BUFFER];
-    let mut left = len as usize;
-    while left > 0 {
-        let n = left.min(buf.len());
-        file.read_exact(&mut buf[..n]).map_err(|e| io(path, e))?;
-        all.extend(buf[..n].as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)));
-        left -= n;
-    }
-    Ok(all)
+    Ok((n as u64, last))
 }
 
 /// The games of bucket `local` in a block's bytes that hold a structure of
@@ -577,60 +753,69 @@ pub fn bucket_games(block: &[u8], local: usize, max_game: u32, print: u8, beyond
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-    use crate::indexdir::crc32;
+    use crate::explorer::format::structure;
+    use chesscore::Move;
 
     /// A structure of bucket `bucket` among `1 << bits` with print `print`.
-    fn structure(bits: u8, bucket: u64, print: u64) -> u64 {
+    fn structure_in(bits: u8, bucket: u64, print: u64) -> u64 {
         bucket << (64 - bits) | print << (64 - bits - PRINT_BITS)
     }
 
+    /// Two workers' postings, out of order within neither, with a game twice
+    /// in one bucket with one structure, once beyond the tree's plies, and a
+    /// third time with another structure of the bucket: a block's buckets
+    /// read back by game and print, the marked ones alone when asked.
     #[test]
     fn postings_come_back_per_bucket_in_game_order() {
-        let dir = std::env::temp_dir().join(format!("bridge-deep-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         let bits = 14;
-        let sink = Sink::create(&dir, bits, &Progress::default()).unwrap();
-        let s = |bucket: u64, print: u64| structure(bits, bucket, print);
-        let last = (1u64 << bits) - 1;
-        // Two workers, out of order, with a game twice in one bucket with
-        // one structure, once beyond the tree's plies, and a third time with
-        // another structure of the bucket.
-        sink.add(&mut vec![posting(s(5, 1), bits, 9, false), posting(s(last, 0), bits, 2, true)]).unwrap();
-        sink.add(&mut vec![posting(s(5, 1), bits, 3, true), posting(s(5, 1), bits, 9, true)]).unwrap();
-        sink.add(&mut vec![posting(s(5, 127), bits, 9, false), posting(s(256, 0), bits, 7, false)]).unwrap();
-        sink.add(&mut vec![posting(s(0, 0), bits, 1, true)]).unwrap();
-        let parts = sink.finish().unwrap();
-        let mut out = Vec::new();
-        let (table, kept) =
-            write_section(&parts, bits, &mut out, 1000, &dir.join("x"), &Progress::default(), 64 << 20).unwrap();
-        assert_eq!(kept, 6, "a game counts once per structure print in a bucket");
-        assert_eq!(table.len(), 64 * DEEP_BLOCK_ENTRY);
-        let block = |i: usize| {
-            let e = &table[i * DEEP_BLOCK_ENTRY..];
-            let off = u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize - 1000;
-            let len = u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize;
-            assert_eq!(crc32(&out[off..off + len]), u32::from_le_bytes(e[12..16].try_into().unwrap()));
-            out[off..off + len].to_vec()
-        };
-        assert_eq!(bucket_games(&block(0), 5, 100, 1, false), Some(vec![3, 9]));
-        assert_eq!(bucket_games(&block(0), 5, 100, 1, true), Some(vec![3, 9]), "held beyond once is beyond");
-        assert_eq!(bucket_games(&block(0), 5, 100, 127, false), Some(vec![9]));
-        assert_eq!(bucket_games(&block(0), 5, 100, 127, true), Some(vec![]));
-        assert_eq!(bucket_games(&block(0), 5, 100, 0, false), Some(vec![]));
-        assert_eq!(bucket_games(&block(0), 0, 100, 0, true), Some(vec![1]));
-        assert_eq!(bucket_games(&block(0), 6, 100, 0, false), Some(vec![]));
-        assert_eq!(bucket_games(&block(1), 0, 100, 0, false), Some(vec![7]));
-        assert_eq!(bucket_games(&block(1), 0, 100, 0, true), Some(vec![]));
-        assert_eq!(bucket_games(&block(63), BLOCK_BUCKETS - 1, 100, 0, true), Some(vec![2]));
+        let s = |bucket: u64, print: u64| structure_in(bits, bucket, print);
+        let mut a =
+            vec![posting(s(5, 1), bits, 9, false), posting(s(5, 1), bits, 3, true), posting(s(0, 0), bits, 1, true)];
+        let mut b =
+            vec![posting(s(5, 1), bits, 9, true), posting(s(5, 127), bits, 9, false), posting(s(6, 0), bits, 4, false)];
+        for buf in [&mut a, &mut b] {
+            buf.sort_unstable();
+            buf.dedup_by_key(|p| place(*p));
+        }
+        // Game 9's two postings of one print lie in different buffers here
+        // only for the test: a build replays each game on one worker.
+        b.retain(|&p| !(bucket_of(p) == 5 && p >> 8 & 0xffff_ffff == 9 && p >> 1 & 0x7f == 1));
+        // Each bucket sorted where it is gathered, or merged from the heads.
+        let mut outs = Vec::new();
+        for gathered in [Vec::with_capacity(8), Vec::new()] {
+            let mut gathered = gathered;
+            let mut heads: Vec<&[u64]> = vec![&a, &b];
+            let mut out = Vec::new();
+            let mut kept = 0;
+            for bucket in 0..BLOCK_BUCKETS as u64 {
+                let hand = &mut |_: &mut Vec<u8>| Ok(());
+                kept += put_bucket(&mut heads, bucket, Count::Whole, &mut out, &mut gathered, hand).unwrap().0;
+            }
+            assert_eq!(kept, 5);
+            assert!(heads.iter().all(|h| h.is_empty()));
+            outs.push(out);
+        }
+        assert_eq!(outs[0], outs[1]);
+        let out = outs.swap_remove(0);
+        assert_eq!(bucket_games(&out, 5, 100, 1, false), Some(vec![3, 9]));
+        assert_eq!(bucket_games(&out, 5, 100, 1, true), Some(vec![3]));
+        assert_eq!(bucket_games(&out, 5, 100, 127, false), Some(vec![9]));
+        assert_eq!(bucket_games(&out, 5, 100, 127, true), Some(vec![]));
+        assert_eq!(bucket_games(&out, 0, 100, 0, true), Some(vec![1]));
+        assert_eq!(bucket_games(&out, 6, 100, 0, false), Some(vec![4]));
+        assert_eq!(bucket_games(&out, 6, 100, 0, true), Some(vec![]));
+        assert_eq!(bucket_games(&out, BLOCK_BUCKETS - 1, 100, 0, false), Some(vec![]));
         // A game past the database's last record is damage.
-        assert_eq!(bucket_games(&block(0), 5, 8, 1, false), None);
-        // So is a delta that wraps around to a game already listed, a game
-        // listed again with the same print or a lower one, a first game of 0,
-        // and a count or a delta written past 64 bits, which would read as 0
-        // or 5 were the bits beyond cut off.
+        assert_eq!(bucket_games(&out, 5, 8, 1, false), None);
+    }
+
+    /// A damaged bucket is refused: a delta that wraps around to a game
+    /// already listed, a game listed again with the same print or a lower
+    /// one, a first game of 0, and a count or a delta written past 64 bits,
+    /// which would read as 0 or 5 were the bits beyond cut off.
+    #[test]
+    fn a_damaged_bucket_is_refused() {
         let bucket = |values: &[u64]| {
             let mut b = Vec::new();
             for &v in values {
@@ -651,80 +836,144 @@ mod tests {
         let mut delta = vec![1, 0x85];
         delta.extend(&long[1..]);
         assert_eq!(bucket_games(&delta, 0, 100, 0, false), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Postings of `bits`-bit buckets from a fixed seed, marked or not; every
-    /// tenth is the one before it with the other mark.
-    fn postings(bits: u8, n: usize) -> Vec<u64> {
-        let mut x = 0x2545_f491_4f6c_dd1du64;
-        let mut all: Vec<u64> = Vec::with_capacity(n);
-        for i in 0..n {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let p = match all.last() {
-                Some(&before) if i % 10 == 9 => before ^ 1,
-                _ => posting(x, bits, (x & 0x3ff) as u32 + 1, x >> 20 & 1 == 1),
-            };
-            all.push(p);
-        }
-        all
-    }
-
-    fn written(dir: &Path, bits: u8, all: &[u64], memory: usize) -> Result<(Vec<u8>, Vec<u8>, u64), SearchError> {
-        std::fs::create_dir_all(dir).unwrap();
-        let sink = Sink::create(dir, bits, &Progress::default()).unwrap();
-        for batch in all.chunks(7_000) {
-            sink.add(&mut batch.to_vec()).unwrap();
-        }
-        let parts = sink.finish().unwrap();
-        let mut out = Vec::new();
-        let result = write_section(&parts, bits, &mut out, 0, &dir.join("x"), &Progress::default(), memory);
-        let _ = std::fs::remove_dir_all(dir);
-        result.map(|(table, kept)| (out, table, kept))
-    }
-
-    /// A partition larger than the memory given is sorted in chunks on disk
-    /// and merged, into the very blocks an in-memory sort writes.
+    /// A full buffer drops its repeats and goes on; one of many buckets ends
+    /// the pass for every worker at the bucket that keeps about half, inside
+    /// a block; a first bucket that alone fills it ends the pass at the game
+    /// that keeps about half, and so does the next pass, which starts there; a
+    /// game that alone fills it is too large.
     #[test]
-    fn a_partition_sorted_on_disk_gives_the_same_blocks() {
-        let base = std::env::temp_dir().join(format!("bridge-deep-disk-{}", std::process::id()));
-        let bits = 14;
-        let all = postings(bits, 60_000);
-        let in_memory = written(&base.join("memory"), bits, &all, 64 << 20).unwrap();
-        // Four partitions of about 120 KB each, against 72 KB of room.
-        const { assert!(15_000 * 8 > MIN_MEMORY - FIXED_BYTES - READ_BUFFER) };
-        let on_disk = written(&base.join("disk"), bits, &all, MIN_MEMORY).unwrap();
-        assert_eq!(on_disk, in_memory);
-        let mut unique = all.clone();
-        unique.sort_unstable();
-        unique.dedup_by_key(|p| place(*p));
-        assert_eq!(in_memory.2, unique.len() as u64);
-        // A bucket's games of a print come back, those marked alone when
-        // asked: every 40th print of a bucket is read back.
-        let (out, table, _) = &in_memory;
-        let mut kept: BTreeMap<(u64, u64), (Vec<u32>, Vec<u32>)> = BTreeMap::new();
-        for &p in &unique {
-            let games = kept.entry((bucket_of(p), p >> 1 & 0x7f)).or_default();
-            games.0.push((p >> 8) as u32);
-            if p & 1 == 0 {
-                games.1.push((p >> 8) as u32);
+    fn a_full_buffer_ends_the_pass_earlier() {
+        let bits = 12;
+        let s = |bucket: u64| structure_in(bits, bucket, 3);
+        let at = |bucket: u64, game: u64| bucket << GAME_BITS | game;
+        let hi = AtomicU64::new(at(1 << bits, 0));
+        let mut buf: Vec<u64> = (0..512).flat_map(|g| [posting(s(300), bits, g + 1, true); 2]).collect();
+        make_room(&mut buf, 1_024, at(256, 0), &hi).unwrap();
+        assert_eq!(
+            (buf.len(), hi.load(Ordering::Relaxed)),
+            (512, at(1 << bits, 0)),
+            "repeats dropped, the pass as it was"
+        );
+        let mut buf: Vec<u64> = (0..1_024).map(|i| posting(s(256 + i / 64), bits, i as u32 + 1, true)).collect();
+        make_room(&mut buf, 1_024, at(256, 0), &hi).unwrap();
+        assert_eq!(hi.load(Ordering::Relaxed), at(264, 0), "inside the block of buckets 256 to 511");
+        assert_eq!(buf.len(), 512);
+        let mut crowded: Vec<u64> = (0..1_024).map(|i| posting(s(256), bits, i + 1, true)).collect();
+        make_room(&mut crowded, 1_024, at(256, 0), &hi).unwrap();
+        assert_eq!((crowded.len(), hi.load(Ordering::Relaxed)), (512, at(256, 513)), "inside bucket 256");
+        let hi = AtomicU64::new(at(1 << bits, 0));
+        let mut next: Vec<u64> = (512..1_536).map(|i| posting(s(256), bits, i + 1, true)).collect();
+        make_room(&mut next, 1_024, at(256, 513), &hi).unwrap();
+        assert_eq!((next.len(), hi.load(Ordering::Relaxed)), (512, at(256, 1_025)), "from game 513 to 1,024");
+        // One game of 64 prints, in a buffer smaller than a worker's least.
+        let mut one: Vec<u64> = (0..64).map(|print| posting(structure_in(bits, 256, print), bits, 7, true)).collect();
+        assert!(matches!(make_room(&mut one, 64, at(256, 7), &hi), Err(SearchError::TooLarge)));
+    }
+
+    /// A crowded bucket is handed over in pieces as it is put, none of which
+    /// grows past [`OUT_BYTES`], and which together read back as the bucket's
+    /// postings; a bucket split among three passes, each going on from the
+    /// game put last, puts the same bytes.
+    #[test]
+    fn a_crowded_bucket_is_put_in_pieces() {
+        let (bits, bucket, games) = (12, 9u64, 600_000u32);
+        let at = |game: u64| (bucket << GAME_BITS) + game;
+        // Two workers' buffers, each game in one; some games hold a
+        // structure of another print too.
+        let mut buffers = [Vec::new(), Vec::new()];
+        for g in 1..=games {
+            let buf = &mut buffers[(g / 1_000 % 2) as usize];
+            buf.push(posting(structure_in(bits, bucket, 5), bits, g, g % 3 == 0));
+            if g % 7 == 0 {
+                buf.push(posting(structure_in(bits, bucket, 6), bits, g, true));
             }
         }
-        for (&(bucket, print), (all, marked)) in kept.iter().step_by(40) {
-            let e = &table[bucket as usize / BLOCK_BUCKETS * DEEP_BLOCK_ENTRY..];
-            let off = u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize;
-            let block = &out[off..off + u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize];
-            let local = bucket as usize % BLOCK_BUCKETS;
-            assert_eq!(bucket_games(block, local, 1024, print as u8, false).as_ref(), Some(all));
-            assert_eq!(bucket_games(block, local, 1024, print as u8, true).as_ref(), Some(marked));
+        let all: u64 = buffers.iter().map(|b| b.len() as u64).sum();
+        let mut gathered = Vec::with_capacity(GATHERED);
+        // Puts the bucket's postings from point `from` to `to` after
+        // `bytes`, as `count` says: the postings put, the last game, and the
+        // pieces handed over.
+        let mut put = |from: u64, to: u64, count: Count, bytes: &mut Vec<u8>| {
+            let mut heads: Vec<&[u64]> = buffers
+                .iter()
+                .map(|b| {
+                    let lo = b.partition_point(|&p| point(p) < from);
+                    &b[lo..lo + b[lo..].partition_point(|&p| point(p) < to)]
+                })
+                .collect();
+            let (mut out, mut pieces) = (Vec::new(), 0);
+            let mut hand = |piece: &mut Vec<u8>| {
+                let piece = std::mem::take(piece);
+                assert!(piece.len() >= OUT_BYTES / 2 && piece.capacity() <= OUT_BYTES, "{}", piece.capacity());
+                bytes.extend(piece);
+                pieces += 1;
+                Ok(())
+            };
+            let (n, last) = put_bucket(&mut heads, bucket, count, &mut out, &mut gathered, &mut hand).unwrap();
+            assert!(out.capacity() <= OUT_BYTES, "{} bytes held at once", out.capacity());
+            bytes.extend(out);
+            (n, last, pieces)
+        };
+        let mut whole = Vec::new();
+        let (n, last, pieces) = put(at(0), at(1 << GAME_BITS), Count::Whole, &mut whole);
+        assert!((n, last) == (all, u64::from(games)) && pieces >= 2, "{n} {last} {pieces}");
+        let mut split = Vec::new();
+        let (a, last) = (put(at(0), at(200_001), Count::First(all), &mut split).0, 200_000);
+        let (b, last) = (put(at(200_001), at(400_001), Count::After(last), &mut split).0, 400_000);
+        let c = put(at(400_001), at(1 << GAME_BITS), Count::After(last), &mut split).0;
+        assert_eq!(a + b + c, all);
+        assert!(split == whole, "the split bucket is put as the whole one");
+        let every = |step: u32| Some((1..=games).filter(|g| g % step == 0).collect::<Vec<_>>());
+        assert_eq!(bucket_games(&whole, 0, games, 5, false), every(1));
+        assert_eq!(bucket_games(&whole, 0, games, 5, true), every(3));
+        assert_eq!(bucket_games(&whole, 0, games, 6, true), every(7));
+    }
+
+    /// Following a line's words alone gives the structure a board gives, at
+    /// every ply, through captures of every kind, en passant, castling and
+    /// promotions to every piece, with and without a capture, from a set-up
+    /// start too; and it says so whenever the structure changes.
+    #[test]
+    fn a_tracked_structure_is_the_boards() {
+        let lines: [(Option<&str>, &str); 4] = [
+            (
+                None,
+                "e2e4 d7d5 e4d5 d8d5 b1c3 d5a5 d2d4 c7c6 g1f3 c8f5 f1c4 e7e6 e1h1 g8f6 c1d2 f8b4 c3e4 a5b6 \
+                 e4f6 g7f6 c4b3 b8d7 d2b4 b6b4 c2c3",
+            ),
+            (None, "e2e4 a7a6 e4e5 d7d5 e5d6 c7d6 d1g4 c8g4 f1a6 b8a6 g1f3 d8b6 e1h1 e8c8"),
+            (Some("r6r/1P4P1/8/8/2k5/8/1p4p1/R3K2R w KQ - 0 1"), "b7a8n g2h1q e1d2 b2a1r g7h8b c4b3 a8b6"),
+            (Some("4k3/1P6/8/8/8/8/6p1/R3K3 b Q - 0 1"), "g2g1q e1d2 e8d7 b7b8n d7c7 a1a7"),
+        ];
+        for (fen, ucis) in lines {
+            let mut board = fen.map_or_else(Board::startpos, |f| Board::from_fen(f).unwrap());
+            let mut tracked = Tracker::of(&board);
+            for uci in ucis.split_whitespace() {
+                let mut mv: Move = uci.parse().unwrap();
+                // Castling is the king onto its rook.
+                if board.piece_at(mv.from).is_some_and(|p| p.0 == Piece::King)
+                    && mv.from.file().abs_diff(mv.to.file()) == 2
+                {
+                    mv = Move::new(
+                        mv.from,
+                        chesscore::Square::new(if mv.to.file() > 4 { 7 } else { 0 }, mv.from.rank()),
+                        None,
+                    );
+                }
+                let word = cbformat::replay::word_of(&board, mv).unwrap();
+                let before = structure(&board);
+                board.play_checked(mv).unwrap();
+                let changed = tracked.play(word).unwrap();
+                assert_eq!(tracked.structure(), structure(&board), "{uci} in {ucis}");
+                if structure(&board) != before {
+                    assert!(changed, "{uci} changed the structure");
+                }
+            }
         }
-        // Less than the least memory is refused at once, as is a partition
-        // whose chunks could not each be read through a buffer.
-        assert!(matches!(written(&base.join("less"), bits, &all, MIN_MEMORY - 1), Err(SearchError::TooLarge)));
-        let one = postings(12, 40_000);
-        assert!(matches!(written(&base.join("many"), 12, &one, MIN_MEMORY), Err(SearchError::TooLarge)));
-        assert!(written(&base.join("enough"), 12, &one, MIN_MEMORY + (256 << 10)).is_ok());
+        assert_eq!(Tracker::of(&Board::startpos()).play(0), None, "word 0 names no move");
+        assert_eq!(Tracker::of(&Board::startpos()).play(movetable::NULL_MOVE), None);
+        assert_eq!(Tracker::of(&Board::startpos()).play(FIRST_CASTLE_960), None);
     }
 }

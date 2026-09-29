@@ -67,9 +67,10 @@ analysis left running longer does not hold an update back. A version whose setti
 installer by hand. To remove the bridge, use
 Settings → Apps → Installed apps → oschess bridge → Uninstall. Its data folder,
 `%APPDATA%\oschess-bridge`, stays: the settings (`bridge.toml`), the pairing
-code, the log (`bridge.log`), the position indexes (`index`, some 1.4 GB for the
-Mega Database) and any Stockfish the bridge installed (`engines`). Delete the
-folder by hand to remove them too. The log says what went wrong, naming a
+code, the log (`bridge.log`) and any Stockfish the bridge installed
+(`engines`). So do the position indexes, in `%LOCALAPPDATA%\oschess
+bridge\index`, some 4 GB for the Mega Database. Delete the folders by hand to
+remove them too. The log says what went wrong, naming a
 database by its id and never by its name or path, so you can attach it to an
 issue as it is; past 1 MiB, the bridge moves it to `bridge.log.1` when it
 starts.
@@ -138,17 +139,22 @@ it over HTTP as oschess does:
 - one game as PGN, the first one and the most annotated of the first 50,000,
   in both forms;
 - the position index's build in the `--index` folder, which must be new or
-  empty so that the build is measured, a lookup per move along the most played
-  line, how many of the notable games those lookups name are their `/games`
-  row whole, and opening it again in a new bridge;
+  empty so that the build is measured, with the sizes of its two files and
+  the most its index folder held while it was built, then where its time
+  went, a row a phase: the stream pass, the tree's passes and the deep
+  section's, each pass's replay and writes, the index file's end and the
+  renames; a lookup per move along the most played line, how many of the
+  notable games those lookups name are their `/games` row whole, and opening
+  it again in a new bridge;
 - when `--engine <exe>` names a UCI engine, a 5-second search: the time to its
   first line, and the lines a second;
 - a small answer over a kept and over a new connection.
 
 The `--index` folder stands for the bridge's data folder: every index the
 child bridge builds, a PGN file's header index included, goes there as it
-would in the data folder, and nothing goes into the data folder itself, so
-another run starts cold again with a new folder.
+would in the data folder, the position indexes in its `index` folder, and
+nothing goes into the data folder or the index folder themselves, so another
+run starts cold again with a new folder.
 
 It prints only timings and counts, and for a failed answer its status and the
 bridge's error code; never a name, game, query or path, so its output can go
@@ -173,13 +179,17 @@ or `OSCHESS_BRIDGE_SEARCH_MIB` ([docs/api.md](docs/api.md#search-memory)).
 
 The first request for a database's positions builds its position index in the
 background, on half of those workers and within the same memory, and keeps it
-in the data folder's `index` folder: the games, results, moves and notable
-games of every position the games reach in their first 40 plies. For the Mega
-Database it takes some five minutes and 1.4 GB. Once kept, the index answers
-from the first request after the bridge starts, until the database changes.
+in its index folder (`%LOCALAPPDATA%\oschess bridge\index` on Windows, the data
+folder's `index` elsewhere): the games, results, moves and notable games of
+every position the games reach in their first 20 plies, and every game's main
+line, from which the positions past them are found. For the Mega Database it
+takes about half a minute and some 4 GB, and no other room while it is built.
+Once kept, the index answers from the first request after the bridge starts,
+until the database changes.
 `cargo run --release -p bridge
---example index_oracle -- <db.2cbh> <index dir>` builds one and checks it
-against a brute-force count, printing numbers only. `cargo run --release -p
+--example index_oracle -- <db.2cbh> <index dir>` builds one, timing each of
+its phases and passes, and checks it against a brute-force count, printing
+numbers only. `cargo run --release -p
 bridge --example classic_pairs -- <scratch dir> <a.cbh> <a.2cbh> …` serves the
 classic and the 2CBH copy of each database given and compares their rows,
 searches, sorts, suggestions and explorer answers field by field, printing

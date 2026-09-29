@@ -433,3 +433,56 @@ impl ClassicIds {
         known(&mut self.annotators, name, |n| b.annotator(n))
     }
 }
+
+/// `games` standard games of legal moves drawn from `seed`, 20 to 160 plies
+/// each, with results by turns and ratings spread: their first moves drawn
+/// from a few, so that games share their openings and then part ways, as a
+/// real database's do, reaching many positions and structures.
+pub fn random_games(name: &str, games: usize, seed: u64) -> TempDb {
+    let mut b = Builder::new();
+    add_random_games(&mut b, games, seed);
+    b.write(name)
+}
+
+/// Adds the games of [`random_games`] to `b`.
+pub fn add_random_games(b: &mut Builder, games: usize, seed: u64) {
+    let mut x = seed | 1;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for g in 0..games {
+        let mut board = Board::startpos();
+        let mut words = vec![MOVES];
+        let plies = 20 + next() % 141;
+        for ply in 0..plies {
+            let moves = board.legal_moves();
+            if moves.is_empty() {
+                break;
+            }
+            let few = if ply < 8 { moves.len().min(3) } else { moves.len() };
+            let mv = moves[(next() % few as u64) as usize];
+            words.push(cbformat::replay::word_of(&board, mv).unwrap());
+            board.play_checked(mv).unwrap();
+        }
+        words.push(END_OF_LINE);
+        let at = b.moves(1, &words);
+        let rec = b.game(at);
+        rec[0x58] = (g % 3) as u8;
+        let elo = 1500 + (next() % 1300) as i16;
+        rec[0x60..0x62].copy_from_slice(&elo.to_le_bytes());
+    }
+}
+
+/// The bytes of the index file or move stream at `path` without its build
+/// id, which every build draws afresh, and its header's CRC over it: what two
+/// builds of the same games must write alike.
+pub fn built_bytes(path: &std::path::Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap();
+    let id = if path.extension().is_some_and(|e| e == "idx") { 116 } else { 40 };
+    bytes[id..id + 8].fill(0);
+    bytes[124..128].fill(0);
+    bytes
+}

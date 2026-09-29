@@ -19,13 +19,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::engine::{Engine, EngineConfig};
+use bridge::explorer::runs::{PassTime, Timings};
 use bridge::server;
 use cbformat::game::{Head, RecordKind};
 use cbformat::pgnfile::lex::Lexer;
@@ -84,7 +85,9 @@ fn options(args: &[String]) -> AnyResult<Options> {
 }
 
 /// `cbtool profile-serve <db> <index> [<engine>]`: the bridge `profile` asks,
-/// in a process of its own. It prints `port <n>` and serves until killed.
+/// in a process of its own. It prints `port <n>` and serves until killed;
+/// once it has built the database's position index, it prints `built`, then
+/// where the build's time went ([`Timings::line`]).
 pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     let [db, index, rest @ ..] = args else { return Err("profile-serve <db> <index> [<engine>]".into()) };
     let listeners = server::bind(0)?;
@@ -102,15 +105,44 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     let mut out = std::io::stdout();
     writeln!(out, "port {port}")?;
     out.flush()?;
-    server::serve(listeners, Arc::new(app))?;
+    let app = Arc::new(app);
+    let watched = Arc::clone(&app);
+    let id = id_of(Path::new(db));
+    std::thread::spawn(move || {
+        loop {
+            if let Some(t) = watched.catalog.explorer.timings(&id) {
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "built {}", t.line()).and_then(|()| out.flush());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    server::serve(listeners, app)?;
     Ok(true)
 }
 
-/// A bridge serving one database in a child process, killed when dropped.
+/// A bridge serving one database in a child process, killed when dropped,
+/// and the lines it prints after its port.
 struct Served {
     child: Child,
     port: u16,
     id: String,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Served {
+    /// Where the time of the bridge's build of the position index went, once
+    /// it tells, waiting `wait` at most.
+    fn built(&self, wait: Duration) -> Option<Timings> {
+        let until = Instant::now() + wait;
+        loop {
+            let line = self.lines.recv_timeout(until.saturating_duration_since(Instant::now())).ok()?;
+            if let Some(t) = line.strip_prefix("built ").and_then(Timings::parse) {
+                return Some(t);
+            }
+        }
+    }
 }
 
 impl Drop for Served {
@@ -128,17 +160,24 @@ fn spawn(o: &Options) -> AnyResult<Served> {
     }
     let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let mut line = String::new();
-    let read = match child.stdout.take() {
-        Some(out) => BufReader::new(out).read_line(&mut line).is_ok(),
-        None => false,
-    };
+    let mut out = child.stdout.take().map(BufReader::new);
+    let read = out.as_mut().is_some_and(|out| out.read_line(&mut line).is_ok());
     let port = line.trim().strip_prefix("port ").and_then(|p| p.parse().ok()).filter(|_| read);
-    let Some(port) = port else {
+    let (Some(port), Some(out)) = (port, out) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err("the bridge did not start".into());
     };
-    Ok(Served { child, port, id: id_of(&o.db) })
+    // Its later lines, until it ends.
+    let (send, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in out.lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(Served { child, port, id: id_of(&o.db), lines })
 }
 
 /// A failed answer, by its status and the bridge's error code only: a code is
@@ -453,6 +492,63 @@ fn stream_counts(path: &Path) -> String {
     }
 }
 
+/// A row for each phase of the index's build (#147): the stream pass, the
+/// tree's passes and the deep section's, each pass's replay and write, then
+/// the index file's end and the renames.
+fn build_phases(table: &mut Table, t: &Timings) {
+    let passes = |all: &[PassTime]| {
+        let (replay, write): (Duration, Duration) =
+            (all.iter().map(|p| p.replay).sum(), all.iter().map(|p| p.write).sum());
+        let each: Vec<String> = all.iter().map(|p| format!("{:.0}+{:.0}", ms(p.replay), ms(p.write))).collect();
+        let counts = format!(
+            "passes {}, replay {:.0} ms, write {:.0} ms; each replay+write ms: {}",
+            all.len(),
+            ms(replay),
+            ms(write),
+            each.join(" ")
+        );
+        (ms(replay + write), counts)
+    };
+    table.once("index", "build: stream pass", ms(t.reading), "games read, move stream written");
+    let (tree, counts) = passes(&t.tree);
+    table.once("index", "build: tree passes", tree, &counts);
+    let (deep, counts) = passes(&t.deep);
+    table.once("index", "build: deep passes", deep, &counts);
+    table.once("index", "build: index file end", ms(t.closing), "header written, file synced");
+    table.once("index", "build: renames", ms(t.renaming), &format!("phases {:.0} ms in all", ms(t.total())));
+}
+
+/// Asks `path`, an explorer request, until it is answered: `Ok` once it is,
+/// counting the answers that the index is being built in `polls`.
+fn build_index(c: &mut Client, path: &str, polls: &mut u64) -> Result<(), String> {
+    loop {
+        match c.get(path, true) {
+            Ok((200, _)) => return Ok(()),
+            // `409 database_unavailable` with `state: "indexing"` while the
+            // index is built; `503 index_unavailable` when its build failed.
+            Ok((409, body)) if strings(&body, "state").iter().any(|s| s == "indexing") => {
+                *polls += 1;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Ok((status, body)) => return Err(failure(status, &body)),
+            Err(_) => return Err("no answer".to_string()),
+        }
+    }
+}
+
+/// The bytes the files in `dir` and its folders take together; 0 for a
+/// folder that cannot be listed.
+fn folder_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => folder_bytes(&e.path()),
+            _ => e.metadata().map_or(0, |m| m.len()),
+        })
+        .sum()
+}
+
 /// Whether `dir` is missing or empty, so that the index is built in it; a
 /// folder that cannot be listed may hold an index and is neither.
 fn fresh(dir: &Path) -> bool {
@@ -604,28 +700,39 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     }
 
     // The position index: its build in the new folder, a lookup per move
-    // along the most played line, and opening it again in a new bridge.
+    // along the most played line, and opening it again in a new bridge. The
+    // index folder is measured while the build writes it (#147): at its
+    // largest, and once the build is done.
     let explorer = |fen: &str| format!("{base}/explorer?fen={}", encode(fen));
+    let folder = o.index.join("index");
+    let building = std::sync::atomic::AtomicBool::new(true);
     let t = Instant::now();
     let mut polls = 0u64;
-    let built = loop {
-        match c.get(&explorer(START_FEN), true) {
-            Ok((200, _)) => break Ok(()),
-            // `409 database_unavailable` with `state: "indexing"` while the
-            // index is built; `503 index_unavailable` when its build failed.
-            Ok((409, body)) if strings(&body, "state").iter().any(|s| s == "indexing") => {
-                polls += 1;
-                std::thread::sleep(Duration::from_millis(250));
+    let (built, peak) = std::thread::scope(|s| {
+        let sampler = s.spawn(|| {
+            let mut peak = 0;
+            while building.load(std::sync::atomic::Ordering::Relaxed) {
+                peak = peak.max(folder_bytes(&folder));
+                std::thread::sleep(Duration::from_millis(20));
             }
-            Ok((status, body)) => break Err(failure(status, &body)),
-            Err(_) => break Err("no answer".to_string()),
-        }
-    };
+            peak.max(folder_bytes(&folder))
+        });
+        let built = build_index(&mut c, &explorer(START_FEN), &mut polls);
+        building.store(false, std::sync::atomic::Ordering::Relaxed);
+        (built, sampler.join().unwrap_or(0))
+    });
     match built {
         Ok(()) => {
             let took = ms(t.elapsed());
-            let stream = stream_counts(&o.index.join("index").join(format!("{}.moves", served.id)));
-            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}"));
+            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
+            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
+            let sizes =
+                format!("index {index} bytes, folder at most {peak} bytes, {} bytes after", folder_bytes(&folder));
+            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}, {sizes}"));
+            match served.built(Duration::from_secs(10)) {
+                Some(t) => build_phases(&mut table, &t),
+                None => table.failure("index", "build phases", "not told"),
+            }
         }
         Err(why) => table.failure("index", "build to first answer", &why),
     }
@@ -966,6 +1073,19 @@ mod tests {
         std::fs::write(&path, b"not a stream").unwrap();
         assert_eq!(stream_counts(&path), "no move stream");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A folder's bytes are its files' and its folders' files'.
+    #[test]
+    fn a_folders_bytes_count_every_file_in_it() {
+        let dir = std::env::temp_dir().join(format!("cbtool-profile-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(folder_bytes(&dir), 0);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("a.idx"), [0u8; 100]).unwrap();
+        std::fs::write(dir.join("inner").join("b"), [0u8; 20]).unwrap();
+        assert_eq!(folder_bytes(&dir), 120);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

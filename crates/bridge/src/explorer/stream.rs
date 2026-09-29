@@ -1,10 +1,11 @@
 //! The move stream (#145): each game's main line as 2CBH move words, in a
 //! file of the bridge's own beside the position index, `<id>.moves`
-//! (`docs/format-notes.md`, "Move stream"). A build writes it from the walk
-//! that builds the index, each word checked as it was played, so every part
-//! of the index sees the same lines. The deep section's candidates are then
-//! replayed from it, mapped read-only, without legality checks and without
-//! reading the database's files.
+//! (`docs/format-notes.md`, "Move stream"). A build writes it first, from its
+//! walk of the database's games, each word checked as it was played; the
+//! tree and the deep section are then built from it (#147), so every part of
+//! the index sees the same lines. The deep section's candidates are replayed
+//! from it too, mapped read-only, without legality checks and without reading
+//! the database's files.
 //!
 //! A 2CBH word names one move from a list of every move each piece can make
 //! on an empty board, so it means the same in any position: the words of a
@@ -39,8 +40,8 @@ use super::source::Line;
 pub const MAGIC: [u8; 8] = *b"OSCBMOV\0";
 pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 128;
-/// The words of a line kept in its record's slot: the tree's depth once
-/// #143 moves it to ply 20, and one more.
+/// The words of a line kept in its record's slot: the tree's depth, 20 plies,
+/// and one more, the move from its last position.
 pub const PREFIX_WORDS: usize = 21;
 const PREFIX_BYTES: usize = 2 * PREFIX_WORDS;
 /// A record's slot: its directory entry, its prefix words, two zero bytes
@@ -331,14 +332,14 @@ pub(super) fn standard_setup() -> &'static [u8; SETUP_BYTES] {
     START.get_or_init(|| setup_of(standard()))
 }
 
-fn standard() -> &'static Board {
+pub(super) fn standard() -> &'static Board {
     static START: OnceLock<Board> = OnceLock::new();
     START.get_or_init(Board::startpos)
 }
 
 /// The move each word below the set-up piece words names in standard chess;
 /// `None` for the words a stream never holds.
-fn moves() -> &'static [Option<Move>] {
+pub(super) fn moves() -> &'static [Option<Move>] {
     static MOVES: OnceLock<Vec<Option<Move>>> = OnceLock::new();
     MOVES.get_or_init(|| (0..FIRST_PIECE_WORD).map(replay::standard_move).collect())
 }
@@ -694,6 +695,24 @@ impl Stream {
 
     /// Record `number`, checked against its CRC.
     fn record(&self, number: u32) -> Result<Record<'_>, Bad> {
+        let (slot, tail) = self.place(number)?;
+        if record_crc(number, &slot[..CRC_AT], tail) != u32_at(slot, CRC_AT) {
+            return Err(Bad::Corrupt("stream record"));
+        }
+        Ok(Record::of(slot, tail))
+    }
+
+    /// Record `number` as a build reads back the stream it has just written
+    /// (#147): placed within the file, but not checked against its CRC, which
+    /// every answer checks. A pass of the build reads every record, and the
+    /// tree's passes only the first bytes of each.
+    pub(super) fn written(&self, number: u32) -> Result<Record<'_>, Bad> {
+        let (slot, tail) = self.place(number)?;
+        Ok(Record::of(slot, tail))
+    }
+
+    /// The slot and the tail of record `number`, within the file.
+    fn place(&self, number: u32) -> Result<(&[u8], &[u8]), Bad> {
         let i = number
             .checked_sub(self.header.first_record)
             .map(u64::from)
@@ -705,7 +724,7 @@ impl Stream {
         let slot =
             at.and_then(|at| bytes.get(at as usize..at as usize + SLOT_BYTES)).ok_or(Bad::Corrupt("stream record"))?;
         let entry = Entry::decode(slot);
-        let (setup, len) = entry.tail_bytes();
+        let len = entry.tail_bytes().1;
         let tail = if len == 0 {
             &[][..]
         } else {
@@ -715,17 +734,7 @@ impl Stream {
                 .and_then(|end| bytes.get(at as usize..end as usize))
                 .ok_or(Bad::Corrupt("stream tail"))?
         };
-        if record_crc(number, &slot[..CRC_AT], tail) != u32_at(slot, CRC_AT) {
-            return Err(Bad::Corrupt("stream record"));
-        }
-        let plies = usize::from(entry.plies);
-        let (start, past) = tail.split_at(setup);
-        Ok(Record {
-            entry,
-            prefix: &slot[PREFIX_AT..PREFIX_AT + 2 * plies.min(PREFIX_WORDS)],
-            past,
-            setup: (setup > 0).then_some(start),
-        })
+        Ok((slot, tail))
     }
 
     /// Record `number`'s directory entry.
@@ -789,22 +798,36 @@ impl Stream {
     }
 }
 
-/// A record of a stream, checked: its entry, the words of its prefix, the
-/// words past it, and its set-up start.
-struct Record<'a> {
-    entry: Entry,
+/// A record of a stream: its entry, the words of its prefix, the words past
+/// it, and its set-up start.
+pub(super) struct Record<'a> {
+    pub entry: Entry,
     prefix: &'a [u8],
     past: &'a [u8],
     setup: Option<&'a [u8]>,
 }
 
-impl Record<'_> {
-    fn words(&self) -> impl Iterator<Item = u16> {
+impl<'a> Record<'a> {
+    /// The record whose slot and tail, as long as its entry says, are these.
+    fn of(slot: &'a [u8], tail: &'a [u8]) -> Record<'a> {
+        let entry = Entry::decode(slot);
+        let setup = entry.tail_bytes().0.min(tail.len());
+        let plies = usize::from(entry.plies);
+        let (start, past) = tail.split_at(setup);
+        Record {
+            entry,
+            prefix: &slot[PREFIX_AT..PREFIX_AT + 2 * plies.min(PREFIX_WORDS)],
+            past,
+            setup: (setup > 0).then_some(start),
+        }
+    }
+
+    pub fn words(&self) -> impl Iterator<Item = u16> + use<'a> {
         self.prefix.as_chunks::<2>().0.iter().chain(self.past.as_chunks::<2>().0).map(|w| u16::from_le_bytes(*w))
     }
 
     /// The set-up start; `None` for the standard one.
-    fn start(&self) -> Result<Option<Board>, Bad> {
+    pub fn start(&self) -> Result<Option<Board>, Bad> {
         self.setup.map(|s| board_of(s).ok_or(Bad::Corrupt("stream set-up"))).transpose()
     }
 }

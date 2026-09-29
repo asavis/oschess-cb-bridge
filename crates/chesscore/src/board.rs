@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::attacks;
 use crate::types::{Bitboard, Color, Move, Piece, Square, squares};
-use crate::zobrist::{CASTLE, EN_PASSANT, KEYS, PIECE, TURN};
+use crate::zobrist::{self, EN_PASSANT, KEYS, TURN};
 
 /// The two castling sides. Short castling ends with the king on the g-file,
 /// long castling on the c-file, in standard chess and Chess960 alike.
@@ -93,13 +93,12 @@ pub struct Board {
 
 #[inline]
 fn piece_key(piece: Piece, color: Color, sq: Square) -> u64 {
-    let kind = 2 * piece.index() + usize::from(color == Color::White);
-    KEYS[PIECE + 64 * kind + sq.index()]
+    zobrist::piece(piece, color, sq)
 }
 
 #[inline]
 fn castle_key(color: Color, side: CastleSide) -> u64 {
-    KEYS[CASTLE + 2 * color.index() + side.index()]
+    zobrist::castle(color, side)
 }
 
 // Per piece kind (pawn, knight, bishop, rook, queen, king): all ones when it

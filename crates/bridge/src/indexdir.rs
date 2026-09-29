@@ -7,14 +7,35 @@
 //! fixed-width reads the files are checked and decoded with.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 /// How long a database's files stay in an index folder after it left the
 /// list (#60): a list that loses a database for a moment, as while ChessBase
-/// rewrites its list, must not cost a rebuild: minutes, and some 8 GB of
-/// temporary space for the Mega Database.
+/// rewrites its list, must not cost a rebuild: for the Mega Database, half a
+/// minute of half the search workers.
 pub const SWEEP_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Empties `dir`, an index folder the bridge no longer uses (#147), of the
+/// files and folders it wrote there, those whose names `kept` knows, then
+/// removes it once nothing else is in it: anything else stays, and so does
+/// the folder then. Each step is tried once, and what stays is tried again at
+/// the next start.
+pub fn sweep_moved(dir: &Path, kept: impl Fn(&str) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(&kept) {
+            continue;
+        }
+        // A link is removed, never followed.
+        let _ = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(entry.path()),
+            _ => std::fs::remove_file(entry.path()),
+        };
+    }
+    let _ = std::fs::remove_dir(dir);
+}
 
 /// The database id of an index folder entry named `<id><suffix>`, for one of
 /// `suffixes`, and the index of that suffix; `None` for anything else, which
@@ -225,6 +246,27 @@ mod tests {
         assert!(!sweep(&mut unlisted, "b", 700));
         assert!(!sweep(&mut unlisted, "b", 1299));
         assert!(sweep(&mut unlisted, "b", 1300));
+    }
+
+    /// A folder the indexes moved out of loses what the bridge wrote there,
+    /// and goes once nothing else is left.
+    #[test]
+    fn a_moved_index_folder_is_emptied_of_the_bridges_files() {
+        let dir = std::env::temp_dir().join(format!("bridge-moved-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("0123456789abcdef.build").join("runs")).unwrap();
+        for name in ["0123456789abcdef.idx", "0123456789abcdef.heads", "notes.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let kept = |name: &str| name.starts_with("0123456789abcdef");
+        sweep_moved(&dir, kept);
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["notes.txt"], "the folder keeps what the bridge did not write");
+        std::fs::remove_file(dir.join("notes.txt")).unwrap();
+        std::fs::write(dir.join("0123456789abcdef.moves"), b"x").unwrap();
+        sweep_moved(&dir, kept);
+        assert!(!dir.exists(), "an emptied folder goes");
+        sweep_moved(&dir, kept);
     }
 
     #[test]
