@@ -183,13 +183,11 @@ fn effects() -> &'static [Effect] {
 /// the changes of its structure ([`Tracker::play_noting`]).
 const CHANGES: usize = 64;
 
-/// The parts of a line's structure after a word that may have changed it,
-/// and the ply it leads to.
+/// The parts of a line's structure after a word that may have changed it.
 #[derive(Clone, Copy, Default)]
 struct Change {
     pawns: [u64; 2],
     pieces: u64,
-    ply: u32,
 }
 
 /// A line's structure followed through its move words alone: each side's
@@ -241,20 +239,19 @@ impl Tracker {
         Some(e >> 23 & 1 != 0)
     }
 
-    /// Plays `words`, from the position at ply `ply`, and notes in `changes`
-    /// the parts of the structure after each word that may have changed it,
-    /// a pawn's move or a capture, with the ply it leads to: without a branch
-    /// a word, since which words do is unpredictable. The changes noted;
-    /// `None` when a word names no move of standard chess.
+    /// Plays `words` and notes in `changes` the parts of the structure after
+    /// each word that may have changed it, a pawn's move or a capture:
+    /// without a branch a word, since which words do is unpredictable. The
+    /// changes noted; `None` when a word names no move of standard chess.
     #[inline]
-    fn play_noting(&mut self, words: &[[u8; 2]], ply: u32, changes: &mut [Change; CHANGES]) -> Option<usize> {
+    fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut [Change; CHANGES]) -> Option<usize> {
         let (mut noted, mut named) = (0, MOVE);
-        for (w, ply) in words.iter().take(CHANGES).zip(ply + 1..) {
+        for w in words.iter().take(CHANGES) {
             let e = self.effects.get(usize::from(u16::from_le_bytes(*w))).map_or(0, |e| e.0);
             named &= e;
             self.apply(e);
             if let Some(c) = changes.get_mut(noted) {
-                *c = Change { pawns: self.pawns, pieces: self.pieces, ply };
+                *c = Change { pawns: self.pawns, pieces: self.pieces };
             }
             noted += (e >> 23 & 1) as usize;
         }
@@ -388,18 +385,23 @@ struct Split {
 }
 
 /// A worker's postings in a pass: its buffer of `cap`, and those of the
-/// pass's first bucket it counted ([`Pass::rest`]).
+/// pass's first bucket it counted ([`Pass::rest`]); and what the replay of a
+/// line notes as it goes, the changes of a run of words and the postings
+/// that lie in the pass.
 struct Kept {
     buf: Vec<u64>,
     cap: usize,
     rest: u64,
+    changes: [Change; CHANGES],
+    found: [u64; MAX_STRUCTURES],
 }
 
-/// What the replay of a line has kept: its structures, and the prints of
-/// those in the pass's first bucket.
+/// What the replay of a line has found: its structures, those of them that
+/// lie in the pass, and the prints of those in the pass's first bucket.
 #[derive(Default)]
 struct Replayed {
     structures: usize,
+    found: usize,
     prints: u128,
 }
 
@@ -413,7 +415,13 @@ impl Pass<'_> {
         let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
         workers::run(want, 0, &Cancel::never(), |w| {
             let cap = self.capacity / w.count;
-            let mut kept = Kept { buf: Vec::new(), cap, rest: 0 };
+            let mut kept = Kept {
+                buf: Vec::new(),
+                cap,
+                rest: 0,
+                changes: [Change::default(); CHANGES],
+                found: [0; MAX_STRUCTURES],
+            };
             kept.buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
             let mut taker = chunks.taker();
             loop {
@@ -439,7 +447,8 @@ impl Pass<'_> {
     /// Adds the postings of game `game`'s structures past the tree's plies
     /// that lie in the pass to `kept`: each once, in the order its line holds
     /// them, as the walk that wrote the stream met them, and marked when the
-    /// line holds it beyond [`MAX_PLY`].
+    /// line holds it beyond [`MAX_PLY`], as it holds every one past the
+    /// tree's plies.
     fn replay(&self, game: u32, kept: &mut Kept) -> Result<(), SearchError> {
         let path = &self.stream.path;
         let record = self.stream.written(game).map_err(|e| from_bad(path, e))?;
@@ -451,67 +460,67 @@ impl Pass<'_> {
         let mut line = Tracker::of(start.as_ref().unwrap_or_else(|| stream::standard()));
         let word = || corrupt(path, "stream word");
         // The tree's plies hold no structure of the section: they are the
-        // prefix's words, and the words past it follow ply 21.
-        const { assert!(stream::PREFIX_WORDS == PRUNE_PLY as usize + 1) };
+        // prefix's words, and the words past it follow ply 21, beyond the
+        // tree's plies.
+        const { assert!(stream::PREFIX_WORDS == PRUNE_PLY as usize + 1 && PRUNE_PLY >= MAX_PLY) };
         let (prefix, past) = record.word_parts();
         for w in prefix {
             line.play(u16::from_le_bytes(*w)).ok_or_else(word)?;
         }
-        // The structure held from ply 21, and the last ply it was held at.
-        let mut held = (line.structure(), u32::from(PRUNE_PLY) + 1);
+        // The pass's points as far as it reached when the line began: `hi`
+        // only comes down, and each posting found is looked at again as it
+        // is kept.
+        let span = self.hi.load(Ordering::Relaxed).saturating_sub(self.lo);
+        let mut held = line.structure();
         let mut replayed = Replayed::default();
-        let mut changes = [Change::default(); CHANGES];
         for words in past.chunks(CHANGES) {
-            let noted = line.play_noting(words, held.1, &mut changes).ok_or_else(word)?;
-            for c in &changes[..noted] {
+            let noted = line.play_noting(words, &mut kept.changes).ok_or_else(word)?;
+            for c in &kept.changes[..noted] {
                 let s = structure_of(c.pawns[0], c.pawns[1], c.pieces);
-                if s != held.0 {
-                    self.add(held.0, c.ply - 1, game, &mut replayed, kept)?;
-                    held.0 = s;
+                if s != held {
+                    self.find(held, game, span, &mut replayed, &mut kept.found);
+                    held = s;
                 }
             }
-            held.1 += words.len() as u32;
         }
-        self.add(held.0, held.1, game, &mut replayed, kept)
+        self.find(held, game, span, &mut replayed, &mut kept.found);
+        kept.rest += u64::from(replayed.prints.count_ones());
+        for i in 0..replayed.found {
+            let p = kept.found[i];
+            if point(p) >= self.hi.load(Ordering::Relaxed) {
+                continue;
+            }
+            if kept.buf.len() >= kept.cap {
+                make_room(&mut kept.buf, kept.cap, self.lo, self.hi)?;
+            }
+            if point(p) < self.hi.load(Ordering::Relaxed) {
+                kept.buf.push(p);
+            }
+        }
+        Ok(())
     }
 
-    /// Adds game `game`'s posting of `structure`, held last at ply `last`, when
-    /// it lies in the pass: the line's first [`MAX_STRUCTURES`] structures, as
-    /// the walk kept them. One of the pass's first bucket is counted, once per
-    /// print, wherever the pass ends.
-    fn add(
-        &self,
-        structure: u64,
-        last: u32,
-        game: u32,
-        replayed: &mut Replayed,
-        kept: &mut Kept,
-    ) -> Result<(), SearchError> {
+    /// Notes game `game`'s posting of `structure` in `found` when it lies in
+    /// the pass's `span` of points from `lo`: the line's first
+    /// [`MAX_STRUCTURES`] structures, as the walk kept them, without a
+    /// branch on where the structure's bucket lies, which is unpredictable.
+    /// One of the pass's first bucket is counted, once per print, wherever
+    /// the pass ends.
+    #[inline(always)]
+    fn find(&self, structure: u64, game: u32, span: u64, replayed: &mut Replayed, found: &mut [u64; MAX_STRUCTURES]) {
         if replayed.structures >= MAX_STRUCTURES {
-            return Ok(());
+            return;
         }
         replayed.structures += 1;
         let at = u64::from(deep_bucket(structure, self.bits)) << GAME_BITS | u64::from(game);
-        if at < self.lo {
-            return Ok(());
+        if at >> GAME_BITS == self.lo >> GAME_BITS && at >= self.lo {
+            replayed.prints |= 1u128 << deep_print(structure, self.bits);
         }
-        if at >> GAME_BITS == self.lo >> GAME_BITS {
-            let print = 1u128 << deep_print(structure, self.bits);
-            if replayed.prints & print == 0 {
-                replayed.prints |= print;
-                kept.rest += 1;
-            }
+        // Fewer found than structures, so within `found`.
+        if let Some(f) = found.get_mut(replayed.found) {
+            *f = posting(structure, self.bits, game, true);
         }
-        if at >= self.hi.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if kept.buf.len() >= kept.cap {
-            make_room(&mut kept.buf, kept.cap, self.lo, self.hi)?;
-        }
-        if at < self.hi.load(Ordering::Relaxed) {
-            kept.buf.push(posting(structure, self.bits, game, last > u32::from(MAX_PLY)));
-        }
-        Ok(())
+        replayed.found += usize::from(at.wrapping_sub(self.lo) < span);
     }
 }
 
@@ -1034,9 +1043,9 @@ mod tests {
     }
 
     /// Words played a run at a time note the parts after each word that may
-    /// change the structure, with the ply it leads to, as the words played
-    /// one at a time say, over random games long enough to promote; a run
-    /// with a word that names no move fails.
+    /// change the structure, as the words played one at a time say, over
+    /// random games long enough to promote; a run with a word that names no
+    /// move fails.
     #[test]
     fn a_run_of_words_notes_each_change() {
         let mut x = 0x2545_f491_4f6c_dd1du64;
@@ -1058,18 +1067,17 @@ mod tests {
             }
             let mut one = Tracker::of(&Board::startpos());
             let mut expected = Vec::new();
-            for (ply, &w) in (1..).zip(&words) {
+            for &w in &words {
                 if one.play(w).unwrap() {
-                    expected.push((one.pawns, one.pieces, ply));
+                    expected.push((one.pawns, one.pieces));
                 }
             }
             let bytes: Vec<[u8; 2]> = words.iter().map(|w| w.to_le_bytes()).collect();
-            let (mut run, mut noted, mut ply) = (Tracker::of(&Board::startpos()), Vec::new(), 0);
+            let (mut run, mut noted) = (Tracker::of(&Board::startpos()), Vec::new());
             let mut changes = [Change::default(); CHANGES];
             for words in bytes.chunks(CHANGES) {
-                let n = run.play_noting(words, ply, &mut changes).unwrap();
-                noted.extend(changes[..n].iter().map(|c| (c.pawns, c.pieces, c.ply)));
-                ply += words.len() as u32;
+                let n = run.play_noting(words, &mut changes).unwrap();
+                noted.extend(changes[..n].iter().map(|c| (c.pawns, c.pieces)));
             }
             assert_eq!(noted, expected);
             assert_eq!(run, one);
@@ -1079,6 +1087,6 @@ mod tests {
         let mut run = Tracker::of(&Board::startpos());
         let mut changes = [Change::default(); CHANGES];
         let e2e4 = cbformat::replay::word_of(&Board::startpos(), "e2e4".parse().unwrap()).unwrap();
-        assert_eq!(run.play_noting(&[e2e4.to_le_bytes(), [0, 0]], 0, &mut changes), None);
+        assert_eq!(run.play_noting(&[e2e4.to_le_bytes(), [0, 0]], &mut changes), None);
     }
 }
