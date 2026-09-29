@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
+use bridge::explorer::paths;
 use bridge::explorer::stream::{BATCH, Header, SLOT_BYTES, TABLE_ENTRY};
 use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, words};
@@ -621,6 +622,38 @@ fn errors_are_the_explorers() {
         assert_eq!(status, 400, "{fen}: {body}");
         assert!(body.contains(r#""parameter":"fen""#), "{body}");
     }
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The games of a position with a `q` that uses a qualifier only the
+/// Library has are refused before the database is opened: nothing is built
+/// or queued for its index (#173). A list without the qualifier then starts
+/// the build.
+#[test]
+fn an_unsupported_qualifier_starts_no_build() {
+    let games = games();
+    let db = database("positions-unsupported", &games);
+    let dir = index_dir("unsupported");
+    let (bridge, id) = serve(&db, &dir);
+    for qualifier in ["tag", "created", "updated", "is", "has", "no"] {
+        let (status, body) = get(bridge.port, &list(&id, START, &format!("&stream=tab&q={qualifier}%3Ax")));
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"error":{{"code":"unsupported_qualifier","message":"ChessBase databases do not have this qualifier","qualifier":"{qualifier}"}}}}"#
+            )
+        );
+    }
+    let (_, status) = get(bridge.port, "/v1/status");
+    assert!(!status.contains(r#""indexing""#), "{status}");
+    let (index, stream) = paths(&dir.join("index"), &id);
+    assert!(!index.exists() && !stream.exists());
+    let (status, body) = get(bridge.port, &list(&id, START, "&q=white%3Aalpha"));
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(r#""state":"indexing""#), "{body}");
+    answered(bridge.port, &list(&id, START, ""));
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }

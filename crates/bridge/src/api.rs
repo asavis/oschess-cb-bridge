@@ -21,7 +21,7 @@ use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok, unavailable};
 use crate::rows::{LINE_BUFFER_BYTES, Lines, MAX_ROW_BYTES, Names, clip, row};
-use crate::search::query::Sort;
+use crate::search::query::{Sort, Unsupported};
 use crate::search::{self, SearchError, Selection, SuggestField};
 use crate::snapshot::Database;
 use crate::store::{Head, Store, with_store};
@@ -378,11 +378,7 @@ fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
 /// The answer to a search that could not finish.
 fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Response {
     match e {
-        SearchError::Unsupported(qualifier) => {
-            error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
-                o.str("qualifier", &qualifier)
-            })
-        }
+        SearchError::Unsupported(qualifier) => unsupported_qualifier(&qualifier),
         SearchError::Superseded => error(409, "superseded", "A newer search on this database replaced this one"),
         SearchError::TooLarge => {
             error(422, "database_too_large", "The database is too large to search or sort within the memory budget")
@@ -392,6 +388,14 @@ fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Re
         SearchError::Read(e) => internal(&entry.id, &e),
         SearchError::IndexDamaged => explorer::rebuilding(app, entry),
     }
+}
+
+/// The answer to a search text that uses `qualifier`, which only the oschess
+/// Library has (`docs/search-grammar.md`).
+fn unsupported_qualifier(qualifier: &str) -> Response {
+    error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
+        o.str("qualifier", qualifier)
+    })
 }
 
 /// The answer to a read of database `id` that failed with a bug: `500
@@ -549,7 +553,14 @@ impl<'r> GamesQuery<'r> {
             }
             stream => stream,
         };
-        Ok(GamesQuery { offset, limit, sort, line, board, stream, q: req.param("q") })
+        // The search text's one refusal needs no database: a qualifier only
+        // the Library has. The search reads the text again, as its grammar's
+        // owner; every other way a search fails needs the database.
+        let q = req.param("q");
+        if let Some(Err(Unsupported(qualifier))) = q.map(search::query::parse) {
+            return Err(unsupported_qualifier(&qualifier));
+        }
+        Ok(GamesQuery { offset, limit, sort, line, board, stream, q })
     }
 }
 
@@ -733,6 +744,24 @@ mod tests {
         for query in ["fen=4k3/8/8/8/8/8/8/4KR1R+w+F+-+0+1", "fen=nonsense&variant=chess960"] {
             assert_eq!(refusal(query), (422, unsupported.to_string()), "{query}");
         }
+        // The Library-only qualifiers of `docs/search-grammar.md`, in any
+        // form, checked last.
+        let with_a_position = format!("q=tag%3Ax&fen={START_PARAM}&stream=tab");
+        for (query, qualifier) in [
+            ("q=tag%3Ax", "tag"),
+            ("q=-is%3Achapter", "is"),
+            ("q=no%3Atag", "no"),
+            ("q=created%3A2026", "created"),
+            ("q=UPDATED%3A%3E1", "updated"),
+            ("q=morphy+has%3Aeco+sort%3Adate", "has"),
+            (with_a_position.as_str(), "tag"),
+        ] {
+            let refusal_body = format!(
+                r#"{{"error":{{"code":"unsupported_qualifier","message":"ChessBase databases do not have this qualifier","qualifier":"{qualifier}"}}}}"#
+            );
+            assert_eq!(refusal(query), (400, refusal_body), "{query}");
+        }
+        assert_eq!(refusal("q=tag%3Ax&stream=bad!"), bad("stream", stream));
     }
 
     #[test]
@@ -756,9 +785,10 @@ mod tests {
         assert!(query.board.is_none());
     }
 
-    /// A list refused for any of its parameters, its `fen` or its `stream`
-    /// among them, does not mark its database in use; a list of a position
-    /// that passes every check does, before the database is opened (#173).
+    /// A list refused for any of its parameters, its `fen`, its `stream` or
+    /// its `q` among them, does not mark its database in use; a list of a
+    /// position that passes every check does, before the database is opened
+    /// (#173).
     #[test]
     fn a_refused_list_marks_nothing_in_use() {
         let path = std::env::temp_dir().join(format!("bridge-api-in-use-{}", std::process::id())).join("Absent.2cbh");
@@ -771,12 +801,13 @@ mod tests {
             format!("fen={START_PARAM}&stream=bad!"),
             format!("fen={START_PARAM}&limit=0"),
             format!("fen={START_PARAM}&variant=chess960"),
+            format!("fen={START_PARAM}&q=tag%3Ax"),
         ] {
             let answer = list(&query);
             assert!(matches!(answer.status, 400 | 422), "{query}: {}", answer.body);
             assert!(!app.catalog.explorer.in_use(&id), "{query} marked the database in use");
         }
-        let answer = list(&format!("fen={START_PARAM}&stream=tab"));
+        let answer = list(&format!("fen={START_PARAM}&stream=tab&q=white%3Amorphy+sort%3Adate"));
         let missing =
             r#"{"error":{"code":"database_unavailable","message":"The database is not ready","state":"missing"}}"#;
         assert_eq!((answer.status, answer.body.as_str()), (409, missing));

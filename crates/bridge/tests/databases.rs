@@ -785,8 +785,9 @@ fn cloud_states_over_http() {
 }
 
 /// A request for the games of a cloud-only database is checked whole before
-/// the database is opened: one refused for any parameter, `stream` and
-/// `fen` among them, starts no download (#173). A valid one then does.
+/// the database is opened: one refused for any parameter, `stream`, `fen`
+/// and a `q` with a Library-only qualifier among them, starts no download
+/// (#173). A valid one then does.
 #[test]
 fn a_refused_request_starts_no_download() {
     let root = Root::new("cloud-refused");
@@ -811,6 +812,19 @@ fn a_refused_request_starts_no_download() {
         assert!(body.contains(&format!("\"parameter\":\"{parameter}\"")), "{query}: {body}");
         assert!(entry.progress().is_none(), "{query} started a download");
         assert_eq!(entry.state(), State::CloudOnly, "{query}");
+    }
+    // Alone and with a valid position alike.
+    for qualifier in ["tag", "created", "updated", "is", "has", "no"] {
+        for query in [format!("q={qualifier}%3Ax"), format!("fen={start}&stream=tab-1&q={qualifier}%3Ax")] {
+            let (status, body) = get(port, &format!("/v1/databases/{id}/games?{query}"));
+            assert_eq!(status, 400, "{query}: {body}");
+            let refusal = format!(
+                "\"code\":\"unsupported_qualifier\",\"message\":\"ChessBase databases do not have this qualifier\",\"qualifier\":\"{qualifier}\""
+            );
+            assert!(body.contains(&refusal), "{query}: {body}");
+            assert!(entry.progress().is_none(), "{query} started a download");
+            assert_eq!(entry.state(), State::CloudOnly, "{query}");
+        }
     }
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?stream=tab-1"));
