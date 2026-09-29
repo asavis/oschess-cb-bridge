@@ -368,6 +368,12 @@ impl Registry {
         ready
     }
 
+    /// Records the build of `id` at `generation`, which runs on this thread
+    /// until the guard drops, as failed should it panic ([`Unwinding`]).
+    pub fn unwinding<'a>(&'a self, id: &'a str, generation: u64) -> Unwinding<'a> {
+        Unwinding { registry: self, id, generation }
+    }
+
     /// Removes from `dir` the heads files no listed database uses, as the
     /// position index's sweep does (#60): a database's file once it has been
     /// off the list for the grace, and a build's partial file when no build
@@ -400,6 +406,26 @@ impl Registry {
     }
 }
 
+/// Records a heads build whose job panics as failed, as the job unwinds to
+/// the queue that catches it ([`crate::fetch::Serial`]) (#172): left
+/// working, its database would never have its file built, and keep a partial
+/// file that no sweep removes. The next build starts after [`RETRY_AFTER`],
+/// and the sweep removes the partial file meanwhile. A normal return leaves
+/// the record to [`Registry::built`].
+pub struct Unwinding<'a> {
+    registry: &'a Registry,
+    id: &'a str,
+    generation: u64,
+}
+
+impl Drop for Unwinding<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.registry.built(self.id, self.generation, Err("the build failed with a bug".into()));
+        }
+    }
+}
+
 /// Record numbers a pass over the heads file has read, for tests.
 pub static ROWS_READ: AtomicU64 = AtomicU64::new(0);
 
@@ -421,6 +447,87 @@ mod tests {
         drop(writing);
         registry.sweep(&dir, &listed);
         assert!(!partial.exists(), "a partial file left by no writer goes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A heads build whose job panics is recorded as failed (#172): no build
+    /// starts again before [`RETRY_AFTER`], the sweep removes the partial
+    /// file the build left, and the next request after that starts a new
+    /// build, whose file is attached.
+    #[test]
+    fn a_build_that_panics_is_recorded_as_failed() {
+        use crate::catalog::Catalog;
+        use crate::fetch::Cloud;
+        use crate::sources::Sources;
+        use cbformat::fixture::{Builder, quiet};
+        use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
+
+        /// Every file on this computer. A build asks between its blocks
+        /// whether its database is still the same, which looks at its files:
+        /// asked so on the heads thread while `bug` holds, it panics, noting
+        /// whether the build's partial file was being written.
+        struct Buggy {
+            bug: AtomicBool,
+            partial: PathBuf,
+            written: AtomicBool,
+        }
+        impl Cloud for Buggy {
+            fn is_cloud_only(&self, _: &Path, _: &std::fs::Metadata) -> bool {
+                if self.bug.load(Ordering::Relaxed) && std::thread::current().name() == Some("heads") {
+                    self.written.fetch_or(self.partial.exists(), Ordering::Relaxed);
+                    panic!("a bug in the build");
+                }
+                false
+            }
+            fn fetch(&self, _: &Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+                Err(std::io::Error::other("not for a test"))
+            }
+        }
+        let mut b = Builder::new();
+        let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+        for _ in 0..3 {
+            b.game(e4);
+        }
+        let db = b.write("heads-bug");
+        let db_path = db.dir().join("db.2cbh");
+        let dir = std::env::temp_dir().join(format!("bridge-heads-bug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = crate::catalog::id_of(&db_path);
+        let partial = partial_path(&path(&dir, &id));
+        let buggy = Buggy { bug: AtomicBool::new(true), partial: partial.clone(), written: AtomicBool::new(false) };
+        let cloud = Arc::new(buggy);
+        let sources = Sources { fixed: vec![db_path], ..Sources::default() };
+        let catalog = Catalog::with_sources(sources, Arc::clone(&cloud) as Arc<dyn Cloud>);
+        catalog.explorer.set_dir(dir.clone());
+        catalog.heads.set_min_records(1);
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        let states = || catalog.heads.states.lock().unwrap_or_else(|e| e.into_inner());
+        catalog.attach_heads(&entry, &open);
+        let until = Instant::now() + Duration::from_secs(30);
+        while matches!(states().get(&id), Some(State::Working(_))) {
+            assert!(Instant::now() < until, "the build is over");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(states().get(&id), Some(State::Waiting(_))), "the build is recorded as failed");
+        assert!(cloud.written.load(Ordering::Relaxed), "the build was writing its partial file");
+        let records = open.db.record_count();
+        assert!(matches!(catalog.heads.lookup(&dir, &id, open.generation, records), Lookup::None), "too soon");
+        catalog.sweep_indexes();
+        assert!(!partial.exists(), "the partial file is swept");
+        // RETRY_AFTER later.
+        if let Some(State::Waiting(at)) = states().get_mut(&id) {
+            *at = at.checked_sub(RETRY_AFTER).expect("the clock goes back that far");
+        }
+        cloud.bug.store(false, Ordering::Relaxed);
+        let until = Instant::now() + Duration::from_secs(30);
+        while !open.indexes.has_usable_heads() {
+            catalog.attach_heads(&entry, &open);
+            assert!(Instant::now() < until, "a heads file was attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(path(&dir, &id).exists() && !partial.exists());
+        drop((open, entry, catalog));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -527,6 +527,7 @@ impl Catalog {
                 let (db, indexes, probe) = (Arc::clone(&open.db), Arc::clone(&open.indexes), entry.generation_probe());
                 let path = heads::path(&dir, &entry.id);
                 let started = self.heads_queue.submit(Box::new(move || {
+                    let _bug = registry.unwinding(&id, generation);
                     let still = || probe() == Some(generation);
                     let result = heads::build_base(&db, generation, &path, &still);
                     if let Some(h) = registry.built(&id, generation, result) {

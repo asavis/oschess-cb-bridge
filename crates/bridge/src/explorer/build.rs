@@ -50,7 +50,8 @@ pub struct Plan {
 
 /// Builds the index of `plan` into `target`, and its move stream beside it
 /// ([`stream::path_of`]), each through a file of its own renamed at the end;
-/// nothing else is written. A failed build removes both.
+/// nothing else is written. A failed build removes both, and so does one
+/// that panics.
 pub fn build_with(
     source: &dyn Source,
     plan: &Plan,
@@ -58,14 +59,28 @@ pub fn build_with(
     progress: &Progress,
     limits: &Limits,
 ) -> Result<Header, SearchError> {
-    let (partial, moves) = (temporary(target), stream::path_of(target));
-    let moves_partial = temporary(&moves);
-    let result = build_in(source, plan, target, progress, limits);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&partial);
-        let _ = std::fs::remove_file(&moves_partial);
+    let mut partials = Partials { paths: [temporary(target), temporary(&stream::path_of(target))], renamed: false };
+    let header = build_in(source, plan, target, progress, limits)?;
+    partials.renamed = true;
+    Ok(header)
+}
+
+/// A build's two files, removed when it drops unless they were renamed into
+/// place: a build that fails, or panics (#172), leaves neither behind. Its
+/// files are closed by then, the build's frames having dropped them first.
+struct Partials {
+    paths: [PathBuf; 2],
+    renamed: bool,
+}
+
+impl Drop for Partials {
+    fn drop(&mut self) {
+        if !self.renamed {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
-    result
 }
 
 fn build_in(

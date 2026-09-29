@@ -307,6 +307,7 @@ impl Registry {
         let (machine, limits) = (self.builds.machine(), *lock(&self.limits));
         let (job_state, p, id) = (Arc::clone(state), Arc::clone(&progress), entry.id.clone());
         let work = move |kind: Kind| {
+            let _bug = Unwinding { state: &job_state, generation };
             // Asked at every turn, a stopped build's too. A background build
             // reads the database only while it opens at the build's
             // generation: listed, wholly on this computer and not downloading.
@@ -442,6 +443,25 @@ impl Registry {
             .collect();
         out.sort();
         out
+    }
+}
+
+/// Fails a build whose work panics, as the work unwinds to the queue that
+/// catches it ([`schedule`]), as a build that fails otherwise does (#172):
+/// left working, its database would be answered `indexing` for ever, never
+/// be built again, and keep a build's files that no sweep removes. A normal
+/// return leaves the state to the work.
+struct Unwinding<'a> {
+    state: &'a Mutex<State>,
+    generation: u64,
+}
+
+impl Drop for Unwinding<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let (why, generation) = ("the build failed with a bug".to_string(), self.generation);
+            *lock(self.state) = State::Failed { at: Instant::now(), why, generation };
+        }
     }
 }
 
@@ -705,6 +725,111 @@ mod tests {
         catalog.explorer.release();
         assert_eq!(Arc::strong_count(&loaded), 2, "held by the two requests alone");
         drop((loaded, again));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A build whose work panics fails as a build that fails otherwise does
+    /// (#172): its database is answered `index_unavailable` for a minute,
+    /// not `indexing` for ever, and no longer shows as building; the next
+    /// request after that minute starts a new build, which ends ready,
+    /// leaving no partial file.
+    #[test]
+    fn a_build_that_panics_fails_and_is_tried_again() {
+        /// A computer whose free space the index thread asks at the start of
+        /// each build's work, which panics then while `bug` holds.
+        struct Buggy {
+            bug: AtomicBool,
+        }
+        impl Machine for Buggy {
+            fn on_battery(&self) -> bool {
+                false
+            }
+            fn free_bytes(&self, _: &Path) -> Option<u64> {
+                if self.bug.load(Ordering::Relaxed) && std::thread::current().name() == Some("bridge-index") {
+                    panic!("a bug in the build");
+                }
+                None
+            }
+        }
+        let db = e4s("explorer-bug");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-bug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        catalog.explorer.set_dir(dir.clone());
+        let machine = Arc::new(Buggy { bug: AtomicBool::new(true) });
+        catalog.explorer.set_machine(Arc::clone(&machine) as Arc<dyn Machine>);
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        let state = catalog.explorer.state(&entry.id);
+        let settled = || {
+            let until = Instant::now() + Duration::from_secs(30);
+            while matches!(*lock(&state), State::Working(_)) {
+                assert!(Instant::now() < until, "the build is over");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Pending(_)));
+        settled();
+        match &*lock(&state) {
+            State::Failed { why, generation, .. } => {
+                assert_eq!((why.as_str(), *generation), ("the build failed with a bug", open.generation));
+            }
+            _ => panic!("the build did not fail"),
+        }
+        let Lookup::Failed(why) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!("not failed") };
+        assert_eq!(why, "the build failed with a bug");
+        assert!(catalog.explorer.building().is_empty(), "no build shows");
+        // A minute later.
+        if let State::Failed { at, .. } = &mut *lock(&state) {
+            *at = at.checked_sub(RETRY_AFTER_FAILURE).expect("the clock goes back a minute");
+        }
+        machine.bug.store(false, Ordering::Relaxed);
+        assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Pending(_)), "a new build");
+        settled();
+        let Lookup::Ready(loaded) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!("not built") };
+        assert_eq!((loaded.generation, loaded.records(), loaded.games()), (open.generation, 3, 3));
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, [format!("{}.idx", entry.id), format!("{}.moves", entry.id)]);
+        drop(loaded);
+        catalog.explorer.release();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A build that panics, here in the workers of its stream pass, removes
+    /// the files it was writing, as a build that fails otherwise does (#172).
+    #[test]
+    fn a_build_that_panics_leaves_no_partial_file() {
+        /// Three records whose games no worker reads without a panic; the
+        /// first to panic notes whether the move stream was being written.
+        struct Buggy {
+            partial: PathBuf,
+            written: AtomicBool,
+        }
+        impl Source for Buggy {
+            fn records(&self) -> u32 {
+                3
+            }
+            fn lines(
+                &self,
+                _: u32,
+                _: u32,
+                _: u8,
+                _: &mut source::Workspace,
+                _: &mut dyn FnMut(&source::Line),
+            ) -> cbformat::Result<()> {
+                self.written.fetch_or(self.partial.exists(), Ordering::Relaxed);
+                panic!("a bug in the reader");
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-bug-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Buggy { partial: dir.join("db.moves.partial"), written: AtomicBool::new(false) };
+        let built = std::panic::catch_unwind(|| prepare(&db, 7, &dir, "db", &Progress::default()).map(drop));
+        assert!(built.is_err(), "the build panicked");
+        assert!(db.written.load(Ordering::Relaxed), "the move stream was being written");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file is left");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
