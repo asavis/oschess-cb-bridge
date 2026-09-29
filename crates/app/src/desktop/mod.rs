@@ -23,8 +23,10 @@ use crate::i18n::{Lang, Strings};
 use crate::status::{Problem, View};
 use server::Shared;
 
-/// The argument the Run key starts the app with, so a start at sign-in can be
-/// told from one by hand.
+/// The argument the Run key starts the app with. Nothing reads it: a start at
+/// sign-in runs as a start by hand does, and the Store's startup task passes
+/// none. It stays because the Run values already written carry it, so that a
+/// version that needs to tell the two starts apart still can.
 const AUTOSTART_ARG: &str = "--autostart";
 
 /// The channel, asked of Windows once.

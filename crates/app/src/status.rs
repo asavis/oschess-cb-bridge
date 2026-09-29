@@ -219,15 +219,31 @@ pub fn icon_file(theme: Theme, tray: Tray, size: u32) -> String {
     format!("{}-{}-{size}.png", theme.name(), tray.name())
 }
 
+/// Snapshots and views for this crate's tests, built in one place so that a
+/// field added to either is filled in once.
 #[cfg(test)]
-mod tests {
-    use bridge::catalog::State::{CloudOnly, Downloading, Missing, Opening, Ready, Unreadable, Unsupported};
-    use bridge::snapshot::Database;
+pub(crate) mod testing {
+    use bridge::catalog::State;
+    use bridge::snapshot::Snapshot;
 
-    use super::*;
-    use crate::i18n::Lang;
+    use super::{DatabaseView, View};
 
-    fn view(states: &[State]) -> View {
+    /// A serving bridge's snapshot: no database, no work, and no browser
+    /// served yet.
+    pub(crate) fn snapshot() -> Snapshot {
+        Snapshot {
+            version: "0.1.0",
+            port: 39581,
+            stopped: None,
+            databases: Vec::new(),
+            work: Vec::new(),
+            served: false,
+        }
+    }
+
+    /// The view of a serving bridge with a database in each of `states`, a
+    /// ready one of 10 records.
+    pub(crate) fn view(states: &[State]) -> View {
         View {
             version: "0.1.0".into(),
             port: 39581,
@@ -240,7 +256,7 @@ mod tests {
                     name: format!("Base {i}"),
                     format: "2cbh".into(),
                     state: *s,
-                    records: (*s == Ready).then_some(10),
+                    records: (*s == State::Ready).then_some(10),
                     size: None,
                     progress: None,
                 })
@@ -251,6 +267,16 @@ mod tests {
         }
         .marked()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use bridge::catalog::State::{CloudOnly, Downloading, Missing, Opening, Ready, Unreadable, Unsupported};
+    use bridge::snapshot::Database;
+
+    use super::testing::view;
+    use super::*;
+    use crate::i18n::Lang;
 
     #[test]
     fn the_mark_and_the_tooltip_follow_the_state() {
@@ -294,9 +320,7 @@ mod tests {
     #[test]
     fn a_snapshot_becomes_a_view() {
         let snapshot = Snapshot {
-            version: "0.1.0",
             port: 40000,
-            stopped: None,
             databases: vec![Database {
                 id: "0123456789abcdef".into(),
                 name: "Mega".into(),
@@ -308,8 +332,8 @@ mod tests {
                 progress: None,
                 listed: true,
             }],
-            work: Vec::new(),
             served: true,
+            ..testing::snapshot()
         };
         let view = View::of(&snapshot);
         assert_eq!(view.problem, None);

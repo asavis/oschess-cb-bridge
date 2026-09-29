@@ -232,7 +232,7 @@ mod tests {
     use super::*;
     use bridge::catalog::State;
 
-    use crate::status::DatabaseView;
+    use crate::status::testing::{self, view};
 
     /// A public key as `tauri signer generate` prints it, made here from an
     /// arbitrary key id and key.
@@ -341,14 +341,7 @@ mod tests {
     #[test]
     fn installs_wait_for_work_a_restart_would_lose() {
         use bridge::snapshot::{Snapshot, Work};
-        let snapshot = |work: Vec<Work>| Snapshot {
-            version: "0.1.0",
-            port: 39581,
-            stopped: None,
-            databases: Vec::new(),
-            work,
-            served: false,
-        };
+        let snapshot = |work: Vec<Work>| Snapshot { work, ..testing::snapshot() };
         assert!(idle(&View::of(&snapshot(Vec::new())), false));
         for work in [Work::Downloading, Work::Opening, Work::Indexing, Work::Analysing] {
             assert!(!idle(&View::of(&snapshot(vec![work])), false), "{work:?}");
@@ -358,26 +351,6 @@ mod tests {
 
     #[test]
     fn a_view_is_idle_unless_busy() {
-        let view = |states: &[State]| View {
-            version: "0.1.0".into(),
-            port: 39581,
-            problem: None,
-            databases: states
-                .iter()
-                .map(|s| DatabaseView {
-                    id: "0".into(),
-                    name: "Base".into(),
-                    format: "2cbh".into(),
-                    state: *s,
-                    records: None,
-                    size: None,
-                    progress: None,
-                })
-                .collect(),
-            connected: false,
-            mark: "",
-            busy: false,
-        };
         // The states themselves no longer decide: the bridge's work does.
         let all = [State::Ready, State::Missing, State::CloudOnly, State::Unreadable, State::Unsupported];
         assert!(idle(&view(&all), false));
@@ -450,15 +423,7 @@ mod tests {
     }
 
     fn idle_view(busy: bool) -> View {
-        View {
-            version: "1.1.0".into(),
-            port: 39581,
-            problem: None,
-            databases: Vec::new(),
-            connected: false,
-            mark: "",
-            busy,
-        }
+        View { busy, ..view(&[]) }
     }
 
     /// A Store install waits for idle and for the minute Windows needs before
