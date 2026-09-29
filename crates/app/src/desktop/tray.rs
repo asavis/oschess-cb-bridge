@@ -58,17 +58,17 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let strings = &shared.strings;
     let view = shared.view();
     let autostart = autostart::state(app) == State::On;
-    let item = |id: &str, key: &str| MenuItem::with_id(app, id, strings.get(key), true, None::<&str>);
+    let item = |id: &str, text: &str| MenuItem::with_id(app, id, text, true, None::<&str>);
     let tick = CheckMenuItem::with_id(app, AUTOSTART, strings.get("menu.autostart"), true, autostart, None::<&str>)?;
     app.manage(AutostartTick(tick.clone()));
     // The Store's package looks through the Store (#153); a direct build only
     // with a real updater key, and the item stays greyed without one.
     let update = MenuItem::with_id(app, "update", strings.get("menu.update"), updater::enabled(app), None::<&str>)?;
     let (open, settings, code, quit) = (
-        item("open", "menu.open")?,
-        item("settings", "menu.settings")?,
-        item("code", "menu.code")?,
-        item("quit", "menu.quit")?,
+        item("open", strings.get("menu.open"))?,
+        item("settings", strings.get("menu.settings"))?,
+        item("code", strings.get("menu.code"))?,
+        item("quit", strings.get("menu.quit"))?,
     );
     let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);
     let items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =

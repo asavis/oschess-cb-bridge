@@ -127,18 +127,12 @@ mod tests {
     }
 
     /// Every key the windows name, in `data-i18n*` attributes and `t(…)` or
-    /// `plural(…)` calls, and every key the Rust side names, is in the
-    /// dictionary: in the calls that translate it, in the failures the
-    /// commands answer (#186), or held in a variable first, such as a
-    /// notification's title picked by a condition.
+    /// `plural(…)` calls, and every key the Rust side names, in the calls that
+    /// translate it and in the failures the commands answer (#186), is in
+    /// both dictionaries, however it is spelled.
     #[test]
     fn every_key_in_use_exists() {
-        let known = keys(Lang::Uk);
-        let sections: BTreeSet<&str> = known.iter().filter_map(|k| k.split_once('.')).map(|(s, _)| s).collect();
-        // Literals that begin like a section of the dictionary but name a
-        // file, such as `app.json` or `tray.rs`: no key ends in these.
-        let file = |literal: &str| matches!(literal.rsplit('.').next(), Some("rs" | "js" | "json" | "html" | "toml"));
-        assert!(!known.iter().any(|k| file(k)), "a key ends like a file name");
+        let known: BTreeSet<String> = keys(Lang::Uk).intersection(&keys(Lang::En)).cloned().collect();
         let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
         let mut used = BTreeSet::new();
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -151,39 +145,80 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
-                for call in ["data-i18n=\"", "data-i18n-title=\"", "data-i18n-label=\"", "t('"] {
-                    used.extend(quoted_after(&text, call));
-                }
-                for call in ["strings.get(\"", "strings.fill(\"", "Failure::new(\"", "Failure::with(\""] {
-                    used.extend(quoted_after(&text, call));
-                }
-                if ext == "rs" {
-                    for literal in quoted_after(&text, "\"") {
-                        let section = literal.split('.').next().unwrap_or_default();
-                        // A plural's base names its forms, which `plural` finds.
-                        let plural = known.contains(&format!("{literal}.one"));
-                        if sections.contains(section) && !file(&literal) && !plural {
-                            used.insert(literal);
-                        }
-                    }
-                }
-                for call in ["plural('", "strings.plural(\""] {
-                    for base in quoted_after(&text, call) {
-                        used.extend(["one", "few", "many"].map(|f| format!("{base}.{f}")));
-                    }
-                }
+                used.extend(keys_named(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display())));
             }
         }
         let missing: Vec<_> = used.iter().filter(|k| !known.contains(*k)).collect();
         assert!(missing.is_empty(), "keys in use but not in the dictionary: {missing:?}");
         assert!(used.len() > 40, "the scan found only {} keys", used.len());
-        for (key, how) in [("settings.port.error", "answered as a failure"), ("toast.update.required.title", "held")] {
-            assert!(used.contains(key), "the scan misses a key {how}: {key}");
-        }
+        assert!(used.contains("settings.port.error"), "the scan reads the failures the commands answer");
     }
 
-    /// The text between `start` and the next quote, for every `start` in `text`
-    /// that begins a word and is followed by a plain dotted key.
+    /// The scan checks a key however it is spelled, and refuses a key it
+    /// cannot read where it is translated: a failure's key misspelled, or a
+    /// key held in a variable, passed unchecked before (#186).
+    #[test]
+    fn the_key_scan_misses_no_spelling() {
+        let known = keys(Lang::Uk);
+        let missing = |source: &str| -> Result<Vec<String>, String> {
+            Ok(keys_named(source)?.into_iter().filter(|k| !known.contains(k)).collect())
+        };
+        assert_eq!(missing(r#"Err(Failure::new("settings.engine.refused"))"#), Ok(vec![]));
+        for (source, key) in [
+            (r#"Err(Failure::new("settings.engine.re_fused"))"#, "settings.engine.re_fused"),
+            (r#"Failure::with("settings.error ", e.to_string())"#, "settings.error "),
+            (r#"strings.get("taost.update.waiting.title")"#, "taost.update.waiting.title"),
+            (r#"strings.fill("tray.port-busy", &[])"#, "tray.port-busy"),
+            (r#"strings.plural("tray.re_ady", n, &[])"#, "tray.re_ady.few"),
+            ("t('settings.engine.re_fused')", "settings.engine.re_fused"),
+            ("plural('db.re_cords', n)", "db.re_cords.one"),
+            (r#"<span data-i18n="settings.nav.en gine">"#, "settings.nav.en gine"),
+        ] {
+            assert!(missing(source).unwrap().iter().any(|k| k == key), "{source}");
+        }
+        let held = r#"let title = if mandatory { "taost.update.waiting.title" } else { "toast.update.waiting.title" };
+            notify(app, strings.get(title).to_string());"#;
+        assert!(keys_named(held).is_err(), "a key held in a variable is not read");
+        assert!(keys_named("Failure::new(KEY)").is_err());
+    }
+
+    /// The keys `source`, a window's page or script or a Rust file, names
+    /// where it translates them, as they are spelled. `Err` names a Rust call
+    /// that translates a key given as anything but a literal: every key the
+    /// Rust side uses is named where it is translated, so that this scan reads
+    /// them all.
+    fn keys_named(source: &str) -> Result<BTreeSet<String>, String> {
+        let mut keys = BTreeSet::new();
+        for call in ["data-i18n=\"", "data-i18n-title=\"", "data-i18n-label=\"", "t('"] {
+            keys.extend(quoted_after(source, call));
+        }
+        for call in ["strings.get(", "strings.fill(", "Failure::new(", "Failure::with("] {
+            keys.extend(literals_of(source, call)?);
+        }
+        for base in quoted_after(source, "plural('").into_iter().chain(literals_of(source, "strings.plural(")?) {
+            keys.extend(["one", "few", "many"].map(|f| format!("{base}.{f}")));
+        }
+        Ok(keys)
+    }
+
+    /// The literal first argument of every Rust `call` in `source`; `Err`
+    /// when one takes anything else.
+    fn literals_of(source: &str, call: &str) -> Result<Vec<String>, String> {
+        source
+            .match_indices(call)
+            .map(|(i, _)| {
+                let rest = source[i + call.len()..].trim_start();
+                let literal = rest.strip_prefix('"').and_then(|r| r.find('"').map(|end| r[..end].to_string()));
+                literal.ok_or_else(|| {
+                    let given: String = rest.chars().take_while(|&c| c != ')' && c != '\n').collect();
+                    format!("{call}{given}): name the key where it is translated, as a literal")
+                })
+            })
+            .collect()
+    }
+
+    /// The text between `start` and the next quote, for every `start` in
+    /// `text` that begins a word, whatever that text is.
     fn quoted_after(text: &str, start: &str) -> Vec<String> {
         let end = if start.ends_with('\'') { '\'' } else { '"' };
         // `t(` and `plural(` are the windows' functions only as whole words.
@@ -195,9 +230,7 @@ mod tests {
             })
             .filter_map(|(i, _)| {
                 let rest = &text[i + start.len()..];
-                let key = &rest[..rest.find(end)?];
-                let plain = !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
-                (plain && key.contains('.')).then(|| key.to_string())
+                Some(rest[..rest.find(end)?].to_string())
             })
             .collect()
     }

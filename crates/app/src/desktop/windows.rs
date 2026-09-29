@@ -32,13 +32,13 @@ const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
 type Builder<'a> = WebviewWindowBuilder<'a, Wry, AppHandle>;
 
-/// A window to build: its label, its page in `ui/` with the page's query, the
-/// dictionary key of its title, and the rest of its look.
+/// A window to build: its label, its page in `ui/` with the page's query, its
+/// title in the app's language, and the rest of its look.
 struct Spec {
     label: &'static str,
     page: &'static str,
     query: String,
-    title: &'static str,
+    title: String,
     configure: fn(Builder<'_>) -> Builder<'_>,
 }
 
@@ -58,7 +58,7 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
 fn build_window(app: &AppHandle, spec: &Spec) -> tauri::Result<WebviewWindow> {
     let lang = shared(app).strings.lang().code();
     let url = WebviewUrl::App(format!("{}.html?lang={lang}{}", spec.page, spec.query).into());
-    let builder = WebviewWindowBuilder::new(app, spec.label, url).title(shared(app).strings.get(spec.title));
+    let builder = WebviewWindowBuilder::new(app, spec.label, url).title(spec.title.as_str());
     (spec.configure)(builder).build()
 }
 
@@ -70,7 +70,7 @@ pub fn create_flyout(app: &AppHandle) {
             label: FLYOUT,
             page: "flyout",
             query: String::new(),
-            title: "window.flyout",
+            title: shared(app).strings.get("window.flyout").to_string(),
             configure: |b| {
                 b.inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
                     .decorations(false)
@@ -157,7 +157,7 @@ pub fn open_settings(app: &AppHandle, section: &str) {
         label: SETTINGS,
         page: "settings",
         query: format!("&section={section}"),
-        title: "window.settings",
+        title: shared(app).strings.get("window.settings").to_string(),
         configure: |b| b.inner_size(960.0, 680.0).min_inner_size(760.0, 520.0).center(),
     };
     spawn_window(app, spec);
@@ -168,7 +168,7 @@ pub fn open_first_run(app: &AppHandle) {
         label: FIRST_RUN,
         page: "first-run",
         query: String::new(),
-        title: "window.firstRun",
+        title: shared(app).strings.get("window.firstRun").to_string(),
         configure: |b| b.inner_size(620.0, 420.0).resizable(false).maximizable(false).minimizable(false).center(),
     };
     spawn_window(app, spec);
