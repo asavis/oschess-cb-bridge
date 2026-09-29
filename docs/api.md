@@ -776,8 +776,10 @@ the oschess analysis panel shows it like its Lichess tabs.
     list of a database's games alone does not put it in use. Such a build
     starts once the database has not changed for a minute, never while it is
     kept only in the cloud, downloading, or a PGN file being opened, and on
-    Windows not while the computer runs on battery; it runs at background
-    priority.
+    Windows not while the computer runs on battery; it runs at the lowest
+    processor priority, below a requested build, with the normal disk
+    priority (`OSCHESS_BRIDGE_BACKGROUND_MODE=background` runs it in
+    Windows's background mode, which lowers its disk priority too).
 
   A build reads header and move records, a few megabytes at a time, never
   annotations, and needs no temporary space. It needs free space of about 400

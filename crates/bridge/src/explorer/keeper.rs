@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::api::App;
 use crate::catalog::{Entry, Opened};
-use crate::machine::Machine;
+use crate::machine::{self, Machine};
 
 use super::schedule::Kind;
 use super::source::Source;
@@ -61,8 +61,10 @@ pub(super) struct Seen {
 /// and then every [`TICK`], and ends once `app` is gone or the keeper is
 /// stopped ([`Registry::stop_keeping`]). It keeps indexes only in an index
 /// folder the bridge was given ([`Registry::set_dir`]), never in the default
-/// one.
+/// one. The priority of the builds it queues is chosen now
+/// ([`machine::BACKGROUND_MODE`]) and logged.
 pub fn start(app: &Arc<App>) {
+    crate::log!("background index builds run in mode {}", machine::background_mode().0);
     let app: Weak<App> = Arc::downgrade(app);
     let spawned =
         std::thread::Builder::new().name("bridge-keeper".into()).stack_size(crate::THREAD_STACK).spawn(move || {

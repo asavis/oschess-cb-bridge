@@ -133,11 +133,12 @@ fn the_background_build_is_timed_from_the_bridges_start() {
         .arg("--index")
         .arg(db.dir().join("index"))
         .arg("--background")
+        .env("OSCHESS_BRIDGE_BACKGROUND_MODE", "background")
         .output()
         .unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("background build to ready"), "{text}");
-    assert!(text.contains("from the bridge's start, no position asked; stream 2 games"), "{text}");
+    assert!(text.contains("from the bridge's start, no position asked, mode background; stream 2 games"), "{text}");
     assert!(!text.contains("build to first answer"), "{text}");
     for phase in ["stream pass", "tree passes", "deep passes"] {
         assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");

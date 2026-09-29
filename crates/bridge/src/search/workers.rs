@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn workers_run_at_the_callers_priority() {
         use crate::machine::{Priority, at, current};
-        for priority in [Priority::Background, Priority::BelowNormal, Priority::Normal] {
+        for priority in [Priority::Background, Priority::Lowest, Priority::BelowNormal, Priority::Normal] {
             let _at = at(priority);
             let got = run(4, 0, &Cancel::never(), |_| Ok(current())).ok().unwrap();
             assert!(got.iter().all(|&p| p == priority), "{priority:?}: {got:?}");

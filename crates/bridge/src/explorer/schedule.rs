@@ -3,8 +3,9 @@
 //! background ([`super::keeper`]). A requested build stops a background build
 //! of another database at its next batch, which then waits for its turn
 //! again, behind it. A background build waits while the computer runs on
-//! battery. A background build's threads run in Windows's background mode, a
-//! requested build's below the normal priority.
+//! battery. A background build's threads run at the priority of work nothing
+//! waits for ([`machine::background`]), a requested build's below the normal
+//! priority.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +34,7 @@ impl Kind {
     pub fn priority(self) -> Priority {
         match self {
             Kind::Requested => Priority::BelowNormal,
-            Kind::Background => Priority::Background,
+            Kind::Background => machine::background(),
         }
     }
 }
@@ -286,6 +287,12 @@ mod tests {
 
     use super::*;
 
+    /// The priority of a background build, in whichever mode the variable
+    /// chose ([`machine::BACKGROUND_MODE`]).
+    fn background_priority() -> Priority {
+        Kind::Background.priority()
+    }
+
     /// A computer whose power the test sets.
     #[derive(Default)]
     struct Power(AtomicBool);
@@ -346,17 +353,17 @@ mod tests {
             Arc::clone(&background),
             build("a", &tx, &background, Some(held))
         ));
-        assert_eq!(next(&events), ("a", Priority::Background, "run"));
+        assert_eq!(next(&events), ("a", background_priority(), "run"));
         let requested = Arc::new(Progress::default());
         assert!(scheduler.submit("b", Kind::Requested, Arc::clone(&requested), build("b", &tx, &requested, None)));
-        assert_eq!(next(&events), ("a", Priority::Background, "stopped"));
+        assert_eq!(next(&events), ("a", background_priority(), "stopped"));
         assert_eq!(next(&events), ("b", Priority::BelowNormal, "run"));
         assert_eq!(next(&events), ("b", Priority::BelowNormal, "done"));
         // The stopped build starts again, from nothing, at its own priority.
-        assert_eq!(next(&events), ("a", Priority::Background, "run"));
+        assert_eq!(next(&events), ("a", background_priority(), "run"));
         assert!(!background.stop.load(Ordering::Relaxed));
         release_background.send(()).unwrap();
-        assert_eq!(next(&events), ("a", Priority::Background, "done"));
+        assert_eq!(next(&events), ("a", background_priority(), "done"));
     }
 
     /// A request for a database whose build waits in the background makes it
@@ -369,7 +376,7 @@ mod tests {
         let (release_a, held_a) = mpsc::channel();
         let a = Arc::new(Progress::default());
         assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), build("a", &tx, &a, Some(held_a))));
-        assert_eq!(next(&events), ("a", Priority::Background, "run"));
+        assert_eq!(next(&events), ("a", background_priority(), "run"));
         let (release_b, held_b) = mpsc::channel();
         let b = Arc::new(Progress::default());
         assert!(scheduler.submit("b", Kind::Background, Arc::clone(&b), build("b", &tx, &b, Some(held_b))));
@@ -387,9 +394,9 @@ mod tests {
         assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
         assert_eq!(next(&events), ("c", Priority::BelowNormal, "run"));
         assert_eq!(next(&events), ("c", Priority::BelowNormal, "done"));
-        assert_eq!(next(&events), ("b", Priority::Background, "run"));
+        assert_eq!(next(&events), ("b", background_priority(), "run"));
         release_b.send(()).unwrap();
-        assert_eq!(next(&events), ("b", Priority::Background, "done"));
+        assert_eq!(next(&events), ("b", background_priority(), "done"));
     }
 
     /// A background build waits while the computer runs on battery, and one
@@ -404,10 +411,10 @@ mod tests {
         let (release, held) = mpsc::channel();
         let a = Arc::new(Progress::default());
         assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), build("a", &tx, &a, Some(held))));
-        assert_eq!(next(&events), ("a", Priority::Background, "run"));
+        assert_eq!(next(&events), ("a", background_priority(), "run"));
         power.0.store(true, Ordering::Relaxed);
         scheduler.pause();
-        assert_eq!(next(&events), ("a", Priority::Background, "stopped"));
+        assert_eq!(next(&events), ("a", background_priority(), "stopped"));
         let b = Arc::new(Progress::default());
         assert!(scheduler.submit("b", Kind::Requested, Arc::clone(&b), build("b", &tx, &b, None)));
         assert_eq!(next(&events), ("b", Priority::BelowNormal, "run"));
@@ -416,9 +423,9 @@ mod tests {
         assert_eq!(a.phase(), "waiting");
         power.0.store(false, Ordering::Relaxed);
         scheduler.poke();
-        assert_eq!(next(&events), ("a", Priority::Background, "run"));
+        assert_eq!(next(&events), ("a", background_priority(), "run"));
         release.send(()).unwrap();
-        assert_eq!(next(&events), ("a", Priority::Background, "done"));
+        assert_eq!(next(&events), ("a", background_priority(), "done"));
     }
 
     /// A thread that cannot start leaves no build waiting, and the next
@@ -437,7 +444,7 @@ mod tests {
         }
         scheduler.refuse_starts(false);
         assert!(scheduler.submit("c", Kind::Background, Arc::clone(&p), build("c", &tx, &p, None)));
-        assert_eq!(next(&events), ("c", Priority::Background, "run"));
-        assert_eq!(next(&events), ("c", Priority::Background, "done"));
+        assert_eq!(next(&events), ("c", background_priority(), "run"));
+        assert_eq!(next(&events), ("c", background_priority(), "done"));
     }
 }

@@ -18,8 +18,9 @@
 //! serves does (#149): the database, the largest one ready, has its position
 //! index built unasked from the start, while the flows run. Each sort and
 //! search row says whether the build still ran when it was done, and the time
-//! from the bridge's start to the index ready replaces the build the first
-//! explorer request starts.
+//! from the bridge's start to the index ready, with the mode the build ran in
+//! (`OSCHESS_BRIDGE_BACKGROUND_MODE`), replaces the build the first explorer
+//! request starts.
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -971,14 +972,17 @@ fn requested_build(table: &mut Table, c: &mut Client, served: &Served, path: &st
 }
 
 /// The build the bridge started unasked, with `--background` (#149): the time
-/// from the bridge's start, `launched`, to the index ready, and the build's
-/// phases.
+/// from the bridge's start, `launched`, to the index ready, the mode it ran
+/// in, and the build's phases.
 fn background_build(table: &mut Table, served: &Served, launched: Instant, folder: &Path) {
     match served.built(BACKGROUND_WAIT) {
         Some((at, t)) => {
             let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
             let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
-            let counts = format!("from the bridge's start, no position asked; {stream}, index {index} bytes");
+            // The bridge has this process's environment, and so its mode.
+            let mode = bridge::machine::background_mode().0;
+            let counts =
+                format!("from the bridge's start, no position asked, mode {mode}; {stream}, index {index} bytes");
             table.once("index", "background build to ready", ms(at.duration_since(launched)), &counts);
             build_phases(table, t);
         }

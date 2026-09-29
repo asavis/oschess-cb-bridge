@@ -154,9 +154,10 @@ With `--background`, the first bridge keeps its indexes as a serving bridge
 does (#149): the database, the largest one ready, has its position index
 built unasked from the bridge's start, while the flows run. Each sort and
 search row says whether the build still ran, and the time from the bridge's
-start to the index ready, with its phases, replaces the build the first
-explorer request starts. Timed with and without it, the sorts and searches
-show what a background build costs them.
+start to the index ready, with the mode it ran in
+(`OSCHESS_BRIDGE_BACKGROUND_MODE`) and its phases, replaces the build the
+first explorer request starts. Timed with and without it, the sorts and
+searches show what a background build costs them.
 
 The `--index` folder stands for the bridge's data folder: every index the
 child bridge builds, a PGN file's header index included, goes there as it
@@ -198,7 +199,12 @@ use up to date by itself (#149): those whose index is kept, or whose positions
 were asked for since it started, and the largest ready database from the
 start. Such a database's index is built in the background, at a low priority
 and not while the computer runs on battery, once the database has not changed
-for a minute; a request for another database's positions goes first.
+for a minute; a request for another database's positions goes first. On
+Windows it runs at the lowest processor priority, below requested builds and
+the engine, and reads and writes at the normal disk priority;
+`OSCHESS_BRIDGE_BACKGROUND_MODE=background` runs it in Windows's background
+mode instead, which lowers its disk and memory priority too, and
+`OSCHESS_BRIDGE_BACKGROUND_MODE=lowcpu` is the default.
 `cargo run --release -p bridge
 --example index_oracle -- <db.2cbh> <index dir>` builds one, timing each of
 its phases and passes, and checks it against a brute-force count, printing
