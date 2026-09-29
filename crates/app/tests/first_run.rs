@@ -13,8 +13,10 @@
 
 use std::path::Path;
 
+/// A file of the app's crate with its lines ending in `\n`: a Windows checkout
+/// ends them in `\r\n`.
 fn source(path: &str) -> String {
-    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect(path)
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect(path).replace("\r\n", "\n")
 }
 
 fn position(text: &str, needle: &str) -> usize {
