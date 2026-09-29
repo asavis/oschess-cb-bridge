@@ -21,7 +21,7 @@ use bridge::fetch::Cloud;
 use bridge::machine::Machine;
 use bridge::search::Indexes;
 use bridge::sources::Sources;
-use cbformat::fixture::{Builder, TempDb, pgn_file};
+use cbformat::fixture::{Builder, DbItems, TempDb, pgn_file};
 use cbformat::movetable::{END_OF_LINE, MOVES};
 use chesscore::Board;
 
@@ -29,6 +29,8 @@ mod common;
 use common::{get, policy, serve_shared};
 
 const TICK: Duration = Duration::from_millis(50);
+/// The numbers ChessBase writes beside a database in its window list.
+const WINDOW_NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 const START: &str = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR%20w%20KQkq%20-%200%201";
 
 /// `games` games, each one of eight lines of 160 plies: a database written
@@ -568,6 +570,48 @@ fn a_queued_background_build_is_dropped_when_its_database_goes_to_the_cloud() {
     assert_eq!(provider.fetches.load(Ordering::SeqCst), 0, "the database was downloaded");
     provider.everything.store(false, Ordering::SeqCst);
     wait("the database was not built once back", 60, || built_for(&root, &id) == Some(queued));
+    drop(bridge);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A database renamed in the ChessBase window while its background build
+/// waits, then taken off the window, is not read (#149): the build, queued
+/// under the former name, is dropped at its turn.
+#[test]
+fn a_queued_background_build_is_dropped_when_its_renamed_database_leaves_the_list() {
+    let root = data_dir("renamed-gone");
+    let chessbase = root.join("ChessBase");
+    std::fs::create_dir_all(&chessbase).unwrap();
+    let db = copies("background-renamed-gone", 10);
+    let path = db.dir().join("db.2cbh");
+    let id = id_of(&path);
+    let window = |titles: &[&str]| {
+        let mut f = DbItems::new();
+        f.section("2cbg");
+        for title in titles {
+            f.database(&path.to_string_lossy(), title, WINDOW_NUMBERS);
+        }
+        std::fs::write(chessbase.join("DBItems.cbini"), f.bytes()).unwrap();
+    };
+    window(&["Before"]);
+    let sources = Sources { chessbase: Some(chessbase.clone()), ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, Arc::new(Provider::default()));
+    let computer = Arc::new(Computer::default());
+    computer.battery.store(true, Ordering::SeqCst);
+    catalog.explorer.set_machine(computer.clone());
+    let bridge = Bridge::new(catalog, &root);
+    bridge.keep(Duration::ZERO);
+    // The only database is in use from the start; on battery its build waits.
+    wait("the background build was not queued", 60, || phase(bridge.port, &id).as_deref() == Some("waiting"));
+    window(&["Renamed later"]);
+    let catalog = &bridge.app.catalog;
+    wait("the new name was not read", 60, || catalog.get(&id).is_some_and(|e| e.name == "Renamed later"));
+    window(&[]);
+    wait("the database did not leave the list", 60, || catalog.get(&id).is_some_and(|e| !e.listed()));
+    computer.battery.store(false, Ordering::SeqCst);
+    wait("the build was not dropped", 60, || bridge.building().is_empty());
+    std::thread::sleep(TICK * 10);
+    assert!(built_for(&root, &id).is_none(), "a database off the list was read");
     drop(bridge);
     std::fs::remove_dir_all(&root).unwrap();
 }

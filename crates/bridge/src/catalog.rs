@@ -100,8 +100,6 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub format: Format,
-    /// Set when the database left the list: it is then reported `missing`.
-    removed: AtomicBool,
     held: Arc<Held>,
     shared: Arc<Shared>,
 }
@@ -115,9 +113,12 @@ struct Shared {
 }
 
 /// What stays with a database when the list is read again or the window
-/// renames it: the open handle and the download.
+/// renames it: whether it is on the list, the open handle and the download.
+/// A job holding the entry of a database since renamed sees its removal too.
 #[derive(Default)]
 struct Held {
+    /// Set when the database left the list: it is then reported `missing`.
+    removed: AtomicBool,
     open: Mutex<Option<Opened>>,
     /// The download running or queued.
     running: Mutex<Option<Arc<Progress>>>,
@@ -156,7 +157,6 @@ impl Entry {
             name: listed.name,
             format: Format::of(&listed.path),
             path: listed.path,
-            removed: AtomicBool::new(false),
             held,
             shared: Arc::clone(shared),
         }
@@ -165,7 +165,7 @@ impl Entry {
     /// Whether the database is on the list; one that left it stays `missing`
     /// until the bridge restarts.
     pub fn listed(&self) -> bool {
-        !self.removed.load(Ordering::Relaxed)
+        !self.held.removed.load(Ordering::Relaxed)
     }
 
     /// The database's state, opening it if it is ready.
@@ -188,7 +188,7 @@ impl Entry {
     /// look at their metadata: `None` when the files were not looked at, for
     /// a database that left the list or is of another format (#67).
     pub fn open_sized(&self) -> (Result<Opened, State>, Option<u64>) {
-        if self.removed.load(Ordering::Relaxed) {
+        if self.held.removed.load(Ordering::Relaxed) {
             return (Err(State::Missing), None);
         }
         if self.format == Format::Other {
@@ -203,7 +203,7 @@ impl Entry {
     /// keeper of the position indexes asks (#149). `None` when that is not
     /// known.
     pub fn open_dated(&self) -> (Result<Opened, State>, Option<SystemTime>) {
-        if self.removed.load(Ordering::Relaxed) || self.format == Format::Other {
+        if self.held.removed.load(Ordering::Relaxed) || self.format == Format::Other {
             return (self.open(), None);
         }
         let files = self.files();
@@ -577,11 +577,11 @@ impl Catalog {
                 Some(e) => Arc::new(Entry::new(item, &self.shared, Arc::clone(&e.held))),
                 None => Arc::new(Entry::new(item, &self.shared, Arc::default())),
             };
-            entry.removed.store(false, Ordering::Relaxed);
+            entry.held.removed.store(false, Ordering::Relaxed);
             entries.push(entry);
         }
         for e in old.iter().filter(|e| !seen.contains(&e.id)) {
-            e.removed.store(true, Ordering::Relaxed);
+            e.held.removed.store(true, Ordering::Relaxed);
             entries.push(Arc::clone(e));
         }
         entries
