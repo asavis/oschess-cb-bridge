@@ -84,10 +84,10 @@ cargo test
 ```
 
 `scripts/clippy-windows.sh` runs clippy for `x86_64-pc-windows-gnu`, which
-checks the Windows-only code without linking it (`rustup target add
-x86_64-pc-windows-gnu`). It stands in a stub for the Windows resource compiler
-that the app's build script calls. Say in the pull request what could
-not be run, such as tests of Windows-only behaviour.
+checks the Windows-only code without linking it (rustup installs that target
+with the toolchain, from `rust-toolchain.toml`). It stands in a stub for the
+Windows resource compiler that the app's build script calls. Say in the pull
+request what could not be run, such as tests of Windows-only behaviour.
 
 A change to the reader is also run with `cbtool verify` over every local
 database available, and the counts go in the pull request body. A reader change

@@ -252,7 +252,7 @@ English after the Windows display language; `crates/app/icons/generate.py`
 draws the tray marks and the app icon from the logo.
 
 The app builds on Windows only. On Linux, `scripts/clippy-windows.sh` checks
-it for `x86_64-pc-windows-gnu` (`rustup target add x86_64-pc-windows-gnu`)
+it for `x86_64-pc-windows-gnu`, a target `rust-toolchain.toml` installs,
 without linking.
 
 A version tag builds the release: `oschess-bridge.exe`, its per-user NSIS

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Checks the Windows build from Linux: clippy for x86_64-pc-windows-gnu, which
-# needs only `rustup target add x86_64-pc-windows-gnu`. Nothing is linked, so the
+# Checks the Windows build from Linux: clippy for x86_64-pc-windows-gnu, a target
+# rust-toolchain.toml installs with the toolchain. Nothing is linked, so the
 # Windows resource compiler the app's build script calls is replaced by a stub
 # that writes an empty resource file. The post-merge CI job on our Windows
 # runner builds and links for real.

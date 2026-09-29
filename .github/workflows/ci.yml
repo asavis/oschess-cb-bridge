@@ -43,7 +43,8 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Script tests
-        # The Store package's version mapping (scripts/test_msix.py).
+        # The Store package's version, the app's as Cargo reads it and its
+        # mapping, and the packing steps (scripts/test_msix.py).
         if: runner.os == 'Linux'
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Declared minimum Rust
@@ -58,6 +59,29 @@ jobs:
             echo "::error::rust-version '$minimum' in Cargo.toml differs from channel '$channel' in rust-toolchain.toml; bump both together"
             exit 1
           fi
+      - name: Tauri CLI of the lock
+        # release.yml's TAURI_CLI_VERSION is the CLI of the tauri crates in
+        # Cargo.lock: `cargo install --locked` builds it with the tauri-utils
+        # its published Cargo.lock names, which must be the one in ours. A
+        # tauri bump that leaves the CLI behind fails here, before a tag.
+        if: runner.os == 'Linux'
+        run: |
+          tauri_utils() { sed -n '/^name = "tauri-utils"$/{n;s/^version = "\(.*\)"$/\1/p;}' "$1"; }
+          cli=$(sed -n 's/^  TAURI_CLI_VERSION: \(.*\)$/\1/p' .github/workflows/release.yml)
+          if [ -z "$cli" ]; then
+            echo "::error::release.yml names no TAURI_CLI_VERSION"
+            exit 1
+          fi
+          curl -fsSL --retry 3 --max-time 120 -o "$RUNNER_TEMP/tauri-cli.crate" \
+            "https://static.crates.io/crates/tauri-cli/tauri-cli-$cli.crate"
+          tar -xzOf "$RUNNER_TEMP/tauri-cli.crate" "tauri-cli-$cli/Cargo.lock" > "$RUNNER_TEMP/tauri-cli.lock"
+          ours=$(tauri_utils Cargo.lock)
+          theirs=$(tauri_utils "$RUNNER_TEMP/tauri-cli.lock")
+          if [ -z "$ours" ] || [ "$ours" != "$theirs" ]; then
+            echo "::error::tauri-cli $cli is built with tauri-utils '$theirs', and Cargo.lock has tauri-utils '$ours': set TAURI_CLI_VERSION in release.yml to the CLI of the tauri crates in Cargo.lock"
+            exit 1
+          fi
+          echo "tauri-cli $cli is built with tauri-utils $ours, the one in Cargo.lock"
       - name: Release build
         # The whole workspace: on Windows, the tray app (crates/app) and the
         # console bridge (crates/bridge) among the rest.
