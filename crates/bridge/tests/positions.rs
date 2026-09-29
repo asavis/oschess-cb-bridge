@@ -284,6 +284,15 @@ fn answered(port: u16, path: &str) -> String {
     }
 }
 
+/// The answer to `path` once the index is built: `200` at once, never the
+/// `409` of a scan that found the index damaged and builds it again, after
+/// which [`answered`] would take the new build's answer.
+fn at_once(port: u16, path: &str) -> String {
+    let (status, body) = get(port, path);
+    assert_eq!(status, 200, "{path}: {body}");
+    body
+}
+
 /// The first number member `"key":123` of a JSON text.
 fn number(body: &str, key: &str) -> u64 {
     let pat = format!("\"{key}\":");
@@ -386,8 +395,8 @@ fn every_position_lists_the_games_a_replay_finds() {
     for (board, ply) in positions.values() {
         let fen = board.fen();
         let want = reached.games(board);
-        let body = answered(bridge.port, &list(&id, &fen, "&limit=500"));
-        let explorer = answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen)));
+        let body = at_once(bridge.port, &list(&id, &fen, "&limit=500"));
+        let explorer = at_once(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen)));
         let got = rows(&body);
         assert_eq!(got.iter().copied().collect::<BTreeSet<_>>(), want, "{fen}");
         assert!(got.windows(2).all(|w| w[0] < w[1]), "in number order, each once: {fen}");
@@ -400,6 +409,35 @@ fn every_position_lists_the_games_a_replay_finds() {
     }
     assert!(positions.len() > 1000, "{} positions", positions.len());
     assert!(crowded > 20 && few > 500 && beyond > 500, "{crowded} crowded, {few} of few games, {beyond} beyond");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The first scan of the stream reads every slot, and notes which games start
+/// from the standard position and which from a set-up one (#142); a scan for
+/// the standard start after it takes the first as they are and replays the
+/// others, and finds the games the first found, at once, a set-up game that
+/// comes home among them. The scans of other positions read every slot.
+#[test]
+fn the_start_after_the_first_scan_lists_what_it_listed() {
+    let games = games();
+    let reached = Reached::of(&games);
+    let db = database("positions-starts", &games);
+    let dir = index_dir("starts");
+    let (bridge, id) = serve(&db, &dir);
+    let boards = [Board::startpos(), board_after("d2d4 d7d5 c2c4 e7e6"), board_after("d2d4")];
+    assert!(reached.games(&boards[0]).contains(&57), "the set-up game that comes home");
+    for (round, sort) in ["number", "white"].into_iter().enumerate() {
+        for (i, board) in boards.iter().enumerate() {
+            let fen = board.fen();
+            let want = reached.games(board);
+            assert!(want.len() > 12, "{fen}: a scan finds its games");
+            // The first builds the index, then scans every slot.
+            let path = list(&id, &fen, &format!("&limit=500&sort={sort}"));
+            let body = if round + i == 0 { answered(bridge.port, &path) } else { at_once(bridge.port, &path) };
+            assert_eq!(rows(&body).into_iter().collect::<BTreeSet<_>>(), want, "{fen} by {sort}");
+        }
+    }
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }

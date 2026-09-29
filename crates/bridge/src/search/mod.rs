@@ -17,7 +17,7 @@ mod sort;
 mod suggest;
 pub mod workers;
 
-pub use members::{Members, Position};
+pub use members::{Adding, Members, Position};
 pub use names::FILES_READ as NAME_FILES_READ;
 pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
