@@ -480,29 +480,50 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      stream"): its buffers, 1 MiB of tails, a block's slots and a line's
      words, take about 1.4 MiB more. It counts what each line adds, for the
      passes that follow: its positions within ply 20 by part of the keys, and
-     its structures past ply 20 by deep block.
+     its structures past ply 20 by deep block. The positions a game from the
+     standard start reaches first within ply 3, at most 9,323 whatever the
+     database and the most crowded of all, a fifth of the tree's entries,
+     are folded as they come, as a tree pass folds a full buffer (below):
+     each worker keeps their entries in a room of up to a million (16 MiB),
+     taken from what the share and the budget have free beside the pass's
+     buffers, and folds it whenever it fills; at the end the workers' entries
+     are folded together, a few dozen per position, and held until the tree
+     is written. A worker with room for fewer than 16,384 entries, or whose
+     entries no longer fold into half its room, makes the build do without,
+     and the tree's passes collect those positions as they do the others.
   2. **The tree's passes** (phase `positions`, in entries). A pass takes as
-     many parts of the keys, in order, as three quarters of the room left in
-     the build's share hold of their entries, one part at least. An entry is
-     16 bytes: the key, the game number (30 bits) with its result (2), and the
-     move (14 bits) and average rating (12). Each worker replays the first 21
-     positions of the games it takes, a few hundred at a time, from the
-     stream just written, mapped, without legality checks, and keeps the
-     entries of the pass's parts in a buffer of its own. A full buffer is
-     sorted by key, and each position of more than 24 entries in it folded:
-     its 12 best games by rating kept whole, the others counted by move and
-     result into entries that count games and rank for no notable game. A
-     buffer still three quarters full ends the pass, for every worker, at the
-     part that keeps about half of it, and the next pass starts there; a
-     first part that alone fills it fails the build as too large. The workers
-     then take the pass's parts in order, each merging one part's entries
-     from every worker's sorted buffer, adding each position up into its
-     record and making the part's blocks. A worker hands its blocks over and
-     goes on with the next part: they are written once every part before
-     them is, and kept until then, within a megabyte or so a worker, so that
-     the tree is written once, in key order. The games the tree's positions
-     count must add up to the entries the stream pass counted, else the
-     build fails.
+     many parts of the keys, in order, as 97% of the room left in the
+     build's share holds of their entries, but for those the stream pass
+     folded, one part at least. An entry is 16 bytes: the key, the game
+     number (30 bits) with its result (2), and the move (14 bits) and average
+     rating (12). Each worker replays the first 21 positions of the games it
+     takes, a few hundred at a time, from the stream just written, mapped,
+     without legality checks, following each position's key through the move
+     words alone, as the deep passes follow the structure (below): a word
+     names the piece, the squares, what is taken and what a pawn becomes, so
+     one lookup a ply gives the key's change, the castling rights it ends and
+     a pawn's double step, whose en passant file the key counts only with a
+     pawn of the other side beside it. It keeps the entries of the pass's
+     parts in a buffer of its own; a worker whose buffer has no room for
+     twice what a chunk of games adds takes no more, unless it is the last
+     one taking them, so that the buffers fill evenly whatever the workers'
+     pace.
+     A full buffer is sorted by key, and each position of more than 24
+     entries in it folded: its 12 best games by rating kept whole, the others
+     counted by move and result into entries that count games and rank for
+     no notable game. A buffer still three quarters full ends the pass, for
+     every worker, at the part that keeps about half of it, and the next pass
+     starts there; a first part that alone fills it fails the build as too
+     large. The workers then take the pass's parts in order, each merging one
+     part's entries from every worker's sorted buffer and from the entries
+     the stream pass folded, adding each position up into its record and
+     making the part's blocks. A worker hands its blocks over and goes on
+     with the next part: they are placed in the file once every part before
+     them is, and kept until then, within a megabyte or so a worker, and
+     written at their place by the worker that placed them, while the others
+     go on, so that the tree lies in the file in key order. The games the
+     tree's positions count must add up to the entries the stream pass
+     counted, else the build fails.
   3. **The deep section's passes** (phase `structures`, in postings), the
      same by ranges of buckets. Each worker replays each whole line from the
      stream and follows only its structure: each word of the move table names
@@ -512,15 +533,23 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      capture. Each structure a line holds past ply 20 whose bucket lies in
      the pass is a posting of 8 bytes, `bucket << 40 | game << 8 | print <<
      1`, plus 1 when the line holds it only within ply 20, as none past it
-     does. A full buffer is sorted and freed of repeats, a game's posting
-     beyond ply 20 kept of two with one print; one still three quarters full
-     ends the pass at the bucket that keeps about half of it, which may lie
-     inside a deep block, which the next pass goes on with. A bucket whose
-     postings alone fill a worker's buffer fails the build as too large: at
-     the smallest budget, 16 MiB, one of a few hundred thousand games. The
-     blocks are written as the tree's parts are.
+     does. A pass plans 97% of its room, and its workers take games as the
+     tree's do. A full buffer is sorted and freed of repeats, a game's
+     posting beyond ply 20 kept of two with one print; one still three
+     quarters full ends the pass at the bucket that keeps about half of it,
+     which may lie inside a deep block, which the next pass goes on with. A
+     bucket whose postings alone fill a worker's buffer fails the build as
+     too large: at the smallest budget, 16 MiB, one of a few hundred thousand
+     games. The blocks are written as the tree's parts are.
   4. **The end.** The tables and the header are written and the index file
-     synced; the stream is renamed, then the index (see "Move stream").
+     synced; what each pass wrote was synced behind the build, on a thread
+     of its own, so that this sync waits for the last pass's bytes alone. The
+     stream is renamed, then the index (see "Move stream").
+
+  The build notes where its time went: the stream pass, each pass of the
+  tree and of the deep section, its replay then its writes, the index
+  file's end and the renames. `cbtool profile` prints a row for each, and
+  the `index_oracle` example prints them too.
 
   Each pass reserves what the budget has free, up to the build's share:
   while searches hold memory, it takes fewer workers and less room, and the

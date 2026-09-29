@@ -75,7 +75,8 @@ fn no_index_is_built_in_the_data_folder() {
 }
 
 /// Every notable game the lookups name is checked against its `/games` row
-/// (#144), and the count says how many are that row whole, then `year`.
+/// (#144), and the count says how many are that row whole, then `year`. The
+/// build of the position index is timed phase by phase (#147).
 #[test]
 fn notable_games_are_counted_as_whole_rows() {
     use cbformat::fixture::{Builder, quiet};
@@ -100,5 +101,9 @@ fn notable_games_are_counted_as_whole_rows() {
     // The lookups: from the start and after 1. e4, both games; after 1... e5,
     // the first, and no move from there.
     assert!(text.contains("topGames entries with every row field: 5 of 5"), "{text}");
+    for phase in ["stream pass", "tree passes", "deep passes", "index file end", "renames"] {
+        assert!(text.contains(&format!("build: {phase}")), "{phase}\n{text}");
+    }
+    assert!(text.contains("passes 1, replay"), "{text}");
     assert!(out.status.success(), "{text}");
 }

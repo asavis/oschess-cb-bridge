@@ -6,7 +6,8 @@
 //! cargo run --release -p bridge --example index_oracle -- <db.2cbh> <index dir> [positions] [seed] [--keep]
 //! ```
 //!
-//! 1. Builds the index cold, timing it and reading the process's peak memory.
+//! 1. Builds the index cold, timing it, each of its phases and passes too,
+//!    and reading the process's peak memory.
 //! 2. Samples positions: a seeded choice of a ply from 0 to [`SAMPLE_PLIES`],
 //!    then of a game whose main line reaches it, 2,000 positions unless told.
 //! 3. Counts every sampled position over the whole database by walking each
@@ -281,6 +282,13 @@ fn main() {
     );
     println!("index file {} bytes, move stream {} bytes", size(&loaded.base.path), size(&loaded.stream.path));
     println!("cold build {build_s:.1} s, peak RSS {} MB", peak_rss_mb());
+    let timings = progress.timings();
+    println!("build phases: {timings}");
+    for (name, passes) in [("tree", &timings.tree), ("deep section", &timings.deep)] {
+        let each: Vec<String> =
+            passes.iter().map(|p| format!("{:.2}+{:.2}", p.replay.as_secs_f64(), p.write.as_secs_f64())).collect();
+        println!("  {name} passes, replay+write s: {}", each.join(" "));
+    }
 
     // Sample positions: a random ply, then a random game whose main line
     // reaches it, so that every ply is sampled as often.

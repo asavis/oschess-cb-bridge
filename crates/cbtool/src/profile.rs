@@ -19,13 +19,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::engine::{Engine, EngineConfig};
+use bridge::explorer::runs::{PassTime, Timings};
 use bridge::server;
 use cbformat::game::{Head, RecordKind};
 use cbformat::pgnfile::lex::Lexer;
@@ -84,7 +85,9 @@ fn options(args: &[String]) -> AnyResult<Options> {
 }
 
 /// `cbtool profile-serve <db> <index> [<engine>]`: the bridge `profile` asks,
-/// in a process of its own. It prints `port <n>` and serves until killed.
+/// in a process of its own. It prints `port <n>` and serves until killed;
+/// once it has built the database's position index, it prints `built`, then
+/// where the build's time went ([`Timings::line`]).
 pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     let [db, index, rest @ ..] = args else { return Err("profile-serve <db> <index> [<engine>]".into()) };
     let listeners = server::bind(0)?;
@@ -102,15 +105,44 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     let mut out = std::io::stdout();
     writeln!(out, "port {port}")?;
     out.flush()?;
-    server::serve(listeners, Arc::new(app))?;
+    let app = Arc::new(app);
+    let watched = Arc::clone(&app);
+    let id = id_of(Path::new(db));
+    std::thread::spawn(move || {
+        loop {
+            if let Some(t) = watched.catalog.explorer.timings(&id) {
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "built {}", t.line()).and_then(|()| out.flush());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    server::serve(listeners, app)?;
     Ok(true)
 }
 
-/// A bridge serving one database in a child process, killed when dropped.
+/// A bridge serving one database in a child process, killed when dropped,
+/// and the lines it prints after its port.
 struct Served {
     child: Child,
     port: u16,
     id: String,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Served {
+    /// Where the time of the bridge's build of the position index went, once
+    /// it tells, waiting `wait` at most.
+    fn built(&self, wait: Duration) -> Option<Timings> {
+        let until = Instant::now() + wait;
+        loop {
+            let line = self.lines.recv_timeout(until.saturating_duration_since(Instant::now())).ok()?;
+            if let Some(t) = line.strip_prefix("built ").and_then(Timings::parse) {
+                return Some(t);
+            }
+        }
+    }
 }
 
 impl Drop for Served {
@@ -128,17 +160,24 @@ fn spawn(o: &Options) -> AnyResult<Served> {
     }
     let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let mut line = String::new();
-    let read = match child.stdout.take() {
-        Some(out) => BufReader::new(out).read_line(&mut line).is_ok(),
-        None => false,
-    };
+    let mut out = child.stdout.take().map(BufReader::new);
+    let read = out.as_mut().is_some_and(|out| out.read_line(&mut line).is_ok());
     let port = line.trim().strip_prefix("port ").and_then(|p| p.parse().ok()).filter(|_| read);
-    let Some(port) = port else {
+    let (Some(port), Some(out)) = (port, out) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err("the bridge did not start".into());
     };
-    Ok(Served { child, port, id: id_of(&o.db) })
+    // Its later lines, until it ends.
+    let (send, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in out.lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(Served { child, port, id: id_of(&o.db), lines })
 }
 
 /// A failed answer, by its status and the bridge's error code only: a code is
@@ -453,6 +492,32 @@ fn stream_counts(path: &Path) -> String {
     }
 }
 
+/// A row for each phase of the index's build (#147): the stream pass, the
+/// tree's passes and the deep section's, each pass's replay and write, then
+/// the index file's end and the renames.
+fn build_phases(table: &mut Table, t: &Timings) {
+    let passes = |all: &[PassTime]| {
+        let (replay, write): (Duration, Duration) =
+            (all.iter().map(|p| p.replay).sum(), all.iter().map(|p| p.write).sum());
+        let each: Vec<String> = all.iter().map(|p| format!("{:.0}+{:.0}", ms(p.replay), ms(p.write))).collect();
+        let counts = format!(
+            "passes {}, replay {:.0} ms, write {:.0} ms; each replay+write ms: {}",
+            all.len(),
+            ms(replay),
+            ms(write),
+            each.join(" ")
+        );
+        (ms(replay + write), counts)
+    };
+    table.once("index", "build: stream pass", ms(t.reading), "games read, move stream written");
+    let (tree, counts) = passes(&t.tree);
+    table.once("index", "build: tree passes", tree, &counts);
+    let (deep, counts) = passes(&t.deep);
+    table.once("index", "build: deep passes", deep, &counts);
+    table.once("index", "build: index file end", ms(t.closing), "header written, file synced");
+    table.once("index", "build: renames", ms(t.renaming), &format!("phases {:.0} ms in all", ms(t.total())));
+}
+
 /// Asks `path`, an explorer request, until it is answered: `Ok` once it is,
 /// counting the answers that the index is being built in `polls`.
 fn build_index(c: &mut Client, path: &str, polls: &mut u64) -> Result<(), String> {
@@ -664,6 +729,10 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
             let sizes =
                 format!("index {index} bytes, folder at most {peak} bytes, {} bytes after", folder_bytes(&folder));
             table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}, {sizes}"));
+            match served.built(Duration::from_secs(10)) {
+                Some(t) => build_phases(&mut table, &t),
+                None => table.failure("index", "build phases", "not told"),
+            }
         }
         Err(why) => table.failure("index", "build to first answer", &why),
     }

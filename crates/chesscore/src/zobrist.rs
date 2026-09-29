@@ -9,11 +9,42 @@
 //! capture there, and 780 when white is to move.
 //!
 //! Source: the Polyglot book format description, "Random64".
+//!
+//! [`piece`], [`castle`], [`en_passant`] and [`white_to_move`] give the keys
+//! to a caller that follows a key without a board, from what each move does.
+
+use crate::board::CastleSide;
+use crate::types::{Color, Piece, Square};
 
 pub(crate) const PIECE: usize = 0;
 pub(crate) const CASTLE: usize = 768;
 pub(crate) const EN_PASSANT: usize = 772;
 pub(crate) const TURN: usize = 780;
+
+/// The key of `color`'s `piece` on `sq`.
+#[inline]
+pub fn piece(piece: Piece, color: Color, sq: Square) -> u64 {
+    let kind = 2 * piece.index() + usize::from(color == Color::White);
+    KEYS[PIECE + 64 * kind + sq.index()]
+}
+
+/// The key of `color`'s right to castle on `side`.
+#[inline]
+pub fn castle(color: Color, side: CastleSide) -> u64 {
+    KEYS[CASTLE + 2 * color.index() + side as usize]
+}
+
+/// The key of an en passant capture on `file`, 0 to 7.
+#[inline]
+pub fn en_passant(file: u8) -> u64 {
+    KEYS[EN_PASSANT + usize::from(file & 7)]
+}
+
+/// The key of white to move.
+#[inline]
+pub fn white_to_move() -> u64 {
+    KEYS[TURN]
+}
 
 pub(crate) const KEYS: [u64; 781] = [
     0x9d39247e33776d41,

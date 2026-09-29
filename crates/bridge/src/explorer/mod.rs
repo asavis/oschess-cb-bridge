@@ -36,7 +36,7 @@ use crate::search::SearchError;
 use build::Plan;
 use file::{Bad, IndexFile};
 use format::{MAX_PLY, PRUNE_PLY, Stats};
-use runs::{Limits, Progress};
+use runs::{Limits, Progress, Timings};
 use source::Source;
 use stream::Stream;
 
@@ -49,6 +49,9 @@ pub struct Loaded {
     pub generation: u64,
     pub base: IndexFile,
     pub stream: Stream,
+    /// Where the build's time went, for an index this process built; `None`
+    /// for one kept on disk.
+    pub built: Option<Timings>,
     /// This index's key in the cache of rendered games, unique in the process.
     id: u64,
 }
@@ -56,7 +59,7 @@ pub struct Loaded {
 impl Loaded {
     pub fn new(generation: u64, base: IndexFile, stream: Stream) -> Loaded {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Loaded { generation, base, stream, id: NEXT.fetch_add(1, Ordering::Relaxed) }
+        Loaded { generation, base, stream, built: None, id: NEXT.fetch_add(1, Ordering::Relaxed) }
     }
 
     /// Game `number`'s rating and rendered JSON, from the cache of rendered
@@ -285,6 +288,16 @@ impl Registry {
         }
     }
 
+    /// Where the time of the build of database `id`'s index went, when this
+    /// process built the index it holds (`cbtool profile`).
+    pub fn timings(&self, id: &str) -> Option<Timings> {
+        let state = lock(&self.states).get(id).map(Arc::clone)?;
+        match &*lock(&state) {
+            State::Ready(l) => l.built.clone(),
+            _ => None,
+        }
+    }
+
     /// The checks and builds running or waiting: database id, phase, done
     /// and total.
     pub fn building(&self) -> Vec<(String, &'static str, u64, u64)> {
@@ -363,7 +376,9 @@ fn index(
     if stream.header.build_id != header.build_id || file.header.build_id != header.build_id {
         return Err(Failure::Open(Bad::Corrupt("another build's files")));
     }
-    Ok(Loaded::new(generation, file, stream))
+    let mut loaded = Loaded::new(generation, file, stream);
+    loaded.built = Some(progress.timings());
+    Ok(loaded)
 }
 
 /// Why a build failed.

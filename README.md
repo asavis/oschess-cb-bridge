@@ -140,9 +140,12 @@ it over HTTP as oschess does:
   in both forms;
 - the position index's build in the `--index` folder, which must be new or
   empty so that the build is measured, with the sizes of its two files and
-  the most its index folder held while it was built, a lookup per move along
-  the most played line, how many of the notable games those lookups name are
-  their `/games` row whole, and opening it again in a new bridge;
+  the most its index folder held while it was built, then where its time
+  went, a row a phase: the stream pass, the tree's passes and the deep
+  section's, each pass's replay and writes, the index file's end and the
+  renames; a lookup per move along the most played line, how many of the
+  notable games those lookups name are their `/games` row whole, and opening
+  it again in a new bridge;
 - when `--engine <exe>` names a UCI engine, a 5-second search: the time to its
   first line, and the lines a second;
 - a small answer over a kept and over a new connection.
@@ -184,8 +187,9 @@ takes about half a minute and some 4 GB, and no other room while it is built.
 Once kept, the index answers from the first request after the bridge starts,
 until the database changes.
 `cargo run --release -p bridge
---example index_oracle -- <db.2cbh> <index dir>` builds one and checks it
-against a brute-force count, printing numbers only. `cargo run --release -p
+--example index_oracle -- <db.2cbh> <index dir>` builds one, timing each of
+its phases and passes, and checks it against a brute-force count, printing
+numbers only. `cargo run --release -p
 bridge --example classic_pairs -- <scratch dir> <a.cbh> <a.2cbh> …` serves the
 classic and the 2CBH copy of each database given and compares their rows,
 searches, sorts, suggestions and explorer answers field by field, printing

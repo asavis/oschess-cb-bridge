@@ -330,11 +330,19 @@ fn any_change_rebuilds_the_whole_index() {
     let first = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
     assert_eq!(progress.phase(), "structures", "built");
     assert_eq!(first.lookup(key_after("")).unwrap().unwrap().lookup_move("e2e4"), Some(5));
+    // Where the build's time went, a pass at a time.
+    let timings = first.built.clone().unwrap();
+    assert_eq!(timings, progress.timings());
+    let passes = (timings.tree.len() as u64, timings.deep.len() as u64);
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(passes, (progress.tree_passes.load(relaxed), progress.deep_passes.load(relaxed)));
+    assert_eq!(passes, (1, 1));
     drop(first);
     // The same generation: the file on disk is used.
     let progress = Progress::default();
     let again = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
     assert_eq!(progress.phase(), "checking", "not built again");
+    assert!(again.built.is_none());
     drop((again, d));
     // Only a move changed, 1.e4 to 1.d4 in a record of the same length: every
     // header record is as before, and the new generation rebuilds it all.

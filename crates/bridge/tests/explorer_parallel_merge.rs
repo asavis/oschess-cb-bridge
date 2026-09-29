@@ -67,7 +67,7 @@ fn passes_on_many_workers_write_the_same_index() {
         return;
     }
     assert_eq!((budget(), threads()), (64 << 20, 16));
-    let db = random_games("parallel-passes", 2_500, 11);
+    let db = random_games("parallel-passes", 5_000, 11);
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
     let (one, one_dir, passes) = build(&d, "one", &Limits::default());
     assert_eq!(passes, (1, 1));
@@ -79,12 +79,18 @@ fn passes_on_many_workers_write_the_same_index() {
     assert!(passes.0 > 1, "{passes:?}");
     drop(search);
     let records = d.record_count();
+    // A record as read, but for where its tail lies.
+    let game = |index: &Loaded, n: u32| {
+        let mut game = index.stream.game(n).unwrap();
+        game.entry.tail = 0;
+        game
+    };
     for (other, dir) in [(&many, &many_dir), (&held_back, &held_dir)] {
         assert!(built_bytes(&one_dir.join("db.idx")) == built_bytes(&dir.join("db.idx")), "{}", dir.display());
         let lengths = [&one_dir, dir].map(|d| std::fs::metadata(d.join("db.moves")).unwrap().len());
         assert_eq!(lengths[0], lengths[1]);
         for n in 1..=records {
-            assert_eq!(one.stream.game(n).unwrap(), other.stream.game(n).unwrap(), "game {n}");
+            assert_eq!(game(&one, n), game(other, n), "game {n}");
         }
     }
     let start = one.lookup(Board::startpos().hash()).unwrap().unwrap();
