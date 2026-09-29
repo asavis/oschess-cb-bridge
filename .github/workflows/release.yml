@@ -266,7 +266,7 @@ jobs:
           name: ${{ needs.sign-exe.result == 'success' && 'exe-signed' || 'exe-unsigned' }}
           path: exe
       - name: Pack
-        # makeappx from the runner's Windows SDK. Unsigned: the Store signs it.
+        # makepri and makeappx from the runner's Windows SDK. Unsigned: the Store signs it.
         run: python scripts/msix.py --exe exe/oschess-bridge.exe --out dist/oschess-bridge.msix
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -14,9 +14,15 @@ product's identity page. Without any of them the package gets a test identity,
 for installing it by hand (docs/release.md). The version comes from the app's
 x.y.z by package_version.
 
-The package is left unsigned: the Store signs it. makeappx.exe comes from
---makeappx or from the newest Windows SDK; --stage-only fills the folder and
-stops, on any system.
+Windows finds the images named by size and theme (targetsize-24_altform-
+unplated and the like) only through the package's resources.pri, which
+makepri.exe writes. Without it Windows takes Square44x44Logo.png for the
+taskbar and the Start menu and lays it on a plate of the accent colour, which
+shows in the tile's rounded corners.
+
+The package is left unsigned: the Store signs it. makeappx.exe and makepri.exe
+come from --makeappx and --makepri or from the newest Windows SDK;
+--stage-only fills and indexes the folder and stops before packing it.
 """
 
 import argparse
@@ -108,13 +114,30 @@ def escape(text):
     return text.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def makeappx(given):
+def sdk_tool(name, given):
     if given:
         return given
-    found = sorted(glob.glob(r"C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\makeappx.exe"))
+    found = sorted(glob.glob(rf"C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\{name}.exe"))
     if not found:
-        fail("no makeappx.exe: install the Windows SDK or pass --makeappx")
+        fail(f"no {name}.exe: install the Windows SDK or pass --{name}")
     return found[-1]
+
+
+def run(command, what):
+    code = subprocess.run(command).returncode
+    if code != 0:
+        fail(f"{what} exited with {code}")
+
+
+def index(folder, tool, work):
+    """Writes the folder's resources.pri, so that Windows finds the images by
+    their size and theme qualifiers. The configuration stays outside the
+    folder, which the package holds as it is."""
+    config = os.path.join(work, "priconfig.xml")
+    run([tool, "createconfig", "/cf", config, "/dq", "uk-UA_en-US", "/pv", "10.0.0", "/o"], "makepri createconfig")
+    manifest = os.path.join(folder, "AppxManifest.xml")
+    pri = os.path.join(folder, "resources.pri")
+    run([tool, "new", "/pr", folder, "/cf", config, "/mn", manifest, "/of", pri, "/o"], "makepri new")
 
 
 def main():
@@ -122,7 +145,8 @@ def main():
     parser.add_argument("--exe", required=True, help="the oschess-bridge.exe to pack")
     parser.add_argument("--out", required=True, help="the .msix to write; its folder also gets the staging folder")
     parser.add_argument("--makeappx", help="makeappx.exe, instead of the newest Windows SDK's")
-    parser.add_argument("--stage-only", action="store_true", help="fill the staging folder and stop")
+    parser.add_argument("--makepri", help="makepri.exe, instead of the newest Windows SDK's")
+    parser.add_argument("--stage-only", action="store_true", help="fill and index the staging folder and stop")
     args = parser.parse_args()
 
     if not os.path.isfile(args.exe):
@@ -132,13 +156,11 @@ def main():
     values["VERSION"] = package_version(app_version())
     folder = os.path.join(out_dir, "msix-stage")
     stage(folder, args.exe, values)
+    index(folder, sdk_tool("makepri", args.makepri), out_dir)
     print(f"msix: staged {folder} as {values['NAME']} {values['VERSION']}")
     if args.stage_only:
         return
-    tool = makeappx(args.makeappx)
-    code = subprocess.run([tool, "pack", "/o", "/d", folder, "/p", os.path.abspath(args.out)]).returncode
-    if code != 0:
-        fail(f"makeappx exited with {code}")
+    run([sdk_tool("makeappx", args.makeappx), "pack", "/o", "/d", folder, "/p", os.path.abspath(args.out)], "makeappx")
     print(f"msix: wrote {args.out}")
 
 

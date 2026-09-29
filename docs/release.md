@@ -227,9 +227,16 @@ installer.
 
 `scripts/msix.py` stages the executable, `crates/app/msix/AppxManifest.xml`
 with the identity and version filled in, and the images from
-`crates/app/icons/msix` (drawn by `icons/generate.py`), and packs them with
-`makeappx` from the Windows SDK. `cargo test -p app` checks the manifest
+`crates/app/icons/msix` (drawn by `icons/generate.py`), indexes the images
+into the package's `resources.pri` with `makepri`, and packs it all with
+`makeappx`, both from the Windows SDK. `cargo test -p app` checks the manifest
 against the app: the startup task, the executable and the images.
+
+Windows finds the images named by size and theme
+(`Square44x44Logo.targetsize-24_altform-unplated.png` and the like) only
+through `resources.pri`. A package without it, as the Store's 1.0.5 was, shows
+`Square44x44Logo.png` on the taskbar and in the Start menu, laid on a plate of
+the accent colour that shows in the tile's rounded corners.
 
 The Store takes a package version whose first part is above 0, whose parts
 are at most 65535 and whose fourth part is 0. The package version is the
@@ -257,8 +264,9 @@ stays out of the release.
 ### Trying a package by hand
 
 On a Windows 11 computer with Developer Mode on (Settings → System → For
-developers), pack a local build with the test identity and register the staged
-folder, which needs no signature:
+developers) and the Windows SDK, pack a local build with the test identity and
+register the staged folder, which needs no signature. `--stage-only` fills and
+indexes the folder and stops before packing it:
 
 ```
 python scripts/msix.py --exe target\release\oschess-bridge.exe --out msix-test\oschess-bridge.msix --stage-only

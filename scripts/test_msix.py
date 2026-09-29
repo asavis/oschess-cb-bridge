@@ -1,8 +1,12 @@
-"""The Store package's version (#112): python3 -m unittest discover -s scripts"""
+"""The Store package's version and packing (#112): python3 -m unittest discover -s scripts"""
 
 import importlib.util
 import os
+import shutil
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPEC = importlib.util.spec_from_file_location("msix", os.path.join(HERE, "msix.py"))
@@ -39,6 +43,50 @@ class PackageVersion(unittest.TestCase):
         self.assertGreater(version[0], 0)
         self.assertEqual(version[3], 0)
         self.assertLessEqual(max(version), 65535)
+
+
+class Packing(unittest.TestCase):
+    def pack(self, *extra):
+        """Runs the script with the SDK tools stubbed out; returns the commands
+        it ran and the staging folder."""
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work)
+        exe = os.path.join(work, "oschess-bridge.exe")
+        with open(exe, "wb") as f:
+            f.write(b"MZ")
+        out = os.path.join(work, "dist", "oschess-bridge.msix")
+        os.makedirs(os.path.dirname(out))
+        argv = ["msix.py", "--exe", exe, "--out", out, "--makepri", "makepri", "--makeappx", "makeappx", *extra]
+        ran = []
+
+        def run(command):
+            ran.append(command)
+            return mock.Mock(returncode=0)
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.dict(os.environ, {name: "" for name in msix.IDENTITY_VARIABLES.values()}),
+            mock.patch.object(msix.subprocess, "run", run),
+            mock.patch("builtins.print"),
+        ):
+            msix.main()
+        return ran, os.path.join(os.path.dirname(out), "msix-stage")
+
+    def test_indexes_the_images_into_the_package_before_packing_it(self):
+        ran, folder = self.pack()
+        steps = [command[:2] for command in ran]
+        self.assertEqual(steps, [["makepri", "createconfig"], ["makepri", "new"], ["makeappx", "pack"]])
+        createconfig, new, pack = ran
+        config = new[new.index("/cf") + 1]
+        self.assertEqual(createconfig[createconfig.index("/cf") + 1], config)
+        self.assertFalse(config.startswith(folder + os.sep), "the configuration stays out of the package")
+        self.assertEqual(new[new.index("/pr") + 1], folder)
+        self.assertEqual(new[new.index("/of") + 1], os.path.join(folder, "resources.pri"))
+        self.assertEqual(pack[pack.index("/d") + 1], folder)
+
+    def test_a_staged_folder_is_indexed_too(self):
+        ran, _ = self.pack("--stage-only")
+        self.assertEqual([command[:2] for command in ran], [["makepri", "createconfig"], ["makepri", "new"]])
 
 
 if __name__ == "__main__":
