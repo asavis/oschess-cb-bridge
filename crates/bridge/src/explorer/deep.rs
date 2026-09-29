@@ -283,14 +283,28 @@ impl Tracker {
         Some(e.flags & CHANGED != 0)
     }
 
-    /// Plays `words` and notes in `changes` the parts of the structure after
-    /// each word that may have changed it, a pawn's move or a capture:
-    /// without a branch a word, since which words do is unpredictable. The
-    /// changes noted; `None` when a word names no move of standard chess.
+    /// Plays `words`, as [`Tracker::play`] plays each, without a branch a
+    /// word: `None` when one names no move of standard chess.
+    #[inline]
+    fn play_all(&mut self, words: &[[u8; 2]]) -> Option<()> {
+        let mut named = NAMED;
+        for w in words {
+            let e = self.effect(u16::from_le_bytes(*w));
+            named &= e.flags;
+            self.apply(e);
+        }
+        (named & NAMED != 0).then_some(())
+    }
+
+    /// Plays `words`, [`CHANGES`] at most, and notes in `changes` the parts
+    /// of the structure after each word that may have changed it, a pawn's
+    /// move or a capture: without a branch a word, since which words do is
+    /// unpredictable. The changes noted; `None` when a word names no move of
+    /// standard chess.
     #[inline]
     fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut [Change; CHANGES]) -> Option<usize> {
         let (mut noted, mut named) = (0, NAMED);
-        for w in words.iter().take(CHANGES) {
+        for w in words {
             let e = self.effect(u16::from_le_bytes(*w));
             named &= e.flags;
             self.apply(e);
@@ -500,9 +514,7 @@ impl Pass<'_> {
         // tree's plies.
         const { assert!(stream::PREFIX_WORDS == PRUNE_PLY as usize + 1 && PRUNE_PLY >= MAX_PLY) };
         let (prefix, past) = record.word_parts();
-        for w in prefix {
-            line.play(u16::from_le_bytes(*w)).ok_or_else(word)?;
-        }
+        line.play_all(prefix).ok_or_else(word)?;
         let within = Within::of(self.lo, self.hi.load(Ordering::Relaxed), self.bits, game);
         let mut held = line.structure();
         let mut replayed = Replayed::default();
@@ -1177,9 +1189,9 @@ mod tests {
     }
 
     /// Words played a run at a time note the parts after each word that may
-    /// change the structure, as the words played one at a time say, over
-    /// random games long enough to promote; a run with a word that names no
-    /// move fails.
+    /// change the structure, as the words played one at a time say, and
+    /// lead to the same structure played all at once, over random games long
+    /// enough to promote; a run with a word that names no move fails.
     #[test]
     fn a_run_of_words_notes_each_change() {
         let mut x = 0x2545_f491_4f6c_dd1du64;
@@ -1215,6 +1227,9 @@ mod tests {
             }
             assert_eq!(noted, expected);
             assert_eq!(run, one);
+            let mut all = Tracker::of(&Board::startpos());
+            assert_eq!(all.play_all(&bytes), Some(()));
+            assert_eq!(all, one);
             changed += noted.len();
         }
         assert!(changed > 1_000, "{changed}");
@@ -1222,5 +1237,6 @@ mod tests {
         let mut changes = [Change::default(); CHANGES];
         let e2e4 = cbformat::replay::word_of(&Board::startpos(), "e2e4".parse().unwrap()).unwrap();
         assert_eq!(run.play_noting(&[e2e4.to_le_bytes(), [0, 0]], &mut changes), None);
+        assert_eq!(run.play_all(&[e2e4.to_le_bytes(), FIRST_CASTLE_960.to_le_bytes()]), None);
     }
 }
