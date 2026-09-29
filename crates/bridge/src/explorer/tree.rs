@@ -188,7 +188,7 @@ fn board_piece(p: movetable::Piece) -> Piece {
 /// when a pawn of the side to move stands beside the pawn that has just
 /// stepped two squares: the pawns followed tell.
 #[derive(Clone, Copy)]
-struct Keys {
+pub(super) struct Keys {
     /// The key without its en passant part, and that part, 0 for none.
     key: u64,
     en_passant: u64,
@@ -204,7 +204,7 @@ impl Keys {
     /// The key of `board` to follow; `None` for a castling rook off its
     /// corner, which a start the stream keeps never has
     /// ([`stream::board_of`]).
-    fn of(board: &Board) -> Option<Keys> {
+    pub(super) fn of(board: &Board) -> Option<Keys> {
         let mut rights = 0;
         for color in [Color::White, Color::Black] {
             for (side, file) in [(CastleSide::Short, 7), (CastleSide::Long, 0)] {
@@ -220,18 +220,23 @@ impl Keys {
         Some(Keys { key: board.hash() ^ en_passant, en_passant, rights, pawns, steps: steps() })
     }
 
-    fn hash(&self) -> u64 {
+    pub(super) fn hash(&self) -> u64 {
         self.key ^ self.en_passant
+    }
+
+    /// The home pawns of the line's position ([`stream::home_pawns`]).
+    pub(super) fn home(&self) -> u16 {
+        stream::home_of(self.pawns[0], self.pawns[1])
     }
 
     /// The move `word` names, as the index packs it; `None` for a word that
     /// names no move of standard chess.
-    fn packed(&self, word: u16) -> Option<u16> {
+    pub(super) fn packed(&self, word: u16) -> Option<u16> {
         self.steps.get(usize::from(word)).map(|s| s.mv).filter(|&mv| mv != NO_MOVE)
     }
 
     /// Plays `word`, which [`Keys::packed`] took.
-    fn play(&mut self, word: u16) {
+    pub(super) fn play(&mut self, word: u16) {
         let Some(&s) = self.steps.get(usize::from(word)) else { return };
         // Both sides' pawns at once, without a branch, as the deep section's
         // tracker plays them: all ones in `black` when black moves.
@@ -380,20 +385,34 @@ pub(super) fn write(
     // grows as it must.
     let table_bytes = BLOCK_ENTRY * (counts.len() + (total / 1024) as usize + 16);
     let least = MIN_WORKER_ENTRIES * ENTRY_BYTES;
+    // The room of a worker whose pass starts at the largest part, which the
+    // passes take whenever the share holds it (`needed`).
+    let largest = (0..counts.len()).map(|part| needed(collected(part))).max().unwrap_or(MIN_WORKER_ENTRIES);
+    let largest = largest.saturating_mul(ENTRY_BYTES);
     // Half the workers at most, as many as the share holds beside a quarter
-    // of it for the entries, one at least.
+    // of it for the entries and beside that room, one at least.
     let games = stream.header.records();
-    let fit = (share.saturating_sub(table_bytes) / 4 * 3 / WORKER_BYTES).max(1);
+    let rest = share.saturating_sub(table_bytes);
+    let fit = ((rest / 4 * 3).min(rest.saturating_sub(largest)) / WORKER_BYTES).max(1);
     let want = threads().div_ceil(2).min(games.div_ceil(64) as usize).min(fit).max(1);
     let room = share.checked_sub(table_bytes + want * WORKER_BYTES).ok_or(SearchError::TooLarge)?;
-    let room = room.min(limits.pass_bytes.unwrap_or(usize::MAX));
+    // No more than the entries take, twice over, and that room: a small
+    // database's build holds a little of the budget, however large its
+    // share, and takes one pass.
+    let entries: u64 = (0..counts.len()).map(collected).sum();
+    let usable = usize::try_from(entries).unwrap_or(usize::MAX).saturating_mul(2 * ENTRY_BYTES).saturating_add(largest);
+    let room = room.min(usable).min(limits.pass_bytes.unwrap_or(usize::MAX));
     if room < least {
         return Err(SearchError::TooLarge);
     }
     // The table's first room is reserved with the passes', so that the
-    // entries never take the room the table then waits for.
+    // entries never take the room the table then waits for. While searches
+    // hold the budget, the passes take less room, but never less than the
+    // largest part's when the share holds it: the build waits for that
+    // rather than start a pass that a part alone would fill.
     let (_memory, want, room) =
-        Room { fixed: table_bytes, each: WORKER_BYTES, workers: want, least, room }.reserve(progress)?;
+        Room { fixed: table_bytes, each: WORKER_BYTES, workers: want, least: largest.clamp(least, room), room }
+            .reserve(progress)?;
     let capacity = room / ENTRY_BYTES;
     let want = want.min(capacity / MIN_WORKER_ENTRIES);
     let mut table = Vec::new();
@@ -413,7 +432,9 @@ pub(super) fn write(
         progress.tree_passes.fetch_add(1, Ordering::Relaxed);
         let pass = Pass { stream, part_bits, first, hi: &hi, capacity, planned, folded, progress };
         let started = Instant::now();
-        let buffers = pass.collect(want)?;
+        // As many workers as each hold the pass's first part in its share
+        // of the room, one at least.
+        let buffers = pass.collect(want.min(capacity / needed(collected(first))).max(1))?;
         let replayed = Instant::now();
         let end = hi.load(Ordering::Relaxed);
         write_parts(&buffers, &pass, end, counts, &mut sink, out, want)?;
@@ -545,16 +566,26 @@ impl Pass<'_> {
 }
 
 /// The keys of the standard start to follow.
-fn standard_keys() -> Keys {
+pub(super) fn standard_keys() -> Keys {
     static START: OnceLock<Keys> = OnceLock::new();
     *START.get_or_init(|| Keys::of(stream::standard()).expect("the standard start castles from the corners"))
+}
+
+/// The entries a worker's buffer holds so that a pass whose first part has
+/// `entries` entries, as the stream pass counted them, never finds that
+/// part too large for it ([`make_room`]), however little they fold: an
+/// eighth more, and [`MIN_WORKER_ENTRIES`] at least.
+fn needed(entries: u64) -> usize {
+    usize::try_from(entries + entries / 7 + 1).unwrap_or(usize::MAX).max(MIN_WORKER_ENTRIES)
 }
 
 /// Makes room in `buf`, a worker's full buffer of `cap` entries in a pass of
 /// the parts from `first` to `hi`, of `part_bits` bits: its entries sorted
 /// and folded, and when they still take three quarters of it, the pass ended
 /// for every worker at the part that keeps about half. A first part that
-/// alone leaves no room is too large for the share.
+/// alone leaves no room is too large for the share: a worker holds what the
+/// part [`needed`] whenever the share holds that, so only a share too small
+/// for one worker and the part's folded entries fails so.
 fn make_room(
     buf: &mut Vec<Entry>,
     cap: usize,
@@ -969,6 +1000,26 @@ mod tests {
         // Part 2 alone fills the buffer with distinct positions.
         let mut full: Vec<Entry> = (0..1_024).map(|i| Entry::new(key(2, i), 1, Outcome::White, 5, 2000)).collect();
         assert!(matches!(make_room(&mut full, 1_024, &mut scratch, 2, &hi, bits), Err(SearchError::TooLarge)));
+    }
+
+    /// A buffer of the entries a part [`needed`] holds that part whole, of
+    /// distinct positions that never fold, filled up with the next part's:
+    /// a pass that starts at it ends past it, whatever its size.
+    #[test]
+    fn a_buffer_of_what_a_part_needed_holds_it() {
+        let bits = 4;
+        let entry = |part: u64, i: u64| Entry::new(part << 60 | i, 1, Outcome::White, 5, 2000);
+        let mut scratch = Vec::with_capacity(FOLD_ENTRIES);
+        for n in (0..=700u64).chain([4_095, 65_535]) {
+            let cap = needed(n);
+            assert!(cap >= MIN_WORKER_ENTRIES && cap as u64 > n, "{n}");
+            let mut buf: Vec<Entry> = (0..n).map(|i| entry(2, i)).collect();
+            buf.extend((0..cap as u64 - n).map(|i| entry(3, i)));
+            let hi = AtomicUsize::new(16);
+            make_room(&mut buf, cap, &mut scratch, 2, &hi, bits).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+            assert!(hi.load(Ordering::Relaxed) >= 3, "{n}: the pass ends past part 2");
+            assert_eq!(buf.iter().filter(|e| part_of(e.key, bits) == 2).count() as u64, n);
+        }
     }
 
     /// Following a line's words alone gives the key a board gives, and the

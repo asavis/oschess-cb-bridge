@@ -273,8 +273,13 @@ pub(super) fn write(
     let fit = (share.saturating_sub(table_bytes) / 4 * 3 / WORKER_BYTES).max(1);
     let want = threads().div_ceil(2).min(games.div_ceil(64) as usize).min(fit).max(1);
     let room = share.checked_sub(table_bytes + want * WORKER_BYTES).ok_or(SearchError::TooLarge)?;
-    let room = room.min(limits.pass_bytes.unwrap_or(usize::MAX));
     let least = MIN_WORKER_POSTINGS * 8;
+    // No more than the postings take, twice over: a small database's build
+    // holds a little of the budget, however large its share, and takes one
+    // pass.
+    let postings: u64 = counts.iter().sum();
+    let usable = usize::try_from(postings).unwrap_or(usize::MAX).saturating_mul(2 * 8).saturating_add(least);
+    let room = room.min(usable).min(limits.pass_bytes.unwrap_or(usize::MAX));
     if room < least {
         return Err(SearchError::TooLarge);
     }

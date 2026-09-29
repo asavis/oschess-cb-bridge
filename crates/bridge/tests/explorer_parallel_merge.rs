@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bridge::explorer::runs::{Limits, Progress};
@@ -39,26 +39,39 @@ fn in_child(name: &str) -> bool {
 }
 
 /// Builds the index of `d` within `limits` in a new folder named after
-/// `name`: the index, its folder, and the passes of the tree and the deep
-/// section.
-fn build(d: &Database, name: &str, limits: &Limits) -> (Loaded, PathBuf, (u64, u64)) {
+/// `name`: the index, its folder, the passes of the tree and the deep
+/// section, and the most of the budget the build held at once.
+fn build(d: &Database, name: &str, limits: &Limits) -> (Loaded, PathBuf, (u64, u64), usize) {
     let dir = std::env::temp_dir().join(format!("bridge-parallel-passes-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let progress = Progress::default();
     let started = Instant::now();
-    let built = explorer::prepare_with(d, 1, &dir, "db", &progress, limits).unwrap();
+    let (before, done, most) = (held(), AtomicBool::new(false), AtomicUsize::new(0));
+    let built = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                most.fetch_max(held().saturating_sub(before), Ordering::Relaxed);
+                std::thread::yield_now();
+            }
+        });
+        let built = explorer::prepare_with(d, 1, &dir, "db", &progress, limits);
+        done.store(true, Ordering::Relaxed);
+        built
+    })
+    .unwrap();
     assert!(started.elapsed() < Duration::from_secs(60), "{name}: the build waited for memory it holds itself");
     let names: BTreeSet<String> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     assert_eq!(names, ["db.idx".to_string(), "db.moves".to_string()].into(), "{name}: the index, and nothing else");
     let passes = (progress.tree_passes.load(Ordering::Relaxed), progress.deep_passes.load(Ordering::Relaxed));
-    (built, dir, passes)
+    (built, dir, passes, most.into_inner())
 }
 
 /// Passes on many workers write the index byte for byte as one pass of each
 /// kind does, however many passes the room makes: the room a test gives, or
 /// what a search leaves free while it holds all of the budget but 5 MiB,
-/// which leaves room for fewer workers than the build asks for. The move
+/// less than the build holds when it has the room, which leaves room for
+/// fewer workers than the build asks for, and less room. The move
 /// stream holds the same records, and as many bytes: only the order its
 /// workers appended them in differs.
 #[test]
@@ -69,14 +82,17 @@ fn passes_on_many_workers_write_the_same_index() {
     assert_eq!((budget(), threads()), (64 << 20, 16));
     let db = random_games("parallel-passes", 5_000, 11);
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let (one, one_dir, passes) = build(&d, "one", &Limits::default());
+    let (one, one_dir, passes, most) = build(&d, "one", &Limits::default());
     assert_eq!(passes, (1, 1));
-    let (many, many_dir, passes) = build(&d, "many", &Limits { pass_bytes: Some(256 << 10), ..Limits::default() });
+    let (many, many_dir, passes, _) = build(&d, "many", &Limits { pass_bytes: Some(256 << 10), ..Limits::default() });
     assert!(passes.0 > 2 && passes.1 > 2, "{passes:?}");
-    // Room for one worker of each pass, and little beside it.
-    let search = Hold::reserve(budget() - held() - (5 << 20)).unwrap();
-    let (held_back, held_dir, passes) = build(&d, "held", &Limits::default());
-    assert!(passes.0 > 1, "{passes:?}");
+    // Room for one worker of each pass, and little beside it: less than the
+    // build holds when it has the room.
+    let free = 5 << 20;
+    assert!(most > free, "the build held {most} bytes at most");
+    let search = Hold::reserve(budget() - held() - free).unwrap();
+    let (held_back, held_dir, _, most) = build(&d, "held", &Limits::default());
+    assert!(most <= free, "the build held {most} bytes at most");
     drop(search);
     let records = d.record_count();
     // A record as read, but for where its tail lies.

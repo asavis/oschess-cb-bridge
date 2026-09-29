@@ -485,6 +485,7 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      database and the most crowded of all, a fifth of the tree's entries,
      are folded as they come, as a tree pass folds a full buffer (below):
      each worker keeps their entries in a room of up to a million (16 MiB),
+     and of no more than four a game of the database, 16,384 at least,
      taken from what the share and the budget have free beside the pass's
      buffers, and folds it whenever it fills; at the end the workers' entries
      are folded together, a few dozen per position, and held until the tree
@@ -494,7 +495,10 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   2. **The tree's passes** (phase `positions`, in entries). A pass takes as
      many parts of the keys, in order, as 97% of the room left in the
      build's share holds of their entries, but for those the stream pass
-     folded, one part at least. The room is reserved together with the
+     folded, one part at least. The room is no more than twice those entries
+     and a worker's room for the largest part (below): a small database's
+     build holds a little of the budget, however large its share, and takes
+     one pass. The room is reserved together with the
      workers' buffers for making blocks and the table of the tree's blocks,
      so that the table never waits for memory the entries took. An entry is 16 bytes: the key, the game
      number (30 bits) with its result (2), and the move (14 bits) and average
@@ -516,8 +520,15 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      no notable game. A buffer still three quarters full ends the pass, for
      every worker, at the part that keeps about half of it, and the next pass
      starts there; a first part that alone fills it fails the build as too
-     large. The workers then take the pass's parts in order, each merging one
-     part's entries from every worker's sorted buffer and from the entries
+     large. So that none does, a worker's buffer holds the pass's first part
+     whole, as the stream pass counted its entries, and an eighth more,
+     however little they fold, whenever the share holds that for one worker:
+     a pass runs on no more workers than leave each that room, and the
+     passes never take less room than the largest part needs, which the
+     build waits for as it waits for its least. Only a share too small for
+     one worker and the folded entries of a part fails. The workers then
+     take the pass's parts in order, each merging one part's entries from
+     every worker's sorted buffer and from the entries
      the stream pass folded, adding each position up into its record and
      making the part's blocks. A worker hands its blocks over and goes on
      with the next part: they are placed in the file once every part before
@@ -535,10 +546,11 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      capture. Each structure a line holds past ply 20 whose bucket lies in
      the pass is a posting of 8 bytes, `bucket << 40 | game << 8 | print <<
      1`, plus 1 when the line holds it only within ply 20, as none past it
-     does. A pass plans 97% of its room, and its workers take games as the
-     tree's do. A full buffer is sorted and freed of repeats, a game's
-     posting beyond ply 20 kept of two with one print; one still three
-     quarters full ends the pass at the bucket that keeps about half of it,
+     does. A pass plans 97% of its room, no more than twice the postings
+     the stream pass counted, and its workers take games as the tree's do.
+     A full buffer is sorted and freed of repeats, a game's posting beyond
+     ply 20 kept of two with one print; one still three quarters full ends
+     the pass at the bucket that keeps about half of it,
      which may lie inside a deep block, which the next pass goes on with.
      When the pass's first bucket alone holds that half, as a structure that
      hundreds of thousands of games hold does at a small budget, the pass
@@ -566,8 +578,12 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
 
   Each pass reserves what the budget has free, up to the build's share:
   while searches hold memory, it takes fewer workers and less room, and the
-  build runs more passes. However many passes and workers it runs, it writes
-  the same index, byte for byte but for the build id. Half the budget is at
+  build runs more passes, never with less room than it needs to go on (the
+  tree's largest part), and takes what more is free once it has that; it
+  reads back the files it wrote, whose tables it holds in the budget, waiting
+  likewise. Builds side by side in one process, as tests run them, each take
+  what their entries use (#148). However many passes and workers it runs, it
+  writes the same index, byte for byte but for the build id. Half the budget is at
   least 8 MiB; a share that cannot hold one worker of the stream pass fails
   the build as too large at once, and one whose room searches hold waits for
   it for up to a minute, then fails as busy.
@@ -608,7 +624,7 @@ it means the same in any position and needs no board to decode.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBMOV\0` |
-  | 8 | 4 | format version, 2 |
+  | 8 | 4 | format version, 3 |
   | 12 | 4 | header length, 128 |
   | 16 | 1 | prefix words per record, *W* = 21 |
   | 20 | 4 | first record, 1 |
@@ -624,7 +640,8 @@ it means the same in any position and needs no board to decode.
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
   The other bytes are zero. Version 1, whose directory, prefix and tail
-  areas lay apart with a CRC for each MiB, is rebuilt.
+  areas lay apart with a CRC for each MiB, and version 2, whose block table
+  held no CRCs of the blocks' slots, are rebuilt.
 - **Body**, from 128 to the block table: the tails and the blocks of slots,
   each starting at a multiple of 64 bytes, in the order the build's workers
   appended them. A worker takes the records of one block at a time and
@@ -654,16 +671,22 @@ it means the same in any position and needs no board to decode.
   possible, else 8; a zero byte); then words *W* to plies − 1. A start equal
   to the standard one is no set-up. A file takes 64 bytes a record and 2
   bytes for each ply past the 21st, 36 more for a set-up start, up to 63
-  bytes of padding after each append of tails, and 8 bytes a block.
-- **Block table**, at the end of the body: the offset of each block's slots,
-  8 bytes each. The file must end with it, have a block for every *B*
-  records and room before the table for every record's slot, and each
-  block's slots must lie within the body at a multiple of 64 bytes; the
-  table is checked against its CRC when the file opens and held in the
-  search memory budget. A record is checked against its CRC whenever an
-  answer reads it, its slot and its tail, which are all a replay reads: its
-  number in the CRC places it, so that a slot moved elsewhere fails too. The
-  build's passes read back the records they have just written without it. A failure
+  bytes of padding after each append of tails, and 12 bytes a block.
+- **Block table**, at the end of the body: for each block the offset of its
+  slots (8 bytes) and the CRC-32 of the block's number from 0 (4 bytes) and
+  its slots (4 bytes), 12 bytes a block. The file must end with it, have a
+  block for every *B* records and room before the table for every record's
+  slot, and each block's slots must lie within the body at a multiple of 64
+  bytes; the table is checked against its CRC when the file opens and held
+  in the search memory budget. A record is checked against its CRC whenever
+  an answer reads it, its slot and its tail, which are all a replay reads:
+  its number in the CRC places it, so that a slot moved elsewhere fails too.
+  A list of a position's games (below) reads every slot and no tail, so it
+  checks each block against the block's CRC instead, the first time it reads
+  the block while the file is open: the block's number places it, and the
+  order of its slots each slot, so that a slot damaged, or moved within its
+  block or into another, fails the blocks it is in. The build's passes read
+  back the records they have just written without either CRC. A failure
   drops both files, and the next request rebuilds them. A torn file, which
   the build does not sync, fails the CRCs of the records it lost.
 - **Finding a position.** Of a bucket's games, a replay skips those the
@@ -685,6 +708,18 @@ it means the same in any position and needs no board to decode.
   takes fewer; each holds only what it found. A replay stops at its next
   game once its request is superseded. Moves played as often are listed in
   the order of the first game, by number, that played each.
+- **Listing a position's games** (#148). The games that reach a position
+  within the tree's plies are its notable games when it has 12 or fewer.
+  Otherwise the search workers take the stream's blocks, 4,096 games at a
+  time, each checked against its CRC the first time a list reads it (see
+  the block table), and read every slot: a standard game passes the
+  home-pawn test above on its entry, then its prefix words are followed to
+  the tree's last ply, its key alone, until it reaches the position or
+  loses a home pawn the position keeps; a set-up game's record is read
+  whole, checked against its CRC, and followed from its start. The games
+  found must also be as many as the tree's record counts, and a difference
+  drops both files as a failed CRC does. The games beyond the tree's plies
+  are those the replay above finds.
 
 # The classic format (`.cbh`)
 
