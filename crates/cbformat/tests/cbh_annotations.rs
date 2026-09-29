@@ -1,6 +1,7 @@
 //! Classic (`.cba`) annotations: decoded, placed by stored-order position and
 //! written as PGN exactly as 2CBH annotations are.
 
+use cbformat::Limits;
 use cbformat::cbh::{Database, annotations};
 use cbformat::fixture::pgn_movetext;
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
@@ -58,7 +59,7 @@ fn db(name: &str, moves: &[u8], items: &[(i32, u8, &[u8])]) -> (cbformat::fixtur
 }
 
 fn movetext(db: &Database, options: &Options) -> (String, AnnotationStatus) {
-    let r = pgn::classic_game_with(db, 1, options).unwrap();
+    let r = pgn::classic_game_with(db, 1, options, Limits::default()).unwrap();
     (pgn_movetext(&r.pgn), r.annotations)
 }
 
@@ -224,7 +225,7 @@ fn annotations_on_no_move_are_damage() {
     let none = move_record(0, None, None, &encode(&Board::startpos(), &[E], 0, false));
     for (what, moves, position) in [("below the game", one_move(), -2), ("no moves", none.clone(), 0)] {
         let (_f, db) = db(&format!("no-move-{position}"), &moves, &[(position, 0x02, b"\x00\x2anote")]);
-        let err = pgn::classic_game_with(&db, 1, &Options::default()).unwrap_err();
+        let err = pgn::classic_game_with(&db, 1, &Options::default(), Limits::default()).unwrap_err();
         assert!(err.to_string().contains("position"), "{what}: {err}");
     }
     let (_f, db) = db("no-moves-game", &none, &[(-1, 0x02, b"\x00\x2agame")]);

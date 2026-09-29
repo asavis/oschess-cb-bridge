@@ -11,6 +11,7 @@ use std::time::Instant;
 
 mod databases;
 
+use cbformat::Limits;
 use cbformat::game::{Head, RecordKind, Start};
 use cbformat::movetable::{self, Captured, MoveWord};
 use cbformat::pgn::{AnnotationStatus, Options};
@@ -45,6 +46,12 @@ not UTF-8 in Windows code page N (default: 1252).
 language of comments (default: English, else the first a game has).
 
 CBTOOL_THREADS sets the number of worker threads (default: one per CPU).";
+
+/// What `verify` reads and `pgn` exports of a game: all that its format
+/// allows, so that checking or exporting a database takes every record the
+/// reader can decode, where a server bounds each game far lower
+/// ([`Limits::default`]).
+const LIMITS: Limits = Limits::format_max();
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -221,7 +228,7 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
             return;
         }
     }
-    let data = match batch.moves_of(&r) {
+    let data = match batch.moves_of_within(&r, LIMITS.game_bytes) {
         Ok(d) => d,
         Err(e) => return fail(s, e.to_string()),
     };
@@ -258,7 +265,7 @@ fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec
         }
         Err(e) => return fail(s, e.to_string()),
     };
-    match batch.annotations_of(&r) {
+    match batch.annotations_of_within(&r, LIMITS.game_bytes) {
         Ok(Some(a)) if !a.is_empty() => {
             s.annotated += 1;
             if let Err(e) = a.check_positions(plies).map(|n| s.count_past_end(n)) {
@@ -449,8 +456,8 @@ impl<'db> Rendered<'db> {
             self.batch = db.batch(id, id.saturating_add(RENDER_BATCH - 1)).ok();
         }
         let rendered = match &self.batch {
-            Some(batch) => batch.pgn(id, options),
-            None => db.pgn(id, options),
+            Some(batch) => batch.pgn(id, options, LIMITS),
+            None => db.pgn(id, options, LIMITS),
         };
         match rendered {
             Ok(game) => {

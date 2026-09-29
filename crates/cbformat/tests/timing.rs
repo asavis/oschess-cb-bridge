@@ -2,6 +2,7 @@
 //! decoders of types 26, 21, 07 and 24, damaged payloads included, and how
 //! both PGN forms write them.
 
+use cbformat::Limits;
 use cbformat::fixture::{TempDb, annotations, one_game, other, pgn_movetext, quiet, rendered};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
 use cbformat::game::timing::{self, Evaluation, Score, Stage};
@@ -214,7 +215,7 @@ fn a_classic_game_writes_the_same_evaluations() {
     let f = b.write("timing-classic");
     let db = cbformat::cbh::Database::open(f.base()).unwrap();
     let render = |full: bool| {
-        let r = pgn::classic_game_with(&db, 1, &Options { full, ..Options::default() }).unwrap();
+        let r = pgn::classic_game_with(&db, 1, &Options { full, ..Options::default() }, Limits::default()).unwrap();
         pgn_movetext(&r.pgn)
     };
     assert_eq!(render(false), "{[%evp 0,2,15,32,-29997]} 1. e4 e5");

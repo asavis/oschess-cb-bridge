@@ -287,22 +287,35 @@ impl Batch<'_> {
     /// The move record of `record`, from the batch's buffer when it lies
     /// inside it and read on its own otherwise.
     pub fn moves_of(&self, record: &Record) -> Result<MoveData<'_>> {
+        self.moves_of_within(record, usize::MAX)
+    }
+
+    /// [`Batch::moves_of`], refusing a record larger than `limit` bytes, as
+    /// [`Database::moves_of_within`] refuses it, however the batch's buffer
+    /// holds it.
+    pub fn moves_of_within(&self, record: &Record, limit: usize) -> Result<MoveData<'_>> {
         let inside = u64::from(record.moves_offset())
             .checked_sub(self.span_at)
             .and_then(|rel| usize::try_from(rel).ok())
             .filter(|&rel| rel.saturating_add(4) <= self.span.len());
         if let Some(rel) = inside {
             let size = be_u24(&self.span, rel + 1) as usize;
-            if size >= 4 && rel + size <= self.span.len() {
+            if (4..=limit).contains(&size) && rel + size <= self.span.len() {
                 return Ok(MoveData { bytes: Cow::Borrowed(&self.span[rel..rel + size]) });
             }
         }
-        self.db.moves_of(record)
+        // Read on its own, which also refuses a record over `limit`.
+        self.db.moves_of_within(record, limit)
     }
 
     /// The annotations of `record`, as [`Database::annotations_of`].
     pub fn annotations_of(&self, record: &Record) -> Result<Option<GameAnnotations>> {
         self.db.annotations_of(record)
+    }
+
+    /// The annotations of `record`, as [`Database::annotations_of_within`].
+    pub fn annotations_of_within(&self, record: &Record, limit: usize) -> Result<Option<GameAnnotations>> {
+        self.db.annotations_of_within(record, limit)
     }
 }
 

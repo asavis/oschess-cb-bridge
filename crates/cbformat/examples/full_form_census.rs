@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 
+use cbformat::Limits;
 use cbformat::fixture::{unbase64url, unpercent};
 use cbformat::game::{Annotation, Head, RecordKind};
 use cbformat::pgn::{self, Options};
@@ -194,7 +195,7 @@ fn census<'a>(paths: impl IntoIterator<Item = &'a str>) -> Totals {
             };
             t.annotated += 1;
             let want = decoded(&a);
-            let got = match base.pgn(id, &full) {
+            let got = match base.pgn(id, &full, Limits::format_max()) {
                 Ok(r) => recovered(&r.pgn, base.format()),
                 Err(_) => {
                     t.unwritten += 1;

@@ -6,7 +6,8 @@
 //! [`pgnfile`] reads a PGN file as a database, through an index it builds.
 //! [`dbitems`] reads the list of databases ChessBase's database window shows.
 //! [`replay`] plays decoded moves on a [`chesscore::Board`], checking each
-//! move word against the position.
+//! move word against the position. [`Limits`] bounds what rendering one game
+//! may read.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ pub mod fixture;
 #[cfg(feature = "fixture")]
 pub mod fixture_cbh;
 pub mod game;
+mod limits;
 pub mod movetable;
 pub mod pgn;
 pub mod pgnfile;
@@ -27,6 +29,8 @@ mod recordfile;
 pub mod replay;
 pub mod v2;
 pub mod view;
+
+pub use limits::Limits;
 
 #[derive(Debug)]
 pub enum Error {

@@ -15,7 +15,7 @@ use chesscore::{Board, Move};
 
 use cbformat::pgn::{self, Options};
 use cbformat::replay::{TreeVisitor, walk};
-use cbformat::{cbh, v2};
+use cbformat::{Limits, cbh, v2};
 
 #[derive(Default, PartialEq, Debug)]
 struct Events(Vec<String>);
@@ -139,7 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if ra.kind() == cbformat::game::RecordKind::Game && rb.kind() == cbformat::game::RecordKind::Game {
-            pgn.compare(id, pgn::classic_game_with(&a, id, &options), pgn::game_with(&b, id, &options), name_exception);
+            let all = Limits::format_max();
+            let (old, new) = (pgn::classic_game_with(&a, id, &options, all), pgn::game_with(&b, id, &options, all));
+            pgn.compare(id, old, new, name_exception);
         }
         if ra.kind() != cbformat::game::RecordKind::Game {
             continue;

@@ -18,18 +18,18 @@ use cbformat::pgnfile::lex::Lexer;
 use cbformat::pgnfile::line::{LineEnd, main_line};
 use cbformat::replay::{self, TreeVisitor};
 use cbformat::v2;
-use cbformat::{Error, Result, cbh, pgnfile};
+use cbformat::{Error, Limits, Result, cbh, pgnfile};
 use chesscore::{Board, Move};
 
+/// The bounds of the bridge's reads of a game or a name: `cbformat`'s
+/// default [`Limits`], the ones a server needs. [`Store::render`] has
+/// `cbformat` render a game within them, and a name read for a row or a
+/// table is read to [`Limits::name_bytes`].
+pub const LIMITS: Limits = Limits::DEFAULT;
 /// The largest move or annotation record, content or spare area, served as
-/// PGN. The largest record of any kind in a Mega Database is about 1.2 MB, a
-/// guiding text; a record near the reader's 64 MiB limit would take gigabytes
-/// to render.
-pub const MAX_GAME_BYTES: usize = 2 << 20;
-/// The longest entity record read for a name, in bytes. Real names are a few
-/// dozen bytes; a longer record, which only a damaged or hostile file holds,
-/// reads as an empty name, and none is ever read whole.
-pub const MAX_NAME_RECORD: usize = 4 << 10;
+/// PGN: [`Limits::game_bytes`] of [`LIMITS`], which sizes the buffers a game's
+/// moves are read into.
+pub const MAX_GAME_BYTES: usize = LIMITS.game_bytes;
 
 /// The names a table holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,8 +101,8 @@ pub trait Store: Sync {
     fn annotator(&self, id: i64) -> Result<Option<String>>;
     /// The title whose key is `key` ([`Head::other`]).
     fn title(&self, key: i64) -> Result<Option<String>>;
-    /// Game `r` as PGN, refusing a move or annotation record larger than
-    /// [`MAX_GAME_BYTES`] before it is read.
+    /// Game `r` as PGN within [`LIMITS`]: a move or annotation record larger
+    /// than [`MAX_GAME_BYTES`] is refused before it is read.
     fn render(&self, r: &Self::Head, options: &Options) -> Result<Rendered>;
     /// The first `plies` plies of game `r`'s main line in SAN, as
     /// [`Store::render`] writes them, separated by single spaces (#81). The
@@ -143,10 +143,10 @@ impl Store for v2::Database {
         u64::try_from(self.entities().stored_count(typ)).unwrap_or(u64::MAX)
     }
     fn player(&self, id: i64) -> Result<Option<Player>> {
-        self.entities().player_within(id, MAX_NAME_RECORD)
+        self.entities().player_within(id, LIMITS.name_bytes)
     }
     fn tournament(&self, id: i64) -> Result<Option<Tournament>> {
-        self.entities().tournament_within(id, MAX_NAME_RECORD)
+        self.entities().tournament_within(id, LIMITS.name_bytes)
     }
     fn read_players<E: From<Error>>(
         &self,
@@ -154,7 +154,7 @@ impl Store for v2::Database {
         buf: &mut [u8],
         each: &mut impl FnMut(Option<Player>) -> std::result::Result<(), E>,
     ) -> std::result::Result<u64, E> {
-        self.entities().read_players_within(ids, buf, MAX_NAME_RECORD, each)
+        self.entities().read_players_within(ids, buf, LIMITS.name_bytes, each)
     }
     fn read_tournaments<E: From<Error>>(
         &self,
@@ -162,21 +162,19 @@ impl Store for v2::Database {
         buf: &mut [u8],
         each: &mut impl FnMut(Option<Tournament>) -> std::result::Result<(), E>,
     ) -> std::result::Result<u64, E> {
-        self.entities().read_tournaments_within(ids, buf, MAX_NAME_RECORD, each)
+        self.entities().read_tournaments_within(ids, buf, LIMITS.name_bytes, each)
     }
     fn annotator(&self, id: i64) -> Result<Option<String>> {
         Ok(self.player(id)?.map(|p| p.pgn()))
     }
     fn title(&self, key: i64) -> Result<Option<String>> {
-        self.entities().title_within(key, MAX_NAME_RECORD)
+        self.entities().title_within(key, LIMITS.name_bytes)
     }
     fn render(&self, r: &v2::Record, options: &Options) -> Result<Rendered> {
-        let data = self.moves_of_within(r, MAX_GAME_BYTES)?;
-        let annotations = self.annotations_of_within(r, MAX_GAME_BYTES)?;
-        pgn::game_from(self, r, &data.moves()?, annotations.as_ref(), options)
+        pgn::game_with(self, r.id(), options, LIMITS)
     }
     fn main_line(&self, r: &v2::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
-        let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
+        let data = match self.read_moves_into(r, LIMITS.game_bytes, buf) {
             Ok(data) => data,
             Err(e) if failed_read(&e) => return Err(e),
             Err(_) => return Ok(None),
@@ -238,15 +236,13 @@ impl Store for cbh::Database {
     }
     fn title(&self, key: i64) -> Result<Option<String>> {
         let Some(id) = classic_id(key).filter(|&id| id >= 1 && id <= self.record_count()) else { return Ok(None) };
-        Ok(Some(self.text_title(&self.record(id)?, MAX_NAME_RECORD)?))
+        Ok(Some(self.text_title(&self.record(id)?, LIMITS.name_bytes)?))
     }
     fn render(&self, r: &cbh::Record, options: &Options) -> Result<Rendered> {
-        let data = self.moves_of_within(r, MAX_GAME_BYTES)?;
-        let annotations = self.annotations_of_within(r, MAX_GAME_BYTES)?;
-        pgn::classic_game_from(self, r, &data.moves()?, annotations.as_ref(), options)
+        pgn::classic_game_with(self, r.id(), options, LIMITS)
     }
     fn main_line(&self, r: &cbh::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
-        let data = match self.read_moves_into(r, MAX_GAME_BYTES, buf) {
+        let data = match self.read_moves_into(r, LIMITS.game_bytes, buf) {
             Ok(data) => data,
             Err(e) if failed_read(&e) => return Err(e),
             Err(_) => return Ok(None),
@@ -359,13 +355,13 @@ impl Store for pgnfile::Database {
         })
     }
     fn player(&self, id: i64) -> Result<Option<Player>> {
-        self.player_within(id, MAX_NAME_RECORD)
+        self.player_within(id, LIMITS.name_bytes)
     }
     fn tournament(&self, id: i64) -> Result<Option<Tournament>> {
-        self.tournament_within(id, MAX_NAME_RECORD)
+        self.tournament_within(id, LIMITS.name_bytes)
     }
     fn annotator(&self, id: i64) -> Result<Option<String>> {
-        self.annotator_within(id, MAX_NAME_RECORD)
+        self.annotator_within(id, LIMITS.name_bytes)
     }
     fn title(&self, _: i64) -> Result<Option<String>> {
         Ok(None)
@@ -373,7 +369,7 @@ impl Store for pgnfile::Database {
     /// The game as the file writes it: its comments are all it has, so the
     /// preferred languages and the full form change nothing.
     fn render(&self, r: &pgnfile::Record, _: &Options) -> Result<Rendered> {
-        Ok(Rendered { pgn: self.text(r, MAX_GAME_BYTES)?, annotations: pgn::AnnotationStatus::Complete })
+        Ok(Rendered { pgn: self.text(r, LIMITS.game_bytes)?, annotations: pgn::AnnotationStatus::Complete })
     }
     /// The main line as the text writes it, played from the standard
     /// position ([`pgnfile::line`]), and read only until the prefix is
@@ -382,7 +378,7 @@ impl Store for pgnfile::Database {
         if r.is_chess960() || r.is_other_variant() {
             return Ok(None);
         }
-        match self.bytes_into(r, MAX_GAME_BYTES, buf) {
+        match self.bytes_into(r, LIMITS.game_bytes, buf) {
             Ok(()) => {}
             Err(e) if failed_read(&e) => return Err(e),
             Err(_) => return Ok(None),

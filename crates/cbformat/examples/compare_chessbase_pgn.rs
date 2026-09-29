@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 
+use cbformat::Limits;
 use cbformat::fixture::unbase64url;
 use cbformat::game::{Quotation, RecordKind};
 use cbformat::pgn::{self, Options};
@@ -451,7 +452,7 @@ fn main() {
     for (&id, their_text) in ids.iter().zip(&theirs) {
         let render = |full: bool| {
             let o = Options { full, ..options.clone() };
-            pgn::game_with(&db, id, &o).map(|r| {
+            pgn::game_with(&db, id, &o, Limits::format_max()).map(|r| {
                 let (head, moves) = r.pgn.split_once("\n\n").unwrap_or_default();
                 (head.to_string(), moves.to_string())
             })

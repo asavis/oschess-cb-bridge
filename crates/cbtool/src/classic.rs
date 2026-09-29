@@ -9,7 +9,7 @@ use cbformat::game::{RecordKind, Start};
 use cbformat::replay::TreeVisitor;
 use chesscore::{Board, Move, Piece};
 
-use super::Stats;
+use super::{LIMITS, Stats};
 
 /// The lines of `info` after the record count.
 pub(crate) fn info(db: &Database) {
@@ -72,7 +72,7 @@ pub(crate) fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures:
             return;
         }
     }
-    let data = match batch.moves_of(&r) {
+    let data = match batch.moves_of_within(&r, LIMITS.game_bytes) {
         Ok(d) => d,
         Err(e) => return fail(s, e.to_string()),
     };
@@ -96,7 +96,7 @@ pub(crate) fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures:
     };
     // Every annotation type has its size, so a classic record is never left
     // incomplete: it decodes, or it is damaged.
-    match batch.annotations_of(&r) {
+    match batch.annotations_of_within(&r, LIMITS.game_bytes) {
         Ok(Some(a)) if !a.is_empty() => {
             s.annotated += 1;
             if let Err(e) = a.check_positions(plies).map(|n| s.count_past_end(n)) {

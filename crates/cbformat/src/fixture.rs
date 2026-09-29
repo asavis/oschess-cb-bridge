@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
+use crate::Limits;
 use crate::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece, Sq};
 use crate::pgn::{self, AnnotationStatus, Options};
 use crate::v2::{Database, checksum};
@@ -271,11 +272,12 @@ pub fn one_game(name: &str, words: &[u16], content: Option<&[u8]>) -> TempDb {
     b.write(name)
 }
 
-/// Game 1 of `db` as PGN under `options`: its movetext, as [`pgn_movetext`]
-/// takes it, and how much of its annotations it holds.
+/// Game 1 of `db` as PGN under `options`, within the default [`Limits`]: its
+/// movetext, as [`pgn_movetext`] takes it, and how much of its annotations it
+/// holds.
 pub fn rendered(db: &TempDb, options: &Options) -> (String, AnnotationStatus) {
     let db = Database::open(db.base()).unwrap();
-    let r = pgn::game_with(&db, 1, options).unwrap();
+    let r = pgn::game_with(&db, 1, options, Limits::default()).unwrap();
     (pgn_movetext(&r.pgn), r.annotations)
 }
 

@@ -209,28 +209,42 @@ impl<'db> Batch<'db> {
     /// The move record of `record`, from the batch's buffer when it lies
     /// inside it and read on its own otherwise.
     pub fn moves_of(&self, record: &Record) -> Result<MoveData<'_>> {
-        match self.moves.frame(record.moves_offset(), "move record") {
+        self.moves_of_within(record, MAX_FRAME_PART)
+    }
+
+    /// [`Batch::moves_of`], refusing a move record whose content or spare
+    /// area is larger than `limit` bytes, as [`Database::moves_of_within`]
+    /// refuses it, however the batch's buffer holds it.
+    pub fn moves_of_within(&self, record: &Record, limit: usize) -> Result<MoveData<'_>> {
+        match self.moves.frame(record.moves_offset(), limit, "move record") {
             Some(found) => {
                 let (tag, content) = found?;
                 Ok(MoveData { tag, content: Cow::Borrowed(content) })
             }
-            None => self.db.moves_of(record),
+            None => self.db.moves_of_within(record, limit),
         }
     }
 
     /// The annotations of `record`, as [`Database::annotations_of`], from the
     /// batch's buffer when the record lies inside it.
     pub fn annotations_of(&self, record: &Record) -> Result<Option<GameAnnotations>> {
+        self.annotations_of_within(record, MAX_FRAME_PART)
+    }
+
+    /// [`Batch::annotations_of`], refusing an annotation record whose content
+    /// or spare area is larger than `limit` bytes, as
+    /// [`Database::annotations_of_within`] refuses it.
+    pub fn annotations_of_within(&self, record: &Record, limit: usize) -> Result<Option<GameAnnotations>> {
         if !self.db.has_annotations() {
             return Ok(None);
         }
         let offset = record.annotations_offset();
-        match self.annotations.frame(offset, "annotation record") {
+        match self.annotations.frame(offset, limit, "annotation record") {
             Some(found) => {
                 let (tag, content) = found?;
                 annotation_content(tag, content, offset).map(Some)
             }
-            None => self.db.annotations_of(record),
+            None => self.db.annotations_of_within(record, limit),
         }
     }
 }
@@ -258,9 +272,10 @@ impl Span {
     }
 
     /// The tag and content of the frame at `offset`, or `None` when the frame
-    /// does not lie wholly inside the span; `kind` names the record.
-    fn frame(&self, offset: i64, kind: &str) -> Option<Result<(u16, &[u8])>> {
-        frame_at(&self.bytes, self.at, offset, MAX_FRAME_PART, kind)
+    /// does not lie wholly inside the span; one whose content or spare area
+    /// is over `limit` bytes is refused, and `kind` names the record.
+    fn frame(&self, offset: i64, limit: usize, kind: &str) -> Option<Result<(u16, &[u8])>> {
+        frame_at(&self.bytes, self.at, offset, limit, kind)
     }
 }
 
