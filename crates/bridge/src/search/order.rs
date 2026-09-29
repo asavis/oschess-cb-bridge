@@ -2,6 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 use std::sync::Mutex;
 
 use cbformat::game::Eco;
@@ -160,14 +161,19 @@ fn merge(runs: &[Vec<u64>], parts: usize, cancel: &Cancel, out: &mut [u32]) -> R
         let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> =
             (0..runs.len()).filter(|&r| from[r] < to[r]).map(|r| Reverse((runs[r][from[r]], r, from[r]))).collect();
         let mut i = 0;
-        while let Some(Reverse((packed, r, at))) = heap.pop() {
+        // The least head is taken and its run's next key put in its place,
+        // which sifts the heap once where a pop and a push would twice.
+        while let Some(mut least) = heap.peek_mut() {
+            let Reverse((packed, r, at)) = *least;
             if i % MERGE_CHECK == 0 && stopped() {
                 return Err(SearchError::Superseded);
             }
             part[i] = packed as u32;
             i += 1;
             if at + 1 < to[r] {
-                heap.push(Reverse((runs[r][at + 1], r, at + 1)));
+                *least = Reverse((runs[r][at + 1], r, at + 1));
+            } else {
+                PeekMut::pop(least);
             }
         }
         Ok(())
