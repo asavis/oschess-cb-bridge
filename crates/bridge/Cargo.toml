@@ -30,12 +30,12 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # The Documents known folder (documents.rs); already in the tree through same-file.
-# The engine's process priority and the machine's memory (engine.rs).
+# The engine's process priority (engine/uci.rs).
 # The code page of PGN text that is not UTF-8 (pgnindex.rs).
 # The position index's move stream, mapped read-only (explorer/map.rs):
 # `CreateFileMappingW` takes a security descriptor, hence `Win32_Security`.
-# The priority of index builds, the power status and a disk's free space
-# (machine.rs).
+# The priority of index builds, the power status, a disk's free space and the
+# physical memory (machine.rs).
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",

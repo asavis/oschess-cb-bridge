@@ -1,12 +1,17 @@
-//! What the bridge asks of the computer for the work it does in the
+//! What the bridge asks of the computer. For the work it does in the
 //! background (#149): the priority of a thread, whether the computer runs on
-//! battery, and the free space of a disk. Only Windows answers. Elsewhere a
-//! thread keeps its priority, the computer is taken as running on mains
-//! power, and the free space as unknown, which no build waits for.
+//! battery, and the free space of a disk. Only Windows answers these.
+//! Elsewhere a thread keeps its priority, the computer is taken as running on
+//! mains power, and the free space as unknown, which no build waits for. For
+//! the engine (#58): its logical processors and physical memory, which set
+//! the engine's defaults and what an analysis may ask of it. Windows and Linux
+//! give the memory; elsewhere it is unknown.
 
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::OnceLock;
+
+use crate::engine::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB};
 
 /// The priority a thread runs at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,7 +20,7 @@ pub enum Priority {
     #[default]
     Normal = 0,
     /// Work a request waits for, below the browser the answer goes to, as
-    /// the engine's process runs (`engine.rs`).
+    /// the engine's process runs (`engine/uci.rs`).
     BelowNormal = 1,
     /// Work nothing waits for, in Windows's background mode, which lowers the
     /// thread's processor, disk and memory priority.
@@ -184,6 +189,49 @@ impl Machine for System {
     }
 }
 
+/// The engine's `Threads` when the configuration names none: all logical
+/// processors but two.
+pub(crate) fn default_threads() -> u32 {
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+    u32::try_from(n.saturating_sub(2)).unwrap_or(u32::MAX).max(1)
+}
+
+/// The engine's `Hash` when the configuration names none: [`DEFAULT_HASH_MB`]
+/// capped at a quarter of the physical memory.
+pub(crate) fn default_hash_mb() -> u32 {
+    match os::physical_memory_mb() {
+        Some(total) => DEFAULT_HASH_MB.min(u32::try_from(total / 4).unwrap_or(u32::MAX)).max(16),
+        None => DEFAULT_HASH_MB,
+    }
+}
+
+/// What an analysis on this computer may ask the engine for (#58).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_threads: u32,
+    pub max_hash_mb: u32,
+}
+
+/// This computer's [`Limits`]: its logical processors, and the largest power
+/// of two at or below half its physical memory, from [`MIN_HASH_MB`] to
+/// [`MAX_HASH_MB`].
+pub fn limits() -> Limits {
+    static LIMITS: OnceLock<Limits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Limits {
+            max_threads: u32::try_from(threads).unwrap_or(u32::MAX).max(1),
+            max_hash_mb: max_hash_mb(os::physical_memory_mb()),
+        }
+    })
+}
+
+fn max_hash_mb(total_mb: Option<u64>) -> u32 {
+    let half = total_mb.map_or(u64::from(DEFAULT_HASH_MB), |t| t / 2);
+    let half = half.clamp(u64::from(MIN_HASH_MB), u64::from(MAX_HASH_MB));
+    1 << (u64::BITS - 1 - half.leading_zeros())
+}
+
 #[cfg(windows)]
 mod os {
     use std::os::windows::ffi::OsStrExt;
@@ -191,6 +239,7 @@ mod os {
 
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
         THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
@@ -232,6 +281,13 @@ mod os {
         let ok = unsafe { GetDiskFreeSpaceExW(name.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
         (ok != 0).then_some(free)
     }
+
+    pub fn physical_memory_mb() -> Option<u64> {
+        let mut status =
+            MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..unsafe { std::mem::zeroed() } };
+        // SAFETY: `status` is a valid MEMORYSTATUSEX with its length set, as the call requires.
+        (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.ullTotalPhys >> 20)
+    }
 }
 
 #[cfg(not(windows))]
@@ -248,6 +304,13 @@ mod os {
 
     pub fn free_bytes(_: &Path) -> Option<u64> {
         None
+    }
+
+    pub fn physical_memory_mb() -> Option<u64> {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 =
+            info.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().strip_suffix("kB")?.trim().parse().ok()?;
+        Some(kb >> 10)
     }
 }
 
@@ -379,6 +442,17 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn the_largest_hash_is_a_power_of_two_within_half_the_memory() {
+        assert_eq!(max_hash_mb(Some(16 * 1024)), 8192);
+        assert_eq!(max_hash_mb(Some(12 * 1024)), 4096);
+        assert_eq!(max_hash_mb(Some(1024 * 1024)), MAX_HASH_MB);
+        assert_eq!(max_hash_mb(Some(8)), MIN_HASH_MB);
+        assert_eq!(max_hash_mb(None), DEFAULT_HASH_MB);
+        let l = limits();
+        assert!(l.max_threads >= 1 && l.max_hash_mb.is_power_of_two());
     }
 
     /// The free space is asked of the nearest folder that exists.
