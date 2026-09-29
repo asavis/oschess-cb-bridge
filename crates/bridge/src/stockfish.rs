@@ -71,7 +71,7 @@ impl Build {
 
     /// The folder this build installs into, in the data folder `data`.
     pub fn dir(&self, data: &Path) -> PathBuf {
-        data.join("engines").join(format!("stockfish-{}", self.version))
+        folder(data, self.version)
     }
 
     /// The installed executable.
@@ -124,6 +124,20 @@ pub trait Transport: Sync {
     fn download(&self, url: &str, to: &Path, max_size: u64) -> Result<(), String>;
     /// Unpacks `members` of the zip archive `zip` under `to`, keeping their paths.
     fn extract(&self, zip: &Path, members: &[String], to: &Path) -> Result<(), String>;
+}
+
+/// The folder the build of `version` installs into, in the data folder
+/// `data`: `engines\stockfish-<version>`, as [`crate::engines::find`] lists it.
+fn folder(data: &Path, version: &str) -> PathBuf {
+    data.join("engines").join(format!("stockfish-{version}"))
+}
+
+/// The licence of the build of `version` the bridge installed in the data
+/// folder `data`. `None` when `version` is not digits and dots, so that a
+/// version the settings window sends names no other file.
+pub fn licence(data: &Path, version: &str) -> Option<PathBuf> {
+    let valid = !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    valid.then(|| folder(data, version).join(LICENCE))
 }
 
 /// Whether `build` is installed in the data folder `data`: its executable and
@@ -387,6 +401,22 @@ mod tests {
         );
         assert_eq!(seen.first(), Some(&Progress::Downloading { done: 0, total: 11 }));
         assert!(seen.ends_with(&[Progress::Checking, Progress::Unpacking]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A version finds the licence installed beside its build, and text that
+    /// is not a version finds nothing.
+    #[test]
+    fn finds_a_licence_by_its_version_only() {
+        let dir = data("licence");
+        install(&dir, &TEST_BUILD, &fake(b"hello world"), &mut |_| {}).unwrap();
+        let path = licence(&dir, TEST_BUILD.version).unwrap();
+        assert_eq!(path, TEST_BUILD.dir(&dir).join(LICENCE));
+        assert_eq!(std::fs::read(&path).unwrap(), b"GPL");
+        assert_eq!(licence(&dir, "17.1"), Some(dir.join("engines").join("stockfish-17.1").join(LICENCE)));
+        for bad in ["", "19/../..", "../19", r"19\..", "/19", "19 ", "dev"] {
+            assert_eq!(licence(&dir, bad), None, "{bad:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
