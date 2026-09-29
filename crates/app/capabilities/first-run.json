@@ -1,12 +1,21 @@
 {
   "identifier": "first-run",
-  "description": "The first-run window: shows and copies the pairing code, opens oschess with it, follows the bridge's state to say when oschess connected, and closes itself.",
+  "description": "The first-run wizard: the databases and folders, the engine and its Stockfish install, autostart and updates, then the pairing code, opening oschess with it, following the bridge's state to say when oschess connected, and closing itself.",
   "windows": ["first-run"],
   "permissions": [
     "core:window:allow-close",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-view",
+    "allow-settings",
+    "allow-add-folder",
+    "allow-remove-database",
+    "allow-engines",
+    "allow-choose-engine",
+    "allow-pick-engine",
+    "allow-install-stockfish",
+    "allow-set-autostart",
+    "allow-set-auto-update",
     "allow-pairing-code",
     "allow-copy-code",
     "allow-open-pairing"

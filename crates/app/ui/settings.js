@@ -36,16 +36,9 @@ function show(section) {
 }
 
 function renderServed(view) {
-  const rows = view.databases.map((db) => {
-    const line = stateLine(db);
-    const name = el('div', 'path', db.name);
-    name.title = db.name;
-    return el('div', 'row', icon('db', 20), el('div', 'text', name, line ? el('div', 'cap12', line) : null),
-      progressBar(db), stateChip(db));
-  });
+  const rows = view.databases.map(databaseRow);
   if (view.problem) {
-    const { title, body } = problemText(view.problem);
-    rows.unshift(el('div', 'row', icon('alert', 20), el('div', 'text', el('div', null, title), el('div', 'cap12', body))));
+    rows.unshift(problemRow(view.problem));
   } else if (!rows.length) {
     rows.push(el('div', 'row empty-row', t('settings.served.none')));
   }
@@ -68,14 +61,9 @@ function renderSettings(settings) {
   if (settings.autostartBlocked) document.getElementById('autostart-state').textContent = t('settings.autostart.blocked');
   toggle('auto-update', settings.autoUpdate);
   const rows = settings.extras.map((extra) => {
-    const detail = !extra.present
-      ? t('settings.folders.missing')
-      : extra.folder ? plural('settings.folders.count', extra.databases ?? 0) : t('settings.folders.file');
-    const path = el('div', 'path selectable', extra.path);
-    path.title = extra.path;
     const remove = el('button', 'btn', t('settings.folders.remove'));
     remove.addEventListener('click', () => act(call('remove_database', { path: extra.path }).then(renderSettings)));
-    return el('div', 'row', icon(extra.folder ? 'folder' : 'db', 20), el('div', 'text', path, el('div', 'cap12', detail)), remove);
+    return extraRow(extra, remove);
   });
   if (!rows.length) rows.push(el('div', 'row empty-row', t('settings.folders.none')));
   document.getElementById('folders').replaceChildren(...rows);
@@ -289,14 +277,6 @@ function notice(text) {
 
 function act(promise) {
   return promise.catch((error) => notice(failure(error)));
-}
-
-// A failure in words, translated here only. The app answers every failure
-// with the dictionary key of its message and the values it names; anything
-// else, such as an error of this script, is shown inside the general message.
-function failure(error) {
-  if (typeof error?.key === 'string') return t(error.key, error.values);
-  return t('settings.error', { message: error });
 }
 
 main();

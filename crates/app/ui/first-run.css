@@ -1,18 +1,62 @@
-.first-run { padding: 18px 32px 28px; display: flex; flex-direction: column; gap: 18px; }
-.hero { display: flex; align-items: center; gap: 16px; }
-.hero .tile { width: 56px; height: 56px; border-radius: 12px; }
-h1 { font-size: 24px; font-weight: 600; line-height: 30px; margin: 0 0 2px; }
+/* The first-run wizard: a header, the three steps, the step's page, which
+   scrolls, and the buttons along the bottom. Over settings.css, whose cards
+   the steps reuse. */
+body { flex-direction: column; }
+.head { display: flex; align-items: center; gap: 14px; padding: 16px 32px 14px; flex: none; }
+.head .tile { width: 40px; height: 40px; }
+.head h1 { font-size: 18px; line-height: 24px; margin: 0 0 2px; }
+
+.steps { display: flex; align-items: center; gap: 10px; margin: 0; padding: 0 32px 16px; list-style: none; flex: none; }
+.steps li { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg2); white-space: nowrap; }
+.steps li + li::before { content: ""; width: 48px; height: 1px; background: var(--stroke-control); margin-right: 2px; }
+.steps b {
+  width: 24px;
+  height: 24px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid #9a9a9a;
+  background: #fff;
+  color: var(--fg2);
+}
+.steps [aria-current="step"] { color: var(--fg); font-weight: 600; }
+.steps [aria-current="step"] b { background: var(--accent); border-color: var(--accent); color: #fff; }
+.steps .done { color: var(--fg); }
+.steps .done b { background: var(--accent-soft); border-color: #f3d0b9; color: var(--accent-text); }
+
+.body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 32px 20px; }
+h2 { font-size: 20px; font-weight: 600; line-height: 28px; margin: 0 0 4px; }
+.sub { margin: 16px 0 8px; }
 .strong { font-weight: 600; }
-.opening { padding: 14px 16px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); display: flex; align-items: center; gap: 12px; color: var(--accent); }
+.grow { flex: 1; }
+.actions { display: flex; gap: 8px; margin-top: 14px; }
+#install-hint { margin-top: 10px; }
+.progress { margin-top: 14px; padding: 12px 14px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); }
+.progress .bar { margin: 10px 0 8px; }
+.progress-line { display: flex; align-items: center; gap: 10px; }
+.progress-line svg { color: var(--accent); }
+.more { color: var(--fg2); font-size: 12px; min-height: 40px; padding-left: 50px; }
+/* No extra folder yet: the «add» row is the card's only row. */
+#folders:empty + .row { border-top: 0; }
+#summary .row > svg:last-child { color: var(--ok); }
+#summary .row > svg.warn { color: var(--warn); }
+#autostart-blocked { margin: 10px 2px 0; }
+
+.opening { margin-top: 16px; padding: 14px 16px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); display: flex; align-items: center; gap: 12px; color: var(--accent); }
 .opening .strong { color: var(--fg); }
 .opening .cap12 { margin-top: 2px; }
 .opening.connected { color: var(--ok); }
-.actions { display: flex; gap: 8px; }
-hr { width: 100%; height: 1px; border: 0; margin: 0; background: var(--stroke); }
+details { margin-top: 16px; }
 summary { display: flex; align-items: center; gap: 8px; font-weight: 600; list-style: none; cursor: default; }
 summary::-webkit-details-marker { display: none; }
 summary svg { transition: transform .15s; transform: rotate(-90deg); }
 details[open] summary svg { transform: none; }
-.hint { margin: 6px 0 10px 22px; line-height: 18px; }
-.code-line { margin-left: 22px; display: flex; gap: 8px; align-items: center; }
-.code-line .field { flex: 1; font-size: 13px; white-space: nowrap; overflow: hidden; }
+.hint { margin: 6px 0 0 22px; line-height: 18px; }
+details .code-line { margin-left: 22px; }
+
+.btn.quiet:disabled { color: var(--fg3); }
+.foot { flex: none; height: 64px; display: flex; align-items: center; gap: 8px; padding: 0 24px; background: var(--layer); border-top: 1px solid var(--stroke); }
+#note { margin-right: 8px; }

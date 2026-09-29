@@ -1,5 +1,5 @@
 //! The app's three windows: the status flyout by the tray, the settings
-//! window and the first-run window. Each page is a file in `ui/`, told its
+//! window and the first-run wizard. Each page is a file in `ui/`, told its
 //! language by a `lang` parameter.
 //!
 //! Every window is built by [`spawn_window`], on a worker thread. On Windows,
@@ -163,13 +163,14 @@ pub fn open_settings(app: &AppHandle, section: &str) {
     spawn_window(app, spec);
 }
 
+/// Opens the first-run wizard (#201): its steps, then the pairing screen.
 pub fn open_first_run(app: &AppHandle) {
     let spec = Spec {
         label: FIRST_RUN,
         page: "first-run",
         query: String::new(),
         title: shared(app).strings.get("window.firstRun").to_string(),
-        configure: |b| b.inner_size(620.0, 420.0).resizable(false).maximizable(false).minimizable(false).center(),
+        configure: |b| b.inner_size(760.0, 720.0).resizable(false).maximizable(false).minimizable(false).center(),
     };
     spawn_window(app, spec);
 }

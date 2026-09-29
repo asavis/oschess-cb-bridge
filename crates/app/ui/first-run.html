@@ -4,38 +4,143 @@
   <meta charset="utf-8">
   <title data-i18n="window.firstRun">oschess міст</title>
   <link rel="stylesheet" href="common.css">
+  <!-- The steps are the settings window's cards: its rows, engines and code line. -->
+  <link rel="stylesheet" href="settings.css">
   <link rel="stylesheet" href="first-run.css">
   <script src="common.js" defer></script>
   <script src="first-run.js" defer></script>
 </head>
 <body>
-  <main class="first-run">
-    <header class="hero">
-      <span class="tile"><img src="img/logo.svg" width="44" height="44" alt=""></span>
-      <div>
-        <h1 data-i18n="firstRun.title">Міст встановлено</h1>
-        <div class="muted" data-i18n="firstRun.subtitle"></div>
+  <header class="head">
+    <span class="tile"><img src="img/logo.svg" width="31" height="31" alt=""></span>
+    <div>
+      <h1 id="title" data-i18n="wizard.title"></h1>
+      <div class="cap12" id="subtitle" data-i18n="wizard.subtitle"></div>
+    </div>
+  </header>
+
+  <ol class="steps">
+    <li data-step="databases"><b>1</b><span data-i18n="wizard.step.databases"></span></li>
+    <li data-step="engine"><b>2</b><span data-i18n="wizard.step.engine"></span></li>
+    <li data-step="startup"><b>3</b><span data-i18n="wizard.step.startup"></span></li>
+  </ol>
+
+  <main class="body">
+    <section id="databases" hidden>
+      <h2 data-i18n="settings.databases.title"></h2>
+      <p class="intro" id="db-lead" data-i18n="wizard.databases.lead"></p>
+      <div id="db-found">
+        <div class="lbl sub" data-i18n="settings.served.title"></div>
+        <div class="cards" id="served"></div>
       </div>
-    </header>
-    <section class="opening" id="opening">
-      <div>
-        <div class="strong" id="opening-title" data-i18n="firstRun.opening.title"></div>
-        <div class="cap12" id="opening-hint" data-i18n="firstRun.opening.hint"></div>
+      <div class="cards" id="db-none" hidden>
+        <div class="row top" data-icon="db">
+          <div class="text">
+            <div class="strong" data-i18n="wizard.databases.none.title"></div>
+            <div class="cap12" data-i18n="wizard.databases.none.hint"></div>
+          </div>
+        </div>
+      </div>
+      <div class="lbl sub" data-i18n="settings.folders.title"></div>
+      <div class="cards">
+        <div id="folders"></div>
+        <div class="row end">
+          <span class="cap12 grow" data-i18n="wizard.databases.addHint"></span>
+          <button class="btn" id="add-folder"><span data-i18n="settings.folders.add"></span></button>
+        </div>
       </div>
     </section>
-    <div class="actions">
-      <button class="btn accent" id="open"><span data-i18n="firstRun.open"></span></button>
-      <button class="btn" id="close" data-i18n="firstRun.close"></button>
-    </div>
-    <hr>
-    <details open>
-      <summary><span data-i18n="firstRun.manual.title"></span></summary>
-      <p class="cap12 hint" data-i18n="firstRun.manual.hint"></p>
-      <div class="code-line">
-        <span class="field mono selectable" id="code"></span>
-        <button class="btn" id="copy"><span data-i18n="firstRun.copy"></span></button>
+
+    <section id="engine" hidden>
+      <h2 data-i18n="settings.engine.title"></h2>
+      <p class="intro" data-i18n="settings.engine.intro"></p>
+      <div class="cards" id="engine-none" hidden>
+        <div class="row top" data-icon="cpu">
+          <div class="text">
+            <div class="strong" data-i18n="settings.engine.none.title"></div>
+            <div class="cap12" data-i18n="settings.engine.none.hint"></div>
+            <div class="actions">
+              <button class="btn accent" id="install-stockfish"><span data-i18n="settings.engine.install"></span></button>
+              <button class="btn" id="pick-other"><span data-i18n="settings.engine.pick"></span></button>
+            </div>
+            <div class="cap12" id="install-hint"></div>
+            <div class="progress" id="install-progress" hidden>
+              <div class="progress-line"><span id="install-text"></span></div>
+              <div class="bar"><i id="install-bar"></i></div>
+              <div class="cap12" data-i18n="wizard.engine.verify"></div>
+            </div>
+          </div>
+        </div>
       </div>
-    </details>
+      <div id="engine-found">
+        <div class="lbl sub" data-i18n="settings.engine.found.hint"></div>
+        <div class="cards">
+          <div id="engines" role="radiogroup" data-i18n-label="settings.engine.found.title"></div>
+          <div class="row" data-icon="file">
+            <div class="text">
+              <div data-i18n="settings.engine.other.title"></div>
+              <div class="cap12" data-i18n="settings.engine.other.hint"></div>
+            </div>
+            <button class="btn" id="pick-engine"><span data-i18n="settings.engine.pick"></span></button>
+          </div>
+        </div>
+      </div>
+      <div class="cap12 checking" id="engine-checking" role="status" hidden><span data-i18n="settings.engine.checking"></span></div>
+    </section>
+
+    <section id="startup" hidden>
+      <h2 data-i18n="wizard.step.startup"></h2>
+      <p class="intro" data-i18n="wizard.startup.lead"></p>
+      <div class="cards">
+        <div class="row" data-icon="power">
+          <div class="text">
+            <div data-i18n="settings.autostart.title"></div>
+            <div class="cap12" data-i18n="wizard.startup.autostartHint"></div>
+          </div>
+          <span class="cap12" id="autostart-state"></span>
+          <button class="tog" id="autostart" role="switch" aria-checked="false" data-i18n-label="settings.autostart.title"><i></i></button>
+        </div>
+        <div class="row" data-icon="refresh">
+          <div class="text">
+            <div data-i18n="settings.autoUpdate.title"></div>
+            <div class="cap12" id="auto-update-hint"></div>
+          </div>
+          <span class="cap12" id="auto-update-state"></span>
+          <button class="tog" id="auto-update" role="switch" aria-checked="false" data-i18n-label="settings.autoUpdate.title"><i></i></button>
+        </div>
+      </div>
+      <div class="warning cap12" id="autostart-blocked" hidden><span data-i18n="settings.autostart.blockedHint"></span></div>
+    </section>
+
+    <section id="done" hidden>
+      <div class="cards" id="summary"></div>
+      <div class="opening" id="opening">
+        <div>
+          <div class="strong" id="opening-title" data-i18n="firstRun.opening.title"></div>
+          <div class="cap12" id="opening-hint" data-i18n="firstRun.opening.hint"></div>
+        </div>
+      </div>
+      <details open>
+        <summary><span data-i18n="firstRun.manual.title"></span></summary>
+        <p class="cap12 hint" data-i18n="firstRun.manual.hint"></p>
+        <div class="code-line">
+          <span class="field mono selectable" id="code"></span>
+          <button class="btn" id="copy"><span data-i18n="firstRun.copy"></span></button>
+        </div>
+      </details>
+    </section>
   </main>
+
+  <footer class="foot">
+    <button class="btn quiet" id="skip" data-i18n="wizard.skip"></button>
+    <span class="grow"></span>
+    <span class="cap12" id="note"></span>
+    <button class="btn" id="back" data-i18n="wizard.back"></button>
+    <button class="btn accent" id="next"></button>
+    <button class="btn" id="close" data-i18n="firstRun.close" hidden></button>
+    <button class="btn accent" id="open" hidden><span data-i18n="firstRun.open"></span></button>
+  </footer>
+
+  <p class="notice" id="notice" role="status" hidden></p>
 </body>
 </html>

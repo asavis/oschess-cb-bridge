@@ -47,10 +47,11 @@ pub struct Flyout {
 /// A started bridge, and what the start should show.
 pub struct Started {
     pub shared: Shared,
-    /// No token existed: the first-run window opens.
+    /// No token existed: the first-run wizard opens, and it opens the pairing
+    /// link on its last screen, not while the user is on its steps (#201).
     pub first_run: bool,
-    /// Browsers must pair again (the first run, a new code or a new port): the
-    /// pairing link opens, which pairs the default browser at once.
+    /// Browsers must pair again after a new code or a new port: the pairing
+    /// link opens, which pairs the default browser at once.
     pub pair: bool,
 }
 
@@ -82,7 +83,7 @@ impl Shared {
         let asked =
             running.is_some() && dir.as_ref().is_some_and(|d| std::fs::remove_file(d.join(PAIR_ON_START)).is_ok());
         let shared = Shared { strings, dir, running, view: Mutex::new(view), flyout: Mutex::default() };
-        Started { shared, first_run, pair: first_run || asked }
+        Started { shared, first_run, pair: asked }
     }
 
     /// The state now: the serving bridge's snapshot, or why it does not serve.

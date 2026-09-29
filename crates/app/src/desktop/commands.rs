@@ -8,7 +8,7 @@ use bridge::engines::{self, Roots};
 use bridge::stockfish::{self, Build};
 use bridge::{config, engine, token};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
@@ -107,13 +107,11 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
     })
 }
 
-/// Asks for a folder and adds it; `None` when the user cancelled.
+/// Asks for a folder, over the window that asked, and adds it; `None` when
+/// the user cancelled.
 #[tauri::command]
-pub async fn add_folder(app: AppHandle) -> Answer<Option<SettingsView>> {
-    let mut dialog = app.dialog().file().set_title(shared(&app).strings.get("settings.folders.add"));
-    if let Some(window) = app.get_webview_window(windows::SETTINGS) {
-        dialog = dialog.set_parent(&window);
-    }
+pub async fn add_folder(app: AppHandle, window: WebviewWindow) -> Answer<Option<SettingsView>> {
+    let dialog = app.dialog().file().set_title(shared(&app).strings.get("settings.folders.add")).set_parent(&window);
     let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_folder()).await.map_err(text)?;
     let Some(folder) = picked else { return Ok(None) };
     let folder = folder.into_path().map_err(text)?;
@@ -160,20 +158,20 @@ pub(super) fn installing() -> bool {
 
 /// Installs the official Stockfish pinned in this release, then chooses it
 /// unless another engine was chosen meanwhile ([`Choices::install`]). The
-/// progress goes to the settings window as `stockfish-progress` events. A
-/// failed installation answers why, in English, inside the message that
-/// Stockfish was not installed.
+/// progress goes to the window that asked, the settings or the first-run
+/// wizard, as `stockfish-progress` events. A failed installation answers why,
+/// in English, inside the message that Stockfish was not installed.
 #[tauri::command]
-pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
+pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<EnginesView> {
     let failed = |message: String| Failure::with("settings.engine.installFailed", message);
     let data = shared(&app).dir().map_err(failed)?;
     let config_path = shared(&app).config_path().map_err(failed)?;
-    let window = app.clone();
+    let label = window.label().to_string();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let install = || {
             let build = Build::for_arch(stockfish::machine_arch());
             stockfish::install(&data, build, &stockfish::System, &mut |progress| {
-                let _ = window.emit_to(windows::SETTINGS, "stockfish-progress", InstallProgress::from(progress));
+                let _ = window.emit_to(label.as_str(), "stockfish-progress", InstallProgress::from(progress));
             })
         };
         CHOICES.install(&config_path, install, |exe| engine::probe(exe).map(drop)).map(drop)
@@ -221,20 +219,19 @@ pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> 
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
-/// Asks for an engine's executable; `None` when the user cancelled. The page
-/// then chooses it with [`choose_engine`], showing that it is being checked
-/// (#73): a slow engine start must not look like a hung window.
+/// Asks for an engine's executable, over the window that asked; `None` when
+/// the user cancelled. The page then chooses it with [`choose_engine`],
+/// showing that it is being checked (#73): a slow engine start must not look
+/// like a hung window.
 #[tauri::command]
-pub async fn pick_engine(app: AppHandle) -> Answer<Option<String>> {
+pub async fn pick_engine(app: AppHandle, window: WebviewWindow) -> Answer<Option<String>> {
     let strings = &shared(&app).strings;
-    let mut dialog = app
+    let dialog = app
         .dialog()
         .file()
         .set_title(strings.get("settings.engine.pick"))
-        .add_filter(strings.get("settings.engine.filter"), &["exe"]);
-    if let Some(window) = app.get_webview_window(windows::SETTINGS) {
-        dialog = dialog.set_parent(&window);
-    }
+        .add_filter(strings.get("settings.engine.filter"), &["exe"])
+        .set_parent(&window);
     let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_file()).await.map_err(text)?;
     let Some(file) = picked else { return Ok(None) };
     let path = file.into_path().map_err(text)?;
