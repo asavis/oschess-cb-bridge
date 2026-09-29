@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
 
+use super::file::Bad;
 use super::format::Outcome;
 
 /// One game passing through one position, in 16 bytes: the key, the game and
@@ -248,25 +249,41 @@ pub struct Room {
 impl Room {
     /// Reserves as much of it as the budget has free now: fewer workers, by
     /// halves, then less room, by halves down to `least`; when not even one
-    /// worker and `least` are free, waits for them as [`reserve`] waits. A
-    /// build yields to searches that hold the budget by taking fewer workers
-    /// and running more passes. Returns the hold, the workers and the room.
+    /// worker and `least` are free, waits for them as [`reserve`] waits, then
+    /// takes what more is free by then. A build yields to searches that hold
+    /// the budget by taking fewer workers and running more passes, never by
+    /// taking less than `least`. Returns the hold, the workers and the room.
     pub fn reserve(&self, progress: &Progress) -> Result<(Hold, usize, usize), SearchError> {
         let mut workers = self.workers.max(1);
-        loop {
-            if let Ok(mut hold) = Hold::reserve_quietly(self.fixed + workers * self.each + self.least) {
-                let mut more = self.room.saturating_sub(self.least);
-                while more > 0 && hold.grow_quietly(more).is_err() {
-                    more /= 2;
-                }
-                return Ok((hold, workers, self.least + more));
+        let mut hold = loop {
+            if let Ok(hold) = Hold::reserve_quietly(self.fixed + workers * self.each + self.least) {
+                break hold;
             }
             if workers == 1 {
-                break;
+                break reserve(self.fixed + self.each + self.least, progress)?;
             }
             workers /= 2;
+        };
+        let mut more = self.room.saturating_sub(self.least);
+        while more > 0 && hold.grow_quietly(more).is_err() {
+            more /= 2;
         }
-        Ok((reserve(self.fixed + self.each + self.least, progress)?, 1, self.least))
+        Ok((hold, workers, self.least + more))
+    }
+}
+
+/// Opens with `open` a file the build wrote, whose tables it holds in the
+/// budget: while searches hold the budget, waits for them as [`reserve`]
+/// waits, rather than fail the build `Busy` at once.
+pub fn opened<T>(progress: &Progress, open: impl Fn() -> Result<T, Bad>) -> Result<T, Bad> {
+    let deadline = Instant::now() + MEMORY_WAIT;
+    loop {
+        match open() {
+            Err(Bad::Busy) if Instant::now() < deadline && !progress.stop.load(Ordering::Relaxed) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            other => return other,
+        }
     }
 }
 

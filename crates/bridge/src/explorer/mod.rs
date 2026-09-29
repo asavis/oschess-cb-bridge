@@ -37,7 +37,7 @@ use crate::search::SearchError;
 use build::Plan;
 use file::{Bad, IndexFile};
 use format::{MAX_PLY, PRUNE_PLY, Stats};
-use runs::{Limits, Progress, Timings};
+use runs::{Limits, Progress, Timings, opened};
 use source::Source;
 use stream::Stream;
 
@@ -372,8 +372,8 @@ fn index(
     let _ = std::fs::remove_dir_all(dir.join(format!("{id}.build")));
     let plan = Plan { first: 1, last: count, generation };
     let header = build::build_with(db, &plan, &path, progress, limits).map_err(Failure::Build)?;
-    let file = IndexFile::open(&path).map_err(Failure::Open)?;
-    let stream = Stream::open(&moves).map_err(Failure::Open)?;
+    let file = opened(progress, || IndexFile::open(&path)).map_err(Failure::Open)?;
+    let stream = opened(progress, || Stream::open(&moves)).map_err(Failure::Open)?;
     if stream.header.build_id != header.build_id || file.header.build_id != header.build_id {
         return Err(Failure::Open(Bad::Corrupt("another build's files")));
     }

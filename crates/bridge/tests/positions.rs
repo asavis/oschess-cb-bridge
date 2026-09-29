@@ -556,8 +556,11 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     let d4 = board_after("d2d4").fen();
     let named = ask(d4.clone(), "&stream=tab");
     assert!(held.arrived(1, Duration::from_secs(30)));
-    let other = ask(d4.clone(), "&stream=other");
-    let unnamed = ask(d4.clone(), "");
+    // In orders of their own: the result of either, kept once it is found,
+    // would answer the named one before it looks at a game, and so before it
+    // could stop.
+    let other = ask(d4.clone(), "&stream=other&sort=white");
+    let unnamed = ask(d4.clone(), "&sort=number-desc");
     assert!(held.arrived(3, Duration::from_secs(30)));
     // The newest in the stream is answered at once: only three are held.
     let (status, body) = get(port, &list(&id, &board_after("e2e4").fen(), "&stream=tab"));

@@ -36,7 +36,7 @@ use super::file::{Bad, write_at};
 use super::format::{
     DEEP_BLOCK_BITS, HEADER_LEN, Header, MAX_PLY, PRUNE_PLY, deep_bits, deep_bucket, part_bits, part_of,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, io, reserve};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, io, opened, reserve};
 use super::source::{Line, Source, Workspace};
 use super::stream::{self, BATCH, Stream};
 use super::tree::{self, Shallow};
@@ -88,7 +88,7 @@ fn build_in(
     writer.finish(plan.generation, build_id)?;
     // The build reads back the stream it has written, mapped, from the
     // operating system's file cache, which holds it outside the budget.
-    let stream = Stream::open(&moves_partial).map_err(|e| from_bad(&moves_partial, e))?;
+    let stream = opened(progress, || Stream::open(&moves_partial)).map_err(|e| from_bad(&moves_partial, e))?;
     progress.time(|t| t.reading = started.elapsed());
     let share = limits.share.checked_sub(counted.bytes).ok_or(SearchError::TooLarge)?;
     let mut out = Out::create(&partial)?;
@@ -200,7 +200,8 @@ fn read_games(
     let batches = total.div_ceil(BATCH as u64);
     // Half the workers at most, and no more than the share holds with their
     // read buffers, their part of the stream and their counts; then each a
-    // room for its folded entries from what the share has beside them.
+    // room for its folded entries from what the share has beside them, no
+    // larger than the entries all the games add, of a few positions each.
     let reading = Workspace::BYTES + stream::WORKER_BYTES + bytes;
     let fit = limits.share.saturating_sub(bytes) / reading;
     if fit == 0 {
@@ -209,6 +210,8 @@ fn read_games(
     let want = threads().div_ceil(2).min(batches as usize).min(fit).max(1);
     let spare = limits.share.saturating_sub(bytes + want * reading) / want;
     let room = (spare / ENTRY_BYTES).saturating_sub(tree::FOLD_ENTRIES).min(tree::SHALLOW_ENTRIES);
+    let added = usize::try_from(total * (u64::from(tree::SHALLOW_PLY) + 1)).unwrap_or(usize::MAX);
+    let room = room.min(added.max(tree::MIN_SHALLOW_ENTRIES));
     let room = room.min(limits.pass_bytes.unwrap_or(usize::MAX) / ENTRY_BYTES);
     let next = AtomicU64::new(0);
     // Set once a worker's folded entries no longer fit its room, or when it
