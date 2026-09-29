@@ -553,10 +553,12 @@ not be built. A FEN that is not a valid position is `400 bad_request` naming
 `total: 0` and no rows.
 
 The first window of a position reached by more than twelve games within its
-first 20 plies replays the first plies of the games that can reach it, some
-tens of milliseconds for the Mega Database; the result is kept with the latest
-searches, so the next windows of the same position, sort and `q` are read from
-it.
+first 20 plies replays the first plies of the games that can reach it. On the
+Mega Database a first window of 200 rows sorted by date took about 65 ms for
+the start position (11,957,416 games) and 25-30 ms at plies 6 to 20, and a
+position beyond ply 20 about 4 ms. The result is kept with the latest searches,
+so the next windows of the same position, sort and `q` are read from it, in
+about 2 ms.
 
 ### `GET /v1/databases/{id}/games/{number}`
 
