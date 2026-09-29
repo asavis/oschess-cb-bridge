@@ -68,8 +68,12 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
         StoreStep::Tell { mandatory } => {
             let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
             if told.is_none_or(|was| mandatory && !was) {
-                let title = if mandatory { "toast.update.required.title" } else { "toast.update.waiting.title" };
-                super::updater::notify(app, strings.get(title).to_string(), strings.get("toast.update.waiting.body"));
+                let title = if mandatory {
+                    strings.get("toast.update.required.title")
+                } else {
+                    strings.get("toast.update.waiting.title")
+                };
+                super::updater::notify(app, title.to_string(), strings.get("toast.update.waiting.body"));
                 *told = Some(mandatory);
             }
             Ok(())

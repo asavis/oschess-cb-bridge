@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bridge::engines::{self, Roots};
-use bridge::stockfish::{self, Build, Progress};
+use bridge::stockfish::{self, Build};
 use bridge::{config, engine, token};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -16,9 +16,9 @@ use tauri_plugin_opener::OpenerExt;
 use super::autostart::{self, State};
 use super::server::{self, Pairing};
 use super::{SharedState, channel, shared, tray, updater, windows};
-use crate::choices::{self, Choices};
+use crate::choices::{self, Choices, EnginesView, InstallProgress};
 use crate::prefs;
-use crate::settings::{self, Extra};
+use crate::settings::{self, Extra, Failure};
 use crate::status::View;
 
 /// What the settings window shows beside the databases.
@@ -39,48 +39,9 @@ pub struct SettingsView {
     store: bool,
 }
 
-/// What the engine section shows: the engines found and the one chosen, the
-/// official build the bridge can install, and whether to offer it instead.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnginesView {
-    /// The engine `bridge.toml` names, if any.
-    chosen: Option<String>,
-    found: Vec<FoundEngine>,
-    install: Installable,
-    /// The chosen engine's name when it is an older Stockfish and the offer
-    /// was not put off for this bridge version.
-    offer_for: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Installable {
-    version: &'static str,
-    megabytes: u64,
-}
-
-/// An installation's progress, for the settings window.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InstallProgress {
-    phase: &'static str,
-    done: u64,
-    total: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FoundEngine {
-    name: String,
-    path: String,
-    source: &'static str,
-    /// For a build the bridge installed: its version, whose licence the
-    /// window can open.
-    version: Option<String>,
-}
-
-type Answer<T> = Result<T, String>;
+/// A command's answer; a failure goes to the window as a dictionary key and
+/// its values ([`Failure`]).
+type Answer<T> = Result<T, Failure>;
 
 fn text<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -168,7 +129,7 @@ pub fn remove_database(app: AppHandle, path: String) -> Answer<SettingsView> {
 
 /// Writes the settings `change` makes to `bridge.toml`, under the lock every
 /// change of it takes (`config::update`).
-fn change_config(app: &AppHandle, change: impl FnOnce(&config::Config) -> config::Config) -> Answer<()> {
+fn change_config(app: &AppHandle, change: impl FnOnce(&config::Config) -> config::Config) -> Result<(), String> {
     config::update(&shared(app).config_path()?, change).map(drop)
 }
 
@@ -185,22 +146,7 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     let data = shared.dir()?;
     let roots = Roots { bridge_data: Some(data.clone()), ..Roots::system() };
     let found = engines::find(&roots);
-    let offer_for = choices::offer_for(&data, config.engine.as_deref(), &found, env!("CARGO_PKG_VERSION"));
-    let build = Build::for_arch(stockfish::machine_arch());
-    Ok(EnginesView {
-        chosen: config.engine.map(|p| p.to_string_lossy().into_owned()),
-        found: found
-            .into_iter()
-            .map(|f| FoundEngine {
-                name: f.name,
-                path: f.path.to_string_lossy().into_owned(),
-                source: f.source,
-                version: f.version,
-            })
-            .collect(),
-        install: Installable { version: build.version, megabytes: build.megabytes() },
-        offer_for,
-    })
+    Ok(EnginesView::new(&data, config.engine.as_deref(), found, env!("CARGO_PKG_VERSION")))
 }
 
 /// The engine choices and Stockfish installations, in the order
@@ -215,28 +161,27 @@ pub(super) fn installing() -> bool {
 /// Installs the official Stockfish pinned in this release, then chooses it
 /// unless another engine was chosen meanwhile ([`Choices::install`]). The
 /// progress goes to the settings window as `stockfish-progress` events. A
-/// failure answers why, in English, for the window to show.
+/// failed installation answers why, in English, inside the message that
+/// Stockfish was not installed.
 #[tauri::command]
 pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
-    let data = shared(&app).dir()?;
-    let config_path = shared(&app).config_path()?;
+    let failed = |message: String| Failure::with("settings.engine.installFailed", message);
+    let data = shared(&app).dir().map_err(failed)?;
+    let config_path = shared(&app).config_path().map_err(failed)?;
     let window = app.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let install = || {
             let build = Build::for_arch(stockfish::machine_arch());
             stockfish::install(&data, build, &stockfish::System, &mut |progress| {
-                let (phase, done, total) = match progress {
-                    Progress::Downloading { done, total } => ("downloading", done, total),
-                    Progress::Checking => ("checking", 0, 0),
-                    Progress::Unpacking => ("unpacking", 0, 0),
-                };
-                let _ = window.emit_to(windows::SETTINGS, "stockfish-progress", InstallProgress { phase, done, total });
+                let _ = window.emit_to(windows::SETTINGS, "stockfish-progress", InstallProgress::from(progress));
             })
         };
         CHOICES.install(&config_path, install, |exe| engine::probe(exe).map(drop)).map(drop)
     })
     .await
-    .map_err(text)??;
+    .map_err(text)
+    .and_then(|installed| installed)
+    .map_err(failed)?;
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
@@ -244,11 +189,12 @@ pub async fn install_stockfish(app: AppHandle) -> Answer<EnginesView> {
 /// version is taken from the window; the path is the bridge's own.
 #[tauri::command]
 pub fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
-    let licence = stockfish::licence(&shared(&app).dir()?, &version).ok_or("not a Stockfish version")?;
+    let licence =
+        stockfish::licence(&shared(&app).dir()?, &version).ok_or_else(|| "not a Stockfish version".to_string())?;
     if !licence.is_file() {
-        return Err(format!("{} is missing", licence.display()));
+        return Err(format!("{} is missing", licence.display()).into());
     }
-    app.opener().open_path(licence.to_string_lossy(), None::<&str>).map_err(text)
+    Ok(app.opener().open_path(licence.to_string_lossy(), None::<&str>).map_err(text)?)
 }
 
 /// Puts off the Stockfish offer until the next bridge version.
@@ -259,15 +205,15 @@ pub async fn dismiss_stockfish_offer(app: AppHandle) -> Answer<EnginesView> {
 }
 
 /// Chooses the engine at `path` once it answers as a UCI engine. A file that
-/// does not is refused with the dictionary key of the message. The bridge
-/// follows `bridge.toml`, so the running engine stops and the new one serves
-/// the next analysis.
+/// does not is refused with its own message. The bridge follows
+/// `bridge.toml`, so the running engine stops and the new one serves the next
+/// analysis.
 #[tauri::command]
 pub async fn choose_engine(app: AppHandle, path: String) -> Answer<EnginesView> {
     let program = PathBuf::from(path);
     let config_path = shared(&app).config_path()?;
     tauri::async_runtime::spawn_blocking(move || -> Answer<()> {
-        let probe = |p: &Path| engine::probe(p).map(drop).map_err(|_| "settings.engine.refused".to_string());
+        let probe = |p: &Path| engine::probe(p).map(drop).map_err(|_| Failure::new("settings.engine.refused"));
         CHOICES.choose(&config_path, program, probe)
     })
     .await
@@ -304,7 +250,7 @@ pub async fn set_autostart(app: AppHandle, on: bool) -> Answer<SettingsView> {
 
 /// Turns starting with Windows on or off, moves the menu's tick with it, and
 /// answers where it stands.
-pub fn switch_autostart(app: &AppHandle, on: bool) -> Answer<State> {
+pub fn switch_autostart(app: &AppHandle, on: bool) -> Result<State, String> {
     let result = autostart::set(app, on);
     tray::show_autostart(app, autostart::state(app) == State::On);
     result
@@ -325,13 +271,13 @@ pub fn check_updates(app: AppHandle) {
 
 #[tauri::command]
 pub fn pairing_code(shared: SharedState<'_>) -> Answer<Pairing> {
-    shared.pairing()
+    Ok(shared.pairing()?)
 }
 
 #[tauri::command]
 pub fn copy_code(app: AppHandle) -> Answer<()> {
     let code = shared(&app).pairing()?.code;
-    app.clipboard().write_text(code).map_err(text)
+    Ok(app.clipboard().write_text(code).map_err(text)?)
 }
 
 /// Makes a new pairing code and restarts the bridge with it: the running
@@ -347,11 +293,10 @@ pub fn new_code(app: AppHandle) -> Answer<()> {
 }
 
 /// Saves a new port and restarts the bridge on it, which then opens the
-/// pairing link. An invalid port is refused with the dictionary key of the
-/// message.
+/// pairing link. An invalid port is refused with its own message.
 #[tauri::command]
 pub fn set_port(app: AppHandle, port: String) -> Answer<()> {
-    let port = settings::parse_port(&port).ok_or("settings.port.error")?;
+    let port = settings::parse_port(&port).ok_or(Failure::new("settings.port.error"))?;
     change_config(&app, |c| config::Config { port, ..c.clone() })?;
     // A paired browser looks for the old port; the pairing link carries the new one.
     server::pair_on_next_start(&shared(&app).dir()?)?;

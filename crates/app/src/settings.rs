@@ -1,10 +1,40 @@
 //! What the settings window shows and changes in `bridge.toml`: the databases
-//! and folders added to ChessBase's own list, and the port.
+//! and folders added to ChessBase's own list, and the port. Also how its
+//! commands fail.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bridge::config::Config;
 use serde::Serialize;
+
+/// A command's failure, in the one shape the settings window translates: the
+/// dictionary key of its message and the values the message names
+/// (`failure` in `settings.js`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Failure {
+    pub key: &'static str,
+    pub values: BTreeMap<&'static str, String>,
+}
+
+impl Failure {
+    /// The message of `key`, which names no values.
+    pub const fn new(key: &'static str) -> Failure {
+        Failure { key, values: BTreeMap::new() }
+    }
+
+    /// The message of `key` around `message`, the app's own text in English.
+    pub fn with(key: &'static str, message: String) -> Failure {
+        Failure { key, values: BTreeMap::from([("message", message)]) }
+    }
+}
+
+/// Any other failure: its English text, inside the general message.
+impl From<String> for Failure {
+    fn from(message: String) -> Failure {
+        Failure::with("settings.error", message)
+    }
+}
 
 /// A database file or a folder of databases added in the settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -95,6 +125,26 @@ mod tests {
         {
             assert_eq!(parse_port(bad), None, "{bad:?}");
         }
+    }
+
+    /// Every failure reaches the window as a key and its values: a refusal
+    /// by its own message, anything else as English text inside the general
+    /// one (#186).
+    #[test]
+    fn failures_come_in_one_shape() {
+        let json = |f: Failure| serde_json::to_value(f).unwrap();
+        assert_eq!(
+            json(Failure::new("settings.port.error")),
+            serde_json::json!({ "key": "settings.port.error", "values": {} })
+        );
+        assert_eq!(
+            json(Failure::with("settings.engine.installFailed", "no uciok".into())),
+            serde_json::json!({ "key": "settings.engine.installFailed", "values": { "message": "no uciok" } })
+        );
+        assert_eq!(
+            json(Failure::from("bridge.toml: access denied".to_string())),
+            serde_json::json!({ "key": "settings.error", "values": { "message": "bridge.toml: access denied" } })
+        );
     }
 
     #[test]

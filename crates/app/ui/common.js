@@ -44,18 +44,12 @@ function bytes(n) {
   return gb >= 1 ? t('size.gb', { n: number(gb, 1) }) : t('size.mb', { n: number(Math.max(n / 2 ** 20, 0.1), 1) });
 }
 
-// A download's or a PGN file's read whole percent, never 100 before the last byte.
-function percent(progress) {
-  if (progress.present >= progress.total) return 100;
-  return Math.min(99, Math.floor((progress.present * 100) / progress.total));
-}
-
 // The bar of a download or of a PGN file being read, or nothing when it has
-// no progress yet.
+// no progress yet. The app computes the percent.
 function progressBar(db) {
   if ((db.state !== 'downloading' && db.state !== 'opening') || !db.progress) return null;
   const fill = el('i');
-  fill.style.width = `${percent(db.progress)}%`;
+  fill.style.width = `${db.progress.percent}%`;
   return el('div', 'bar', fill);
 }
 
@@ -129,9 +123,9 @@ function stateChip(db) {
     case 'ready': return chip('ready', 'check', t('db.chip.ready'));
     case 'cloudOnly': return chip('cloudOnly', 'cloud', t('db.chip.cloudOnly'));
     case 'downloading':
-      return chip('downloading', 'cloudDown', db.progress ? t('db.percent', { n: percent(db.progress) }) : t('db.chip.downloading'));
+      return chip('downloading', 'cloudDown', db.progress ? t('db.percent', { n: db.progress.percent }) : t('db.chip.downloading'));
     case 'opening':
-      return chip('neutral', 'spin', db.progress ? t('db.percent', { n: percent(db.progress) }) : t('db.chip.opening'));
+      return chip('neutral', 'spin', db.progress ? t('db.percent', { n: db.progress.percent }) : t('db.chip.opening'));
     case 'missing': return chip('neutral', 'alert', t('db.chip.missing'));
     case 'unreadable': return chip('bad', 'alert', t('db.chip.unreadable'));
     case 'unsupported': return chip('neutral', 'file', t('db.chip.unsupported'));
