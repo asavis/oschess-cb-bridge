@@ -1,36 +1,18 @@
 //! Classic databases through the HTTP API: listed, searched and served like
 //! 2CBH ones, and answering as a 2CBH copy of the same content answers.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use bridge::store::MAX_GAME_BYTES;
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
 use chesscore::Board;
 
 mod common;
-use common::{classic_fixture, fixture, get, policy, serve};
-
-/// Serves `paths`, with the indexes in `index_dir` as in a data folder.
-fn start(paths: &[PathBuf], index_dir: &Path) -> u16 {
-    let app = App::new("test", policy(), Catalog::new(paths.to_vec()));
-    app.catalog.use_data_dir(index_dir);
-    serve(app)
-}
-
-/// A body without its `"generation":"…"` member, which differs between copies.
-fn without_generation(body: &str) -> String {
-    match body.find(r#""generation":""#) {
-        Some(at) => {
-            let end = at + 14 + body[at + 14..].find('"').unwrap() + 1;
-            let end = if body[end..].starts_with(',') { end + 1 } else { end };
-            format!("{}{}", &body[..at], &body[end..])
-        }
-        None => body.to_string(),
-    }
-}
+use common::{
+    classic_fixture, fixture, get, has_members, has_object, member, object_with, start_with_dir, without_generation,
+};
 
 fn index_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bridge-classic-{}-{name}", std::process::id()));
@@ -46,13 +28,14 @@ fn a_classic_copy_answers_as_its_2cbh_copy() {
     let (f2, fc) = (fixture("classic-api-2cbh", &[]), classic_fixture("classic-api-cbh", &[]));
     let (p2, pc) = (f2.dir().join("db.2cbh"), fc.dir().join("db.cbh"));
     let dir = index_dir("copies");
-    let port = start(&[pc.clone(), p2.clone()], &dir);
+    let (port, _app) = start_with_dir([pc.clone(), p2.clone()], &dir);
     let (ic, i2) = (id_of(&pc), id_of(&p2));
 
     let (status, body) = get(port, "/v1/databases");
     assert_eq!(status, 200);
-    let listed = format!(r#""id":"{ic}","name":"db","format":"cbh","state":"ready","records":10,"generation":""#);
-    assert!(body.contains(&listed), "{body}");
+    let listed = format!(r#""id":"{ic}","name":"db","format":"cbh","state":"ready","records":10"#);
+    let listed = object_with(&body, &listed).unwrap_or_else(|| panic!("{body}"));
+    assert!(member(listed, "generation").starts_with('"'), "{listed}");
     assert!(get(port, "/v1/status").1.contains(r#""ready":2"#));
 
     let both = |path: &str| {
@@ -84,7 +67,7 @@ fn a_classic_copy_answers_as_its_2cbh_copy() {
     }
     // The guiding text: its title as the event, and no game fields.
     let (_, row) = both("/v1/databases/{id}/games?offset=7&limit=1");
-    assert!(row.contains(r#""number":8,"kind":"text","white":"","#) && row.contains(r#""event":"London""#), "{row}");
+    assert!(has_object(&row, r#""number":8,"kind":"text","white":"","event":"London""#), "{row}");
     assert_eq!(both("/v1/databases/{id}/games/8").0, 422);
     assert_eq!(both("/v1/databases/{id}/games/11").0, 404);
     for number in [1, 3, 5, 9, 10] {
@@ -106,7 +89,7 @@ fn a_classic_copy_answers_as_its_2cbh_copy() {
     }
     let (_, body) = get(port, &format!("/v1/databases/{ic}/explorer?fen={start_fen}"));
     // Games 1-7 and 10: not the guiding text, and not the deleted game.
-    assert!(body.contains(r#""index":{"records":10,"games":8}"#), "{body}");
+    assert!(has_members(&body, r#""index":{"records":10,"games":8}"#), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -129,7 +112,7 @@ fn classic_games_are_rendered_within_the_limits() {
     let f = b.write("classic-api-limits");
     let path = f.dir().join("db.cbh");
     let dir = index_dir("limits");
-    let port = start(std::slice::from_ref(&path), &dir);
+    let (port, _app) = start_with_dir([path.clone()], &dir);
     let id = id_of(&path);
 
     let (status, body) = get(port, &format!("/v1/databases/{id}/games/1?lang=en"));

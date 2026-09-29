@@ -1,7 +1,7 @@
-//! What the test files share: a bridge served on a free port and the
-//! requests a test sends it, and the fixture of `docs/search-grammar.md`,
-//! written as a 2CBH database and as a classic one with the same content.
-//! Each test file uses a part of it.
+//! What the test files share: a bridge served on a free port, the requests a
+//! test sends it and the reading of its answers, and the fixture of
+//! `docs/search-grammar.md`, written as a 2CBH database, as a classic one and
+//! as a PGN file with the same content. Each test file uses a part of it.
 //!
 //! The search memory budget (`search::memory`), the answer budget
 //! (`budget`) and the search workers (`search::workers`) are one per
@@ -14,12 +14,15 @@
 //! else, a test asserts on its own holds only.
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
+use bridge::catalog::Catalog;
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record};
@@ -42,6 +45,25 @@ pub fn policy() -> Policy {
 /// policy's port set to that one; the port.
 pub fn serve(app: App) -> u16 {
     serve_shared(app).0
+}
+
+/// The app of a test's bridge serving the databases at `paths`, with
+/// [`policy`] and no engine.
+pub fn app_of(paths: impl IntoIterator<Item = PathBuf>) -> App {
+    App::new("test", policy(), Catalog::new(paths))
+}
+
+/// Serves the databases at `paths` as [`serve_shared`] does, with their
+/// indexes in `dir` as in a data folder.
+pub fn start_with_dir(paths: impl IntoIterator<Item = PathBuf>, dir: &Path) -> (u16, Arc<App>) {
+    serve_with_dir(app_of(paths), dir)
+}
+
+/// Serves `app` as [`serve_shared`] does, with its indexes in `dir` as in a
+/// data folder.
+pub fn serve_with_dir(app: App, dir: &Path) -> (u16, Arc<App>) {
+    app.catalog.use_data_dir(dir);
+    serve_shared(app)
 }
 
 /// [`serve`], and the app served, for a test that asks it things as it serves.
@@ -88,14 +110,72 @@ pub fn request(port: u16, path: &str) -> String {
     )
 }
 
+/// How long a test waits for the rest of an answer before it fails. Longer
+/// than any answer of these tests takes on a loaded machine, it turns a bridge
+/// that stops answering, or never closes a connection, into a failure that
+/// names the request instead of a run that hangs.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A connection to the bridge on `port` whose reads fail after
+/// [`ANSWER_TIMEOUT`] without a byte.
+pub fn connect(port: u16) -> std::io::Result<TcpStream> {
+    let s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+    Ok(s)
+}
+
 /// Sends `raw` on a new connection and reads the whole answer, head and body;
-/// `None` when the connection is refused or cut.
+/// `None` when the connection is refused or cut. An answer that stops for
+/// [`ANSWER_TIMEOUT`] before the connection ends fails the test.
 pub fn exchange(port: u16, raw: &str) -> Option<String> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let mut s = connect(port).ok()?;
     s.write_all(raw.as_bytes()).ok()?;
-    let mut out = String::new();
-    s.read_to_string(&mut out).ok()?;
-    Some(out)
+    let mut out = Vec::new();
+    match s.read_to_end(&mut out) {
+        Ok(_) => String::from_utf8(out).ok(),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => panic!(
+            "no end of the answer to {:?} within {ANSWER_TIMEOUT:?}: {}",
+            raw.lines().next().unwrap_or_default(),
+            String::from_utf8_lossy(&out)
+        ),
+        Err(_) => None,
+    }
+}
+
+/// An answer: its status, its header lines and its body.
+pub struct Reply {
+    pub status: u16,
+    pub headers: String,
+    pub body: String,
+}
+
+impl Reply {
+    /// The value of header `name`, in whatever case the answer writes it.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.lines().find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+}
+
+/// The [`Reply`] of a whole answer; `None` when its head is cut short.
+pub fn parse_reply(text: &str) -> Option<Reply> {
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    let (status_line, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    let status = status_line.split(' ').nth(1)?.parse().ok()?;
+    Some(Reply { status, headers: headers.to_string(), body: body.to_string() })
+}
+
+/// Sends `raw` on a new connection: its answer.
+pub fn send(port: u16, raw: &str) -> Reply {
+    let out = exchange(port, raw).expect("the bridge answers");
+    parse_reply(&out).unwrap_or_else(|| panic!("not an answer: {out}"))
+}
+
+/// The answer to [`request`]`(port, path)`, with its headers.
+pub fn get_reply(port: u16, path: &str) -> Reply {
+    send(port, &request(port, path))
 }
 
 /// The status and body of [`request`]`(port, path)`.
@@ -106,9 +186,177 @@ pub fn get(port: u16, path: &str) -> (u16, String) {
 /// [`get`], or `None` when the connection is refused or cut: during a start,
 /// the port may belong to another test's bridge that has just ended.
 pub fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
-    let out = exchange(port, &request(port, path))?;
-    let status = out.split(' ').nth(1)?.parse().ok()?;
-    Some((status, out.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default()))
+    let reply = parse_reply(&exchange(port, &request(port, path))?)?;
+    Some((reply.status, reply.body))
+}
+
+/// A body without its `"generation":"…"` member, which differs between copies
+/// of a database.
+pub fn without_generation(body: &str) -> String {
+    match body.find(r#""generation":""#) {
+        Some(at) => {
+            let end = at + 14 + body[at + 14..].find('"').unwrap() + 1;
+            let end = if body[end..].starts_with(',') { end + 1 } else { end };
+            format!("{}{}", &body[..at], &body[end..])
+        }
+        None => body.to_string(),
+    }
+}
+
+/// The length of the JSON value `text` starts with: a string, an object or an
+/// array to its closing mark, any other value to the `,`, `}` or `]` after it.
+/// The bridge writes JSON without spaces.
+fn value_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    match bytes.first() {
+        Some(b'"') => {
+            let mut at = 1;
+            while bytes[at] != b'"' {
+                at += if bytes[at] == b'\\' { 2 } else { 1 };
+            }
+            at + 1
+        }
+        Some(b'{' | b'[') => {
+            let (mut depth, mut at) = (0, 0);
+            loop {
+                match bytes[at] {
+                    b'"' => {
+                        at += value_len(&text[at..]);
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return at + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+        }
+        _ => text.find([',', '}', ']']).unwrap_or(text.len()),
+    }
+}
+
+/// The values between the brackets `open` and `close` that `text` is, each
+/// as written, with its key when `keyed`.
+fn items(text: &str, open: char, close: char, keyed: bool) -> Vec<(&str, &str)> {
+    let mut rest = text.strip_prefix(open).unwrap_or_else(|| panic!("not {open}…{close}: {text}"));
+    let mut out = Vec::new();
+    if rest.starts_with(close) {
+        return out;
+    }
+    loop {
+        let mut key = "";
+        if keyed {
+            let len = value_len(rest);
+            assert!(rest.starts_with('"') && rest[len..].starts_with(':'), "no key at {rest}");
+            key = &rest[1..len - 1];
+            rest = &rest[len + 1..];
+        }
+        let len = value_len(rest);
+        out.push((key, &rest[..len]));
+        rest = &rest[len..];
+        match rest.chars().next() {
+            Some(',') => rest = &rest[1..],
+            Some(c) if c == close => return out,
+            _ => panic!("no {close} closes {text}"),
+        }
+    }
+}
+
+/// The members of the JSON object `object`: each key, as written between its
+/// quotes, and its value, as written.
+pub fn members(object: &str) -> Vec<(&str, &str)> {
+    items(object, '{', '}', true)
+}
+
+/// The value of member `key` of the JSON object `object`, as written: a
+/// string with its quotes.
+pub fn member<'a>(object: &'a str, key: &str) -> &'a str {
+    find_member(object, key).unwrap_or_else(|| panic!("no {key} in {object}"))
+}
+
+fn find_member<'a>(object: &'a str, key: &str) -> Option<&'a str> {
+    members(object).into_iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// The text of the string member `key` of the JSON object `object`, its
+/// escapes as written.
+pub fn string_member<'a>(object: &'a str, key: &str) -> &'a str {
+    let value = member(object, key);
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{key} is no string in {object}"))
+}
+
+/// The objects of the array member `key` of the JSON object `object`, each as
+/// its text.
+pub fn objects<'a>(object: &'a str, key: &str) -> Vec<&'a str> {
+    items(member(object, key), '[', ']', false).into_iter().map(|(_, v)| v).collect()
+}
+
+/// Whether the JSON value `actual` matches `expected`: an object has each
+/// member of `expected` with a matching value, whatever their order and
+/// whatever other members it has; an array has as many elements, each
+/// matching; any other value is written alike.
+fn matches(actual: &str, expected: &str) -> bool {
+    match expected.as_bytes().first() {
+        Some(b'{') => {
+            actual.starts_with('{')
+                && members(expected).iter().all(|(k, v)| find_member(actual, k).is_some_and(|a| matches(a, v)))
+        }
+        Some(b'[') => {
+            let expected = items(expected, '[', ']', false);
+            actual.starts_with('[') && {
+                let actual = items(actual, '[', ']', false);
+                actual.len() == expected.len() && actual.iter().zip(&expected).all(|(a, e)| matches(a.1, e.1))
+            }
+        }
+        _ => actual == expected,
+    }
+}
+
+/// Whether the JSON object `object` has `wanted`, members as JSON writes them
+/// (`"state":"ready","records":3`), each with its value, whatever their order
+/// and whatever other members it has: an answer of `docs/api.md` may gain
+/// members. A value that is an object is matched by its members the same way,
+/// an array element by element.
+pub fn has_members(object: &str, wanted: &str) -> bool {
+    matches(object, &format!("{{{wanted}}}"))
+}
+
+/// The first object of the JSON text `json`, itself or one at any depth in
+/// it, that has `wanted` as [`has_members`] reads them.
+pub fn object_with<'a>(json: &'a str, wanted: &str) -> Option<&'a str> {
+    let wanted = format!("{{{wanted}}}");
+    let mut at = 0;
+    while at < json.len() {
+        match json.as_bytes()[at] {
+            b'"' => {
+                at += value_len(&json[at..]);
+                continue;
+            }
+            b'{' => {
+                let object = &json[at..at + value_len(&json[at..])];
+                if matches(object, &wanted) {
+                    return Some(object);
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Whether an object of the JSON text `json` has `wanted`: see
+/// [`object_with`].
+pub fn has_object(json: &str, wanted: &str) -> bool {
+    object_with(json, wanted).is_some()
 }
 
 pub const DOC: &str = include_str!("../../../../docs/search-grammar.md");
@@ -229,63 +477,166 @@ pub fn rows(extra: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// [`fixture`] of `rows` in its form.
-pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
-    let (mut players, mut tournaments, mut titles) = (Names::default(), Names::default(), Names::default());
-    let mut b = Builder::new();
-    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
-    for (i, line) in rows.iter().enumerate() {
+/// A row of the fixture's form, its columns as the document's `fixture` block
+/// names them.
+#[derive(Clone, Copy)]
+pub struct FixtureRow<'a> {
+    pub number: usize,
+    /// `game`, `text` (a guiding text), `analysis` or `deleted` (a game
+    /// marked deleted).
+    pub kind: &'a str,
+    /// A name, `Last, First`; `-` for none, as for `black` and `annotator`.
+    pub white: &'a str,
+    pub black: &'a str,
+    /// A game's event; the title of a guiding text or an analysis.
+    pub event: &'a str,
+    /// As PGN writes it, `??` for an unknown part.
+    pub date: &'a str,
+    /// `5`, `1(2)` with a sub-round, `-` for none.
+    pub round: &'a str,
+    pub result: &'a str,
+    /// `C52`, `-` for none.
+    pub eco: &'a str,
+    /// Full moves.
+    pub moves: u16,
+    /// 0 when unknown.
+    pub white_elo: u16,
+    pub black_elo: u16,
+    pub annotator: &'a str,
+}
+
+impl<'a> FixtureRow<'a> {
+    pub fn parse(line: &'a str) -> FixtureRow<'a> {
         let f: Vec<&str> = line.split('|').map(str::trim).collect();
-        assert_eq!(f[0].parse::<usize>().unwrap(), i + 1, "fixture rows are numbered in order");
-        let rec = b.game(e4);
-        let (white, black, annotator) = (players.id(f[2]), players.id(f[3]), players.id(f[12]));
-        let ids: &[(usize, i64)] = match f[1] {
-            "text" => {
-                rec[0] |= 2;
-                &[(0x20, annotator), (0x28, titles.id(f[4]))]
-            }
-            "analysis" => {
-                rec[2] = 2;
-                &[(0x18, titles.id(f[4])), (0x28, annotator)]
-            }
-            kind => {
-                if kind == "deleted" {
-                    rec[0] |= 0x80;
-                }
-                &[(0x18, white), (0x20, black), (0x28, tournaments.id(f[4])), (0x30, annotator)]
-            }
-        };
-        for &(at, id) in ids {
-            put(rec, at, &id.to_le_bytes());
+        assert_eq!(f.len(), 13, "a fixture row has 13 columns: {line}");
+        FixtureRow {
+            number: f[0].parse().unwrap(),
+            kind: f[1],
+            white: f[2],
+            black: f[3],
+            event: f[4],
+            date: f[5],
+            round: f[6],
+            result: f[7],
+            eco: f[8],
+            moves: f[9].parse().unwrap(),
+            white_elo: f[10].parse().unwrap(),
+            black_elo: f[11].parse().unwrap(),
+            annotator: f[12],
         }
-        if f[1] == "text" || f[1] == "analysis" {
-            continue;
-        }
-        let date: Vec<i32> = f[5].split('.').map(|p| p.parse().unwrap_or(0)).collect();
-        put(rec, 0xbc, &((date[0] << 9) | (date[1] << 5) | date[2]).to_le_bytes());
-        let (round, sub): (i16, i16) = match f[6] {
+    }
+
+    /// The date as both ChessBase formats pack it: the year from bit 9, the
+    /// month from bit 5 and the day, each 0 when unknown.
+    pub fn packed_date(&self) -> u32 {
+        let d: Vec<u32> = self.date.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        (d[0] << 9) | (d[1] << 5) | d[2]
+    }
+
+    /// The round and the sub-round, 0 for none.
+    pub fn round_numbers(&self) -> (u16, u16) {
+        match self.round {
             "-" => (0, 0),
             r => match r.split_once('(') {
                 Some((r, s)) => (r.parse().unwrap(), s.trim_end_matches(')').parse().unwrap()),
                 None => (r.parse().unwrap(), 0),
             },
-        };
-        put(rec, 0x5a, &round.to_le_bytes());
-        put(rec, 0x5c, &sub.to_le_bytes());
-        rec[0x58] = match f[7] {
+        }
+    }
+
+    /// The result as both ChessBase formats store it.
+    pub fn result_code(&self) -> u8 {
+        match self.result {
             "0-1" => 0,
             "1/2-1/2" => 1,
             "1-0" => 2,
             _ => 3,
-        };
-        let eco = match f[8].as_bytes() {
+        }
+    }
+
+    /// The ECO code as both ChessBase formats store it: 128 times its place
+    /// from A00, which is 1; 0 for none.
+    pub fn eco_code(&self) -> u16 {
+        match self.eco.as_bytes() {
             [l, d1, d2] => (u16::from(l - b'A') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0') + 1) * 128,
             _ => 0,
+        }
+    }
+}
+
+/// The row in its form, as [`FixtureRow::parse`] reads it.
+impl std::fmt::Display for FixtureRow<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self;
+        write!(
+            f,
+            "{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}",
+            r.number,
+            r.kind,
+            r.white,
+            r.black,
+            r.event,
+            r.date,
+            r.round,
+            r.result,
+            r.eco,
+            r.moves,
+            r.white_elo,
+            r.black_elo,
+            r.annotator
+        )
+    }
+}
+
+/// `rows` parsed, which are numbered in order from 1, as the records of a
+/// database are.
+fn numbered(rows: &[String]) -> Vec<FixtureRow<'_>> {
+    let parsed: Vec<FixtureRow> = rows.iter().map(|l| FixtureRow::parse(l)).collect();
+    for (i, row) in parsed.iter().enumerate() {
+        assert_eq!(row.number, i + 1, "fixture rows are numbered in order");
+    }
+    parsed
+}
+
+/// [`fixture`] of `rows` in its form.
+pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
+    let (mut players, mut tournaments, mut titles) = (Names::default(), Names::default(), Names::default());
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    for row in numbered(rows) {
+        let rec = b.game(e4);
+        let (white, black, annotator) = (players.id(row.white), players.id(row.black), players.id(row.annotator));
+        let ids: &[(usize, i64)] = match row.kind {
+            "text" => {
+                rec[0] |= 2;
+                &[(0x20, annotator), (0x28, titles.id(row.event))]
+            }
+            "analysis" => {
+                rec[2] = 2;
+                &[(0x18, titles.id(row.event)), (0x28, annotator)]
+            }
+            kind => {
+                if kind == "deleted" {
+                    rec[0] |= 0x80;
+                }
+                &[(0x18, white), (0x20, black), (0x28, tournaments.id(row.event)), (0x30, annotator)]
+            }
         };
-        put(rec, 0x80, &eco.to_le_bytes());
-        put(rec, 0x8a, &f[9].parse::<i16>().unwrap().to_le_bytes());
-        put(rec, 0x60, &f[10].parse::<i16>().unwrap().to_le_bytes());
-        put(rec, 0x70, &f[11].parse::<i16>().unwrap().to_le_bytes());
+        for &(at, id) in ids {
+            put(rec, at, &id.to_le_bytes());
+        }
+        if row.kind == "text" || row.kind == "analysis" {
+            continue;
+        }
+        put(rec, 0xbc, &row.packed_date().to_le_bytes());
+        let (round, sub) = row.round_numbers();
+        put(rec, 0x5a, &round.to_le_bytes());
+        put(rec, 0x5c, &sub.to_le_bytes());
+        rec[0x58] = row.result_code();
+        put(rec, 0x80, &row.eco_code().to_le_bytes());
+        put(rec, 0x8a, &row.moves.to_le_bytes());
+        put(rec, 0x60, &row.white_elo.to_le_bytes());
+        put(rec, 0x70, &row.black_elo.to_le_bytes());
     }
     b.lid(lid(&players.0, &tournaments.0, &titles.0));
     b.write(name)
@@ -296,21 +647,22 @@ pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
 /// then knights back and forth. A PGN file holds games only.
 pub fn pgn_fixture(name: &str, rows: &[String]) -> TempDb {
     let mut text = String::new();
-    for line in rows {
-        let f: Vec<&str> = line.split('|').map(str::trim).collect();
-        assert_eq!(f[1], "game", "a PGN file holds games only");
-        let round = f[6].replace('(', ".").replace(')', "");
+    for row in rows.iter().map(|l| FixtureRow::parse(l)) {
+        assert_eq!(row.kind, "game", "a PGN file holds games only");
+        let round = row.round.replace('(', ".").replace(')', "");
+        let elo = |elo: u16| if elo == 0 { "-".to_string() } else { elo.to_string() };
+        let (white_elo, black_elo) = (elo(row.white_elo), elo(row.black_elo));
         let tags = [
-            ("Event", f[4]),
-            ("Date", f[5]),
+            ("Event", row.event),
+            ("Date", row.date),
             ("Round", round.as_str()),
-            ("White", f[2]),
-            ("Black", f[3]),
-            ("Result", f[7]),
-            ("ECO", f[8]),
-            ("WhiteElo", if f[10] == "0" { "-" } else { f[10] }),
-            ("BlackElo", if f[11] == "0" { "-" } else { f[11] }),
-            ("Annotator", f[12]),
+            ("White", row.white),
+            ("Black", row.black),
+            ("Result", row.result),
+            ("ECO", row.eco),
+            ("WhiteElo", white_elo.as_str()),
+            ("BlackElo", black_elo.as_str()),
+            ("Annotator", row.annotator),
         ];
         for (tag, value) in tags {
             if value != "-" {
@@ -318,7 +670,7 @@ pub fn pgn_fixture(name: &str, rows: &[String]) -> TempDb {
             }
         }
         text.push('\n');
-        let moves: usize = f[9].parse().unwrap();
+        let moves = usize::from(row.moves);
         for ply in 0..(2 * moves).saturating_sub(1) {
             let san = match ply {
                 0 => "e4",
@@ -331,7 +683,7 @@ pub fn pgn_fixture(name: &str, rows: &[String]) -> TempDb {
             text.push_str(san);
             text.push(' ');
         }
-        text.push_str(f[7]);
+        text.push_str(row.result);
         text.push_str("\n\n");
     }
     cbformat::fixture::pgn_file(name, text.as_bytes())
@@ -346,49 +698,32 @@ pub fn classic_fixture(name: &str, extra: &[&str]) -> TempDb {
     let mut b = fixture_cbh::Builder::new();
     let e4 = move_record(0, None, None, &encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
     let mut ids = ClassicIds::default();
-    let rows = block("fixture").into_iter().filter(|l| !l.starts_with('#')).chain(extra.iter().copied());
-    for (i, line) in rows.enumerate() {
-        let f: Vec<&str> = line.split('|').map(str::trim).collect();
-        assert_eq!(f[0].parse::<usize>().unwrap(), i + 1, "fixture rows are numbered in order");
-        let annotator = ids.annotator(&mut b, f[12]);
-        if f[1] == "text" {
-            put3(b.text(&[(0, f[4].as_bytes())]), 0x0d, annotator);
+    let rows = rows(extra);
+    for row in numbered(&rows) {
+        let annotator = ids.annotator(&mut b, row.annotator);
+        if row.kind == "text" {
+            put3(b.text(&[(0, row.event.as_bytes())]), 0x0d, annotator);
             continue;
         }
-        assert_ne!(f[1], "analysis", "the classic format has no analyses");
-        let (white, black, event) = (ids.player(&mut b, f[2]), ids.player(&mut b, f[3]), ids.tournament(&mut b, f[4]));
+        assert_ne!(row.kind, "analysis", "the classic format has no analyses");
+        let (white, black) = (ids.player(&mut b, row.white), ids.player(&mut b, row.black));
+        let event = ids.tournament(&mut b, row.event);
         let rec = b.game(&e4);
-        if f[1] == "deleted" {
+        if row.kind == "deleted" {
             rec[0] |= 0x80;
         }
         for (at, id) in [(0x09, white), (0x0c, black), (0x0f, event), (0x12, annotator)] {
             put3(rec, at, id);
         }
-        let date: Vec<u32> = f[5].split('.').map(|p| p.parse().unwrap_or(0)).collect();
-        put3(rec, 0x18, (date[0] << 9) | (date[1] << 5) | date[2]);
-        let (round, sub): (u8, u8) = match f[6] {
-            "-" => (0, 0),
-            r => match r.split_once('(') {
-                Some((r, s)) => (r.parse().unwrap(), s.trim_end_matches(')').parse().unwrap()),
-                None => (r.parse().unwrap(), 0),
-            },
-        };
-        rec[0x1d] = round;
-        rec[0x1e] = sub;
-        rec[0x1b] = match f[7] {
-            "0-1" => 0,
-            "1/2-1/2" => 1,
-            "1-0" => 2,
-            _ => 3,
-        };
-        let eco = match f[8].as_bytes() {
-            [l, d1, d2] => (u16::from(l - b'A') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0') + 1) * 128,
-            _ => 0,
-        };
-        rec[0x23..0x25].copy_from_slice(&eco.to_be_bytes());
-        rec[0x2d] = f[9].parse().unwrap();
-        rec[0x1f..0x21].copy_from_slice(&f[10].parse::<u16>().unwrap().to_be_bytes());
-        rec[0x21..0x23].copy_from_slice(&f[11].parse::<u16>().unwrap().to_be_bytes());
+        put3(rec, 0x18, row.packed_date());
+        let (round, sub) = row.round_numbers();
+        rec[0x1d] = u8::try_from(round).unwrap();
+        rec[0x1e] = u8::try_from(sub).unwrap();
+        rec[0x1b] = row.result_code();
+        rec[0x23..0x25].copy_from_slice(&row.eco_code().to_be_bytes());
+        rec[0x2d] = u8::try_from(row.moves).unwrap();
+        rec[0x1f..0x21].copy_from_slice(&row.white_elo.to_be_bytes());
+        rec[0x21..0x23].copy_from_slice(&row.black_elo.to_be_bytes());
     }
     b.write(name)
 }

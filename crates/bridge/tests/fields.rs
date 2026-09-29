@@ -2,15 +2,12 @@
 //! them (#68): the game list's row, what a search matches, and the served
 //! PGN's tag, which writes `?` where the list shows nothing.
 
-use std::path::PathBuf;
-
-use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{get, policy, serve};
+use common::{app_of, get, member, objects, serve, string_member};
 
 /// A date (year, month, day, 0 unknown), an ECO field as stored, and a round
 /// and sub-round as 2CBH stores them, signed.
@@ -42,10 +39,6 @@ fn database(name: &str) -> TempDb {
     b.write(name)
 }
 
-fn start(paths: Vec<PathBuf>) -> u16 {
-    serve(App::new("test", policy(), Catalog::new(paths)))
-}
-
 /// The body of a `200` answer to `GET path`.
 fn get_ok(port: u16, path: &str) -> String {
     let (status, body) = get(port, path);
@@ -53,35 +46,29 @@ fn get_ok(port: u16, path: &str) -> String {
     body
 }
 
-/// A string member `"key":"…"` of a JSON text, or a `[Key \"…\"]` tag of a
-/// PGN inside one.
-fn member<'a>(text: &'a str, key: &str) -> &'a str {
-    let at = text.find(&format!(r#""{key}":""#)).unwrap_or_else(|| panic!("no {key} in {text}")) + key.len() + 4;
-    &text[at..at + text[at..].find('"').unwrap()]
-}
-
+/// The `[Key \"…\"]` tag of a PGN inside a JSON string.
 fn tag<'a>(pgn: &'a str, name: &str) -> Option<&'a str> {
     let at = pgn.find(&format!(r#"[{name} \""#))? + name.len() + 4;
     Some(&pgn[at..at + pgn[at..].find('\\').unwrap()])
 }
 
 fn numbers(body: &str) -> Vec<u32> {
-    body.split(r#"{"number":"#).skip(1).map(|r| r[..r.find(',').unwrap()].parse().unwrap()).collect()
+    objects(body, "rows").into_iter().map(|r| member(r, "number").parse().unwrap()).collect()
 }
 
 #[test]
 fn the_list_the_search_and_the_pgn_agree() {
     let db = database("fields");
     let path = db.dir().join("db.2cbh");
-    let port = start(vec![path.clone()]);
+    let port = serve(app_of([path.clone()]));
     let id = id_of(&path);
     let list = get_ok(port, &format!("/v1/databases/{id}/games?limit=20"));
-    let rows: Vec<&str> = list.split(r#"{"number":"#).skip(1).collect();
+    let rows = objects(&list, "rows");
     assert_eq!(rows.len(), GAMES.len());
     let mut seen = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let number = i as u32 + 1;
-        let (date, eco, round) = (member(row, "date"), member(row, "eco"), member(row, "round"));
+        let (date, eco, round) = (string_member(row, "date"), string_member(row, "eco"), string_member(row, "round"));
         let pgn = get_ok(port, &format!("/v1/databases/{id}/games/{number}"));
         assert_eq!(tag(&pgn, "Date"), Some(date), "game {number}");
         assert_eq!(tag(&pgn, "ECO"), Some(eco).filter(|e| !e.is_empty()), "game {number}");

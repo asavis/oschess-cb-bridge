@@ -23,7 +23,7 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
 
 mod common;
-use common::{TOKEN, get, policy, serve};
+use common::{TOKEN, get, has_members, has_object, members, objects, policy, serve};
 
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 
@@ -555,7 +555,8 @@ fn a_file_moved_to_the_cloud_during_a_download_is_downloaded_next_time() {
 
 /// A provider that keeps a file marked after every byte of it was read
 /// leaves the database cloud-only, reported once; nothing downloads again
-/// until the next request for its games.
+/// until the next request for its games. A download starts running or queued,
+/// shown by its progress, so none starting is seen at once.
 #[test]
 fn a_mark_kept_after_a_download_keeps_the_database_cloud_only() {
     let root = Root::new("kept-mark");
@@ -568,8 +569,8 @@ fn a_mark_kept_after_a_download_keeps_the_database_cloud_only() {
     wait_for_download(&entry);
     assert_eq!(entry.state(), State::CloudOnly);
     assert!(entry.marks_kept());
-    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(states(&catalog), ["cloudOnly"]);
+    assert!(entry.progress().is_none(), "a kept mark started a download by itself");
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1, "a kept mark started a download by itself");
     assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
     wait_for_download(&entry);
@@ -798,9 +799,9 @@ fn cloud_states_over_http() {
 
     let (status, body) = get(port, "/v1/databases");
     assert_eq!(status, 200);
-    assert!(body.contains(&format!("\"state\":\"cloudOnly\",\"size\":{size}")), "{body}");
+    assert!(has_object(&body, &format!("\"state\":\"cloudOnly\",\"size\":{size}")), "{body}");
     let (_, body) = get(port, "/v1/status");
-    assert!(body.contains("\"cloudOnly\":1,\"downloading\":0"), "{body}");
+    assert!(has_object(&body, "\"cloudOnly\":1,\"downloading\":0"), "{body}");
     assert!(!body.contains("\"download\""), "{body}");
 
     cloud.hold(true);
@@ -811,14 +812,15 @@ fn cloud_states_over_http() {
     assert_eq!(status, 409, "{body}");
     let (_, body) = get(port, "/v1/databases");
     assert!(
-        body.contains(&format!(
-            "\"state\":\"downloading\",\"size\":{size},\"progress\":{{\"present\":0,\"total\":{size}}}"
-        )),
+        has_object(
+            &body,
+            &format!("\"state\":\"downloading\",\"size\":{size},\"progress\":{{\"present\":0,\"total\":{size}}}")
+        ),
         "{body}"
     );
     let (_, body) = get(port, "/v1/status");
-    assert!(body.contains("\"cloudOnly\":0,\"downloading\":1"), "{body}");
-    assert!(body.contains(&format!("\"download\":{{\"present\":0,\"total\":{size}}}")), "{body}");
+    assert!(has_object(&body, "\"cloudOnly\":0,\"downloading\":1"), "{body}");
+    assert!(has_object(&body, &format!("\"download\":{{\"present\":0,\"total\":{size}}}")), "{body}");
 
     cloud.hold(false);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -832,7 +834,7 @@ fn cloud_states_over_http() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let (_, body) = get(port, "/v1/databases");
-    assert!(body.contains("\"state\":\"ready\",\"records\":1"), "{body}");
+    assert!(has_object(&body, "\"state\":\"ready\",\"records\":1"), "{body}");
 }
 
 /// A request for the games of a cloud-only database is checked whole before
@@ -872,7 +874,7 @@ fn a_refused_request_starts_no_download() {
             let refusal = format!(
                 "\"code\":\"unsupported_qualifier\",\"message\":\"ChessBase databases do not have this qualifier\",\"qualifier\":\"{qualifier}\""
             );
-            assert!(body.contains(&refusal), "{query}: {body}");
+            assert!(has_object(&body, &refusal), "{query}: {body}");
             assert!(entry.progress().is_none(), "{query} started a download");
             assert_eq!(entry.state(), State::CloudOnly, "{query}");
         }
@@ -906,14 +908,23 @@ fn the_snapshot_shows_cloud_states() {
     let bridge =
         Bridge { listeners, app: app.clone(), port, token: TOKEN.into(), link: String::new(), first_run: false };
     let background = Background::serve(bridge).unwrap();
+    // The members of an object past a database's id, name and format.
+    let keys = |object: &str| -> Vec<String> {
+        let mut keys: Vec<String> = members(object).into_iter().map(|(k, _)| k.to_string()).collect();
+        keys.retain(|k| !["id", "name", "format"].contains(&k.as_str()));
+        keys.sort();
+        keys
+    };
     // The database in one snapshot, which looks at each of its files once, and
-    // the list's row for it, which says the same.
+    // the list's row for it, which says the same: past its id, name and
+    // format, the row has the snapshot's members, and no other.
     let snapshot = || {
         let before = cloud.looks.load(Ordering::SeqCst);
         let database = background.snapshot().databases[0].clone();
         assert_eq!(cloud.looks.load(Ordering::SeqCst) - before, files.len(), "{:?}", database.state);
         let (_, body) = get(port, "/v1/databases");
-        assert!(body.contains(&row(&database)), "{} in {body}", row(&database));
+        let (listed, want) = (objects(&body, "databases")[0], row(&database));
+        assert!(has_members(listed, &want) && keys(listed) == keys(&format!("{{{want}}}")), "{want} in {body}");
         database
     };
     let fields = |d: &Database| (d.state, d.records, d.size, d.progress);
@@ -931,8 +942,8 @@ fn the_snapshot_shows_cloud_states() {
     assert_eq!((ready.name.as_str(), ready.generation), ("Remote", entry.generation()));
 }
 
-/// A database's row in `GET /v1/databases` from its state on, as the contract
-/// writes it.
+/// The members of a database's row in `GET /v1/databases` past its id, name
+/// and format, as the contract writes them.
 fn row(d: &bridge::snapshot::Database) -> String {
     let mut row = format!("\"state\":\"{}\"", d.state.name());
     if let Some(records) = d.records {
@@ -947,7 +958,7 @@ fn row(d: &bridge::snapshot::Database) -> String {
     if let Some((present, total)) = d.progress {
         row += &format!(",\"progress\":{{\"present\":{present},\"total\":{total}}}");
     }
-    row + "}"
+    row
 }
 
 /// The binary finds the window list through `OSCHESS_BRIDGE_DOCUMENTS`.

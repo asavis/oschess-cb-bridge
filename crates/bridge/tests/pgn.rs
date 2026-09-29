@@ -3,10 +3,9 @@
 //! answering as a 2CBH copy of the same games answers.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use bridge::api::App;
 use bridge::catalog::{Catalog, State, id_of};
 use bridge::search::{self, Indexes, SearchError, Selection};
 use bridge::store::MAX_GAME_BYTES;
@@ -16,19 +15,15 @@ use cbformat::pgnfile;
 use cbformat::view::Base;
 
 mod common;
-use common::{block, fixture_of, get, pgn_fixture, policy, rows, serve_shared};
+use common::{
+    FixtureRow, block, fixture_of, get, has_members, has_object, member, object_with, pgn_fixture, rows,
+    start_with_dir, without_generation,
+};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bridge-pgn-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
-}
-
-/// Serves `paths`, with the PGN and position indexes in `dir`.
-fn start(paths: &[PathBuf], dir: &Path) -> (u16, Arc<App>) {
-    let app = App::new("test", policy(), Catalog::new(paths.to_vec()));
-    app.catalog.use_data_dir(dir);
-    serve_shared(app)
 }
 
 /// Asks for `path` until the answer is no longer a `409` for a database or an
@@ -54,31 +49,15 @@ fn wait_ready(catalog: &Catalog, path: &Path) {
     }
 }
 
-/// A body without its `"generation":"…"` member, which differs between copies.
-fn without_generation(body: &str) -> String {
-    match body.find(r#""generation":""#) {
-        Some(at) => {
-            let end = at + 14 + body[at + 14..].find('"').unwrap() + 1;
-            let end = if body[end..].starts_with(',') { end + 1 } else { end };
-            format!("{}{}", &body[..at], &body[end..])
-        }
-        None => body.to_string(),
-    }
-}
-
 /// The fixture of `docs/search-grammar.md` with what PGN cannot hold made a
 /// game: the guiding text and the deleted game are games, and every game has
 /// at least one move, so that both copies play `1. e4` in each.
 fn pgn_rows() -> Vec<String> {
     rows(&[])
-        .into_iter()
+        .iter()
         .map(|line| {
-            let mut f: Vec<String> = line.split('|').map(|x| x.trim().to_string()).collect();
-            f[1] = "game".into();
-            if f[9] == "0" {
-                f[9] = "1".into();
-            }
-            f.join(" | ")
+            let row = FixtureRow::parse(line);
+            FixtureRow { kind: "game", moves: row.moves.max(1), ..row }.to_string()
         })
         .collect()
 }
@@ -92,14 +71,16 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
     let (fp, f2) = (pgn_fixture("api-pgn", &rows), fixture_of("pgn-api-2cbh", &rows));
     let (pp, p2) = (fp.dir().join("db.pgn"), f2.dir().join("db.2cbh"));
     let dir = scratch("copies");
-    let (port, app) = start(&[pp.clone(), p2.clone()], &dir);
+    let (port, app) = start_with_dir([pp.clone(), p2.clone()], &dir);
     let (ip, i2) = (id_of(&pp), id_of(&p2));
     wait_ready(&app.catalog, &pp);
     let (status, body) = get(port, "/v1/databases");
     assert_eq!(status, 200);
-    let listed = format!(r#""id":"{ip}","name":"db","format":"pgn","state":"ready","records":10,"generation":""#);
-    assert!(body.contains(&listed), "{body}");
-    assert!(get(port, "/v1/status").1.contains(r#""ready":2,"opening":0"#));
+    let listed = format!(r#""id":"{ip}","name":"db","format":"pgn","state":"ready","records":10"#);
+    let listed = object_with(&body, &listed).unwrap_or_else(|| panic!("{body}"));
+    assert!(member(listed, "generation").starts_with('"'), "{listed}");
+    let (_, status) = get(port, "/v1/status");
+    assert!(has_object(&status, r#""ready":2,"opening":0"#), "{status}");
 
     let both = |path: &str| {
         let (a, b) = (get(port, &path.replace("{id}", &ip)), get(port, &path.replace("{id}", &i2)));
@@ -139,7 +120,7 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
     get_ready(port, &url.replace("{id}", &i2));
     let (status, body) = both(&url);
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains(r#""index":{"records":10,"games":10}"#), "{body}");
+    assert!(has_members(&body, r#""index":{"records":10,"games":10}"#), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -191,22 +172,22 @@ fn games_are_served_as_written() {
     let f = pgn_file("served", text.as_bytes());
     let path = f.dir().join("db.pgn");
     let dir = scratch("served");
-    let (port, app) = start(std::slice::from_ref(&path), &dir);
+    let (port, app) = start_with_dir([path.clone()], &dir);
     let id = id_of(&path);
     wait_ready(&app.catalog, &path);
     for query in ["", "?lang=de", "?annotations=full"] {
         let (status, body) = get(port, &format!("/v1/databases/{id}/games/1{query}"));
         assert_eq!(status, 200, "{body}");
         let want = r#""pgn":"[Event \"Paris\"]\n[White \"Morphy, Paul\"]\n\n1. e4 e5 {A comment} (1... c5) 2. Nf3 1-0\n","annotations":"complete""#;
-        assert!(body.contains(want), "{body}");
+        assert!(has_members(&body, want), "{body}");
     }
     let (status, body) = get(port, &format!("/v1/databases/{id}/games/2"));
     assert_eq!(status, 422, "{body}");
     assert!(body.contains(r#""code":"unreadable_game""#) && body.contains("over the"), "{body}");
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=5"));
     assert_eq!(status, 200);
-    assert!(body.contains(r#""number":1,"kind":"game","white":"Morphy, Paul","#), "{body}");
-    assert!(body.contains(r#""moves":2,"eco":"","event":"Paris","site":"""#), "{body}");
+    assert!(has_object(&body, r#""number":1,"kind":"game","white":"Morphy, Paul""#), "{body}");
+    assert!(has_object(&body, r#""number":1,"moves":2,"eco":"","event":"Paris","site":"""#), "{body}");
     assert_eq!(get(port, &format!("/v1/databases/{id}/games/3")).0, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -219,7 +200,7 @@ fn opening_restarting_and_changing() {
     let f = pgn_file("opening", game.repeat(3).as_bytes());
     let path = f.dir().join("db.pgn");
     let dir = scratch("opening");
-    let (port, app) = start(std::slice::from_ref(&path), &dir);
+    let (port, app) = start_with_dir([path.clone()], &dir);
     let id = id_of(&path);
     // The build waits behind a job that holds the queue.
     let (release, hold) = mpsc::channel::<()>();
@@ -231,14 +212,15 @@ fn opening_restarting_and_changing() {
     let want = format!(
         r#""id":"{id}","name":"db","format":"pgn","state":"opening","progress":{{"present":0,"total":{size}}}"#
     );
-    assert!(body.contains(&want), "{body}");
+    assert!(has_object(&body, &want), "{body}");
     assert!(get(port, "/v1/status").1.contains(r#""opening":1"#));
     let (status, body) = get(port, &format!("/v1/databases/{id}/games"));
     assert_eq!(status, 409, "{body}");
     assert!(body.contains(r#""state":"opening""#), "{body}");
     release.send(()).unwrap();
     wait_ready(&app.catalog, &path);
-    assert!(get(port, "/v1/databases").1.contains(r#""state":"ready","records":3"#));
+    let (_, body) = get(port, "/v1/databases");
+    assert!(has_object(&body, r#""state":"ready","records":3"#), "{body}");
 
     // Started again, the bridge reads the index built before: no build runs.
     let catalog = Catalog::new(vec![path.clone()]);
@@ -246,8 +228,8 @@ fn opening_restarting_and_changing() {
     catalog.pgn().queue().refuse_starts(true);
     assert_eq!(catalog.get(&id).unwrap().state(), State::Ready);
 
-    // A game more: read again, then ready with it.
-    std::thread::sleep(Duration::from_millis(20));
+    // A game more: read again, then ready with it. The file is longer, so
+    // that its generation changes whatever the clock.
     std::fs::write(&path, game.repeat(4)).unwrap();
     let (_, body) = get(port, "/v1/databases");
     assert!(body.contains(r#""state":"opening""#) || body.contains(r#""records":4"#), "{body}");
@@ -284,24 +266,24 @@ fn the_position_index_reads_main_lines() {
     let f = pgn_file("explorer", text.as_bytes());
     let path = f.dir().join("db.pgn");
     let dir = scratch("explorer");
-    let (port, _app) = start(std::slice::from_ref(&path), &dir);
+    let (port, _app) = start_with_dir([path.clone()], &dir);
     let id = id_of(&path);
     let after_e4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR%20b%20KQkq%20-%200%201";
     let (status, body) = get_ready(port, &format!("/v1/databases/{id}/explorer?fen={after_e4}"));
     assert_eq!(status, 200, "{body}");
     // Games 1, 2 and 3 reach it; 3's Ke7 is illegal, so no move of it counts.
-    assert!(body.contains(r#""games":3,"white":1,"draws":1,"black":1,"#), "{body}");
-    assert!(body.contains(r#""uci":"e7e5","san":"e5","games":1,"white":1,"#), "{body}");
-    assert!(body.contains(r#""uci":"c7c5","san":"c5","games":1,"white":0,"draws":0,"black":1"#), "{body}");
-    assert!(body.contains(r#""index":{"records":6,"games":4}"#), "{body}");
+    assert!(has_members(&body, r#""games":3,"white":1,"draws":1,"black":1"#), "{body}");
+    assert!(has_object(&body, r#""uci":"e7e5","san":"e5","games":1,"white":1"#), "{body}");
+    assert!(has_object(&body, r#""uci":"c7c5","san":"c5","games":1,"white":0,"draws":0,"black":1"#), "{body}");
+    assert!(has_members(&body, r#""index":{"records":6,"games":4}"#), "{body}");
     // The variation's 2. Nf3 is not the main line's.
     let after_c5 = "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR%20w%20KQkq%20-%200%202";
     let (_, body) = get(port, &format!("/v1/databases/{id}/explorer?fen={after_c5}"));
-    assert!(body.contains(r#""games":1,"#) && body.contains(r#""moves":[]"#), "{body}");
+    assert!(has_members(&body, r#""games":1,"moves":[]"#), "{body}");
     // The null move ends game 6's line after 1. d4.
     let after_d4 = "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR%20b%20KQkq%20-%200%201";
     let (_, body) = get(port, &format!("/v1/databases/{id}/explorer?fen={after_d4}"));
-    assert!(body.contains(r#""games":1,"#) && body.contains(r#""moves":[]"#), "{body}");
+    assert!(has_members(&body, r#""games":1,"moves":[]"#), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -331,7 +313,7 @@ fn rows_carry_the_main_line() {
     let f = pgn_file("lines", text.as_bytes());
     let path = f.dir().join("db.pgn");
     let dir = scratch("lines");
-    let (port, app) = start(std::slice::from_ref(&path), &dir);
+    let (port, app) = start_with_dir([path.clone()], &dir);
     let id = id_of(&path);
     wait_ready(&app.catalog, &path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20&line=60"));

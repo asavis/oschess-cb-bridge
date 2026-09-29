@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use cbformat::fixture::{Builder, TempDb, bytes, lid_header, sq, words};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record, start_position};
 use cbformat::movetable::{self, ALTERNATIVE, Captured, Color, END_OF_LINE, MOVES, MoveWord, NULL_MOVE, Piece};
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{get, policy, serve};
+use common::{app_of, get, serve, string_member};
 
 /// Castling, a capture, a knight named by its file, a promotion with check,
 /// a mate: the games both formats hold, with the line each must answer.
@@ -163,7 +163,7 @@ fn classic(name: &str) -> TempDb {
 }
 
 fn start(paths: Vec<PathBuf>, between_reads: Option<Box<dyn Fn() + Send + Sync>>) -> u16 {
-    serve(App { between_reads, ..App::new("test", policy(), Catalog::new(paths)) })
+    serve(App { between_reads, ..app_of(paths) })
 }
 
 /// Each row's `line` member, verbatim, by the row's number: `"…"`, `null`,
@@ -211,8 +211,7 @@ fn main_line(pgn: &str) -> String {
 fn served(port: u16, id: &str, number: u32) -> String {
     let (status, body) = get(port, &format!("/v1/databases/{id}/games/{number}"));
     assert_eq!(status, 200, "{body}");
-    let pgn = &body[body.find(r#""pgn":""#).unwrap() + 7..];
-    main_line(&pgn[..pgn.find(r#"","annotations""#).unwrap()])
+    main_line(string_member(&body, "pgn"))
 }
 
 #[test]

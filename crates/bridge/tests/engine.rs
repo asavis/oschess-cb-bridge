@@ -3,6 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use bridge::engine::{self, Engine, EngineConfig};
 use bridge::sources::Sources;
 
 mod common;
-use common::{ORIGIN, exchange, get, policy, request, serve_shared};
+use common::{ORIGIN, app_of, exchange, get, get_reply, has_members, member, request, send, serve_shared};
 
 fn fake() -> EngineConfig {
     EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(1), Some(16))
@@ -21,7 +22,7 @@ fn fake() -> EngineConfig {
 
 /// A server with `engine`, and the port it listens on.
 fn start(engine: Engine) -> (u16, Arc<App>) {
-    serve_shared(App { engine, ..App::new("test", policy(), Catalog::new(Vec::new())) })
+    serve_shared(App { engine, ..app_of([]) })
 }
 
 /// An analysis being read: the response head, then its lines one by one.
@@ -124,8 +125,8 @@ fn streams_the_lines_of_a_search_to_its_best_move() {
     assert_eq!(lines.last().unwrap(), BEST, "{lines:?}");
     // The deepest lines of both numbers are written before the best move.
     for k in [1, 2] {
-        let deepest = format!(r#"{{"info":{{"depth":6,"seldepth":8,"multipv":{k},"score":{{"cp":{}}},"#, 10 * k);
-        assert!(lines.iter().any(|l| l.starts_with(&deepest)), "{k}: {lines:?}");
+        let deepest = format!(r#""info":{{"depth":6,"seldepth":8,"multipv":{k},"score":{{"cp":{}}}}}"#, 10 * k);
+        assert!(lines.iter().any(|l| has_members(l, &deepest)), "{k}: {lines:?}");
     }
     assert!(lines.iter().all(|l| !l.contains("searching")));
     // The engine said its own name.
@@ -162,8 +163,9 @@ fn configured_values_above_the_limits_start_and_stay_within_them() {
     let (port, _app) = start(Engine::new(over));
     let (_, status) = get(port, "/v1/status");
     let (threads, hash) = (u64::from(limits.max_threads), u64::from(limits.max_hash_mb));
-    assert!(status.contains(&format!(r#""threads":{{"default":{threads},"max":{threads}}}"#)), "{status}");
-    assert!(status.contains(&format!(r#""hash":{{"default":{hash},"max":{hash}}}"#)), "{status}");
+    let engine = member(&status, "engine");
+    assert!(has_members(engine, &format!(r#""threads":{{"default":{threads},"max":{threads}}}"#)), "{status}");
+    assert!(has_members(engine, &format!(r#""hash":{{"default":{hash},"max":{hash}}}"#)), "{status}");
     let search = |extra: &str| {
         let mut a = Analysis::open(port, &format!("depth=2&stream=tab1{extra}"));
         assert_eq!(a.status, 200);
@@ -213,7 +215,7 @@ fn a_crashed_engine_ends_the_stream_and_starts_again() {
     let (port, _app) = start(Engine::new(fake()));
     let mut a = Analysis::open(port, "moves=h2h3&stream=tab1");
     let lines = a.rest();
-    assert!(lines.last().unwrap().starts_with(r#"{"error":{"code":"engine_exited""#), "{lines:?}");
+    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_exited"}"#), "{lines:?}");
     let mut b = Analysis::open(port, "depth=2&stream=tab1");
     assert_eq!(b.rest().last().unwrap(), BEST);
 }
@@ -249,7 +251,7 @@ fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
     let (port, _app) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
     let started = Instant::now();
     let lines = Analysis::open(port, "depth=1").rest();
-    assert!(lines.last().unwrap().starts_with(r#"{"error":{"code":"engine_failed""#), "{lines:?}");
+    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_failed"}"#), "{lines:?}");
     let took = started.elapsed();
     assert!(took < Duration::from_secs(7), "the handshake took {took:?}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -296,12 +298,6 @@ fn refuses_bad_input_and_a_missing_engine() {
     assert!(a.body().contains(r#""code":"no_engine""#));
 }
 
-/// The whole answer to a GET of `path` that carries no token.
-fn get_without_token(port: u16, path: &str) -> String {
-    let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n");
-    exchange(port, &raw).unwrap()
-}
-
 #[test]
 fn the_status_names_the_engine() {
     let (port, _app) = start(Engine::new(fake()));
@@ -311,7 +307,7 @@ fn the_status_names_the_engine() {
         r#""engine":{{"name":"fake-uci","threads":{{"default":1,"max":{}}},"hash":{{"default":16,"max":{}}}}}"#,
         limits.max_threads, limits.max_hash_mb
     );
-    assert!(status.contains(&engine), "{status}");
+    assert!(has_members(&status, &engine), "{status}");
     let (port, _app) = start(Engine::none());
     assert!(get(port, "/v1/status").1.contains(r#""engine":null"#));
 }
@@ -319,8 +315,10 @@ fn the_status_names_the_engine() {
 #[test]
 fn the_token_is_required() {
     let (port, _app) = start(Engine::new(fake()));
-    let out = get_without_token(port, "/v1/engine/analyze?depth=1");
-    assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+    let path = "/v1/engine/analyze?depth=1";
+    let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n");
+    let r = send(port, &raw);
+    assert_eq!(r.status, 401, "{}", r.body);
 }
 
 /// With a real engine, which the tests do not carry:
@@ -369,20 +367,35 @@ fn engine_line(path: &std::path::Path) -> String {
     format!("port = 39581\nengine = '{}'\nengine_threads = 1\nengine_hash = 16\n", path.display())
 }
 
+/// Writes `text` beside `path`, lets `prepare` change that file, and puts it
+/// in the place of `path` whole, as the settings window saves: the engine's
+/// watcher, which also looks from a thread of its own, never reads a
+/// half-written file, which an empty one would be. The file's signature is its
+/// size and modification time, and the new file is dated a second after the
+/// one it replaces, so that the change shows at the same size too, however
+/// coarse the clock.
+fn replace_with(path: &Path, text: &str, prepare: impl FnOnce(&Path)) {
+    let part = path.with_extension("toml.part");
+    std::fs::write(&part, text).unwrap();
+    if let Ok(before) = std::fs::metadata(path).and_then(|m| m.modified()) {
+        let file = std::fs::File::options().write(true).open(&part).unwrap();
+        file.set_modified(before + Duration::from_secs(1)).unwrap();
+    }
+    prepare(&part);
+    std::fs::rename(&part, path).unwrap();
+}
+
+/// [`replace_with`] the file as written.
+fn replace(path: &Path, text: &str) {
+    replace_with(path, text, |_| {});
+}
+
 #[test]
 fn the_engine_follows_bridge_toml() {
     let dir = std::env::temp_dir().join(format!("bridge-follow-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let toml = dir.join("bridge.toml");
-    let write = |text: &str| {
-        // Replaced whole, as the settings window saves it: the engine's watcher
-        // must never read a half-written file, which an empty one would be.
-        let part = dir.join("bridge.toml.part");
-        std::fs::write(&part, text).unwrap();
-        std::fs::rename(&part, &toml).unwrap();
-        // The signature includes the modification time; let it move on coarse clocks.
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let write = |text: &str| replace(&toml, text);
     write("port = 39581\n");
     let (port, app) = start(Engine::following(Arc::new(Watched::new(toml.clone())), Duration::from_millis(50)));
     assert!(!app.engine.is_configured());
@@ -427,12 +440,7 @@ fn a_broken_file_keeps_the_databases_and_the_engine() {
     };
     // Each text replaces the file whole: the engine's first read runs in the
     // background, and must not find a file cut short while it is written.
-    let replace = |text: &str| {
-        let part = dir.join("bridge.toml.part");
-        std::fs::write(&part, text).unwrap();
-        std::fs::rename(&part, &toml).unwrap();
-    };
-    replace(&file(&first, "Old.2cbh"));
+    replace(&toml, &file(&first, "Old.2cbh"));
     let watched = Arc::new(Watched::new(toml.clone()));
     let catalog = Catalog::with_sources(
         Sources { config: Some(Arc::clone(&watched)), ..Sources::default() },
@@ -443,23 +451,27 @@ fn a_broken_file_keeps_the_databases_and_the_engine() {
     assert_eq!(names(), ["Old"]);
     assert_eq!(engine.name().as_deref(), Some("engine-c"));
 
-    // Of another length than before, so its signature changes whatever the clock.
-    replace(&format!("{}databases = [unquoted, and more]\n", engine_line(&second)));
+    replace(&toml, &format!("{}databases = [unquoted, and more]\n", engine_line(&second)));
     assert_eq!(names(), ["Old"], "a broken file keeps the databases");
     assert_eq!(engine.name().as_deref(), Some("engine-c"), "and the engine");
 
-    replace(&file(&second, "New database.2cbh"));
+    replace(&toml, &file(&second, "New database.2cbh"));
     assert_eq!(names(), ["New database"]);
     assert_eq!(engine.name().as_deref(), Some("engine-d"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A read that fails is tried again even when the file did not change, and a
-/// pipe in the file's place is never read, so nothing waits on it.
+/// pipe in the file's place is never read, so nothing waits on it. The
+/// watcher's own thread looks whenever a loaded machine lets it: each change
+/// replaces the file whole, so that whenever it looks, it finds one of the
+/// files the test asserts on.
 #[cfg(unix)]
 #[test]
 fn a_failed_read_is_tried_again_and_a_pipe_is_never_read() {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
     let dir = std::env::temp_dir().join(format!("bridge-reread-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let toml = dir.join("bridge.toml");
@@ -468,21 +480,25 @@ fn a_failed_read_is_tried_again_and_a_pipe_is_never_read() {
     std::fs::write(&toml, engine_line(&first)).unwrap();
     let engine = Engine::following(Arc::new(Watched::new(toml.clone())), Duration::from_secs(3600));
     assert_eq!(engine.name().as_deref(), Some("engine-a"));
-    std::thread::sleep(Duration::from_millis(20));
-    std::fs::write(&toml, engine_line(&second)).unwrap();
-    std::fs::set_permissions(&toml, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Unreadable from the moment it is in place.
+    replace_with(&toml, &engine_line(&second), |part| mode(part, 0o000));
     // Skipped when the tests run as root, who reads the file anyway.
     if std::fs::read(&toml).is_err() {
         assert_eq!(engine.name().as_deref(), Some("engine-a"));
     }
-    std::fs::set_permissions(&toml, std::fs::Permissions::from_mode(0o644)).unwrap();
+    mode(&toml, 0o644);
     assert_eq!(engine.name().as_deref(), Some("engine-b"));
 
-    std::fs::remove_file(&toml).unwrap();
-    assert!(std::process::Command::new("mkfifo").arg(&toml).status().unwrap().success());
-    let asked = Instant::now();
-    assert_eq!(engine.name().as_deref(), Some("engine-b"));
-    assert!(asked.elapsed() < Duration::from_secs(1));
+    let pipe = dir.join("pipe");
+    assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    std::fs::rename(&pipe, &toml).unwrap();
+    // A read of the pipe would wait for a writer for ever: the name comes on
+    // another thread, which the test gives up on at a deadline.
+    let (tx, rx) = mpsc::channel();
+    let asking = engine.clone();
+    std::thread::spawn(move || tx.send(asking.name()));
+    let name = rx.recv_timeout(Duration::from_secs(20)).expect("the pipe was read");
+    assert_eq!(name.as_deref(), Some("engine-b"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -500,13 +516,8 @@ fn a_probe_accepts_only_a_uci_engine() {
 
 /// `GET /v1/engine/warm?{query}`: the status and the body.
 fn warm(port: u16, query: &str) -> (u16, String) {
-    let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    (&s).write_all(request(port, &format!("/v1/engine/warm?{query}")).as_bytes()).unwrap();
-    let mut text = String::new();
-    BufReader::new(s).read_to_string(&mut text).unwrap();
-    let status = text.split(' ').nth(1).unwrap().parse().unwrap();
-    (status, text.split_once("\r\n\r\n").map_or("", |(_, body)| body).to_string())
+    let r = get_reply(port, &format!("/v1/engine/warm?{query}"));
+    (r.status, r.body)
 }
 
 /// A warm-up starts the engine with the threads and hash asked for (#110), so
@@ -570,6 +581,7 @@ fn a_warm_up_of_an_engine_that_cannot_start_is_a_bad_gateway() {
     let out = exchange(port, &request(port, "/v1/engine/warm")).unwrap();
     let (head, body) = out.split_once("\r\n\r\n").unwrap();
     assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{head}");
-    assert!(body.starts_with(r#"{"error":{"code":"engine_failed","message":"#), "{body}");
+    let error = member(body, "error");
+    assert!(has_members(error, r#""code":"engine_failed""#) && member(error, "message").starts_with('"'), "{body}");
     assert!(!app.engine.is_running());
 }
