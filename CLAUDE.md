@@ -47,7 +47,16 @@ The review gate follows the scheme of the `kidschessleague` project.
   once on the owner's account (`CODEX_HOME=/home/asavi/.codex`) without changing
   the reviewing backend or its GitHub identity, and say which account ran it.
 - Once the clean verdict is recorded, the implementing session squash-merges the
-  pull request itself with `--match-head-commit <clean sha>`.
+  pull request itself with `--match-head-commit <clean sha>`. This is the
+  owner's standing authorization (2026-09-30): a pull request whose current
+  head carries a `CB-REVIEW: CLEAN <sha>` verdict and the prose review naming
+  that commit is reviewed, and an agent merges it into `main` without asking
+  again.
+- That merge is where an agent's authority ends. The version number, a version
+  change in `crates/app/Cargo.toml`, a `v*` tag, publishing a draft release and
+  a Microsoft Store submission each need the owner's explicit order naming the
+  version. An agent never chooses a version, and a general request such as
+  "ship it" or "send it to the Store" is not that order.
 
 ## Checks
 
