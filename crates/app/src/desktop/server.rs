@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bridge::config::{self, DEFAULT_PORT};
+use bridge::pairing;
 use bridge::snapshot::Background;
-use bridge::start::{self, Options};
-use bridge::{pairing, server};
+use bridge::start::{self, Cause, Options};
 
 use crate::i18n::Strings;
 use crate::status::{Problem, View};
@@ -74,11 +74,6 @@ impl Shared {
     /// Starts the bridge.
     pub fn start(strings: Strings) -> Started {
         let dir = start::data_dir().ok();
-        // Before the bridge's own start, which opens it too: a start that
-        // stops at bridge.toml is logged as well.
-        if let Some(dir) = &dir {
-            bridge::log::open(dir);
-        }
         let (running, view, first_run) = match &dir {
             Some(dir) => serve(dir),
             None => (None, failed(DEFAULT_PORT, "no data folder: %APPDATA% is not set".into()), false),
@@ -142,35 +137,20 @@ fn failed(port: u16, reason: String) -> View {
 /// Starts serving from `dir`, waiting up to [`PORT_WAIT`] for a port that is
 /// taken.
 fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
-    let port = match config::load(&dir.join(config::FILE_NAME)) {
-        Ok(config) => config.port,
+    // The status reports the app's version, the one its release carries, not
+    // the bridge library's.
+    let options = Options { version: Some(env!("CARGO_PKG_VERSION")), port_wait: PORT_WAIT, ..Options::default() };
+    let bridge = match start::prepare(dir, &options) {
+        Ok(bridge) => bridge,
         Err(e) => {
-            bridge::log!("the bridge cannot start: {}", e.logged());
-            return (None, failed(DEFAULT_PORT, e.to_string()), false);
+            let view = match e.cause {
+                Cause::PortInUse(port) => View::failed(env!("CARGO_PKG_VERSION"), port, Problem::PortBusy { port }),
+                Cause::Other { port } => failed(port.unwrap_or(DEFAULT_PORT), e.to_string()),
+            };
+            return (None, view, false);
         }
     };
-    let deadline = Instant::now() + PORT_WAIT;
-    let bridge = loop {
-        // The status reports the app's version, the one its release carries,
-        // not the bridge library's.
-        match start::prepare(dir, &Options { version: Some(env!("CARGO_PKG_VERSION")), ..Options::default() }) {
-            Ok(bridge) => break bridge,
-            Err(e) => {
-                let busy = port_busy(port);
-                if busy && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(250));
-                    continue;
-                }
-                let view = if busy {
-                    View::failed(env!("CARGO_PKG_VERSION"), port, Problem::PortBusy { port })
-                } else {
-                    failed(port, e)
-                };
-                return (None, view, false);
-            }
-        }
-    };
-    let (first_run, link, token) = (bridge.first_run, bridge.link.clone(), bridge.token.clone());
+    let (first_run, port, link, token) = (bridge.first_run, bridge.port, bridge.link.clone(), bridge.token.clone());
     match Background::serve(bridge) {
         Ok(background) => {
             let running = Running { background, link, token };
@@ -182,8 +162,4 @@ fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
             (None, failed(port, format!("no server thread: {e}")), false)
         }
     }
-}
-
-fn port_busy(port: u16) -> bool {
-    matches!(server::bind(port), Err(e) if e.kind() == std::io::ErrorKind::AddrInUse)
 }
