@@ -1,6 +1,7 @@
 // Shared by the three windows: the words in the window's language, the calls
-// to the app, the icons, and how a database is shown. Text that comes from the
-// bridge (database names, paths) is always set as text, never as markup.
+// to the app and their failures, the icons, and how a database and an added
+// folder are shown. Text that comes from the bridge (database names, paths)
+// is always set as text, never as markup.
 'use strict';
 
 const LANG = new URLSearchParams(location.search).get('lang') === 'en' ? 'en' : 'uk';
@@ -19,6 +20,15 @@ function t(key, values = {}) {
     text = text.split(`{${name}}`).join(String(value));
   }
   return text;
+}
+
+// A failure in words, translated here only. The app answers every failure
+// with the dictionary key of its message and the values it names; anything
+// else, such as an error of a page's script, is shown inside the general
+// message.
+function failure(error) {
+  if (typeof error?.key === 'string') return t(error.key, error.values);
+  return t('settings.error', { message: error });
 }
 
 // Ukrainian: 1, 21 … one; 2–4, 22–24 … few; the rest many. English: one, many.
@@ -158,4 +168,31 @@ function problemText(problem) {
     return { title: t('flyout.portBusy.title', { port: problem.port }), body: t('flyout.portBusy.body') };
   }
   return { title: t('flyout.stopped.title'), body: t('flyout.stopped.body') };
+}
+
+// A served database as a row of the settings window and the first-run wizard:
+// its name, its state's line, a bar while it downloads or opens, its chip.
+function databaseRow(db) {
+  const line = stateLine(db);
+  const name = el('div', 'path', db.name);
+  name.title = db.name;
+  return el('div', 'row', icon('db', 20), el('div', 'text', name, line ? el('div', 'cap12', line) : null),
+    progressBar(db), stateChip(db));
+}
+
+// What stops the bridge, as a row above the databases.
+function problemRow(problem) {
+  const { title, body } = problemText(problem);
+  return el('div', 'row', icon('alert', 20), el('div', 'text', el('div', null, title), el('div', 'cap12', body)));
+}
+
+// A folder or database file added beside ChessBase's list, as a row with its
+// `action` button.
+function extraRow(extra, action) {
+  const detail = !extra.present
+    ? t('settings.folders.missing')
+    : extra.folder ? plural('settings.folders.count', extra.databases ?? 0) : t('settings.folders.file');
+  const path = el('div', 'path selectable', extra.path);
+  path.title = extra.path;
+  return el('div', 'row', icon(extra.folder ? 'folder' : 'db', 20), el('div', 'text', path, el('div', 'cap12', detail)), action);
 }
