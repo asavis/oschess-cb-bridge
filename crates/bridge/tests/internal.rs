@@ -2,23 +2,12 @@
 //! database's id alone, without the database's folder or name (#117). The log
 //! is one per process, so the test that opens it has a binary of its own.
 
-use std::path::Path;
-
-use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use bridge::log;
 use cbformat::fixture_cbh::Builder;
 
 mod common;
-use common::{get, policy, serve};
-
-/// Serves the database at `path`, with the indexes in `dir` as in a data
-/// folder.
-fn start(path: &Path, dir: &Path) -> u16 {
-    let app = App::new("test", policy(), Catalog::new(vec![path.to_path_buf()]));
-    app.catalog.use_data_dir(dir);
-    serve(app)
-}
+use common::{get, start_with_dir};
 
 /// A classic database whose guiding text points into the `.cbg` file's own
 /// header: a list window and a sort both read its title, and fail with a
@@ -43,7 +32,7 @@ fn a_damaged_database_answers_internal_and_is_logged_by_its_id() {
     }
     drop(built);
     let path = folder.join("Private Games.cbh");
-    let port = start(&path, &top);
+    let (port, _app) = start_with_dir([path.clone()], &top);
     let id = id_of(&path);
 
     for query in ["", "?sort=tournament"] {
