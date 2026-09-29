@@ -57,13 +57,11 @@ function renderSettings(settings) {
   document.getElementById('version').textContent = t('settings.version', { version: settings.version });
   document.getElementById('version-title').textContent = t('settings.versionRow.title', { version: settings.version });
   // A build without a real updater key does not look for updates. The
-  // Microsoft Store updates its package itself: no update controls (#112).
+  // Microsoft Store's package looks through the Store (#153).
   document.getElementById('version-hint').textContent = settings.store
     ? t('settings.versionRow.store')
     : settings.updates ? t('settings.versionRow.hint') : t('settings.versionRow.off');
   document.getElementById('check-updates').disabled = !settings.updates;
-  document.getElementById('check-updates').hidden = settings.store;
-  document.getElementById('auto-update').closest('.row').hidden = settings.store;
   document.getElementById('port-title').textContent = t('settings.port.title', { port: settings.port });
   toggle('autostart', settings.autostart);
   // Only Windows' Startup apps settings turn back on what the user turned off there.

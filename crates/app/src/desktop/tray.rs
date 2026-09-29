@@ -7,7 +7,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Wry};
 
 use super::autostart::{self, State};
-use super::{channel, commands, shared, updater, windows};
+use super::{commands, shared, updater, windows};
 use crate::i18n::Strings;
 use crate::status::{Theme, View, icon_file, icon_size};
 
@@ -61,8 +61,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let item = |id: &str, key: &str| MenuItem::with_id(app, id, strings.get(key), true, None::<&str>);
     let tick = CheckMenuItem::with_id(app, AUTOSTART, strings.get("menu.autostart"), true, autostart, None::<&str>)?;
     app.manage(AutostartTick(tick.clone()));
-    // Only a build with a real updater key looks for updates. The Store's
-    // package has no such item: the Store updates it.
+    // The Store's package looks through the Store (#153); a direct build only
+    // with a real updater key, and the item stays greyed without one.
     let update = MenuItem::with_id(app, "update", strings.get("menu.update"), updater::enabled(app), None::<&str>)?;
     let (open, settings, code, quit) = (
         item("open", "menu.open")?,
@@ -71,11 +71,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         item("quit", "menu.quit")?,
     );
     let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);
-    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = vec![&open, &settings, &code, &first, &tick];
-    if !channel().is_store() {
-        items.push(&update);
-    }
-    items.extend([&second as &dyn tauri::menu::IsMenuItem<Wry>, &quit]);
+    let items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
+        vec![&open, &settings, &code, &first, &tick, &update, &second, &quit];
     let menu = Menu::with_items(app, &items)?;
     let mut builder = TrayIconBuilder::with_id(TRAY)
         .tooltip(view.tooltip(strings))

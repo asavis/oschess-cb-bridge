@@ -37,8 +37,12 @@
   "toast.update.latest.title": "Оновлень немає",
   "toast.update.latest.body": "Версія {version} — найновіша.",
   "toast.update.installing": "Оновлюємо міст до {version}…",
+  "toast.update.installing.store": "Оновлюємо міст…",
   "toast.update.failed.title": "Не вдалося оновити міст",
   "toast.update.failed.body": "Спробуйте пізніше.",
+  "toast.update.waiting.title": "Доступна нова версія мосту",
+  "toast.update.required.title": "Потрібно оновити міст",
+  "toast.update.waiting.body": "Відкрийте міст у Microsoft Store й натисніть «Оновити».",
 
   "flyout.working": "працює",
   "flyout.notWorking": "не працює",
