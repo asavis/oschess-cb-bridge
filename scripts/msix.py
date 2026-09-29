@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Packs the Microsoft Store package, oschess-bridge.msix (#112).
 
-    python3 scripts/msix.py --exe target/.../oschess-bridge.exe --out dist/oschess-bridge.msix
+    python3 scripts/msix.py --exe exe/oschess-bridge.exe --out dist/oschess-bridge.msix
 
-The package holds the given oschess-bridge.exe, the manifest
+The package holds the given tray app as oschess-bridge.exe: the release's
+oschess-bridge.exe, which the Tauri CLI renames, or a cargo build's
+target/release/oschess-bridge-app.exe, never the console bridge that cargo
+names oschess-bridge.exe. With it go the manifest
 crates/app/msix/AppxManifest.xml with its values filled in, and the images in
 crates/app/icons/msix as Assets. It carries no engine: as the installed app,
 the Store's copy installs Stockfish only when the user asks (#13).
@@ -32,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from typing import NoReturn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,13 +61,22 @@ def read(path):
         return f.read()
 
 
-def app_version():
-    """The app's version, x.y.z, as crates/app/Cargo.toml names it."""
-    package = read(os.path.join(APP, "Cargo.toml")).split("[package]", 1)[1].split("\n[", 1)[0]
-    found = re.search(r'^version = "([^"]*)"$', package, re.M)
-    if not found:
-        fail("crates/app/Cargo.toml names no version")
-    return found.group(1)
+def app_version(root=ROOT):
+    """The app's version, x.y.z, as Cargo reads it, so the one release.yml
+    takes from `cargo pkgid -p app` and checks the tag against: package.version
+    in crates/app/Cargo.toml, or the workspace's when the package inherits it."""
+    version = load_toml(os.path.join(root, "crates", "app", "Cargo.toml")).get("package", {}).get("version")
+    if version == {"workspace": True}:
+        workspace = load_toml(os.path.join(root, "Cargo.toml")).get("workspace", {})
+        version = workspace.get("package", {}).get("version")
+    if not isinstance(version, str):
+        fail("crates/app/Cargo.toml names no version, of its own or from the workspace")
+    return version
+
+
+def load_toml(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
 
 def package_version(version):
@@ -142,7 +155,12 @@ def index(folder, tool, work):
 
 def main():
     parser = argparse.ArgumentParser(description="Packs the Microsoft Store package, oschess-bridge.msix.")
-    parser.add_argument("--exe", required=True, help="the oschess-bridge.exe to pack")
+    parser.add_argument(
+        "--exe",
+        required=True,
+        help="the tray app, packed as oschess-bridge.exe: the release's oschess-bridge.exe"
+        " or a cargo build's oschess-bridge-app.exe",
+    )
     parser.add_argument("--out", required=True, help="the .msix to write; its folder also gets the staging folder")
     parser.add_argument("--makeappx", help="makeappx.exe, instead of the newest Windows SDK's")
     parser.add_argument("--makepri", help="makepri.exe, instead of the newest Windows SDK's")

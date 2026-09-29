@@ -3,8 +3,13 @@
 # brings and moves `rust-version` in Cargo.toml to the same version: nothing
 # builds with an older compiler, so the declared minimum is this channel. CI
 # fails when the two differ.
+#
+# The targets: x86_64-pc-windows-msvc, the Windows app's, and
+# x86_64-pc-windows-gnu, for which scripts/clippy-windows.sh checks the
+# Windows code from Linux. rustup installs both with the toolchain, on every
+# machine and runner, so no step or recipe adds either by hand.
 [toolchain]
 channel = "1.98.1"
 profile = "minimal"
 components = ["clippy", "rustfmt"]
-targets = ["x86_64-pc-windows-msvc"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]

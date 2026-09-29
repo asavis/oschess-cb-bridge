@@ -2,7 +2,9 @@
 
 import importlib.util
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,52 @@ SPEC.loader.exec_module(msix)
 
 def parts(version):
     return tuple(int(part) for part in version.split("."))
+
+
+def write(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+class AppVersion(unittest.TestCase):
+    """The version Cargo reads for crates/app, which release.yml checks the tag
+    against, whatever the manifest's layout."""
+
+    def version_of(self, app, workspace="[workspace]\n"):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "crates", "app"))
+            write(os.path.join(root, "Cargo.toml"), workspace)
+            write(os.path.join(root, "crates", "app", "Cargo.toml"), app)
+            return msix.app_version(root)
+
+    def test_reads_the_package_s_own_version(self):
+        app = (
+            '[package]\nname = "app"\nversion = "1.2.3" # the tag names it\nedition.workspace = true\n\n'
+            '[dependencies]\nbridge = { version = "0.1.0", path = "../bridge" }\n'
+        )
+        self.assertEqual(self.version_of(app), "1.2.3")
+
+    def test_reads_the_workspace_s_version_when_the_package_inherits_it(self):
+        app = '[package]\nname = "app"\nversion.workspace = true\n'
+        workspace = '[workspace]\nmembers = ["crates/*"]\n\n[workspace.package]\nversion = "2.0.1"\n'
+        self.assertEqual(self.version_of(app, workspace), "2.0.1")
+
+    def test_refuses_a_manifest_without_a_version(self):
+        for app in ['[package]\nname = "app"\n', '[package]\nname = "app"\nversion.workspace = true\n']:
+            with self.assertRaises(SystemExit, msg=app):
+                self.version_of(app)
+
+    @unittest.skipUnless(shutil.which("cargo"), "needs cargo")
+    def test_reads_the_version_release_yml_takes_from_cargo(self):
+        # release.yml: version=$(cargo pkgid -p app | sed 's/.*[#@]//')
+        pkgid = subprocess.run(
+            ["cargo", "pkgid", "-p", "app", "--locked", "--offline"],
+            cwd=msix.ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(msix.app_version(), re.sub(r".*[#@]", "", pkgid))
 
 
 class PackageVersion(unittest.TestCase):

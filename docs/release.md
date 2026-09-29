@@ -23,7 +23,8 @@ jobs, in order:
    `crates/app/Cargo.toml`, and that the updater secret and the public key in
    `crates/app/tauri.conf.json` agree. It then builds `oschess-bridge.exe`
    with the Tauri CLI named in the workflow (`TAURI_CLI_VERSION`, the CLI of the
-   `tauri` crates in `Cargo.lock`).
+   `tauri` crates in `Cargo.lock`: built with the same `tauri-utils`, which
+   the `ci` workflow checks on every merge).
 2. **sign-exe**: SignPath signs the executable, once signing is on.
 3. **bundle**: builds the installer around that executable.
 4. **sign-installer**: SignPath signs the installer, once signing is on.
@@ -90,6 +91,17 @@ When something is wrong, delete the draft and the tag
 (`git push origin :refs/tags/v0.2.0`), fix it in a pull request, and tag again.
 Never move or reuse the tag of a published release: checksums, installed apps
 and links refer to it.
+
+## Pinned actions
+
+`ci.yml` and `release.yml` pin every action by commit, with its version in a
+comment, and repeat that pin at each step that uses it: `actions/checkout` and
+`actions/upload-artifact` in both workflows, `actions/download-artifact` and
+the SignPath action in `release.yml`. No bot updates them, since nothing here
+may be started by anyone else ([CLAUDE.md](../CLAUDE.md), "Checks"). Moving an
+action is a pull request that changes every copy of its pin, commit and
+version comment together; `grep -n 'uses:' .github/workflows/*.yml` lists
+them all.
 
 ## Switching on signing
 
@@ -242,8 +254,10 @@ The Store takes a package version whose first part is above 0, whose parts
 are at most 65535 and whose fourth part is 0. The package version is the
 app's with a fourth part of 0, so the Store shows the version the app does:
 1.0.0 packs as 1.0.0.0. The app went from 0.1.0 straight to 1.0.0 for its
-first Store release, and `scripts/msix.py` refuses a 0.x version.
-`scripts/test_msix.py` pins that mapping, and CI runs it.
+first Store release, and `scripts/msix.py` refuses a 0.x version. The app's
+version is the one Cargo reads for `crates/app`, which the build job checks
+the tag against. `scripts/test_msix.py` pins that reading and the mapping, and
+CI runs it.
 
 The identity comes from three repository variables, all public values from
 Partner Center's product identity page:
@@ -264,12 +278,17 @@ stays out of the release.
 ### Trying a package by hand
 
 On a Windows 11 computer with Developer Mode on (Settings → System → For
-developers) and the Windows SDK, pack a local build with the test identity and
-register the staged folder, which needs no signature. `--stage-only` fills and
-indexes the folder and stops before packing it:
+developers) and the Windows SDK, pack a local build of the tray app with the
+test identity and register the staged folder, which needs no signature. After
+`cargo build --release` the tray app is `target\release\oschess-bridge-app.exe`,
+the file the `ci` workflow uploads from `main` too; the `oschess-bridge.exe`
+beside it is the console bridge (`crates/bridge`), since only the release's
+Tauri CLI build gives the tray app that name. `scripts/msix.py` packs the file
+it is given as `oschess-bridge.exe`, and `--stage-only` fills and indexes the
+folder and stops before packing it:
 
 ```
-python scripts/msix.py --exe target\release\oschess-bridge.exe --out msix-test\oschess-bridge.msix --stage-only
+python scripts/msix.py --exe target\release\oschess-bridge-app.exe --out msix-test\oschess-bridge.msix --stage-only
 ```
 ```
 powershell -Command "Add-AppxPackage -Register msix-test\msix-stage\AppxManifest.xml"
