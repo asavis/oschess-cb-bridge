@@ -129,18 +129,18 @@ with them.
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
-| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer, `state: "indexing"` with `progress` while its position index is built |
-| 409 | `superseded` | A newer search (`q`) on the same database replaced this one while it ran; the page shows the newer answer |
+| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer and the games of a position, `state: "indexing"` with `progress` while the position index is built |
+| 409 | `superseded` | A newer search (`q` or `fen`) on the same database replaced this one while it ran; the page shows the newer answer |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
-| 422 | `unsupported` | The explorer's position or variant is Chess960, which the position index does not hold; `variant` names it |
+| 422 | `unsupported` | The position or variant of the explorer or of `fen` is Chess960, which the position index does not hold; `variant` names it |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it with the database's `id`, in `bridge.log` in its data folder and, in a console, on standard error |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
-| 503 | `index_unavailable` | The position index could not be built; the message says why, and the next request after a minute tries again |
+| 503 | `index_unavailable` | The position index could not be built; the message says why, too little free disk space among the reasons, and the next request after a minute tries again |
 | 503 | `busy` | Too many open connections, too many large answers being sent at once, or search memory taken by other searches; `Retry-After: 1` |
 
 ## Database identity and generations
@@ -198,7 +198,10 @@ databases of up to about 89 million records. A Mega Database of 12 million
 records needs about 330 MB with three sort orders and the suggestion counts.
 The position index's move stream is not in the budget: it is mapped
 read-only, and its pages are the operating system's file cache, which drops
-them when memory is short and reads them again when they are needed.
+them when memory is short and reads them again when they are needed. The games
+of a position that a list is narrowed to (`fen`) are in the budget: one bit
+per record while they are found, and 4 bytes a game in the list kept for
+paging.
 
 Passes over a database run on workers shared by all requests: the machine's
 cores, at most 16, or `OSCHESS_BRIDGE_THREADS`. A search takes the workers that
@@ -217,14 +220,15 @@ fewer workers, down to one.
 
 A client names its searches' stream with the `stream` parameter: 1 to 64
 characters of `A-Z`, `a-z`, `0-9`, `-` and `_`, chosen by the client, for
-example one per browser tab and list. A request that carries `q` and a
-`stream` supersedes the search still running in the same stream on the same
-database: that one stops at its next batch of headers and is answered
-`409 superseded`. An empty `q=` counts: clearing the search box supersedes
-the search it replaces. Other streams, requests without a `stream`, requests
-without `q`, and suggestions are never superseded, so a page in one tab never
-stops a search another tab still waits for. A database remembers its 256
-most recently used streams; a forgotten stream starts afresh.
+example one per browser tab and list. A request that carries `q` or `fen` and
+a `stream` supersedes the search still running in the same stream on the same
+database: that one stops at its next batch of headers, or of the games of a
+position it looks through, and is answered `409 superseded`. An empty `q=`
+counts: clearing the search box supersedes the search it replaces. Other
+streams, requests without a `stream`, requests without `q` or `fen`, and
+suggestions are never superseded, so a page in one tab never stops a search
+another tab still waits for. A database remembers its 256 most recently used
+streams; a forgotten stream starts afresh.
 
 ## Endpoints
 
@@ -432,7 +436,8 @@ of the same games answers, apart from what the format has otherwise:
 
 ### `GET /v1/databases/{id}/games`
 
-One window of the database's records, sorted and optionally searched.
+One window of the database's records, sorted and optionally searched or
+narrowed to the games of a position.
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -442,6 +447,8 @@ One window of the database's records, sorted and optionally searched.
 | `q` | | A search in the Library search grammar ([search-grammar.md](search-grammar.md)); `total` then counts the matches |
 | `stream` | | The client's name for this list, which lets a newer search replace an older one ([Cancellation](#cancellation)); an invalid name is `400 bad_request` |
 | `line` | | Plies of each game's main line to add to its row, 1 to 60 (below); any other value is `400 bad_request`. Without it, rows are as shown |
+| `fen` | | A position in FEN: the window holds only the games whose main line reaches it, at any ply ([Games of a position](#games-of-a-position)); `total` counts them |
+| `variant` | `standard` | With `fen`: any value other than `standard` is `422 unsupported` |
 
 Sort keys: `number`, `white`, `black`, `whiteElo`, `blackElo`, `result`,
 `moves`, `eco`, `tournament` (alias `event`), `date`, `round`, `annotator` —
@@ -482,7 +489,7 @@ and has no other key.
 
 | Field | Meaning |
 |---|---|
-| `total` | Rows matching `q` (all records without `q`) |
+| `total` | Rows matching `q` and `fen` (all records without either) |
 | `number` | The record's number in the database, from 1, as ChessBase numbers it |
 | `kind` | `game`, `text` (a guiding text) or `analysis` |
 | `white`, `black`, `event`, `site`, `annotator` | As in the PGN tags; empty when unknown. Names are `Last, First`; a classic database's annotator is as stored |
@@ -518,6 +525,38 @@ game's PGN has them in full. A window therefore stays small however long a
 name stored in the database is. Rows, like searches, read a name's entity
 record to at most 4 KiB; a longer record, which only a damaged file holds, is
 an empty name.
+
+#### Games of a position
+
+With `fen`, the list holds the games the explorer counts for that position
+(`GET /v1/databases/{id}/explorer`): each game whose main line reaches it at
+any ply, once; standard chess only, from the standard start or a set-up
+position; never a deleted game, a guiding text or an analysis. `q` narrows
+them further, a game matching both; `sort`, `offset`, `limit`, `stream` and
+`line` apply as without `fen`, and `total` counts the games that match both.
+
+The answer acknowledges the position:
+
+    "position": { "fen": "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", "games": 1234567 }
+
+`fen` is the position as the bridge writes it; `games` counts its games
+before `q`, the explorer's `games`. A bridge older than this parameter
+ignores it and answers the whole list without `position`: a client that sent
+`fen` and finds no `position` treats the list as not filtered.
+
+The games of a position come from the position index. Until it is ready the
+request is answered as the explorer's is: `409 database_unavailable` with
+`state: "indexing"` and `progress`, or `503 index_unavailable` when it could
+not be built. A FEN that is not a valid position is `400 bad_request` naming
+`fen`; a Chess960 position, or a `variant` other than `standard`, is
+`422 unsupported` with `variant: "chess960"`. A position no game reaches has
+`total: 0` and no rows.
+
+The first window of a position reached by more than twelve games within its
+first 20 plies replays the first plies of the games that can reach it, some
+tens of milliseconds for the Mega Database; the result is kept with the latest
+searches, so the next windows of the same position, sort and `q` are read from
+it.
 
 ### `GET /v1/databases/{id}/games/{number}`
 
@@ -795,10 +834,13 @@ the oschess analysis panel shows it like its Lichess tabs.
   files': it writes them as `<id>.moves.partial` and `<id>.idx.partial`,
   renamed at its end, and deletes the database's former files when it
   starts. The move stream takes 64 bytes a game and 2 bytes for each ply
-  past the 21st, each game with a CRC checked whenever it is replayed; for
-  the Mega Database, some 2 GB, and its index about as much, 0.85 GB of it
-  the deep section. The stream is mapped read-only: the operating system
-  keeps as much of it in memory as it can spare, outside the search memory.
+  past the 21st, each game with a CRC checked whenever it is replayed; a list
+  of a position's games reads every game's first plies, and what it finds
+  there must be as many games as the index counts, else both files are built
+  again. For the Mega Database, the stream is some 2 GB, and its index about
+  as much, 0.85 GB of it the deep section. The stream is mapped read-only: the
+  operating system keeps as much of it in memory as it can spare, outside
+  the search memory.
   On Windows a build replaces a file still mapped by an answer in flight
   once that answer is done. When the bridge starts, after each change of the
   database list, and at least once a minute while the list is asked for, the

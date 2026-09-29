@@ -11,6 +11,7 @@ use crate::access::{Policy, Verdict, cors};
 use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
 use crate::engine::{self, Engine, Limit, Search};
+use crate::explorer;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok};
@@ -310,6 +311,16 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
         Some(Ok(n)) if (1..=MAX_LINE_PLIES).contains(&n) => Some(n),
         Some(_) => return bad_parameter("line", "line must be between 1 and 60"),
     };
+    // The games of a position (#148): its FEN checked as the explorer checks
+    // it, `variant` with it only.
+    let board = match req.param("fen") {
+        None => None,
+        Some(_) if req.param("variant").is_some_and(|v| v != "standard") => return explorer::unsupported(),
+        Some(fen) => match explorer::board(fen) {
+            Ok(board) => Some(board),
+            Err(answer) => return answer,
+        },
+    };
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
@@ -320,9 +331,21 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
         Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
     };
     app.catalog.attach_heads(entry, &open);
-    let (selection, sort) = match search::select(&open.db, &open.indexes, req.param("q"), stream, sort_param) {
+    let (db, idx, q) = (&open.db, &open.indexes, req.param("q"));
+    let selected = match &board {
+        Some(board) => {
+            let loaded = match explorer::ready(app, entry, &open) {
+                Ok(loaded) => loaded,
+                Err(answer) => return answer,
+            };
+            let games = explorer::positions::Games { loaded: &loaded, board };
+            search::select_position(db, idx, q, stream, sort_param, &games).map(|(s, sort, n)| (s, sort, Some(n)))
+        }
+        None => search::select(db, idx, q, stream, sort_param).map(|(s, sort)| (s, sort, None)),
+    };
+    let (selection, sort, games) = match selected {
         Ok(found) => found,
-        Err(e) => return search_error(entry, open.generation, e),
+        Err(e) => return search_error(app, entry, open.generation, e),
     };
     // Reserved before the rows are built and held until the answer is written.
     let size = match line {
@@ -371,14 +394,17 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
             return database_changing();
         }
     }
-    let body = Obj::new()
+    let mut body = Obj::new()
         .str("generation", &format!("{:016x}", open.generation))
         .num("total", total as i64)
         .num("offset", offset as i64)
-        .str("sort", &sort.name())
-        .raw("rows", &json::array(rows))
-        .done();
-    ok(body).holding(hold)
+        .str("sort", &sort.name());
+    // The position acknowledged, as the bridge writes it, with its games
+    // before `q`.
+    if let (Some(board), Some(games)) = (&board, games) {
+        body = body.raw("position", &Obj::new().str("fen", &board.fen()).num("games", games as i64).done());
+    }
+    ok(body.raw("rows", &json::array(rows)).done()).holding(hold)
 }
 
 fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
@@ -403,7 +429,7 @@ fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
     app.catalog.attach_heads(entry, &open);
     let list = match search::suggest(&open.db, &open.indexes, field, prefix, limit) {
         Ok(list) => list,
-        Err(e) => return search_error(entry, open.generation, e),
+        Err(e) => return search_error(app, entry, open.generation, e),
     };
     // A name escapes to at most 6 bytes a byte in JSON, and its label is shorter.
     let size = list.iter().map(|s| s.name.len() * 12 + 128).sum::<usize>() + 256;
@@ -421,7 +447,7 @@ fn valid_stream(s: &str) -> bool {
 }
 
 /// The answer to a search that could not finish.
-fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
+fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Response {
     match e {
         SearchError::Unsupported(qualifier) => {
             error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
@@ -435,6 +461,7 @@ fn search_error(entry: &Entry, generation: u64, e: SearchError) -> Response {
         SearchError::Busy => error(503, "busy", "Search memory is taken by other searches; retry"),
         SearchError::Read(e) if changing(entry, generation, &e) => database_changing(),
         SearchError::Read(e) => internal(&entry.id, &e),
+        SearchError::IndexDamaged => explorer::rebuilding(app, entry),
     }
 }
 

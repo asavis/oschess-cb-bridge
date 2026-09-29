@@ -663,7 +663,9 @@ it means the same in any position and needs no board to decode.
   search memory budget. A record is checked against its CRC whenever an
   answer reads it, its slot and its tail, which are all a replay reads: its
   number in the CRC places it, so that a slot moved elsewhere fails too. The
-  build's passes read back the records they have just written without it. A failure
+  build's passes read back the records they have just written without it, and
+  so does a list of a position's games its slots (below), whose CRCs cover
+  tails it does not read. A failure
   drops both files, and the next request rebuilds them. A torn file, which
   the build does not sync, fails the CRCs of the records it lost.
 - **Finding a position.** Of a bucket's games, a replay skips those the
@@ -685,6 +687,18 @@ it means the same in any position and needs no board to decode.
   takes fewer; each holds only what it found. A replay stops at its next
   game once its request is superseded. Moves played as often are listed in
   the order of the first game, by number, that played each.
+- **Listing a position's games** (#148). The games that reach a position
+  within the tree's plies are its notable games when it has 12 or fewer.
+  Otherwise the search workers take the stream's blocks, 4,096 games at a
+  time, and read every slot: a standard game passes the home-pawn test above
+  on its entry, then its prefix words are followed to the tree's last ply,
+  its key alone, until it reaches the position or loses a home pawn the
+  position keeps; a set-up game's record is read whole, checked against its
+  CRC, and followed from its start. The games found must be as many as the
+  tree's record counts: a slot damaged so that its game is found or missed
+  wrongly changes the count by one, and a difference drops both files as a
+  failed CRC does. The games beyond the tree's plies are those the replay
+  above finds.
 
 # The classic format (`.cbh`)
 

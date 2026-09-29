@@ -14,13 +14,14 @@ pub mod deep;
 pub mod file;
 pub mod format;
 mod map;
+pub mod positions;
 pub mod rendered;
 pub mod runs;
 pub mod source;
 pub mod stream;
 mod tree;
 
-pub use answer::{deep, render, route, stats, uci};
+pub use answer::{board, deep, ready, rebuilding, render, route, stats, uci, unsupported};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -457,6 +458,7 @@ fn describe(e: &SearchError) -> String {
         SearchError::Superseded => "the build was stopped".into(),
         SearchError::Read(e) => crate::log::error(e),
         SearchError::Unsupported(q) => q.clone(),
+        SearchError::IndexDamaged => "the position index is damaged".into(),
     }
 }
 

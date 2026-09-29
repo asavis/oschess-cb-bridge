@@ -266,7 +266,7 @@ pub(super) fn home_pawns(board: &Board) -> u16 {
 }
 
 /// The home pawns among the `white` and `black` pawns.
-fn home_of(white: Bitboard, black: Bitboard) -> u16 {
+pub(super) fn home_of(white: Bitboard, black: Bitboard) -> u16 {
     (white >> 8 & 0xff | (black >> 48 & 0xff) << 8) as u16
 }
 
@@ -694,7 +694,7 @@ impl Stream {
     }
 
     /// Record `number`, checked against its CRC.
-    fn record(&self, number: u32) -> Result<Record<'_>, Bad> {
+    pub(super) fn record(&self, number: u32) -> Result<Record<'_>, Bad> {
         let (slot, tail) = self.place(number)?;
         if record_crc(number, &slot[..CRC_AT], tail) != u32_at(slot, CRC_AT) {
             return Err(Bad::Corrupt("stream record"));
@@ -709,6 +709,23 @@ impl Stream {
     pub(super) fn written(&self, number: u32) -> Result<Record<'_>, Bad> {
         let (slot, tail) = self.place(number)?;
         Ok(Record::of(slot, tail))
+    }
+
+    /// The number of block `block`'s first record, and the slots of its
+    /// records in order, as a scan of every game reads them (#148): placed
+    /// within the file, but not checked against their CRCs, which cover their
+    /// tails too, and which a scan of every slot would read whole.
+    pub(super) fn slots(&self, block: usize) -> Result<(u32, impl Iterator<Item = Slot<'_>>), Bad> {
+        let &at = self.blocks.get(block).ok_or(Bad::Corrupt("stream block"))?;
+        // Every block but the last holds BATCH records; each block's slots lie
+        // before the table, checked when it opened.
+        let first = block as u64 * BATCH as u64;
+        let count = self.header.records().saturating_sub(first).min(BATCH as u64) as usize;
+        let bytes =
+            self.map.bytes().get(at as usize..at as usize + count * SLOT_BYTES).ok_or(Bad::Corrupt("stream block"))?;
+        let number =
+            u32::try_from(u64::from(self.header.first_record) + first).map_err(|_| Bad::Corrupt("stream block"))?;
+        Ok((number, bytes.as_chunks::<SLOT_BYTES>().0.iter().map(Slot::of)))
     }
 
     /// The slot and the tail of record `number`, within the file.
@@ -795,6 +812,26 @@ impl Stream {
                 return Ok(None);
             }
         }
+    }
+}
+
+/// A record's slot alone: its entry, and the words of its prefix.
+pub(super) struct Slot<'a> {
+    pub entry: Entry,
+    prefix: &'a [u8],
+}
+
+impl<'a> Slot<'a> {
+    fn of(slot: &'a [u8; SLOT_BYTES]) -> Slot<'a> {
+        let entry = Entry::decode(slot);
+        let words = usize::from(entry.plies).min(PREFIX_WORDS);
+        Slot { entry, prefix: &slot[PREFIX_AT..PREFIX_AT + 2 * words] }
+    }
+
+    /// The line's first words, up to [`PREFIX_WORDS`]: a set-up game's follow
+    /// its start, which its tail holds.
+    pub fn words(&self) -> impl Iterator<Item = u16> + use<'a> {
+        self.prefix.as_chunks::<2>().0.iter().map(|w| u16::from_le_bytes(*w))
     }
 }
 

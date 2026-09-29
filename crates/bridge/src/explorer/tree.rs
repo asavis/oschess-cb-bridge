@@ -188,7 +188,7 @@ fn board_piece(p: movetable::Piece) -> Piece {
 /// when a pawn of the side to move stands beside the pawn that has just
 /// stepped two squares: the pawns followed tell.
 #[derive(Clone, Copy)]
-struct Keys {
+pub(super) struct Keys {
     /// The key without its en passant part, and that part, 0 for none.
     key: u64,
     en_passant: u64,
@@ -204,7 +204,7 @@ impl Keys {
     /// The key of `board` to follow; `None` for a castling rook off its
     /// corner, which a start the stream keeps never has
     /// ([`stream::board_of`]).
-    fn of(board: &Board) -> Option<Keys> {
+    pub(super) fn of(board: &Board) -> Option<Keys> {
         let mut rights = 0;
         for color in [Color::White, Color::Black] {
             for (side, file) in [(CastleSide::Short, 7), (CastleSide::Long, 0)] {
@@ -220,18 +220,23 @@ impl Keys {
         Some(Keys { key: board.hash() ^ en_passant, en_passant, rights, pawns, steps: steps() })
     }
 
-    fn hash(&self) -> u64 {
+    pub(super) fn hash(&self) -> u64 {
         self.key ^ self.en_passant
+    }
+
+    /// The home pawns of the line's position ([`stream::home_pawns`]).
+    pub(super) fn home(&self) -> u16 {
+        stream::home_of(self.pawns[0], self.pawns[1])
     }
 
     /// The move `word` names, as the index packs it; `None` for a word that
     /// names no move of standard chess.
-    fn packed(&self, word: u16) -> Option<u16> {
+    pub(super) fn packed(&self, word: u16) -> Option<u16> {
         self.steps.get(usize::from(word)).map(|s| s.mv).filter(|&mv| mv != NO_MOVE)
     }
 
     /// Plays `word`, which [`Keys::packed`] took.
-    fn play(&mut self, word: u16) {
+    pub(super) fn play(&mut self, word: u16) {
         let Some(&s) = self.steps.get(usize::from(word)) else { return };
         // Both sides' pawns at once, without a branch, as the deep section's
         // tracker plays them: all ones in `black` when black moves.
@@ -541,7 +546,7 @@ impl Pass<'_> {
 }
 
 /// The keys of the standard start to follow.
-fn standard_keys() -> Keys {
+pub(super) fn standard_keys() -> Keys {
     static START: OnceLock<Keys> = OnceLock::new();
     *START.get_or_init(|| Keys::of(stream::standard()).expect("the standard start castles from the corners"))
 }

@@ -1,6 +1,7 @@
 //! `GET /v1/databases/{id}/explorer?fen=`: the moves played from a position
 //! and its notable games, in the shape the oschess panel's explorer tabs use.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chesscore::{Board, Move, Piece};
@@ -10,7 +11,7 @@ use cbformat::pgn::san;
 use cbformat::view::Base;
 
 use crate::api::App;
-use crate::catalog::Entry;
+use crate::catalog::{Entry, Opened};
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok};
@@ -24,7 +25,7 @@ use super::file::Bad;
 use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, structure, unpack_move};
 use super::runs::Progress;
 use super::source::average_elo;
-use super::stream::Target;
+use super::stream::{Hit, Target};
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
@@ -32,13 +33,10 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         return unsupported();
     }
     let Some(fen) = req.param("fen") else { return bad_parameter("fen", "fen is required") };
-    let Ok(board) = Board::from_fen(fen) else { return bad_parameter("fen", "fen is not a valid position") };
-    // Castling rights named by rook file are Chess960 notation, and a position
-    // whose castling needs Chess960 rules is Chess960: neither is indexed, since
-    // the Polyglot key cannot tell which rook a right belongs to.
-    if board.is_chess960() {
-        return unsupported();
-    }
+    let board = match board(fen) {
+        Ok(board) => board,
+        Err(answer) => return answer,
+    };
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => {
@@ -47,31 +45,60 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
             });
         }
     };
-    let Some(shared) = app.catalog.get(&entry.id) else { return crate::reply::not_found() };
-    match app.catalog.explorer.index(shared, &open) {
-        Lookup::Ready(loaded) => match stats(&loaded, &board, &Cancel::never()) {
-            Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
-            Err(Bad::Busy) => busy(),
-            Err(_) => {
-                app.catalog.explorer.forget(&entry.id);
-                error_with(409, "database_unavailable", "The position index is being rebuilt", |o| {
-                    o.str("state", "indexing")
-                })
-            }
-        },
-        Lookup::Pending(progress) => indexing(&progress),
-        Lookup::Failed(why) => {
-            error(503, "index_unavailable", &format!("The position index could not be built: {why}"))
-        }
-        Lookup::Busy => busy(),
+    let loaded = match ready(app, entry, &open) {
+        Ok(loaded) => loaded,
+        Err(answer) => return answer,
+    };
+    match stats(&loaded, &board, &Cancel::never()) {
+        Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
+        Err(Bad::Busy) => busy(),
+        Err(_) => rebuilding(app, entry),
     }
+}
+
+/// The position `fen` names; else its answer: `400` naming `fen` for a FEN
+/// that is not a valid position, `422 unsupported` for Chess960. Castling
+/// rights named by rook file are Chess960 notation, and a position whose
+/// castling needs Chess960 rules is Chess960: neither is indexed, since the
+/// Polyglot key cannot tell which rook a right belongs to.
+pub fn board(fen: &str) -> Result<Board, Response> {
+    let Ok(board) = Board::from_fen(fen) else { return Err(bad_parameter("fen", "fen is not a valid position")) };
+    if board.is_chess960() {
+        return Err(unsupported());
+    }
+    Ok(board)
+}
+
+/// The position index of `entry` at the generation of `open`, ready to
+/// answer; else the answer meanwhile: `409 database_unavailable` with
+/// `state: "indexing"` and the progress while it is built, `503
+/// index_unavailable` when it could not be, `503 busy` when the search memory
+/// has no room to open it.
+pub fn ready(app: &App, entry: &Entry, open: &Opened) -> Result<Arc<Loaded>, Response> {
+    let Some(shared) = app.catalog.get(&entry.id) else { return Err(crate::reply::not_found()) };
+    match app.catalog.explorer.index(shared, open) {
+        Lookup::Ready(loaded) => Ok(loaded),
+        Lookup::Pending(progress) => Err(indexing(&progress)),
+        Lookup::Failed(why) => {
+            Err(error(503, "index_unavailable", &format!("The position index could not be built: {why}")))
+        }
+        Lookup::Busy => Err(busy()),
+    }
+}
+
+/// Drops the index of `entry`, which a read found damaged, so that the next
+/// request builds it again; the answer meanwhile.
+pub fn rebuilding(app: &App, entry: &Entry) -> Response {
+    app.catalog.explorer.forget(&entry.id);
+    error_with(409, "database_unavailable", "The position index is being rebuilt", |o| o.str("state", "indexing"))
 }
 
 fn busy() -> Response {
     error(503, "busy", "The search memory is taken by searches; retry")
 }
 
-fn unsupported() -> Response {
+/// The answer for a Chess960 position or variant.
+pub fn unsupported() -> Response {
     error_with(422, "unsupported", "Chess960 positions are not indexed", |o| o.str("variant", "chess960"))
 }
 
@@ -268,14 +295,8 @@ pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<St
 }
 
 /// The games that hold `board`'s structure, only those that hold it beyond
-/// the tree's plies when `beyond`, and that reach `target`, replayed from the
-/// move stream ([`IndexFile::deep_games`] names the candidates): on the
-/// calling thread, taken as one of the shared workers, when one worker would
-/// take them all, else on at most half of them, so that searches keep the
-/// rest; `None` when none does. Either waits for its first worker as a
-/// search does, and is `Busy` when none comes free.
-///
-/// [`IndexFile::deep_games`]: super::file::IndexFile::deep_games
+/// the tree's plies when `beyond`, and that reach `target`, counted as
+/// [`stats`] counts them; `None` when none does.
 fn replay(
     loaded: &Loaded,
     board: &Board,
@@ -283,45 +304,8 @@ fn replay(
     beyond: bool,
     cancel: &Cancel,
 ) -> Result<Option<Found>, Bad> {
-    let (games, _memory) = loaded.base.deep_games(structure(board), beyond)?;
-    if games.is_empty() {
-        return Ok(None);
-    }
-    if games.len() <= DEEP_GAMES_PER_WORKER {
-        // Requests at once never replay on more threads than the workers.
-        let _worker = workers::one(cancel).map_err(|_| Bad::Busy)?;
-        let _memory = Hold::reserve(Found::BYTES).map_err(|_| Bad::Busy)?;
-        let mut found = Found::new().ok_or(Bad::Busy)?;
-        for &game in &games {
-            if cancel.is_cancelled() {
-                return Err(Bad::Busy);
-            }
-            find(loaded, game, target, &mut found)?;
-        }
-        return Ok(Some(found).filter(|found| found.counts.games > 0));
-    }
-    let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
-    let next = AtomicUsize::new(0);
-    let parts = workers::run(want, Found::BYTES, cancel, |w| {
-        let mut found = Found::new().ok_or(SearchError::Busy)?;
-        loop {
-            let from = next.fetch_add(DEEP_GAMES_AT_ONCE, Ordering::Relaxed);
-            let Some(taken) = games.get(from..(from + DEEP_GAMES_AT_ONCE).min(games.len())) else { break };
-            for &game in taken {
-                if w.stopped() || cancel.is_cancelled() {
-                    return Err(SearchError::Superseded);
-                }
-                if let Err(damaged) = find(loaded, game, target, &mut found) {
-                    return Ok(Err(damaged));
-                }
-            }
-        }
-        Ok(Ok(found))
-    })
-    .map_err(|_| Bad::Busy)?;
     let mut all: Option<Found> = None;
-    for part in parts {
-        let part = part?;
+    for part in replay_with(loaded, board, target, beyond, cancel, &Counted)? {
         match &mut all {
             Some(all) => all.merge(&part),
             None => all = Some(part),
@@ -330,15 +314,99 @@ fn replay(
     Ok(all.filter(|all| all.counts.games > 0))
 }
 
-/// Replays game `game`'s line to `target`, and adds the game to `found` when
-/// it reaches it.
-fn find(loaded: &Loaded, game: u32, target: &Target, found: &mut Found) -> Result<(), Bad> {
-    if let Some(hit) = loaded.stream.find(game, target)? {
+/// What the replays of a position's candidates keep of the games that reach
+/// it: a part for each worker, which [`Keep::BYTES`] bounds.
+pub(super) trait Keep: Sync {
+    type Part: Send;
+    /// What a part takes at most, which a worker reserves before it starts.
+    const BYTES: usize;
+    /// A part, allocated fallibly.
+    fn part(&self) -> Option<Self::Part>;
+    /// Adds game `game`, which reached the position as `hit` says, to `part`.
+    fn add(&self, part: &mut Self::Part, game: u32, hit: Hit);
+}
+
+/// The explorer's counts, moves and notable games.
+struct Counted;
+
+impl Keep for Counted {
+    type Part = Found;
+    const BYTES: usize = Found::BYTES;
+
+    fn part(&self) -> Option<Found> {
+        Found::new()
+    }
+
+    fn add(&self, found: &mut Found, game: u32, hit: Hit) {
         let mut counts = Counts::default();
         counts.add(hit.outcome);
         found.add(hit.mv, &counts, (hit.elo, game), game);
     }
-    Ok(())
+}
+
+/// The games that hold `board`'s structure, only those that hold it beyond
+/// the tree's plies when `beyond`, replayed to `target` from the move stream
+/// ([`IndexFile::deep_games`] names the candidates), each that reaches it
+/// kept by `keep` in the part of the worker that replayed it: on the calling
+/// thread, taken as one of the shared workers, when one worker would take
+/// them all, else on at most half of them, so that searches keep the rest.
+/// The parts; none when no game holds the structure. Either waits for its
+/// first worker as a search does, and is `Busy` when none comes free. A
+/// replay stops at its next game once `cancel` is, and the answer is then
+/// `Busy`; a stream found damaged is `Corrupt`.
+///
+/// [`IndexFile::deep_games`]: super::file::IndexFile::deep_games
+pub(super) fn replay_with<K: Keep>(
+    loaded: &Loaded,
+    board: &Board,
+    target: &Target,
+    beyond: bool,
+    cancel: &Cancel,
+    keep: &K,
+) -> Result<Vec<K::Part>, Bad> {
+    let (games, _memory) = loaded.base.deep_games(structure(board), beyond)?;
+    if games.is_empty() {
+        return Ok(Vec::new());
+    }
+    let find = |game: u32, part: &mut K::Part| -> Result<(), Bad> {
+        if let Some(hit) = loaded.stream.find(game, target)? {
+            keep.add(part, game, hit);
+        }
+        Ok(())
+    };
+    if games.len() <= DEEP_GAMES_PER_WORKER {
+        // Requests at once never replay on more threads than the workers.
+        let _worker = workers::one(cancel).map_err(|_| Bad::Busy)?;
+        let _memory = Hold::reserve(K::BYTES).map_err(|_| Bad::Busy)?;
+        let mut part = keep.part().ok_or(Bad::Busy)?;
+        for &game in &games {
+            if cancel.is_cancelled() {
+                return Err(Bad::Busy);
+            }
+            find(game, &mut part)?;
+        }
+        return Ok(vec![part]);
+    }
+    let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
+    let next = AtomicUsize::new(0);
+    let parts = workers::run(want, K::BYTES, cancel, |w| {
+        let mut part = keep.part().ok_or(SearchError::Busy)?;
+        loop {
+            let from = next.fetch_add(DEEP_GAMES_AT_ONCE, Ordering::Relaxed);
+            let Some(taken) = games.get(from..(from + DEEP_GAMES_AT_ONCE).min(games.len())) else { break };
+            for &game in taken {
+                if w.stopped() || cancel.is_cancelled() {
+                    return Err(SearchError::Superseded);
+                }
+                if let Err(damaged) = find(game, &mut part) {
+                    return Ok(Err(damaged));
+                }
+            }
+        }
+        Ok(Ok(part))
+    })
+    .map_err(|_| Bad::Busy)?;
+    parts.into_iter().collect()
 }
 
 /// UCI with castling as the king's two-square step (`e1g1`, `e1c1`), for a
