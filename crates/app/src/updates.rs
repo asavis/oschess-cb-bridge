@@ -83,6 +83,38 @@ pub fn idle(view: &View, installing: bool) -> bool {
     !view.busy && !installing
 }
 
+/// What a look in the Store channel does with what it found (#153). The
+/// Store installs a packaged app's update only while the app is closed, and
+/// the bridge runs in the tray all the time, so the app installs its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreStep {
+    /// No update waits; a look the user asked for says so.
+    Latest,
+    /// Windows installs updates silently for this user («Update apps
+    /// automatically» on, a network that is not metered): wait until the
+    /// bridge is idle, then install; Windows closes the bridge and starts it
+    /// again.
+    InstallQuietly,
+    /// Windows would not install silently, and the user asked: the bridge's
+    /// page in the Microsoft Store opens, where «Update» installs it.
+    OpenStore,
+    /// Windows would not install silently, and nobody asked: a notification
+    /// says an update waits, or that it is required when the submission marks
+    /// it mandatory.
+    Tell { mandatory: bool },
+}
+
+/// The step for a look that `found` an update or not, when Windows allows
+/// `silent` installs, the update is `mandatory`, and the user `asked`.
+pub fn store_step(found: bool, silent: bool, mandatory: bool, asked: bool) -> StoreStep {
+    match (found, silent, asked) {
+        (false, _, _) => StoreStep::Latest,
+        (true, true, _) => StoreStep::InstallQuietly,
+        (true, false, true) => StoreStep::OpenStore,
+        (true, false, false) => StoreStep::Tell { mandatory },
+    }
+}
+
 /// Notes in `dir` that `version` is being installed. The error names the
 /// note by its file name alone: it goes to the log, which holds no path
 /// (#117).
@@ -302,5 +334,28 @@ mod tests {
         }
         assert!(dir.join(NOTE).is_dir(), "the folder in its way is left");
         let _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// What a Store look does: an update installs silently whenever Windows
+    /// allows it, asked or not and mandatory or not; otherwise a look on
+    /// request opens the Store, and an automatic one tells, saying whether the
+    /// update is required.
+    #[test]
+    fn a_store_look_installs_quietly_whenever_windows_allows_it() {
+        use StoreStep::*;
+        // found, silent, mandatory, asked → step
+        let cases = [
+            (false, true, false, true, Latest),
+            (false, false, true, false, Latest),
+            (true, true, false, false, InstallQuietly),
+            (true, true, true, true, InstallQuietly),
+            (true, false, false, true, OpenStore),
+            (true, false, true, true, OpenStore),
+            (true, false, false, false, Tell { mandatory: false }),
+            (true, false, true, false, Tell { mandatory: true }),
+        ];
+        for (found, silent, mandatory, asked, step) in cases {
+            assert_eq!(store_step(found, silent, mandatory, asked), step, "{found} {silent} {mandatory} {asked}");
+        }
     }
 }

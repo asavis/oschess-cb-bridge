@@ -39,6 +39,9 @@
   "toast.update.installing": "Updating the bridge to {version}…",
   "toast.update.failed.title": "The bridge could not be updated",
   "toast.update.failed.body": "Try again later.",
+  "toast.update.waiting.title": "Bridge {version} is available",
+  "toast.update.required.title": "The bridge needs updating to {version}",
+  "toast.update.waiting.body": "Open the bridge in the Microsoft Store and choose “Update”.",
 
   "flyout.working": "running",
   "flyout.notWorking": "not running",

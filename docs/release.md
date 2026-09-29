@@ -190,8 +190,15 @@ need our own signature first. The package holds the same `oschess-bridge.exe`
 as the installer, and the app tells where it came from by its package identity
 (`crates/app/src/channel.rs`). In the Store's copy:
 
-- the Store updates the package, so the app registers no updater and shows no
-  update controls;
+- the app looks for updates through the Store API instead of the updater
+  plugin (#153), on the same schedule and with the same menu entry and
+  settings. The Store would install a packaged app's update only while the app
+  is closed, and the bridge runs in the tray all the time. When Windows
+  allows silent installs («Update apps automatically» on and a network that
+  is not metered), the app installs the update itself once it is idle;
+  Windows closes it for the install and starts it again. Otherwise an
+  automatic look notifies that an update waits, and «Check for updates» opens
+  the bridge's page in the Store app, where «Update» installs it;
 - «Start with Windows» enables the package's startup task instead of writing
   the Run value, which inside a package Windows would never read at sign-in. A
   task the user turned off in Windows' Startup apps settings can only be turned
@@ -254,8 +261,10 @@ powershell -Command "Add-AppxPackage -Register msix-test\msix-stage\AppxManifest
 Start «oschess bridge» from the Start menu, then check the list below, and
 remove it with `Get-AppxPackage oschess.bridge.test | Remove-AppxPackage`:
 
-- the settings show no update controls, and the tray menu has no «Check for
-  updates»;
+- the settings show «Update automatically» and «Check now», the tray menu has
+  «Check for updates», and a look answers «No updates» (a package registered
+  by hand has no Store listing to update from, so the silent install itself
+  is tried with the Store build, below);
 - «Install Stockfish» downloads, checks and chooses the pinned build, and
   analysis works with it;
 - «Start with Windows» turns the task on and off (Settings → Apps → Startup
@@ -276,3 +285,23 @@ remove it with `Get-AppxPackage oschess.bridge.test | Remove-AppxPackage`:
    Pricing: free. Then submit it for certification.
 
 Later versions are submitted the same way, with the package from each release.
+
+### Hotfix
+
+Every submission, an update's included, is certified again: up to three
+business days, often a few hours; no option shortens it. What else a fix
+waits for:
+
+1. **Publishing.** Since Submission 2, a submission publishes as soon as it
+   passes certification, with no «Publish now» hold; keep it that way.
+   Publishing takes minutes, and the listing follows in about 15.
+2. **Installed copies.** The Store API sees an update a couple of hours after
+   it passes, and the app looks every six hours, so a copy installs it within
+   about eight hours, or at once from «Check for updates».
+3. **Mandatory updates.** For a fix that cannot wait, tick «Make this update
+   mandatory» on the submission's Packages page. A copy that cannot install
+   silently then says the update is required instead of that one waits.
+
+A fix that must reach users faster belongs in the web app where it can, which
+deploys without the Store, or in the GitHub release, which the direct channel
+installs within six hours. The Store channel follows with its certification.

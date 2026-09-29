@@ -5,6 +5,7 @@ mod autostart;
 mod commands;
 mod package;
 mod server;
+mod store_updates;
 mod system;
 mod tray;
 mod updater;
@@ -51,7 +52,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
     // Only with a real key in tauri.conf.json: the placeholder keeps updates
-    // off. The Store updates its package itself.
+    // off. The Store's package looks through the Store instead (#153).
     if let Some(updater) = updater::plugin(context.config()).filter(|_| !channel().is_store()) {
         builder = builder.plugin(updater);
     }

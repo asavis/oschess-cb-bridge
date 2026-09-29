@@ -2,7 +2,7 @@
 
 The texts for the bridge's Partner Center submission (#112,
 [release.md](release.md#microsoft-store)), Ukrainian first. They describe the
-Store's copy, which the Store updates.
+Store's copy, which updates itself through the Store (#153).
 
 ## Properties
 
