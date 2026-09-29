@@ -80,9 +80,10 @@ impl Registry {
         *lock(&self.dir) = Some(dir);
     }
 
-    /// Where index files are kept; the data folder's `pgn` unless set.
+    /// Where index files are kept; the data folder's `pgn`
+    /// ([`crate::folders::pgn_dir`]) unless set.
     pub fn dir(&self) -> Option<PathBuf> {
-        lock(&self.dir).clone().or_else(|| crate::token::data_dir().map(|d| d.join("pgn")))
+        lock(&self.dir).clone().or_else(|| crate::folders::data_dir().map(|d| crate::folders::pgn_dir(&d)))
     }
 
     /// The queue builds run in.

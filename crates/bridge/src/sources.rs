@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use cbformat::dbitems;
 
@@ -15,8 +16,9 @@ use crate::config;
 pub struct Sources {
     /// ChessBase's documents folder, holding `DBItems.cbini`.
     pub chessbase: Option<PathBuf>,
-    /// `bridge.toml`; its `databases` are read again when it changes.
-    pub config: Option<PathBuf>,
+    /// `bridge.toml`, as the bridge follows it, for the engine too (#175);
+    /// its `databases` are read again when it changes.
+    pub config: Option<Arc<config::Watched>>,
     /// Databases named on the command line.
     pub fixed: Vec<PathBuf>,
 }
@@ -69,8 +71,8 @@ impl Sources {
     /// The `databases` of `bridge.toml`, as written; empty when there is no
     /// file. Read through `config::read`, the one reader of the file (#70).
     pub fn configured(&self) -> Result<Vec<PathBuf>, String> {
-        let Some(path) = &self.config else { return Ok(Vec::new()) };
-        config::read(path).map(|c| c.map(|c| c.databases).unwrap_or_default())
+        let Some(file) = &self.config else { return Ok(Vec::new()) };
+        config::read(file.path()).map(|c| c.map(|c| c.databases).unwrap_or_default())
     }
 }
 
@@ -115,9 +117,9 @@ pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
 #[derive(Default)]
 pub(crate) struct Read {
     window: Kept<Vec<Listed>>,
-    /// `bridge.toml`, followed as every reader of it does (#70); made on the
-    /// first update.
-    config: Option<config::Watched>,
+    /// What the list has seen of the changes of `bridge.toml`, which it
+    /// follows as every reader of it does (#70).
+    config: config::Seen,
     /// The `databases` it names, as last read.
     configured: Vec<PathBuf>,
     /// The databases of each configured path.
@@ -131,8 +133,8 @@ impl Read {
         let mut changed =
             self.window.update(signature(window_file.as_deref()), &dbitems::FILE_NAME, || sources.window());
         let configured = match &sources.config {
-            Some(path) => {
-                let look = self.config.get_or_insert_with(|| config::Watched::new(path.clone())).look();
+            Some(file) => {
+                let look = file.look(&mut self.config);
                 changed |= look.changed;
                 look.config.databases
             }

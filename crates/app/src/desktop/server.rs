@@ -131,7 +131,7 @@ impl Shared {
     }
 
     pub fn config_path(&self) -> Result<PathBuf, String> {
-        Ok(self.dir()?.join("bridge.toml"))
+        Ok(self.dir()?.join(config::FILE_NAME))
     }
 }
 
@@ -142,7 +142,7 @@ fn failed(port: u16, reason: String) -> View {
 /// Starts serving from `dir`, waiting up to [`PORT_WAIT`] for a port that is
 /// taken.
 fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
-    let port = match config::load(&dir.join("bridge.toml")) {
+    let port = match config::load(&dir.join(config::FILE_NAME)) {
         Ok(config) => config.port,
         Err(e) => {
             bridge::log!("the bridge cannot start: {}", e.logged());

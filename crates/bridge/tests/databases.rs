@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use bridge::access::Policy;
 use bridge::api::App;
 use bridge::catalog::{Catalog, Entry, State, id_of};
+use bridge::config::Watched;
 use bridge::fetch::Cloud;
 use bridge::server;
 use bridge::sources::Sources;
@@ -67,7 +68,8 @@ impl Root {
     }
 
     fn sources(&self) -> Sources {
-        Sources { chessbase: Some(self.chessbase()), config: Some(self.path("bridge.toml")), fixed: Vec::new() }
+        let config = Arc::new(Watched::new(self.path("bridge.toml")));
+        Sources { chessbase: Some(self.chessbase()), config: Some(config), fixed: Vec::new() }
     }
 }
 
@@ -697,7 +699,8 @@ fn files_that_are_not_regular_are_never_opened() {
             catalog.entries().iter().map(|e| (e.name.clone(), e.state().name())).collect();
         let games = catalog.get(&companion_id).unwrap().open_to_read().err();
         let ready = catalog.get(&good_id).unwrap().open_to_read().is_ok();
-        let config = Sources { config: Some(pipe_config.clone()), ..Sources::default() }.configured().is_err();
+        let pipe = Sources { config: Some(Arc::new(Watched::new(pipe_config.clone()))), ..Sources::default() };
+        let config = pipe.configured().is_err();
         let startup = bridge::config::load_or_create(&pipe_config).is_err();
         tx.send((listed, games, ready, config, startup)).unwrap();
     });

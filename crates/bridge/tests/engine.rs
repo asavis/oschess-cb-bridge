@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::Catalog;
+use bridge::config::Watched;
 use bridge::engine::{self, Engine, EngineConfig};
 use bridge::sources::Sources;
 
@@ -383,7 +384,7 @@ fn the_engine_follows_bridge_toml() {
         std::thread::sleep(Duration::from_millis(20));
     };
     write("port = 39581\n");
-    let (port, app) = start(Engine::following(toml.clone(), Duration::from_millis(50)));
+    let (port, app) = start(Engine::following(Arc::new(Watched::new(toml.clone())), Duration::from_millis(50)));
     assert!(!app.engine.is_configured());
     let first = fake_copy(&dir, "engine-a");
     write(&engine_line(&first));
@@ -411,9 +412,10 @@ fn the_engine_follows_bridge_toml() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The database list and the engine read `bridge.toml` alike (#70): a file
-/// that cannot be parsed keeps the databases and the engine read before, and
-/// the next good file sets both.
+/// The database list and the engine read `bridge.toml` alike (#70), through
+/// the one reader of it a start gives both (#175): a file that cannot be
+/// parsed keeps the databases and the engine read before, and the next good
+/// file sets both, whichever of them reads it.
 #[test]
 fn a_broken_file_keeps_the_databases_and_the_engine() {
     let dir = std::env::temp_dir().join(format!("bridge-broken-{}", std::process::id()));
@@ -431,11 +433,12 @@ fn a_broken_file_keeps_the_databases_and_the_engine() {
         std::fs::rename(&part, &toml).unwrap();
     };
     replace(&file(&first, "Old.2cbh"));
+    let watched = Arc::new(Watched::new(toml.clone()));
     let catalog = Catalog::with_sources(
-        Sources { config: Some(toml.clone()), ..Sources::default() },
+        Sources { config: Some(Arc::clone(&watched)), ..Sources::default() },
         Arc::new(bridge::fetch::System),
     );
-    let engine = Engine::following(toml.clone(), Duration::from_secs(3600));
+    let engine = Engine::following(watched, Duration::from_secs(3600));
     let names = || catalog.entries().iter().filter(|e| e.listed()).map(|e| e.name.clone()).collect::<Vec<_>>();
     assert_eq!(names(), ["Old"]);
     assert_eq!(engine.name().as_deref(), Some("engine-c"));
@@ -463,7 +466,7 @@ fn a_failed_read_is_tried_again_and_a_pipe_is_never_read() {
     let first = fake_copy(&dir, "engine-a");
     let second = fake_copy(&dir, "engine-b");
     std::fs::write(&toml, engine_line(&first)).unwrap();
-    let engine = Engine::following(toml.clone(), Duration::from_secs(3600));
+    let engine = Engine::following(Arc::new(Watched::new(toml.clone())), Duration::from_secs(3600));
     assert_eq!(engine.name().as_deref(), Some("engine-a"));
     std::thread::sleep(Duration::from_millis(20));
     std::fs::write(&toml, engine_line(&second)).unwrap();
