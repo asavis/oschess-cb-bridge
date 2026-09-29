@@ -1,5 +1,6 @@
 //! Responses in the shape `docs/api.md` specifies.
 
+use crate::catalog::State;
 use crate::http::Response;
 use crate::json::Obj;
 
@@ -26,4 +27,10 @@ pub fn bad_parameter(parameter: &str, message: &str) -> Response {
 
 pub fn not_found() -> Response {
     error(404, "not_found", "No such resource")
+}
+
+/// `409 database_unavailable` for a database that is not ready, with the
+/// `state` it is in.
+pub fn unavailable(state: State) -> Response {
+    error_with(409, "database_unavailable", "The database is not ready", |o| o.str("state", state.name()))
 }

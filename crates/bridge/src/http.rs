@@ -39,6 +39,13 @@ impl Request {
     pub fn segments(&self) -> Option<Vec<String>> {
         self.path.split('/').skip(1).map(|s| decode(s, false)).collect()
     }
+
+    /// `GET target` read as the server reads it, with `Host` its only header:
+    /// for the tests of what an endpoint makes of its parameters.
+    #[cfg(test)]
+    pub(crate) fn get(target: &str) -> Request {
+        parse(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1").as_bytes()).expect("a well-formed request")
+    }
 }
 
 /// Why no request could be read from a connection.
@@ -143,14 +150,8 @@ impl Conn {
     /// `application/x-ndjson`, and closes the body when it returns. The
     /// connection is not reused afterwards.
     pub fn write_stream(&mut self, response: &Response, body: Stream) -> io::Result<()> {
-        let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
-        for (name, value) in &response.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str(
-            "Content-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        );
-        self.stream.write_all(head.as_bytes())?;
+        let framing = "Content-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\n";
+        self.stream.write_all(head(response, framing, false).as_bytes())?;
         self.stream.flush()?;
         let mut chunks = Chunks { stream: &mut self.stream, failed: false };
         body(&mut chunks);
@@ -162,21 +163,30 @@ impl Conn {
     }
 
     pub fn write(&mut self, response: &Response, keep_alive: bool) -> io::Result<()> {
-        let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
-        for (name, value) in &response.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
+        let mut framing = String::new();
         if !response.body.is_empty() {
-            head.push_str("Content-Type: application/json; charset=utf-8\r\n");
+            framing.push_str("Content-Type: application/json; charset=utf-8\r\n");
         }
-        head.push_str(&format!(
-            "Content-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: {}\r\n\r\n",
-            response.body.len(),
-            if keep_alive { "keep-alive" } else { "close" }
-        ));
-        write_both(&mut self.stream, head.as_bytes(), response.body.as_bytes())?;
+        framing.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+        write_both(&mut self.stream, head(response, &framing, keep_alive).as_bytes(), response.body.as_bytes())?;
         self.stream.flush()
     }
+}
+
+/// The head of `response`: the status line, the response's own headers, then
+/// `framing`, the headers that say how its body is sent, and last the headers
+/// every answer carries, ending the head.
+fn head(response: &Response, framing: &str, keep_alive: bool) -> String {
+    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
+    for (name, value) in &response.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(framing);
+    head.push_str(&format!(
+        "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: {}\r\n\r\n",
+        if keep_alive { "keep-alive" } else { "close" }
+    ));
+    head
 }
 
 /// Writes `head` then `body` as one vectored write, so that they usually leave
@@ -287,6 +297,7 @@ fn reason(status: u16) -> &'static str {
         421 => "Misdirected Request",
         422 => "Unprocessable Content",
         431 => "Request Header Fields Too Large",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     }
@@ -446,5 +457,46 @@ mod tests {
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 3").err(), Some(ReadError::Body));
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked").err(), Some(ReadError::Body));
         assert!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 0").is_ok());
+    }
+
+    /// The bytes a client reads when `send` writes to the connection accepted
+    /// from it.
+    fn written(send: impl FnOnce(&mut Conn)) -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut conn = Conn::new(listener.accept().unwrap().0);
+        send(&mut conn);
+        drop(conn);
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    /// Every head is the status line with its reason phrase, `502` among them
+    /// (#173), the answer's own headers, how its body is sent, and the headers
+    /// every answer carries.
+    #[test]
+    fn heads_are_written_whole() {
+        let shared = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
+        let json =
+            written(|c| c.write(&Response::json(502, r#"{"a":1}"#.into()).header("Vary", "Origin"), true).unwrap());
+        assert_eq!(
+            json,
+            format!(
+                "HTTP/1.1 502 Bad Gateway\r\nVary: Origin\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 7\r\n{shared}Connection: keep-alive\r\n\r\n{{\"a\":1}}"
+            )
+        );
+        let empty = written(|c| c.write(&Response::empty(204), false).unwrap());
+        assert_eq!(empty, format!("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n{shared}Connection: close\r\n\r\n"));
+        let lines = written(|c| {
+            let body: Stream = Box::new(|sink: &mut dyn Sink| sink.line("{}").unwrap());
+            c.write_stream(&Response::empty(200).header("Vary", "Origin"), body).unwrap();
+        });
+        assert_eq!(
+            lines,
+            format!(
+                "HTTP/1.1 200 OK\r\nVary: Origin\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\n{shared}Connection: close\r\n\r\n3\r\n{{}}\n\r\n0\r\n\r\n"
+            )
+        );
     }
 }

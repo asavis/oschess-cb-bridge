@@ -84,7 +84,14 @@ pub fn replace(dir: &Path) -> io::Result<String> {
 }
 
 pub fn is_valid(token: &str) -> bool {
-    token.len() == TOKEN_LEN && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    token.len() == TOKEN_LEN && is_base64url(token)
+}
+
+/// Whether `s` holds only the characters of base64url: `A-Z`, `a-z`, `0-9`,
+/// `-` and `_`. A client's stream name is made of the same (`docs/api.md`,
+/// "Cancellation").
+pub(crate) fn is_base64url(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn base64url(bytes: &[u8]) -> String {
