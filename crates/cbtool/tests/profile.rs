@@ -210,3 +210,62 @@ fn rows_taken_before_the_background_build_starts_say_so() {
         assert!(row.ends_with(" before the build"), "{row}");
     }
 }
+
+/// Every bridge a profile starts keeps its indexes in the one `--index`
+/// folder, and sweeps it as it starts of the partial files there, which only
+/// the process writing them can tell from abandoned ones (#191). So one
+/// bridge runs at a time: the one before has ended when the next starts.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_bridge_runs_at_a_time() {
+    use cbformat::fixture::{Builder, quiet};
+    use cbformat::movetable::{self, Color, Piece};
+    use std::process::Stdio;
+
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
+    b.game(e4);
+    b.game(e4);
+    let db = b.write("cbtool-profile-one-bridge");
+    let out = db.dir().join("profile.txt");
+    let mut profile = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+        .arg("profile")
+        .arg(db.dir().join("db.2cbh"))
+        .arg("--index")
+        .arg(db.dir().join("index"))
+        .stdout(std::fs::File::create(&out).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (mut started, mut most) = (std::collections::HashSet::new(), 0);
+    let status = loop {
+        if let Some(status) = profile.try_wait().unwrap() {
+            break status;
+        }
+        let running = children(profile.id());
+        most = most.max(running.len());
+        started.extend(running);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(status.success(), "{text}");
+    // The first bridge, the one after it, and one for each names flow.
+    assert!(started.len() >= 4, "{started:?}\n{text}");
+    assert_eq!(most, 1, "bridges running at once\n{text}");
+}
+
+/// The processes running now whose parent is `parent`.
+#[cfg(target_os = "linux")]
+fn children(parent: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let child = |e: std::fs::DirEntry| {
+        let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+        let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+        // `pid (name) state ppid …`, where the name may hold spaces and
+        // parentheses.
+        let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+        let (state, ppid) = (fields.next()?, fields.next()?.parse::<u32>().ok()?);
+        (ppid == parent && state != "Z").then_some(pid)
+    };
+    entries.flatten().filter_map(child).collect()
+}

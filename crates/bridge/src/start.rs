@@ -184,14 +184,19 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failure> {
         fixed: options.databases.clone(),
     };
     let link = pairing::link(web, &token, config.port);
-    let app = App {
-        engine: Engine::from_config_file(file),
-        ..App::new(
-            options.version.unwrap_or(env!("CARGO_PKG_VERSION")),
-            Policy { port: config.port, origins, token: token.clone() },
-            Catalog::with_sources(sources, Arc::new(System)),
-        )
-    };
+    let version = options.version.unwrap_or(env!("CARGO_PKG_VERSION"));
+    let policy = Policy { port: config.port, origins, token: token.clone() };
+    let app = setup(dir, version, policy, sources, Engine::from_config_file(file));
+    Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
+}
+
+/// The app of a bridge whose data folder is `dir`, serving the databases of
+/// `sources` under `policy` with `engine`: its indexes kept where that data
+/// folder keeps them, and swept of what the list no longer uses. Every start
+/// sets its bridge up here, and so do the bridges `cbtool profile` times,
+/// which serve one database with the engine they are given (#191).
+pub fn setup(dir: &Path, version: &'static str, policy: Policy, sources: Sources, engine: Engine) -> App {
+    let app = App { engine, ..App::new(version, policy, Catalog::with_sources(sources, Arc::new(System))) };
     app.catalog.use_data_dir(dir);
     // The indexes are kept apart from the data folder where it roams (#147).
     // Those kept in it before are rebuilt anyway, for the index's new
@@ -203,7 +208,7 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failure> {
         });
     }
     app.catalog.sweep_indexes();
-    Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
+    app
 }
 
 /// The origins the bridge serves under `config`, oschess's own first, and the
