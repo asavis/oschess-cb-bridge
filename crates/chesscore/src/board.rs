@@ -500,12 +500,16 @@ impl Board {
             return Err(IllegalMove::Occupied);
         }
         let occupied = self.occupied();
+        // A slider reaches a square on one of its lines when nothing stands
+        // between: one lookup, where its attacks would take a ray each way.
+        let line = attacks::direction(mv.from, mv.to);
+        let clear = attacks::between(mv.from, mv.to) & occupied == 0;
         let reachable = match piece {
             Piece::Pawn => self.pawn_reaches(mv, occupied)?,
             Piece::Knight => attacks::knight(mv.from) & mv.to.bit() != 0,
-            Piece::Bishop => attacks::bishop(mv.from, occupied) & mv.to.bit() != 0,
-            Piece::Rook => attacks::rook(mv.from, occupied) & mv.to.bit() != 0,
-            Piece::Queen => attacks::queen(mv.from, occupied) & mv.to.bit() != 0,
+            Piece::Bishop => attacks::diagonal_mask(line) != 0 && clear,
+            Piece::Rook => attacks::straight_mask(line) != 0 && clear,
+            Piece::Queen => (attacks::straight_mask(line) | attacks::diagonal_mask(line)) != 0 && clear,
             Piece::King => attacks::king(mv.from) & mv.to.bit() != 0,
         };
         if !reachable {
