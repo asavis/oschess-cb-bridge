@@ -6,6 +6,7 @@ use std::borrow::Cow;
 
 use super::bytes::be_u24;
 use super::{Database, MIN_FILE_HEADER, MoveData, Record};
+use crate::recordfile::{over_limit, span};
 use crate::{Error, Result};
 
 /// The `.cbg` bytes a buffer holds: from `at`, `len` of them.
@@ -19,9 +20,11 @@ impl Database {
     /// Reads into `buf` the `.cbg` bytes from the first to past the last move
     /// record of `records`, which are consecutive; `next` is the record after
     /// them, whose move record ends the span, or `None` at the end of the
-    /// database. `buf` grows within its capacity only; the span is `None` when
-    /// it does not fit there, when the offsets name no span, or when the
-    /// database is too large for its headers' offsets (see `.cbj`).
+    /// database. A `next` whose offset names no record ends the span where the
+    /// last move record starts, and that one is read on its own. `buf` grows
+    /// within its capacity only; the span is `None` when it does not fit
+    /// there, when the offsets name no span, or when the database is too large
+    /// for its headers' offsets (see `.cbj`).
     pub fn read_move_window(
         &self,
         records: &[Record],
@@ -31,21 +34,17 @@ impl Database {
         if self.wide.is_some() {
             return Ok(None);
         }
-        let offsets = records.iter().map(|r| u64::from(r.moves_offset())).filter(|&o| o >= MIN_FILE_HEADER);
-        let (Some(at), Some(last)) = (offsets.clone().min(), offsets.max()) else { return Ok(None) };
-        let file_len = self.moves.len()?;
-        let end = next.map(|n| u64::from(n.moves_offset())).filter(|&o| o >= MIN_FILE_HEADER).unwrap_or(file_len);
-        let end = end.max(last).min(file_len);
-        let at = at.min(file_len);
-        let Some(len) =
-            end.checked_sub(at).and_then(|l| usize::try_from(l).ok()).filter(|&l| l > 0 && l <= buf.capacity())
-        else {
+        let offset = |r: &Record| u64::from(r.moves_offset());
+        let Some(range) = span(records.iter().map(offset), next.map(offset), self.moves.len()?, MIN_FILE_HEADER) else {
+            return Ok(None);
+        };
+        let Some(len) = usize::try_from(range.end - range.start).ok().filter(|&l| l <= buf.capacity()) else {
             return Ok(None);
         };
         buf.clear();
         buf.resize(len, 0);
-        self.moves.read_into(at, buf)?;
-        Ok(Some(MoveWindow { at, len }))
+        self.moves.read_into(range.start, buf)?;
+        Ok(Some(MoveWindow { at: range.start, len }))
     }
 
     /// The move record of `record` from `window`, which `buf` holds, or `None`
@@ -75,8 +74,7 @@ impl Database {
         }
         let whole = bytes.get(rel..rel + size)?;
         if size > limit {
-            let what = format!("move record at {offset:#x}: {size} bytes, over the {limit}-byte limit");
-            return Some(Err(Error::Format(what)));
+            return Some(Err(Error::Format(format!("move record at {offset:#x}: {}", over_limit(size, limit)))));
         }
         Some(Ok(MoveData { bytes: Cow::Borrowed(whole) }))
     }
@@ -87,10 +85,8 @@ impl Database {
     pub fn read_moves_into<'a>(&self, record: &Record, limit: usize, buf: &'a mut Vec<u8>) -> Result<MoveData<'a>> {
         let (at, size) = self.move_extent(record)?;
         if size > limit || size > buf.capacity() {
-            return Err(Error::Format(format!(
-                "move record at {at:#x}: {size} bytes, over the {}-byte limit",
-                limit.min(buf.capacity())
-            )));
+            let bound = limit.min(buf.capacity());
+            return Err(Error::Format(format!("move record at {at:#x}: {}", over_limit(size, bound))));
         }
         buf.clear();
         buf.resize(size, 0);

@@ -171,6 +171,53 @@ fn a_move_record_4_gib_past_the_span_is_read_on_its_own() {
     assert_eq!(got, alone);
 }
 
+/// The record after a run whose move offset names no record says nothing of
+/// where the run's last move record ends (#166): the span a batch or a window
+/// reads then ends where that move record starts, and it alone is read on its
+/// own. A move record damaged on disk after the span was read shows which:
+/// only the one read on its own is found damaged.
+#[test]
+fn a_next_record_naming_no_move_record_ends_the_span_at_the_last_one() {
+    use std::io::{Seek, SeekFrom, Write};
+    let f = fixture(5, 0);
+    let (cbh, cbg) = (f.dir().join("db.2cbh"), f.dir().join("db.2cbg"));
+    let (original_cbh, original_cbg) = (std::fs::read(&cbh).unwrap(), std::fs::read(&cbg).unwrap());
+    // Game 5's move offset as written, then negative, 0, and inside the file
+    // header.
+    for bad in [None, Some(-1i64), Some(0), Some(11)] {
+        let mut headers = original_cbh.clone();
+        if let Some(bad) = bad {
+            headers[5 * 192 + 8..5 * 192 + 16].copy_from_slice(&bad.to_le_bytes());
+        }
+        std::fs::write(&cbh, headers).unwrap();
+        std::fs::write(&cbg, &original_cbg).unwrap();
+        let db = Database::open(f.base()).unwrap();
+        let want: Vec<Vec<Token>> = (1..=4).map(|id| tokens(&db, id)).collect();
+        let records = db.records(1, 4).unwrap();
+        let mut buf = Vec::with_capacity(1 << 16);
+        let window = db.read_move_window(&records, Some(&db.record(5).unwrap()), &mut buf).unwrap().expect("a window");
+        let batch = db.batch(1, 4).unwrap();
+        // Game 4's move record damaged on disk: its magic number.
+        let mut file = std::fs::OpenOptions::new().write(true).open(&cbg).unwrap();
+        file.seek(SeekFrom::Start(records[3].moves_offset() as u64)).unwrap();
+        file.write_all(&[0; 8]).unwrap();
+        drop(file);
+        let in_window = |id: usize| db.moves_in(window, &buf, &records[id - 1], 1 << 20);
+        let got = |data: cbformat::v2::MoveData<'_>| data.moves().unwrap().tokens().collect::<Vec<_>>();
+        for id in 1..=3 {
+            assert_eq!(got(in_window(id).expect("inside the window").unwrap()), want[id - 1], "{bad:?}");
+            assert_eq!(got(batch.moves_of(&records[id - 1]).unwrap()), want[id - 1], "{bad:?}");
+        }
+        if bad.is_some() {
+            assert!(in_window(4).is_none(), "{bad:?}");
+            assert!(batch.moves_of(&records[3]).is_err(), "{bad:?}: read on its own");
+        } else {
+            assert_eq!(got(in_window(4).expect("inside the window").unwrap()), want[3]);
+            assert_eq!(got(batch.moves_of(&records[3]).unwrap()), want[3]);
+        }
+    }
+}
+
 #[test]
 fn read_records_fills_the_callers_buffer() {
     let f = fixture(30, 0);

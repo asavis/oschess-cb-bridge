@@ -139,7 +139,7 @@ fn classic_games_are_rendered_within_the_limits() {
     for number in [2, 3] {
         let (status, body) = get(port, &format!("/v1/databases/{id}/games/{number}"));
         assert_eq!(status, 422, "{body}");
-        assert!(body.contains(r#""code":"unreadable_game""#) && body.contains("over the limit"), "{body}");
+        assert!(body.contains(r#""code":"unreadable_game""#) && body.contains("-byte limit"), "{body}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

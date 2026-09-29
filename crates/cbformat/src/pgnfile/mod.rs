@@ -40,7 +40,8 @@ use std::path::{Path, PathBuf};
 
 use crate::codepage::CodePage;
 use crate::file::DbFile;
-use crate::game::{Date, Eco, GameResult, Head, MAX_BATCH_RECORDS, Player, RecordKind, Tournament};
+use crate::game::{Date, Eco, GameResult, Head, Player, RecordKind, Tournament};
+use crate::recordfile::{RecordFile, over_limit};
 use crate::{Error, Result};
 
 use lex::Lexer;
@@ -492,9 +493,9 @@ fn write_index(
 pub struct Database {
     path: PathBuf,
     text: DbFile,
-    index: DbFile,
+    /// The index: its records, and the name table after them.
+    index: RecordFile<RECORD_SIZE>,
     index_len: u64,
-    games: u32,
     /// Players, tournaments and annotators.
     counts: [u32; 3],
     names_at: u64,
@@ -536,7 +537,8 @@ impl Database {
         {
             return Err(bad("sizes that do not fit the file"));
         }
-        Ok(Database { path: pgn.to_path_buf(), text, index: index_file, index_len, games, counts, names_at, page })
+        let index = RecordFile::new(index_file, HEADER_SIZE, games);
+        Ok(Database { path: pgn.to_path_buf(), text, index, index_len, counts, names_at, page })
     }
 
     pub fn path(&self) -> &Path {
@@ -544,7 +546,7 @@ impl Database {
     }
 
     pub fn record_count(&self) -> u32 {
-        self.games
+        self.index.count()
     }
 
     /// The code page of games that are not UTF-8.
@@ -554,38 +556,27 @@ impl Database {
 
     /// The record of 1-based game `id`.
     pub fn record(&self, id: u32) -> Result<Record> {
-        if id == 0 || id > self.games {
-            return Err(Error::NoSuchGame(id));
-        }
-        let mut b = [0; RECORD_SIZE];
-        self.index.read_into(record_at(id), &mut b)?;
-        Ok(Record { id, b })
+        Ok(Record { id, b: self.index.record(id)? })
     }
 
     /// Reads records from `first` into `buf`, as many as it holds up to the
     /// last, in one read; how many it read, none when `first` is 0 or past
     /// the end. It allocates nothing.
     pub fn read_records(&self, first: u32, buf: &mut [u8]) -> Result<u32> {
-        if first == 0 || first > self.games {
-            return Ok(0);
-        }
-        let fits = u32::try_from(buf.len() / RECORD_SIZE).unwrap_or(u32::MAX);
-        let count = fits.min(self.games - first + 1);
-        self.index.read_into(record_at(first), &mut buf[..count as usize * RECORD_SIZE])?;
-        Ok(count)
+        self.index.read_records(first, buf)
     }
 
     /// Records `first..=last`, clamped to the database and to
-    /// [`MAX_BATCH_RECORDS`] records, in one read.
+    /// [`crate::game::MAX_BATCH_RECORDS`] records, in one read.
     pub fn records(&self, first: u32, last: u32) -> Result<Vec<Record>> {
-        let first = first.max(1);
-        let last = last.min(self.games).min(first.saturating_add(MAX_BATCH_RECORDS - 1));
-        if first > last {
-            return Ok(Vec::new());
-        }
-        let mut buf = vec![0u8; (last - first + 1) as usize * RECORD_SIZE];
-        self.index.read_into(record_at(first), &mut buf)?;
-        Ok(buf.as_chunks::<RECORD_SIZE>().0.iter().zip(first..=last).map(|(b, id)| Record { id, b: *b }).collect())
+        self.index.records(first, last, Record::from_bytes)
+    }
+
+    /// `first..=last` clamped as [`Database::records`] clamps it: within the
+    /// database and at most [`crate::game::MAX_BATCH_RECORDS`] long, with
+    /// `first` at least 1.
+    pub(crate) fn clamp(&self, first: u32, last: u32) -> (u32, u32) {
+        self.index.clamp(first, last)
     }
 
     pub fn players(&self) -> u32 {
@@ -603,12 +594,12 @@ impl Database {
     /// Entry `n` of the name table's texts, read to at most `limit` bytes; a
     /// longer text, which only a damaged index holds, is empty.
     fn name(&self, n: u64, limit: usize) -> Result<String> {
-        let e = self.index.read(self.names_at + n * ENTRY_SIZE, ENTRY_SIZE as usize)?;
+        let e = self.index.file().read(self.names_at + n * ENTRY_SIZE, ENTRY_SIZE as usize)?;
         let (at, len) = (le_u64(&e, 0), le_u32(&e, 8) as usize);
         if len > limit || at.checked_add(len as u64).is_none_or(|end| end > self.index_len) {
             return Ok(String::new());
         }
-        Ok(String::from_utf8_lossy(&self.index.read(at, len)?).into_owned())
+        Ok(String::from_utf8_lossy(&self.index.file().read(at, len)?).into_owned())
     }
 
     /// The table position of name `id` of `kind`; `None` for an id the table
@@ -680,7 +671,7 @@ impl Database {
     pub fn bytes_into(&self, r: &Record, limit: usize, buf: &mut Vec<u8>) -> Result<()> {
         let len = r.len() as usize;
         if len > limit {
-            return Err(Error::Format(format!("the game is {len} bytes, over the {limit}-byte limit")));
+            return Err(Error::Format(format!("the game is {}", over_limit(len, limit))));
         }
         buf.clear();
         buf.resize(len, 0);
@@ -710,8 +701,4 @@ impl Database {
         }
         Ok(out)
     }
-}
-
-fn record_at(id: u32) -> u64 {
-    HEADER_SIZE + u64::from(id - 1) * RECORD_SIZE as u64
 }

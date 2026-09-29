@@ -206,8 +206,7 @@ impl Base {
             Base::TwoCbh(db) => Batch::TwoCbh(db, db.batch(first, last)?),
             Base::Cbh(db) => Batch::Cbh(db, db.batch(first, last)?),
             Base::Pgn(db) => {
-                let first = first.max(1);
-                let last = last.min(db.record_count()).min(first.saturating_add(crate::game::MAX_BATCH_RECORDS - 1));
+                let (first, last) = db.clamp(first, last);
                 Batch::Pgn(db, first..=last)
             }
         })
@@ -250,12 +249,7 @@ impl Format {
             Format::Cbh => ("cbh", &cbh::READ, &[".cbh", ".cbg", ".cbp", ".cbt", ".cbc", ".cbs"]),
             Format::Pgn => return vec![(path.to_path_buf(), true)],
         };
-        let stem = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(main)) {
-            path.with_extension("")
-        } else {
-            path.to_path_buf()
-        };
-        let files = crate::file::with_extensions(&stem, extensions);
+        let files = crate::file::with_extensions(&crate::file::stem(path, main), extensions);
         // A missing file has no size.
         let len = |ext: &str| {
             let file = files.get(extensions.iter().position(|e| *e == ext)?)?;
@@ -278,11 +272,7 @@ pub fn format_of(path: &Path) -> Format {
     if let Some(format) = Format::of_extension(path) {
         return format;
     }
-    let with = |ext: &str| {
-        let mut s = path.as_os_str().to_owned();
-        s.push(ext);
-        PathBuf::from(s)
-    };
+    let with = |ext: &str| crate::file::with_extension(path, ext);
     if !with(".2cbh").exists() && with(".cbh").exists() { Format::Cbh } else { Format::TwoCbh }
 }
 
