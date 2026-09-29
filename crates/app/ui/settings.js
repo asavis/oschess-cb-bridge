@@ -98,8 +98,7 @@ function renderEngines(view) {
     return engineRow(f.name, `${origin} · ${f.path}`, f.path, view.chosen, f.version);
   });
   if (view.chosen && !view.found.some((f) => f.path === view.chosen)) {
-    const name = view.chosen.split(/[\\/]/).pop();
-    rows.unshift(engineRow(name, view.chosen, view.chosen, view.chosen));
+    rows.unshift(engineRow(view.chosenName, view.chosen, view.chosen, view.chosen));
   }
   document.getElementById('engines').replaceChildren(...rows);
   document.getElementById('engine-none').hidden = rows.length > 0;
@@ -126,9 +125,8 @@ function engineRow(name, detail, path, chosen, version) {
 }
 
 // One choice at a time: the controls wait from the file dialog until the
-// engine is checked, so a slower answer never replaces a later choice. A
-// refused engine names the dictionary key of its message; the list is read
-// again.
+// engine is checked, so a slower answer never replaces a later choice. After
+// a refused engine the list is read again.
 let choosing = false;
 
 // `path` gives the engine to check, or nothing (a closed file dialog).
@@ -143,12 +141,12 @@ function choose(path) {
       if (!chosen) return;
       // #73: starting an engine can take seconds; the section says so until it answers.
       line.hidden = false;
-      return call('choose_engine', { path: chosen }).then(renderEngines, (message) => {
-        notice(t(String(message)));
+      return call('choose_engine', { path: chosen }).then(renderEngines, (error) => {
+        notice(failure(error));
         return call('engines').then(renderEngines);
       });
     })
-    .catch((message) => notice(t('settings.error', { message })))
+    .catch((error) => notice(failure(error)))
     .finally(() => {
       choosing = false;
       enginesBusy(false);
@@ -182,7 +180,7 @@ function installStockfish() {
   line.textContent = t('settings.engine.progress.downloading', { done: 0, total: engines ? engines.install.megabytes : 0 });
   line.hidden = false;
   call('install_stockfish')
-    .then(renderEngines, (message) => notice(t('settings.engine.installFailed', { message: String(message) })))
+    .then(renderEngines, (error) => notice(failure(error)))
     .finally(() => {
       choosing = false;
       enginesBusy(false);
@@ -190,11 +188,11 @@ function installStockfish() {
     });
 }
 
+// The app counts the megabytes, rounded as the build's size is.
 function showInstallProgress(progress) {
   const line = document.getElementById('install-progress');
-  const mb = (bytes) => Math.round(bytes / 1048576);
   line.textContent = progress.phase === 'downloading'
-    ? t('settings.engine.progress.downloading', { done: mb(progress.done), total: mb(progress.total) })
+    ? t('settings.engine.progress.downloading', { done: progress.doneMegabytes, total: progress.totalMegabytes })
     : t(`settings.engine.progress.${progress.phase}`);
 }
 
@@ -254,8 +252,8 @@ function wire() {
   });
   form.addEventListener('submit', (e) => {
     e.preventDefault();
-    call('set_port', { port: input.value }).then(restarting, (message) => {
-      error.textContent = t(String(message));
+    call('set_port', { port: input.value }).then(restarting, (failed) => {
+      error.textContent = failure(failed);
       error.hidden = false;
     });
   });
@@ -268,8 +266,8 @@ async function revealCode(shown) {
     try {
       const pairing = await call('pairing_code');
       document.getElementById('code').textContent = pairing.code;
-    } catch (message) {
-      notice(t('settings.error', { message }));
+    } catch (error) {
+      notice(failure(error));
       return;
     }
   }
@@ -290,7 +288,15 @@ function notice(text) {
 }
 
 function act(promise) {
-  return promise.catch((message) => notice(t('settings.error', { message })));
+  return promise.catch((error) => notice(failure(error)));
+}
+
+// A failure in words, translated here only. The app answers every failure
+// with the dictionary key of its message and the values it names; anything
+// else, such as an error of this script, is shown inside the general message.
+function failure(error) {
+  if (typeof error?.key === 'string') return t(error.key, error.values);
+  return t('settings.error', { message: error });
 }
 
 main();

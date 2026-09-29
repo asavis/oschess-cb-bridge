@@ -4,9 +4,11 @@
 //! stays in the engine list either way.
 //!
 //! Also the offer of the pinned Stockfish build in place of an older chosen
-//! one, and putting it off until the next bridge version. The settings
-//! window's commands hand in what needs Windows, the installation and the
-//! engine's probe, so that all of this is tested on every system.
+//! one, putting it off until the next bridge version, and the engine
+//! section's view, whose names and numbers are made here so that the window
+//! only shows them. The settings window's commands hand in what needs
+//! Windows, the installation and the engine's probe, so that all of this is
+//! tested on every system.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +16,8 @@ use std::sync::{Mutex, PoisonError};
 
 use bridge::config;
 use bridge::engines::Found;
-use bridge::stockfish;
+use bridge::stockfish::{self, Build, Progress};
+use serde::Serialize;
 
 use crate::prefs;
 
@@ -51,15 +54,15 @@ impl Choices {
     /// Chooses `engine` in the `bridge.toml` at `config_path` once `probe`
     /// accepts it; a refusal is answered as `probe` gives it, and nothing is
     /// saved.
-    pub fn choose(
+    pub fn choose<E: From<String>>(
         &self,
         config_path: &Path,
         engine: PathBuf,
-        probe: impl FnOnce(&Path) -> Result<(), String>,
-    ) -> Result<(), String> {
+        probe: impl FnOnce(&Path) -> Result<(), E>,
+    ) -> Result<(), E> {
         let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
         probe(&engine)?;
-        self.save(config_path, engine)
+        Ok(self.save(config_path, engine)?)
     }
 
     /// Installs Stockfish with `install`, which answers the executable, then
@@ -111,20 +114,26 @@ impl Choices {
 /// Stockfish build in its place: the chosen engine is an older Stockfish
 /// ([`stockfish::offer`]), the pinned build is not installed in the data
 /// folder `data` (it would be in the list already), and the offer was not put
-/// off for the `running` bridge version. The chosen engine is named as `found`
-/// names it, else after its file.
+/// off for the `running` bridge version. The chosen engine is named as
+/// `name_of` names it.
 pub fn offer_for(data: &Path, chosen: Option<&Path>, found: &[Found], running: &str) -> Option<String> {
     let chosen = chosen?;
-    let name = match found.iter().find(|f| f.path.as_os_str() == chosen.as_os_str()) {
+    let name = name_of(chosen, found);
+    let build = stockfish::offer(Some((chosen, &name)))?;
+    let dismissed = prefs::load(data).stockfish_offer_dismissed.as_deref() == Some(running);
+    (!stockfish::is_installed(data, build) && !dismissed).then_some(name)
+}
+
+/// The name of the `chosen` engine: as `found` names it, else after its file
+/// without `.exe`, as the list names an engine by its file.
+fn name_of(chosen: &Path, found: &[Found]) -> String {
+    match found.iter().find(|f| f.path.as_os_str() == chosen.as_os_str()) {
         Some(f) => f.name.clone(),
         None => {
             let path = chosen.to_string_lossy();
             path.rsplit(['\\', '/']).next().unwrap_or(&path).trim_end_matches(".exe").to_string()
         }
-    };
-    let build = stockfish::offer(Some((chosen, &name)))?;
-    let dismissed = prefs::load(data).stockfish_offer_dismissed.as_deref() == Some(running);
-    (!stockfish::is_installed(data, build) && !dismissed).then_some(name)
+    }
 }
 
 /// Puts off the Stockfish offer until the next bridge version: notes in the
@@ -133,13 +142,100 @@ pub fn dismiss_offer(data: &Path, running: &str) -> Result<(), String> {
     prefs::save(data, &prefs::Prefs { stockfish_offer_dismissed: Some(running.into()), ..prefs::load(data) })
 }
 
+/// What the engine section shows: the engines found and the one chosen, the
+/// official build the bridge can install, and whether to offer it instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnginesView {
+    /// The engine `bridge.toml` names, if any.
+    chosen: Option<String>,
+    /// The chosen engine's name, as the list names it, else after its file.
+    chosen_name: Option<String>,
+    found: Vec<FoundEngine>,
+    install: Installable,
+    /// The chosen engine's name when it is an older Stockfish and the offer
+    /// was not put off for this bridge version.
+    offer_for: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Installable {
+    version: &'static str,
+    /// Its size in whole megabytes ([`stockfish::megabytes`]).
+    megabytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FoundEngine {
+    name: String,
+    path: String,
+    source: &'static str,
+    /// For a build the bridge installed: its version, whose licence the
+    /// window can open.
+    version: Option<String>,
+}
+
+impl EnginesView {
+    /// The engine section for the engines `found` and the `chosen` one, with
+    /// the offer as [`offer_for`] makes it for the data folder `data` and the
+    /// `running` bridge version.
+    pub fn new(data: &Path, chosen: Option<&Path>, found: Vec<Found>, running: &str) -> EnginesView {
+        let build = Build::for_arch(stockfish::machine_arch());
+        EnginesView {
+            chosen: chosen.map(|p| p.to_string_lossy().into_owned()),
+            chosen_name: chosen.map(|p| name_of(p, &found)),
+            offer_for: offer_for(data, chosen, &found, running),
+            install: Installable { version: build.version, megabytes: build.megabytes() },
+            found: found
+                .into_iter()
+                .map(|f| FoundEngine {
+                    name: f.name,
+                    path: f.path.to_string_lossy().into_owned(),
+                    source: f.source,
+                    version: f.version,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// An installation's progress, for the settings window: a download counts in
+/// whole megabytes, rounded as the build's size is ([`stockfish::megabytes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallProgress {
+    phase: &'static str,
+    done_megabytes: u64,
+    total_megabytes: u64,
+}
+
+impl From<Progress> for InstallProgress {
+    fn from(progress: Progress) -> InstallProgress {
+        let (phase, done, total) = match progress {
+            Progress::Downloading { done, total } => ("downloading", done, total),
+            Progress::Checking => ("checking", 0, 0),
+            Progress::Unpacking => ("unpacking", 0, 0),
+        };
+        InstallProgress {
+            phase,
+            done_megabytes: stockfish::megabytes(done),
+            total_megabytes: stockfish::megabytes(total),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use serde_json::json;
+
     use super::*;
+    use crate::settings::Failure;
 
     fn folder(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bridge-app-choices-{name}-{}", std::process::id()));
@@ -273,7 +369,9 @@ mod tests {
 
     /// One installation at a time. An installation that fails, or whose build
     /// does not answer, chooses nothing and leaves the next free to start; an
-    /// engine the probe refuses is not chosen either.
+    /// engine the probe refuses is not chosen either, and the refusal is
+    /// answered as the probe gives it, while a choice that cannot be saved
+    /// fails with the general message.
     #[test]
     fn a_failed_installation_or_a_refused_engine_chooses_nothing() {
         let dir = folder("failed");
@@ -292,9 +390,12 @@ mod tests {
         assert!(!choices.installing());
         let silent = choices.install(&toml, || Ok(PathBuf::from("stockfish.exe")), |_| Err("no uciok".into()));
         assert_eq!(silent, Err("no uciok".into()));
-        let refused = choices.choose(&toml, PathBuf::from("notes.txt"), |_| Err("settings.engine.refused".into()));
-        assert_eq!(refused, Err("settings.engine.refused".into()));
+        let refused =
+            choices.choose(&toml, PathBuf::from("notes.txt"), |_| Err(Failure::new("settings.engine.refused")));
+        assert_eq!(refused, Err(Failure::new("settings.engine.refused")));
         assert_eq!(engine_in(&toml), None);
+        let unsaved = choices.choose(&dir, PathBuf::from("lc0.exe"), |_| Ok::<(), Failure>(()));
+        assert_eq!(unsaved.map_err(|f| f.key), Err("settings.error"), "the folder is no bridge.toml");
         assert!(!choices.installing());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -346,6 +447,61 @@ mod tests {
         assert_eq!(offer_for(&dir, chosen, &found, "1.2.1"), None);
         assert_eq!(offer_for(&dir, Some(Path::new(r"C:\x\stockfish_16_x64.exe")), &found, "1.2.1"), None);
         assert_eq!(offer_for(&dir, chosen, &found, "1.3.0").as_deref(), Some("Stockfish 17.1"), "the next version");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine section as the window shows it (#186): the chosen engine
+    /// named as the offer names it, also when it is not in the list; the
+    /// build's size and a download's progress in whole megabytes, rounded up
+    /// alike, so that the progress ends on the size the section named.
+    #[test]
+    fn the_engine_section_comes_named_and_counted() {
+        let dir = folder("view");
+        let found = vec![listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe")];
+        let view = |chosen: Option<&str>| {
+            serde_json::to_value(EnginesView::new(&dir, chosen.map(Path::new), found.clone(), "1.2.1")).unwrap()
+        };
+        let unlisted = view(Some(r"C:\x\stockfish_16_x64.exe"));
+        assert_eq!(unlisted["chosen"], r"C:\x\stockfish_16_x64.exe");
+        assert_eq!(unlisted["chosenName"], "stockfish_16_x64");
+        assert_eq!(unlisted["offerFor"], unlisted["chosenName"], "the offer names it alike");
+        let chosen = view(Some(r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"));
+        assert_eq!(chosen["chosenName"], "Stockfish 17.1");
+        assert_eq!(
+            chosen["found"],
+            json!([{
+                "name": "Stockfish 17.1",
+                "path": r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe",
+                "source": "ChessBase",
+                "version": null,
+            }])
+        );
+        let none = view(None);
+        for field in ["chosen", "chosenName", "offerFor"] {
+            assert!(none[field].is_null(), "{field}");
+        }
+        let build = Build::for_arch(stockfish::machine_arch());
+        assert_eq!(none["install"], json!({ "version": build.version, "megabytes": build.megabytes() }));
+
+        let progress = |p: Progress| serde_json::to_value(InstallProgress::from(p)).unwrap();
+        for build in &stockfish::PINNED {
+            let (start, end) = (
+                progress(Progress::Downloading { done: 0, total: build.size }),
+                progress(Progress::Downloading { done: build.size, total: build.size }),
+            );
+            assert_eq!(
+                start,
+                json!({ "phase": "downloading", "doneMegabytes": 0, "totalMegabytes": build.megabytes() })
+            );
+            assert_eq!(end["doneMegabytes"], build.megabytes(), "{:?}", build.arch);
+        }
+        // The ARM64 build's 76.48 MB are 77, as its size is shown, not 76.
+        assert_eq!(progress(Progress::Downloading { done: 1, total: 80_190_536 })["totalMegabytes"], 77);
+        assert_eq!(
+            progress(Progress::Checking),
+            json!({ "phase": "checking", "doneMegabytes": 0, "totalMegabytes": 0 })
+        );
+        assert_eq!(progress(Progress::Unpacking)["phase"], "unpacking");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

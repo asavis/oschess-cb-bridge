@@ -3,6 +3,7 @@
 
 use bridge::catalog::State;
 use bridge::snapshot::Snapshot;
+use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use crate::i18n::Strings;
@@ -38,8 +39,9 @@ fn state_name<S: Serializer>(state: &State, out: S) -> Result<S::Ok, S::Error> {
     out.serialize_str(state.name())
 }
 
-/// A download's bytes on this computer and in all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// A download's bytes on this computer and in all. The windows get its
+/// [`Progress::percent`] with them and show that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     pub present: u64,
     pub total: u64,
@@ -49,6 +51,16 @@ impl Progress {
     /// Whole percent, never 100 before the last byte.
     pub fn percent(self) -> u64 {
         if self.present >= self.total { 100 } else { (self.present * 100 / self.total).min(99) }
+    }
+}
+
+impl Serialize for Progress {
+    fn serialize<S: Serializer>(&self, out: S) -> Result<S::Ok, S::Error> {
+        let mut fields = out.serialize_struct("Progress", 3)?;
+        fields.serialize_field("present", &self.present)?;
+        fields.serialize_field("total", &self.total)?;
+        fields.serialize_field("percent", &self.percent())?;
+        fields.end()
     }
 }
 
@@ -374,7 +386,7 @@ mod tests {
             [0, 33, 42, 99, 100, 100, 100]
         );
         let json = serde_json::to_string(&downloading(5, 10).databases[0]).unwrap();
-        assert!(json.ends_with(r#""size":10,"progress":{"present":5,"total":10}}"#), "{json}");
+        assert!(json.ends_with(r#""size":10,"progress":{"present":5,"total":10,"percent":50}}"#), "{json}");
     }
 
     #[test]

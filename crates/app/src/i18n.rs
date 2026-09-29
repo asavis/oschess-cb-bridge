@@ -127,10 +127,18 @@ mod tests {
     }
 
     /// Every key the windows name, in `data-i18n*` attributes and `t(…)` or
-    /// `plural(…)` calls, and every key the Rust side names, is in the dictionary.
+    /// `plural(…)` calls, and every key the Rust side names, is in the
+    /// dictionary: in the calls that translate it, in the failures the
+    /// commands answer (#186), or held in a variable first, such as a
+    /// notification's title picked by a condition.
     #[test]
     fn every_key_in_use_exists() {
         let known = keys(Lang::Uk);
+        let sections: BTreeSet<&str> = known.iter().filter_map(|k| k.split_once('.')).map(|(s, _)| s).collect();
+        // Literals that begin like a section of the dictionary but name a
+        // file, such as `app.json` or `tray.rs`: no key ends in these.
+        let file = |literal: &str| matches!(literal.rsplit('.').next(), Some("rs" | "js" | "json" | "html" | "toml"));
+        assert!(!known.iter().any(|k| file(k)), "a key ends like a file name");
         let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
         let mut used = BTreeSet::new();
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -146,8 +154,18 @@ mod tests {
                 for call in ["data-i18n=\"", "data-i18n-title=\"", "data-i18n-label=\"", "t('"] {
                     used.extend(quoted_after(&text, call));
                 }
-                for call in ["strings.get(\"", "strings.fill(\""] {
+                for call in ["strings.get(\"", "strings.fill(\"", "Failure::new(\"", "Failure::with(\""] {
                     used.extend(quoted_after(&text, call));
+                }
+                if ext == "rs" {
+                    for literal in quoted_after(&text, "\"") {
+                        let section = literal.split('.').next().unwrap_or_default();
+                        // A plural's base names its forms, which `plural` finds.
+                        let plural = known.contains(&format!("{literal}.one"));
+                        if sections.contains(section) && !file(&literal) && !plural {
+                            used.insert(literal);
+                        }
+                    }
                 }
                 for call in ["plural('", "strings.plural(\""] {
                     for base in quoted_after(&text, call) {
@@ -159,6 +177,9 @@ mod tests {
         let missing: Vec<_> = used.iter().filter(|k| !known.contains(*k)).collect();
         assert!(missing.is_empty(), "keys in use but not in the dictionary: {missing:?}");
         assert!(used.len() > 40, "the scan found only {} keys", used.len());
+        for (key, how) in [("settings.port.error", "answered as a failure"), ("toast.update.required.title", "held")] {
+            assert!(used.contains(key), "the scan misses a key {how}: {key}");
+        }
     }
 
     /// The text between `start` and the next quote, for every `start` in `text`

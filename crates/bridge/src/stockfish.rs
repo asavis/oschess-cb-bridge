@@ -81,8 +81,15 @@ impl Build {
 
     /// The size in whole megabytes, as the settings window shows it.
     pub fn megabytes(&self) -> u64 {
-        self.size.div_ceil(1 << 20)
+        megabytes(self.size)
     }
+}
+
+/// `bytes` in whole megabytes, rounded up, as the settings window shows a
+/// build's size and its download's progress: a size is never understated,
+/// and the progress ends on the size the window named before the download.
+pub fn megabytes(bytes: u64) -> u64 {
+    bytes.div_ceil(1 << 20)
 }
 
 /// This computer's architecture: an x86-64 bridge emulated on an ARM64
@@ -492,6 +499,9 @@ mod tests {
             assert!(build.exe.ends_with(".exe"));
         }
         assert_eq!(Build::for_arch(Arch::X86_64).megabytes(), 78);
+        // 80,190,536 bytes are 76.48 MB: rounded up to 77, never down to 76.
+        assert_eq!(Build::for_arch(Arch::Arm64).megabytes(), 77);
+        assert_eq!([0, 1, 1 << 20, (1 << 20) + 1].map(megabytes), [0, 1, 1, 2]);
     }
 
     #[test]
