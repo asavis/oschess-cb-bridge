@@ -171,6 +171,12 @@ pub(super) struct Counted {
 /// games from the standard start reach first within [`tree::SHALLOW_PLY`]
 /// plies, unless they do not fold into the room a worker has for them, when
 /// the tree's passes collect them as they do the others.
+/// Games of a batch between two looks at foreground work (#149). A batch
+/// of the stream pass runs for milliseconds on every worker, which a cold
+/// search starting meanwhile would otherwise share whole; within it a
+/// background build gives way every so many games as well.
+const GIVE_WAY_EVERY: u32 = 256;
+
 fn read_games(
     source: &dyn Source,
     plan: &Plan,
@@ -272,10 +278,16 @@ fn read_games(
             let hi = (lo + BATCH as u64 - 1).min(u64::from(plan.last));
             part.begin(lo as u32, hi as u32);
             let mut failed = None;
+            let mut since = 0;
             source.lines(lo as u32, hi as u32, MAX_PLY, &mut work, &mut |line: &Line| {
                 if failed.is_none() {
                     count(line);
                     failed = part.add(line).err();
+                }
+                since += 1;
+                if since == GIVE_WAY_EVERY {
+                    since = 0;
+                    progress.give_way();
                 }
             })?;
             match failed {
