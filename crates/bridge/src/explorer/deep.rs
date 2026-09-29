@@ -62,7 +62,8 @@ const MIN_WORKER_POSTINGS: usize = 2 * MAX_STRUCTURES;
 /// handed over once it holds half of it, even inside a bucket, and so never
 /// grows past it.
 const OUT_BYTES: usize = 1 << 20;
-/// The postings of a bucket gathered to be sorted, at most.
+/// The postings of a run of a block's buckets gathered to be sorted, at
+/// most ([`Gathered`]).
 const GATHERED: usize = 4096;
 /// What a worker holds besides its postings: the bytes it makes, its share
 /// of those kept, and a block's buffers to merge.
@@ -715,8 +716,7 @@ fn write_blocks(
         let stopped = || w.stopped() || progress.stopped();
         let mut heads: Vec<&[u64]> = Vec::new();
         heads.try_reserve_exact(buffers.len()).map_err(|_| Refused::Busy)?;
-        let mut gathered: Vec<u64> = Vec::new();
-        gathered.try_reserve_exact(GATHERED).map_err(|_| Refused::Busy)?;
+        let mut room = Gathered::new(GATHERED)?;
         loop {
             // A background build gives way to foreground work before it
             // takes its next block, so that none waits for it (#149).
@@ -750,7 +750,12 @@ fn write_blocks(
             };
             let mut bytes = Vec::new();
             let (low, high) = (from >> GAME_BITS, (to - 1) >> GAME_BITS);
+            room.count(&heads);
+            let mut gathered = low;
             for bucket in low..=high {
+                if bucket >= gathered {
+                    gathered = room.gather(&mut heads, bucket, high);
+                }
                 let (starts, ends) = (from <= bucket << GAME_BITS, to >= (bucket + 1) << GAME_BITS);
                 // Only the pass's first bucket ends inside it ([`make_room`]).
                 let count = match (starts, ends) {
@@ -758,7 +763,7 @@ fn write_blocks(
                     (true, false) => Count::First(rest),
                     (false, _) => Count::After(pass.split.last),
                 };
-                let (n, last) = put_bucket(&mut heads, bucket, count, &mut bytes, &mut gathered, &mut hand)?;
+                let (n, last) = put_bucket(&mut heads, bucket, count, &mut bytes, room.bucket(bucket), &mut hand)?;
                 kept.set(kept.get() + n);
                 // A bucket's count is its postings in every part.
                 let left = match count {
@@ -799,23 +804,108 @@ enum Count {
     After(u64),
 }
 
-/// Puts bucket `bucket`'s postings, which lie first in the sorted `heads`,
-/// to `out`, taking them off the heads: what `count` says, then each by game
-/// from the one before, handing `out` over whenever it holds half of
-/// [`OUT_BYTES`] before another. Returns the postings put and the last game.
-/// A game's postings all come from one worker's buffer, so none repeats
-/// another's, and a bucket's postings gathered from every head and sorted
-/// are in the order of the heads merged: a bucket that fits `gathered`'s
-/// capacity is sorted there, a larger one merged.
+/// A worker's room for putting a block's buckets: the block's postings
+/// counted by bucket, and those of a run of its buckets gathered from the
+/// heads, `room` at most, each bucket's together, where each starts, and the
+/// run's buckets.
+struct Gathered {
+    counts: [usize; BLOCK_BUCKETS],
+    starts: [usize; BLOCK_BUCKETS],
+    postings: Vec<u64>,
+    room: usize,
+    first: u64,
+    end: u64,
+}
+
+/// A bucket's place among its block's.
+fn local(bucket: u64) -> usize {
+    bucket as usize & (BLOCK_BUCKETS - 1)
+}
+
+impl Gathered {
+    /// Room for `room` postings.
+    fn new(room: usize) -> Result<Gathered, SearchError> {
+        let mut postings = Vec::new();
+        postings.try_reserve_exact(room).map_err(|_| Refused::Busy)?;
+        Ok(Gathered { counts: [0; BLOCK_BUCKETS], starts: [0; BLOCK_BUCKETS], postings, room, first: 0, end: 0 })
+    }
+
+    /// Counts the postings of one block in `heads` by bucket, and gathers
+    /// none yet.
+    fn count(&mut self, heads: &[&[u64]]) {
+        self.counts.fill(0);
+        for &p in heads.iter().flat_map(|h| h.iter()) {
+            self.counts[local(bucket_of(p))] += 1;
+        }
+        (self.first, self.end) = (0, 0);
+    }
+
+    /// Gathers the postings of the buckets from `bucket` on, to `high` at
+    /// most, that the room holds together, which lie first in the sorted
+    /// `heads`, and takes them off the heads: each head's once, by bucket.
+    /// A bucket that alone does not fit is left in the heads, to be merged.
+    /// The bucket after them.
+    fn gather(&mut self, heads: &mut [&[u64]], bucket: u64, high: u64) -> u64 {
+        let (mut end, mut total) = (bucket, 0);
+        while end <= high && total + self.counts[local(end)] <= self.room {
+            self.starts[local(end)] = total;
+            total += self.counts[local(end)];
+            end += 1;
+        }
+        (self.first, self.end) = (bucket, end);
+        if end == bucket {
+            return bucket + 1;
+        }
+        self.postings.clear();
+        self.postings.resize(total, 0);
+        let mut at = self.starts;
+        for h in heads.iter_mut() {
+            let k = h.iter().take_while(|&&p| bucket_of(p) < end).count();
+            for &p in &h[..k] {
+                let i = &mut at[local(bucket_of(p))];
+                if let Some(to) = self.postings.get_mut(*i) {
+                    *to = p;
+                }
+                *i += 1;
+            }
+            *h = &h[k..];
+        }
+        end
+    }
+
+    /// Bucket `bucket`'s postings, sorted, when they were gathered.
+    fn bucket(&mut self, bucket: u64) -> Option<&[u64]> {
+        if !(self.first..self.end).contains(&bucket) {
+            return None;
+        }
+        let at = self.starts[local(bucket)];
+        let postings = self.postings.get_mut(at..at + self.counts[local(bucket)])?;
+        postings.sort_unstable();
+        Some(postings)
+    }
+}
+
+/// Puts bucket `bucket`'s postings to `out`: those `gathered`, sorted, or
+/// else those which lie first in the sorted `heads`, taken off the heads.
+/// Writes what `count` says, then each by game from the one before, handing
+/// `out` over whenever it holds half of [`OUT_BYTES`] before another.
+/// Returns the postings put and the last game. A game's postings all come
+/// from one worker's buffer, so none repeats another's, and a bucket's
+/// postings gathered from every head and sorted are in the order of the
+/// heads merged: a bucket that fits a worker's room is gathered and sorted
+/// there ([`Gathered`]), a larger one merged.
 fn put_bucket(
     heads: &mut [&[u64]],
     bucket: u64,
     count: Count,
     out: &mut Vec<u8>,
-    gathered: &mut Vec<u64>,
+    gathered: Option<&[u64]>,
     hand: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), SearchError>,
 ) -> Result<(u64, u64), SearchError> {
-    let n: usize = heads.iter().map(|h| h.iter().take_while(|&&p| bucket_of(p) == bucket).count()).sum();
+    let n: usize = match gathered {
+        Some(postings) => postings.len(),
+        None => heads.iter().map(|h| h.iter().take_while(|&&p| bucket_of(p) == bucket).count()).sum(),
+    };
     let mut last = match count {
         Count::Whole => {
             varint(out, n as u64);
@@ -836,15 +926,8 @@ fn put_bucket(
         last = game;
         Ok::<(), SearchError>(())
     };
-    if n <= gathered.capacity() {
-        gathered.clear();
-        for h in heads.iter_mut() {
-            let k = h.iter().take_while(|&&p| bucket_of(p) == bucket).count();
-            gathered.extend_from_slice(&h[..k]);
-            *h = &h[k..];
-        }
-        gathered.sort_unstable();
-        for &x in gathered.iter() {
+    if let Some(postings) = gathered {
+        for &x in postings {
             put(x, out)?;
         }
     } else {
@@ -933,22 +1016,26 @@ mod tests {
         // Game 9's two postings of one print lie in different buffers here
         // only for the test: a build replays each game on one worker.
         b.retain(|&p| !(bucket_of(p) == 5 && p >> 8 & 0xffff_ffff == 9 && p >> 1 & 0x7f == 1));
-        // Each bucket sorted where it is gathered, or merged from the heads.
+        // Each bucket sorted where it is gathered, with others or alone, or
+        // merged from the heads, as a block's buckets are put.
         let mut outs = Vec::new();
-        for gathered in [Vec::with_capacity(8), Vec::new()] {
-            let mut gathered = gathered;
+        for room in [8, 2, 0] {
+            let mut room = Gathered::new(room).unwrap();
             let mut heads: Vec<&[u64]> = vec![&a, &b];
-            let mut out = Vec::new();
-            let mut kept = 0;
+            let (mut out, mut kept, mut gathered) = (Vec::new(), 0, 0);
+            room.count(&heads);
             for bucket in 0..BLOCK_BUCKETS as u64 {
+                if bucket >= gathered {
+                    gathered = room.gather(&mut heads, bucket, BLOCK_BUCKETS as u64 - 1);
+                }
                 let hand = &mut |_: &mut Vec<u8>| Ok(());
-                kept += put_bucket(&mut heads, bucket, Count::Whole, &mut out, &mut gathered, hand).unwrap().0;
+                kept += put_bucket(&mut heads, bucket, Count::Whole, &mut out, room.bucket(bucket), hand).unwrap().0;
             }
             assert_eq!(kept, 5);
             assert!(heads.iter().all(|h| h.is_empty()));
             outs.push(out);
         }
-        assert_eq!(outs[0], outs[1]);
+        assert!(outs[0] == outs[1] && outs[1] == outs[2]);
         let out = outs.swap_remove(0);
         assert_eq!(bucket_games(&out, 5, 100, 1, false), Some(vec![3, 9]));
         assert_eq!(bucket_games(&out, 5, 100, 1, true), Some(vec![3]));
@@ -1086,7 +1173,7 @@ mod tests {
             }
         }
         let all: u64 = buffers.iter().map(|b| b.len() as u64).sum();
-        let mut gathered = Vec::with_capacity(GATHERED);
+        let mut room = Gathered::new(GATHERED).unwrap();
         // Puts the bucket's postings from point `from` to `to` after
         // `bytes`, as `count` says: the postings put, the last game, and the
         // pieces handed over.
@@ -1106,7 +1193,9 @@ mod tests {
                 pieces += 1;
                 Ok(())
             };
-            let (n, last) = put_bucket(&mut heads, bucket, count, &mut out, &mut gathered, &mut hand).unwrap();
+            room.count(&heads);
+            assert_eq!(room.gather(&mut heads, bucket, bucket), bucket + 1);
+            let (n, last) = put_bucket(&mut heads, bucket, count, &mut out, room.bucket(bucket), &mut hand).unwrap();
             assert!(out.capacity() <= OUT_BYTES, "{} bytes held at once", out.capacity());
             bytes.extend(out);
             (n, last, pieces)
