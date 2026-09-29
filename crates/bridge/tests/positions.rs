@@ -434,6 +434,59 @@ fn transpositions_set_up_games_and_what_is_never_listed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A line is given up early only on what it never gets back: its men, its
+/// pawns and its home pawns, never on its pieces of one kind, which a
+/// promotion adds to (#142). So the positions after a queen was taken and a
+/// pawn promoted to a queen, with a third knight, or with a second bishop on
+/// squares of one colour list their games, and so do the positions after
+/// them: within the tree's plies, where more than twelve games reach them
+/// and the stream is scanned, and beyond them, where one game does and it is
+/// replayed.
+#[test]
+fn positions_after_a_promotion_list_their_games() {
+    // 1.e4 e5 2.Qh5 Nc6 3.Qxf7+ Kxf7 4.a4 b5 5.axb5 a6 6.bxa6 Bb7 7.axb7 Nf6
+    // 8.bxa8, at ply 15, or 23 after the knights' hops.
+    let line = "e2e4 e7e5 d1h5 b8c6 h5f7 e8f7 a2a4 b7b5 a4b5 a7a6 b5a6 c8b7 a6b7 g8f6";
+    let mut games = Vec::new();
+    for promotion in ["b7a8q", "b7a8n", "b7a8b"] {
+        let ucis = format!("{line} {promotion} f8e7 g1f3 h8f8");
+        games.extend((0..13).map(|_| Game::new(Kind::Game, None, &ucis)));
+        games.push(Game::new(Kind::Game, None, &format!("{}{ucis}", hops(2))));
+    }
+    let after = |promotion: &str| board_after(&format!("{line} {promotion}"));
+    assert_eq!(after("b7a8q").colored(CPiece::Queen, CColor::White).count_ones(), 1, "the queen taken, then a new one");
+    assert_eq!(after("b7a8n").colored(CPiece::Knight, CColor::White).count_ones(), 3, "a third knight");
+    const LIGHT: u64 = 0x55aa_55aa_55aa_55aa;
+    let bishops = after("b7a8b").colored(CPiece::Bishop, CColor::White);
+    assert_eq!((bishops & LIGHT).count_ones(), 2, "two bishops on light squares");
+    let db = database("positions-promotions", &games);
+    let dir = index_dir("promotions");
+    let (bridge, id) = serve(&db, &dir);
+    let reached = Reached::of(&games);
+    let (mut within, mut beyond) = (0, 0);
+    let mut lines: Vec<&Game> = Vec::new();
+    for g in &games {
+        if !lines.iter().any(|l| l.ucis == g.ucis) {
+            lines.push(g);
+        }
+    }
+    for g in lines {
+        let promoted_at = g.ucis.split_whitespace().position(|uci| uci.starts_with("b7a8")).unwrap() + 1;
+        for (ply, board) in g.positions().into_iter().enumerate().skip(promoted_at) {
+            let fen = board.fen();
+            let want = reached.games(&board);
+            let got = rows(&answered(bridge.port, &list(&id, &fen, "&limit=500")));
+            assert_eq!(got.iter().copied().collect::<BTreeSet<_>>(), want, "{fen}");
+            assert!(!want.is_empty(), "{fen}");
+            within += usize::from(ply <= 20 && want.len() > 12);
+            beyond += usize::from(ply > 20);
+        }
+    }
+    assert_eq!((within, beyond), (12, 12), "each promotion within the tree's plies and beyond them");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The list of a position's games is the database's list narrowed to them:
 /// by every sort key in both directions, with `q`, whose `total` counts the
 /// games matching both while `position.games` counts the position's; its
