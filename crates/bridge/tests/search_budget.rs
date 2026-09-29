@@ -10,6 +10,7 @@ use bridge::search::workers::{taken, threads};
 use bridge::search::{self, BATCH_BYTES, Indexes, SearchError, Selection, SuggestField, Suggestion};
 use cbformat::fixture::{Builder, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
+use cbformat::v2::HEADER_RECORD_SIZE;
 use cbformat::view::Base;
 
 /// The budget is one per process: its checks run one after another.
@@ -44,10 +45,12 @@ fn retained_orders_are_evicted_and_a_full_budget_answers_busy() {
     let retained = held();
     assert!(retained >= RECORDS as usize * 4);
 
-    // Leave 10 MB free besides the workers' batch buffers: an ECO order fits
-    // only once the date order is evicted, after which the budget holds the
-    // ECO order in its place.
-    let buffers = threads() * BATCH_BYTES;
+    // Leave 10 MB free besides the workers' batch buffers, one for each
+    // worker the pass takes, a chunk of records each at least: an ECO order
+    // fits only once the date order is evicted, after which the budget holds
+    // the ECO order in its place.
+    let chunks = RECORDS.div_ceil((BATCH_BYTES / HEADER_RECORD_SIZE) as u64) as usize;
+    let buffers = threads().min(chunks) * BATCH_BYTES;
     let taken = Hold::reserve(budget() - retained - buffers - (10 << 20)).unwrap();
     let scanned = idx.scanned();
     assert_eq!(order(&idx, "eco").unwrap(), RECORDS as usize);

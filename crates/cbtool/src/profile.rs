@@ -43,6 +43,17 @@ const RUNS: usize = 5;
 const ANNOTATED_SCAN: u32 = 50_000;
 /// Lookups along the most played line.
 const LOOKUPS: usize = 30;
+/// The plies of the most played line whose games are listed (#148), and
+/// what their first window takes at most on the Mega Database.
+const LIST_LINE_PLIES: [usize; 4] = [0, 6, 12, 20];
+const LIST_LINE_TARGET_MS: u32 = 150;
+/// The plies of games sampled across the database whose games are listed,
+/// and what their first window takes at most.
+const LIST_SAMPLED_PLIES: [u32; 2] = [40, 80];
+const LIST_SAMPLED_TARGET_MS: u32 = 50;
+/// What the next window of a position's games takes at most, read from the
+/// result kept.
+const LIST_NEXT_TARGET_MS: u32 = 30;
 const SORT_KEYS: [&str; 12] = [
     "number",
     "white",
@@ -741,7 +752,13 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let mut played = 0;
     let mut stop = "";
     let mut notable = Vec::new();
+    // The positions of the line whose games are listed below, by ply.
+    let mut listed: Vec<(String, u32, Vec<String>)> =
+        LIST_LINE_PLIES.iter().map(|p| (format!("line ply {p}"), LIST_LINE_TARGET_MS, Vec::new())).collect();
     for _ in 0..LOOKUPS {
+        if let Some(at) = LIST_LINE_PLIES.iter().position(|&p| p == played) {
+            listed[at].2.push(board.fen());
+        }
         let Some(body) = lookups.get(&mut c, &explorer(&board.fen()), true) else { break };
         notable.extend(objects(&body, "topGames"));
         let Some(uci) = strings(&body, "uci").into_iter().next() else {
@@ -760,10 +777,13 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     table.row("index", "lookup per move", &mut lookups, &counts);
     // Deep positions (#133): positions of games from across the database at
     // plies 30, 60 and 90, past the tree's pruning ply and past its depth;
-    // each must find at least its own game.
+    // each must find at least its own game. Their positions at plies 40 and
+    // 80 are kept for the lists below.
     let mut deep = Samples::default();
     let (mut asked, mut found) = (0, 0);
     let mut lexer = Lexer::new();
+    let mut sampled: Vec<(String, u32, Vec<String>)> =
+        LIST_SAMPLED_PLIES.iter().map(|p| (format!("sampled ply {p}"), LIST_SAMPLED_TARGET_MS, Vec::new())).collect();
     for k in 1..=8u64 {
         let n = (records / 9 * k).max(1);
         let Some((200, body)) = c.get(&format!("{base}/games/{n}"), true).ok() else { continue };
@@ -772,6 +792,9 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         main_line(pgn.as_bytes(), &mut lexer, &mut |board, mv| {
             if [30, 60, 90].contains(&ply) {
                 fens.push(board.fen());
+            }
+            if let Some(at) = LIST_SAMPLED_PLIES.iter().position(|&p| p == ply) {
+                sampled[at].2.push(board.fen());
             }
             ply += 1;
             mv.is_some()
@@ -799,6 +822,8 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let games = games.map_or(String::new(), |g| format!("{g} games reach it"));
     table.row("index", "crowded structure, first", &mut first, &games);
     table.row("index", "crowded structure", &mut crowded, "");
+    listed.extend(sampled);
+    list_positions(&mut table, &mut c, &base, &listed);
     // Each notable game the lookups named is its `/games` row whole, then its
     // year (#144): compared with its number's row, asked for once a number
     // after the lookups, so that their times stay as they were.
@@ -908,6 +933,47 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
         table.row("http", &format!("status, {case}"), &mut s, "");
     }
     Ok(!table.failed)
+}
+
+/// The games of a position (#148), for each case's positions: the first
+/// window of 200 by date, which finds the position's games, then the next
+/// one, read from the result kept. The date order is cached by the sorts
+/// before. Each list's `total` must be the explorer's `games` for the same
+/// position. The counts name what each window takes at most on the Mega
+/// Database.
+fn list_positions(table: &mut Table, c: &mut Client, base: &str, cases: &[(String, u32, Vec<String>)]) {
+    for (case, target, fens) in cases {
+        let (mut first, mut next) = (Samples::default(), Samples::default());
+        let (mut equal, mut totals) = (0, Vec::new());
+        for fen in fens {
+            let path = format!("{base}/games?fen={}&sort=date&limit=200", encode(fen));
+            let total = first.get(c, &path, true).and_then(|body| number(&body, "total"));
+            for _ in 0..RUNS {
+                next.get(c, &format!("{path}&offset=200"), true);
+            }
+            let games = match c.get(&format!("{base}/explorer?fen={}", encode(fen)), true) {
+                Ok((200, body)) => number(&body, "games"),
+                _ => None,
+            };
+            if total.is_some() && total == games {
+                equal += 1;
+            }
+            totals.push(total.map_or("-".to_string(), |t| t.to_string()));
+        }
+        let counts = match fens.len() {
+            0 => "no such position".to_string(),
+            n => {
+                if equal < n {
+                    table.failed = true;
+                }
+                format!("total = explorer's games for {equal} of {n}; totals {}; target {target} ms", totals.join(" "))
+            }
+        };
+        table.row("list", &format!("{case}, first page"), &mut first, &counts);
+        if !fens.is_empty() {
+            table.row("list", &format!("{case}, next page"), &mut next, &format!("target {LIST_NEXT_TARGET_MS} ms"));
+        }
+    }
 }
 
 /// A 5-second search from the start position, read line by line: the time to

@@ -6,6 +6,7 @@
 mod compare;
 pub mod gate;
 pub mod heads;
+mod members;
 pub mod memory;
 mod names;
 mod order;
@@ -16,6 +17,7 @@ mod sort;
 mod suggest;
 pub mod workers;
 
+pub use members::{Members, Position};
 pub use names::FILES_READ as NAME_FILES_READ;
 pub use scan::BATCH_BYTES;
 pub use suggest::{SuggestField, Suggestion, suggest};
@@ -60,8 +62,8 @@ pub struct Indexes {
     tournament_groups: Slot<Held<Groups>>,
     orders: Mutex<HashMap<Sort, Arc<OrderSlot>>>,
     counts: Slot<Held<suggest::Counts>>,
-    /// The latest searches, newest last: the query and sort, and the result.
-    results: Mutex<VecDeque<(String, Numbers)>>,
+    /// The latest searches, newest last.
+    results: Mutex<VecDeque<Kept>>,
     /// Searches started on this database, per client stream: the latest in a
     /// stream supersedes the others there.
     streams: Streams,
@@ -252,6 +254,15 @@ impl Evict for Indexes {
     }
 }
 
+/// A search kept for paging: its sort and query, the position it is narrowed
+/// to, its result, and the games of that position before the query.
+struct Kept {
+    query: String,
+    position: Option<u64>,
+    numbers: Numbers,
+    games: u64,
+}
+
 /// Which records a list request shows.
 pub enum Selection {
     /// Every record, in number order: no search and no other sort.
@@ -271,6 +282,9 @@ pub enum SearchError {
     Busy,
     /// A newer search on the same database replaced this one.
     Superseded,
+    /// The position index that finds a position's games was found damaged
+    /// (#148): it is dropped and built again.
+    IndexDamaged,
 }
 
 impl From<cbformat::Error> for SearchError {
@@ -299,7 +313,23 @@ pub fn select(
     stream: Option<&str>,
     sort_param: Option<Sort>,
 ) -> Result<(Selection, Sort), SearchError> {
-    with_store!(db, db => select_in(db, idx, q, stream, sort_param))
+    with_store!(db, db => select_in(db, idx, q, stream, sort_param, None)).map(|(s, sort, _)| (s, sort))
+}
+
+/// [`select`] among the games of `position` (#148): those `q` selects, in
+/// the same order; that order; and how many games the position has before
+/// `q`. A request with a position and a `stream` supersedes the search still
+/// running in that stream, as one with `q` does. The result is kept for the
+/// next windows under its sort, position and query.
+pub fn select_position(
+    db: &Base,
+    idx: &Indexes,
+    q: Option<&str>,
+    stream: Option<&str>,
+    sort_param: Option<Sort>,
+    position: &dyn Position,
+) -> Result<(Selection, Sort, u64), SearchError> {
+    with_store!(db, db => select_in(db, idx, q, stream, sort_param, Some(position)))
 }
 
 fn select_in<S: Store>(
@@ -308,9 +338,10 @@ fn select_in<S: Store>(
     q: Option<&str>,
     stream: Option<&str>,
     sort_param: Option<Sort>,
-) -> Result<(Selection, Sort), SearchError> {
-    let cancel = match (q, stream) {
-        (Some(_), Some(stream)) => idx.streams.newest(stream),
+    position: Option<&dyn Position>,
+) -> Result<(Selection, Sort, u64), SearchError> {
+    let cancel = match stream {
+        Some(stream) if q.is_some() || position.is_some() => idx.streams.newest(stream),
         _ => Cancel::never(),
     };
     idx.gate.enter();
@@ -319,27 +350,74 @@ fn select_in<S: Store>(
     let sort = sort_param.or(query.sort).unwrap_or(Sort::DEFAULT);
     let heads = idx.heads();
     let ctl = Control { cancel: &cancel, scanned: &idx.scanned, heads: heads.as_deref() };
-    if query.terms.is_empty() {
+    if query.terms.is_empty() && position.is_none() {
         return Ok(match sort.key {
-            SortKey::Number => (Selection::All { descending: sort.descending }, sort),
-            _ => (Selection::Numbers(idx.order(db, &ctl, sort)?), sort),
+            SortKey::Number => (Selection::All { descending: sort.descending }, sort, 0),
+            _ => (Selection::Numbers(idx.order(db, &ctl, sort)?), sort, 0),
         });
     }
     let key = format!("{}|{}", sort.name(), q.trim());
-    let kept =
-        idx.results.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone());
-    if let Some(numbers) = kept {
-        return Ok((Selection::Numbers(numbers), sort));
+    let at = position.map(|p| p.key());
+    let kept = idx
+        .results
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|k| k.query == key && k.position == at)
+        .map(|k| (k.numbers.clone(), k.games));
+    if let Some((numbers, games)) = kept {
+        // A kept result answers at once, but not a request a newer one in its
+        // stream has superseded meanwhile: that one gets `409 superseded`
+        // whether or not its result was kept (#148).
+        if cancel.is_cancelled() {
+            return Err(SearchError::Superseded);
+        }
+        return Ok((Selection::Numbers(numbers), sort, games));
     }
-    let numbers = Arc::new(search(db, idx, &ctl, &query, sort)?);
+    let members = position.map(|p| p.games(&cancel)).transpose()?;
+    let games = members.as_ref().map_or(0, Members::count);
+    // A position no game reaches needs neither a sort order nor a pass.
+    let numbers = Arc::new(match &members {
+        Some(members) if query.terms.is_empty() || games == 0 => members_in(db, idx, &ctl, members, games, sort)?,
+        members => search(db, idx, &ctl, &query, sort, members.as_ref())?,
+    });
+    drop(members);
     let mut results = idx.results.lock().unwrap_or_else(|e| e.into_inner());
-    results.push_back((key, numbers.clone()));
-    while results.len() > KEPT_RESULTS || results.iter().map(|(_, v)| v.len()).sum::<usize>() > KEPT_NUMBERS {
+    results.push_back(Kept { query: key, position: at, numbers: numbers.clone(), games });
+    while results.len() > KEPT_RESULTS || results.iter().map(|k| k.numbers.len()).sum::<usize>() > KEPT_NUMBERS {
         if results.pop_front().is_none() {
             break;
         }
     }
-    Ok((Selection::Numbers(numbers), sort))
+    Ok((Selection::Numbers(numbers), sort, games))
+}
+
+/// The `count` records of `members` in `sort` order: in number order, the
+/// set's own; in any other, the key's whole order passed through the set,
+/// which costs the same for any set.
+fn members_in<S: Store>(
+    db: &S,
+    idx: &Indexes,
+    ctl: &Control<'_>,
+    members: &Members,
+    count: u64,
+    sort: Sort,
+) -> Result<Held<Vec<u32>>, SearchError> {
+    let count = usize::try_from(count).map_err(|_| SearchError::TooLarge)?;
+    let hold = Hold::reserve(count.checked_mul(4).ok_or(SearchError::TooLarge)?)?;
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve_exact(count).map_err(|_| Refused::Busy)?;
+    match sort {
+        _ if count == 0 => {}
+        Sort { key: SortKey::Number, descending } => {
+            out.extend(members.iter().take(count));
+            if descending {
+                out.reverse();
+            }
+        }
+        _ => out.extend(idx.order(db, ctl, sort)?.iter().copied().filter(|&n| members.contains(n)).take(count)),
+    }
+    Ok(Held::new(out, hold))
 }
 
 /// Appends to a vector whose growth is reserved in the budget first.
@@ -355,12 +433,13 @@ impl<'h> scan::Visit<(Vec<u32>, Allowance<'h>)> for TitleKeys {
     }
 }
 
-/// The numbers of the records a query matches.
-struct Matching<'m, 'a>(&'m scan::Matcher<'a>);
+/// The numbers of the records a query matches, among the games of a
+/// position when one is given.
+struct Matching<'m, 'a>(&'m scan::Matcher<'a>, Option<&'m Members>);
 
 impl<'h> scan::Visit<(Vec<u32>, Allowance<'h>)> for Matching<'_, '_> {
     fn visit(&self, acc: &mut (Vec<u32>, Allowance<'h>), r: &impl Head) -> Result<(), SearchError> {
-        if self.0.matches(r) {
+        if self.1.is_none_or(|m| m.contains(r.id())) && self.0.matches(r) {
             push_u32(&mut acc.0, r.id(), &mut acc.1)?;
         }
         Ok(())
@@ -377,12 +456,15 @@ fn push_u32(v: &mut Vec<u32>, x: u32, allow: &mut Allowance<'_>) -> Result<(), R
     Ok(())
 }
 
+/// The records `query` matches, among `members` when given, in `sort` order:
+/// the pass that evaluates the query tests the membership first.
 fn search<S: Store>(
     db: &S,
     idx: &Indexes,
     ctl: &Control<'_>,
     query: &Query,
     sort: Sort,
+    members: Option<&Members>,
 ) -> Result<Held<Vec<u32>>, SearchError> {
     let uses = |fields: &[Field]| query.terms.iter().any(|t| fields.contains(&t.field));
     let load = |used: bool, kind| if used { idx.names(db, kind, ctl.cancel).map(Some) } else { Ok(None) };
@@ -405,7 +487,8 @@ fn search<S: Store>(
     let sets = Mutex::new(Hold::default());
     let matcher = scan::Matcher::new(query, &tables, &mut Allowance::new(&sets))?;
     let found = Mutex::new(Hold::default());
-    let parts = scan::scan(db, ctl, |_| Ok((Vec::new(), Allowance::new(&found))), &Matching(&matcher), |_| {})?;
+    let parts =
+        scan::scan(db, ctl, |_| Ok((Vec::new(), Allowance::new(&found))), &Matching(&matcher, members), |_| {})?;
     let parts: Vec<Vec<u32>> = parts.into_iter().map(|(numbers, _)| numbers).collect();
     let matches: usize = parts.iter().map(Vec::len).sum();
     let mut hold = Hold::reserve(matches * 4)?;

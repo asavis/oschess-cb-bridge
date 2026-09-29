@@ -17,6 +17,9 @@
 //!    Compares the games, results and moves of the explorer's answer, its
 //!    tree and its deep section together, and its notable games.
 //! 4. Times the explorer's answer for each sampled position, warm.
+//! 5. Finds the games of each sampled position as a list of them does
+//!    (#148), compares them with the brute-force count's games, one by one
+//!    through a fingerprint of the set, and times it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -155,13 +158,14 @@ impl Rng {
 }
 
 /// A position's games counted by brute force: their counts, the moves played
-/// from their first visits with theirs, and the best of them by rating, then
-/// number, best first.
+/// from their first visits with theirs, the best of them by rating, then
+/// number, best first, and the set of them.
 #[derive(Default, Clone)]
 struct Brute {
     counts: Counts,
     moves: HashMap<u16, Counts>,
     top: Vec<(u16, u32)>,
+    games: Fingerprint,
 }
 
 impl Brute {
@@ -173,6 +177,7 @@ impl Brute {
         self.top.push(best);
         self.top.sort_unstable_by(|a, b| b.cmp(a));
         self.top.truncate(TOP_GAMES);
+        self.games.add(best.1);
     }
 
     fn merge(&mut self, other: Brute) {
@@ -183,6 +188,34 @@ impl Brute {
         self.top.extend(other.top);
         self.top.sort_unstable_by(|a, b| b.cmp(a));
         self.top.truncate(TOP_GAMES);
+        self.games.merge(&other.games);
+    }
+}
+
+/// A set of game numbers in a few bytes, whatever their order: how many, their
+/// sum, and their mixed bits folded together. Two sets that differ by any
+/// game differ here but by a chance of about 2^-64.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Fingerprint {
+    count: u64,
+    sum: u64,
+    mixed: u64,
+}
+
+impl Fingerprint {
+    fn add(&mut self, game: u32) {
+        let mut z = u64::from(game).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.count += 1;
+        self.sum = self.sum.wrapping_add(u64::from(game));
+        self.mixed ^= z ^ (z >> 31);
+    }
+
+    fn merge(&mut self, other: &Fingerprint) {
+        self.count += other.count;
+        self.sum = self.sum.wrapping_add(other.sum);
+        self.mixed ^= other.mixed;
     }
 }
 
@@ -369,4 +402,32 @@ fn main() {
     times.sort_by(|a, b| a.total_cmp(b));
     let at = |q: f64| times[((times.len() as f64 - 1.0) * q) as usize];
     println!("warm answer: p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms", at(0.5), at(0.95), at(1.0));
+
+    // The games of each position as a list of them finds them (#148), the
+    // same games as the brute-force count's, and the time it takes, warm,
+    // before they are sorted or a row is read.
+    let (mut equal, mut differ) = (0, 0);
+    let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    for (key, (board, ply)) in &sample {
+        let t = Instant::now();
+        let games = explorer::positions::games(&loaded, board, &Cancel::never()).expect("games");
+        let took = t.elapsed().as_secs_f64() * 1000.0;
+        let mut got = Fingerprint::default();
+        games.iter().for_each(|game| got.add(game));
+        if got == brute.get(key).map(|b| b.games).unwrap_or_default() {
+            equal += 1;
+        } else {
+            differ += 1;
+        }
+        times[usize::from(*ply > u32::from(MAX_PLY))].push(took);
+    }
+    println!("games of a position: {equal} equal, {differ} different");
+    for ((lo, hi), mut times) in bands.iter().zip(times) {
+        if times.is_empty() {
+            continue;
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        let at = |q: f64| times[((times.len() as f64 - 1.0) * q) as usize];
+        println!("  plies {lo}-{hi}: p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms", at(0.5), at(0.95), at(1.0));
+    }
 }
