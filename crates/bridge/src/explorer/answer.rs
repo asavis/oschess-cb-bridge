@@ -2,7 +2,7 @@
 //! and its notable games, in the shape the oschess panel's explorer tabs use.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use chesscore::{Board, Move, Piece};
 
@@ -387,13 +387,11 @@ pub(super) fn replay_with<K: Keep>(
         return Ok(vec![part]);
     }
     let want = games.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
-    let next = AtomicUsize::new(0);
+    let next = workers::Parts::new(games.len().div_ceil(DEEP_GAMES_AT_ONCE));
     let parts = workers::run(want, K::BYTES, cancel, |w| {
         let mut part = keep.part().ok_or(SearchError::Busy)?;
-        loop {
-            let from = next.fetch_add(DEEP_GAMES_AT_ONCE, Ordering::Relaxed);
-            let Some(taken) = games.get(from..(from + DEEP_GAMES_AT_ONCE).min(games.len())) else { break };
-            for &game in taken {
+        while let Some(taken) = next.take(w, cancel)? {
+            for &game in games.chunks(DEEP_GAMES_AT_ONCE).nth(taken).unwrap_or_default() {
                 if w.stopped() || cancel.is_cancelled() {
                     return Err(SearchError::Superseded);
                 }

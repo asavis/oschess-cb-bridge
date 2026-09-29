@@ -125,12 +125,12 @@ fn suggest_in<S: Store>(
     let players = idx.names(db, Kind::Players, &never)?;
     let annotators = idx.names(db, Kind::Annotators, &never)?;
     let tournaments = idx.names(db, Kind::Tournaments, &never)?;
-    let player_groups = cached(&idx.player_groups, || groups(&players))?;
+    let player_groups = cached(&idx.player_groups, || groups(&players, &never))?;
     let annotator_groups = match S::ANNOTATORS_ARE_PLAYERS {
         true => player_groups.clone(),
-        false => cached(&idx.annotator_groups, || groups(&annotators))?,
+        false => cached(&idx.annotator_groups, || groups(&annotators, &never))?,
     };
-    let tournament_groups = cached(&idx.tournament_groups, || groups(&tournaments))?;
+    let tournament_groups = cached(&idx.tournament_groups, || groups(&tournaments, &never))?;
     let counts = cached(&idx.counts, || counts(db, &ctl, &player_groups, &annotator_groups, &tournament_groups))?;
     let (table, groups, games): (&NameTable, &Groups, &[u32]) = match field {
         SuggestField::Player => (&players, &player_groups, &counts.players),

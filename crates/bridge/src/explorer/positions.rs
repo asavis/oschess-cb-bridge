@@ -38,12 +38,10 @@
 //!
 //! [`Departures::allows`]: super::stream::Departures::allows
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use chesscore::Board;
 
 use crate::search::memory::Cancel;
-use crate::search::workers::{self, threads};
+use crate::search::workers;
 use crate::search::{Members, Position, SearchError};
 
 use super::Loaded;
@@ -168,29 +166,19 @@ fn scan(stream: &Stream, board: &Board, members: &Members, cancel: &Cancel) -> R
         return from_start(stream, &starts, (key, home), members, cancel);
     }
     let finding = stream.find_starts();
-    let blocks = stream.header.blocks as usize;
-    let next = AtomicUsize::new(0);
-    let found = workers::run(threads().min(blocks).max(1), 0, cancel, |w| {
+    let found = workers::each(stream.header.blocks as usize, cancel, |block| {
+        let (first, slots) = stream.slots(block).map_err(damaged)?;
+        let mut noting = finding.as_ref().map(Starts::noting);
         let mut found = 0u64;
-        loop {
-            let block = next.fetch_add(1, Ordering::Relaxed);
-            if block >= blocks {
-                return Ok(found);
+        for (number, slot) in (first..).zip(slots) {
+            if let Some(noting) = &mut noting {
+                noting.note(number, &slot.entry);
             }
-            if w.stopped() || cancel.is_cancelled() {
-                return Err(SearchError::Superseded);
-            }
-            let (first, slots) = stream.slots(block).map_err(damaged)?;
-            let mut noting = finding.as_ref().map(Starts::noting);
-            for (number, slot) in (first..).zip(slots) {
-                if let Some(noting) = &mut noting {
-                    noting.note(number, &slot.entry);
-                }
-                if reaches(stream, number, &slot, key, home).map_err(damaged)? && members.insert(number) {
-                    found += 1;
-                }
+            if reaches(stream, number, &slot, key, home).map_err(damaged)? && members.insert(number) {
+                found += 1;
             }
         }
+        Ok(found)
     })?;
     if let Some(starts) = finding {
         stream.keep(starts);
@@ -216,23 +204,14 @@ fn from_start(
 ) -> Result<u64, SearchError> {
     let standard = members.union(&starts.standard);
     let parts = starts.set_up.words().div_ceil(SET_UP_WORDS);
-    let next = AtomicUsize::new(0);
-    let found = workers::run(threads().min(parts).max(1), 0, cancel, |w| {
+    let found = workers::each(parts, cancel, |part| {
         let mut found = 0u64;
-        loop {
-            let part = next.fetch_add(1, Ordering::Relaxed);
-            if part >= parts {
-                return Ok(found);
-            }
-            if w.stopped() || cancel.is_cancelled() {
-                return Err(SearchError::Superseded);
-            }
-            for number in starts.set_up.iter_in(part * SET_UP_WORDS..(part + 1) * SET_UP_WORDS) {
-                if set_up_reaches(stream, number, key, home).map_err(damaged)? && members.insert(number) {
-                    found += 1;
-                }
+        for number in starts.set_up.iter_in(part * SET_UP_WORDS..(part + 1) * SET_UP_WORDS) {
+            if set_up_reaches(stream, number, key, home).map_err(damaged)? && members.insert(number) {
+                found += 1;
             }
         }
+        Ok(found)
     })?;
     Ok(standard + found.iter().sum::<u64>())
 }

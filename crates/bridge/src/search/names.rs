@@ -256,15 +256,17 @@ impl NameTable {
 
     /// The ids in order of their name as shown, equal names in id order; ids
     /// with an empty name left out. Sorted on the workers, with a second list
-    /// while they sort.
-    fn by_exact_name(&self, allow: &mut Allowance<'_>) -> Result<Vec<u32>, SearchError> {
+    /// while they sort. `Superseded` once `cancel` is.
+    fn by_exact_name(&self, allow: &mut Allowance<'_>, cancel: &Cancel) -> Result<Vec<u32>, SearchError> {
         allow.take(self.len * 8)?;
         let mut ids = Vec::new();
         ids.try_reserve_exact(self.len).map_err(|_| Refused::Busy)?;
         ids.extend((0..self.len as u32).filter(|&i| !self.name(i64::from(i)).is_empty()));
-        workers::sort_by(&mut ids, &|&a: &u32, &b: &u32| {
-            self.name(i64::from(a)).cmp(self.name(i64::from(b))).then(a.cmp(&b))
-        })?;
+        workers::sort_by(
+            &mut ids,
+            &|&a: &u32, &b: &u32| self.name(i64::from(a)).cmp(self.name(i64::from(b))).then(a.cmp(&b)),
+            cancel,
+        )?;
         Ok(ids)
     }
 }
@@ -543,8 +545,8 @@ impl NameTable {
 /// per table and id: a tournament and a guiding text's title sort among each
 /// other. Names equal but for case share a position, so that sorting falls back
 /// to the record number, and every empty name has position 0, which is also the
-/// key of a missing name.
-pub fn joint_ranks(tables: &[&NameTable]) -> Result<Held<Vec<Vec<u32>>>, SearchError> {
+/// key of a missing name. `Superseded` once `cancel` is.
+pub fn joint_ranks(tables: &[&NameTable], cancel: &Cancel) -> Result<Held<Vec<Vec<u32>>>, SearchError> {
     let total: usize = tables.iter().map(|t| t.len()).sum();
     // The entries twice while the workers sort them, then the entries and the
     // ranks kept.
@@ -555,7 +557,7 @@ pub fn joint_ranks(tables: &[&NameTable]) -> Result<Held<Vec<Vec<u32>>>, SearchE
         all.extend((0..table.len()).filter(|&id| !table.lower(id).is_empty()).map(|id| ((t as u64) << 48) | id as u64));
     }
     let name = |e: u64| tables[(e >> 48) as usize].lower((e & ((1 << 48) - 1)) as usize);
-    workers::sort_by(&mut all, &|&a: &u64, &b: &u64| name(a).cmp(name(b)).then(a.cmp(&b)))?;
+    workers::sort_by(&mut all, &|&a: &u64, &b: &u64| name(a).cmp(name(b)).then(a.cmp(&b)), cancel)?;
     let mut ranks: Vec<Vec<u32>> = Vec::new();
     for t in tables {
         let mut r = Vec::new();
@@ -584,11 +586,12 @@ pub struct Groups {
 
 pub const NO_GROUP: u32 = u32::MAX;
 
-pub fn groups(table: &NameTable) -> Result<Held<Groups>, SearchError> {
+/// The groups of `table`'s names; `Superseded` once `cancel` is.
+pub fn groups(table: &NameTable, cancel: &Cancel) -> Result<Held<Groups>, SearchError> {
     let shared = Mutex::new(Hold::reserve(table.len().checked_mul(8).ok_or(Refused::TooLarge)?)?);
     let (of_id, first_id) = {
         let mut allow = Allowance::new(&shared);
-        let ids = table.by_exact_name(&mut allow)?;
+        let ids = table.by_exact_name(&mut allow, cancel)?;
         let mut of_id = Vec::new();
         of_id.try_reserve_exact(table.len()).map_err(|_| Refused::Busy)?;
         of_id.resize(table.len(), NO_GROUP);
@@ -862,15 +865,31 @@ mod tests {
     #[test]
     fn ranks_groups_and_matching() {
         let t = table(&["", "b", "A", "a", "a"]);
-        assert_eq!(*joint_ranks(&[&t]).ok().unwrap(), [vec![0, 2, 1, 1, 1]], "empty is 0, case is ignored");
+        let never = Cancel::never();
+        assert_eq!(*joint_ranks(&[&t], &never).ok().unwrap(), [vec![0, 2, 1, 1, 1]], "empty is 0, case is ignored");
         let u = table(&["", "B", "a"]);
-        assert_eq!(*joint_ranks(&[&t, &u]).ok().unwrap(), [vec![0, 2, 1, 1, 1], vec![0, 2, 1]]);
-        let g = groups(&t).ok().unwrap();
+        assert_eq!(*joint_ranks(&[&t, &u], &never).ok().unwrap(), [vec![0, 2, 1, 1, 1], vec![0, 2, 1]]);
+        let g = groups(&t, &never).ok().unwrap();
         assert_eq!(g.of_id, [NO_GROUP, 2, 0, 1, 1]);
         assert_eq!(g.first_id, [2, 3, 1]);
         let shared = Mutex::new(Hold::default());
         let s = t.containing("a", &mut Allowance::new(&shared)).unwrap();
         assert!(!s.contains(0) && !s.contains(1) && s.contains(2) && s.contains(3));
         assert_eq!((t.name(3), t.name(-1), t.name(9)), ("a", "", ""));
+    }
+
+    /// A names sort, for ranks or for groups, stops once its search is
+    /// superseded (#179): of enough names that the workers sort them in parts.
+    #[test]
+    fn a_superseded_names_sort_stops() {
+        let names: Vec<String> =
+            (0..100_000u32).map(|i| format!("name {}", i.wrapping_mul(2_654_435_761) % 5000)).collect();
+        let t = table(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let latest = std::sync::Arc::new(AtomicU64::new(0));
+        let old = Cancel::newest(&latest);
+        assert!(joint_ranks(&[&t], &old).is_ok() && groups(&t, &old).is_ok(), "not superseded yet");
+        let _newer = Cancel::newest(&latest);
+        assert!(matches!(joint_ranks(&[&t], &old), Err(SearchError::Superseded)));
+        assert!(matches!(groups(&t, &old), Err(SearchError::Superseded)));
     }
 }
