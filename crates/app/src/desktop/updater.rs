@@ -6,7 +6,8 @@
 //! it again. In the Store channel the Store API looks (`store_updates`, #153).
 //! Either way the new start says so.
 
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use tauri::plugin::TauriPlugin;
 use tauri::{AppHandle, Runtime};
@@ -25,6 +26,15 @@ const IDLE_POLL: Duration = Duration::from_secs(30);
 /// One look or install at a time; a look on request waits for a running one.
 static GATE: updates::Gate = updates::Gate::new();
 
+/// When this process started looking for updates, at the app's start.
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// How long the app has run, as far as a Store install's restart needs to
+/// know (`updates::RESTARTABLE_AFTER`).
+pub(super) fn alive() -> Duration {
+    STARTED.get_or_init(Instant::now).elapsed()
+}
+
 /// The updater plugin, when `config` holds a real key; `None` keeps the
 /// updater out, and nothing looks for updates. The plugin gets the key as
 /// checked, without surrounding space, never the raw configuration value.
@@ -42,6 +52,7 @@ pub fn enabled(app: &AppHandle) -> bool {
 /// Says «updated to X» when this start follows an update, and starts the
 /// automatic looks.
 pub fn start(app: &AppHandle) {
+    STARTED.get_or_init(Instant::now);
     let shared = shared(app);
     if let Some(version) = shared.dir().ok().and_then(|dir| updates::updated(&dir, env!("CARGO_PKG_VERSION"))) {
         let title = shared.strings.fill("toast.updated.title", &[("version", &version)]);

@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -20,6 +21,15 @@ use crate::status::View;
 /// The file in the data folder that names the version being installed, so
 /// that the start after the installer can say the bridge was updated.
 const NOTE: &str = "updating-to";
+/// The file that names the version a Store install started from (#153): the
+/// Store does not say which version it installs, so the start after it says
+/// the bridge was updated when it runs another version than this one.
+const FROM: &str = "updating-from";
+
+/// How long the process must have run before Windows restarts it after a
+/// Store install: `RegisterApplicationRestart` restarts only a process that
+/// ran for at least 60 seconds.
+pub const RESTARTABLE_AFTER: Duration = Duration::from_secs(61);
 
 /// The updater's public key in the `updater` section of the plugins'
 /// configuration, when it is a real one; `None` when there is no section or
@@ -104,6 +114,76 @@ pub enum StoreStep {
     Tell { mandatory: bool },
 }
 
+/// Whether a Store install may start now (#153): the bridge is idle, as for
+/// the direct installer, and it has run long enough (`alive`) for Windows to
+/// start it again after closing it for the install.
+pub fn store_ready(view: &View, installing: bool, alive: Duration) -> bool {
+    idle(view, installing) && alive >= RESTARTABLE_AFTER
+}
+
+/// What installing a Store update needs from Windows, so that its order is
+/// tested without Windows (#153).
+pub trait StoreInstall {
+    /// Downloads the update without installing it; whether it completed.
+    fn download(&self) -> Result<bool, String>;
+    /// Asks Windows to start the bridge again after closing it.
+    fn register_restart(&self) -> Result<(), String>;
+    /// Installs the downloaded update; Windows closes the bridge for it, so
+    /// this returns only when the install did not take place: whether it
+    /// reported completion anyway.
+    fn install(&self) -> Result<bool, String>;
+}
+
+/// A [`StoreInstall`] made of three calls, for a caller whose Windows types
+/// are simplest captured in closures.
+pub struct StoreCalls<D, R, I> {
+    pub download: D,
+    pub register_restart: R,
+    pub install: I,
+}
+
+impl<D, R, I> StoreInstall for StoreCalls<D, R, I>
+where
+    D: Fn() -> Result<bool, String>,
+    R: Fn() -> Result<(), String>,
+    I: Fn() -> Result<bool, String>,
+{
+    fn download(&self) -> Result<bool, String> {
+        (self.download)()
+    }
+    fn register_restart(&self) -> Result<(), String> {
+        (self.register_restart)()
+    }
+    fn install(&self) -> Result<bool, String> {
+        (self.install)()
+    }
+}
+
+/// Installs a Store update silently: it downloads first, then waits until
+/// `ready` (idle and restartable, [`store_ready`]) so that no work begun
+/// during the download is lost, notes where it started from in `dir`, asks
+/// for the restart and installs. A process still running after the install
+/// forgets the note.
+pub fn install_quietly(
+    store: &impl StoreInstall,
+    dir: &Path,
+    running: &str,
+    wait_ready: impl FnOnce(),
+) -> Result<(), String> {
+    if !store.download()? {
+        return Err("the Store download did not complete".into());
+    }
+    wait_ready();
+    note_from(dir, running)?;
+    store.register_restart()?;
+    let installed = store.install();
+    forget(dir);
+    match installed? {
+        true => Ok(()),
+        false => Err("the Store install did not complete".into()),
+    }
+}
+
 /// The step for a look that `found` an update or not, when Windows allows
 /// `silent` installs, the update is `mandatory`, and the user `asked`.
 pub fn store_step(found: bool, silent: bool, mandatory: bool, asked: bool) -> StoreStep {
@@ -122,19 +202,29 @@ pub fn note(dir: &Path, version: &str) -> Result<(), String> {
     std::fs::write(dir.join(NOTE), version).map_err(|e| format!("{NOTE}: {e}"))
 }
 
-/// Removes the note, after an installer that did not start.
-pub fn forget(dir: &Path) {
-    let _ = std::fs::remove_file(dir.join(NOTE));
+/// Notes in `dir` that a Store install starts from `running` (#153).
+pub fn note_from(dir: &Path, running: &str) -> Result<(), String> {
+    std::fs::write(dir.join(FROM), running).map_err(|e| format!("{FROM}: {e}"))
 }
 
-/// The version this start was updated to: the one the note names, when it is
-/// the version now `running`. The note is removed either way, so that an
-/// installer that failed says nothing and a later start says nothing twice.
+/// Removes the notes, after an install that did not take place.
+pub fn forget(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(NOTE));
+    let _ = std::fs::remove_file(dir.join(FROM));
+}
+
+/// The version this start was updated to: the one the direct installer's note
+/// names, when it is the version now `running`, or the one `running` after a
+/// Store install that started from another version. The notes are removed
+/// either way, so that an install that failed says nothing and a later start
+/// says nothing twice.
 pub fn updated(dir: &Path, running: &str) -> Option<String> {
-    let path = dir.join(NOTE);
-    let noted = std::fs::read_to_string(&path).ok();
+    let to = std::fs::read_to_string(dir.join(NOTE)).ok();
+    let from = std::fs::read_to_string(dir.join(FROM)).ok();
     forget(dir);
-    noted.filter(|v| v.trim() == running).map(|_| running.to_string())
+    let reached = to.is_some_and(|v| v.trim() == running);
+    let moved = from.is_some_and(|v| !v.trim().is_empty() && v.trim() != running);
+    (reached || moved).then(|| running.to_string())
 }
 
 #[cfg(test)]
@@ -357,5 +447,89 @@ mod tests {
         for (found, silent, mandatory, asked, step) in cases {
             assert_eq!(store_step(found, silent, mandatory, asked), step, "{found} {silent} {mandatory} {asked}");
         }
+    }
+
+    fn idle_view(busy: bool) -> View {
+        View {
+            version: "1.1.0".into(),
+            port: 39581,
+            problem: None,
+            databases: Vec::new(),
+            connected: false,
+            mark: "",
+            busy,
+        }
+    }
+
+    /// A Store install waits for idle and for the minute Windows needs before
+    /// it restarts a process it closed.
+    #[test]
+    fn a_store_install_waits_until_windows_would_restart_the_bridge() {
+        assert!(!store_ready(&idle_view(false), false, Duration::from_secs(60)));
+        assert!(store_ready(&idle_view(false), false, RESTARTABLE_AFTER));
+        assert!(!store_ready(&idle_view(true), false, Duration::from_secs(3600)));
+        assert!(!store_ready(&idle_view(false), true, Duration::from_secs(3600)));
+    }
+
+    struct FakeStore<'a> {
+        events: &'a std::cell::RefCell<Vec<String>>,
+        dir: &'a Path,
+        downloaded: bool,
+    }
+
+    impl StoreInstall for FakeStore<'_> {
+        fn download(&self) -> Result<bool, String> {
+            self.events.borrow_mut().push("download".into());
+            Ok(self.downloaded)
+        }
+        fn register_restart(&self) -> Result<(), String> {
+            self.events.borrow_mut().push("register".into());
+            Ok(())
+        }
+        fn install(&self) -> Result<bool, String> {
+            let noted = std::fs::read_to_string(self.dir.join(FROM)).unwrap_or_default();
+            self.events.borrow_mut().push(format!("install from {noted}"));
+            Ok(false)
+        }
+    }
+
+    /// A Store install downloads before it waits for the bridge to be ready,
+    /// so work begun during the download is never cut off; it notes where it
+    /// started from before installing, and a process still running afterwards
+    /// forgets the note. A download that did not complete installs nothing.
+    #[test]
+    fn a_store_install_downloads_then_waits_then_installs() {
+        let dir = std::env::temp_dir().join(format!("bridge-app-store-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let store = FakeStore { events: &events, dir: &dir, downloaded: true };
+        let result = install_quietly(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into()));
+        assert_eq!(result, Err("the Store install did not complete".into()));
+        assert_eq!(*events.borrow(), ["download", "ready", "register", "install from 1.1.0"]);
+        assert!(!dir.join(FROM).exists(), "a process still running forgets the note");
+
+        events.borrow_mut().clear();
+        let store = FakeStore { events: &events, dir: &dir, downloaded: false };
+        assert!(install_quietly(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into())).is_err());
+        assert_eq!(*events.borrow(), ["download"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The start after a Store install says it was updated when it runs
+    /// another version than the one the install started from, and nothing
+    /// when the install failed and the same version starts again; once.
+    #[test]
+    fn the_start_after_a_store_install_says_so_once() {
+        let dir = std::env::temp_dir().join(format!("bridge-app-store-from-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        note_from(&dir, "1.1.0").unwrap();
+        assert_eq!(updated(&dir, "1.2.0"), Some("1.2.0".to_string()));
+        assert_eq!(updated(&dir, "1.2.0"), None, "once");
+        note_from(&dir, "1.2.0").unwrap();
+        assert_eq!(updated(&dir, "1.2.0"), None, "the same version: the install did not happen");
+        assert!(!dir.join(FROM).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
