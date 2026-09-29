@@ -36,6 +36,16 @@ impl DbFile {
         })
     }
 
+    /// [`DbFile::open`] for a file a database may lack: `None` when there is
+    /// none at `path`.
+    pub(crate) fn open_optional(path: PathBuf) -> Result<Option<DbFile>> {
+        match DbFile::open(path) {
+            Ok(f) => Ok(Some(f)),
+            Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub(crate) fn len(&self) -> Result<u64> {
         self.file.metadata().map(|m| m.len()).map_err(|e| Error::Io(self.path.to_path_buf(), e))
     }
@@ -80,16 +90,26 @@ impl DbFile {
     }
 }
 
+/// The stem of the database `path` names: `path` without its extension when
+/// that is `main`, in any case, else `path` itself, taken as a bare stem.
+pub(crate) fn stem(path: &Path, main: &str) -> PathBuf {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(main)) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// The path `stem` takes with `ext` appended.
+pub(crate) fn with_extension(stem: &Path, ext: &str) -> PathBuf {
+    let mut s = stem.as_os_str().to_owned();
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 /// The paths `stem` takes with each of `extensions` appended.
 pub(crate) fn with_extensions<'a>(stem: &Path, extensions: impl IntoIterator<Item = &'a &'a str>) -> Vec<PathBuf> {
-    extensions
-        .into_iter()
-        .map(|ext| {
-            let mut s = stem.as_os_str().to_owned();
-            s.push(ext);
-            PathBuf::from(s)
-        })
-        .collect()
+    extensions.into_iter().map(|ext| with_extension(stem, ext)).collect()
 }
 
 #[cfg(unix)]

@@ -487,11 +487,11 @@ fn a_huge_annotation_record_is_refused_before_it_is_read() {
     let text = String::from_utf8_lossy(&verify.stdout);
     assert_eq!(verify.status.code(), Some(1), "{text}{}", String::from_utf8_lossy(&verify.stderr));
     assert!(text.contains("failures           1") && text.contains("game 1: annotations:"), "{text}");
-    assert!(text.contains("over the limit"), "{text}");
+    assert!(text.contains("-byte limit"), "{text}");
     let pgn = run(&["pgn", db]);
     let err = String::from_utf8_lossy(&pgn.stderr);
     assert_eq!(pgn.status.code(), Some(1), "{err}");
-    assert!(err.contains("game 1:") && err.contains("over the limit"), "{err}");
+    assert!(err.contains("game 1:") && err.contains("-byte limit"), "{err}");
     assert!(String::from_utf8_lossy(&pgn.stdout).contains("\n1. e4 1-0"), "game 2 is exported");
 }
 

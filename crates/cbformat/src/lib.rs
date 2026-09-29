@@ -23,6 +23,7 @@ pub mod game;
 pub mod movetable;
 pub mod pgn;
 pub mod pgnfile;
+mod recordfile;
 pub mod replay;
 pub mod v2;
 pub mod view;

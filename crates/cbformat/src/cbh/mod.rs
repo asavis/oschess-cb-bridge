@@ -12,7 +12,8 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use crate::file::{self, DbFile};
-use crate::game::{GameAnnotations, MAX_BATCH_RECORDS};
+use crate::game::GameAnnotations;
+use crate::recordfile::{RecordFile, Run, over_limit, span};
 use crate::{Error, Result};
 
 pub mod annotations;
@@ -76,7 +77,7 @@ pub fn needs_wide(moves_len: u64, annotations_len: Option<u64>) -> bool {
 /// An open classic database: game headers, moves and entities.
 pub struct Database {
     stem: PathBuf,
-    headers: DbFile,
+    headers: RecordFile<RECORD_SIZE>,
     moves: DbFile,
     /// `None` when the database has no `.cba` file.
     annotations: Option<DbFile>,
@@ -84,7 +85,6 @@ pub struct Database {
     /// 4 GiB and the 32-bit ones of `.cbh` cannot reach every record.
     wide: Option<wide::Wide>,
     entities: Entities,
-    records: u32,
     format_version: u8,
 }
 
@@ -92,40 +92,23 @@ impl Database {
     /// Opens the database whose files share `path`'s stem. `path` may name the
     /// `.cbh` file or the bare stem. The record count is taken now.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let stem = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cbh")) {
-            path.with_extension("")
-        } else {
-            path.to_owned()
-        };
+        let stem = file::stem(path.as_ref(), "cbh");
         let with = |ext: &str| {
             debug_assert!(READ.contains(&ext), "the classic reader opens {ext}, which cbh::READ does not list");
-            let mut s = stem.clone().into_os_string();
-            s.push(ext);
-            PathBuf::from(s)
+            file::with_extension(&stem, ext)
         };
-        let headers = DbFile::open(with(".cbh"))?;
-        let len = headers.len()?;
-        if len < RECORD_SIZE as u64 || !len.is_multiple_of(RECORD_SIZE as u64) {
-            return Err(Error::Format(format!(".cbh size {len} is not a multiple of 46")));
-        }
-        let records = u32::try_from(len / RECORD_SIZE as u64 - 1)
-            .map_err(|_| Error::Format(format!(".cbh size {len} holds more than 2^32 records")))?;
-        let header = headers.read(0, RECORD_SIZE)?;
+        let headers = RecordFile::open(with(".cbh"), ".cbh")?;
+        let header = headers.file().read(0, RECORD_SIZE)?;
         let record_size = be_u16(&header, 0x03);
         if record_size as usize != RECORD_SIZE {
             return Err(Error::Format(format!(".cbh record size {record_size}, expected 46")));
         }
         let moves = DbFile::open(with(".cbg"))?;
-        let annotations = match DbFile::open(with(".cba")) {
-            Ok(f) => Some(f),
-            Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
+        let annotations = DbFile::open_optional(with(".cba"))?;
         let annotations_len = annotations.as_ref().map(DbFile::len).transpose()?;
         let wide = if needs_wide(moves.len()?, annotations_len) { Some(wide::Wide::open(with(".cbj"))?) } else { None };
         let entities = Entities::open(with)?;
-        Ok(Database { stem, headers, moves, annotations, wide, entities, records, format_version: header[0x05] })
+        Ok(Database { stem, headers, moves, annotations, wide, entities, format_version: header[0x05] })
     }
 
     pub fn stem(&self) -> &Path {
@@ -140,7 +123,7 @@ impl Database {
 
     /// Number of records, including deleted games and guiding texts.
     pub fn record_count(&self) -> u32 {
-        self.records
+        self.headers.count()
     }
 
     /// The format version byte of the header file.
@@ -154,12 +137,7 @@ impl Database {
 
     /// The record for 1-based game id `id`.
     pub fn record(&self, id: u32) -> Result<Record> {
-        if id == 0 || id > self.records {
-            return Err(Error::NoSuchGame(id));
-        }
-        let mut b = [0; RECORD_SIZE];
-        self.headers.read_into(u64::from(id) * RECORD_SIZE as u64, &mut b)?;
-        Ok(Record { id, b })
+        Ok(Record { id, b: self.headers.record(id)? })
     }
 
     /// Where a game's moves and annotations are: from `.cbh`, or from `.cbj`
@@ -183,7 +161,7 @@ impl Database {
     pub fn moves_of_within(&self, record: &Record, limit: usize) -> Result<MoveData<'static>> {
         let (at, size) = self.move_extent(record)?;
         if size > limit {
-            return Err(Error::Format(format!("move record at {at:#x}: {size} bytes, over the limit of {limit}")));
+            return Err(Error::Format(format!("move record at {at:#x}: {}", over_limit(size, limit))));
         }
         Ok(MoveData { bytes: Cow::Owned(self.moves.read(at, size)?) })
     }
@@ -241,7 +219,7 @@ impl Database {
             return Err(bad("runs past end of file"));
         }
         if size > limit {
-            return Err(bad(&format!("{size} bytes, over the limit of {limit}")));
+            return Err(bad(&over_limit(size, limit)));
         }
         annotations::parse(&file.read(at, size)?, record.id()).map(Some)
     }
@@ -252,99 +230,58 @@ impl Database {
     /// allocates nothing, as [`crate::v2::Database::read_records`];
     /// [`Record::from_bytes`] makes the records.
     pub fn read_records(&self, first: u32, buf: &mut [u8]) -> Result<u32> {
-        if first == 0 || first > self.records {
-            return Ok(0);
-        }
-        let fits = u32::try_from(buf.len() / RECORD_SIZE).unwrap_or(u32::MAX);
-        let count = fits.min(self.records - first + 1);
-        let bytes = count as usize * RECORD_SIZE;
-        self.headers.read_into(u64::from(first) * RECORD_SIZE as u64, &mut buf[..bytes])?;
-        Ok(count)
+        self.headers.read_records(first, buf)
     }
 
     /// Records `first..=last`, clamped to the database and to
-    /// [`MAX_BATCH_RECORDS`] records, in one read.
+    /// [`crate::game::MAX_BATCH_RECORDS`] records, in one read.
     pub fn records(&self, first: u32, last: u32) -> Result<Vec<Record>> {
-        let (first, last) = self.clamp(first, last);
-        if first > last {
-            return Ok(Vec::new());
-        }
-        let headers = self.read_headers(first, last)?;
-        Ok(headers.as_chunks::<RECORD_SIZE>().0.iter().zip(first..=last).map(|(b, id)| Record { id, b: *b }).collect())
+        self.headers.records(first, last, Record::from_bytes)
     }
 
     /// Records `first..=last`, clamped as [`Database::records`] clamps them,
     /// with their move records, read in two large reads. [`Batch::ids`] gives
     /// the ids read.
     pub fn batch(&self, first: u32, last: u32) -> Result<Batch<'_>> {
-        let (first, last) = self.clamp(first, last);
-        if first > last {
-            return Ok(Batch { db: self, first, last, headers: Vec::new(), span_at: 0, span: Vec::new() });
-        }
-        if self.wide.is_some() {
-            // The headers' 32-bit offsets cannot place a span; every move
-            // record is read on its own through `.cbj`.
-            let headers = self.read_headers(first, last)?;
-            return Ok(Batch { db: self, first, last, headers, span_at: 0, span: Vec::new() });
-        }
         // One record past the batch, when there is one: its move record starts
         // where the batch's last one ends, as move records are in id order.
-        let upto = last.saturating_add(1).min(self.records);
-        let headers = self.read_headers(first, upto)?;
-        let offsets: Vec<u64> = headers
-            .as_chunks::<RECORD_SIZE>()
-            .0
-            .iter()
-            .map(|r| u64::from(Record { id: 0, b: *r }.moves_offset()))
-            .filter(|&o| o >= 10)
-            .collect();
-        let file_len = self.moves.len()?;
-        let span_at = offsets.iter().copied().min().unwrap_or(0).min(file_len);
-        let span_end = if upto > last { offsets.last().copied().unwrap_or(file_len) } else { file_len };
-        let span_end = span_end.max(offsets.iter().copied().max().unwrap_or(0)).min(file_len);
-        let span = if span_end > span_at && span_end - span_at <= MAX_BATCH_SPAN {
-            self.moves.read(span_at, (span_end - span_at) as usize)?
-        } else {
-            Vec::new()
+        // With `.cbj`, the headers' 32-bit offsets cannot place a span, and
+        // every move record is read on its own through it.
+        let run = self.headers.run(first, last, self.wide.is_none())?;
+        let offset = |r: &[u8; RECORD_SIZE]| u64::from(Record::from_bytes(0, r).moves_offset());
+        let placed = match self.wide {
+            Some(_) => None,
+            None => span(run.records().iter().map(offset), run.next().map(offset), self.moves.len()?, MIN_FILE_HEADER),
         };
-        Ok(Batch { db: self, first, last, headers, span_at, span })
-    }
-
-    fn clamp(&self, first: u32, last: u32) -> (u32, u32) {
-        let first = first.max(1);
-        (first, last.min(self.records).min(first.saturating_add(MAX_BATCH_RECORDS - 1)))
-    }
-
-    /// The header records `first..=last`, at most [`MAX_BATCH_RECORDS`] + 1.
-    fn read_headers(&self, first: u32, last: u32) -> Result<Vec<u8>> {
-        let count = (last - first + 1) as usize;
-        self.headers.read(u64::from(first) * RECORD_SIZE as u64, count * RECORD_SIZE)
+        let (span_at, span) = match placed {
+            Some(s) if s.end - s.start <= MAX_BATCH_SPAN => {
+                (s.start, self.moves.read(s.start, (s.end - s.start) as usize)?)
+            }
+            _ => (0, Vec::new()),
+        };
+        Ok(Batch { db: self, run, span_at, span })
     }
 }
 
 /// A run of records read together by [`Database::batch`].
 pub struct Batch<'db> {
     db: &'db Database,
-    first: u32,
-    last: u32,
-    headers: Vec<u8>,
+    /// The records of the batch, and possibly the one after it.
+    run: Run<RECORD_SIZE>,
     span_at: u64,
     span: Vec<u8>,
 }
 
 impl Batch<'_> {
     pub fn ids(&self) -> RangeInclusive<u32> {
-        self.first..=self.last
+        self.run.ids()
     }
 
     pub fn record(&self, id: u32) -> Result<Record> {
-        if !self.ids().contains(&id) {
-            return self.db.record(id);
+        match self.run.get(id) {
+            Some(b) => Ok(Record { id, b }),
+            None => self.db.record(id),
         }
-        let o = (id - self.first) as usize * RECORD_SIZE;
-        let mut b = [0; RECORD_SIZE];
-        b.copy_from_slice(&self.headers[o..o + RECORD_SIZE]);
-        Ok(Record { id, b })
     }
 
     /// The move record of `record`, from the batch's buffer when it lies
