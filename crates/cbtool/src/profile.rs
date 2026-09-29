@@ -453,6 +453,37 @@ fn stream_counts(path: &Path) -> String {
     }
 }
 
+/// Asks `path`, an explorer request, until it is answered: `Ok` once it is,
+/// counting the answers that the index is being built in `polls`.
+fn build_index(c: &mut Client, path: &str, polls: &mut u64) -> Result<(), String> {
+    loop {
+        match c.get(path, true) {
+            Ok((200, _)) => return Ok(()),
+            // `409 database_unavailable` with `state: "indexing"` while the
+            // index is built; `503 index_unavailable` when its build failed.
+            Ok((409, body)) if strings(&body, "state").iter().any(|s| s == "indexing") => {
+                *polls += 1;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Ok((status, body)) => return Err(failure(status, &body)),
+            Err(_) => return Err("no answer".to_string()),
+        }
+    }
+}
+
+/// The bytes the files in `dir` and its folders take together; 0 for a
+/// folder that cannot be listed.
+fn folder_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => folder_bytes(&e.path()),
+            _ => e.metadata().map_or(0, |m| m.len()),
+        })
+        .sum()
+}
+
 /// Whether `dir` is missing or empty, so that the index is built in it; a
 /// folder that cannot be listed may hold an index and is neither.
 fn fresh(dir: &Path) -> bool {
@@ -604,28 +635,35 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     }
 
     // The position index: its build in the new folder, a lookup per move
-    // along the most played line, and opening it again in a new bridge.
+    // along the most played line, and opening it again in a new bridge. The
+    // index folder is measured while the build writes it (#147): at its
+    // largest, and once the build is done.
     let explorer = |fen: &str| format!("{base}/explorer?fen={}", encode(fen));
+    let folder = o.index.join("index");
+    let building = std::sync::atomic::AtomicBool::new(true);
     let t = Instant::now();
     let mut polls = 0u64;
-    let built = loop {
-        match c.get(&explorer(START_FEN), true) {
-            Ok((200, _)) => break Ok(()),
-            // `409 database_unavailable` with `state: "indexing"` while the
-            // index is built; `503 index_unavailable` when its build failed.
-            Ok((409, body)) if strings(&body, "state").iter().any(|s| s == "indexing") => {
-                polls += 1;
-                std::thread::sleep(Duration::from_millis(250));
+    let (built, peak) = std::thread::scope(|s| {
+        let sampler = s.spawn(|| {
+            let mut peak = 0;
+            while building.load(std::sync::atomic::Ordering::Relaxed) {
+                peak = peak.max(folder_bytes(&folder));
+                std::thread::sleep(Duration::from_millis(20));
             }
-            Ok((status, body)) => break Err(failure(status, &body)),
-            Err(_) => break Err("no answer".to_string()),
-        }
-    };
+            peak.max(folder_bytes(&folder))
+        });
+        let built = build_index(&mut c, &explorer(START_FEN), &mut polls);
+        building.store(false, std::sync::atomic::Ordering::Relaxed);
+        (built, sampler.join().unwrap_or(0))
+    });
     match built {
         Ok(()) => {
             let took = ms(t.elapsed());
-            let stream = stream_counts(&o.index.join("index").join(format!("{}.moves", served.id)));
-            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}"));
+            let stream = stream_counts(&folder.join(format!("{}.moves", served.id)));
+            let index = std::fs::metadata(folder.join(format!("{}.idx", served.id))).map_or(0, |m| m.len());
+            let sizes =
+                format!("index {index} bytes, folder at most {peak} bytes, {} bytes after", folder_bytes(&folder));
+            table.once("index", "build to first answer", took, &format!("{polls} polls, {stream}, {sizes}"));
         }
         Err(why) => table.failure("index", "build to first answer", &why),
     }
@@ -966,6 +1004,19 @@ mod tests {
         std::fs::write(&path, b"not a stream").unwrap();
         assert_eq!(stream_counts(&path), "no move stream");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A folder's bytes are its files' and its folders' files'.
+    #[test]
+    fn a_folders_bytes_count_every_file_in_it() {
+        let dir = std::env::temp_dir().join(format!("cbtool-profile-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(folder_bytes(&dir), 0);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("a.idx"), [0u8; 100]).unwrap();
+        std::fs::write(dir.join("inner").join("b"), [0u8; 20]).unwrap();
+        assert_eq!(folder_bytes(&dir), 120);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

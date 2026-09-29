@@ -347,47 +347,48 @@ been confirmed, because no placeholder was available.
 ## Position index (the bridge's own files)
 
 Not a ChessBase format: the files the bridge writes for
-`GET /v1/databases/{id}/explorer` (`docs/api.md`), two per database in the
-data folder's `index` folder: the index, `<id>.idx`, and its move stream,
-`<id>.moves` (see "Move stream" below). Integers are little-endian.
+`GET /v1/databases/{id}/explorer` (`docs/api.md`), two per database in its
+index folder (`docs/api.md`, "Storage"): the index, `<id>.idx`, and its move
+stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
 
 - **Key.** A position is its Polyglot key (`chesscore::Board::hash`), which
   adds an en passant square only when a capture is possible. Chess960 games
   are left out, since the key names a castling right by its side, not by its
   rook.
 - **What a game adds.** Each position of its main line from the start to
-  ply 40, once however often it is reached, with the move played from it, the
-  one from ply 40 included; a position reached again adds only the move from
-  its first visit.
+  ply 20, once however often it is reached, with the move played from it, the
+  one from ply 20 included; a position reached again adds only the move from
+  its first visit. Every such position is kept, however few games reach it
+  (#147): the tree is every position within the first 20 plies.
   A null move or damaged moves end the line there, and so does its
   65,535th ply; the position before them counts, and no move from it. A game
-  whose move record is over 2 MiB, or cannot be read, adds nothing. A
-  position reached by one game only beyond ply 20 is dropped. The tree, the
-  deep section and the move stream are built from one walk of each line, so
-  they all hold the same lines.
+  whose move record is over 2 MiB, or cannot be read, adds nothing. The build
+  writes the move stream from its walk of each line, then builds the tree and
+  the deep section from the stream, so they all hold the same lines.
 - **What a game adds to the deep section** (#133): each structure (each
   side's pawns and its knights, bishops, rooks and queens counted) that its
   main line holds at some ply beyond 20, once, to its bucket, with the
-  structure's print and whether the line holds it at some ply beyond 40. Only
-  a pawn move or a capture changes a structure, and neither is undone, so a
-  game holds each one for a single stretch of plies. Every game that reaches
-  a position beyond ply 20 is found among the games of its structure's
-  bucket with its print, by replaying their lines from the move stream: all
-  of the position's games when the tree does not hold it, and those that
-  first reach it beyond ply 40, which the tree did not count, when it does
-  (#146). Such a game holds the structure beyond ply 40, so only the games
-  marked so are replayed then. The pieces matter: every pawnless ending
-  shares one pawn structure, 186,041 games of the Mega Database, and with the
-  pieces counted the most crowded bucket, bare kings, holds 38,367.
+  structure's print and whether the line holds it at some ply beyond the
+  tree's depth, 20, which each of them does. Only a pawn move or a capture
+  changes a structure, and neither is undone, so a game holds each one for a
+  single stretch of plies. Every game that reaches a position beyond ply 20
+  is found among the games of its structure's bucket with its print, by
+  replaying their lines from the move stream: all of the position's games
+  when the tree does not hold it, and those that first reach it beyond ply
+  20, which the tree did not count, when it does (#146). Such a game holds
+  the structure beyond ply 20, so only the games marked so are replayed then.
+  The pieces matter: every pawnless ending shares one pawn structure, 186,041
+  games of the Mega Database, and with the pieces counted the most crowded
+  bucket, bare kings, holds 38,367.
 - **Header** (128 bytes):
 
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBIDX\0` |
-  | 8 | 4 | format version, 4 |
+  | 8 | 4 | format version, 5 |
   | 12 | 4 | header length, 128 |
-  | 17 | 1 | depth in plies, 40 |
-  | 18 | 1 | pruning ply, 20 |
+  | 17 | 1 | depth in plies, 20 |
+  | 18 | 1 | pruning ply, 20: none within the depth |
   | 19 | 1 | deep bucket bits, 8 to 24 |
   | 20 | 4 | first record indexed |
   | 24 | 4 | last record indexed |
@@ -405,12 +406,16 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   | 116 | 8 | build id, which the move stream built with it carries too |
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
-  The other bytes are zero.
+  The other bytes are zero. Version 4, a tree to ply 40 whose positions
+  reached by one game only beyond ply 20 were dropped, is rebuilt.
 
 - **Blocks** follow the header back to back, positions in ascending key order,
   up to 4,096 a block, and a block ends once its records reach 1 MiB, or where
-  one of the build's sixteen ranges of keys ends (see "The build"). A block holds its keys, 12 bytes each (the key, then the
-  record's offset in the block's data, 4 bytes), then the records.
+  one of the build's parts of the keys ends: 2^*n* parts by the keys' top *n*
+  bits, *n* the bit length of the last record less 8, from 4 to 16, about 256
+  records a part (see "The build"). A block holds its keys, 12 bytes each
+  (the key, then the record's offset in the block's data, 4 bytes), then the
+  records.
 - **A record** is unsigned LEB128 numbers:
   - the games, white wins, draws and black wins;
   - the number of moves, then each move as 2 bytes (from square, to square,
@@ -432,7 +437,7 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   game, then print, in ascending order: the game's difference from the
   previous posting's (the first from 0, and 0 only for a game's next print)
   times 256, plus the print times 2, plus 1 when the game holds the structure
-  beyond ply 40; all unsigned LEB128. Structures that share a bucket are told
+  beyond ply 20; all unsigned LEB128. Structures that share a bucket are told
   apart by their print, except one in 128; a lookup replays the games of its
   bucket with its print, marked when the tree holds the position, and keeps
   those whose main line reaches the position's key.
@@ -460,57 +465,77 @@ data folder's `index` folder: the index, `<id>.idx`, and its move stream,
   rebuilds both. A crash between writing one and the other, or a file copied
   from another build, never pairs an index with a stream it was not built
   with.
-- **The build.** Workers read the header records and the move records of 2,048
-  games at a time into buffers reserved in the search budget, about 3 MiB a
-  worker: the run's move records at once when they fit a 2 MiB window of
-  `.2cbg`, else one record of at most 2 MiB at a time; never `.2cba`. They
-  turn their share of the games into 16-byte entries:
-  the key, the game number (30 bits) with its result (2), and the move (14),
-  ply (6) and average rating (12). Each worker sorts its entries within its
-  share of the search memory budget and writes them as runs. It writes each
-  block's part of the move stream as it goes: its buffers, 1 MiB of tails, a
-  block's slots and a line's words, about 1.4 MiB, come out of its entries'
-  share, and each worker's games start at a block's start. Nothing of the
-  stream is read back. The runs are then
-  merged, each run with a 64 KiB read buffer: in passes of as many runs as half
-  the budget holds, at most 256, until the final merge can take all that are
-  left beside the writer's 6 MiB. That final merge adds up each position's
-  entries into its record as it passes them. It runs apart for sixteen ranges
-  of keys, split by the keys' top four bits: keys are hashes, so the ranges
-  hold about as many positions. Each run notes where each range starts in it,
-  and up to half the workers merge a range each into a file of the range's
-  blocks. The memory of one range, its runs' buffers and a writer, is waited
-  for as the one merge waited for it; more ranges merge at once only as far as
-  the budget holds theirs now, all reserved before any starts. Each run's file
-  is opened once, and every range reads it at its own offsets, so a merge
-  keeps no more files open than one merge of all the runs. The index is then
-  those files in key order, copied behind the header, and the table of all
-  their blocks. Half the budget is at least
-  8 MiB, which holds the writer and 30 runs; a smaller share fails the build
-  as too large rather than waiting for memory the build holds itself.
-- **The deep section's build** (#133). The same workers read every main line
-  to its end, not only its first 40 plies, and turn each structure it holds
-  past ply 20 into a posting, `bucket << 40 | game << 8 | print << 1`, plus 1
-  when the line holds it only within ply 40, kept in a 1 MiB buffer. A full
-  buffer is sorted and appended to up to 256 partition files, split by the
-  bucket's top bits, of 4,096 buckets at least, each written through a 4 KiB
-  buffer held in the build's share while it reads. Once the tree is written,
-  each partition in turn is sorted and freed of repeated postings, a game's
-  posting beyond ply 40 kept of the two with one print, and written as its
-  deep blocks, within what the build's share of the budget leaves beside the
-  writer it holds. A partition that fits is sorted in memory. A larger one,
-  such as the partition of a structure that most games hold, is sorted in
-  chunks that fit, written apart and merged into one sorted file. Each of its
-  blocks is then read twice from that file, for its buckets' counts, then for
-  their games. Blocks are written as they are made, their CRC kept running. A
-  share too small to merge a partition's chunks, each through at least 4 KiB,
-  fails the build at once.
+- **The build** (#147) runs three kinds of pass, on at most half the search
+  workers and within half the search memory budget, and writes nothing but
+  `<id>.moves.partial` and `<id>.idx.partial`, renamed `<id>.moves` and
+  `<id>.idx` at the end; the database's former files are deleted when it
+  starts, so that the folder never holds more than the new files.
+  1. **The stream pass** (phase `reading`, in records). Workers read the
+     header records and the move records of 2,048 games at a time into
+     buffers reserved in the search budget, about 3 MiB a worker: the run's
+     move records at once when they fit a 2 MiB window of `.2cbg`, else one
+     record of at most 2 MiB at a time; never `.2cba`. Each worker takes a
+     block of the move stream, 4,096 records, at a time, plays each main line,
+     checking every move, and writes the block's records (see "Move
+     stream"): its buffers, 1 MiB of tails, a block's slots and a line's
+     words, take about 1.4 MiB more. It counts what each line adds, for the
+     passes that follow: its positions within ply 20 by part of the keys, and
+     its structures past ply 20 by deep block.
+  2. **The tree's passes** (phase `positions`, in entries). A pass takes as
+     many parts of the keys, in order, as three quarters of the room left in
+     the build's share hold of their entries, one part at least. An entry is
+     16 bytes: the key, the game number (30 bits) with its result (2), and the
+     move (14 bits) and average rating (12). Each worker replays the first 21
+     positions of the games it takes, a few hundred at a time, from the
+     stream just written, mapped, without legality checks, and keeps the
+     entries of the pass's parts in a buffer of its own. A full buffer is
+     sorted by key, and each position of more than 24 entries in it folded:
+     its 12 best games by rating kept whole, the others counted by move and
+     result into entries that count games and rank for no notable game. A
+     buffer still three quarters full ends the pass, for every worker, at the
+     part that keeps about half of it, and the next pass starts there; a
+     first part that alone fills it fails the build as too large. The workers
+     then take the pass's parts in order, each merging one part's entries
+     from every worker's sorted buffer, adding each position up into its
+     record and making the part's blocks. A worker hands its blocks over and
+     goes on with the next part: they are written once every part before
+     them is, and kept until then, within a megabyte or so a worker, so that
+     the tree is written once, in key order. The games the tree's positions
+     count must add up to the entries the stream pass counted, else the
+     build fails.
+  3. **The deep section's passes** (phase `structures`, in postings), the
+     same by ranges of buckets. Each worker replays each whole line from the
+     stream and follows only its structure: each word of the move table names
+     the piece that moves, where, what it takes and what a pawn becomes, so
+     each side's pawns and pieces counted by kind follow the words without a
+     board, and the structure is hashed again only after a pawn's move or a
+     capture. Each structure a line holds past ply 20 whose bucket lies in
+     the pass is a posting of 8 bytes, `bucket << 40 | game << 8 | print <<
+     1`, plus 1 when the line holds it only within ply 20, as none past it
+     does. A full buffer is sorted and freed of repeats, a game's posting
+     beyond ply 20 kept of two with one print; one still three quarters full
+     ends the pass at the bucket that keeps about half of it, which may lie
+     inside a deep block, which the next pass goes on with. A bucket whose
+     postings alone fill a worker's buffer fails the build as too large: at
+     the smallest budget, 16 MiB, one of a few hundred thousand games. The
+     blocks are written as the tree's parts are.
+  4. **The end.** The tables and the header are written and the index file
+     synced; the stream is renamed, then the index (see "Move stream").
+
+  Each pass reserves what the budget has free, up to the build's share:
+  while searches hold memory, it takes fewer workers and less room, and the
+  build runs more passes. However many passes and workers it runs, it writes
+  the same index, byte for byte but for the build id. Half the budget is at
+  least 8 MiB; a share that cannot hold one worker of the stream pass fails
+  the build as too large at once, and one whose room searches hold waits for
+  it for up to a minute, then fails as busy.
 
 ## Move stream (the bridge's own file)
 
-`<id>.moves` (#145), written by the same build as `<id>.idx`: each game's
-main line as 2CBH move words, so that the deep section's candidates are
-replayed from memory instead of from the database's files. A 2CBH word names
+`<id>.moves` (#145), written first by the build of `<id>.idx`, which then
+builds the tree and the deep section from it (#147): each game's main line as
+2CBH move words, so that the deep section's candidates are replayed from
+memory instead of from the database's files. A 2CBH word names
 one move from a list of every move each piece can make on an empty board, so
 it means the same in any position and needs no board to decode.
 
@@ -522,13 +547,16 @@ it means the same in any position and needs no board to decode.
   three formats give the same records; with one worker, as for a few thousand
   games, the same file byte for byte past the generation and the build id,
   since with more the order of tails and blocks follows the workers'
-  progress. A line ends where the index's ends: before a null move or
-  damage, or at 65,535 plies.
+  progress. The index built from it is the same whatever that order. A line
+  ends where the index's ends: before a null move or damage, or at 65,535
+  plies.
 - **Mapped read-only.** The bridge maps the file whole (`mmap`, or
   `MapViewOfFile` on Windows) and replays its words without legality checks.
   Its pages are the operating system's file cache, outside the search memory
   budget. The bridge maps only its own files, never a database's, and never
-  writes a file it maps: a build writes `<id>.moves.partial` and renames it.
+  writes a file it maps: a build writes `<id>.moves.partial`, maps it once
+  written to build the tree and the deep section from it, unmaps it and
+  renames it.
   On Windows a mapped file cannot be replaced, so the rename is tried again
   until the answers that still map the old stream are done, for up to a
   minute. The stream is renamed before the index: a build stopped between
@@ -590,9 +618,10 @@ it means the same in any position and needs no board to decode.
   records and room before the table for every record's slot, and each
   block's slots must lie within the body at a multiple of 64 bytes; the
   table is checked against its CRC when the file opens and held in the
-  search memory budget. A record is checked against its CRC whenever it is
-  read, its slot and its tail, which are all a replay reads: its number in
-  the CRC places it, so that a slot moved elsewhere fails too. A failure
+  search memory budget. A record is checked against its CRC whenever an
+  answer reads it, its slot and its tail, which are all a replay reads: its
+  number in the CRC places it, so that a slot moved elsewhere fails too. The
+  build's passes read back the records they have just written without it. A failure
   drops both files, and the next request rebuilds them. A torn file, which
   the build does not sync, fails the CRCs of the records it lost.
 - **Finding a position.** Of a bucket's games, a replay skips those the

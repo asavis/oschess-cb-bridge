@@ -1,64 +1,66 @@
-//! A whole build: sorted runs from the games, then a merge that adds up each
-//! position's games, results, moves and notable games and writes them in key
-//! order, dropping single-game positions beyond the pruning ply. The merge
-//! takes the [`PARTS`] ranges of keys apart on the workers, each into a file of
-//! its own blocks, and the index file is those blocks in key order, then the
-//! table of blocks. The games' move stream (#145) is written while they are
-//! read, and both files carry one build id.
+//! A whole build (#147), in three kinds of pass, which write nothing but the
+//! two files they build, `<id>.moves.partial` and `<id>.idx.partial`:
+//!
+//! 1. The stream pass reads the database's games once, writes their main
+//!    lines as the move stream, and counts the tree's entries in each part of
+//!    the keys and the deep section's postings in each of its blocks.
+//! 2. The tree's passes replay each game's first positions from the stream,
+//!    for as many parts of the keys at a time as the build's share of the
+//!    budget holds, and write the tree in key order ([`super::tree`]).
+//! 3. The deep section's passes replay each whole line, for as many buckets
+//!    at a time, and write its blocks in order ([`super::deep`]).
+//!
+//! Both files carry one build id and are renamed into place at the end: the
+//! stream first, then the index.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
-use crate::indexdir::{crc32, u32_at};
 use crate::search::SearchError;
-use crate::search::memory::Cancel;
+use crate::search::memory::{Cancel, Refused};
 use crate::search::workers::{self, threads};
 
 use super::deep;
+use super::file::Bad;
 use super::format::{
-    BLOCK_DATA, BLOCK_KEYS, Block, Counts, HEADER_LEN, Header, MAX_PLY, NO_MOVE, Stats, TOP_GAMES, deep_bits,
+    DEEP_BLOCK_BITS, HEADER_LEN, Header, MAX_PLY, PRUNE_PLY, deep_bits, deep_bucket, part_bits, part_of,
 };
-use super::runs::{self, Entry, Limits, PARTS, Progress, RUN_BUFFER, Run, io};
-use super::source::Source;
-use super::stream;
+use super::runs::{Limits, MAX_GAME, Progress, io, reserve};
+use super::source::{Line, Source, Workspace};
+use super::stream::{self, BATCH, Stream};
+use super::tree;
 
-/// Entries a merging worker counts before it adds them to the progress.
-const PROGRESS_STEP: u64 = 1 << 16;
-
-/// What to build: records `first..=last` of the database at `generation`,
-/// with single-game positions beyond `prune_ply` dropped.
+/// What to build: records `first..=last` of the database at `generation`.
 pub struct Plan {
     pub first: u32,
     pub last: u32,
-    pub prune_ply: u8,
     pub generation: u64,
 }
 
-/// The writer's memory: its output buffer, a block's keys and records, and the
-/// table of blocks.
-pub const WRITER_BYTES: usize = (1 << 20) + BLOCK_KEYS * 12 + super::format::MAX_BLOCK_DATA + (4 << 20);
+/// What the index file's writer buffers.
+const OUT_BUFFER: usize = 1 << 20;
 
 /// Builds the index of `plan` into `target`, and its move stream beside it
-/// ([`stream::path_of`]), each through a temporary file renamed at the end;
-/// the runs go to `work`, which is emptied afterwards.
+/// ([`stream::path_of`]), each through a file of its own renamed at the end;
+/// nothing else is written. A failed build removes both.
 pub fn build_with(
     source: &dyn Source,
     plan: &Plan,
-    work: &Path,
     target: &Path,
     progress: &Progress,
     limits: &Limits,
 ) -> Result<Header, SearchError> {
-    let _ = std::fs::remove_dir_all(work);
-    std::fs::create_dir_all(work).map_err(|e| io(work, e))?;
-    let result = build_in(source, plan, work, target, progress, limits);
-    let _ = std::fs::remove_dir_all(work);
+    let (partial, moves) = (temporary(target), stream::path_of(target));
+    let moves_partial = temporary(&moves);
+    let result = build_in(source, plan, target, progress, limits);
     if result.is_err() {
-        let _ = std::fs::remove_file(temporary(target));
-        let _ = std::fs::remove_file(temporary(&stream::path_of(target)));
+        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(&moves_partial);
     }
     result
 }
@@ -66,432 +68,407 @@ pub fn build_with(
 fn build_in(
     source: &dyn Source,
     plan: &Plan,
-    work: &Path,
     target: &Path,
     progress: &Progress,
     limits: &Limits,
 ) -> Result<Header, SearchError> {
-    // The merges fit the build's share with the writer's memory, so a merge
-    // never waits for what the same build holds.
-    let fan_ins = runs::fan_ins(limits.share, WRITER_BYTES)?;
-    // So does the deep section beside the writer (#133).
-    let deep_memory = limits.share.saturating_sub(WRITER_BYTES);
-    if deep_memory < deep::MIN_MEMORY {
+    if plan.last > MAX_GAME {
         return Err(SearchError::TooLarge);
     }
-    progress.start("reading", u64::from(plan.last.saturating_sub(plan.first) + 1));
-    let sink = deep::Sink::create(work, deep_bits(plan.last), progress)?;
-    let moves = stream::path_of(target);
-    let writer = stream::Writer::create(&temporary(&moves), plan.first, plan.last)?;
-    let runs = runs::write_runs(source, plan.first, plan.last, work, progress, limits, &sink, &writer)?;
-    let bits = sink.bits();
-    let deep_parts = sink.finish()?;
+    let (partial, moves) = (temporary(target), stream::path_of(target));
+    let moves_partial = temporary(&moves);
+    let (part_bits, bits) = (part_bits(plan.last), deep_bits(plan.last));
+    let writer = stream::Writer::create(&moves_partial, plan.first, plan.last)?;
+    let counted = read_games(source, plan, &writer, part_bits, bits, progress, limits)?;
     let build_id = stream::build_id();
     writer.finish(plan.generation, build_id)?;
-    let entries: u64 = runs.iter().map(|r| r.entries).sum();
-    progress.start("merging", entries);
-    let runs = runs::reduce(runs, work, progress, fan_ins)?;
-    let parts = merge_parts(&runs, work, plan.prune_ply, progress, limits.share);
-    for r in &runs {
-        let _ = std::fs::remove_file(&r.path);
-    }
-    let parts = parts?;
-    let partial = temporary(target);
-    let _writer_memory = runs::reserve(WRITER_BYTES, progress)?;
+    // The build reads back the stream it has written, mapped, from the
+    // operating system's file cache, which holds it outside the budget.
+    let stream = Stream::open(&moves_partial).map_err(|e| from_bad(&moves_partial, e))?;
+    let _out_memory = reserve(OUT_BUFFER, progress)?;
+    let share = limits.share.checked_sub(counted.bytes + OUT_BUFFER).ok_or(SearchError::TooLarge)?;
+    let mut out = Out::create(&partial)?;
+    let tree = tree::write(&stream, &counted.entries, part_bits, &mut out, progress, share, limits)?;
+    let deep_offset = out.offset;
+    let deep = deep::write(&stream, &counted.postings, bits, &mut out, progress, share, limits)?;
     let header = Header {
         max_ply: MAX_PLY,
-        prune_ply: plan.prune_ply,
+        prune_ply: PRUNE_PLY,
         first_record: plan.first,
         last_record: plan.last,
         generation: plan.generation,
-        games: 0,
-        keys: 0,
-        blocks: 0,
-        table_offset: 0,
-        table_crc: 0,
-        file_len: 0,
+        games: stream.header.games,
+        keys: tree.keys,
+        blocks: tree.blocks,
+        table_offset: tree.table_offset,
+        table_crc: tree.table_crc,
+        file_len: out.offset,
         deep_bits: bits,
-        deep_postings: 0,
-        deep_offset: 0,
-        deep_table_offset: 0,
-        deep_table_crc: 0,
+        deep_postings: deep.postings,
+        deep_offset,
+        deep_table_offset: deep.table_offset,
+        deep_table_crc: deep.table_crc,
         build_id,
     };
-    let header = assemble(&parts, &deep_parts, &partial, header, progress, deep_memory)?;
+    out.finish(&header)?;
+    drop(stream);
     // The stream, then the index: a stop between the two leaves files of
-    // different builds, which are rebuilt. On Windows the old stream may be
-    // mapped by an answer still in flight, which the rename waits for.
-    stream::replace(&temporary(&moves), &moves).map_err(|e| io(&moves, e))?;
-    std::fs::rename(&partial, target).map_err(|e| io(target, e))?;
+    // different builds, which are rebuilt. On Windows an old file may be
+    // mapped by an answer still in flight, which each rename waits for.
+    stream::replace(&moves_partial, &moves).map_err(|e| io(&moves, e))?;
+    stream::replace(&partial, target).map_err(|e| io(target, e))?;
     Ok(header)
 }
 
-/// One part's blocks, written apart: their file, its length, the part's
-/// table of blocks at offsets within that file, and its counts.
-struct Part {
-    path: PathBuf,
-    len: u64,
-    table: Vec<Block>,
-    keys: u64,
-    /// Games indexed: every game starts with its ply-0 position, once.
-    games: u64,
-}
-
-/// Merges each part of `runs` into a file of its blocks in `dir`, on up to
-/// half the workers and as many at once as `share` holds their read buffers
-/// and writers; the parts in key order.
-fn merge_parts(
-    runs: &[Run],
-    dir: &Path,
-    prune_ply: u8,
-    progress: &Progress,
-    share: usize,
-) -> Result<Vec<Part>, SearchError> {
-    // One range's buffers and writer are waited for, as one merge of all the
-    // ranges would wait for them; more ranges at once only as far as the
-    // budget holds them now, all reserved before any is merged.
-    let each = runs.len() * RUN_BUFFER + WRITER_BYTES;
-    let mut memory = runs::reserve(each, progress)?;
-    let mut want = threads().div_ceil(2).min(PARTS).min(share / each).max(1);
-    while want > 1 && memory.grow_quietly((want - 1) * each).is_err() {
-        want -= 1;
-    }
-    // Each run's file is opened once, for all the ranges.
-    let files = runs::open(runs)?;
-    let merged: Vec<Mutex<Option<Part>>> = (0..PARTS).map(|_| Mutex::new(None)).collect();
-    workers::run(want, 0, &Cancel::never(), |w| {
-        for k in (w.index..PARTS).step_by(w.count) {
-            let part = merge_part(runs, &files, k, dir, prune_ply, progress, &|| w.stopped())?;
-            *merged[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(part);
-        }
-        Ok(())
-    })?;
-    merged
-        .into_iter()
-        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).ok_or(SearchError::Superseded))
-        .collect()
-}
-
-/// Merges part `k` of `runs`, read from their `files`, into its file in `dir`;
-/// the caller holds the memory.
-fn merge_part(
-    runs: &[Run],
-    files: &[File],
-    k: usize,
-    dir: &Path,
-    prune_ply: u8,
-    progress: &Progress,
-    stopped: &dyn Fn() -> bool,
-) -> Result<Part, SearchError> {
-    let mut writer = Writer::create(&dir.join(format!("part-{k}")))?;
-    let mut agg = Aggregate::default();
-    let (mut games, mut done, mut positions) = (0u64, 0u64, 0u64);
-    let report = |done: &mut u64, positions: &mut u64| {
-        progress.done.fetch_add(std::mem::take(done), Ordering::Relaxed);
-        progress.positions.fetch_add(std::mem::take(positions), Ordering::Relaxed);
-    };
-    runs::merge_part(runs, files, k, |e| {
-        if progress.stop.load(Ordering::Relaxed) || stopped() {
-            return Err(SearchError::Superseded);
-        }
-        done += 1;
-        if done == PROGRESS_STEP {
-            report(&mut done, &mut positions);
-        }
-        if e.ply() == 0 {
-            games += 1;
-        }
-        if agg.count.games > 0 && e.key != agg.key {
-            positions += 1;
-            agg.emit(prune_ply, &mut writer)?;
-        }
-        agg.add(&e);
-        Ok(())
-    })?;
-    if agg.count.games > 0 {
-        positions += 1;
-        agg.emit(prune_ply, &mut writer)?;
-    }
-    report(&mut done, &mut positions);
-    writer.close(games)
-}
-
-/// Writes the index file at `path`: the header, the parts' blocks in key
-/// order, each part's file removed once copied, the table of blocks, then the
-/// deep section from `deep`'s partitions (#133), within `deep_memory` bytes,
-/// and its table.
-fn assemble(
-    parts: &[Part],
-    deep: &[(PathBuf, u64)],
-    path: &Path,
-    mut header: Header,
-    progress: &Progress,
-    deep_memory: usize,
-) -> Result<Header, SearchError> {
-    let mut out = BufWriter::with_capacity(1 << 20, File::create(path).map_err(|e| io(path, e))?);
-    out.write_all(&[0u8; HEADER_LEN]).map_err(|e| io(path, e))?;
-    let mut offset = HEADER_LEN as u64;
-    let mut table = Vec::new();
-    let mut blocks = 0u64;
-    for part in parts {
-        let mut input = File::open(&part.path).map_err(|e| io(&part.path, e))?;
-        let copied = std::io::copy(&mut input, &mut out).map_err(|e| io(path, e))?;
-        if copied != part.len {
-            return Err(io(&part.path, std::io::Error::other("a part has the wrong length")));
-        }
-        drop(input);
-        let _ = std::fs::remove_file(&part.path);
-        for b in &part.table {
-            Block { offset: b.offset + offset, ..*b }.encode(&mut table);
-        }
-        offset += part.len;
-        blocks += part.table.len() as u64;
-        header.keys += part.keys;
-        header.games += part.games;
-    }
-    header.blocks = u32::try_from(blocks).map_err(|_| SearchError::TooLarge)?;
-    header.table_offset = offset;
-    header.table_crc = crc32(&table);
-    out.write_all(&table).map_err(|e| io(path, e))?;
-    header.deep_offset = offset + table.len() as u64;
-    let (deep_table, postings) =
-        super::deep::write_section(deep, header.deep_bits, &mut out, header.deep_offset, path, progress, deep_memory)?;
-    let deep_len: u64 = deep_table.chunks(super::format::DEEP_BLOCK_ENTRY).map(|e| u64::from(u32_at(e, 8))).sum();
-    header.deep_postings = postings;
-    header.deep_table_offset = header.deep_offset + deep_len;
-    header.deep_table_crc = crc32(&deep_table);
-    header.file_len = header.deep_table_offset + deep_table.len() as u64;
-    out.write_all(&deep_table).map_err(|e| io(path, e))?;
-    let mut file = out.into_inner().map_err(|e| io(path, e.into_error()))?;
-    file.seek(SeekFrom::Start(0)).map_err(|e| io(path, e))?;
-    file.write_all(&header.encode()).map_err(|e| io(path, e))?;
-    file.sync_all().map_err(|e| io(path, e))?;
-    Ok(header)
-}
-
-fn temporary(target: &Path) -> PathBuf {
-    let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+/// The file at `path` with `.partial` after its name.
+fn temporary(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".partial");
-    target.with_file_name(name)
+    path.with_file_name(name)
 }
 
-/// One position's entries, added up as the merge passes them.
-#[derive(Default)]
-struct Aggregate {
-    key: u64,
-    count: Counts,
-    min_ply: u8,
-    moves: Vec<(u16, Counts)>,
-    /// The best games so far, best first: (rating, game).
-    top: Vec<(u16, u32)>,
+/// A failure of the file at `path` as a build's failure.
+pub(super) fn from_bad(path: &Path, e: Bad) -> SearchError {
+    match e {
+        Bad::Io(e) => io(path, e),
+        Bad::Corrupt(what) => corrupt(path, what),
+        Bad::Busy => SearchError::Busy,
+    }
 }
 
-impl Aggregate {
-    fn add(&mut self, e: &Entry) {
-        if self.count.games == 0 {
-            self.key = e.key;
-            self.min_ply = e.ply();
-        }
-        self.min_ply = self.min_ply.min(e.ply());
-        let outcome = e.outcome();
-        self.count.add(outcome);
-        if e.mv() != NO_MOVE {
-            match self.moves.iter_mut().find(|m| m.0 == e.mv()) {
-                Some(m) => m.1.add(outcome),
-                None => {
-                    let mut c = Counts::default();
-                    c.add(outcome);
-                    self.moves.push((e.mv(), c));
-                }
+/// The file at `path` does not hold what it should.
+pub(super) fn corrupt(path: &Path, what: &str) -> SearchError {
+    io(path, std::io::Error::other(what.to_string()))
+}
+
+/// What the stream pass counted: the tree's entries in each part of the
+/// keys, and the deep section's postings in each of its blocks, held in the
+/// budget until the build ends.
+struct Counted {
+    entries: Vec<u64>,
+    postings: Vec<u64>,
+    bytes: usize,
+    _memory: crate::search::memory::Hold,
+}
+
+/// The stream pass: reads records `plan.first..=plan.last` on at most half
+/// the shared workers, so that searches keep the rest, a block of the stream
+/// at a time, and writes each game's line to `writer`; counts what each line
+/// adds to the tree, in parts of `part_bits` bits, and to the deep section,
+/// of buckets of `bits` bits.
+fn read_games(
+    source: &dyn Source,
+    plan: &Plan,
+    writer: &stream::Writer,
+    part_bits: u8,
+    bits: u8,
+    progress: &Progress,
+    limits: &Limits,
+) -> Result<Counted, SearchError> {
+    let (parts, blocks) = (1usize << part_bits, 1usize << (bits - DEEP_BLOCK_BITS));
+    let bytes = 8 * (parts + blocks);
+    let memory = reserve(bytes, progress)?;
+    let mut counted = Counted { entries: vec![0; parts], postings: vec![0; blocks], bytes, _memory: memory };
+    let total = (u64::from(plan.last) + 1).saturating_sub(u64::from(plan.first));
+    progress.start("reading", total);
+    if total == 0 {
+        return Ok(counted);
+    }
+    let batches = total.div_ceil(BATCH as u64);
+    // Half the workers at most, and no more than the share holds with their
+    // read buffers, their part of the stream and their counts.
+    let per_worker = Workspace::BYTES + stream::WORKER_BYTES + bytes;
+    let fit = limits.share.saturating_sub(bytes) / per_worker;
+    if fit == 0 {
+        return Err(SearchError::TooLarge);
+    }
+    let want = threads().div_ceil(2).min(batches as usize).min(fit).max(1);
+    let next = AtomicU64::new(0);
+    let found = workers::run(want, 0, &Cancel::never(), |w| {
+        let hold = reserve(per_worker, progress)?;
+        let mut work = Workspace::new().ok_or(Refused::Busy)?;
+        work.keep_words().ok_or(Refused::Busy)?;
+        let mut part = writer.part().ok_or(Refused::Busy)?;
+        let zeros = |n: usize| {
+            let mut v: Vec<u64> = Vec::new();
+            v.try_reserve_exact(n).ok()?;
+            v.resize(n, 0);
+            Some(v)
+        };
+        let mut entries = zeros(parts).ok_or(Refused::Busy)?;
+        let mut postings = zeros(blocks).ok_or(Refused::Busy)?;
+        let mut count = |line: &Line| {
+            for &(key, _, _) in &line.positions {
+                entries[part_of(key, part_bits)] += 1;
             }
+            for &s in &line.structures {
+                postings[(deep_bucket(s, bits) >> DEEP_BLOCK_BITS) as usize] += 1;
+            }
+        };
+        loop {
+            // Whole blocks of the stream, so that each block is one worker's.
+            let batch = next.fetch_add(1, Ordering::Relaxed);
+            if batch >= batches {
+                break;
+            }
+            if w.stopped() || progress.stop.load(Ordering::Relaxed) {
+                return Err(SearchError::Superseded);
+            }
+            let lo = u64::from(plan.first) + batch * BATCH as u64;
+            let hi = (lo + BATCH as u64 - 1).min(u64::from(plan.last));
+            part.begin(lo as u32, hi as u32);
+            let mut failed = None;
+            source.lines(lo as u32, hi as u32, MAX_PLY, &mut work, &mut |line: &Line| {
+                if failed.is_none() {
+                    count(line);
+                    failed = part.add(line).err();
+                }
+            })?;
+            match failed {
+                Some(e) => return Err(e),
+                None => part.end()?,
+            }
+            progress.done.fetch_add(hi - lo + 1, Ordering::Relaxed);
         }
-        // Higher rating first; among equal ratings, the later game.
-        let item = (e.elo(), e.game());
-        let at = self.top.partition_point(|&t| t > item);
-        if at < TOP_GAMES {
-            self.top.insert(at, item);
-            self.top.truncate(TOP_GAMES);
+        progress.skipped.fetch_add(work.skipped, Ordering::Relaxed);
+        drop((work, part, hold));
+        Ok((entries, postings))
+    })?;
+    for (entries, postings) in found {
+        for (all, one) in counted.entries.iter_mut().zip(entries) {
+            *all += one;
+        }
+        for (all, one) in counted.postings.iter_mut().zip(postings) {
+            *all += one;
         }
     }
+    Ok(counted)
+}
 
-    /// Writes the position unless it is one game's beyond `prune_ply`, and
-    /// starts afresh.
-    fn emit(&mut self, prune_ply: u8, writer: &mut Writer) -> Result<(), SearchError> {
-        if !(self.count.games == 1 && self.min_ply > prune_ply) {
-            self.moves.sort_unstable_by(|a, b| b.1.games.cmp(&a.1.games).then(a.0.cmp(&b.0)));
-            let stats = Stats {
-                counts: self.count,
-                moves: std::mem::take(&mut self.moves),
-                top: self.top.iter().map(|t| t.1).collect(),
-            };
-            writer.push(self.key, &stats)?;
-        }
-        self.count = Counts::default();
-        self.moves.clear();
-        self.top.clear();
-        Ok(())
+/// The games of a pass, handed to its workers a few at a time as each comes
+/// free.
+pub(super) struct Chunks {
+    next: AtomicU64,
+    last: u64,
+    size: u64,
+}
+
+impl Chunks {
+    /// Records `first..=last` for `workers` workers: about sixteen chunks a
+    /// worker, of 16 to 1,024 records.
+    pub fn new(first: u32, last: u32, workers: usize) -> Chunks {
+        let records = (u64::from(last) + 1).saturating_sub(u64::from(first));
+        let size = records.div_ceil(16 * workers.max(1) as u64).clamp(16, 1024);
+        Chunks { next: AtomicU64::new(u64::from(first)), last: u64::from(last), size }
+    }
+
+    /// The next records to take, first and last; `None` once all are taken.
+    pub fn take(&self) -> Option<(u32, u32)> {
+        let lo = self.next.fetch_add(self.size, Ordering::Relaxed);
+        (lo <= self.last).then(|| (lo as u32, (lo + self.size - 1).min(self.last) as u32))
     }
 }
 
-/// Writes one part's blocks in key order into a file of their own, and keeps
-/// its table of blocks.
-struct Writer {
-    out: BufWriter<File>,
+/// The index file being written, from its start to its end: the header's
+/// room first, filled in last.
+pub(super) struct Out {
+    file: BufWriter<File>,
     path: PathBuf,
-    offset: u64,
-    keys: Vec<u8>,
-    data: Vec<u8>,
-    first_key: u64,
-    in_block: usize,
-    table: Vec<Block>,
-    total_keys: u64,
-    record: Vec<u8>,
+    /// Where the next bytes go.
+    pub offset: u64,
 }
 
-impl Writer {
-    fn create(path: &Path) -> Result<Writer, SearchError> {
-        let out = BufWriter::with_capacity(1 << 20, File::create(path).map_err(|e| io(path, e))?);
-        Ok(Writer {
-            out,
-            path: path.to_path_buf(),
-            offset: 0,
-            keys: Vec::new(),
-            data: Vec::new(),
-            first_key: 0,
-            in_block: 0,
-            table: Vec::new(),
-            total_keys: 0,
-            record: Vec::new(),
-        })
+impl Out {
+    fn create(path: &Path) -> Result<Out, SearchError> {
+        let file = File::create(path).map_err(|e| io(path, e))?;
+        let mut out = Out { file: BufWriter::with_capacity(OUT_BUFFER, file), path: path.to_path_buf(), offset: 0 };
+        out.put(&[0u8; HEADER_LEN])?;
+        Ok(out)
     }
 
-    fn push(&mut self, key: u64, stats: &Stats) -> Result<(), SearchError> {
-        if self.in_block == 0 {
-            self.first_key = key;
-        }
-        self.record.clear();
-        stats.encode(&mut self.record);
-        let at = u32::try_from(self.data.len()).map_err(|_| SearchError::TooLarge)?;
-        self.keys.extend(key.to_le_bytes());
-        self.keys.extend(at.to_le_bytes());
-        self.data.extend_from_slice(&self.record);
-        self.in_block += 1;
-        self.total_keys += 1;
-        if self.in_block == BLOCK_KEYS || self.data.len() >= BLOCK_DATA {
-            self.flush_block()?;
-        }
+    pub fn put(&mut self, bytes: &[u8]) -> Result<(), SearchError> {
+        self.file.write_all(bytes).map_err(|e| io(&self.path, e))?;
+        self.offset += bytes.len() as u64;
         Ok(())
     }
 
-    fn flush_block(&mut self) -> Result<(), SearchError> {
-        if self.in_block == 0 {
+    /// Writes `header` in its room and syncs the file.
+    fn finish(self, header: &Header) -> Result<(), SearchError> {
+        let path = self.path;
+        let mut file = self.file.into_inner().map_err(|e| io(&path, e.into_error()))?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| io(&path, e))?;
+        file.write_all(&header.encode()).map_err(|e| io(&path, e))?;
+        file.sync_all().map_err(|e| io(&path, e))
+    }
+}
+
+/// Units of work made on the workers in any order and written in theirs, so
+/// that a file is written once, from its start to its end, whatever the
+/// workers' progress. Each worker takes the next unit as it comes free, makes
+/// its bytes and hands them over: they are written at once when every unit
+/// before theirs is, else kept until then, and the worker goes on with its
+/// next unit, so that no worker waits for another to write; whoever writes a
+/// unit writes the kept ones that follow it. What is kept stays within
+/// `room` bytes: a worker whose bytes do not fit waits until they do, or
+/// until its unit's turn has come. A unit too large for one hand-over is
+/// handed over in pieces, in order, the last one ending it.
+pub(super) struct Turns<T, M> {
+    taken: AtomicU32,
+    units: u32,
+    room: usize,
+    state: Mutex<Queue<T, M>>,
+    written: Condvar,
+}
+
+/// The units written and kept.
+struct Queue<T, M> {
+    /// The next unit to write.
+    next: u32,
+    sink: T,
+    /// The pieces made ahead of their turn, by unit, in order: each with its
+    /// bytes and whether it ends its unit.
+    kept: BTreeMap<u32, VecDeque<(M, usize, bool)>>,
+    bytes: usize,
+}
+
+/// Writes a piece of a unit to the sink.
+pub(super) type WriteUnit<'a, T, M> = &'a (dyn Fn(&mut T, M) -> Result<(), SearchError> + Sync);
+
+impl<T, M> Turns<T, M> {
+    pub fn new(units: usize, room: usize, sink: T) -> Turns<T, M> {
+        let units = u32::try_from(units).unwrap_or(u32::MAX);
+        let queue = Queue { next: 0, sink, kept: BTreeMap::new(), bytes: 0 };
+        Turns { taken: AtomicU32::new(0), units, room, state: Mutex::new(queue), written: Condvar::new() }
+    }
+
+    /// The next unit to make, `None` once all are taken.
+    pub fn take(&self) -> Option<usize> {
+        let unit = self.taken.fetch_add(1, Ordering::Relaxed);
+        (unit < self.units).then_some(unit as usize)
+    }
+
+    /// Hands over `made`, `bytes` long, a piece of `unit`, the last one when
+    /// `last`, to be written with `write`. A worker waiting for room stops,
+    /// `Superseded`, once `stopped`, as every worker does after another one
+    /// failed.
+    pub fn put(
+        &self,
+        unit: usize,
+        made: M,
+        bytes: usize,
+        last: bool,
+        stopped: &dyn Fn() -> bool,
+        write: WriteUnit<'_, T, M>,
+    ) -> Result<(), SearchError> {
+        let unit = unit as u32;
+        let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A piece fits when nothing is kept, however large.
+        while q.next != unit && q.bytes > 0 && q.bytes + bytes > self.room {
+            if stopped() {
+                return Err(SearchError::Superseded);
+            }
+            q = self.written.wait_timeout(q, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        if q.next != unit {
+            q.bytes += bytes;
+            q.kept.entry(unit).or_default().push_back((made, bytes, last));
             return Ok(());
         }
-        let mut all = std::mem::take(&mut self.keys);
-        all.extend_from_slice(&self.data);
-        let block = Block {
-            first_key: self.first_key,
-            offset: self.offset,
-            keys: self.in_block as u32,
-            data_len: u32::try_from(self.data.len()).map_err(|_| SearchError::TooLarge)?,
-            crc: crc32(&all),
-        };
-        self.out.write_all(&all).map_err(|e| io(&self.path, e))?;
-        self.offset += all.len() as u64;
-        self.table.push(block);
-        all.clear();
-        self.keys = all;
-        self.data.clear();
-        self.in_block = 0;
+        write(&mut q.sink, made)?;
+        if !last {
+            return Ok(());
+        }
+        q.next += 1;
+        // The units kept after it, as far as they are whole; the pieces of
+        // one still being made are written, and its worker writes the rest.
+        loop {
+            let next = q.next;
+            let Some(pieces) = q.kept.remove(&next) else { break };
+            let mut ended = false;
+            for (made, bytes, last) in pieces {
+                q.bytes -= bytes;
+                write(&mut q.sink, made)?;
+                ended = last;
+            }
+            if !ended {
+                break;
+            }
+            q.next += 1;
+        }
+        self.written.notify_all();
         Ok(())
-    }
-
-    /// The part as written, `games` games in it.
-    fn close(mut self, games: u64) -> Result<Part, SearchError> {
-        self.flush_block()?;
-        self.out.flush().map_err(|e| io(&self.path, e))?;
-        Ok(Part { path: self.path, len: self.offset, table: self.table, keys: self.total_keys, games })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::explorer::file::IndexFile;
-    use crate::explorer::format::{MIN_DEEP_BITS, Outcome, PRUNE_PLY};
 
-    /// Positions of every part, spread over three runs, merge part by part
-    /// into one index: its table passes the checks of opening, and every
-    /// position holds all its games, as one merge of all the runs would.
+    /// Units made on many workers, each taking its time, are written in
+    /// their order, some in pieces among them, and no more than the room is
+    /// ever kept; a worker waiting for room stops once told to.
     #[test]
-    fn parts_merge_into_one_index_in_key_order() {
-        let dir = std::env::temp_dir().join(format!("bridge-build-parts-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key = |i: u64| i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut games_of = std::collections::BTreeMap::new();
-        let mut runs = Vec::new();
-        let mut game = 0u32;
-        for r in 0..3 {
-            let mut buf = Vec::new();
-            for i in 0..4_000u64 {
-                if (i + r as u64).is_multiple_of(3) {
-                    continue;
-                }
-                game += 1;
-                // Each game passes one position at ply 0 and another at ply 2.
-                buf.push(Entry::new(key(i), game, Outcome::White, 100, 0, 2000));
-                buf.push(Entry::new(key(i + 10_000), game, Outcome::Draw, 101, 2, 2100));
-                *games_of.entry(key(i)).or_insert(0u64) += 1;
-                *games_of.entry(key(i + 10_000)).or_insert(0u64) += 1;
-            }
-            runs::flush(&mut buf, &dir, r, &mut runs).unwrap();
-        }
-        assert!((0..PARTS).all(|k| runs.iter().all(|r| r.parts[k + 1] > r.parts[k])), "every run holds every part");
-        let parts = merge_parts(&runs, &dir, PRUNE_PLY, &Progress::default(), 64 << 20).unwrap();
-        assert_eq!(parts.len(), PARTS);
-        let header = Header {
-            max_ply: MAX_PLY,
-            prune_ply: PRUNE_PLY,
-            first_record: 1,
-            last_record: game,
-            generation: 1,
-            games: 0,
-            keys: 0,
-            blocks: 0,
-            table_offset: 0,
-            table_crc: 0,
-            file_len: 0,
-            deep_bits: MIN_DEEP_BITS,
-            deep_postings: 0,
-            deep_offset: 0,
-            deep_table_offset: 0,
-            deep_table_crc: 0,
-            build_id: 1,
+    fn units_are_written_in_order_whatever_the_workers_progress() {
+        let most = std::sync::atomic::AtomicUsize::new(0);
+        let turns: Turns<(Vec<usize>, usize), (usize, usize)> = Turns::new(500, 30, (Vec::new(), 0));
+        let write = |out: &mut (Vec<usize>, usize), (unit, _): (usize, usize)| {
+            out.0.push(unit);
+            Ok(())
         };
-        let path = dir.join("index");
-        let deep = deep::Sink::create(&dir, MIN_DEEP_BITS, &Progress::default()).unwrap().finish().unwrap();
-        let header = assemble(&parts, &deep, &path, header, &Progress::default(), 64 << 20).unwrap();
-        assert_eq!((header.games, header.keys), (u64::from(game), games_of.len() as u64));
-        assert!(header.blocks as usize >= PARTS, "a part's blocks end with it");
-        let file = IndexFile::open(&path).unwrap();
-        for (&key, &games) in &games_of {
-            assert_eq!(file.lookup(key).unwrap().map(|s| s.counts.games), Some(games), "{key:x}");
-        }
-        assert_eq!(file.lookup(key(4_000)).unwrap(), None);
-        assert!(!dir.join("part-0").exists(), "a part's file is removed once copied");
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::thread::scope(|s| {
+            for w in 0..8u64 {
+                let (turns, write, most) = (&turns, &write, &most);
+                s.spawn(move || {
+                    while let Some(unit) = turns.take() {
+                        std::thread::sleep(Duration::from_micros((unit as u64 * 7919 + w) % 200));
+                        // Every tenth unit in three pieces.
+                        let pieces = if unit % 10 == 0 { 3 } else { 1 };
+                        for p in 0..pieces {
+                            turns.put(unit, (unit, p), 10, p + 1 == pieces, &|| false, write).unwrap();
+                            let kept = turns.state.lock().unwrap().bytes;
+                            most.fetch_max(kept, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        let q = turns.state.into_inner().unwrap();
+        let want: Vec<usize> = (0..500).flat_map(|u| std::iter::repeat_n(u, if u % 10 == 0 { 3 } else { 1 })).collect();
+        assert_eq!(q.sink.0, want);
+        assert_eq!((q.next, q.bytes, q.kept.len()), (500, 0, 0));
+        assert!(most.into_inner() <= 30, "kept within the room");
+        // Unit 1 kept, unit 2 waits for room that unit 0, never handed over,
+        // would free: it stops once told to.
+        let stuck: Turns<Vec<usize>, usize> = Turns::new(3, 10, Vec::new());
+        let write = |out: &mut Vec<usize>, unit: usize| {
+            out.push(unit);
+            Ok(())
+        };
+        stuck.put(1, 1, 10, true, &|| false, &write).unwrap();
+        assert!(matches!(stuck.put(2, 2, 10, true, &|| true, &write), Err(SearchError::Superseded)));
+        stuck.put(0, 0, 10, true, &|| false, &write).unwrap();
+        assert_eq!(stuck.state.into_inner().unwrap().sink, [0, 1]);
     }
 
+    /// Chunks cover the records once each, whatever the workers, up to the
+    /// last record a game can have.
     #[test]
-    fn a_position_keeps_its_best_games_and_counts_each_move() {
-        let mut a = Aggregate::default();
-        for g in 1..=20u32 {
-            let outcome = [Outcome::White, Outcome::Draw, Outcome::Black, Outcome::Other][g as usize % 4];
-            a.add(&Entry::new(9, g, outcome, if g % 2 == 0 { 70 } else { 71 }, 3, (g * 100) as u16));
+    fn chunks_cover_every_record_once() {
+        for (first, last, workers) in
+            [(1, 1, 8), (1, 2_000, 8), (1, 100_000, 3), (5, 4, 2), (MAX_GAME - 50, MAX_GAME, 4)]
+        {
+            let chunks = Chunks::new(first, last, workers);
+            let mut next = first;
+            while let Some((lo, hi)) = chunks.take() {
+                assert_eq!(lo, next);
+                assert!(hi >= lo && hi <= last);
+                next = hi + 1;
+            }
+            assert_eq!(next, last.max(first - 1) + 1, "{first}..={last}");
         }
-        assert_eq!(a.count, Counts { games: 20, white: 5, draws: 5, black: 5 });
-        assert_eq!(a.top.len(), TOP_GAMES);
-        assert_eq!(a.top[0], (2000, 20));
-        assert_eq!(a.moves.iter().map(|m| m.1.games).sum::<u64>(), 20);
+        let top = Chunks::new(u32::MAX - 5, u32::MAX, 1);
+        assert_eq!(top.take(), Some((u32::MAX - 5, u32::MAX)));
+        assert_eq!(top.take(), None);
+        assert_eq!(top.take(), None);
     }
 }

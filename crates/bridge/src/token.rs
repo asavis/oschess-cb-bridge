@@ -11,7 +11,6 @@ const TOKEN_FILE: &str = "token";
 /// set, else `%APPDATA%\oschess-bridge` on Windows and
 /// `$XDG_CONFIG_HOME/oschess-bridge` or `~/.config/oschess-bridge` elsewhere.
 pub fn data_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     if let Some(dir) = var("OSCHESS_BRIDGE_HOME") {
         return Some(dir);
     }
@@ -21,6 +20,31 @@ pub fn data_dir() -> Option<PathBuf> {
         var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|h| h.join(".config")))
     };
     base.map(|b| b.join("oschess-bridge"))
+}
+
+/// Where the bridge whose data folder is `data` keeps its position indexes
+/// and the heads and names files beside them (#147): on Windows, for the
+/// data folder `OSCHESS_BRIDGE_HOME` does not set,
+/// `%LOCALAPPDATA%\oschess bridge\index`, since `%APPDATA%` roams with the
+/// user's profile and the indexes of a large database take gigabytes; else
+/// the data folder's `index`, where they were kept before.
+pub fn index_dir(data: &Path) -> PathBuf {
+    let local = if cfg!(windows) && var("OSCHESS_BRIDGE_HOME").is_none() { var("LOCALAPPDATA") } else { None };
+    index_dir_in(data, data_dir().as_deref(), local.as_deref())
+}
+
+/// [`index_dir`] of the data folder `data`, where the data folder by default
+/// is `default` and the local application data folder is `local`.
+fn index_dir_in(data: &Path, default: Option<&Path>, local: Option<&Path>) -> PathBuf {
+    match local {
+        Some(local) if default == Some(data) => local.join("oschess bridge").join("index"),
+        _ => data.join("index"),
+    }
+}
+
+/// The environment variable `name`, unless it is unset or empty.
+fn var(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// Whether `dir` holds a token already; it does not on the bridge's first run.
@@ -78,6 +102,22 @@ mod tests {
         assert_eq!(base64url(b"foo"), "Zm9v");
         assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
         assert_eq!(base64url(&[0u8; 32]).len(), TOKEN_LEN);
+    }
+
+    /// The default data folder keeps its indexes in the local application
+    /// data folder when there is one; any other data folder, as tests and
+    /// tools give, in its own `index`.
+    #[test]
+    fn the_default_data_folder_keeps_its_indexes_apart() {
+        let (data, local) = (Path::new("/roaming/oschess-bridge"), Path::new("/local"));
+        assert_eq!(index_dir_in(data, Some(data), Some(local)), local.join("oschess bridge").join("index"));
+        assert_eq!(index_dir_in(data, Some(data), None), data.join("index"));
+        let other = Path::new("/tmp/profile");
+        assert_eq!(index_dir_in(other, Some(data), Some(local)), other.join("index"));
+        assert_eq!(index_dir_in(other, None, Some(local)), other.join("index"));
+        if !cfg!(windows) {
+            assert_eq!(index_dir(data), data.join("index"), "elsewhere the folder stays where it was");
+        }
     }
 
     #[test]

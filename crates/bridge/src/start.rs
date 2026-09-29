@@ -146,6 +146,16 @@ fn ready(dir: &Path, options: &Options) -> Result<Bridge, Failed> {
         )
     };
     app.catalog.use_data_dir(dir);
+    // The indexes are kept apart from the data folder where it roams (#147).
+    // Those kept in it before are rebuilt anyway, for the index's new
+    // version, so they go, once.
+    let index = token::index_dir(dir);
+    if index != dir.join("index") {
+        crate::indexdir::sweep_moved(&dir.join("index"), |name| {
+            crate::explorer::is_index_file(name) || crate::search::heads::entry_id(name).is_some()
+        });
+    }
+    app.catalog.explorer.set_dir(index);
     app.catalog.sweep_indexes();
     Ok(Bridge { listeners, app: Arc::new(app), port: config.port, token, link, first_run })
 }

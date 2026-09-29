@@ -4,9 +4,9 @@
 //! from it and its notable games, and the games' main lines as a move stream
 //! to find the games that reach a position beyond those plies in. An index is
 //! built in the background the first time it is asked for and kept on disk in
-//! the bridge's data folder; a change to the database rebuilds it. An index
-//! kept on disk for the database as it is now answers from the first
-//! request, without a build.
+//! the bridge's index folder ([`crate::token::index_dir`]); a change to the
+//! database rebuilds it. An index kept on disk for the database as it is now
+//! answers from the first request, without a build.
 
 mod answer;
 mod build;
@@ -18,9 +18,9 @@ pub mod rendered;
 pub mod runs;
 pub mod source;
 pub mod stream;
+mod tree;
 
 pub use answer::{deep, render, route, stats, uci};
-pub use build::WRITER_BYTES;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -129,9 +129,16 @@ impl Default for Registry {
 enum Kept {
     /// `<id>.idx` or `<id>.moves`: a database's index or its move stream.
     Index,
-    /// `<id>.idx.partial`, `<id>.moves.partial` or the `<id>.build` folder: a
-    /// build's work, which only the build running for `<id>` uses.
+    /// `<id>.idx.partial` or `<id>.moves.partial`: a build's work, which
+    /// only the build running for `<id>` uses; or the `<id>.build` folder,
+    /// the work of a build of a version before #147.
     Work,
+}
+
+/// Whether an index folder entry named `name` is a database's index, move
+/// stream, or a build's work, which the bridge wrote.
+pub fn is_index_file(name: &str) -> bool {
+    index_entry(name).is_some()
 }
 
 /// The database id and kind of an index folder entry; `None` for anything
@@ -142,14 +149,15 @@ fn index_entry(name: &str) -> Option<(&str, Kept)> {
 }
 
 impl Registry {
-    /// Keeps index files in `dir` (the bridge's data folder's `index`).
+    /// Keeps index files in `dir`.
     pub fn set_dir(&self, dir: PathBuf) {
         *lock(&self.dir) = Some(dir);
     }
 
-    /// Where index files are kept; the data folder's `index` unless set.
+    /// Where index files are kept: the data folder's index folder
+    /// ([`crate::token::index_dir`]) unless set.
     pub fn dir(&self) -> Option<PathBuf> {
-        lock(&self.dir).clone().or_else(|| crate::token::data_dir().map(|d| d.join("index")))
+        lock(&self.dir).clone().or_else(|| crate::token::data_dir().map(|d| crate::token::index_dir(&d)))
     }
 
     fn state(&self, id: &str) -> Arc<Mutex<State>> {
@@ -296,10 +304,12 @@ impl Registry {
     }
 }
 
-/// The index file of database `id` in `dir`, and the folder its build uses.
-/// Its move stream lies beside the index file ([`stream::path_of`]).
+/// The index file of database `id` in `dir`, and its move stream beside it
+/// ([`stream::path_of`]).
 pub fn paths(dir: &Path, id: &str) -> (PathBuf, PathBuf) {
-    (dir.join(format!("{id}.idx")), dir.join(format!("{id}.build")))
+    let index = dir.join(format!("{id}.idx"));
+    let stream = stream::path_of(&index);
+    (index, stream)
 }
 
 /// The index of `id` for the database at `generation`: the file kept on disk
@@ -332,7 +342,7 @@ fn index(
     limits: &Limits,
 ) -> Result<Loaded, Failure> {
     std::fs::create_dir_all(dir).map_err(Failure::Folder)?;
-    let (path, work) = paths(dir, id);
+    let (path, moves) = paths(dir, id);
     let count = db.records();
     progress.start("checking", u64::from(count));
     match current(&path, generation, count) {
@@ -340,10 +350,16 @@ fn index(
         Err(_) => return Err(Failure::Busy),
         Ok(None) => {}
     }
-    let plan = Plan { first: 1, last: count, prune_ply: PRUNE_PLY, generation };
-    let header = build::build_with(db, &plan, &work, &path, progress, limits).map_err(Failure::Build)?;
+    // The files there can never answer again: they go before the build takes
+    // their room, and so does the work of an older version's build. A stream
+    // still mapped on Windows stays until the build replaces it.
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&moves);
+    let _ = std::fs::remove_dir_all(dir.join(format!("{id}.build")));
+    let plan = Plan { first: 1, last: count, generation };
+    let header = build::build_with(db, &plan, &path, progress, limits).map_err(Failure::Build)?;
     let file = IndexFile::open(&path).map_err(Failure::Open)?;
-    let stream = Stream::open(&stream::path_of(&path)).map_err(Failure::Open)?;
+    let stream = Stream::open(&moves).map_err(Failure::Open)?;
     if stream.header.build_id != header.build_id || file.header.build_id != header.build_id {
         return Err(Failure::Open(Bad::Corrupt("another build's files")));
     }

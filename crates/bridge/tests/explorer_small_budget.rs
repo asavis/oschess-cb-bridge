@@ -2,16 +2,17 @@
 //! worker. The budget is read once per process, so each test runs itself again
 //! in a child process with that budget set.
 
-use std::sync::atomic::AtomicU64;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge::catalog::Catalog;
-use bridge::explorer::Lookup;
 use bridge::explorer::file::Bad;
-use bridge::explorer::format::{MAX_PLY, structure};
-use bridge::explorer::runs::{Limits, Progress, RUN_BUFFER, fan_ins};
-use bridge::explorer::{self, WRITER_BYTES, deep, rendered};
+use bridge::explorer::format::structure;
+use bridge::explorer::runs::{Limits, Progress};
+use bridge::explorer::{self, Loaded, Lookup, rendered};
 use bridge::search::memory::{Cancel, Hold, budget, held};
 use bridge::search::workers::{self, WAIT, threads};
 use cbformat::fixture::{Builder, TempDb, quiet, words};
@@ -19,6 +20,9 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::v2::Database;
 use cbformat::view::Base;
 use chesscore::Board;
+
+mod common;
+use common::{built_bytes, random_games};
 
 const CHILD: &str = "BRIDGE_SMALL_BUDGET_CHILD";
 
@@ -60,47 +64,127 @@ fn pawns(name: &str, games: usize) -> TempDb {
     b.write(name)
 }
 
-/// The reviewer's shape: a build whose runs are far more than the final
-/// merge can take beside the writer within half of a 16 MiB budget. The runs
-/// are merged in passes that fit, the build never waits for memory it holds
-/// itself, and the index equals one built in a single merge.
+/// A build of `d` within `limits` in a new folder named after `name`, watched
+/// as it runs: the index, its progress, every name the folder held, and the
+/// most the budget held.
+struct Watched {
+    loaded: Loaded,
+    progress: Arc<Progress>,
+    names: BTreeSet<String>,
+    most: usize,
+    dir: PathBuf,
+}
+
+fn watched(d: &Database, name: &str, limits: &Limits) -> Result<Watched, String> {
+    let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (done, most, names) = (AtomicBool::new(false), AtomicU64::new(0), Mutex::new(BTreeSet::new()));
+    let progress = Arc::new(Progress::default());
+    let built = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                most.fetch_max(held() as u64, Ordering::Relaxed);
+                for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                    names.lock().unwrap().insert(e.file_name().into_string().unwrap());
+                }
+                std::thread::yield_now();
+            }
+        });
+        let built = explorer::prepare_with(d, 1, &dir, "db", &progress, limits);
+        done.store(true, Ordering::Relaxed);
+        built
+    })?;
+    let (names, most) = (names.into_inner().unwrap(), most.into_inner() as usize);
+    Ok(Watched { loaded: built, progress, names, most, dir })
+}
+
+/// A build's passes: the tree's and the deep section's.
+fn passes(p: &Progress) -> (u64, u64) {
+    (p.tree_passes.load(Ordering::Relaxed), p.deep_passes.load(Ordering::Relaxed))
+}
+
+/// The two files of the index built in `dir`.
+fn files(dir: &Path) -> [PathBuf; 2] {
+    [dir.join("db.idx"), dir.join("db.moves")]
+}
+
+/// The key acceptance of #147: a build whose share of the budget holds a
+/// fraction of the entries and postings at a time takes many passes, and
+/// writes the same files, byte for byte but for the build id, as a build
+/// that takes one pass of each kind. Neither writes anything but its two
+/// `.partial` files, which become the index, nor holds more of the budget
+/// than its share. Games that all play one line fold their crowded positions
+/// as the passes collect them; games that part ways fill many parts of the
+/// keys and many buckets, and a pass ends inside a block of the deep section.
 #[test]
-fn a_build_of_many_runs_merges_within_a_small_budget() {
-    if !in_child("a_build_of_many_runs_merges_within_a_small_budget") {
+fn many_passes_write_the_files_of_one() {
+    if !in_child("many_passes_write_the_files_of_one") {
         return;
     }
-    assert_eq!(budget(), 16 << 20);
-    let db = pawns("small-budget-runs", 2_000);
-    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let limits = Limits { run_entries: Some(300), ..Limits::default() };
-    let (_, last) = fan_ins(limits.share, WRITER_BYTES).unwrap();
-    let dir = std::env::temp_dir().join(format!("bridge-small-budget-runs-{}", std::process::id()));
-    let progress = Progress::default();
-    let started = Instant::now();
-    let built = explorer::prepare_with(&d, 1, &dir, "db", &progress, &limits).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(30), "no wait for memory");
-    let entries = progress.total.load(std::sync::atomic::Ordering::Relaxed) as usize;
-    assert_eq!(entries, 2_000 * (usize::from(MAX_PLY).min(32) + 1));
-    assert!(entries.div_ceil(300) > 4 * last, "{} runs for a final fan-in of {last}", entries.div_ceil(300));
-    // The same index from runs that a single merge takes.
-    let one_dir = std::env::temp_dir().join(format!("bridge-small-budget-one-{}", std::process::id()));
-    let one = explorer::prepare_with(&d, 1, &one_dir, "db", &Progress::default(), &Limits::default()).unwrap();
-    let mut board = Board::startpos();
-    for uci in ["a2a3", "a7a6", "b2b3", "b7b6"] {
-        assert_eq!(built.lookup(board.hash()).unwrap(), one.lookup(board.hash()).unwrap(), "{uci}");
-        board.play_checked(uci.parse().unwrap()).unwrap();
+    assert_eq!((budget(), threads()), (16 << 20, 1));
+    // Each of the one line's structures is 2,000 postings of a bucket, and
+    // some of its blocks hold more than a pass: a pass ends inside them.
+    let dbs =
+        [(pawns("small-budget-one-line", 2_000), 32 << 10), (random_games("small-budget-lines", 1_500, 7), 128 << 10)];
+    for (db, pass) in dbs {
+        let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+        let one = watched(&d, "one", &Limits::default()).unwrap();
+        assert_eq!(passes(&one.progress), (1, 1), "one pass of each kind");
+        let started = Instant::now();
+        let many = watched(&d, "many", &Limits { pass_bytes: Some(pass), ..Limits::default() }).unwrap();
+        let (tree, deep) = passes(&many.progress);
+        assert!(tree > 2 && deep > 2, "{tree} and {deep} passes");
+        assert!(started.elapsed() < Duration::from_secs(60), "no wait for memory");
+        for w in [&one, &many] {
+            let allowed = ["db.idx", "db.idx.partial", "db.moves", "db.moves.partial"];
+            assert!(w.names.iter().all(|n| allowed.contains(&n.as_str())), "{:?}", w.names);
+            let left: BTreeSet<String> =
+                std::fs::read_dir(&w.dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            assert_eq!(left, ["db.idx".to_string(), "db.moves".to_string()].into(), "the index, and nothing else");
+            assert!(w.most <= Limits::default().share + (1 << 20), "{} held", w.most);
+        }
+        for (a, b) in files(&one.dir).iter().zip(&files(&many.dir)) {
+            assert!(built_bytes(a) == built_bytes(b), "{} differs", a.display());
+        }
+        let (a, b) = (&one.loaded.base.header, &many.loaded.base.header);
+        assert_eq!(a.games, d.record_count().into());
+        assert_eq!(b.deep_postings, a.deep_postings);
+        let start = Board::startpos();
+        assert_eq!(many.loaded.lookup(start.hash()).unwrap().unwrap().counts.games, a.games);
+        drop((one.loaded, many.loaded));
+        for dir in [one.dir, many.dir] {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
-    assert_eq!(built.lookup(Board::startpos().hash()).unwrap().unwrap().counts.games, 2_000);
-    // A share that cannot hold the writer and two runs is refused at once.
-    let tight = Limits { share: WRITER_BYTES + RUN_BUFFER, run_entries: None };
-    let started = Instant::now();
-    let refused = explorer::prepare_with(&d, 2, &dir, "db2", &Progress::default(), &tight).err().unwrap();
-    assert!(refused.contains("too small") && started.elapsed() < Duration::from_secs(5), "{refused}");
-    drop((built, one));
     assert_eq!(held(), 0, "the builds returned what they held, and the indexes their tables");
-    for dir in [dir, one_dir] {
+}
+
+/// A share too small for a pass of the stream, or a crowded structure's
+/// bucket that alone fills a pass, is refused as too large at once, rather
+/// than waiting for memory the build holds itself.
+#[test]
+fn a_share_too_small_is_refused_at_once() {
+    if !in_child("a_share_too_small_is_refused_at_once") {
+        return;
+    }
+    let db = pawns("small-budget-refused", 2_000);
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    for (name, limits) in [
+        ("share", Limits { share: 1 << 20, pass_bytes: None }),
+        // Every game holds every structure of the line: 2,000 postings a
+        // bucket, of which a pass holds 1,024.
+        ("bucket", Limits { pass_bytes: Some(8 << 10), ..Limits::default() }),
+    ] {
+        let started = Instant::now();
+        let refused = watched(&d, name, &limits).err().unwrap();
+        assert!(refused.contains("too small") && started.elapsed() < Duration::from_secs(10), "{name}: {refused}");
+        let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(left.is_empty(), "{name}: a failed build leaves nothing");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    assert_eq!(held(), 0);
 }
 
 /// Rendered notable games are held in the budget, stay under their cap,
@@ -167,64 +251,6 @@ fn a_kept_index_without_memory_is_busy_not_built() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The reviewer's shape for the deep section: one structure that every game
-/// holds, so that its partition, 12 MB, is larger than what the build's
-/// share leaves beside the writer it holds. The partition is sorted on disk
-/// within the share, at once, into the blocks an in-memory sort writes.
-#[test]
-fn a_deep_partition_larger_than_the_share_is_written_within_it() {
-    if !in_child("a_deep_partition_larger_than_the_share_is_written_within_it") {
-        return;
-    }
-    let games = 1_500_000u64;
-    let write = |name: &str, memory: usize| {
-        let dir = std::env::temp_dir().join(format!("bridge-small-budget-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sink = deep::Sink::create(&dir, 12, &Progress::default()).unwrap();
-        // A structure of bucket 1234, held beyond the tree's plies by every
-        // other game.
-        let structure = 1234u64 << 52;
-        for first in (1..=games).step_by(100_000) {
-            let postings = (first..first + 100_000).map(|g| deep::posting(structure, 12, g as u32, g % 2 == 0));
-            sink.add(&mut postings.collect()).unwrap();
-        }
-        let parts = sink.finish().unwrap();
-        let mut out = Vec::new();
-        let started = Instant::now();
-        let result = deep::write_section(&parts, 12, &mut out, 0, &dir.join("x"), &Progress::default(), memory);
-        std::fs::remove_dir_all(&dir).unwrap();
-        (result.map(|(table, kept)| (out, table, kept)), started.elapsed())
-    };
-    let share = Limits::default().share;
-    let writer = Hold::reserve(WRITER_BYTES).unwrap();
-    let (within, took) = write("share", share - WRITER_BYTES);
-    assert!(took < Duration::from_secs(20), "no wait for memory the build holds: {took:?}");
-    let within = within.unwrap();
-    assert_eq!(within.2, games);
-    drop(writer);
-    assert_eq!(held(), 0);
-    let (in_memory, _) = write("memory", 64 << 20);
-    assert_eq!(within, in_memory.unwrap());
-}
-
-/// The deep sink's partition buffers are held in the budget from the start
-/// of a build's reading until the partitions are closed.
-#[test]
-fn a_deep_sinks_buffers_are_held_in_the_budget() {
-    if !in_child("a_deep_sinks_buffers_are_held_in_the_budget") {
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("bridge-small-budget-sink-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let before = held();
-    let sink = deep::Sink::create(&dir, 21, &Progress::default()).unwrap();
-    assert!(sink.bytes() > 0 && sink.bytes() <= 1 << 20, "{}", sink.bytes());
-    assert_eq!(held(), before + sink.bytes());
-    sink.finish().unwrap();
-    assert_eq!(held(), before);
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
 /// Replays keep within the workers' limit (#146): with the one worker taken,
 /// a bucket small enough for the calling thread to replay waits for it as a
 /// bucket of the workers does, and both are answered busy once the wait is
@@ -237,7 +263,7 @@ fn a_replay_on_the_calling_thread_waits_for_a_worker() {
     }
     assert_eq!(threads(), 1);
     // 300 games of one line and 10 of another, 60 plies of knights out and
-    // back past the tree's pruning ply, each line alone in its structure.
+    // back past the tree's depth, each line alone in its structure.
     let hops = "g1f3 g8f6 f3g1 f6g8 ".repeat(15);
     let mut b = Builder::new();
     let mut line = |ucis: String, games: usize| {
