@@ -36,8 +36,11 @@ Store's copy, which updates itself through the Store (#153).
 > Windows.
 >
 > Міст відповідає лише браузеру, який ви з ним з’єднали, і лише на адресі
-> цього комп’ютера. В інтернет він звертається лише тоді, коли ви просите
-> встановити Stockfish.
+> цього комп’ютера. В інтернет він звертається лише в двох випадках. Через
+> хвилину після запуску й далі кожні шість годин він питає Microsoft Store,
+> чи вийшла нова версія, і оновлюється через Store; «Оновлювати автоматично»
+> в налаштуваннях вимикає ці перевірки. А коли ви просите встановити
+> Stockfish, міст завантажує його офіційну збірку з GitHub.
 >
 > Відкритий код, ліцензія AGPL-3.0: https://github.com/asavis/oschess-cb-bridge
 
@@ -71,8 +74,11 @@ Store's copy, which updates itself through the Store (#153).
 > start with Windows.
 >
 > The bridge answers only the browser you paired it with, and only on this
-> computer's own address. It goes online only when you ask it to install
-> Stockfish.
+> computer's own address. It goes online in two cases only. A minute after it
+> starts, and every six hours after that, it asks the Microsoft Store whether
+> a new version is out, and updates through the Store; «Update automatically»
+> in the settings turns these checks off. And when you ask it to install
+> Stockfish, it downloads the official build from GitHub.
 >
 > Open source under the AGPL-3.0 licence: https://github.com/asavis/oschess-cb-bridge
 

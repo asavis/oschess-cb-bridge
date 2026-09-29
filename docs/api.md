@@ -1001,8 +1001,8 @@ https://oschess.org/library?source=chessbase#cb-bridge=<token>&port=<port>
 
 in the default browser. The fragment never reaches a server. The web app reads
 it, stores the token and port for this browser, and removes the fragment from
-the address bar before it renders. The tray menu's «Show pairing token» shows
-the same token for pasting by hand.
+the address bar before it renders. The tray menu's «Pairing code…» shows the
+same token in the settings, for pasting by hand.
 
 ## Fake bridge
 

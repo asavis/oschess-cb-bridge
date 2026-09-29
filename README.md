@@ -289,16 +289,31 @@ Roles:
 - Approvers: [@asavis](https://github.com/asavis), who approves every signing
   request.
 
-Privacy: the bridge sends no information about you, your computer or your
-databases anywhere. It opens your databases read-only and serves them only to
-the oschess page in a browser on the same computer, over the loopback address
+Privacy: the bridge collects no information about you, your computer or your
+databases. It opens your databases read-only and serves them only to the
+oschess page in a browser on the same computer, over the loopback address
 `127.0.0.1`, and only to a browser that holds the pairing code. Beyond this
-computer it connects only to GitHub, to look for a new release of the bridge
-and download it; that request carries nothing about you or your databases, and
-«Update automatically» in the settings turns the automatic looks off. The
-installer downloads Microsoft's WebView2 runtime from Microsoft when Windows
-lacks it, and opening a database kept only in the cloud makes Windows download
-its files from your cloud storage, as opening them in any program does.
+computer, what it connects to depends on where you got it:
+
+- The copy from this repository's releases looks on GitHub for a new release
+  of the bridge, and downloads it from there when there is one. The request
+  asks for the newest release's `latest.json` and carries nothing about you or
+  your databases. Its installer downloads Microsoft's WebView2 runtime from
+  Microsoft when Windows lacks it.
+- The copy from the Microsoft Store asks Windows whether the Microsoft Store
+  has an update for it, and updates through the Store. Windows makes these
+  requests as it does for any app installed from the Store; the bridge adds
+  nothing about you or your databases to them.
+- Either copy downloads the official Stockfish build from Stockfish's GitHub
+  releases when you ask for it in the settings, and at no other time.
+
+Either copy looks for updates a minute after it starts, every six hours after
+that, and when you ask from the menu or the settings; «Update automatically»
+in the settings turns the automatic looks off. Each of these connections shows
+the server your internet address, as any connection does. Opening a database
+kept only in the cloud makes Windows download its files from your cloud
+storage, as opening them in any program does; the bridge itself connects
+nowhere for it.
 
 ## Legal
 
