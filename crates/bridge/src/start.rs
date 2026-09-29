@@ -391,9 +391,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file broken while the bridge runs is logged once for each change
-    /// that breaks it, though the database list and the engine both follow
-    /// it (#175).
+    /// A file broken while the bridge runs is logged once for each broken
+    /// revision, though the database list and the engine both follow it and
+    /// look at it again and again (#175): a broken file changed into another
+    /// broken one is logged again, so that the log says what is wrong now.
     #[test]
     fn a_broken_file_is_logged_once_for_each_change() {
         let _log = log::testing::hold();
@@ -417,10 +418,12 @@ mod tests {
         };
         replace(b"port = \n");
         assert_eq!(logged(), 1);
+        replace(b"databases = [unquoted]\n");
+        assert_eq!(logged(), 2, "another broken revision is another line");
         replace(&good);
-        assert_eq!(logged(), 1, "a good file is no line");
+        assert_eq!(logged(), 2, "a good file is no line");
         replace(b"Jane = 1\n");
-        assert_eq!(logged(), 2);
+        assert_eq!(logged(), 3);
         drop(bridge);
         let _ = std::fs::remove_dir_all(&dir);
     }

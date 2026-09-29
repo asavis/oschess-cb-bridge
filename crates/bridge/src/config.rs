@@ -188,8 +188,9 @@ fn read_file(path: &Path) -> Result<Option<Config>, Error> {
 /// by whichever reader looks first. There is one rule for what a read means:
 /// - a missing file is the defaults;
 /// - a file that cannot be read or parsed leaves the last good settings in
-///   force, is logged once, and is read again at the next look, as access
-///   may return.
+///   force, and is read again at the next look, as access may return. It
+///   is logged once for each revision, however often it is read, so that a
+///   broken file changed into another broken one is logged again.
 #[derive(Debug)]
 pub struct Watched {
     path: PathBuf,
@@ -204,8 +205,9 @@ struct Last {
     /// How many reads have changed the settings; the first that succeeds
     /// counts as one.
     changes: u64,
-    /// Whether the last read failed; its error has been logged.
-    failing: bool,
+    /// The signature of the revision whose failed read was logged last;
+    /// `None` once a read succeeds.
+    failed: Option<u64>,
 }
 
 /// What one reader of a [`Watched`] file has seen of its changes: nothing
@@ -243,13 +245,13 @@ impl Watched {
                     if last.changes == 0 || next != last.config {
                         (last.config, last.changes) = (next, last.changes + 1);
                     }
-                    (last.signature, last.failing) = (Some(signature), false);
+                    (last.signature, last.failed) = (Some(signature), None);
                 }
                 Err(e) => {
-                    if !last.failing {
+                    if last.failed != Some(signature) {
                         crate::log!("{}; keeping the settings read before", e.logged());
                     }
-                    (last.signature, last.failing) = (None, true);
+                    (last.signature, last.failed) = (None, Some(signature));
                 }
             }
         }
