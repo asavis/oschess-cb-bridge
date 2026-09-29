@@ -389,7 +389,14 @@ pub struct Catalog {
     heads_queue: Arc<Serial>,
     sources: Sources,
     shared: Arc<Shared>,
-    listing: Mutex<Listing>,
+    /// The sources as last read. Held while they are read again and the list
+    /// is rebuilt from them, so that one refresh runs at a time; a request for
+    /// one database never waits on it, however long a source takes to read.
+    read: Mutex<Read>,
+    /// The listed databases in order, then those that left the list. A
+    /// rebuild replaces the whole list, so this lock is held only to take a
+    /// handle to it.
+    entries: Mutex<Arc<Vec<Arc<Entry>>>>,
     /// Called after the sources are read, before the list is rebuilt.
     after_read: Mutex<Option<Hook>>,
     /// Whether the index folder is swept of what the list no longer uses
@@ -403,13 +410,6 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 type Hook = Box<dyn Fn() + Send + Sync>;
 
-/// The list as last read.
-struct Listing {
-    read: Read,
-    /// The listed databases in order, then those that left the list.
-    entries: Vec<Arc<Entry>>,
-}
-
 impl Catalog {
     /// The databases at `paths`, in order, each once.
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Catalog {
@@ -419,14 +419,14 @@ impl Catalog {
     /// The databases of `sources`, read now and again whenever they change.
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
         let shared = Arc::new(Shared { cloud, downloads: Arc::default(), pgn: pgnindex::Registry::default() });
-        let listing = Listing { read: Read::default(), entries: Vec::new() };
         let catalog = Catalog {
             explorer: crate::explorer::Registry::default(),
             heads: Arc::default(),
             heads_queue: Arc::new(Serial::labelled("heads")),
             sources,
             shared,
-            listing: Mutex::new(listing),
+            read: Mutex::default(),
+            entries: Mutex::default(),
             after_read: Mutex::new(None),
             sweeping: AtomicBool::new(false),
             swept: Mutex::new(None),
@@ -463,9 +463,14 @@ impl Catalog {
     /// The databases, the list read again first if its sources changed.
     pub fn entries(&self) -> Vec<Arc<Entry>> {
         let rebuilt = self.refresh(false);
-        let entries = lock(&self.listing).entries.clone();
+        let entries = self.listed();
         self.sweep_if_due(&entries, rebuilt);
-        entries
+        entries.to_vec()
+    }
+
+    /// The list as last rebuilt.
+    fn listed(&self) -> Arc<Vec<Arc<Entry>>> {
+        Arc::clone(&lock(&self.entries))
     }
 
     /// Sweeps the index folder, and the PGN header index folder, of what the
@@ -540,22 +545,29 @@ impl Catalog {
         }
     }
 
+    /// The database `id` of the list as last rebuilt, without reading the
+    /// sources again: a request for one database never waits on a source
+    /// that is slow to read, such as a folder on a network drive that no
+    /// longer answers.
     pub fn get(&self, id: &str) -> Option<Arc<Entry>> {
-        lock(&self.listing).entries.iter().find(|e| e.id == id).cloned()
+        self.listed().iter().find(|e| e.id == id).cloned()
     }
 
     /// Reads again the sources that changed or failed last time
     /// ([`Read`]), and rebuilds the list when any was read, or `always`;
-    /// whether it did.
+    /// whether it did. One refresh runs at a time; the rebuilt list replaces
+    /// the one [`Catalog::get`] reads.
     fn refresh(&self, always: bool) -> bool {
-        let mut listing = lock(&self.listing);
-        let changed = listing.read.update(&self.sources);
+        let mut read = lock(&self.read);
+        let changed = read.update(&self.sources);
         if let Some(hook) = lock(&self.after_read).as_ref() {
             hook();
         }
         if changed || always {
-            let listed = listing.read.listed(&self.sources);
-            listing.entries = self.merge(&listing.entries, listed);
+            // Only a refresh replaces the list, and refreshes run one at a
+            // time: the list it starts from is still the last one.
+            let entries = self.merge(&self.listed(), read.listed(&self.sources));
+            *lock(&self.entries) = Arc::new(entries);
         }
         changed || always
     }
