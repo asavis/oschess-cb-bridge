@@ -784,6 +784,42 @@ fn cloud_states_over_http() {
     assert!(body.contains("\"state\":\"ready\",\"records\":1"), "{body}");
 }
 
+/// A request for the games of a cloud-only database is checked whole before
+/// the database is opened: one refused for any parameter, `stream` and
+/// `fen` among them, starts no download (#173). A valid one then does.
+#[test]
+fn a_refused_request_starts_no_download() {
+    let root = Root::new("cloud-refused");
+    let db = database_at(&root.path("bases"), "Remote");
+    let cloud = Arc::new(FakeCloud::with_files(files_of(&db), false));
+    let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
+    let (id, entry) = (id_of(&db), catalog.get(&id_of(&db)).unwrap());
+    let port = serve(App::new("test", policy(), catalog));
+    // A download started now would wait, and show.
+    cloud.hold(true);
+    let start = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR+w+KQkq+-+0+1";
+    let position_in_a_bad_stream = format!("fen={start}&stream=bad!");
+    for (query, parameter) in [
+        ("stream=bad!", "stream"),
+        ("stream=", "stream"),
+        ("fen=nonsense", "fen"),
+        (position_in_a_bad_stream.as_str(), "stream"),
+        ("limit=0", "limit"),
+    ] {
+        let (status, body) = get(port, &format!("/v1/databases/{id}/games?{query}"));
+        assert_eq!(status, 400, "{query}: {body}");
+        assert!(body.contains(&format!("\"parameter\":\"{parameter}\"")), "{query}: {body}");
+        assert!(entry.progress().is_none(), "{query} started a download");
+        assert_eq!(entry.state(), State::CloudOnly, "{query}");
+    }
+    assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0);
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games?stream=tab-1"));
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("\"code\":\"database_unavailable\"") && body.contains("\"state\":\"downloading\""), "{body}");
+    cloud.hold(false);
+    wait_for(&entry, State::Ready);
+}
+
 /// The snapshot a user interface polls shows a cloud database as the list
 /// does, without reading it: cloud-only, downloading once its games were
 /// asked for, then ready. The list's row and the snapshot are one view (#67),

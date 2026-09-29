@@ -14,7 +14,7 @@ use crate::api::App;
 use crate::catalog::{Entry, Opened};
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
-use crate::reply::{bad_parameter, error, error_with, ok};
+use crate::reply::{bad_parameter, error, error_with, ok, unavailable};
 use crate::rows::{Names, row_obj};
 use crate::search::SearchError;
 use crate::search::memory::{Cancel, Hold};
@@ -42,11 +42,7 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     };
     let open = match entry.open_to_read() {
         Ok(open) => open,
-        Err(state) => {
-            return error_with(409, "database_unavailable", "The database is not ready", |o| {
-                o.str("state", state.name())
-            });
-        }
+        Err(state) => return unavailable(state),
     };
     let loaded = match ready(app, entry, &open) {
         Ok(loaded) => loaded,

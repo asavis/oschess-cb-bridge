@@ -217,6 +217,13 @@ impl Registry {
         }
     }
 
+    /// Whether database `id` is marked in use ([`Registry::mark_in_use`]),
+    /// for the tests of the requests that mark it.
+    #[cfg(test)]
+    pub(crate) fn in_use(&self, id: &str) -> bool {
+        lock(&self.used).contains(id)
+    }
+
     /// Sets how builds see the computer: its power, and the free space of
     /// the index folder's disk. Tests stand in their own.
     pub fn set_machine(&self, machine: Arc<dyn Machine>) {

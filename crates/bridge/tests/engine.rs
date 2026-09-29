@@ -552,3 +552,21 @@ fn a_warm_up_refuses_bad_input_and_a_missing_engine() {
     assert_eq!(status, 409);
     assert!(body.contains("no_engine"), "{body}");
 }
+
+/// An engine that cannot be started answers a warm-up `502 engine_failed`,
+/// under the reason phrase of 502 (#173).
+#[test]
+fn a_warm_up_of_an_engine_that_cannot_start_is_a_bad_gateway() {
+    let missing = std::env::temp_dir().join(format!(
+        "bridge-no-such-engine-{}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    let _ = std::fs::remove_file(&missing);
+    let (port, app) = start(Engine::new(EngineConfig::new(missing, Some(1), Some(16))));
+    let out = exchange(port, &request(port, "/v1/engine/warm")).unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{head}");
+    assert!(body.starts_with(r#"{"error":{"code":"engine_failed","message":"#), "{body}");
+    assert!(!app.engine.is_running());
+}

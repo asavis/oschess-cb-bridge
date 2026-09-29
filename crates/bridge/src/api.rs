@@ -1,11 +1,15 @@
 //! The v1 endpoints of `docs/api.md`.
 
+use std::fmt::Display;
+use std::ops::RangeInclusive;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use cbformat::Error;
 use cbformat::game::RecordKind;
 use cbformat::pgn;
+use chesscore::Board;
 
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;
@@ -15,12 +19,13 @@ use crate::explorer;
 use crate::foreground;
 use crate::http::{Request, Response};
 use crate::json::{self, Obj};
-use crate::reply::{bad_parameter, error, error_with, not_found, ok};
+use crate::reply::{bad_parameter, error, error_with, not_found, ok, unavailable};
 use crate::rows::{LINE_BUFFER_BYTES, Lines, MAX_ROW_BYTES, Names, clip, row};
 use crate::search::query::Sort;
 use crate::search::{self, SearchError, Selection, SuggestField};
 use crate::snapshot::Database;
 use crate::store::{Head, Store, with_store};
+use crate::token;
 
 pub const API_VERSION: i64 = 1;
 pub const MAX_LIMIT: u32 = 500;
@@ -182,40 +187,13 @@ fn status(app: &App) -> Response {
 /// `GET /v1/engine/analyze`: the engine's lines for a position, streamed.
 fn analyze(app: &App, req: &Request) -> Response {
     if !app.engine.is_configured() {
-        return error(409, "no_engine", "No engine is configured in the bridge");
+        return no_engine();
     }
-    let number = |name: &'static str, default: Option<u32>| -> Result<Option<u32>, Response> {
-        match req.param(name) {
-            None => Ok(default),
-            Some(v) => v.parse().map(Some).map_err(|_| bad_parameter(name, &format!("{name} is a whole number"))),
-        }
+    let AnalyzeQuery { search, stream } = match AnalyzeQuery::parse(req) {
+        Ok(query) => query,
+        Err(answer) => return answer,
     };
-    let multipv = match number("multipv", Some(1)) {
-        Ok(n) => n.unwrap_or(1),
-        Err(r) => return r,
-    };
-    let limit = match (number("depth", None), number("movetime", None)) {
-        (Err(r), _) | (_, Err(r)) => return r,
-        (Ok(None), Ok(None)) => Limit::Infinite,
-        (Ok(Some(d)), Ok(None)) => Limit::Depth(d),
-        (Ok(None), Ok(Some(t))) => Limit::MovetimeMs(t),
-        (Ok(Some(_)), Ok(Some(_))) => return bad_parameter("movetime", "Give depth or movetime, not both"),
-    };
-    let stream = req.param("stream").unwrap_or_default();
-    if stream.len() > 64 || !stream.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return bad_parameter("stream", "stream is at most 64 letters, digits, - and _");
-    }
-    let (threads, hash_mb) = match (number("threads", None), number("hash", None)) {
-        (Err(r), _) | (_, Err(r)) => return r,
-        (Ok(threads), Ok(hash_mb)) => (threads, hash_mb),
-    };
-    let search = Search::new(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit)
-        .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()));
-    let search = match search {
-        Ok(search) => search,
-        Err((parameter, message)) => return bad_parameter(parameter, &message),
-    };
-    let (engine, stream) = (app.engine.clone(), stream.to_string());
+    let engine = app.engine.clone();
     Response::stream(200, move |sink| engine.analyze(&search, &stream, sink))
 }
 
@@ -223,30 +201,22 @@ fn analyze(app: &App, req: &Request) -> Response {
 /// `threads` and `hash` an analysis takes.
 fn warm(app: &App, req: &Request) -> Response {
     if !app.engine.is_configured() {
-        return error(409, "no_engine", "No engine is configured in the bridge");
+        return no_engine();
     }
-    let number = |name: &'static str| -> Result<Option<u32>, Response> {
-        match req.param(name) {
-            None => Ok(None),
-            Some(v) => v.parse().map(Some).map_err(|_| bad_parameter(name, &format!("{name} is a whole number"))),
-        }
-    };
-    let (threads, hash_mb) = match (number("threads"), number("hash")) {
-        (Err(r), _) | (_, Err(r)) => return r,
-        (Ok(threads), Ok(hash_mb)) => (threads, hash_mb),
-    };
-    let search = match Search::new(None, "", 1, Limit::Infinite)
-        .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()))
-    {
-        Ok(search) => search,
-        Err((parameter, message)) => return bad_parameter(parameter, &message),
+    let WarmQuery { search } = match WarmQuery::parse(req) {
+        Ok(query) => query,
+        Err(answer) => return answer,
     };
     match app.engine.warm(&search) {
         engine::Warmed::Ready => Response::json(200, Obj::new().str("engine", "ready").done()),
         engine::Warmed::Busy => Response::json(200, Obj::new().str("engine", "busy").done()),
-        engine::Warmed::NoEngine => error(409, "no_engine", "No engine is configured in the bridge"),
+        engine::Warmed::NoEngine => no_engine(),
         engine::Warmed::Failed(why) => error(502, "engine_failed", &why),
     }
+}
+
+fn no_engine() -> Response {
+    error(409, "no_engine", "No engine is configured in the bridge")
 }
 
 fn progress(present: u64, total: u64) -> String {
@@ -277,10 +247,6 @@ fn database(d: &Database) -> String {
     o.done()
 }
 
-fn unavailable(state: State) -> Response {
-    error_with(409, "database_unavailable", "The database is not ready", |o| o.str("state", state.name()))
-}
-
 /// Whether a failed read is explained by the database changing under it.
 fn changing(entry: &Entry, generation: u64, e: &Error) -> bool {
     matches!(e, Error::Io(..)) || entry.generation() != Some(generation)
@@ -296,54 +262,21 @@ fn database_changing() -> Response {
 }
 
 fn games(app: &App, entry: &Entry, req: &Request) -> Response {
+    let GamesQuery { offset, limit, sort: sort_param, line, board, stream, q } = match GamesQuery::parse(req) {
+        Ok(query) => query,
+        Err(answer) => return answer,
+    };
     // The games of a position mark the database in use (#149); a list alone
     // does not.
-    if req.param("fen").is_some() {
+    if board.is_some() {
         app.catalog.explorer.mark_in_use(&entry.id);
     }
-    let offset = match req.param("offset").map(str::parse::<u64>) {
-        None => 0,
-        Some(Ok(n)) => n,
-        Some(Err(_)) => return bad_parameter("offset", "offset must be a whole number"),
-    };
-    let limit = match req.param("limit").map(str::parse::<u32>) {
-        None => DEFAULT_LIMIT,
-        Some(Ok(n)) if (1..=MAX_LIMIT).contains(&n) => n,
-        Some(_) => return bad_parameter("limit", "limit must be between 1 and 500"),
-    };
-    let sort_param = match req.param("sort") {
-        None => None,
-        Some(text) => match Sort::parse(text) {
-            Some(sort) => Some(sort),
-            None => return bad_parameter("sort", "unknown sort key"),
-        },
-    };
-    let line = match req.param("line").map(str::parse::<u8>) {
-        None => None,
-        Some(Ok(n)) if (1..=MAX_LINE_PLIES).contains(&n) => Some(n),
-        Some(_) => return bad_parameter("line", "line must be between 1 and 60"),
-    };
-    // The games of a position (#148): its FEN checked as the explorer checks
-    // it, `variant` with it only.
-    let board = match req.param("fen") {
-        None => None,
-        Some(_) if req.param("variant").is_some_and(|v| v != "standard") => return explorer::unsupported(),
-        Some(fen) => match explorer::board(fen) {
-            Ok(board) => Some(board),
-            Err(answer) => return answer,
-        },
-    };
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
     };
-    let stream = match req.param("stream") {
-        None => None,
-        Some(s) if valid_stream(s) => Some(s),
-        Some(_) => return bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"),
-    };
     app.catalog.attach_heads(entry, &open);
-    let (db, idx, q) = (&open.db, &open.indexes, req.param("q"));
+    let (db, idx) = (&open.db, &open.indexes);
     let selected = match &board {
         Some(board) => {
             let loaded = match explorer::ready(app, entry, &open) {
@@ -420,19 +353,9 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
 }
 
 fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
-    let field = match req.param("field") {
-        Some("player") => SuggestField::Player,
-        Some("event") => SuggestField::Event,
-        Some("annotator") => SuggestField::Annotator,
-        _ => return bad_parameter("field", "field must be player, event or annotator"),
-    };
-    let Some(prefix) = req.param("prefix").filter(|p| !p.trim().is_empty()) else {
-        return bad_parameter("prefix", "prefix must not be empty");
-    };
-    let limit = match req.param("limit").map(str::parse::<usize>) {
-        None => 20,
-        Some(Ok(n)) if (1..=20).contains(&n) => n,
-        Some(_) => return bad_parameter("limit", "limit must be between 1 and 20"),
+    let SuggestQuery { field, field_name, prefix, limit } = match SuggestQuery::parse(req) {
+        Ok(query) => query,
+        Err(answer) => return answer,
     };
     let open = match entry.open() {
         Ok(open) => open,
@@ -449,13 +372,7 @@ fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
     let items = list
         .iter()
         .map(|s| Obj::new().str("value", &s.name).str("label", &clip(s.name.clone())).num("games", s.games).done());
-    let field = req.param("field").unwrap_or_default();
-    ok(Obj::new().str("field", field).raw("suggestions", &json::array(items)).done()).holding(hold)
-}
-
-/// A client's stream name: 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-` and `_`.
-fn valid_stream(s: &str) -> bool {
-    (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    ok(Obj::new().str("field", field_name).raw("suggestions", &json::array(items)).done()).holding(hold)
 }
 
 /// The answer to a search that could not finish.
@@ -478,11 +395,12 @@ fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Re
 }
 
 /// The answer to a read of database `id` that failed with a bug: `500
-/// internal`, logged with the id and the error, whose path the log leaves
-/// out (#117).
+/// internal`, logged with the id and the error. The error's path is left
+/// out of both (#117, #173).
 fn internal(id: &str, e: &Error) -> Response {
-    crate::log!("internal error on database {id}: {}", crate::log::error(e));
-    error(500, "internal", &e.to_string())
+    let why = crate::log::error(e);
+    crate::log!("internal error on database {id}: {why}");
+    error(500, "internal", &why)
 }
 
 /// Rows `first..first + count` in one header read.
@@ -533,13 +451,9 @@ fn attempt<S: Store>(app: &App, db: &S, number: u32, options: &pgn::Options) -> 
 }
 
 fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
-    let Some(number) = number.parse::<u32>().ok().filter(|&n| n > 0) else { return not_found() };
-    // Languages ChessBase has no number for are passed over; English is the default.
-    let mut options = pgn::Options::with_languages(req.param("lang").unwrap_or("en").split(','));
-    options.full = match req.param("annotations") {
-        None | Some("reading") => false,
-        Some("full") => true,
-        Some(_) => return bad_parameter("annotations", "annotations must be reading or full"),
+    let GameQuery { number, options } = match GameQuery::parse(number, req) {
+        Ok(query) => query,
+        Err(answer) => return answer,
     };
     for _ in 0..GAME_ATTEMPTS {
         let open = match entry.open_to_read() {
@@ -586,19 +500,372 @@ fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
             }
             Err(Error::Io(..)) => database_changing(),
             Err(e) => error_with(422, "unreadable_game", "The game's records are damaged", |o| {
-                o.str("reason", &e.to_string())
+                o.str("reason", &crate::log::error(&e))
             }),
         };
     }
     database_changing()
 }
 
+// The parameters of each endpoint, checked before anything is read or
+// started: a request refused for one of them marks no database in use and
+// starts no download (#173). Where several are wrong, the first refused is
+// the first checked here.
+
+/// The parameters of `GET /v1/databases/{id}/games`.
+struct GamesQuery<'r> {
+    offset: u64,
+    limit: u32,
+    sort: Option<Sort>,
+    line: Option<u8>,
+    /// The position of `fen`, whose games alone are listed (#148).
+    board: Option<Board>,
+    stream: Option<&'r str>,
+    q: Option<&'r str>,
+}
+
+impl<'r> GamesQuery<'r> {
+    fn parse(req: &'r Request) -> Result<GamesQuery<'r>, Response> {
+        let offset = match req.param("offset") {
+            None => 0,
+            Some(text) => text.parse::<u64>().map_err(|_| bad_parameter("offset", "offset must be a whole number"))?,
+        };
+        let limit = bounded(req, "limit", 1..=MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT);
+        let sort = match req.param("sort") {
+            None => None,
+            Some(text) => Some(Sort::parse(text).ok_or_else(|| bad_parameter("sort", "unknown sort key"))?),
+        };
+        let line = bounded(req, "line", 1..=MAX_LINE_PLIES)?;
+        // The games of a position (#148): its FEN checked as the explorer
+        // checks it, `variant` with it only.
+        let board = match req.param("fen") {
+            None => None,
+            Some(_) if req.param("variant").is_some_and(|v| v != "standard") => return Err(explorer::unsupported()),
+            Some(fen) => Some(explorer::board(fen)?),
+        };
+        let stream = match req.param("stream") {
+            Some(s) if s.is_empty() || !stream_name(s) => {
+                return Err(bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"));
+            }
+            stream => stream,
+        };
+        Ok(GamesQuery { offset, limit, sort, line, board, stream, q: req.param("q") })
+    }
+}
+
+/// The parameters of `GET /v1/databases/{id}/games/{number}`, with the
+/// number itself: `404` unless it is a record's.
+struct GameQuery {
+    number: u32,
+    options: pgn::Options,
+}
+
+impl GameQuery {
+    fn parse(number: &str, req: &Request) -> Result<GameQuery, Response> {
+        let Some(number) = number.parse::<u32>().ok().filter(|&n| n > 0) else { return Err(not_found()) };
+        // Languages ChessBase has no number for are passed over; English is the default.
+        let mut options = pgn::Options::with_languages(req.param("lang").unwrap_or("en").split(','));
+        options.full = match req.param("annotations") {
+            None | Some("reading") => false,
+            Some("full") => true,
+            Some(_) => return Err(bad_parameter("annotations", "annotations must be reading or full")),
+        };
+        Ok(GameQuery { number, options })
+    }
+}
+
+/// The parameters of `GET /v1/databases/{id}/suggest`.
+struct SuggestQuery<'r> {
+    field: SuggestField,
+    /// `field` as the request names it, which the answer repeats.
+    field_name: &'r str,
+    prefix: &'r str,
+    limit: usize,
+}
+
+impl<'r> SuggestQuery<'r> {
+    fn parse(req: &'r Request) -> Result<SuggestQuery<'r>, Response> {
+        let field_name = req.param("field").unwrap_or_default();
+        let field = match field_name {
+            "player" => SuggestField::Player,
+            "event" => SuggestField::Event,
+            "annotator" => SuggestField::Annotator,
+            _ => return Err(bad_parameter("field", "field must be player, event or annotator")),
+        };
+        let Some(prefix) = req.param("prefix").filter(|p| !p.trim().is_empty()) else {
+            return Err(bad_parameter("prefix", "prefix must not be empty"));
+        };
+        let limit = bounded(req, "limit", 1..=20)?.unwrap_or(20);
+        Ok(SuggestQuery { field, field_name, prefix, limit })
+    }
+}
+
+/// The parameters of `GET /v1/engine/analyze`: the search, and the stream
+/// that names the client's view.
+struct AnalyzeQuery {
+    search: Search,
+    stream: String,
+}
+
+impl AnalyzeQuery {
+    fn parse(req: &Request) -> Result<AnalyzeQuery, Response> {
+        let multipv = whole(req, "multipv")?.unwrap_or(1);
+        let limit = match (whole(req, "depth")?, whole(req, "movetime")?) {
+            (None, None) => Limit::Infinite,
+            (Some(d), None) => Limit::Depth(d),
+            (None, Some(t)) => Limit::MovetimeMs(t),
+            (Some(_), Some(_)) => return Err(bad_parameter("movetime", "Give depth or movetime, not both")),
+        };
+        let stream = req.param("stream").unwrap_or_default();
+        if !stream_name(stream) {
+            return Err(bad_parameter("stream", "stream is at most 64 letters, digits, - and _"));
+        }
+        let (threads, hash_mb) = resources(req)?;
+        let search = Search::new(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit)
+            .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()));
+        Ok(AnalyzeQuery { search: checked(search)?, stream: stream.to_string() })
+    }
+}
+
+/// The parameters of `GET /v1/engine/warm`: a search with the `threads` and
+/// `hash` of the analysis to come.
+struct WarmQuery {
+    search: Search,
+}
+
+impl WarmQuery {
+    fn parse(req: &Request) -> Result<WarmQuery, Response> {
+        let (threads, hash_mb) = resources(req)?;
+        let search = Search::new(None, "", 1, Limit::Infinite)
+            .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()));
+        Ok(WarmQuery { search: checked(search)? })
+    }
+}
+
+/// Parameter `name`: `None` when absent, else a whole number within `range`;
+/// `400` naming it otherwise.
+fn bounded<T: FromStr + PartialOrd + Display>(
+    req: &Request,
+    name: &str,
+    range: RangeInclusive<T>,
+) -> Result<Option<T>, Response> {
+    match req.param(name).map(str::parse::<T>) {
+        None => Ok(None),
+        Some(Ok(n)) if range.contains(&n) => Ok(Some(n)),
+        Some(_) => Err(bad_parameter(name, &format!("{name} must be between {} and {}", range.start(), range.end()))),
+    }
+}
+
+/// Parameter `name` of the engine's endpoints: `None` when absent, else a
+/// whole number, whose bounds [`Search`] checks; `400` naming it otherwise.
+fn whole(req: &Request, name: &str) -> Result<Option<u32>, Response> {
+    match req.param(name).map(str::parse::<u32>) {
+        None => Ok(None),
+        Some(Ok(n)) => Ok(Some(n)),
+        Some(Err(_)) => Err(bad_parameter(name, &format!("{name} is a whole number"))),
+    }
+}
+
+/// `threads` and `hash`, which an analysis and a warm-up take alike.
+fn resources(req: &Request) -> Result<(Option<u32>, Option<u32>), Response> {
+    Ok((whole(req, "threads")?, whole(req, "hash")?))
+}
+
+/// `search` as [`Search`] checked it: `400` naming the parameter at fault.
+fn checked(search: Result<Search, (&'static str, String)>) -> Result<Search, Response> {
+    search.map_err(|(parameter, message)| bad_parameter(parameter, &message))
+}
+
+/// Whether `s` can name a client's stream: at most 64 characters of `A-Z`,
+/// `a-z`, `0-9`, `-` and `_` (`docs/api.md`, "Cancellation"). A list's
+/// stream is not empty either; an analysis without one has the empty one.
+fn stream_name(s: &str) -> bool {
+    s.len() <= 64 && token::is_base64url(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A `500 internal` is logged by its database's id, without the path its
-    /// error carries; the answer is as `docs/api.md` gives it (#117).
+    /// The start position, and as a query writes it.
+    const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    const START_PARAM: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR+w+KQkq+-+0+1";
+
+    /// The status and body of the answer a parser refused a request with.
+    fn refused<T>(parsed: Result<T, Response>) -> (u16, String) {
+        match parsed {
+            Ok(_) => panic!("accepted"),
+            Err(answer) => (answer.status, answer.body),
+        }
+    }
+
+    /// `400 bad_request` naming `parameter`, whole.
+    fn bad(parameter: &str, message: &str) -> (u16, String) {
+        (400, format!(r#"{{"error":{{"code":"bad_request","message":"{message}","parameter":"{parameter}"}}}}"#))
+    }
+
+    /// A list's parameters are refused as they always were, the first
+    /// checked first, with no database at hand (#173).
+    #[test]
+    fn a_list_refuses_each_parameter() {
+        let refusal = |query: &str| refused(GamesQuery::parse(&Request::get(&format!("/?{query}"))));
+        let stream = "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _";
+        let long = format!("stream={}", "a".repeat(65));
+        for (query, parameter, message) in [
+            ("offset=-1", "offset", "offset must be a whole number"),
+            ("limit=0", "limit", "limit must be between 1 and 500"),
+            ("limit=501", "limit", "limit must be between 1 and 500"),
+            ("sort=elo", "sort", "unknown sort key"),
+            ("line=0", "line", "line must be between 1 and 60"),
+            ("line=256", "line", "line must be between 1 and 60"),
+            ("fen=", "fen", "fen is not a valid position"),
+            ("fen=nonsense", "fen", "fen is not a valid position"),
+            ("stream=", "stream", stream),
+            ("stream=bad!", "stream", stream),
+            (long.as_str(), "stream", stream),
+            ("stream=bad!&fen=nonsense&limit=0", "limit", "limit must be between 1 and 500"),
+            ("stream=bad!&fen=nonsense", "fen", "fen is not a valid position"),
+        ] {
+            assert_eq!(refusal(query), bad(parameter, message), "{query}");
+        }
+        let unsupported =
+            r#"{"error":{"code":"unsupported","message":"Chess960 positions are not indexed","variant":"chess960"}}"#;
+        for query in ["fen=4k3/8/8/8/8/8/8/4KR1R+w+F+-+0+1", "fen=nonsense&variant=chess960"] {
+            assert_eq!(refusal(query), (422, unsupported.to_string()), "{query}");
+        }
+    }
+
+    #[test]
+    fn a_list_takes_its_parameters() {
+        let req = Request::get(&format!(
+            "/?offset=5&limit=500&sort=white-desc&line=60&fen={START_PARAM}&variant=standard&stream=Tab-1_x&q=player%3Amorphy"
+        ));
+        let Ok(query) = GamesQuery::parse(&req) else { panic!("refused") };
+        assert_eq!(
+            (query.offset, query.limit, query.sort, query.line, query.stream, query.q),
+            (5, 500, Sort::parse("white-desc"), Some(60), Some("Tab-1_x"), Some("player:morphy"))
+        );
+        assert_eq!(query.board.map(|board| board.fen()).as_deref(), Some(START));
+        // The defaults; `variant` alone narrows nothing.
+        let req = Request::get("/?variant=chess960");
+        let Ok(query) = GamesQuery::parse(&req) else { panic!("refused") };
+        assert_eq!(
+            (query.offset, query.limit, query.sort, query.line, query.stream, query.q),
+            (0, DEFAULT_LIMIT, None, None, None, None)
+        );
+        assert!(query.board.is_none());
+    }
+
+    /// A list refused for any of its parameters, its `fen` or its `stream`
+    /// among them, does not mark its database in use; a list of a position
+    /// that passes every check does, before the database is opened (#173).
+    #[test]
+    fn a_refused_list_marks_nothing_in_use() {
+        let path = std::env::temp_dir().join(format!("bridge-api-in-use-{}", std::process::id())).join("Absent.2cbh");
+        let policy = Policy { port: 0, origins: Vec::new(), token: String::new() };
+        let app = App::new("test", policy, Catalog::new([path.clone()]));
+        let id = crate::catalog::id_of(&path);
+        let list = |query: &str| route(&app, &Request::get(&format!("/v1/databases/{id}/games?{query}")));
+        for query in [
+            "fen=nonsense".to_string(),
+            format!("fen={START_PARAM}&stream=bad!"),
+            format!("fen={START_PARAM}&limit=0"),
+            format!("fen={START_PARAM}&variant=chess960"),
+        ] {
+            let answer = list(&query);
+            assert!(matches!(answer.status, 400 | 422), "{query}: {}", answer.body);
+            assert!(!app.catalog.explorer.in_use(&id), "{query} marked the database in use");
+        }
+        let answer = list(&format!("fen={START_PARAM}&stream=tab"));
+        let missing =
+            r#"{"error":{"code":"database_unavailable","message":"The database is not ready","state":"missing"}}"#;
+        assert_eq!((answer.status, answer.body.as_str()), (409, missing));
+        assert!(app.catalog.explorer.in_use(&id));
+    }
+
+    /// Suggestions and a game refuse their parameters as they always did.
+    #[test]
+    fn suggestions_and_a_game_refuse_each_parameter() {
+        let suggest = |query: &str| refused(SuggestQuery::parse(&Request::get(&format!("/?{query}"))));
+        for (query, parameter, message) in [
+            ("prefix=m", "field", "field must be player, event or annotator"),
+            ("field=colour&prefix=m", "field", "field must be player, event or annotator"),
+            ("field=player", "prefix", "prefix must not be empty"),
+            ("field=player&prefix=+", "prefix", "prefix must not be empty"),
+            ("field=event&prefix=p&limit=0", "limit", "limit must be between 1 and 20"),
+            ("field=event&prefix=p&limit=21", "limit", "limit must be between 1 and 20"),
+        ] {
+            assert_eq!(suggest(query), bad(parameter, message), "{query}");
+        }
+        let req = Request::get("/?field=annotator&prefix=Kas&limit=3");
+        let Ok(query) = SuggestQuery::parse(&req) else { panic!("refused") };
+        assert_eq!(
+            (query.field, query.field_name, query.prefix, query.limit),
+            (SuggestField::Annotator, "annotator", "Kas", 3)
+        );
+
+        let game = |number: &str, query: &str| refused(GameQuery::parse(number, &Request::get(&format!("/?{query}"))));
+        let not_found = r#"{"error":{"code":"not_found","message":"No such resource"}}"#;
+        for number in ["0", "-1", "x", "4294967296"] {
+            assert_eq!(game(number, ""), (404, not_found.to_string()), "{number}");
+        }
+        assert_eq!(game("1", "annotations=all"), bad("annotations", "annotations must be reading or full"));
+        for (query, full) in [("", false), ("annotations=reading", false), ("annotations=full", true)] {
+            let Ok(parsed) = GameQuery::parse("7", &Request::get(&format!("/?{query}"))) else { panic!("{query}") };
+            assert_eq!((parsed.number, parsed.options.full), (7, full), "{query}");
+        }
+    }
+
+    /// An analysis and a warm-up refuse their parameters as they always did:
+    /// each whole number before the bounds [`Search`] checks.
+    #[test]
+    fn the_engine_parameters_are_refused_as_before() {
+        let analysis = |query: &str| refused(AnalyzeQuery::parse(&Request::get(&format!("/?{query}"))));
+        let stream = "stream is at most 64 letters, digits, - and _";
+        let long = format!("stream={}", "a".repeat(65));
+        for (query, parameter, message) in [
+            ("multipv=x", "multipv", "multipv is a whole number"),
+            ("multipv=6", "multipv", "multipv is 1 to 5"),
+            ("depth=x&movetime=y", "depth", "depth is a whole number"),
+            ("movetime=-1", "movetime", "movetime is a whole number"),
+            ("depth=5&movetime=100", "movetime", "Give depth or movetime, not both"),
+            ("depth=0", "depth", "depth is 1 to 99"),
+            ("stream=a%20b", "stream", stream),
+            (long.as_str(), "stream", stream),
+            ("stream=a%20b&multipv=x", "multipv", "multipv is a whole number"),
+            ("threads=x&hash=y", "threads", "threads is a whole number"),
+            ("hash=x", "hash", "hash is a whole number"),
+            ("multipv=9&threads=x", "threads", "threads is a whole number"),
+        ] {
+            assert_eq!(analysis(query), bad(parameter, message), "{query}");
+        }
+        let too_many = format!("threads is 1 to {}", engine::limits().max_threads);
+        assert_eq!(analysis("threads=0"), bad("threads", &too_many));
+        let warm_up = |query: &str| refused(WarmQuery::parse(&Request::get(&format!("/?{query}"))));
+        assert_eq!(warm_up("threads=x"), bad("threads", "threads is a whole number"));
+        assert_eq!(warm_up("threads=0&hash=x"), bad("hash", "hash is a whole number"));
+        assert_eq!(warm_up("threads=0"), bad("threads", &too_many));
+
+        let Ok(query) = AnalyzeQuery::parse(&Request::get("/?moves=e2e4+e7e5&multipv=2&depth=6&threads=1&hash=16"))
+        else {
+            panic!("refused")
+        };
+        let search = &query.search;
+        assert_eq!(
+            (search.multipv, search.limit, search.threads, search.hash_mb, query.stream.as_str()),
+            (2, Limit::Depth(6), Some(1), Some(16), "")
+        );
+        let longest = "a".repeat(64);
+        for (query, name) in [("stream=".to_string(), ""), (format!("stream={longest}"), longest.as_str())] {
+            let Ok(parsed) = AnalyzeQuery::parse(&Request::get(&format!("/?{query}"))) else { panic!("{query}") };
+            assert_eq!((parsed.search.limit, parsed.stream.as_str()), (Limit::Infinite, name), "{query}");
+        }
+        let Ok(query) = WarmQuery::parse(&Request::get("/?hash=16")) else { panic!("refused") };
+        assert_eq!((query.search.threads, query.search.hash_mb), (None, Some(16)));
+    }
+
+    /// A `500 internal` is logged by its database's id, and neither the log
+    /// nor the answer carries the path its error does (#117, #173).
     #[test]
     fn an_internal_error_is_logged_by_the_database_id_alone() {
         let held = crate::log::testing::hold();
@@ -610,13 +877,14 @@ mod tests {
         let id = "0123456789abcdef";
         let r = internal(id, &Error::Io(db.clone(), std::io::Error::other("the disk is gone")));
         assert_eq!(r.status, 500);
-        assert!(r.body.contains(r#""code":"internal""#), "{}", r.body);
+        assert_eq!(r.body, r#"{"error":{"code":"internal","message":".2cbg: the disk is gone"}}"#);
         // Other tests may log beside this one.
         let log = std::fs::read_to_string(dir.join(crate::log::FILE_NAME)).unwrap();
         let line = log.lines().find(|l| l.contains(id)).unwrap();
         assert!(line.ends_with(" internal error on database 0123456789abcdef: .2cbg: the disk is gone"), "{line}");
         for private in [dir.to_str().unwrap(), "Jane Doe", "Private Games"] {
             assert!(!log.contains(private), "{private} in {log}");
+            assert!(!r.body.contains(private), "{private} in {}", r.body);
         }
         drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
