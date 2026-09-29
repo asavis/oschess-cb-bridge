@@ -59,13 +59,28 @@ jobs:
             exit 1
           fi
       - name: Release build
+        # The whole workspace: on Windows, the tray app (crates/app) and the
+        # console bridge (crates/bridge) among the rest.
         run: cargo build --release --locked
-      - name: Upload the Windows executable
-        # The build of main, for trying it on Windows before a release.
+      - name: Upload the tray app
+        # The build of main, for trying the app that ships on Windows before a
+        # release. It keeps its cargo name, oschess-bridge-app.exe: only the
+        # release's Tauri CLI build renames it to oschess-bridge.exe.
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: oschess-bridge-windows
+          name: oschess-bridge-tray-app-windows
+          path: target/release/oschess-bridge-app.exe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the console bridge
+        # crates/bridge's oschess-bridge.exe, the same bridge in a console, as
+        # the README runs it. Not the release's oschess-bridge.exe, which is
+        # the tray app renamed.
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oschess-bridge-console-windows
           path: target/release/oschess-bridge.exe
           if-no-files-found: error
           retention-days: 14
