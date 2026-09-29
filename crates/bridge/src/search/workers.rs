@@ -356,21 +356,24 @@ where
         let mut heap: Vec<(T, usize, usize)> =
             (0..runs.len()).filter(|&r| from[r] < to[r]).map(|r| (runs[r].as_ref()[from[r]], r, from[r])).collect();
         heap.sort_unstable_by(|a, b| cmp(&a.0, &b.0));
+        let Some(&(mut least)) = heap.first() else { return Ok(()) };
         for (i, slot) in part.iter_mut().enumerate() {
-            let Some(&(least, r, at)) = heap.first() else { break };
             if i % MERGE_CHECK == 0 && stopped() {
                 return Err(SearchError::Superseded);
             }
-            *slot = map(least);
+            let (item, r, at) = least;
+            *slot = map(item);
             // The least head is taken and its run's next item put in its
             // place, which sifts the heap once where a pop and a push would
-            // twice.
-            if at + 1 < to[r] {
-                heap[0] = (runs[r].as_ref()[at + 1], r, at + 1);
-            } else {
-                heap.swap_remove(0);
-            }
-            sift_down(&mut heap, cmp);
+            // twice; the heap's last head takes the place of a run that ends.
+            let next = match at + 1 < to[r] {
+                true => (runs[r].as_ref()[at + 1], r, at + 1),
+                false => match heap.pop() {
+                    Some(last) if !heap.is_empty() => last,
+                    _ => break,
+                },
+            };
+            least = sift_down(&mut heap, next, cmp);
         }
         Ok(())
     };
@@ -398,11 +401,17 @@ where
     Ok(())
 }
 
-/// Moves the first head of `heap`, a heap by `cmp` of the least first but
-/// for that head, down past each lesser child to its place.
-fn sift_down<T: Copy, F: Fn(&T, &T) -> std::cmp::Ordering>(heap: &mut [(T, usize, usize)], cmp: &F) {
-    let Some(&moved) = heap.first() else { return };
-    let (end, mut hole) = (heap.len(), 0);
+/// Puts `moved` in the place of the least head of `heap`, a heap by `cmp` of
+/// the least first, and then down past each lesser child: the least head now.
+/// It is returned as it is held, not read back from the heap just written,
+/// which would wait for the write when the least head stays at the top, as
+/// it does for as long as one run holds the least keys.
+fn sift_down<T: Copy, F: Fn(&T, &T) -> std::cmp::Ordering>(
+    heap: &mut [(T, usize, usize)],
+    moved: (T, usize, usize),
+    cmp: &F,
+) -> (T, usize, usize) {
+    let (end, mut hole, mut least) = (heap.len(), 0, moved);
     loop {
         let mut child = 2 * hole + 1;
         if child >= end {
@@ -411,13 +420,18 @@ fn sift_down<T: Copy, F: Fn(&T, &T) -> std::cmp::Ordering>(heap: &mut [(T, usize
         if child + 1 < end {
             child += usize::from(cmp(&heap[child + 1].0, &heap[child].0).is_lt());
         }
-        if !cmp(&heap[child].0, &moved.0).is_lt() {
+        let up = heap[child];
+        if !cmp(&up.0, &moved.0).is_lt() {
             break;
         }
-        heap[hole] = heap[child];
+        if hole == 0 {
+            least = up;
+        }
+        heap[hole] = up;
         hole = child;
     }
     heap[hole] = moved;
+    least
 }
 
 #[cfg(test)]
