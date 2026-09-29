@@ -3,6 +3,7 @@
 //! command that keeps its data, and game quotations and medals in the reading
 //! form as ChessBase's own export writes them.
 
+use cbformat::Limits;
 use cbformat::fixture::{
     TempDb, annotations, arrows, bytes, one_game, other, pgn_movetext, quiet, rendered, squares, symbols, text,
     unpercent,
@@ -369,7 +370,7 @@ fn a_classic_game_keeps_its_languages_quotations_and_data() {
     let f = b.write("full-classic");
     let db = cbformat::cbh::Database::open(f.base()).unwrap();
     let render = |full: bool| {
-        let r = pgn::classic_game_with(&db, 1, &Options { full, ..Options::default() }).unwrap();
+        let r = pgn::classic_game_with(&db, 1, &Options { full, ..Options::default() }, Limits::default()).unwrap();
         pgn_movetext(&r.pgn)
     };
     assert_eq!(
@@ -634,7 +635,8 @@ fn every_command_keeps_to_its_grammar() {
     b.annotations(&annotation_record(1, &items));
     let f = b.write("grammar-classic");
     let classic = cbformat::cbh::Database::open(f.base()).unwrap();
-    let classic_full = pgn::classic_game_with(&classic, 1, &Options { full: true, ..Options::default() }).unwrap().pgn;
+    let options = Options { full: true, ..Options::default() };
+    let classic_full = pgn::classic_game_with(&classic, 1, &options, Limits::default()).unwrap().pgn;
 
     let outputs = [full_all, render(&rest, true).0, classic_full];
     let mut seen = std::collections::BTreeSet::new();

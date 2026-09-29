@@ -3,10 +3,10 @@
 //! [`Base`] opens a 2CBH (`.2cbh`) or a classic (`.cbh`) database and reads
 //! both the same way: header fields as the [`v2`] types, the names of a
 //! game's players, tournament and annotator, the move tree through the same
-//! [`TreeVisitor`] walk, annotations, and PGN. [`v2`] and [`cbh`] each
-//! provide what it reads. A PGN file, read through its index
-//! ([`crate::pgnfile`]), gives the same headers, names and PGN; its moves are
-//! only in its text.
+//! [`TreeVisitor`] walk, annotations, and PGN, which it renders within the
+//! [`Limits`] its caller gives. [`v2`] and [`cbh`] each provide what it
+//! reads. A PGN file, read through its index ([`crate::pgnfile`]), gives the
+//! same headers, names and PGN; its moves are only in its text.
 
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Player, RecordKi
 use crate::pgn::{self, Options, Rendered};
 use crate::replay::{self, TreeStats, TreeVisitor};
 use crate::v2;
-use crate::{Error, Result, cbh, pgnfile};
+use crate::{Error, Limits, Result, cbh, pgnfile};
 
 /// The format of a database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,11 +191,13 @@ impl Base {
     }
 
     /// Game `id` as PGN with its annotations; a PGN game as its file has it.
-    pub fn pgn(&self, id: u32, options: &Options) -> Result<Rendered> {
+    /// A move or annotation record, or a PGN game's text, over
+    /// [`Limits::game_bytes`] is refused before it is read.
+    pub fn pgn(&self, id: u32, options: &Options, limits: Limits) -> Result<Rendered> {
         match self {
-            Base::TwoCbh(db) => pgn::game_with(db, id, options),
-            Base::Cbh(db) => pgn::classic_game_with(db, id, options),
-            Base::Pgn(db) => pgn_text(db, &db.record(id)?),
+            Base::TwoCbh(db) => pgn::game_with(db, id, options, limits),
+            Base::Cbh(db) => pgn::classic_game_with(db, id, options, limits),
+            Base::Pgn(db) => pgn_text(db, &db.record(id)?, limits),
         }
     }
 
@@ -214,8 +216,11 @@ impl Base {
 }
 
 /// A PGN game as its file has it: the comments in its text are all it has.
-fn pgn_text(db: &pgnfile::Database, r: &pgnfile::Record) -> Result<Rendered> {
-    Ok(Rendered { pgn: db.text(r, pgnfile::MAX_TEXT)?, annotations: pgn::AnnotationStatus::Complete })
+/// Its text is read to [`Limits::game_bytes`], and never past
+/// [`pgnfile::MAX_TEXT`].
+fn pgn_text(db: &pgnfile::Database, r: &pgnfile::Record, limits: Limits) -> Result<Rendered> {
+    let limit = limits.game_bytes.min(pgnfile::MAX_TEXT);
+    Ok(Rendered { pgn: db.text(r, limit)?, annotations: pgn::AnnotationStatus::Complete })
 }
 
 impl Format {
@@ -415,28 +420,30 @@ impl Batch<'_> {
         })
     }
 
-    /// Game `id` as PGN, from the batch's buffers when it lies inside them.
-    pub fn pgn(&self, id: u32, options: &Options) -> Result<Rendered> {
+    /// Game `id` as PGN, from the batch's buffers when it lies inside them,
+    /// within `limits` as [`Base::pgn`] renders it.
+    pub fn pgn(&self, id: u32, options: &Options, limits: Limits) -> Result<Rendered> {
+        let limit = limits.game_bytes;
         match self {
             Batch::TwoCbh(db, b) => {
                 let r = b.record(id)?;
                 if r.kind() != RecordKind::Game {
-                    return pgn::game_with(db, id, options);
+                    return pgn::game_with(db, id, options, limits);
                 }
-                let data = b.moves_of(&r)?;
-                let annotations = b.annotations_of(&r)?;
+                let data = b.moves_of_within(&r, limit)?;
+                let annotations = b.annotations_of_within(&r, limit)?;
                 pgn::game_from(db, &r, &data.moves()?, annotations.as_ref(), options)
             }
             Batch::Cbh(db, b) => {
                 let r = b.record(id)?;
                 if r.kind() != RecordKind::Game {
-                    return pgn::classic_game_with(db, id, options);
+                    return pgn::classic_game_with(db, id, options, limits);
                 }
-                let data = b.moves_of(&r)?;
-                let annotations = b.annotations_of(&r)?;
+                let data = b.moves_of_within(&r, limit)?;
+                let annotations = b.annotations_of_within(&r, limit)?;
                 pgn::classic_game_from(db, &r, &data.moves()?, annotations.as_ref(), options)
             }
-            Batch::Pgn(db, ids) if ids.contains(&id) => pgn_text(db, &db.record(id)?),
+            Batch::Pgn(db, ids) if ids.contains(&id) => pgn_text(db, &db.record(id)?, limits),
             Batch::Pgn(..) => Err(Error::NoSuchGame(id)),
         }
     }

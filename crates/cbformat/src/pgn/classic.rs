@@ -5,27 +5,31 @@ use crate::cbh::{self, Database, GameMoves, Record};
 use crate::game::{GameAnnotations, Player, RecordKind, Start};
 use crate::replay::start_board;
 use crate::view::PositionOrder;
-use crate::{Error, Result};
+use crate::{Error, Limits, Result};
 
-/// A classic game as PGN, as [`super::game`] writes a 2CBH one.
+/// A classic game as PGN, as [`super::game`] writes a 2CBH one, within the
+/// default [`Limits`].
 pub fn classic_game(db: &Database, id: u32) -> Result<String> {
-    classic_game_with(db, id, &Options::default()).map(|r| r.pgn)
+    classic_game_with(db, id, &Options::default(), Limits::default()).map(|r| r.pgn)
 }
 
 /// [`classic_game`] with `options`, and how much of the annotations it holds.
-pub fn classic_game_with(db: &Database, id: u32, options: &Options) -> Result<Rendered> {
+/// A move or annotation record over [`Limits::game_bytes`] is refused before
+/// it is read.
+pub fn classic_game_with(db: &Database, id: u32, options: &Options, limits: Limits) -> Result<Rendered> {
     let r = db.record(id)?;
     if r.kind() != RecordKind::Game {
         return Err(Error::Format(format!("record {id} is not a game")));
     }
-    let data = db.moves_of(&r)?;
-    let annotations = db.annotations_of(&r)?;
+    let data = db.moves_of_within(&r, limits.game_bytes)?;
+    let annotations = db.annotations_of_within(&r, limits.game_bytes)?;
     classic_game_from(db, &r, &data.moves()?, annotations.as_ref(), options)
 }
 
 /// [`classic_game_with`] for a record, move record and annotations already
-/// read, as from a [`crate::cbh::Batch`]; entities are read from `db`.
-/// `annotations` is `None` when the database has no `.cba` file.
+/// read, as from a [`crate::cbh::Batch`], within the bounds the caller chose;
+/// entities are read from `db`. `annotations` is `None` when the database has
+/// no `.cba` file.
 pub fn classic_game_from(
     db: &Database,
     r: &Record,

@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use cbformat::codepage::CodePage;
 use cbformat::fixture::{self, TempDb, quiet, text};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
 use cbformat::game::{Date, Eco, GameResult, Head, RecordKind, Start, language};
@@ -10,6 +11,7 @@ use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, Options};
 use cbformat::replay::TreeVisitor;
 use cbformat::view::{Base, Format, Header, PositionOrder, format_of};
+use cbformat::{Limits, cbh, pgnfile, v2};
 use chesscore::{Board, Move};
 
 use Color::{Black as B, White as W};
@@ -82,8 +84,8 @@ fn both_formats_read_the_same() {
     assert_eq!((new.record_count(), old.record_count()), (1, 1));
     assert!(new.has_annotations() && old.has_annotations());
 
-    let options = Options::default();
-    let (a, b) = (new.pgn(1, &options).unwrap(), old.pgn(1, &options).unwrap());
+    let (options, limits) = (Options::default(), Limits::default());
+    let (a, b) = (new.pgn(1, &options, limits).unwrap(), old.pgn(1, &options, limits).unwrap());
     // The comments land on the same moves although the formats number them
     // differently; only the result after the movetext may differ.
     let want = "1. e4 {e4} 1... c5 {c5} (1... c6 {c6} 2. d4 {d4}) 2. Nf3 {Nf3} ";
@@ -106,7 +108,7 @@ fn both_formats_read_the_same() {
         assert_eq!(a.blocks.len(), 5);
         let batch = base.batch(1, 10).unwrap();
         assert_eq!(batch.ids(), 1..=1);
-        assert_eq!(batch.pgn(1, &options).unwrap(), base.pgn(1, &options).unwrap());
+        assert_eq!(batch.pgn(1, &options, limits).unwrap(), base.pgn(1, &options, limits).unwrap());
         assert_eq!(base.headers(1, 5).unwrap().len(), 1);
     }
 }
@@ -124,7 +126,7 @@ fn names_and_header_fields() {
     assert_eq!((h.round(), h.elo()), ((0, 0), (0, 0)));
     // The direct classic writer gives the same PGN as the view.
     let db = cbformat::cbh::Database::open(f1.base()).unwrap();
-    assert_eq!(pgn::classic_game(&db, 1).unwrap(), old.pgn(1, &Options::default()).unwrap().pgn);
+    assert_eq!(pgn::classic_game(&db, 1).unwrap(), old.pgn(1, &Options::default(), Limits::default()).unwrap().pgn);
 
     // A header of one format given to a database of the other is an error.
     let f2 = two_cbh("names");
@@ -313,4 +315,107 @@ fn a_classic_database_requires_its_cbj_past_4_gib() {
         set_len(len);
     }
     assert_eq!(required(), small);
+}
+
+/// Limits of `n` bytes for a game's move and annotation records, or its PGN
+/// text.
+fn within(n: usize) -> Limits {
+    Limits { game_bytes: n, ..Limits::default() }
+}
+
+/// Game 1 of `base` as PGN within `limits`, or the error's text: read alone,
+/// and from a batch whose buffers hold its records, which must agree.
+fn render_within(base: &Base, limits: Limits) -> Result<String, String> {
+    let options = Options::default();
+    let alone = base.pgn(1, &options, limits).map(|r| r.pgn).map_err(|e| e.to_string());
+    let batch = base.batch(1, 2).unwrap().pgn(1, &options, limits).map(|r| r.pgn).map_err(|e| e.to_string());
+    assert_eq!(batch, alone, "{limits:?}");
+    alone
+}
+
+/// Each format renders a game within the limits it is given (#168), from
+/// its own reads and from a batch's buffers alike: a record one byte over
+/// them is refused before it is rendered, and one within them renders as
+/// [`Limits::format_max`] renders it.
+#[test]
+fn a_game_is_rendered_within_the_limits_given() {
+    let comment = "x".repeat(100);
+    // 2CBH: 6 bytes of moves, and a longer annotation record. The second game
+    // makes the batch's buffers hold the first one's records.
+    let words = [movetable::MOVES, quiet(W, Pawn, "e2", "e4"), movetable::END_OF_LINE];
+    let notes = fixture::annotations(&[(0, vec![text(false, language::ENGLISH, &comment)])]);
+    let mut b = fixture::Builder::new();
+    let moves = b.moves(1, &words);
+    let a = b.annotations(&notes);
+    b.annotated_game(moves, a);
+    b.game(moves);
+    let f2 = b.write("view-limits-2cbh");
+    // Classic: the same, its sizes counting the whole records.
+    use Tok::{End as E, Mv as M};
+    let record = move_record(0, None, None, &encode(&Board::startpos(), &[M("e2e4"), E], 0, false));
+    let data = [b"\x00\x2a".as_slice(), comment.as_bytes()].concat();
+    let classic_notes = annotation_record(1, &[(0, 0x02, &data)]);
+    let mut b = fixture_cbh::Builder::new();
+    b.game(&record);
+    b.annotations(&classic_notes);
+    b.game(&record);
+    let f1 = b.write("view-limits-cbh");
+
+    for (f, moves, notes) in [(&f2, 6, notes.len()), (&f1, record.len(), classic_notes.len())] {
+        let base = Base::open(f.base()).unwrap();
+        let whole = render_within(&base, Limits::format_max()).unwrap();
+        assert!(whole.contains(&comment), "{whole}");
+        assert_eq!(render_within(&base, within(notes)), Ok(whole));
+        for (n, what) in [(notes - 1, "annotation record"), (moves - 1, "move record")] {
+            let err = render_within(&base, within(n)).unwrap_err();
+            assert!(err.contains(what) && err.contains(&format!("over the {n}-byte limit")), "{err}");
+        }
+    }
+
+    // A PGN file: its game's text.
+    let game = format!("[Event \"Limits\"]\n\n1. e4 {{{comment}}} *\n");
+    let f = fixture::pgn_file("view-limits", format!("{game}\n{game}").as_bytes());
+    let (path, index) = (f.dir().join("db.pgn"), f.dir().join("db.idx"));
+    pgnfile::build(&path, &index, 0, CodePage::WESTERN, &mut |_| true).unwrap();
+    let db = pgnfile::Database::open(&path, &index, 0, CodePage::WESTERN).unwrap();
+    let len = db.record(1).unwrap().len() as usize;
+    let base = Base::Pgn(db);
+    let whole = render_within(&base, Limits::format_max()).unwrap();
+    assert_eq!(whole, game);
+    assert_eq!(render_within(&base, within(len)), Ok(whole));
+    let err = render_within(&base, within(len - 1)).unwrap_err();
+    assert!(err.contains(&format!("over the {}-byte limit", len - 1)), "{err}");
+}
+
+/// The entry points that take no limits render within the default ones,
+/// which refuse a record no server should render; [`Limits::format_max`]
+/// renders it.
+#[test]
+fn a_game_rendered_without_limits_is_bounded_by_the_default_ones() {
+    let big = Limits::DEFAULT.game_bytes;
+    let over = |err: cbformat::Error| {
+        let err = err.to_string();
+        assert!(err.contains(&format!("over the {big}-byte limit")), "{err}");
+        err
+    };
+    let e4 = [movetable::MOVES, quiet(W, Pawn, "e2", "e4"), movetable::END_OF_LINE];
+    let notes = fixture::annotations(&[(0, vec![text(false, language::ENGLISH, &"x".repeat(big))])]);
+    let f = fixture::one_game("view-limits-default", &e4, Some(&notes));
+    let db = v2::Database::open(f.base()).unwrap();
+    let err = over(pgn::game(&db, 1).unwrap_err());
+    let base = Base::open(f.base()).unwrap();
+    assert_eq!(base.pgn(1, &Options::default(), Limits::default()).unwrap_err().to_string(), err);
+    assert!(base.pgn(1, &Options::default(), Limits::format_max()).unwrap().pgn.len() > big);
+
+    let mut nulls = vec![movetable::MOVES];
+    nulls.extend(std::iter::repeat_n(movetable::NULL_MOVE, big / 2 + 1));
+    nulls.push(movetable::END_OF_LINE);
+    let f = fixture::one_game("view-limits-default-moves", &nulls, None);
+    let db = v2::Database::open(f.base()).unwrap();
+    over(pgn::movetext(&db, &db.record(1).unwrap()).unwrap_err());
+
+    let mut b = fixture_cbh::Builder::new();
+    b.game(&move_record(0, None, None, &vec![0; big]));
+    let f = b.write("view-limits-default-cbh");
+    over(pgn::classic_game(&cbh::Database::open(f.base()).unwrap(), 1).unwrap_err());
 }
