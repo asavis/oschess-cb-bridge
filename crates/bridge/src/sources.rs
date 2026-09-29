@@ -106,11 +106,12 @@ pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
 }
 
 /// What was last read from each source. A source is read again when its
-/// signature (sizes and modification times) is not the one it was last read
-/// at. The signature is taken before reading, so that a change made while it
-/// is read shows next time. A read that fails keeps what was last read and
-/// records no signature, so the source is read again on the next request: a
-/// folder or file that cannot be read for a while loses none of its databases.
+/// signature (sizes and modification times, and for a folder the databases
+/// it lists) is not the one it was last read at. The signature is taken
+/// before reading, so that a change made while it is read shows next time. A
+/// read that fails keeps what was last read and records no signature, so the
+/// source is read again on the next request: a folder or file that cannot be
+/// read for a while loses none of its databases.
 #[derive(Default)]
 pub(crate) struct Read {
     window: Kept<Vec<Listed>>,
@@ -206,24 +207,53 @@ pub(crate) fn signature(path: Option<&Path>) -> u64 {
     hash.finish()
 }
 
-/// [`signature`] of a configured path, and for a folder also the name, size
-/// and modification time of each database file in it. A folder's own time
-/// moves with the kernel's coarse clock, a few milliseconds a step, and its
-/// size rarely changes, so a database added right after a listing could leave
-/// both as they were and stay unseen until the folder changed again.
+/// [`signature`] of a configured path, and the paths [`expand`] lists for it:
+/// for a folder, its database files of every format. A folder's own time moves
+/// with the kernel's coarse clock, a few milliseconds a step, and its size
+/// rarely changes, so a database added right after a listing could leave both
+/// as they were and stay unseen until the folder changed again. Taken from
+/// `expand` itself, the signature changes whenever the list does. The files'
+/// sizes and times are left out: they never decide whether a file is listed,
+/// and a PGN file that grows, or a database being saved, would otherwise have
+/// the folder read again and the list rebuilt on every request while it is
+/// written.
 fn folder_signature(path: &Path) -> u64 {
     let mut hash = Hash::new();
     hash.write_file(path);
-    if let Ok(entries) = std::fs::read_dir(path) {
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|f| matches!(Format::of(f), Format::TwoCbh | Format::Cbh))
-            .collect();
-        files.sort();
-        for file in files {
-            hash.write(file.as_os_str().as_encoded_bytes());
-            hash.write_file(&file);
+    match expand(path) {
+        Ok(listed) => {
+            for database in listed {
+                hash.write(database.path.as_os_str().as_encoded_bytes());
+            }
         }
+        // Unlike the signature of any list, so that the read runs, logs why
+        // the folder cannot be read, and is tried again until it can be.
+        Err(_) => hash.write(&[0xff]),
     }
     hash.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A folder's signature follows which databases it lists, not their sizes
+    /// and times: a PGN file that grows and a database being saved leave it
+    /// as it was, so the folder is not read again for them.
+    #[test]
+    fn a_database_written_keeps_its_folder_signature() {
+        let f = cbformat::fixture::pgn_file("folder-signature", b"[White \"A\"]\n\n1. e4 *\n");
+        let (pgn, twocbh) = (f.dir().join("db.pgn"), f.dir().join("db.2cbh"));
+        std::fs::write(&twocbh, [0u8; 32]).unwrap();
+        let listed: Vec<PathBuf> = expand(f.dir()).unwrap().into_iter().map(|l| l.path).collect();
+        assert_eq!(listed, [twocbh.clone(), pgn.clone()]);
+        let before = folder_signature(f.dir());
+        let append = |path: &Path, bytes: &[u8]| {
+            std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(bytes).unwrap();
+        };
+        append(&pgn, b"\n[White \"B\"]\n\n1. d4 *\n");
+        append(&twocbh, &[0u8; 32]);
+        assert_eq!(folder_signature(f.dir()), before);
+    }
 }

@@ -191,9 +191,10 @@ fn a_configured_folder_is_read_again_when_it_changes() {
 
 /// A database added to a configured folder shows even when the folder's own
 /// size and time did not change, as happens within one tick of the kernel's
-/// coarse clock: the listing, not only the folder's time, decides. Unix only:
-/// resetting a folder's time needs a directory handle with timestamp-write
-/// access on Windows, which `File::open` does not give.
+/// coarse clock: the listing, not only the folder's time, decides, for a PGN
+/// file as for a ChessBase database. Unix only: resetting a folder's time
+/// needs a directory handle with timestamp-write access on Windows, which
+/// `File::open` does not give.
 #[cfg(unix)]
 #[test]
 fn a_database_added_within_one_clock_tick_shows() {
@@ -208,6 +209,11 @@ fn a_database_added_within_one_clock_tick_shows() {
     folder.set_modified(before).unwrap();
     assert_eq!(folder.metadata().unwrap().modified().unwrap(), before);
     assert_eq!(names(&catalog), ["One", "Two"]);
+
+    std::fs::write(root.path("folder/Three.pgn"), "[Event \"?\"]\n\n*\n").unwrap();
+    folder.set_modified(before).unwrap();
+    assert_eq!(folder.metadata().unwrap().modified().unwrap(), before);
+    assert_eq!(names(&catalog), ["One", "Three", "Two"]);
 }
 
 /// Damaged, empty or absent lists give no databases and no panic; a list that
@@ -610,6 +616,48 @@ fn a_source_changed_while_it_is_read_is_read_again() {
     // The next one reads the change made during that read; Gamma2 left the list.
     assert_eq!(names(&catalog), ["Alpha", "Beta", "Gamma2"]);
     assert_eq!(states(&catalog), ["ready", "ready", "missing"]);
+}
+
+/// A request for one database answers while the list's sources are read,
+/// however long that takes, from the list as last rebuilt: a configured folder
+/// on a network drive that stops answering holds up the listings, never the
+/// databases' own requests. The rebuilt list replaces it once the read ends.
+#[test]
+fn a_database_answers_while_the_sources_are_read() {
+    use std::sync::mpsc;
+
+    let root = Root::new("slow-source");
+    let folder = root.path("folder");
+    let one = database_at(&folder, "One");
+    std::fs::write(root.path("bridge.toml"), format!("databases = ['{}']\n", folder.display())).unwrap();
+    let catalog = Arc::new(Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System)));
+    assert_eq!(names(&catalog), ["One"]);
+
+    // The next read of the sources is held until `release` is dropped.
+    let (reading, read) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    catalog.after_read(move || {
+        let _ = reading.send(());
+        let _ = released.lock().unwrap().recv();
+    });
+    let two = database_at(&folder, "Two");
+    let listing = {
+        let catalog = Arc::clone(&catalog);
+        std::thread::spawn(move || names(&catalog))
+    };
+    read.recv_timeout(Duration::from_secs(10)).expect("the sources were not read");
+
+    let (tx, rx) = mpsc::channel();
+    let (reader, ids) = (Arc::clone(&catalog), [id_of(&one), id_of(&two)]);
+    std::thread::spawn(move || {
+        let _ = tx.send(ids.map(|id| reader.get(&id).map(|e| e.state())));
+    });
+    let answers = rx.recv_timeout(Duration::from_secs(10)).expect("a request waited for the sources");
+    assert_eq!(answers, [Some(State::Ready), None]);
+    drop(release);
+    assert_eq!(listing.join().unwrap(), ["One", "Two"]);
+    assert_eq!(catalog.get(&id_of(&two)).map(|e| e.state()), Some(State::Ready));
 }
 
 /// Pipes and folders named like database files are never opened: a folder's
