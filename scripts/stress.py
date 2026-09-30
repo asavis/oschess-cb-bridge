@@ -33,7 +33,6 @@ when a run failed.
 import argparse
 import json
 import os
-import re
 import signal
 import statistics
 import subprocess
@@ -46,7 +45,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 HOG = "while :; do :; done"
-FAILED_TEST = re.compile(r"^test (\S+) \.\.\. FAILED$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -97,8 +95,18 @@ def binaries(cargo_messages):
 
 
 def failed_tests(output):
-    """The names of the tests libtest reports as failed in `output`."""
-    return FAILED_TEST.findall(output)
+    """The names of the tests libtest reports as failed in `output`: the list
+    under its last `failures:` line, which it prints however its output is
+    set (`--nocapture`, `--quiet`), unlike the `... FAILED` lines."""
+    lines = output.splitlines()
+    if "failures:" not in lines:
+        return []
+    names = []
+    for line in lines[len(lines) - lines[::-1].index("failures:") :]:
+        if not line.startswith("    ") or not line.strip():
+            break
+        names.append(line.strip())
+    return names
 
 
 def parse_cpus(text):
@@ -169,15 +177,17 @@ def summary(outcomes_by_run, loads):
 
 def build():
     """Builds the tests as `cargo test` does and returns their binaries."""
-    done = subprocess.run(
+    cargo = Live.start(
         ["cargo", "test", "--no-run", "--message-format=json-render-diagnostics"],
         cwd=ROOT,
         stdout=subprocess.PIPE,
         text=True,
     )
-    if done.returncode != 0:
+    messages, _ = cargo.communicate()
+    Live.kill(cargo)
+    if cargo.returncode != 0:
         sys.exit("cargo test --no-run failed")
-    return binaries(done.stdout)
+    return binaries(messages)
 
 
 class Aborted(Exception):
@@ -185,22 +195,39 @@ class Aborted(Exception):
 
 
 class Live:
-    """The process groups started and not yet ended: each test binary with
-    the processes it starts, and each busy loop. Each runs in a session of
-    its own, which a Ctrl-C in the terminal does not reach, so the script
-    kills them itself when it ends early, and starts none after that."""
+    """The process groups started and not yet ended: the build, each test
+    binary with the processes it starts, and each busy loop. Each runs in a
+    session of its own, which a Ctrl-C in the terminal does not reach, so the
+    script kills them itself when it ends early, and starts none after that.
+
+    Python runs signal handlers in the main thread between two steps, so a
+    signal there could land after a process started and before it was
+    listed. While the main thread starts one, a signal is held (`held`), and
+    raised once the process is listed."""
 
     lock = threading.Lock()
     groups = set()
     closed = False
+    held = False
+    pending = False
 
     @classmethod
     def start(cls, args, **kwargs):
-        with cls.lock:
-            if cls.closed:
-                raise Aborted
-            process = subprocess.Popen(args, start_new_session=True, **kwargs)
-            cls.groups.add(process.pid)
+        main = threading.current_thread() is threading.main_thread()
+        if main:
+            cls.held = True
+        try:
+            with cls.lock:
+                if cls.closed:
+                    raise Aborted
+                process = subprocess.Popen(args, start_new_session=True, **kwargs)
+                cls.groups.add(process.pid)
+        finally:
+            if main:
+                cls.held = False
+                if cls.pending:
+                    cls.pending = False
+                    raise KeyboardInterrupt
         return process
 
     @classmethod
@@ -211,11 +238,6 @@ class Live:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-
-    @classmethod
-    def ended(cls, process):
-        with cls.lock:
-            cls.groups.discard(process.pid)
 
     @classmethod
     def kill_all(cls):
@@ -232,7 +254,7 @@ class Live:
 def run_binary(binary, prefix, libtest_args, timeout):
     """Runs `binary` once under `prefix` (taskset and nice, or nothing): its
     outcome. A binary still running after `timeout` seconds is killed with
-    every process it started."""
+    every process it started, and so are the processes it leaves running."""
     started = time.monotonic()
     process = Live.start(
         [*prefix, binary.exe, *libtest_args],
@@ -249,8 +271,9 @@ def run_binary(binary, prefix, libtest_args, timeout):
         Live.kill(process)
         output, _ = process.communicate()
         return Outcome(binary, time.monotonic() - started, problem=f"still running after {timeout} s", output=output)
-    Live.ended(process)
     seconds = time.monotonic() - started
+    # A process the binary started may outlive it, its output sent elsewhere.
+    Live.kill(process)
     failed = failed_tests(output)
     problem = "" if process.returncode == 0 or failed else f"exited with {process.returncode}"
     return Outcome(binary, seconds, failed, problem, output)
@@ -287,8 +310,11 @@ def write_log(out, name, outcomes):
 
 
 def interrupted(*_):
-    """Ends the script on a plain kill as Ctrl-C does, so that nothing it
-    started outlives it."""
+    """Ends the script on Ctrl-C or a plain kill, so that nothing it started
+    outlives it; see `Live` for a signal that comes as a process starts."""
+    if Live.held:
+        Live.pending = True
+        return
     raise KeyboardInterrupt
 
 
@@ -329,7 +355,27 @@ def main(argv=None):
     hogs = 3 * len(cpus) if args.hogs is None else args.hogs
     out = args.out or ROOT / "target" / "stress" / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out.mkdir(parents=True, exist_ok=True)
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    results, loads = {}, []
+    try:
+        stress(args, cpu_list, hogs, out, results, loads)
+        stopped = False
+    except KeyboardInterrupt:
+        stopped = True
+        Live.kill_all()
+        print("stopped")
+    print(summary(dict(sorted(results.items())), loads))
+    print(f"output of failed runs: {out}")
+    if stopped:
+        return 130
+    return 0 if all(o.ok for outcomes in results.values() for o in outcomes) else 1
 
+
+def stress(args, cpu_list, hogs, out, results, loads):
+    """Builds the tests, runs them once without the load and `args.runs`
+    times under it, and records each run in `results` and its load average
+    in `loads`. A Ctrl-C or a kill stops it with KeyboardInterrupt."""
     chosen = build()
     if args.bin:
         unknown = set(args.bin) - {b.name for b in chosen}
@@ -339,7 +385,7 @@ def main(argv=None):
     print(f"{len(chosen)} test binaries: {', '.join(b.label for b in chosen)}", flush=True)
 
     lock = threading.Lock()
-    results, loads, next_run = {}, [], iter(range(1, args.runs + 1))
+    next_run = iter(range(1, args.runs + 1))
     # `stop`: start no more runs; `aborted`: the script is ending early, and
     # the runs it cut short are no one's failures.
     stop, aborted = threading.Event(), threading.Event()
@@ -382,28 +428,20 @@ def main(argv=None):
                 return
             report(run, outcomes)
 
-    signal.signal(signal.SIGTERM, interrupted)
-    stopped = False
-    try:
-        with Hogs(hogs, cpu_list, args.hog_nice), ThreadPoolExecutor(args.jobs) as pool:
-            futures = [pool.submit(job) for _ in range(args.jobs)]
-            try:
-                for future in futures:
-                    future.result()
-            except BaseException:
-                stop.set()
-                aborted.set()
-                Live.kill_all()
-                raise
-    except KeyboardInterrupt:
-        stopped = True
-        print("stopped")
-
-    print(summary(dict(sorted(results.items())), loads))
-    print(f"output of failed runs: {out}")
-    if stopped:
-        return 130
-    return 0 if all(o.ok for outcomes in results.values() for o in outcomes) else 1
+    # Busy loops that started before a signal are listed in `Live`, which
+    # the caller kills, even when `Hogs` did not finish starting them.
+    with Hogs(hogs, cpu_list, args.hog_nice), ThreadPoolExecutor(args.jobs) as pool:
+        futures = [pool.submit(job) for _ in range(args.jobs)]
+        try:
+            for future in futures:
+                future.result()
+        except BaseException:
+            # The workers wait on their tests: kill those first, or leaving
+            # the pool would wait for them to end.
+            stop.set()
+            aborted.set()
+            Live.kill_all()
+            raise
 
 
 if __name__ == "__main__":
