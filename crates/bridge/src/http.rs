@@ -112,13 +112,21 @@ impl Conn {
         self
     }
 
+    /// The next request: its first byte within the connection's idle wait,
+    /// the rest within [`REQUEST_TIMEOUT`] of it.
     pub fn read_request(&mut self) -> Result<Request, Refusal> {
-        self.read_request_within(REQUEST_TIMEOUT)
+        self.read_request_waiting(self.idle, REQUEST_TIMEOUT)
     }
 
     /// [`Conn::read_request`] with `limit` in place of [`REQUEST_TIMEOUT`],
     /// and no longer than that to wait for the first byte either.
     pub fn read_request_within(&mut self, limit: Duration) -> Result<Request, Refusal> {
+        self.read_request_waiting(self.idle.min(limit), limit)
+    }
+
+    /// Waits `idle` for a request to begin, then `limit` from its first byte
+    /// for the rest of it.
+    fn read_request_waiting(&mut self, idle: Duration, limit: Duration) -> Result<Request, Refusal> {
         let mut started = (!self.buf.is_empty()).then(Instant::now);
         loop {
             let too_large = |buf: &[u8]| Refusal { error: ReadError::TooLarge, origin: sniff_origin(buf) };
@@ -133,7 +141,7 @@ impl Conn {
                 return Err(too_large(&self.buf));
             }
             let timeout = match started {
-                None => self.idle.min(limit),
+                None => idle,
                 Some(t) => match limit.checked_sub(t.elapsed()).filter(|d| !d.is_zero()) {
                     Some(left) => left,
                     None => return Err(ReadError::Dropped.quiet()),
@@ -467,6 +475,35 @@ mod tests {
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 3").err(), Some(ReadError::Body));
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked").err(), Some(ReadError::Body));
         assert!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 0").is_ok());
+    }
+
+    /// How long a connection waits for a request to begin, told by the read
+    /// time-out it sets before its first read: `idle` in full, even past
+    /// [`REQUEST_TIMEOUT`] (#217), and no longer than a limit given.
+    #[test]
+    fn a_request_is_awaited_for_the_idle_wait() {
+        let wait = |idle: Option<Duration>, limit: Option<Duration>| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let mut conn = Conn::new(listener.accept().unwrap().0);
+            if let Some(idle) = idle {
+                conn = conn.idle(idle);
+            }
+            // The client has left, so the first read ends at once.
+            drop(client);
+            let read = match limit {
+                Some(limit) => conn.read_request_within(limit),
+                None => conn.read_request(),
+            };
+            assert_eq!(read.err().map(|r| r.error), Some(ReadError::Closed));
+            conn.stream.read_timeout().unwrap()
+        };
+        assert_eq!(wait(None, None), Some(IDLE_TIMEOUT));
+        let long = REQUEST_TIMEOUT * 30;
+        assert_eq!(wait(Some(long), None), Some(long));
+        let short = Duration::from_millis(500);
+        assert_eq!(wait(Some(long), Some(short)), Some(short));
+        assert_eq!(wait(None, Some(short)), Some(short));
     }
 
     /// The bytes a client reads when `send` writes to the connection accepted
