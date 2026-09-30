@@ -6,13 +6,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bridge::catalog::Catalog;
 use bridge::explorer::file::Bad;
 use bridge::explorer::format::structure;
-use bridge::explorer::runs::{Limits, Progress};
+use bridge::explorer::runs::{Limits, MEMORY_WAIT, Progress};
 use bridge::explorer::{self, Loaded, Lookup, rendered};
+use bridge::foreground;
 use bridge::search::memory::{Cancel, Hold, budget, held};
 use bridge::search::workers::{self, WAIT, threads};
 use cbformat::fixture::{Builder, TempDb, quiet, words};
@@ -22,27 +23,14 @@ use cbformat::view::Base;
 use chesscore::Board;
 
 mod common;
-use common::{built_bytes, random_games};
-
-const CHILD: &str = "BRIDGE_SMALL_BUDGET_CHILD";
+use common::{WAIT_LIMIT, built_bytes, random_games, until};
 
 /// Whether this is the child that runs the test's body. The parent runs the
 /// test `name` in a child with a 16 MiB budget and one worker, and checks it
 /// passed.
 fn in_child(name: &str) -> bool {
-    if std::env::var_os(CHILD).is_some() {
-        return true;
-    }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
-        .env("OSCHESS_BRIDGE_SEARCH_MIB", "16")
-        .env("OSCHESS_BRIDGE_THREADS", "1")
-        .output()
-        .unwrap();
-    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success() && text.contains("1 passed"), "{text}");
-    false
+    let env = [("OSCHESS_BRIDGE_SEARCH_MIB", "16"), ("OSCHESS_BRIDGE_THREADS", "1")];
+    common::in_child(name, "BRIDGE_SMALL_BUDGET_CHILD", &env)
 }
 
 /// `games` games of 32 quiet pawn moves, a3 a6 … h3 h6 then a4 a5 … h4 h5,
@@ -140,7 +128,9 @@ fn many_passes_write_the_files_of_one() {
         let many = watched(&d, "many", &Limits { pass_bytes: Some(pass), ..Limits::default() }).unwrap();
         let (tree, deep) = passes(&many.progress);
         assert!(tree > 2 && deep > 2, "{tree} and {deep} passes");
-        assert!(started.elapsed() < Duration::from_secs(60), "no wait for memory");
+        // A build that waited for memory it holds itself would wait all of
+        // MEMORY_WAIT; this one takes a few seconds.
+        assert!(started.elapsed() < MEMORY_WAIT, "no wait for memory");
         for w in [&one, &many] {
             let allowed = ["db.idx", "db.idx.partial", "db.moves", "db.moves.partial"];
             assert!(w.names.iter().all(|n| allowed.contains(&n.as_str())), "{:?}", w.names);
@@ -176,7 +166,8 @@ fn a_share_too_small_is_refused_at_once() {
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
     let started = Instant::now();
     let refused = watched(&d, "share", &Limits { share: 1 << 20, ..Limits::default() }).err().unwrap();
-    assert!(refused.contains("too small") && started.elapsed() < Duration::from_secs(10), "{refused}");
+    // Waiting would take all of MEMORY_WAIT; the refusal takes milliseconds.
+    assert!(refused.contains("too small") && started.elapsed() < MEMORY_WAIT / 2, "{refused}");
     let dir = std::env::temp_dir().join(format!("bridge-small-budget-share-{}", std::process::id()));
     let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
     assert!(left.is_empty(), "a failed build leaves nothing");
@@ -293,6 +284,8 @@ fn a_replay_on_the_calling_thread_waits_for_a_worker() {
         let started = Instant::now();
         (games(board, &Cancel::never()), started.elapsed())
     };
+    // Set by a replay's thread as it begins and as it ends.
+    let (began, ended) = (AtomicBool::new(false), AtomicBool::new(false));
     std::thread::scope(|s| {
         // A search holds the one worker until released, or until a failed
         // check drops `release`.
@@ -304,9 +297,7 @@ fn a_replay_on_the_calling_thread_waits_for_a_worker() {
                 Ok(())
             })
         });
-        while workers::taken() == 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until("the search took the worker", WAIT_LIMIT, || workers::taken() > 0);
         let (a, b) = (s.spawn(|| waited(&inline)), s.spawn(|| waited(&pooled)));
         for (what, (answer, took)) in [("inline", a.join().unwrap()), ("pooled", b.join().unwrap())] {
             assert!(matches!(answer, Err(Bad::Busy)) && took >= WAIT, "{what}: {answer:?} after {took:?}");
@@ -316,11 +307,22 @@ fn a_replay_on_the_calling_thread_waits_for_a_worker() {
         let _newer = Cancel::newest(&latest);
         let started = Instant::now();
         assert!(matches!(games(&inline, &old), Err(Bad::Busy)));
-        assert!(started.elapsed() < WAIT / 2, "a superseded replay stops waiting");
-        // The worker comes free while a replay waits for it.
-        let waiting = s.spawn(|| games(&inline, &Cancel::never()));
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!waiting.is_finished(), "the replay waits for the worker");
+        // One that waited would take all of WAIT.
+        assert!(started.elapsed() < WAIT, "a superseded replay stops waiting");
+        // The worker comes free while a replay waits for it. The replay's
+        // thread counts as foreground work, which it sets aside while it
+        // waits for a worker (`foreground::aside`): none runs then, in this
+        // process of one test, until the replay has its worker.
+        let waiting = s.spawn(|| {
+            let work = foreground::begin();
+            began.store(true, Ordering::SeqCst);
+            let answer = games(&inline, &Cancel::never());
+            ended.store(true, Ordering::SeqCst);
+            drop(work);
+            answer
+        });
+        until("the replay waited for a worker", WAIT_LIMIT, || began.load(Ordering::SeqCst) && !foreground::running());
+        assert!(!ended.load(Ordering::SeqCst), "the replay waits for the worker");
         release.send(()).unwrap();
         assert_eq!(waiting.join().unwrap().unwrap(), Some(10));
         assert!(search.join().unwrap().is_ok());

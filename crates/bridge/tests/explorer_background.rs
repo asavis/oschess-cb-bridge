@@ -3,7 +3,13 @@
 //! run requested builds before background ones, background builds that give
 //! way to searches, and what `/v1/status` and the explorer say meanwhile.
 //! Every bridge here has its keeper look every 50 ms, with the quiet period
-//! each test sets.
+//! each test sets. A test that takes nothing having happened as never
+//! happening waits for the keeper's looks, which its [`Computer`] counts.
+//!
+//! A search a test holds is foreground work for the whole process
+//! (`bridge::foreground`): the background builds of the other tests would
+//! give way to it too, for their patience at every batch. The tests that
+//! hold one each run in a process of their own ([`in_child`]).
 
 use std::collections::HashSet;
 use std::fs::Metadata;
@@ -17,19 +23,26 @@ use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::config::Watched;
 use bridge::explorer::format::{HEADER_LEN, Header};
-use bridge::explorer::runs::Limits;
+use bridge::explorer::runs::{Limits, Progress};
 use bridge::fetch::Cloud;
 use bridge::machine::Machine;
 use bridge::search::Indexes;
 use bridge::sources::Sources;
 use cbformat::fixture::{Builder, DbItems, TempDb, pgn_file};
 use cbformat::movetable::{END_OF_LINE, MOVES};
+use cbformat::v2::Database;
 use chesscore::Board;
 
 mod common;
-use common::{get, policy, serve_shared};
+use common::{WAIT_LIMIT, get, in_child, index_dir, policy, poll, serve_shared, until};
 
 const TICK: Duration = Duration::from_millis(50);
+/// What tells a child process that runs a test's body that it is one.
+const CHILD: &str = "BRIDGE_BACKGROUND_CHILD";
+/// The patience of a background build where a test shows that it goes on at
+/// once when a search it gives way to ends, or that a request makes it give
+/// way no longer: twice as long as the test waits for that ([`WAIT_LIMIT`]).
+const LONG_PATIENCE: Duration = Duration::from_secs(600);
 /// The numbers ChessBase writes beside a database in its window list.
 const WINDOW_NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 const START: &str = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR%20w%20KQkq%20-%200%201";
@@ -93,15 +106,6 @@ fn generation(path: &Path) -> u64 {
     Catalog::new([path.to_path_buf()]).entries()[0].generation().unwrap()
 }
 
-/// Waits up to `secs` seconds for `done`.
-fn wait(what: &str, secs: u64, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while !done() {
-        assert!(Instant::now() < deadline, "{what}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 /// The phase `/v1/status` gives the build of `id`, if it lists one.
 fn phase(port: u16, id: &str) -> Option<String> {
     let (_, body) = get(port, "/v1/status");
@@ -110,20 +114,47 @@ fn phase(port: u16, id: &str) -> Option<String> {
     Some(body[at..at + body[at..].find('"')?].to_string())
 }
 
-/// A computer whose power and free disk space a test sets.
+/// What a test does as the keeper begins a look.
+type OnLook = Box<dyn Fn() + Send + Sync>;
+
+/// A computer whose power and free disk space a test sets, which counts the
+/// keeper's looks, and does what the test sets as each begins: the keeper
+/// asks about the power as it begins a look, on its thread, `bridge-keeper`.
 #[derive(Default)]
 struct Computer {
     battery: AtomicBool,
     free: Mutex<Option<u64>>,
+    looks: AtomicUsize,
+    on_look: Mutex<Option<OnLook>>,
 }
 
 impl Machine for Computer {
     fn on_battery(&self) -> bool {
+        if std::thread::current().name() == Some("bridge-keeper") {
+            self.looks.fetch_add(1, Ordering::SeqCst);
+            if let Some(look) = &*self.on_look.lock().unwrap() {
+                look();
+            }
+        }
         self.battery.load(Ordering::SeqCst)
     }
 
     fn free_bytes(&self, _: &Path) -> Option<u64> {
         *self.free.lock().unwrap()
+    }
+}
+
+impl Computer {
+    /// The looks the keeper has begun.
+    fn looks(&self) -> usize {
+        self.looks.load(Ordering::SeqCst)
+    }
+
+    /// Waits until the keeper has begun three more looks, so that two whole
+    /// looks came after the call: what a look would do has been done.
+    fn looked(&self) {
+        let from = self.looks();
+        until("the keeper did not look", WAIT_LIMIT, || self.looks() >= from + 3);
     }
 }
 
@@ -189,17 +220,11 @@ impl Bridge {
     }
 }
 
-/// How long a test waits for a search to be held.
-const ARRIVAL: Duration = Duration::from_secs(30);
-
 impl Drop for Bridge {
     fn drop(&mut self) {
         let explorer = &self.app.catalog.explorer;
         explorer.stop_keeping();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !explorer.building().is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        poll(WAIT_LIMIT, || explorer.building().is_empty().then_some(()));
         explorer.release();
     }
 }
@@ -215,7 +240,10 @@ fn a_changed_database_in_use_is_rebuilt_without_a_request() {
     bridge.keep(Duration::from_millis(200));
     // The only ready database is in use from the start.
     let first = generation(&path);
-    wait("the index was not built", 60, || built_for(&dir, &id) == Some(first));
+    until("the index was not built", WAIT_LIMIT, || built_for(&dir, &id) == Some(first));
+    // The index file is in place before the build is over: the explorer
+    // answers from it once the build has ended.
+    until("the build did not end", WAIT_LIMIT, || bridge.building().is_empty());
     let (status, body) = bridge.explorer(&id);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""games":20,"#), "{body}");
@@ -224,8 +252,8 @@ fn a_changed_database_in_use_is_rebuilt_without_a_request() {
     let _grown = copies("background-changed", 30);
     let second = generation(&path);
     assert_ne!(first, second);
-    wait("the index was not rebuilt", 60, || built_for(&dir, &id) == Some(second));
-    wait("the build did not end", 60, || bridge.building().is_empty());
+    until("the index was not rebuilt", WAIT_LIMIT, || built_for(&dir, &id) == Some(second));
+    until("the build did not end", WAIT_LIMIT, || bridge.building().is_empty());
     let (status, body) = bridge.explorer(&id);
     assert_eq!(status, 200, "the first request after the change answers at once: {body}");
     assert!(body.contains(r#""games":30,"#), "{body}");
@@ -240,23 +268,50 @@ fn a_database_that_keeps_changing_waits_until_it_is_quiet() {
     let db = copies("background-changing", 10);
     let path = db.dir().join("db.2cbh");
     let (id, dir) = (id_of(&path), data_dir("changing"));
-    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    // Written again, with 11 or 12 games, as the keeper begins each look,
+    // every 50 ms, forty times as often as the quiet period: each look finds
+    // a generation the one before did not, however far apart a loaded
+    // machine has the looks come.
+    let (changing, written) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(Vec::new())));
+    let computer = Arc::new(Computer::default());
+    *computer.on_look.lock().unwrap() = Some(Box::new({
+        let (changing, written) = (Arc::clone(&changing), Arc::clone(&written));
+        move || {
+            if changing.load(Ordering::SeqCst) {
+                let mut written = written.lock().unwrap();
+                let games = 11 + written.len() % 2;
+                written.push(copies("background-changing", games));
+            }
+        }
+    }));
+    let catalog = Catalog::new([path.clone()]);
+    catalog.explorer.set_machine(computer.clone());
+    let bridge = Bridge::new(catalog, &dir);
     bridge.keep(Duration::from_secs(2));
-    // Written again every 50 ms for 3 s, with 11 or 12 games: many ticks.
-    let mut written = Vec::new();
-    let until = Instant::now() + Duration::from_secs(3);
-    let mut games = 11;
-    while Instant::now() < until {
-        written.push(copies("background-changing", games));
-        games = 23 - games;
+    let unbuilt = || {
         assert!(built_for(&dir, &id).is_none(), "built while it changed");
         assert!(bridge.building().is_empty(), "queued while it changed: {:?}", bridge.building());
-        std::thread::sleep(Duration::from_millis(50));
+    };
+    // For 3 s, longer than the quiet period, then while the keeper begins
+    // three more looks.
+    let three = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < three {
+        unbuilt();
+        std::thread::sleep(TICK);
     }
+    let (looks, deadline) = (computer.looks() + 3, Instant::now() + WAIT_LIMIT);
+    while computer.looks() < looks {
+        assert!(Instant::now() < deadline, "the keeper did not look");
+        unbuilt();
+        std::thread::sleep(TICK);
+    }
+    // No more writes once the look that may be writing is over.
+    changing.store(false, Ordering::SeqCst);
+    computer.looked();
     let last = generation(&path);
-    wait("the index was not built once quiet", 60, || built_for(&dir, &id) == Some(last));
+    until("the index was not built once quiet", WAIT_LIMIT, || built_for(&dir, &id) == Some(last));
     drop(bridge);
-    drop(written);
+    written.lock().unwrap().clear();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -275,17 +330,17 @@ fn a_requested_build_goes_before_a_background_one() {
     let bridge = Bridge::new(catalog, &dir);
     bridge.keep(Duration::ZERO);
     // The largest database is in use from the start: its build runs.
-    wait("the background build did not start", 60, || {
+    until("the background build did not start", WAIT_LIMIT, || {
         phase(bridge.port, &a).is_some_and(|p| !["waiting", "checking"].contains(&p.as_str()))
     });
     let (status, body) = bridge.explorer(&b);
     assert_eq!(status, 409, "{body}");
-    wait("the requested build did not answer", 60, || bridge.explorer(&b).0 == 200);
+    until("the requested build did not answer", WAIT_LIMIT, || bridge.explorer(&b).0 == 200);
     assert!(built_for(&dir, &a).is_none(), "the background build ended first");
     assert!(phase(bridge.port, &a).is_some(), "the stopped build waits again");
     // It completes afterwards, asked for by nobody.
-    wait("the stopped build did not complete", 120, || built_for(&dir, &a) == Some(generation(&paths[0])));
-    wait("the build did not end", 60, || bridge.building().is_empty());
+    until("the stopped build did not complete", WAIT_LIMIT, || built_for(&dir, &a) == Some(generation(&paths[0])));
+    until("the build did not end", WAIT_LIMIT, || bridge.building().is_empty());
     let (status, body) = bridge.explorer(&a);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""games":20000,"#), "{body}");
@@ -324,6 +379,8 @@ fn nothing_is_built_in_the_background_for_a_cloud_only_unlisted_or_opening_datab
     let provider = Arc::new(Provider { files, ..Provider::default() });
     let sources = Sources { config: Some(Arc::new(Watched::new(config.clone()))), ..Sources::default() };
     let catalog = Catalog::with_sources(sources, provider.clone());
+    let computer = Arc::new(Computer::default());
+    catalog.explorer.set_machine(computer.clone());
     assert_eq!(catalog.entries().len(), 4);
     // The PGN file's header index waits behind another build.
     let (release, held) = mpsc::channel::<()>();
@@ -341,8 +398,8 @@ fn nothing_is_built_in_the_background_for_a_cloud_only_unlisted_or_opening_datab
     assert_eq!(listed, [true, true, false, true]);
     let bridge = Bridge::new(catalog, &root);
     bridge.keep(Duration::ZERO);
-    wait("the ready database was not built", 60, || built_for(&root, &ids[0]).is_some());
-    std::thread::sleep(TICK * 10);
+    until("the ready database was not built", WAIT_LIMIT, || built_for(&root, &ids[0]).is_some());
+    computer.looked();
     for (id, what) in ids[1..].iter().zip(["cloud-only", "unlisted", "opening"]) {
         assert!(built_for(&root, id).is_none(), "{what} was built");
     }
@@ -350,7 +407,7 @@ fn nothing_is_built_in_the_background_for_a_cloud_only_unlisted_or_opening_datab
     assert_eq!(provider.fetches.load(Ordering::SeqCst), 0, "a database was downloaded");
     // Once opened, the PGN file is built.
     release.send(()).unwrap();
-    wait("the PGN file was not built once ready", 60, || built_for(&root, &ids[3]).is_some());
+    until("the PGN file was not built once ready", WAIT_LIMIT, || built_for(&root, &ids[3]).is_some());
     drop(bridge);
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -370,10 +427,12 @@ fn the_startup_pick_is_the_largest_ready_database() {
     let provider = Arc::new(Provider { files, ..Provider::default() });
     let dir = data_dir("pick");
     let catalog = Catalog::with_sources(Sources { fixed: paths.to_vec(), ..Sources::default() }, provider.clone());
+    let computer = Arc::new(Computer::default());
+    catalog.explorer.set_machine(computer.clone());
     let bridge = Bridge::new(catalog, &dir);
     bridge.keep(Duration::ZERO);
-    wait("the largest ready database was not built", 60, || built_for(&dir, &ids[1]).is_some());
-    std::thread::sleep(TICK * 10);
+    until("the largest ready database was not built", WAIT_LIMIT, || built_for(&dir, &ids[1]).is_some());
+    computer.looked();
     assert!(built_for(&dir, &ids[0]).is_none(), "a smaller database was built");
     assert!(built_for(&dir, &ids[2]).is_none(), "a cloud-only database was built");
     assert!(bridge.building().is_empty(), "{:?}", bridge.building());
@@ -398,7 +457,7 @@ fn too_little_free_space_answers_503_and_skips_background_builds() {
     catalog.explorer.set_machine(computer.clone());
     let bridge = Bridge::new(catalog, &dir);
     bridge.keep(Duration::ZERO);
-    std::thread::sleep(TICK * 10);
+    computer.looked();
     assert!(bridge.building().is_empty(), "{:?}", bridge.building());
     assert!(built_for(&dir, &a).is_none());
     for id in [&b, &a] {
@@ -410,11 +469,11 @@ fn too_little_free_space_answers_503_and_skips_background_builds() {
     }
     // With room again, the background build waits for the next change.
     *computer.free.lock().unwrap() = Some(1 << 40);
-    std::thread::sleep(TICK * 10);
+    computer.looked();
     assert!(bridge.building().is_empty() && built_for(&dir, &a).is_none(), "{:?}", bridge.building());
     std::thread::sleep(Duration::from_millis(20));
     let _changed = copies("background-disk-large", 41);
-    wait("the changed database was not built", 60, || built_for(&dir, &a) == Some(generation(&paths[0])));
+    until("the changed database was not built", WAIT_LIMIT, || built_for(&dir, &a) == Some(generation(&paths[0])));
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -437,16 +496,16 @@ fn a_queued_build_shows_waiting() {
     catalog.explorer.mark_in_use(&ids[2]);
     let bridge = Bridge::new(catalog, &dir);
     assert_eq!(bridge.explorer(&ids[0]).0, 409);
-    wait("the build did not start", 60, || phase(bridge.port, &ids[0]).is_some_and(|p| p != "waiting"));
+    until("the build did not start", WAIT_LIMIT, || phase(bridge.port, &ids[0]).is_some_and(|p| p != "waiting"));
     let (status, body) = bridge.explorer(&ids[1]);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains(r#""progress":{"phase":"waiting","done":0,"total":0}"#), "{body}");
     assert_eq!(phase(bridge.port, &ids[1]).as_deref(), Some("waiting"));
     // The keeper queues the third, in use, behind them.
     bridge.keep(Duration::ZERO);
-    wait("the background build was not queued", 60, || phase(bridge.port, &ids[2]).is_some());
+    until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &ids[2]).is_some());
     assert_eq!(phase(bridge.port, &ids[2]).as_deref(), Some("waiting"));
-    wait("the builds did not end", 120, || ids.iter().all(|id| built_for(&dir, id).is_some()));
+    until("the builds did not end", WAIT_LIMIT, || ids.iter().all(|id| built_for(&dir, id).is_some()));
     let written =
         |id: &str| std::fs::metadata(dir.join("index").join(format!("{id}.idx"))).unwrap().modified().unwrap();
     assert!(written(&ids[0]) <= written(&ids[1]) && written(&ids[1]) <= written(&ids[2]), "built out of turn");
@@ -468,14 +527,14 @@ fn a_background_build_waits_on_battery() {
     catalog.explorer.set_machine(computer.clone());
     let bridge = Bridge::new(catalog, &dir);
     bridge.keep(Duration::ZERO);
-    wait("the background build was not queued", 60, || phase(bridge.port, &a).is_some());
-    std::thread::sleep(TICK * 10);
+    until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &a).is_some());
+    computer.looked();
     assert_eq!(phase(bridge.port, &a).as_deref(), Some("waiting"));
     assert!(built_for(&dir, &a).is_none());
-    wait("the requested build did not answer", 60, || bridge.explorer(&b).0 == 200);
+    until("the requested build did not answer", WAIT_LIMIT, || bridge.explorer(&b).0 == 200);
     assert!(built_for(&dir, &a).is_none(), "built on battery");
     computer.battery.store(false, Ordering::SeqCst);
-    wait("the background build did not run on mains power", 60, || built_for(&dir, &a).is_some());
+    until("the background build did not run on mains power", WAIT_LIMIT, || built_for(&dir, &a).is_some());
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -493,7 +552,7 @@ fn a_database_unchanged_for_the_quiet_period_is_built_at_the_first_look() {
     // A tick and a quiet period of an hour: only the first look can build it.
     bridge.app.catalog.explorer.set_keeping(Duration::from_secs(3600), Duration::from_secs(60));
     bridge::explorer::keeper::start(&bridge.app);
-    wait("the index was not built at the first look", 60, || built_for(&dir, &id) == Some(generation(&path)));
+    until("the index was not built at the first look", WAIT_LIMIT, || built_for(&dir, &id) == Some(generation(&path)));
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -511,8 +570,8 @@ fn a_replaced_database_with_old_modification_times_waits_until_it_is_quiet() {
     let quiet = Duration::from_secs(3);
     bridge.keep(quiet);
     let first = generation(&path);
-    wait("the old database was not built at the first look", 60, || built_for(&dir, &id) == Some(first));
-    wait("the first build did not end", 60, || bridge.building().is_empty());
+    until("the old database was not built at the first look", WAIT_LIMIT, || built_for(&dir, &id) == Some(first));
+    until("the first build did not end", WAIT_LIMIT, || bridge.building().is_empty());
     // A copy of more games, its files dated as long ago, moved over the old.
     let next = copies("background-replaced-next", 11);
     backdate(next.dir());
@@ -528,7 +587,7 @@ fn a_replaced_database_with_old_modification_times_waits_until_it_is_quiet() {
         assert!(bridge.building().is_empty(), "queued before the quiet period: {:?}", bridge.building());
         std::thread::sleep(TICK);
     }
-    wait("the replaced database was not built once quiet", 60, || built_for(&dir, &id) == Some(second));
+    until("the replaced database was not built once quiet", WAIT_LIMIT, || built_for(&dir, &id) == Some(second));
     assert!(replaced.elapsed() >= quiet, "built after {:?}", replaced.elapsed());
     drop(bridge);
     drop(next);
@@ -557,20 +616,20 @@ fn a_queued_background_build_is_dropped_when_its_database_goes_to_the_cloud() {
     let bridge = Bridge::new(catalog, &root);
     bridge.keep(Duration::ZERO);
     // The only database is in use from the start; on battery its build waits.
-    wait("the background build was not queued", 60, || phase(bridge.port, &id).as_deref() == Some("waiting"));
+    until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("waiting"));
     let queued = generation(&path);
     provider.everything.store(true, Ordering::SeqCst);
     let entry = bridge.app.catalog.get(&id).unwrap();
     assert!(entry.open().is_err(), "a cloud-only database opened");
     assert_eq!(entry.generation(), Some(queued), "going to the cloud changed the generation");
     computer.battery.store(false, Ordering::SeqCst);
-    wait("the build was not dropped", 60, || bridge.building().is_empty());
-    std::thread::sleep(TICK * 10);
+    until("the build was not dropped", WAIT_LIMIT, || bridge.building().is_empty());
+    computer.looked();
     assert!(built_for(&root, &id).is_none(), "a cloud-only database was read");
     assert!(bridge.building().is_empty(), "queued while cloud-only: {:?}", bridge.building());
     assert_eq!(provider.fetches.load(Ordering::SeqCst), 0, "the database was downloaded");
     provider.everything.store(false, Ordering::SeqCst);
-    wait("the database was not built once back", 60, || built_for(&root, &id) == Some(queued));
+    until("the database was not built once back", WAIT_LIMIT, || built_for(&root, &id) == Some(queued));
     drop(bridge);
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -603,15 +662,15 @@ fn a_queued_background_build_is_dropped_when_its_renamed_database_leaves_the_lis
     let bridge = Bridge::new(catalog, &root);
     bridge.keep(Duration::ZERO);
     // The only database is in use from the start; on battery its build waits.
-    wait("the background build was not queued", 60, || phase(bridge.port, &id).as_deref() == Some("waiting"));
+    until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("waiting"));
     window(&["Renamed later"]);
     let catalog = &bridge.app.catalog;
-    wait("the new name was not read", 60, || catalog.get(&id).is_some_and(|e| e.name == "Renamed later"));
+    until("the new name was not read", WAIT_LIMIT, || catalog.get(&id).is_some_and(|e| e.name == "Renamed later"));
     window(&[]);
-    wait("the database did not leave the list", 60, || catalog.get(&id).is_some_and(|e| !e.listed()));
+    until("the database did not leave the list", WAIT_LIMIT, || catalog.get(&id).is_some_and(|e| !e.listed()));
     computer.battery.store(false, Ordering::SeqCst);
-    wait("the build was not dropped", 60, || bridge.building().is_empty());
-    std::thread::sleep(TICK * 10);
+    until("the build was not dropped", WAIT_LIMIT, || bridge.building().is_empty());
+    computer.looked();
     assert!(built_for(&root, &id).is_none(), "a database off the list was read");
     drop(bridge);
     std::fs::remove_dir_all(&root).unwrap();
@@ -623,25 +682,44 @@ fn a_queued_background_build_is_dropped_when_its_renamed_database_leaves_the_lis
 /// the index is built.
 #[test]
 fn a_background_build_gives_way_to_a_search() {
+    if !in_child("a_background_build_gives_way_to_a_search", CHILD, &[]) {
+        return;
+    }
     let db = copies("background-gives-way", 20);
     let path = db.dir().join("db.2cbh");
+    // How long the same games take to build on this computer now, as a build
+    // that never gives way.
+    let alone = {
+        let scratch = index_dir("gives-way-alone");
+        let started = Instant::now();
+        drop(
+            bridge::explorer::prepare(&Database::open(&path).unwrap(), 1, &scratch, "db", &Progress::default())
+                .unwrap(),
+        );
+        let took = started.elapsed();
+        std::fs::remove_dir_all(&scratch).unwrap();
+        took
+    };
     let (id, dir) = (id_of(&path), data_dir("gives-way"));
     let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
-    bridge.app.catalog.explorer.set_patience(Duration::from_secs(120));
+    bridge.app.catalog.explorer.set_patience(LONG_PATIENCE);
     let indexes = bridge.indexes(&id);
     let held = indexes.gate().hold(1);
     let search = bridge.search(&id);
-    assert!(held.arrived(1, ARRIVAL));
+    assert!(held.arrived(1, WAIT_LIMIT));
     bridge.keep(Duration::ZERO);
-    wait("the background build did not start", 60, || phase(bridge.port, &id).as_deref() == Some("reading"));
-    // Twenty games take milliseconds to build.
-    std::thread::sleep(Duration::from_secs(1));
+    until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("reading"));
+    // Twenty games take milliseconds to build: a build that went on would be
+    // over in ten times as long as they took alone, or a second.
+    std::thread::sleep((alone * 10).max(Duration::from_secs(1)));
     assert_eq!(bridge.building(), [(id.clone(), "reading", 0, 20)], "it went on while the search ran");
     assert!(built_for(&dir, &id).is_none());
     drop(held);
     let (status, body) = search.join().unwrap();
     assert_eq!(status, 200, "{body}");
-    wait("the build did not go on once the search ended", 60, || built_for(&dir, &id) == Some(generation(&path)));
+    until("the build did not go on once the search ended", WAIT_LIMIT, || {
+        built_for(&dir, &id) == Some(generation(&path))
+    });
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -654,22 +732,25 @@ fn a_background_build_gives_way_to_a_search() {
 /// done long before a background build's patience would run out.
 #[test]
 fn a_requested_build_does_not_give_way() {
+    if !in_child("a_requested_build_does_not_give_way", CHILD, &[]) {
+        return;
+    }
     let (large, small) = (copies("background-no-way-large", 40), copies("background-no-way-small", 10));
     let paths = [large.dir().join("db.2cbh"), small.dir().join("db.2cbh")];
     let (a, b) = (id_of(&paths[0]), id_of(&paths[1]));
     let dir = data_dir("no-way");
     let bridge = Bridge::new(Catalog::new(paths.clone()), &dir);
-    bridge.app.catalog.explorer.set_patience(Duration::from_secs(120));
+    bridge.app.catalog.explorer.set_patience(LONG_PATIENCE);
     let indexes = bridge.indexes(&b);
     let held = indexes.gate().hold(1);
     let search = bridge.search(&b);
-    assert!(held.arrived(1, ARRIVAL));
+    assert!(held.arrived(1, WAIT_LIMIT));
     // The largest database is in use from the start: its build gives way.
     bridge.keep(Duration::ZERO);
-    wait("the background build did not start", 60, || phase(bridge.port, &a).as_deref() == Some("reading"));
-    wait("the requested build did not answer", 60, || bridge.explorer(&b).0 == 200);
+    until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &a).as_deref() == Some("reading"));
+    until("the requested build did not answer", WAIT_LIMIT, || bridge.explorer(&b).0 == 200);
     assert!(built_for(&dir, &a).is_none(), "the background build went on");
-    wait("the promoted build did not answer", 60, || bridge.explorer(&a).0 == 200);
+    until("the promoted build did not answer", WAIT_LIMIT, || bridge.explorer(&a).0 == 200);
     assert!(!search.is_finished(), "the search ended");
     drop(held);
     let (status, body) = search.join().unwrap();
@@ -685,6 +766,9 @@ fn a_requested_build_does_not_give_way() {
 /// each wait their whole patience at least once, one after the other.
 #[test]
 fn a_background_build_ends_while_a_search_never_does() {
+    if !in_child("a_background_build_ends_while_a_search_never_does", CHILD, &[]) {
+        return;
+    }
     let db = copies("background-starved", 300);
     let path = db.dir().join("db.2cbh");
     let (id, dir) = (id_of(&path), data_dir("starved"));
@@ -694,10 +778,10 @@ fn a_background_build_ends_while_a_search_never_does() {
     let indexes = bridge.indexes(&id);
     let held = indexes.gate().hold(1);
     let search = bridge.search(&id);
-    assert!(held.arrived(1, ARRIVAL));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let started = Instant::now();
     bridge.keep(Duration::ZERO);
-    wait("the build did not end while the search ran", 60, || built_for(&dir, &id) == Some(generation(&path)));
+    until("the build did not end while the search ran", WAIT_LIMIT, || built_for(&dir, &id) == Some(generation(&path)));
     let took = started.elapsed();
     assert!(took >= patience * 5, "it gave way less than its patience per pass: {took:?}");
     assert!(!search.is_finished(), "the search ended");

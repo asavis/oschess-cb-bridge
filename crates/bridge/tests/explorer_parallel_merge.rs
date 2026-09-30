@@ -5,9 +5,9 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use bridge::explorer::runs::{Limits, Progress};
+use bridge::explorer::runs::{Limits, MEMORY_WAIT, Progress};
 use bridge::explorer::{self, Loaded};
 use bridge::search::memory::{Hold, budget, held};
 use bridge::search::workers::threads;
@@ -17,25 +17,12 @@ use chesscore::Board;
 mod common;
 use common::{built_bytes, random_games};
 
-const CHILD: &str = "BRIDGE_PARALLEL_MERGE_CHILD";
-
 /// Whether this is the child that runs the test's body. The parent runs the
 /// test `name` in a child with a 64 MiB budget and sixteen workers, and
 /// checks it passed.
 fn in_child(name: &str) -> bool {
-    if std::env::var_os(CHILD).is_some() {
-        return true;
-    }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
-        .env("OSCHESS_BRIDGE_SEARCH_MIB", "64")
-        .env("OSCHESS_BRIDGE_THREADS", "16")
-        .output()
-        .unwrap();
-    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success() && text.contains("1 passed"), "{text}");
-    false
+    let env = [("OSCHESS_BRIDGE_SEARCH_MIB", "64"), ("OSCHESS_BRIDGE_THREADS", "16")];
+    common::in_child(name, "BRIDGE_PARALLEL_MERGE_CHILD", &env)
 }
 
 /// Builds the index of `d` within `limits` in a new folder named after
@@ -59,7 +46,9 @@ fn build(d: &Database, name: &str, limits: &Limits) -> (Loaded, PathBuf, (u64, u
         built
     })
     .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(60), "{name}: the build waited for memory it holds itself");
+    // A build that waited for memory it holds itself would wait all of
+    // MEMORY_WAIT; this one takes seconds.
+    assert!(started.elapsed() < MEMORY_WAIT, "{name}: the build waited for memory it holds itself");
     let names: BTreeSet<String> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     assert_eq!(names, ["db.idx".to_string(), "db.moves".to_string()].into(), "{name}: the index, and nothing else");

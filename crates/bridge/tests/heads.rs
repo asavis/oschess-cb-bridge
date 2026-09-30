@@ -14,7 +14,7 @@ use cbformat::pgnfile;
 use cbformat::view::Base;
 
 mod common;
-use common::{block, classic_fixture, fixture_of, pgn_fixture, rows};
+use common::{WAIT_LIMIT, block, classic_fixture, fixture_of, pgn_fixture, rows, until};
 
 const ID: &str = "0123456789abcdef";
 
@@ -246,15 +246,10 @@ fn a_broken_heads_file_is_built_again() {
     let path = heads::path(&dir, &entry.id);
     let open = entry.open().unwrap();
     let ready = |open: &Opened| {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
+        until("a heads file was attached", WAIT_LIMIT, || {
             catalog.attach_heads(&entry, open);
-            if open.indexes.has_usable_heads() {
-                return;
-            }
-            assert!(std::time::Instant::now() < until, "a heads file was attached");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+            open.indexes.has_usable_heads()
+        });
     };
     ready(&open);
     let mut bytes = std::fs::read(&path).unwrap();
@@ -275,11 +270,7 @@ fn a_broken_heads_file_is_built_again() {
 /// Waits for `paths` to exist, as the names files are written on a thread of
 /// their own.
 fn written(paths: &[PathBuf]) {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !paths.iter().all(|p| p.exists()) {
-        assert!(std::time::Instant::now() < until, "the names files were written");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    until("the names files were written", WAIT_LIMIT, || paths.iter().all(|p| p.exists()));
 }
 
 /// With a heads file set, the name tables read from the database are written
@@ -340,12 +331,10 @@ fn a_damaged_names_file_is_read_from_the_database_and_written_again() {
         again.set_heads(Arc::clone(&h));
         assert_eq!(answers(&db, &again), plain, "byte {at} damaged");
         // Written again from the table read from the database: whole, though
-        // its chunks may fall otherwise when fewer workers were free.
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while std::fs::read(&players).unwrap() == bad {
-            assert!(std::time::Instant::now() < until, "byte {at}: the file was written again");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        // its chunks may fall otherwise when fewer workers were free. It
+        // replaces the damaged one by a rename, which a read may meet.
+        let again = || std::fs::read(&players).is_ok_and(|now| now != bad);
+        until(&format!("byte {at}: the file was written again"), WAIT_LIMIT, again);
         let before = NAME_FILES_READ.load(Ordering::Relaxed);
         let fresh = Indexes::default();
         fresh.set_heads(Arc::clone(&h));

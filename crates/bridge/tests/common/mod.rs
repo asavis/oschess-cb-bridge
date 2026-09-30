@@ -12,22 +12,28 @@
 //! in a child process of their own. A second test beside one of them must not
 //! reserve from those budgets, or it belongs in a binary of its own. Anywhere
 //! else, a test asserts on its own holds only.
+//!
+//! A test that needs them otherwise than its binary's other tests have them,
+//! or needs the process to itself, runs again in a child process of its own
+//! ([`in_child`]).
 #![allow(dead_code)]
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
-use bridge::catalog::Catalog;
+use bridge::catalog::{Catalog, id_of};
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
-use chesscore::Board;
+use chesscore::{Board, Move, Square};
 
 /// The pairing token of every bridge a test serves or starts.
 pub const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
@@ -93,6 +99,19 @@ impl Served {
     pub fn new(app: App) -> Served {
         let (port, app) = serve_shared(app);
         Served { port, app }
+    }
+
+    /// Serves `app` as [`serve_with_dir`] does, with its indexes in `dir`.
+    pub fn with_dir(app: App, dir: &Path) -> Served {
+        app.catalog.use_data_dir(dir);
+        Served::new(app)
+    }
+
+    /// Serves the 2CBH database `db` with its indexes in `dir`, as in a data
+    /// folder: the bridge and the database's id.
+    pub fn database(db: &TempDb, dir: &Path) -> (Served, String) {
+        let path = db.dir().join("db.2cbh");
+        (Served::with_dir(app_of([path.clone()]), dir), id_of(&path))
     }
 }
 
@@ -188,6 +207,59 @@ pub fn get(port: u16, path: &str) -> (u16, String) {
 pub fn try_get(port: u16, path: &str) -> Option<(u16, String)> {
     let reply = parse_reply(&exchange(port, &request(port, path))?)?;
     Some((reply.status, reply.body))
+}
+
+/// How long a test waits for what it expects before it fails: an index
+/// built, a build started or ended, a file written, a thread at its wait.
+/// Far longer than any of it takes on a loaded machine, it only turns what
+/// never comes into a failure that names it, instead of a run that hangs. A
+/// test whose contract is a bound of its own, such as "long before its
+/// patience runs out", waits for that bound instead.
+pub const WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// Asks `ready` every 10 ms until it gives a value, for `limit` at most: the
+/// value, or `None` once `limit` has passed without one.
+pub fn poll<T>(limit: Duration, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(value) = ready() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits until `done` holds, asking every 10 ms, for `limit` at most; then
+/// the test fails with `what`.
+pub fn until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+    assert!(poll(limit, || done().then_some(())).is_some(), "{what} (waited {limit:?})");
+}
+
+/// The body of the `200` answer to `path`, asked again every 10 ms while it
+/// is `409`, as while the index it needs is built, for [`WAIT_LIMIT`] at
+/// most. Any other answer fails the test.
+pub fn answered(port: u16, path: &str) -> String {
+    let mut last = String::new();
+    let body = poll(WAIT_LIMIT, || {
+        let (status, body) = get(port, path);
+        match status {
+            200 => Some(body),
+            409 => {
+                last = body;
+                None
+            }
+            _ => panic!("{path}: {status} {body}"),
+        }
+    });
+    body.unwrap_or_else(|| panic!("{path} was still {last} after {WAIT_LIMIT:?}"))
+}
+
+/// `fen` as the value of a query parameter: its spaces and slashes escaped.
+pub fn fen_param(fen: &str) -> String {
+    fen.replace(' ', "%20").replace('/', "%2F")
 }
 
 /// A body without its `"generation":"…"` member, which differs between copies
@@ -820,4 +892,214 @@ pub fn built_bytes(path: &std::path::Path) -> Vec<u8> {
     bytes[id..id + 8].fill(0);
     bytes[124..128].fill(0);
     bytes
+}
+
+/// A database of `records` records of which only the first, a game of 1.e4
+/// whose players are both `x`, is written: the rest of the header file is a
+/// hole, read as records of zeros, which a file system with sparse files
+/// keeps without writing it.
+pub fn sparse(name: &str, records: u64) -> TempDb {
+    let mut b = Builder::new();
+    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
+    b.game(e4);
+    b.lid(lid(&["x".to_string()], &[], &[]));
+    let db = b.write(name);
+    let file = std::fs::OpenOptions::new().write(true).open(db.dir().join("db.2cbh")).unwrap();
+    file.set_len((records + 1) * 192).unwrap();
+    db
+}
+
+/// Plays `uci` on `board`, castling written as the king's two-square step,
+/// which chesscore takes as the king taking its rook.
+pub fn play(board: &mut Board, uci: &str) {
+    let mut mv: Move = uci.parse().unwrap();
+    let king = board.piece_at(mv.from).map(|p| p.0) == Some(chesscore::Piece::King);
+    if king && mv.from.file().abs_diff(mv.to.file()) == 2 {
+        mv.to = Square::new(if mv.to.file() == 6 { 7 } else { 0 }, mv.from.rank());
+    }
+    board.play_checked(mv).unwrap();
+}
+
+/// The board after `ucis` from the standard start, each move played as
+/// [`play`] plays it.
+pub fn board_after(ucis: &str) -> Board {
+    let mut board = Board::startpos();
+    for uci in ucis.split_whitespace() {
+        play(&mut board, uci);
+    }
+    board
+}
+
+/// A folder of its own for a test's index files, named after `name`, which
+/// no other test of its binary uses: empty, and not made yet.
+pub fn index_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("bridge-index-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// How long a test run again in a child process may take before the child
+/// is killed and the test fails: longer than a child waits for what it
+/// expects ([`WAIT_LIMIT`]), so that a child that waits in vain says what
+/// for.
+pub const CHILD_LIMIT: Duration = Duration::from_secs(900);
+
+/// Whether this process is a child that runs a test's body: one started
+/// with the variable `marker` set ([`ChildTest`]).
+pub fn is_child(marker: &str) -> bool {
+    std::env::var_os(marker).is_some()
+}
+
+/// Whether this is the child that runs the test's body. The parent runs the
+/// test `name` again in a child process of its own, with `marker` and `env`
+/// set ([`ChildTest`]), and checks it passed.
+pub fn in_child(name: &str, marker: &str, env: &[(&str, &str)]) -> bool {
+    if is_child(marker) {
+        return true;
+    }
+    ChildTest::start(name, marker, env).end().passed();
+    false
+}
+
+/// The test `name` of this binary run again, alone, in a child process with
+/// the variable `marker` set, which tells the child it is one, and `env`:
+/// for a test that needs what is read once per process, such as the search
+/// budget (`OSCHESS_BRIDGE_SEARCH_MIB`) or the workers
+/// (`OSCHESS_BRIDGE_THREADS`), otherwise than its binary's other tests have
+/// it, or needs the process to itself. The child writes a log file of its
+/// own, as children run beside each other. A child still running when this
+/// is dropped, as a failed test unwinds, is killed.
+pub struct ChildTest {
+    name: String,
+    child: Child,
+    log: PathBuf,
+    started: Instant,
+}
+
+impl ChildTest {
+    pub fn start(name: &str, marker: &str, env: &[(&str, &str)]) -> ChildTest {
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        let n = STARTED.fetch_add(1, Ordering::Relaxed);
+        let log = std::env::temp_dir().join(format!("bridge-child-{}-{n}-{name}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(marker, "1")
+            .envs(env.iter().copied())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        ChildTest { name: name.to_string(), child, log, started: Instant::now() }
+    }
+
+    /// Waits for the child to end, until [`CHILD_LIMIT`] after it started,
+    /// when it is killed: how it ended, and what it wrote.
+    pub fn end(&mut self) -> Ended {
+        let left = CHILD_LIMIT.saturating_sub(self.started.elapsed());
+        let status = poll(left, || self.child.try_wait().unwrap());
+        if status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let output = String::from_utf8_lossy(&std::fs::read(&self.log).unwrap_or_default()).into_owned();
+        Ended { name: self.name.clone(), status, output }
+    }
+}
+
+impl Drop for ChildTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.log);
+    }
+}
+
+/// How a child's run of its test ended, and what it wrote.
+pub struct Ended {
+    name: String,
+    /// `None` when the child was killed at [`CHILD_LIMIT`].
+    status: Option<ExitStatus>,
+    output: String,
+}
+
+impl Ended {
+    /// Checks that the child ran its one test and passed: what it wrote.
+    pub fn passed(self) -> String {
+        let Some(status) = self.status else {
+            panic!("{} did not end within {CHILD_LIMIT:?}:\n{}", self.name, self.output)
+        };
+        assert!(status.success() && self.output.contains("1 passed"), "{}: {status}\n{}", self.name, self.output);
+        self.output
+    }
+}
+
+/// The bridge as a separate process under an address-space limit of
+/// `limit_kib` KiB, serving the database at `path` with its home in `home`
+/// and `env` set: nothing a database or an index file claims may make it
+/// allocate beyond its budget or abort. Killed when dropped.
+#[cfg(unix)]
+pub struct Limited {
+    child: Child,
+    pub port: u16,
+    pub id: String,
+}
+
+#[cfg(unix)]
+impl Limited {
+    /// Starts the bridge on a port found free. Another test's bridge may take
+    /// that port first, and this one then fails to bind and ends: the bridge
+    /// counts as started only while it runs and lists this database, and
+    /// otherwise starts again on another port.
+    pub fn start(path: &Path, home: &Path, limit_kib: u64, env: &[(&str, &str)]) -> Limited {
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(home.join("token"), TOKEN).unwrap();
+        for _ in 0..10 {
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+            std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
+            let child = Command::new("sh")
+                .arg("-c")
+                .arg(format!("ulimit -v {limit_kib} && exec \"$0\" --database \"$1\""))
+                .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
+                .arg(path)
+                .env("OSCHESS_BRIDGE_HOME", home)
+                .env("MALLOC_ARENA_MAX", "2")
+                .envs(env.iter().copied())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut limited = Limited { child, port, id: id_of(path) };
+            if limited.serves() {
+                return limited;
+            }
+        }
+        panic!("the bridge did not start");
+    }
+
+    /// Whether this bridge runs and serves its database, waiting for it to
+    /// start, [`WAIT_LIMIT`] at most.
+    fn serves(&mut self) -> bool {
+        let listed = format!(r#""id":"{}""#, self.id);
+        let seen = poll(WAIT_LIMIT, || {
+            if self.ended().is_some() {
+                return Some(false);
+            }
+            let (_, body) = try_get(self.port, "/v1/databases")?;
+            Some(body.contains(&listed) && self.ended().is_none())
+        });
+        seen == Some(true)
+    }
+
+    /// How the bridge ended; `None` while it runs.
+    pub fn ended(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Limited {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

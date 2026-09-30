@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bridge::explorer;
 use bridge::explorer::runs::Progress;
@@ -32,16 +32,21 @@ fn a_build_waits_for_memory_and_never_evicts() {
     let flag = Arc::new(Flag(AtomicBool::new(false)));
     let weak: Weak<dyn Evict> = Arc::downgrade(&(Arc::clone(&flag) as Arc<dyn Evict>));
     register(weak);
-    // Searches hold the whole budget for a second.
+    // Searches hold the whole budget for a second: the build, which cannot
+    // reserve a byte meanwhile, ends only after they give it back.
     let all = Hold::reserve_quietly(budget() - held()).unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(1));
-        drop(all);
-    });
+    let freed = Arc::new(AtomicBool::new(false));
+    let release = {
+        let freed = Arc::clone(&freed);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            freed.store(true, Ordering::SeqCst);
+            drop(all);
+        })
+    };
     let dir = std::env::temp_dir().join(format!("bridge-explorer-budget-{}", std::process::id()));
-    let started = Instant::now();
     let loaded = explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(900), "the build waited for the memory");
+    assert!(freed.load(Ordering::SeqCst), "the build waited for the memory");
     assert!(!flag.0.load(Ordering::SeqCst), "nothing searches kept was evicted");
     assert_eq!(loaded.games(), 50);
     release.join().unwrap();

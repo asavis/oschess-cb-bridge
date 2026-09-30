@@ -4,7 +4,6 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::format::{BLOCK_ENTRY, DEEP_BLOCK_ENTRY, Header, MAX_PLY, MIN_DEEP_BITS};
@@ -12,90 +11,35 @@ use cbformat::fixture::{Builder, TempDb, annotations, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{TOKEN, try_get};
+use common::{Limited, WAIT_LIMIT, poll, try_get};
 
 const START: &str = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR%20w%20KQkq%20-%200%201";
 
-/// The bridge as a separate process under an address-space limit of
-/// `limit_kib`, with a 16 MiB search budget and four workers; killed when
-/// dropped.
-struct Limited {
-    child: std::process::Child,
-    port: u16,
-    id: String,
+/// The bridge under an address-space limit of `limit_kib` KiB, serving the
+/// database at `path`, with a 16 MiB search budget and four workers.
+fn limited(path: &Path, home: &Path, limit_kib: u64) -> Limited {
+    let env = [("OSCHESS_BRIDGE_SEARCH_MIB", "16"), ("OSCHESS_BRIDGE_THREADS", "4")];
+    Limited::start(path, home, limit_kib, &env)
 }
 
-impl Limited {
-    /// Starts the bridge on a port found free, again on another port when a
-    /// bridge of another test took that one first (see `serves`).
-    fn start(path: &Path, home: &Path, limit_kib: u64) -> Limited {
-        std::fs::create_dir_all(home).unwrap();
-        std::fs::write(home.join("token"), TOKEN).unwrap();
-        for _ in 0..10 {
-            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-            std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
-            let child = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("ulimit -v {limit_kib} && exec \"$0\" --database \"$1\""))
-                .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
-                .arg(path)
-                .env("OSCHESS_BRIDGE_HOME", home)
-                .env("OSCHESS_BRIDGE_SEARCH_MIB", "16")
-                .env("OSCHESS_BRIDGE_THREADS", "4")
-                .env("MALLOC_ARENA_MAX", "2")
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let mut limited = Limited { child, port, id: id_of(path) };
-            if limited.serves() {
-                return limited;
-            }
+/// The explorer's answer for the start position once the index is built,
+/// which is answered `409` meanwhile; the bridge must keep running.
+fn explore(bridge: &mut Limited) -> String {
+    let path = format!("/v1/databases/{}/explorer?fen={START}", bridge.id);
+    let mut last = String::new();
+    let answer = poll(WAIT_LIMIT, || {
+        let Some((status, out)) = try_get(bridge.port, &path) else {
+            panic!("the bridge stopped answering; it ended: {:?}", bridge.ended());
+        };
+        if status == 200 {
+            return Some(out);
         }
-        panic!("the bridge did not start");
-    }
-
-    /// Whether this bridge runs and serves its database, waiting for it to
-    /// start: a bridge that could not bind its port ends, and the port may
-    /// then be another test's bridge.
-    fn serves(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if self.child.try_wait().unwrap().is_some() {
-                return false;
-            }
-            if let Some((_, body)) = try_get(self.port, "/v1/databases") {
-                let listed = body.contains(&format!(r#""id":"{}""#, self.id));
-                return listed && self.child.try_wait().unwrap().is_none();
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
-    }
-
-    /// The explorer's answer for the start position once the index is built.
-    fn explore(&mut self) -> String {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let answer = try_get(self.port, &format!("/v1/databases/{}/explorer?fen={START}", self.id));
-            let Some((status, out)) = answer else {
-                panic!("the bridge stopped answering; it ended: {:?}", self.child.try_wait().unwrap());
-            };
-            if status == 200 {
-                return out;
-            }
-            assert_eq!(status, 409, "{out}");
-            assert!(self.child.try_wait().unwrap().is_none(), "the bridge ended while indexing");
-            assert!(Instant::now() < deadline, "the index was not built: {out}");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for Limited {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+        assert_eq!(status, 409, "{out}");
+        assert!(bridge.ended().is_none(), "the bridge ended while indexing");
+        last = out;
+        None
+    });
+    answer.unwrap_or_else(|| panic!("the index was not built: {last}"))
 }
 
 fn e4(b: &mut Builder) -> i64 {
@@ -122,8 +66,8 @@ fn a_huge_annotation_file_is_never_read() {
     let mut headers = std::fs::read(&cbh).unwrap();
     headers[2 * 192 + 0x10..2 * 192 + 0x18].copy_from_slice(&((240i64 << 20) - 64).to_le_bytes());
     std::fs::write(&cbh, headers).unwrap();
-    let mut bridge = Limited::start(&cbh, &db.dir().join("home"), 256 << 10);
-    let out = bridge.explore();
+    let mut bridge = limited(&cbh, &db.dir().join("home"), 256 << 10);
+    let out = explore(&mut bridge);
     assert!(out.contains(r#""games":50,"white":50"#), "{out}");
 }
 
@@ -141,8 +85,8 @@ fn a_move_record_over_the_limit_leaves_its_game_out() {
     }
     let db = b.write("explorer-limits-moves");
     let cbh = db.dir().join("db.2cbh");
-    let mut bridge = Limited::start(&cbh, &db.dir().join("home"), 256 << 10);
-    let out = bridge.explore();
+    let mut bridge = limited(&cbh, &db.dir().join("home"), 256 << 10);
+    let out = explore(&mut bridge);
     assert!(out.contains(r#""games":20,"white":20"#), "{out}");
     assert!(!out.contains(r#""uci":"d2d4""#), "{out}");
 }
@@ -191,7 +135,7 @@ fn an_index_file_claiming_a_huge_table_is_rebuilt() {
     f.set_len(h.file_len).unwrap();
     std::os::unix::fs::FileExt::write_all_at(&f, &h.encode(), 0).unwrap();
     drop(f);
-    let mut bridge = Limited::start(&cbh, &home, 256 << 10);
-    let out = bridge.explore();
+    let mut bridge = limited(&cbh, &home, 256 << 10);
+    let out = explore(&mut bridge);
     assert!(out.contains(r#""games":10,"white":10"#), "{out}");
 }

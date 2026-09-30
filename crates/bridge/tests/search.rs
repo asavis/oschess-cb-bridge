@@ -232,23 +232,13 @@ fn a_game_counts_once_per_name() {
     assert_eq!(suggested(&db, &idx, SuggestField::Player, "same", 20).unwrap(), [("Same, Person".into(), 1)]);
 }
 
-/// A database of `records` headers of which only the first is written: the
-/// rest of the header file is a hole, read as zeros, which needs a file system
-/// with sparse files.
-#[cfg(unix)]
-fn sparse(name: &str, records: u64) -> TempDb {
-    let f = raw_db(name, &["x"], &[&|_| {}]);
-    let file = std::fs::OpenOptions::new().write(true).open(f.dir().join("db.2cbh")).unwrap();
-    file.set_len((records + 1) * 192).unwrap();
-    f
-}
-
 /// A sort order that could never fit in the memory budget is refused before
-/// anything is allocated: 200 million records need 2.4 GB to sort.
+/// anything is allocated: 200 million records need 2.4 GB to sort. Sparse
+/// files need Unix.
 #[cfg(unix)]
 #[test]
 fn a_sort_that_cannot_fit_is_refused_up_front() {
-    let f = sparse("search-too-large", 200_000_000);
+    let f = common::sparse("search-too-large", 200_000_000);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
     let started = std::time::Instant::now();
@@ -257,35 +247,50 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
         Err(SearchError::TooLarge)
     ));
     assert_eq!(idx.scanned(), 0, "not a record was read");
+    // Nothing is read, which takes milliseconds: a loaded machine has room.
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
-/// A newer search on the same database stops the one still scanning: the
-/// first answers `Superseded` before the second is done, having read only
-/// a part of the database.
+/// A newer search on the same database stops the one still scanning, each of
+/// its workers at its next batch: the first, having read a part of the
+/// database, answers `Superseded` while the second waits at its start, before
+/// it reads a record. Sparse files need Unix.
 #[cfg(unix)]
 #[test]
 fn a_newer_search_stops_the_older_one() {
     const RECORDS: u64 = 8_000_000;
-    let f = sparse("search-superseded", RECORDS);
+    let f = common::sparse("search-superseded", RECORDS);
     let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
-    let (db1, idx1) = (db.clone(), idx.clone());
-    let first = std::thread::spawn(move || {
-        let r = search::select(&db1, &idx1, Some("needle"), Some("tab"), None);
-        (r.map(|_| ()), std::time::Instant::now())
-    });
-    while idx.scanned() == 0 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let second = search::select(&db, &idx, Some("other"), Some("tab"), None);
-    let second_done = std::time::Instant::now();
-    let (first, first_done) = first.join().unwrap();
+    let run = |q: &'static str| {
+        let (db, idx) = (db.clone(), idx.clone());
+        std::thread::spawn(move || {
+            let r = search::select(&db, &idx, Some(q), Some("tab"), None);
+            r.map(|(selection, _)| matches!(selection, Selection::Numbers(ref v) if v.is_empty()))
+        })
+    };
+    let first = run("needle");
+    common::until("the first search read a record", common::WAIT_LIMIT, || idx.scanned() > 0);
+    // The second is the newest in the stream as it waits at its start,
+    // having read nothing, until it is let go.
+    let held = idx.gate().hold(1);
+    let second = run("other");
+    assert!(held.arrived(1, common::WAIT_LIMIT));
+    let superseded = idx.scanned();
+    let first = first.join().unwrap();
     assert!(matches!(first, Err(SearchError::Superseded)), "{first:?}");
-    assert!(matches!(second, Ok((Selection::Numbers(ref v), _)) if v.is_empty()));
-    assert!(first_done <= second_done, "the first search stopped before the second finished");
-    let first_read = idx.scanned() - RECORDS;
-    assert!(first_read < RECORDS / 2, "the first search read {first_read} of {RECORDS} records");
+    let first_read = idx.scanned();
+    let batch = search::BATCH_BYTES / cbformat::v2::HEADER_RECORD_SIZE;
+    let batches = (search::workers::threads() * batch) as u64;
+    assert!(
+        first_read - superseded <= batches,
+        "the first search read {} records once superseded, more than a batch of each worker",
+        first_read - superseded
+    );
+    assert!(first_read < RECORDS, "the first search read all {RECORDS} records");
+    drop(held);
+    let second = second.join().unwrap();
+    assert!(matches!(second, Ok(true)), "the second search, let go, finds nothing: {second:?}");
 }
 
 /// Names sort ignoring case only: `alpha` and `ALPHA` are one key, so their
@@ -334,7 +339,7 @@ fn suggestions_keep_the_best_of_many() {
 #[cfg(unix)]
 #[test]
 fn only_the_same_stream_supersedes() {
-    let f = sparse("search-streams", 100_000);
+    let f = common::sparse("search-streams", 100_000);
     let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
     let held = idx.gate().hold(2);
@@ -343,9 +348,9 @@ fn only_the_same_stream_supersedes() {
         std::thread::spawn(move || search::select(&db1, &idx1, Some(q), stream, None).map(|_| ()))
     };
     let named = run("needle", Some("tab"));
-    assert!(held.arrived(1, std::time::Duration::from_secs(30)));
+    assert!(held.arrived(1, common::WAIT_LIMIT));
     let unnamed = run("pin", None);
-    assert!(held.arrived(2, std::time::Duration::from_secs(30)));
+    assert!(held.arrived(2, common::WAIT_LIMIT));
     assert!(search::select(&db, &idx, Some(""), Some("tab"), None).is_ok(), "an empty q");
     drop(held);
     assert!(matches!(named.join().unwrap(), Err(SearchError::Superseded)));

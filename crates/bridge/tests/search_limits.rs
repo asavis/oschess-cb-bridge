@@ -5,7 +5,6 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
@@ -14,18 +13,7 @@ use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{TOKEN, get, policy, serve_shared, try_get};
-
-/// One game, then `records - 1` headers that are a hole in the file.
-fn sparse(name: &str, records: u64) -> TempDb {
-    let mut b = Builder::new();
-    let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
-    b.game(e4);
-    let db = b.write(name);
-    let file = std::fs::OpenOptions::new().write(true).open(db.dir().join("db.2cbh")).unwrap();
-    file.set_len((records + 1) * 192).unwrap();
-    db
-}
+use common::{Limited, WAIT_LIMIT, get, policy, serve_shared, sparse};
 
 struct Served {
     port: u16,
@@ -58,9 +46,6 @@ impl Served {
     }
 }
 
-/// How long a test waits for a search to be held.
-const ARRIVAL: Duration = Duration::from_secs(30);
-
 /// A search with `q` in a stream makes the one still running in the same
 /// stream answer `409 superseded`, and the newer one is served.
 #[test]
@@ -69,7 +54,7 @@ fn a_superseded_search_answers_409() {
     let indexes = s.indexes();
     let held = indexes.gate().hold(1);
     let first = s.send("q=needle&stream=tab-1");
-    assert!(held.arrived(1, ARRIVAL));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let (status, out) = s.get("q=other&stream=tab-1");
     assert_eq!(status, 200, "{out}");
     drop(held);
@@ -85,7 +70,7 @@ fn an_empty_q_supersedes_the_running_search() {
     let indexes = s.indexes();
     let held = indexes.gate().hold(1);
     let first = s.send("q=needle&stream=tab-1");
-    assert!(held.arrived(1, ARRIVAL));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let (status, out) = s.get("q=&stream=tab-1");
     assert_eq!(status, 200, "{out}");
     drop(held);
@@ -99,9 +84,9 @@ fn other_streams_do_not_supersede() {
     let indexes = s.indexes();
     let held = indexes.gate().hold(2);
     let first = s.send("q=needle&stream=oschess-tab");
-    assert!(held.arrived(1, ARRIVAL));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let second = s.send("q=other&stream=staging-tab");
-    assert!(held.arrived(2, ARRIVAL));
+    assert!(held.arrived(2, WAIT_LIMIT));
     let (status, out) = s.get("q=third");
     assert_eq!(status, 200, "{out}");
     drop(held);
@@ -136,68 +121,10 @@ fn a_large_order_merges_every_record_once() {
     }
 }
 
-/// The bridge as a separate process under a 256 MiB address-space limit,
-/// serving `path`, with `env` set; killed when dropped.
-struct Limited {
-    child: std::process::Child,
-    port: u16,
-    id: String,
-}
-
-impl Limited {
-    /// Starts the bridge on a port found free. Another test's bridge may take
-    /// that port first, and this one then fails to bind and ends: the bridge
-    /// counts as started only while it runs and lists this database, and
-    /// otherwise starts again on another port.
-    fn start(path: &Path, home: &Path, env: &[(&str, &str)]) -> Limited {
-        std::fs::create_dir_all(home).unwrap();
-        std::fs::write(home.join("token"), TOKEN).unwrap();
-        let id = id_of(path);
-        for _ in 0..10 {
-            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-            std::fs::write(home.join("bridge.toml"), format!("port = {port}\n")).unwrap();
-            let mut command = std::process::Command::new("sh");
-            command
-                .arg("-c")
-                .arg("ulimit -v 262144 && exec \"$0\" --database \"$1\"")
-                .arg(env!("CARGO_BIN_EXE_oschess-bridge"))
-                .arg(path)
-                .env("OSCHESS_BRIDGE_HOME", home)
-                .env("MALLOC_ARENA_MAX", "2")
-                .stdout(std::process::Stdio::null());
-            for (k, v) in env {
-                command.env(k, v);
-            }
-            let mut limited = Limited { child: command.spawn().unwrap(), port, id: id.clone() };
-            if limited.serves() {
-                return limited;
-            }
-        }
-        panic!("the bridge did not start");
-    }
-
-    /// Whether this bridge runs and serves its database, waiting for it to start.
-    fn serves(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if self.child.try_wait().unwrap().is_some() {
-                return false;
-            }
-            if let Some((_, body)) = try_get(self.port, "/v1/databases") {
-                let listed = body.contains(&format!(r#""id":"{}""#, self.id));
-                return listed && self.child.try_wait().unwrap().is_none();
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
-    }
-}
-
-impl Drop for Limited {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// The bridge under a 256 MiB address-space limit, serving `path`, with
+/// `env` set.
+fn limited(path: &Path, home: &Path, env: &[(&str, &str)]) -> Limited {
+    Limited::start(path, home, 256 << 10, env)
 }
 
 /// A header file claiming 4,294,967,295 records, of 824 GB but a few bytes on
@@ -208,7 +135,7 @@ impl Drop for Limited {
 fn a_database_too_large_to_sort_is_refused_under_a_memory_limit() {
     let db = sparse("limits-too-large", u64::from(u32::MAX));
     let path = db.dir().join("db.2cbh");
-    let b = Limited::start(&path, &db.dir().join("home"), &[("OSCHESS_BRIDGE_THREADS", "1")]);
+    let b = limited(&path, &db.dir().join("home"), &[("OSCHESS_BRIDGE_THREADS", "1")]);
     let (status, out) = get(b.port, &format!("/v1/databases/{}/games?sort=date", b.id));
     assert_eq!(status, 422, "{out}");
     assert!(out.contains(r#""code":"database_too_large""#), "{out}");
@@ -225,7 +152,7 @@ fn more_workers_than_the_budget_holds_buffers_for_still_search() {
     let db = sparse("limits-many-workers", 300_000);
     let path = db.dir().join("db.2cbh");
     let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
-    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    let b = limited(&path, &db.dir().join("home"), &env);
     for query in ["q=moves:12345", "sort=date"] {
         let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
         assert_eq!(status, 200, "{query}: {out}");
@@ -245,7 +172,7 @@ fn many_workers_leave_room_for_their_matches() {
     let db = b.write("limits-many-matches");
     let path = db.dir().join("db.2cbh");
     let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
-    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    let b = limited(&path, &db.dir().join("home"), &env);
     for query in ["q=moves:21&limit=1", "q=moves:21&sort=date&limit=1"] {
         let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
         assert_eq!(status, 200, "{query}: {out}");
@@ -297,7 +224,7 @@ fn many_names_load_on_many_workers_within_a_small_budget() {
     let db = b.write("limits-many-names");
     let path = db.dir().join("db.2cbh");
     let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
-    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    let b = limited(&path, &db.dir().join("home"), &env);
     for (query, total) in [("q=player:a&limit=1", "100000"), ("q=player:nomatch&limit=1", "0")] {
         let (status, out) = get(b.port, &format!("/v1/databases/{}/games?{query}", b.id));
         assert_eq!(status, 200, "{query}: {out}");
@@ -353,7 +280,7 @@ fn huge_name_records_are_never_read_whole() {
     huge_names_lid(&db.dir().join("db.2lid"), 16 * 4096);
     let path = db.dir().join("db.2cbh");
     let env = [("OSCHESS_BRIDGE_THREADS", "16"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
-    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    let b = limited(&path, &db.dir().join("home"), &env);
     let answers: Vec<(u16, String)> = std::thread::scope(|s| {
         let running: Vec<_> = (0..8)
             .map(|n| {
@@ -382,7 +309,7 @@ fn concurrent_searches_under_a_memory_limit_all_get_an_answer() {
     let db = sparse("limits-concurrent", 2_000_000);
     let path = db.dir().join("db.2cbh");
     let env = [("OSCHESS_BRIDGE_THREADS", "4"), ("OSCHESS_BRIDGE_SEARCH_MIB", "16")];
-    let b = Limited::start(&path, &db.dir().join("home"), &env);
+    let b = limited(&path, &db.dir().join("home"), &env);
     let answers: Vec<(u16, String)> = std::thread::scope(|s| {
         let running: Vec<_> = (0..24)
             .map(|n| {

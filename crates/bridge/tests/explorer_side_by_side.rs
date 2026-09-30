@@ -21,25 +21,13 @@ use cbformat::v2::Database;
 mod common;
 use common::random_games;
 
-const CHILD: &str = "BRIDGE_SIDE_BY_SIDE_CHILD";
-
 /// Whether this is the child that runs the test's body. The parent runs the
 /// test `name` in a child with the default budget and 64 workers, and checks
 /// it passed.
 fn in_child(name: &str) -> bool {
-    if std::env::var_os(CHILD).is_some() {
-        return true;
-    }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
-        .env("OSCHESS_BRIDGE_SEARCH_MIB", DEFAULT_BUDGET_MIB.to_string())
-        .env("OSCHESS_BRIDGE_THREADS", "64")
-        .output()
-        .unwrap();
-    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success() && text.contains("1 passed"), "{text}");
-    false
+    let mib = DEFAULT_BUDGET_MIB.to_string();
+    let env = [("OSCHESS_BRIDGE_SEARCH_MIB", mib.as_str()), ("OSCHESS_BRIDGE_THREADS", "64")];
+    common::in_child(name, "BRIDGE_SIDE_BY_SIDE_CHILD", &env)
 }
 
 /// Games of each database: its parts of the keys hold a few hundred entries
