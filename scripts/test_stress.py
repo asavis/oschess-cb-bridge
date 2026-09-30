@@ -152,6 +152,20 @@ class Cpus(unittest.TestCase):
         self.assertEqual(stress.default_cpus({3}), {3})
 
 
+class Slowdown(unittest.TestCase):
+    """How many times run 0 the loaded runs took, by their median."""
+
+    def test_divides_the_loaded_median_by_run_0(self):
+        api = stress.Binary("api", "api", "/t/api", "/repo")
+        runs = {0: [stress.Outcome(api, 2.0)], 1: [stress.Outcome(api, 6.0)], 2: [stress.Outcome(api, 12.0)]}
+        self.assertEqual(stress.slowdown(runs), 4.5)
+
+    def test_is_unknown_without_run_0_or_a_loaded_run(self):
+        api = stress.Binary("api", "api", "/t/api", "/repo")
+        self.assertIsNone(stress.slowdown({1: [stress.Outcome(api, 6.0)]}))
+        self.assertIsNone(stress.slowdown({0: [stress.Outcome(api, 2.0)]}))
+
+
 class Summary(unittest.TestCase):
     """The report after the runs."""
 
@@ -244,11 +258,13 @@ sys.exit(stress.main(["--out", os.path.join(tmp, "out"), *sys.argv[4:]]))
 
 # The fake test binary: it notes its process id and a child's, whose output
 # goes elsewhere. The first run (run 0) ends at once when `$1` is `quick`;
-# the others sleep until killed, or exit at once with 101 when it is `exit`.
+# the others sleep until killed, or exit at once with 101 when it is `exit`;
+# every run passes at once when it is `fast`.
 FAKE_TEST = """#!/bin/sh
 sleep 300 >/dev/null 2>&1 &
 echo "$$ $!" >> pids
 if [ "$MODE" = exit ]; then exit 101; fi
+if [ "$MODE" = fast ]; then exit 0; fi
 if [ "$MODE" = quick ] && [ ! -e first ]; then touch first; exit 0; fi
 exec sleep 300
 """
@@ -274,10 +290,8 @@ def children(pid):
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("taskset"), "Linux with taskset")
-class Lifecycle(unittest.TestCase):
-    """Nothing the runner starts outlives it: a signal in any phase kills the
-    build, the tests with their children and the busy loops, and a test
-    binary's leftover children are killed when it exits (#233)."""
+class FakeRun(unittest.TestCase):
+    """The runner run in a child process with a fake build and test binary."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -326,6 +340,12 @@ class Lifecycle(unittest.TestCase):
         driver.send_signal(sig)
         self.assertEqual(driver.wait(timeout=60), 130)
 
+
+class Lifecycle(FakeRun):
+    """Nothing the runner starts outlives it: a signal in any phase kills the
+    build, the tests with their children and the busy loops, and a test
+    binary's leftover children are killed when it exits (#233)."""
+
     def test_a_signal_during_the_build(self):
         driver = self.start("build", "--hogs", "0")
         pids = self.noted(1)
@@ -364,6 +384,21 @@ class Lifecycle(unittest.TestCase):
         driver = self.start("run", "--runs", "1", "--hogs", "0", env_mode="exit")
         self.assertEqual(driver.wait(timeout=60), 1)
         self.assert_all_end(self.noted(2))
+
+
+class MinSlowdown(FakeRun):
+    """`--min-slowdown` voids a campaign whose load did not slow the tests
+    (#235): exit status 2, with the reason, when every run passed."""
+
+    def test_a_campaign_below_the_slowdown_is_void(self):
+        driver = self.start("run", "--runs", "2", "--hogs", "0", "--min-slowdown", "1000", env_mode="fast")
+        self.assertEqual(driver.wait(timeout=60), 2)
+        with open(os.path.join(self.tmp, "driver.log")) as f:
+            self.assertIn("void: the loaded runs took", f.read())
+
+    def test_a_campaign_at_the_slowdown_passes(self):
+        driver = self.start("run", "--runs", "2", "--hogs", "0", "--min-slowdown", "0.01", env_mode="fast")
+        self.assertEqual(driver.wait(timeout=60), 0)
 
 
 if __name__ == "__main__":
