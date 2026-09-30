@@ -14,7 +14,9 @@ use bridge::engine::{self, Engine, EngineConfig};
 use bridge::sources::Sources;
 
 mod common;
-use common::{ORIGIN, TestBridge, app_of, exchange, get, get_reply, has_members, member, request, send};
+use common::{
+    ORIGIN, TestBridge, WAIT_LIMIT, app_of, exchange, get, get_reply, has_members, member, request, send, until,
+};
 
 fn fake() -> EngineConfig {
     EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(1), Some(16))
@@ -36,7 +38,7 @@ struct Analysis {
 impl Analysis {
     fn open(port: u16, query: &str) -> Analysis {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
         (&s).write_all(request(port, &format!("/v1/engine/analyze?{query}")).as_bytes()).unwrap();
         let mut reader = BufReader::new(s);
         let mut head = String::new();
@@ -106,11 +108,9 @@ fn an_analysis_is_work_while_it_streams() {
     assert!(bridge.app.engine.analyzing(Duration::from_secs(60)));
     assert!(!bridge.app.engine.analyzing(Duration::ZERO), "one running past the bound counts as none");
     drop(a);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while bridge.app.engine.analyzing(Duration::from_secs(60)) {
-        assert!(Instant::now() < deadline, "the analysis ends when its client leaves");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until("the analysis ends when its client leaves", WAIT_LIMIT, || {
+        !bridge.app.engine.analyzing(Duration::from_secs(60))
+    });
 }
 
 #[test]
@@ -250,11 +250,16 @@ fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
     let chatty = dir.join(format!("fake-uci-chatty{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(env!("CARGO_BIN_EXE_fake-uci"), &chatty).unwrap();
     let (port, _bridge) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
-    let started = Instant::now();
     let lines = Analysis::open(port, "depth=1").rest();
-    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_failed"}"#), "{lines:?}");
-    let took = started.elapsed();
-    assert!(took < Duration::from_secs(7), "the handshake took {took:?}");
+    // The engine writes lines without end and never `uciok`: a deadline that
+    // each line put off would never come, and the answer would stop until
+    // the test's patience ran out. The handshake fails at its deadline,
+    // which the message names. A bound on the time the analysis took, and a
+    // flood that ended in `uciok` three seconds after the deadline, stood for
+    // this, which a loaded machine could break (#238).
+    let last = lines.last().unwrap_or_else(|| panic!("the handshake did not end within {WAIT_LIMIT:?}"));
+    assert!(has_members(last, r#""error":{"code":"engine_failed"}"#), "{lines:?}");
+    assert!(member(member(last, "error"), "message").contains("uciok in time"), "{last}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -264,11 +269,7 @@ fn an_idle_engine_ends_its_process() {
     let mut a = Analysis::open(port, "depth=1");
     assert_eq!(a.rest().last().unwrap(), BEST);
     assert!(bridge.app.engine.is_running());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while bridge.app.engine.is_running() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(!bridge.app.engine.is_running(), "the idle engine still runs");
+    until("the idle engine still runs", WAIT_LIMIT, || !bridge.app.engine.is_running());
 }
 
 #[test]
@@ -412,7 +413,7 @@ fn the_engine_follows_bridge_toml() {
     assert!(running.line().is_some());
     let second = fake_copy(&dir, "engine-b");
     write(&engine_line(&second));
-    let ended = running.rest_within(Duration::from_secs(3)).expect("the old search ran on");
+    let ended = running.rest_within(WAIT_LIMIT).expect("the old search ran on");
     assert!(ended.iter().all(|l| l.starts_with(r#"{"info":"#) || l == r#"{"superseded":true}"#), "{ended:?}");
     assert_eq!(bridge.app.engine.name().as_deref(), Some("engine-b"));
 
@@ -498,7 +499,7 @@ fn a_failed_read_is_tried_again_and_a_pipe_is_never_read() {
     let (tx, rx) = mpsc::channel();
     let asking = engine.clone();
     std::thread::spawn(move || tx.send(asking.name()));
-    let name = rx.recv_timeout(Duration::from_secs(20)).expect("the pipe was read");
+    let name = rx.recv_timeout(WAIT_LIMIT).expect("the pipe was read");
     assert_eq!(name.as_deref(), Some("engine-b"));
     let _ = std::fs::remove_dir_all(&dir);
 }

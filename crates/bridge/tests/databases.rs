@@ -23,7 +23,9 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
 
 mod common;
-use common::{TOKEN, TestBridge, get, has_members, has_object, members, objects, policy, settle};
+use common::{
+    TOKEN, TestBridge, WAIT_LIMIT, get, has_members, has_object, members, objects, policy, poll, settle, until,
+};
 
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 
@@ -392,11 +394,8 @@ fn size_of(files: &[PathBuf]) -> u64 {
 }
 
 fn wait_for(entry: &Entry, state: State) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while entry.state() != state {
-        assert!(Instant::now() < deadline, "still {:?}, waiting for {state:?}", entry.state());
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let reached = poll(WAIT_LIMIT, || (entry.state() == state).then_some(()));
+    assert!(reached.is_some(), "still {:?} after {WAIT_LIMIT:?}, waiting for {state:?}", entry.state());
 }
 
 /// Listing never reads a cloud-only database; opening it for games downloads
@@ -527,11 +526,7 @@ fn a_database_moved_back_to_the_cloud_is_cloud_only_again() {
 
 /// Waits until the database's download, running or queued, has ended.
 fn wait_for_download(entry: &Entry) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while entry.progress().is_some() {
-        assert!(Instant::now() < deadline, "the download does not end");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    until("the download does not end", WAIT_LIMIT, || entry.progress().is_none());
 }
 
 /// A companion file moved to the cloud while the download of another ran
@@ -654,14 +649,14 @@ fn a_database_answers_while_the_sources_are_read() {
         let catalog = Arc::clone(&catalog);
         std::thread::spawn(move || names(&catalog))
     };
-    read.recv_timeout(Duration::from_secs(10)).expect("the sources were not read");
+    read.recv_timeout(WAIT_LIMIT).expect("the sources were not read");
 
     let (tx, rx) = mpsc::channel();
     let (reader, ids) = (Arc::clone(&catalog), [id_of(&one), id_of(&two)]);
     std::thread::spawn(move || {
         let _ = tx.send(ids.map(|id| reader.get(&id).map(|e| e.state())));
     });
-    let answers = rx.recv_timeout(Duration::from_secs(10)).expect("a request waited for the sources");
+    let answers = rx.recv_timeout(WAIT_LIMIT).expect("a request waited for the sources");
     assert_eq!(answers, [Some(State::Ready), None]);
     drop(release);
     assert_eq!(listing.join().unwrap(), ["One", "Two"]);
@@ -710,8 +705,7 @@ fn files_that_are_not_regular_are_never_opened() {
         let startup = bridge::config::load_or_create(&pipe_config).is_err();
         tx.send((listed, games, ready, config, startup)).unwrap();
     });
-    let (listed, games, ready, config, startup) =
-        rx.recv_timeout(Duration::from_secs(20)).expect("a pipe blocked the bridge");
+    let (listed, games, ready, config, startup) = rx.recv_timeout(WAIT_LIMIT).expect("a pipe blocked the bridge");
     let listed: Vec<(&str, &str)> = listed.iter().map(|(n, s)| (n.as_str(), *s)).collect();
     assert_eq!(listed, [("Good", "ready"), ("Companion", "unreadable"), ("Header", "unreadable")]);
     assert_eq!(games, Some(State::Unreadable));
@@ -828,16 +822,13 @@ fn cloud_states_over_http() {
     assert!(has_object(&body, &format!("\"download\":{{\"present\":0,\"total\":{size}}}")), "{body}");
 
     cloud.hold(false);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let (status, body) = get(port, &format!("/v1/databases/{id}/games"));
-        if status == 200 {
-            assert!(body.contains("\"total\":1"), "{body}");
-            break;
-        }
-        assert!(Instant::now() < deadline, "{status} {body}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let mut last = (0, String::new());
+    let body = poll(WAIT_LIMIT, || {
+        last = get(port, &format!("/v1/databases/{id}/games"));
+        (last.0 == 200).then(|| last.1.clone())
+    });
+    let body = body.unwrap_or_else(|| panic!("still {} {} after {WAIT_LIMIT:?}", last.0, last.1));
+    assert!(body.contains("\"total\":1"), "{body}");
     let (_, body) = get(port, "/v1/databases");
     assert!(has_object(&body, "\"state\":\"ready\",\"records\":1"), "{body}");
 }
@@ -995,7 +986,7 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
         let mut out = child.stdout.take().unwrap();
         text.clear();
         let mut buf = [0u8; 256];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT_LIMIT;
         while !text.contains("Windowed") && Instant::now() < deadline {
             match out.read(&mut buf) {
                 Ok(0) | Err(_) => break,

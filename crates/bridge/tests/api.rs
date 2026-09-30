@@ -1,6 +1,6 @@
 //! The server against `docs/api.md`, over real loopback connections.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,8 +17,8 @@ use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Pie
 
 mod common;
 use common::{
-    ANSWER_TIMEOUT, ORIGIN, Reply, TOKEN, TestBridge, app_of, connect, get_reply, has_members, has_object, member,
-    object_with, objects, send,
+    ORIGIN, Reply, TOKEN, TestBridge, WAIT_LIMIT, app_of, connect, get_reply, has_members, has_object, member,
+    object_with, objects, poll, send, unanswered,
 };
 
 /// `games` games of 1.e4 won by white, white and black being "Morphy, Paul";
@@ -321,46 +321,6 @@ fn a_connection_serves_several_requests() {
     assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
 }
 
-/// Answers on a kept connection come at once (#142). An answer written in two
-/// pieces waited for the client's delayed acknowledgement of the first, on
-/// every round trip but the first few: 40 ms on Linux, the shortest there is,
-/// longer elsewhere. A loaded machine holds back some round trips as long,
-/// not the typical one: the median of 20 stays under that floor, where a
-/// bound on their total failed under load.
-#[test]
-fn answers_on_a_kept_connection_come_without_delay() {
-    const DELAYED_ACK: Duration = Duration::from_millis(40);
-    let db = database("api-no-delay", 1, 0, 0);
-    let bridge = start(&db, vec![], None);
-    let p = bridge.port;
-    let one = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
-    let mut s = std::io::BufReader::new(connect(p).unwrap());
-    let mut trips = Vec::new();
-    for _ in 0..20 {
-        let started = Instant::now();
-        s.get_mut().write_all(one.as_bytes()).unwrap();
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            let read = std::io::BufRead::read_line(&mut s, &mut line).unwrap();
-            assert!(read > 0, "the connection ended within an answer's head: {trips:?}");
-            if line == "\r\n" {
-                break;
-            }
-            if let Some(v) = line.strip_prefix("Content-Length: ") {
-                length = v.trim().parse().unwrap();
-            }
-        }
-        let mut body = vec![0; length];
-        s.read_exact(&mut body).unwrap();
-        trips.push(started.elapsed());
-    }
-    let mut sorted = trips.clone();
-    sorted.sort();
-    let median = sorted[trips.len() / 2];
-    assert!(median < DELAYED_ACK, "the median round trip took {median:?}: {trips:?}");
-}
-
 /// A `.2lid` with six entity types (players, tournaments, sources, the unused
 /// type 3, teams, game tags), `count` entities each in containers of `size`
 /// bytes, holding `entities` as (type, id, record after its length field).
@@ -536,7 +496,7 @@ fn the_ipv6_loopback_is_served() {
     let bridge = start(&db, vec![], None);
     let p = bridge.port;
     let mut s = TcpStream::connect(("::1", p)).unwrap();
-    s.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+    s.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
     let raw = format!(
         "GET /v1/status HTTP/1.1\r\nHost: [::1]:{p}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
     );
@@ -585,19 +545,16 @@ fn a_game_too_large_to_render_is_refused() {
 }
 
 /// Asks for `/v1/status` until the answer is `status`, every answer before it
-/// being `meanwhile`: the bridge counts the connections opened or closed just
-/// before in its own time, which a loaded machine makes long.
+/// being `meanwhile`, for [`WAIT_LIMIT`] at most: the bridge counts the
+/// connections opened or closed just before in its own time, which a loaded
+/// machine makes long.
 fn status_until(port: u16, status: u16, meanwhile: u16) -> Reply {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let r = poll(WAIT_LIMIT, || {
         let r = get_reply(port, "/v1/status");
-        if r.status == status {
-            return r;
-        }
-        assert_eq!(r.status, meanwhile, "{}", r.body);
-        assert!(Instant::now() < deadline, "still {} after 10 s: {}", r.status, r.body);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+        assert!(r.status == status || r.status == meanwhile, "{} {}", r.status, r.body);
+        (r.status == status).then_some(r)
+    });
+    r.unwrap_or_else(|| panic!("still {meanwhile} after {WAIT_LIMIT:?}"))
 }
 
 /// Holds the connection cap with [`server::MAX_CONNECTIONS`] connections that
@@ -609,30 +566,21 @@ fn status_until(port: u16, status: u16, meanwhile: u16) -> Reply {
 /// be reached again. Such a connection is replaced.
 fn hold_the_cap(port: u16) -> (Vec<TcpStream>, Reply) {
     let mut held: Vec<TcpStream> = (0..server::MAX_CONNECTIONS).map(|_| connect(port).unwrap()).collect();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let busy = poll(WAIT_LIMIT, || {
         let r = get_reply(port, "/v1/status");
         if r.status == 503 {
-            return (held, r);
+            return Some(r);
         }
         assert_eq!(r.status, 200, "{}", r.body);
-        assert!(Instant::now() < deadline, "still 200 after 10 s: {}", r.body);
         for s in &mut held {
             if !unanswered(s) {
                 *s = connect(port).unwrap();
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Whether the bridge has neither answered nor closed `s`, a connection that
-/// sent nothing.
-fn unanswered(s: &TcpStream) -> bool {
-    s.set_nonblocking(true).unwrap();
-    let unanswered = matches!(s.peek(&mut [0]), Err(e) if e.kind() == ErrorKind::WouldBlock);
-    s.set_nonblocking(false).unwrap();
-    unanswered
+        None
+    });
+    let busy = busy.unwrap_or_else(|| panic!("still 200 after {WAIT_LIMIT:?}"));
+    (held, busy)
 }
 
 /// Over the connection cap, the `busy` answer is readable by an allowed page,

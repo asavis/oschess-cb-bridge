@@ -186,13 +186,7 @@ impl Conn {
     }
 
     pub fn write(&mut self, response: &Response, keep_alive: bool) -> io::Result<()> {
-        let mut framing = String::new();
-        if !response.body.is_empty() {
-            framing.push_str("Content-Type: application/json; charset=utf-8\r\n");
-        }
-        framing.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-        write_both(&mut self.stream, head(response, &framing, keep_alive).as_bytes(), response.body.as_bytes())?;
-        self.stream.flush()
+        write_answer(&mut self.stream, response, keep_alive)
     }
 
     /// Ends the connection. A close with unread bytes resets the connection,
@@ -245,10 +239,22 @@ fn head(response: &Response, framing: &str, keep_alive: bool) -> String {
     head
 }
 
+/// Writes `response` whole, its head and its body, to `out`: see
+/// [`write_both`].
+fn write_answer(out: &mut impl Write, response: &Response, keep_alive: bool) -> io::Result<()> {
+    let mut framing = String::new();
+    if !response.body.is_empty() {
+        framing.push_str("Content-Type: application/json; charset=utf-8\r\n");
+    }
+    framing.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+    write_both(out, head(response, &framing, keep_alive).as_bytes(), response.body.as_bytes())?;
+    out.flush()
+}
+
 /// Writes `head` then `body` as one vectored write, so that they usually leave
 /// in the same segments, without copying the body: an answer's memory is
 /// reserved once, for the body (#142).
-fn write_both(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::Result<()> {
+fn write_both(stream: &mut impl Write, head: &[u8], body: &[u8]) -> io::Result<()> {
     let mut slices = [IoSlice::new(head), IoSlice::new(body)];
     let mut rest = &mut slices[..];
     while !rest.is_empty() {
@@ -569,6 +575,64 @@ mod tests {
         let short = Duration::from_millis(500);
         assert_eq!(wait(Some(long), Some(short)), Some(short));
         assert_eq!(wait(None, Some(short)), Some(short));
+    }
+
+    /// A writer that takes all it is given in each write, as a socket with
+    /// room for it does, and counts the writes.
+    #[derive(Default)]
+    struct Counting {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.writes += 1;
+            let before = self.bytes.len();
+            bufs.iter().for_each(|b| self.bytes.extend_from_slice(b));
+            Ok(self.bytes.len() - before)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An answer is one write, its head and its body together (#142): written
+    /// in two, the second waited on a kept connection for the client's
+    /// delayed acknowledgement of the first, 40 ms on Linux and longer
+    /// elsewhere. A test that timed round trips failed under load (#250);
+    /// this one counts the writes.
+    #[test]
+    fn an_answer_is_one_write() {
+        for (response, keep_alive) in [
+            (Response::json(200, r#"{"a":1}"#.into()).header("Vary", "Origin"), true),
+            (Response::json(200, "x".repeat(1 << 20)), false),
+            (Response::empty(204), true),
+        ] {
+            let mut out = Counting::default();
+            write_answer(&mut out, &response, keep_alive).unwrap();
+            assert_eq!(out.writes, 1, "{}", response.status);
+            let text = String::from_utf8(out.bytes).unwrap();
+            assert!(text.starts_with("HTTP/1.1 ") && text.ends_with(&format!("\r\n\r\n{}", response.body)));
+        }
+    }
+
+    /// A connection the bridge accepts sends each write at once, without
+    /// holding a small one back for the client's acknowledgement of the one
+    /// before (#142): `Conn::new`, through which the bridge serves or refuses
+    /// every connection, turns Nagle's algorithm off.
+    #[test]
+    fn an_accepted_connection_sends_without_delay() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let accepted = listener.accept().unwrap().0;
+        assert!(!accepted.nodelay().unwrap(), "a new socket delays small writes");
+        assert!(Conn::new(accepted).stream.nodelay().unwrap());
     }
 
     /// The bytes a client reads when `send` writes to the connection accepted

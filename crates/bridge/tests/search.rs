@@ -241,14 +241,13 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
     let f = common::sparse("search-too-large", 200_000_000);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
-    let started = std::time::Instant::now();
     assert!(matches!(
         search::select(&db, &idx, None, None, search::query::Sort::parse("date")),
         Err(SearchError::TooLarge)
     ));
+    // Refused before it reads: a bound on the time it took stood for this,
+    // and failed on a loaded machine however little was done (#238).
     assert_eq!(idx.scanned(), 0, "not a record was read");
-    // Nothing is read, which takes milliseconds: a loaded machine has room.
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 /// A newer search on the same database stops the one still scanning, each of

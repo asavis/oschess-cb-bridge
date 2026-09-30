@@ -34,7 +34,7 @@ use cbformat::v2::Database;
 use chesscore::Board;
 
 mod common;
-use common::{TestBridge, WAIT_LIMIT, get, in_child, index_dir, policy, until};
+use common::{Sent, TestBridge, WAIT_LIMIT, get, in_child, index_dir, policy, until};
 
 const TICK: Duration = Duration::from_millis(50);
 /// What tells a child process that runs a test's body that it is one.
@@ -194,8 +194,9 @@ trait Background {
     /// The indexes searches on database `id` use, where a test holds them.
     fn indexes(&self, id: &str) -> Arc<Indexes>;
 
-    /// Sends a search on database `id` from a thread of its own.
-    fn search(&self, id: &str) -> std::thread::JoinHandle<(u16, String)>;
+    /// Sends a search on database `id`, whose answer the test reads once it
+    /// has let the search go: the answer's patience runs from then (#244).
+    fn search(&self, id: &str) -> Sent;
 }
 
 impl Background for TestBridge {
@@ -211,9 +212,8 @@ impl Background for TestBridge {
         self.app.catalog.get(id).unwrap().open().ok().unwrap().indexes
     }
 
-    fn search(&self, id: &str) -> std::thread::JoinHandle<(u16, String)> {
-        let (port, path) = (self.port, format!("/v1/databases/{id}/games?q=x"));
-        std::thread::spawn(move || get(port, &path))
+    fn search(&self, id: &str) -> Sent {
+        Sent::get(self.port, &format!("/v1/databases/{id}/games?q=x"))
     }
 }
 
@@ -709,7 +709,7 @@ fn a_background_build_gives_way_to_a_search() {
     assert_eq!(bridge.building(), [(id.clone(), "reading", 0, 20)], "it went on while the search ran");
     assert!(built_for(&dir, &id).is_none());
     drop(held);
-    let (status, body) = search.join().unwrap();
+    let (status, body) = search.answer();
     assert_eq!(status, 200, "{body}");
     until("the build did not go on once the search ended", WAIT_LIMIT, || {
         built_for(&dir, &id) == Some(generation(&path))
@@ -745,9 +745,9 @@ fn a_requested_build_does_not_give_way() {
     until("the requested build did not answer", WAIT_LIMIT, || bridge.explorer(&b).0 == 200);
     assert!(built_for(&dir, &a).is_none(), "the background build went on");
     until("the promoted build did not answer", WAIT_LIMIT, || bridge.explorer(&a).0 == 200);
-    assert!(!search.is_finished(), "the search ended");
+    assert!(!search.answered(), "the search ended");
     drop(held);
-    let (status, body) = search.join().unwrap();
+    let (status, body) = search.answer();
     assert_eq!(status, 200, "{body}");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -778,9 +778,9 @@ fn a_background_build_ends_while_a_search_never_does() {
     until("the build did not end while the search ran", WAIT_LIMIT, || built_for(&dir, &id) == Some(generation(&path)));
     let took = started.elapsed();
     assert!(took >= patience * 5, "it gave way less than its patience per pass: {took:?}");
-    assert!(!search.is_finished(), "the search ended");
+    assert!(!search.answered(), "the search ended");
     drop(held);
-    let (status, body) = search.join().unwrap();
+    let (status, body) = search.answer();
     assert_eq!(status, 200, "{body}");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();

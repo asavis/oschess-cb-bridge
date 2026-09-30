@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
 
 use bridge::catalog::{Catalog, State, id_of};
 use bridge::search::{self, Indexes, SearchError, Selection};
@@ -16,8 +15,8 @@ use cbformat::view::Base;
 
 mod common;
 use common::{
-    FixtureRow, TestBridge, app_of, block, fixture_of, get, has_members, has_object, member, object_with, pgn_fixture,
-    rows, without_generation,
+    FixtureRow, TestBridge, WAIT_LIMIT, app_of, block, fixture_of, get, has_members, has_object, member, object_with,
+    pgn_fixture, poll, rows, without_generation,
 };
 
 fn scratch(name: &str) -> PathBuf {
@@ -29,24 +28,22 @@ fn scratch(name: &str) -> PathBuf {
 /// Asks for `path` until the answer is no longer a `409` for a database or an
 /// index still being prepared.
 fn get_ready(port: u16, path: &str) -> (u16, String) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    let mut last = String::new();
+    let answer = poll(WAIT_LIMIT, || {
         let answer = get(port, path);
-        if answer.0 != 409 {
-            return answer;
+        if answer.0 == 409 {
+            last = answer.1;
+            return None;
         }
-        assert!(Instant::now() < deadline, "{path} stayed {}", answer.1);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        Some(answer)
+    });
+    answer.unwrap_or_else(|| panic!("{path} stayed {last} for {WAIT_LIMIT:?}"))
 }
 
 fn wait_ready(catalog: &Catalog, path: &Path) {
     let entry = catalog.get(&id_of(path)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while entry.state() != State::Ready {
-        assert!(Instant::now() < deadline, "{} stayed {:?}", path.display(), entry.state());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let ready = poll(WAIT_LIMIT, || (entry.state() == State::Ready).then_some(()));
+    assert!(ready.is_some(), "{} stayed {:?} for {WAIT_LIMIT:?}", path.display(), entry.state());
 }
 
 /// The fixture of `docs/search-grammar.md` with what PGN cannot hold made a

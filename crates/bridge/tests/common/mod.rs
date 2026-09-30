@@ -185,12 +185,6 @@ pub fn request(port: u16, path: &str) -> String {
     )
 }
 
-/// How long a test waits for the rest of an answer before it fails. Longer
-/// than any answer of these tests takes on a loaded machine, it turns a bridge
-/// that stops answering, or never closes a connection, into a failure that
-/// names the request instead of a run that hangs.
-pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// How long a test's bridge keeps an open connection waiting for a request,
 /// in place of [`bridge::http::IDLE_TIMEOUT`]. A loaded machine can stall a
 /// test between its connect and its write for longer than that; the bridge
@@ -200,28 +194,75 @@ pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 pub const IDLE_TIMEOUT: Duration = WAIT_LIMIT;
 
 /// A connection to the bridge on `port` whose reads fail after
-/// [`ANSWER_TIMEOUT`] without a byte.
+/// [`WAIT_LIMIT`] without a byte: a bridge that stops answering, or never
+/// closes a connection, fails the test by the request's name instead of
+/// hanging the run. A large answer on a loaded machine takes minutes (#253).
 pub fn connect(port: u16) -> std::io::Result<TcpStream> {
     let s = TcpStream::connect(("127.0.0.1", port))?;
-    s.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+    s.set_read_timeout(Some(WAIT_LIMIT))?;
     Ok(s)
 }
 
 /// Sends `raw` on a new connection and reads the whole answer, head and body;
 /// `None` when the connection is refused or cut. An answer that stops for
-/// [`ANSWER_TIMEOUT`] before the connection ends fails the test.
+/// [`WAIT_LIMIT`] before the connection ends fails the test.
 pub fn exchange(port: u16, raw: &str) -> Option<String> {
     let mut s = connect(port).ok()?;
     s.write_all(raw.as_bytes()).ok()?;
+    read_answer(&mut s, raw)
+}
+
+/// The rest of the answer to `raw` on `s`, to the connection's end; `None`
+/// when the connection is cut.
+fn read_answer(s: &mut TcpStream, raw: &str) -> Option<String> {
     let mut out = Vec::new();
     match s.read_to_end(&mut out) {
         Ok(_) => String::from_utf8(out).ok(),
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => panic!(
-            "no end of the answer to {:?} within {ANSWER_TIMEOUT:?}: {}",
+            "no end of the answer to {:?} within {WAIT_LIMIT:?}: {}",
             raw.lines().next().unwrap_or_default(),
             String::from_utf8_lossy(&out)
         ),
         Err(_) => None,
+    }
+}
+
+/// Whether the bridge has neither answered nor closed `s`, looking without
+/// waiting.
+pub fn unanswered(s: &TcpStream) -> bool {
+    s.set_nonblocking(true).unwrap();
+    let unanswered = matches!(s.peek(&mut [0]), Err(e) if e.kind() == ErrorKind::WouldBlock);
+    s.set_nonblocking(false).unwrap();
+    unanswered
+}
+
+/// [`request`]`(port, path)` sent on a connection of its own, whose answer
+/// the test reads later ([`Sent::answer`]): for a request the test holds
+/// back, whose answer's patience must run from when it lets the request go,
+/// not from the send (#244).
+pub struct Sent {
+    stream: TcpStream,
+    raw: String,
+}
+
+impl Sent {
+    pub fn get(port: u16, path: &str) -> Sent {
+        let raw = request(port, path);
+        let mut stream = connect(port).expect("the bridge accepts");
+        stream.write_all(raw.as_bytes()).expect("the bridge takes the request");
+        Sent { stream, raw }
+    }
+
+    /// Whether the bridge has begun to answer, or closed the connection.
+    pub fn answered(&self) -> bool {
+        !unanswered(&self.stream)
+    }
+
+    /// The status and body of the answer, waited for [`WAIT_LIMIT`] from now.
+    pub fn answer(mut self) -> (u16, String) {
+        let out = read_answer(&mut self.stream, &self.raw).expect("the bridge answers");
+        let reply = parse_reply(&out).unwrap_or_else(|| panic!("not an answer: {out}"));
+        (reply.status, reply.body)
     }
 }
 

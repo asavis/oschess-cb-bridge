@@ -5,8 +5,8 @@
 //! The moves of a position steer it: with `h2h3` among them it exits when it
 //! is told to search; with `a2a3` it ignores `stop`; with `b2b3` it writes one
 //! line and then nothing until it is stopped. Started under a name containing
-//! `chatty`, it answers `uci` with eight seconds of `id name` lines before
-//! `uciok`.
+//! `chatty`, it answers `uci` with `id name` lines, never `uciok`, for as
+//! long as they can be written.
 //!
 //! Its `nps` tells what it was set to (#58): `Threads` × 10⁹ + `Hash` × 10³ +
 //! how many `Threads` and `Hash` options it has been sent.
@@ -25,10 +25,8 @@ fn main() {
         }
     });
     let mut out = io::stdout().lock();
-    let mut say = |text: &str| {
-        let _ = writeln!(out, "{text}");
-        let _ = out.flush();
-    };
+    // Whether the line was written: it is not once the bridge is gone.
+    let mut say = |text: &str| writeln!(out, "{text}").and_then(|()| out.flush()).is_ok();
     let (mut multipv, mut position) = (1u32, String::new());
     let (mut threads, mut hash, mut resources_set) = (1u64, 16u64, 0u64);
     let mut search: Option<(u32, Option<u32>, Option<Instant>)> = None;
@@ -40,17 +38,17 @@ fn main() {
                 match words.as_slice() {
                     ["uci"] => {
                         if std::env::args().next().is_some_and(|name| name.contains("chatty")) {
-                            let until = Instant::now() + Duration::from_secs(8);
-                            while Instant::now() < until {
-                                say(&format!("id name {}Engine", " ".repeat(60_000)));
-                            }
+                            while say(&format!("id name {}Engine", " ".repeat(60_000))) {}
+                            return;
                         }
                         say("id name Fake UCI 1.0");
                         say("id author the bridge's tests");
                         say("option name MultiPV type spin default 1 min 1 max 500");
                         say("uciok");
                     }
-                    ["isready"] => say("readyok"),
+                    ["isready"] => {
+                        say("readyok");
+                    }
                     ["setoption", "name", "MultiPV", "value", n] => multipv = n.parse().unwrap_or(1),
                     ["setoption", "name", "Threads", "value", n] => {
                         threads = n.parse().unwrap_or(0);
