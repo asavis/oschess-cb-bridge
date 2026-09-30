@@ -3,6 +3,7 @@
 
 use super::{Annotation, Arrow, Reader, Square, decode_text};
 use crate::Result;
+use crate::game::{QuoteDamage, quote_offsets};
 use crate::movetable::{Sq, from_cb_square};
 
 /// One annotation of type `t`, or `None` when its layout is unknown.
@@ -146,35 +147,15 @@ fn training_list(r: &mut Reader<'_>) -> Result<()> {
     Ok(())
 }
 
-/// A game quotation: header strings, fixed blocks, rating lists, the start
-/// position when it is not the standard one, and moves. `false` for a start
-/// marker of unknown meaning.
+/// A game quotation, skipped as [`quote_offsets`] walks it: header strings,
+/// fixed blocks, rating lists, the start position when it is not the standard
+/// one, and moves. `false` for a start marker of unknown meaning.
 fn quotation(r: &mut Reader<'_>) -> Result<bool> {
-    r.expect_one()?;
-    r.skip(2 + 2 + 4 + 1)?; // mode, unknown, int 1, zero
-    for _ in 0..6 {
-        let n = r.u8()? as usize; // counts the terminating zero
-        r.skip(n)?;
+    match quote_offsets(r.rest()) {
+        Ok(Some(q)) => r.skip(q.len).map(|()| true),
+        Ok(None) => Ok(false),
+        Err(QuoteDamage { at, what }) => Err(r.bad_ahead(at, what)),
     }
-    r.skip(35 + 44)?;
-    for _ in 0..2 {
-        r.skip(5)?; // 01 00 01 00 00
-        let n = r.len()?;
-        r.skip(n)?;
-    }
-    r.skip(26)?;
-    match r.u8()? {
-        1 => {}
-        // A set-up start: 64 squares file by file, then 11 bytes of side to
-        // move, move number and the like (docs/format-notes.md).
-        0 => r.skip(64 + 11)?,
-        _ => return Ok(false),
-    }
-    r.skip(2)?;
-    let moves = r.len()?;
-    r.skip(moves.checked_mul(5).ok_or_else(|| r.bad("quotation move count"))?)?;
-    r.skip(4)?;
-    Ok(true)
 }
 
 /// A type left out of the reading form; the parser fills in its data.

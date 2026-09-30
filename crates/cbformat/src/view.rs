@@ -11,7 +11,7 @@
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Player, RecordKind, Start, Tournament};
+use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Names, PositionOrder, RecordKind, Start};
 use crate::pgn::{self, Options, Rendered};
 use crate::replay::{self, TreeStats, TreeVisitor};
 use crate::v2;
@@ -26,17 +26,6 @@ pub enum Format {
     Cbh,
     /// A PGN file, `.pgn`.
     Pgn,
-}
-
-/// How a format numbers the moves annotations are on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PositionOrder {
-    /// In PGN order: each alternative and everything after it right after the
-    /// move it replaces. 2CBH numbers them so.
-    Pgn,
-    /// In stored order: depth first, the main line first at every position.
-    /// The classic format numbers them so.
-    Stored,
 }
 
 /// An open database of any format.
@@ -110,7 +99,8 @@ impl Base {
         }
     }
 
-    /// How [`Base::annotations_of`] numbers the moves.
+    /// How [`Base::annotations_of`] numbers the moves, as the
+    /// [`crate::game::Source`] of its annotations says.
     pub fn position_order(&self) -> PositionOrder {
         match self {
             Base::TwoCbh(_) | Base::Pgn(_) => PositionOrder::Pgn,
@@ -137,26 +127,18 @@ impl Base {
         })
     }
 
-    /// The players, tournament and annotator a game names.
+    /// The players, tournament and annotator a game names: the players and
+    /// the tournament as its PGN tags read them, and the annotator, which a
+    /// 2CBH database keeps with its players and a classic one on its own.
     pub fn names(&self, header: &Header) -> Result<Names> {
         match (self, header) {
             (Base::TwoCbh(db), Header::TwoCbh(r)) => {
-                let e = db.entities();
-                Ok(Names {
-                    white: e.player(r.white())?,
-                    black: e.player(r.black())?,
-                    tournament: e.tournament(r.tournament())?,
-                    annotator: e.player(r.annotator())?.map(|p| p.pgn()),
-                })
+                let names = db.tag_names(r)?;
+                Ok(Names { annotator: db.entities().player(r.annotator())?.map(|p| p.pgn()), ..names })
             }
             (Base::Cbh(db), Header::Cbh(r)) => {
-                let e = db.entities();
-                Ok(Names {
-                    white: e.player(r.white())?,
-                    black: e.player(r.black())?,
-                    tournament: e.tournament(r.tournament())?,
-                    annotator: e.annotator(r.annotator())?,
-                })
+                let names = db.tag_names(r)?;
+                Ok(Names { annotator: db.entities().annotator(r.annotator())?, ..names })
             }
             (Base::Pgn(db), Header::Pgn(r)) => Ok(Names {
                 white: db.player(r.white())?,
@@ -351,15 +333,6 @@ impl Head for Header {
     fn bytes(&self) -> &[u8] {
         each!(self, r => Head::bytes(r))
     }
-}
-
-/// The entities a game names; `None` for an unused or unreadable entry.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Names {
-    pub white: Option<Player>,
-    pub black: Option<Player>,
-    pub tournament: Option<Tournament>,
-    pub annotator: Option<String>,
 }
 
 /// A game's move record, in either format.

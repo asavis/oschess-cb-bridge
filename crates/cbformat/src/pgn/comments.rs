@@ -1,11 +1,12 @@
 //! A game's annotations as PGN: comments, NAGs and `[%csl]` / `[%cal]`
-//! graphics, placed by position in the numbering of the game's format: PGN
-//! order for 2CBH, stored order for the classic format. The reading form
-//! writes one language and game quotations as ChessBase writes them; the full
-//! form (asavis/oschess-cb-bridge#42) writes every text as its own comment led
-//! by `[%lang]`, and every other annotation as a command (`commands.rs`).
-//! Both forms write the main line's evaluations as ChessBase does,
-//! `[%evp]`; the full form also writes each move's `[%eval]` and `[%emt]`.
+//! graphics, placed by position in the numbering of the format they were read
+//! from, their [`Source`]: PGN order for 2CBH, stored order for the classic
+//! format. The reading form writes one language and game quotations as
+//! ChessBase writes them; the full form (asavis/oschess-cb-bridge#42) writes
+//! every text as its own comment led by `[%lang]`, and every other annotation
+//! as a command (`commands.rs`). Both forms write the main line's evaluations
+//! as ChessBase does, `[%evp]`; the full form also writes each move's
+//! `[%eval]` and `[%emt]`.
 
 use std::collections::BTreeMap;
 
@@ -14,9 +15,8 @@ use super::commands;
 use super::san::{file_char, rank_char};
 use super::tree::{At, Notes};
 use crate::game::timing::{self, Score};
-use crate::game::{Annotation, GAME_POSITION, GameAnnotations, language};
+use crate::game::{Annotation, GAME_POSITION, GameAnnotations, PositionOrder, Source, language};
 use crate::movetable::Sq;
-use crate::view::PositionOrder;
 
 /// The annotations of one game, grouped by position, with the one language
 /// its texts are written in.
@@ -28,7 +28,9 @@ pub(super) struct Commentary<'a> {
     /// The main line's last move in stored order.
     last: Option<u32>,
     language: Option<u16>,
-    order: PositionOrder,
+    /// The format the annotations were read from: how their positions number
+    /// the moves and how their data is laid out.
+    source: Source,
     full: bool,
     /// For the full form: the type that ended decoding and the bytes after it.
     undecoded: Option<(u16, &'a [u8])>,
@@ -41,13 +43,8 @@ pub(super) struct Commentary<'a> {
 impl<'a> Commentary<'a> {
     /// The annotations of a game with `moves` moves, whose main line is the
     /// stored moves `main_line`.
-    pub(super) fn new(
-        annotations: &'a GameAnnotations,
-        order: PositionOrder,
-        options: &Options,
-        moves: u32,
-        main_line: &[u32],
-    ) -> Self {
+    pub(super) fn new(annotations: &'a GameAnnotations, options: &Options, moves: u32, main_line: &[u32]) -> Self {
+        let source = annotations.source;
         let last = main_line.last().copied();
         let mut by_position: BTreeMap<i32, Vec<&Annotation>> = BTreeMap::new();
         for b in &annotations.blocks {
@@ -76,7 +73,7 @@ impl<'a> Commentary<'a> {
         // Type 26 on the game: entry `k` is the position after the main
         // line's ply `k`, the first the start position.
         let evaluations = by_position.get(&GAME_POSITION).into_iter().flatten().find_map(|a| match a {
-            Annotation::Other { code: 0x26, data } => timing::evaluations(data, order == PositionOrder::Stored),
+            Annotation::Other { code: 0x26, data } => timing::evaluations(data, source == Source::Classic),
             _ => None,
         });
         let evp = evaluations.as_deref().and_then(commands::evp);
@@ -85,12 +82,12 @@ impl<'a> Commentary<'a> {
             .enumerate()
             .filter_map(|(k, &stored)| Some((stored, evaluations.as_ref()?.get(k + 1)?.score()?)))
             .collect();
-        Commentary { by_position, past_end, last, language, order, full: options.full, undecoded, evp, scores }
+        Commentary { by_position, past_end, last, language, source, full: options.full, undecoded, evp, scores }
     }
 
     /// The annotations at the move `at`, in this game's numbering.
     fn at(&self, at: At) -> Option<&Vec<&'a Annotation>> {
-        let position = match self.order {
+        let position = match self.source.position_order() {
             PositionOrder::Pgn => at.pgn,
             PositionOrder::Stored => at.stored,
         };
@@ -125,7 +122,7 @@ impl<'a> Commentary<'a> {
     /// evaluation (type 21), else the main line's (type 26), and its own time
     /// spent (type 07).
     fn timing(&self, at: At, own: &[&Annotation]) -> Vec<String> {
-        let classic = self.order == PositionOrder::Stored;
+        let classic = self.source == Source::Classic;
         let own_score = own.iter().find_map(|a| match a {
             Annotation::Other { code: 0x21, data } => timing::engine_evaluation(data, classic),
             _ => None,
@@ -166,7 +163,7 @@ impl<'a> Commentary<'a> {
     fn commands(&self, anns: &[&Annotation]) -> Vec<String> {
         anns.iter()
             .filter_map(|a| match a {
-                Annotation::Other { code, data } => Some(commands::for_other(*code, data, self.order)),
+                Annotation::Other { code, data } => Some(commands::for_other(*code, data, self.source)),
                 a => commands::graphic(a),
             })
             .collect()
@@ -176,7 +173,7 @@ impl<'a> Commentary<'a> {
     fn medals(&self, anns: &[&Annotation]) -> Vec<String> {
         anns.iter()
             .filter_map(|a| match a {
-                Annotation::Other { code, data } => commands::medal(*code, data, self.order),
+                Annotation::Other { code, data } => commands::medal(*code, data, self.source),
                 _ => None,
             })
             .collect()
@@ -184,7 +181,7 @@ impl<'a> Commentary<'a> {
 
     /// The reading form's game quotations, as ChessBase writes them.
     fn quotes(&self, anns: &[&Annotation]) -> Vec<String> {
-        anns.iter().filter_map(|a| commands::quotation_text(a, self.order)).map(|q| clean(&q)).collect()
+        anns.iter().filter_map(|a| commands::quotation_text(a, self.source)).map(|q| clean(&q)).collect()
     }
 
     fn texts(&self, anns: &[&Annotation], before: bool) -> Option<String> {

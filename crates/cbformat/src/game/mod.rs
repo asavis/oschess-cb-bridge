@@ -12,10 +12,11 @@ mod start;
 
 pub(crate) use annotations::decode_text as annotations_text;
 pub use annotations::{
-    Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Quotation, QuotedPlayer, Square, Unknown, language,
-    timing,
+    Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, PositionOrder, Quotation, QuotedPlayer, Source, Square,
+    Unknown, language, timing,
 };
-pub use entities::{Player, Tournament};
+pub(crate) use annotations::{QuoteDamage, quote_offsets};
+pub use entities::{Names, Player, Tournament};
 pub use fields::{Date, Eco, GameResult, ROUND_TEXT_BYTES, RecordKind, round_text};
 pub use head::Head;
 pub use start::{Setup, Start};

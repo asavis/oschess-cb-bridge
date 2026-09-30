@@ -5,9 +5,8 @@
 use chesscore::{Board, Move, Piece, Square};
 
 use crate::game::timing::{self, Evaluation, Score};
-use crate::game::{Annotation, Arrow, Quotation, language};
+use crate::game::{Annotation, Arrow, Quotation, Source, language};
 use crate::movetable::Sq;
-use crate::view::PositionOrder;
 
 /// The `[%lang]` code of a ChessBase language number: ISO 639-1 where there is
 /// one, `any` for a text meant for every language, `cb-<nation>` for a classic
@@ -65,24 +64,22 @@ pub(super) fn base64url(data: &[u8]) -> String {
     out
 }
 
-/// The command for an annotation the reading form leaves out, in the
-/// numbering of `order`'s format: its decoded fields where they are known,
-/// and always its data, so that nothing is lost.
-pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String {
+/// The command for an annotation the reading form leaves out, its data laid
+/// out as its `source` format stores it: its decoded fields where they are
+/// known, and always its data, so that nothing is lost.
+pub(super) fn for_other(code: u16, data: &[u8], source: Source) -> String {
     let raw = base64url(data);
-    let classic = order == PositionOrder::Stored;
     let quote = match code {
-        0x13 if classic => Quotation::parse_classic(data),
-        0x13 => Quotation::parse_2cbh(data),
+        0x13 => parse_quotation(data, source),
         _ => None,
     };
     if let Some(q) = quote {
         return quotation(&q, raw);
     }
-    if let Some(m) = medal(code, data, order) {
+    if let Some(m) = medal(code, data, source) {
         return m;
     }
-    if classic {
+    if source == Source::Classic {
         return command("raw", &[("type", format!("{code:02x}")), ("data", raw)]);
     }
     let byte = |i: usize| data.get(i).copied().unwrap_or_default();
@@ -149,6 +146,14 @@ pub(super) fn for_other(code: u16, data: &[u8], order: PositionOrder) -> String 
             )
         }
         _ => command("raw", &[("type", format!("{code:02x}")), ("data", raw)]),
+    }
+}
+
+/// A game quotation's data, decoded in the layout of its `source` format.
+fn parse_quotation(data: &[u8], source: Source) -> Option<Quotation> {
+    match source {
+        Source::TwoCbh => Quotation::parse_2cbh(data),
+        Source::Classic => Quotation::parse_classic(data),
     }
 }
 
@@ -229,23 +234,19 @@ fn castle_to(board: &Board, mv: Move) -> Option<Square> {
 
 /// The reading form's text of a game quotation, as ChessBase's own PGN writes
 /// it, or `None` for another annotation or a quotation not understood.
-pub(super) fn quotation_text(a: &Annotation, order: PositionOrder) -> Option<String> {
+pub(super) fn quotation_text(a: &Annotation, source: Source) -> Option<String> {
     let Annotation::Other { code: 0x13, data } = a else { return None };
-    let q = match order {
-        PositionOrder::Stored => Quotation::parse_classic(data),
-        PositionOrder::Pgn => Quotation::parse_2cbh(data),
-    }?;
-    Some(q.chessbase_text())
+    Some(parse_quotation(data, source)?.chessbase_text())
 }
 
 /// Medals (type `22`) as ChessBase's own PGN writes them, `[%mdl <bits>]`:
 /// the `int` of medal bits, little-endian in 2CBH and big-endian in the
 /// classic format. Both forms write it; it holds the whole annotation.
-pub(super) fn medal(code: u16, data: &[u8], order: PositionOrder) -> Option<String> {
+pub(super) fn medal(code: u16, data: &[u8], source: Source) -> Option<String> {
     let b: [u8; 4] = data.try_into().ok().filter(|_| code == 0x22)?;
-    let bits = match order {
-        PositionOrder::Pgn => u32::from_le_bytes(b),
-        PositionOrder::Stored => u32::from_be_bytes(b),
+    let bits = match source {
+        Source::TwoCbh => u32::from_le_bytes(b),
+        Source::Classic => u32::from_be_bytes(b),
     };
     Some(format!("[%mdl {bits}]"))
 }

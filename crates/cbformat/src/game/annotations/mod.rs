@@ -11,6 +11,7 @@ mod quote;
 pub mod timing;
 
 pub use quote::{Quotation, QuotedPlayer};
+pub(crate) use quote::{QuoteDamage, quote_offsets};
 
 /// The position of annotations that belong to the game as a whole.
 pub const GAME_POSITION: i32 = -1;
@@ -25,12 +26,49 @@ pub struct GameAnnotations {
     /// The record's bytes after the type code of [`Self::stopped_at`], which
     /// could not be decoded; empty when decoding reached the end.
     pub undecoded: Vec<u8>,
+    /// The format the record was read from, which each format's reader sets
+    /// and the PGN writer follows. 2CBH by default.
+    pub source: Source,
+}
+
+/// The format an annotation record was read from. It says how the positions
+/// number the moves, and how the data of an [`Annotation::Other`] is laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Source {
+    /// `.2cba`: positions in PGN order, integers little-endian.
+    #[default]
+    TwoCbh,
+    /// The classic `.cba`: positions in stored order, integers big-endian,
+    /// and layouts of its own.
+    Classic,
+}
+
+impl Source {
+    /// How a record of this format numbers the moves its positions name.
+    pub fn position_order(self) -> PositionOrder {
+        match self {
+            Source::TwoCbh => PositionOrder::Pgn,
+            Source::Classic => PositionOrder::Stored,
+        }
+    }
+}
+
+/// How a format numbers the moves annotations are on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionOrder {
+    /// In PGN order: each alternative and everything after it right after the
+    /// move it replaces. 2CBH numbers them so.
+    Pgn,
+    /// In stored order: depth first, the main line first at every position.
+    /// The classic format numbers them so.
+    Stored,
 }
 
 /// The annotations attached to one position. Their order is meaningful.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
-    /// −1 for the game, else a move counted from 0 in PGN order.
+    /// −1 for the game, else a move counted from 0 in the order of the
+    /// record's [`Source::position_order`].
     pub position: i32,
     pub annotations: Vec<Annotation>,
 }
@@ -60,7 +98,8 @@ pub enum Annotation {
     Squares(Vec<Square>),
     Arrows(Vec<Arrow>),
     /// A type of known layout that the reading form of the PGN leaves out:
-    /// its type code and its data, the bytes after the type as stored.
+    /// its type code and its data, the bytes after the type as stored in the
+    /// record's [`Source`] format.
     Other {
         code: u16,
         data: Vec<u8>,

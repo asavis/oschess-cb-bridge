@@ -7,11 +7,11 @@
 //! Integers are big-endian.
 //!
 //! Positions count the moves in stored order (depth first, the main line
-//! first at every position), not in the PGN order 2CBH uses; the PGN writer
-//! places them by that order.
+//! first at every position), not in the PGN order 2CBH uses; the annotations
+//! say so by their [`Source`], which the PGN writer places them by.
 
 use super::bytes::{be_u16, be_u24, be_u32};
-use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Square, language};
+use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Source, Square, language};
 use crate::movetable::{Sq, from_cb_square};
 use crate::{Error, Result};
 
@@ -46,7 +46,7 @@ pub fn parse(record: &[u8], id: u32) -> Result<GameAnnotations> {
     if record_size(record) != record.len() {
         return Err(bad(0x0a, "size disagrees with the record"));
     }
-    let mut out = GameAnnotations::default();
+    let mut out = GameAnnotations { source: Source::Classic, ..GameAnnotations::default() };
     let mut count = 0u32;
     let mut i = HEAD;
     while i < record.len() {

@@ -12,7 +12,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use crate::file::{self, DbFile};
-use crate::game::GameAnnotations;
+use crate::game::{GameAnnotations, Names, Source};
 use crate::recordfile::{RecordFile, Run, over_limit, span};
 use crate::{Error, Result};
 
@@ -135,6 +135,16 @@ impl Database {
         &self.entities
     }
 
+    /// The players and the tournament game `record` names, which its PGN tags
+    /// hold: the one lookup of them that the PGN writer and
+    /// [`crate::view::Base::names`] share. The annotator, which the tags do
+    /// not hold, is left `None`.
+    pub(crate) fn tag_names(&self, record: &Record) -> Result<Names> {
+        let e = &self.entities;
+        let tournament = e.tournament(record.tournament())?;
+        Ok(Names { white: e.player(record.white())?, black: e.player(record.black())?, tournament, annotator: None })
+    }
+
     /// The record for 1-based game id `id`.
     pub fn record(&self, id: u32) -> Result<Record> {
         Ok(Record { id, b: self.headers.record(id)? })
@@ -207,7 +217,7 @@ impl Database {
         let Some(file) = &self.annotations else { return Ok(None) };
         let at = self.offsets(record)?.1;
         if at == 0 {
-            return Ok(Some(GameAnnotations::default()));
+            return Ok(Some(GameAnnotations { source: Source::Classic, ..GameAnnotations::default() }));
         }
         let bad = |what: &str| Error::Format(format!("annotation record at {at:#x}: {what}"));
         let file_len = file.len()?;

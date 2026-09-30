@@ -2,9 +2,7 @@
 
 use super::{Options, Rendered, Tags, finish, write_tree};
 use crate::cbh::{self, Database, GameMoves, Record};
-use crate::game::{GameAnnotations, Player, RecordKind, Start};
-use crate::replay::start_board;
-use crate::view::PositionOrder;
+use crate::game::{GameAnnotations, RecordKind};
 use crate::{Error, Limits, Result};
 
 /// A classic game as PGN, as [`super::game`] writes a 2CBH one, within the
@@ -40,23 +38,10 @@ pub fn classic_game_from(
     if r.kind() != RecordKind::Game {
         return Err(Error::Format(format!("record {} is not a game", r.id())));
     }
-    let e = db.entities();
-    let name = |pid| -> Result<Option<Player>> { e.player(pid) };
     // The position the moves are played from: a set-up game gets the castling
     // rights its castling moves use, so that the PGN replays.
     let start = cbh::start_as_played(moves)?;
-    let tags = Tags {
-        tournament: e.tournament(r.tournament())?,
-        date: r.played_date(),
-        round: (i32::from(r.round()), i32::from(r.subround())),
-        white: name(r.white())?,
-        black: name(r.black())?,
-        result: r.result(),
-        elo: (i32::from(r.white_elo()), i32::from(r.black_elo())),
-        eco: r.eco(),
-        start: (start != Start::Standard).then(|| start_board(&start)).transpose()?,
-        chess960: moves.is_chess960(),
-    };
-    let text = write_tree(|tree| cbh::walk_from(moves, &start, tree), annotations, PositionOrder::Stored, options)?;
+    let tags = Tags::new(r, db.tag_names(r)?, &start, moves.is_chess960())?;
+    let text = write_tree(|tree| cbh::walk_from(moves, &start, tree), annotations, options)?;
     Ok(finish(&tags, &text, annotations))
 }

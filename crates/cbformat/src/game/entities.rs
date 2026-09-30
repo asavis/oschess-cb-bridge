@@ -1,4 +1,5 @@
-//! A game's players and its tournament, as both formats name them.
+//! A game's players and its tournament, as both formats name them, and all
+//! the entities a game names together.
 
 use super::Date;
 
@@ -19,4 +20,13 @@ pub struct Tournament {
     pub title: String,
     pub place: String,
     pub start: Date,
+}
+
+/// The entities a game names; `None` for an unused or unreadable entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    pub white: Option<Player>,
+    pub black: Option<Player>,
+    pub tournament: Option<Tournament>,
+    pub annotator: Option<String>,
 }

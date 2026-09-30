@@ -7,7 +7,7 @@
 //! decoded before it is kept and the record is marked incomplete.
 
 use crate::game::annotations_text as decode_text;
-use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Square, Unknown};
+use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Source, Square, Unknown};
 use crate::{Error, Result};
 
 mod layout;
@@ -29,7 +29,7 @@ impl GameAnnotations {
     /// is checked against the game by [`Self::check_positions`].
     pub fn parse(content: &[u8]) -> Result<Self> {
         let mut r = Reader { b: content, i: 0 };
-        let mut out = GameAnnotations::default();
+        let mut out = GameAnnotations { source: Source::TwoCbh, ..GameAnnotations::default() };
         loop {
             let position = r.i32()?;
             if position == END_MARKER {
@@ -77,10 +77,18 @@ pub(super) struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     pub(super) fn bad(&self, what: &str) -> Error {
-        Error::Format(format!("annotations at byte {}: {what}", self.i))
+        self.bad_ahead(0, what)
+    }
+    /// [`Reader::bad`] at `n` bytes past the current one.
+    pub(super) fn bad_ahead(&self, n: usize, what: &str) -> Error {
+        Error::Format(format!("annotations at byte {}: {what}", self.i.saturating_add(n)))
     }
     pub(super) fn left(&self) -> usize {
         self.b.len() - self.i
+    }
+    /// The bytes from here to the end of the record.
+    pub(super) fn rest(&self) -> &'a [u8] {
+        self.b.get(self.i..).unwrap_or_default()
     }
     pub(super) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if n > self.left() {

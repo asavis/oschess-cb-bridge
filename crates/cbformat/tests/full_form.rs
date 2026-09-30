@@ -9,7 +9,7 @@ use cbformat::fixture::{
     unpercent,
 };
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
-use cbformat::game::{Date, GameAnnotations, Quotation, Unknown, language};
+use cbformat::game::{Annotation, Date, GameAnnotations, Quotation, Unknown, language};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, AnnotationStatus, Options};
 use cbformat::v2::{Database, GameMoves};
@@ -295,6 +295,47 @@ fn quotations_keep_what_is_not_decoded() {
         Some(&annotations(&[(0, vec![other(0x13, &[1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 3, b'a', b'b'])])])),
     );
     assert!(Database::open(db.base()).is_ok());
+}
+
+/// One walk of the quotation layout serves the `.2cba` reader and
+/// [`Quotation::parse_2cbh`]: whatever byte of a quotation is changed, one the
+/// reader keeps is one the parser decodes, and one cut short, even of only its
+/// last bytes, is neither.
+#[test]
+fn the_reader_keeps_only_quotations_the_parser_decodes() {
+    let quote = quote_2cbh(&Spec { moves: &[[sq("e2"), sq("e4")]], ..Spec::default() });
+    let record = |q: &[u8]| annotations(&[(0, vec![other(0x13, q), text(false, language::ENGLISH, "next")])]);
+    let a = GameAnnotations::parse(&record(&quote)).unwrap();
+    let [Annotation::Other { code: 0x13, data }, Annotation::Text { .. }] = &a.blocks[0].annotations[..] else {
+        panic!("{a:?}")
+    };
+    assert_eq!(*data, quote);
+    // The quotations a record's reader keeps.
+    let kept = |content: &[u8]| -> Vec<Vec<u8>> {
+        let Ok(a) = GameAnnotations::parse(content) else { return Vec::new() };
+        let all = a.blocks.into_iter().flat_map(|b| b.annotations);
+        all.filter_map(|a| match a {
+            Annotation::Other { code: 0x13, data } => Some(data),
+            _ => None,
+        })
+        .collect()
+    };
+    let mut decoded = 0;
+    for i in 0..quote.len() {
+        for v in [0, 1, 2, 0x7f, 0xff, quote[i] ^ 1] {
+            let mut q = quote.clone();
+            q[i] = v;
+            for data in kept(&record(&q)) {
+                assert!(Quotation::parse_2cbh(&data).is_some(), "byte {i} set to {v}");
+                decoded += 1;
+            }
+        }
+        // Cut short, the record ends in the quotation: an error, or a start
+        // of unknown meaning read from the end marker.
+        assert_eq!(Quotation::parse_2cbh(&quote[..i]), None, "cut at {i}");
+        assert!(kept(&annotations(&[(0, vec![other(0x13, &quote[..i])])])).is_empty(), "cut at {i}");
+    }
+    assert!(decoded > quote.len(), "{decoded}");
 }
 
 #[test]
