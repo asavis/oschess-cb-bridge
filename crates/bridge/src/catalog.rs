@@ -1,7 +1,7 @@
 //! The databases the bridge serves: identity, state, and the open database,
 //! opened again whenever the files change (`docs/api.md`, "Database identity
-//! and generations"). An open database holds no handle to its files while
-//! nothing reads them (`cbformat::file`, #241), so ChessBase can save into it.
+//! and generations"). On Windows, an open database holds no handle to its
+//! files between reads (`cbformat::file`, #241), so ChessBase can save into it.
 //! The list follows its sources (`crate::sources`) and is read again when
 //! they change.
 

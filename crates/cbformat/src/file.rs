@@ -1,13 +1,20 @@
-//! Database files read at positions, never mapped, and never held open while
-//! nothing reads them (#241). A program that writes a database, as ChessBase
-//! does when it saves a game, opens its files so that no other handle may
-//! exist, whatever that handle shares; a reader that kept its handles would
-//! make every save fail. So a file opens its handles when a read needs one,
-//! and a thread of this module closes them once the file has not been read
-//! for [`IDLE`]: a scan keeps its handles, an idle database holds none. A
-//! read that meets a file another program holds fails at once, never waiting
-//! for it with the handles of the database's other files open, which that
-//! program may need next.
+//! Database files read at positions, never mapped, and on Windows never held
+//! open between reads (#241). ChessBase opens the files of a database it
+//! saves so that no other handle may exist, whatever that handle shares; a
+//! reader that kept its handles would make every save fail. So a file opens
+//! its handles when a read needs one, and a thread of this module closes them
+//! once the file has not been read for [`IDLE`]: a scan keeps its handles, an
+//! idle database holds none. A read that meets a file another program holds
+//! fails at once, never waiting for it with the handles of the database's
+//! other files open, which that program may need next.
+//!
+//! A handle opened again at a file's path must be the file the database was
+//! opened on, which only an identity that no other file takes, then or
+//! later, can tell: the volume and 128-bit file id of NTFS and ReFS. Where a
+//! file has none, as an inode, which passes to another file once the last
+//! handle of the old one closes, or a FAT directory slot, the file keeps a
+//! handle for as long as it is open, as every file did before #241, and is
+//! never opened again at its path. ChessBase runs on Windows only.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -33,11 +40,29 @@ pub struct DbFile {
 
 struct Inner {
     path: Box<Path>,
-    /// The file the database was opened on: a handle opened again at `path`
-    /// must be this one.
-    identity: Identity,
+    source: Source,
     handles: Mutex<Handles>,
 }
+
+/// Where a reader that finds no spare handle gets one.
+enum Source {
+    /// The path, for a file whose identity no other file takes: a handle
+    /// opened there must have `identity`, as `identify` reads it. Between
+    /// reads, such a file holds no handle.
+    Path { identity: Identity, identify: Identify },
+    /// A handle kept for as long as the file is open, which each reader opens
+    /// again on Windows and the readers share elsewhere: for a file without
+    /// such an identity.
+    Kept(Arc<File>),
+}
+
+/// Reads the identity of the file a handle has open, when it has one that no
+/// other file takes, then or later.
+type Identify = fn(&File) -> std::io::Result<Option<Identity>>;
+
+/// Which file a handle has open: its volume and file id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity(u64, u128);
 
 /// The handles of a file that no read uses now, and when it was last read.
 struct Handles {
@@ -53,14 +78,25 @@ struct Handles {
 
 impl DbFile {
     pub fn open(path: PathBuf) -> Result<DbFile> {
+        DbFile::open_with(path, lasting_identity)
+    }
+
+    /// [`DbFile::open`], reading the file's identity with `identify`.
+    fn open_with(path: PathBuf, identify: Identify) -> Result<DbFile> {
         let file = File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
-        let identity = identity(&file).map_err(|e| Error::Io(path.clone(), e))?;
+        let identity = identify(&file).map_err(|e| Error::Io(path.clone(), e))?;
+        let (source, first) = match identity {
+            Some(identity) => (Source::Path { identity, identify }, Some(file)),
+            None => (Source::Kept(Arc::new(file)), None),
+        };
         let inner = Arc::new(Inner {
             path: path.into_boxed_path(),
-            identity,
+            source,
             handles: Mutex::new(Handles { spare: Vec::new(), last_read: Instant::now(), watched: false }),
         });
-        inner.give(Arc::new(file));
+        if let Some(file) = first {
+            inner.give(Arc::new(file));
+        }
         Ok(DbFile { inner })
     }
 
@@ -86,9 +122,9 @@ impl DbFile {
             .map_err(|e| Error::Io(self.inner.path.to_path_buf(), e))
     }
 
-    /// Calls `read` with a handle of the file, opened again at its path when
-    /// the file holds none that a reader may take, and leaves the handle for
-    /// the next reads.
+    /// Calls `read` with a handle of the file, opened again when the file
+    /// holds none that a reader may take, and leaves the handle for the next
+    /// reads.
     fn with_handle<T>(&self, read: impl FnOnce(&File) -> std::io::Result<T>) -> std::io::Result<T> {
         let handle = self.inner.take()?;
         let result = read(&handle);
@@ -111,8 +147,9 @@ impl DbFile {
 }
 
 impl Inner {
-    /// A handle for one read: a spare one, or one opened again at the path,
-    /// which must still name the file the database was opened on.
+    /// A handle for one read: a spare one, else one opened again, at the path
+    /// when it must still name the file the database was opened on, else from
+    /// the kept handle.
     fn take(&self) -> std::io::Result<Arc<File>> {
         let spare = {
             let mut handles = lock(&self.handles);
@@ -121,23 +158,39 @@ impl Inner {
         if let Some(handle) = spare {
             return Ok(handle);
         }
-        let file = File::open(&self.path)?;
-        if identity(&file)? != self.identity {
-            return Err(std::io::Error::other("the file was replaced since the database was opened"));
+        match &self.source {
+            Source::Path { identity, identify } => {
+                let file = File::open(&self.path)?;
+                if identify(&file)?.as_ref() != Some(identity) {
+                    return Err(std::io::Error::other("the file was replaced since the database was opened"));
+                }
+                Ok(Arc::new(file))
+            }
+            // A handle of its own when one opens, else the kept one, which
+            // reads one read at a time.
+            #[cfg(windows)]
+            Source::Kept(kept) => Ok(reopen(kept).map_or_else(|_| Arc::clone(kept), Arc::new)),
+            #[cfg(not(windows))]
+            Source::Kept(kept) => Ok(Arc::clone(kept)),
         }
-        Ok(Arc::new(file))
     }
 
     /// Leaves `handle` for the next reads, and has the closer close it once
-    /// the file is idle; without a closer the handle closes now.
+    /// the file is idle; without a closer the handle closes now. Elsewhere
+    /// than on Windows, a kept handle stays with the file, and readers leave
+    /// nothing.
     fn give(self: &Arc<Self>, handle: Arc<File>) {
-        if !closer_runs() {
+        let room = match self.source {
+            _ if cfg!(windows) => SPARE_HANDLES,
+            Source::Path { .. } => 1,
+            Source::Kept(_) => 0,
+        };
+        if room == 0 || !closer_runs() {
             return;
         }
         let watch = {
             let mut handles = lock(&self.handles);
             handles.last_read = Instant::now();
-            let room = if cfg!(windows) { SPARE_HANDLES } else { 1 };
             if handles.spare.len() < room {
                 handles.spare.push(handle);
             }
@@ -198,34 +251,85 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Which file a handle has open: its volume and file index on Windows, its
-/// device and inode elsewhere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Identity(u64, u64);
-
-#[cfg(unix)]
-fn identity(file: &File) -> std::io::Result<Identity> {
-    use std::os::unix::fs::MetadataExt;
-    let m = file.metadata()?;
-    Ok(Identity(m.dev(), m.ino()))
-}
-
+/// The volume and 128-bit id of the file `file` has open, on NTFS and ReFS,
+/// whose ids no other file of the volume takes; `None` on another file system
+/// or when the file system gives no id. FAT, for one, numbers a file by its
+/// directory slot, which a file made in its place takes over.
 #[cfg(windows)]
-fn identity(file: &File) -> std::io::Result<Identity> {
+fn lasting_identity(file: &File) -> std::io::Result<Option<Identity>> {
     use std::os::windows::io::{AsRawHandle, RawHandle};
+    /// FILE_ID_INFO.
+    #[repr(C)]
+    struct FileIdInfo {
+        volume: u64,
+        id: [u8; 16],
+    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetFileInformationByHandle(file: RawHandle, information: *mut [u32; 13]) -> i32;
+        fn GetVolumeInformationByHandleW(
+            file: RawHandle,
+            volume_name: *mut u16,
+            volume_name_size: u32,
+            serial: *mut u32,
+            component_length: *mut u32,
+            flags: *mut u32,
+            file_system_name: *mut u16,
+            file_system_name_size: u32,
+        ) -> i32;
+        fn GetFileInformationByHandleEx(file: RawHandle, class: i32, information: *mut FileIdInfo, size: u32) -> i32;
     }
-    // BY_HANDLE_FILE_INFORMATION: thirteen 32-bit words, of which the 8th is
-    // the volume's serial number and the 12th and 13th the file index.
-    let mut information = [0u32; 13];
-    // SAFETY: `file` holds its handle open for the whole call, and the
-    // buffer has the size and alignment of the structure the call fills.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
-        return Err(std::io::Error::last_os_error());
+    /// FILE_INFO_BY_HANDLE_CLASS's FileIdInfo.
+    const FILE_ID_INFO: i32 = 18;
+    // MAX_PATH + 1, the most the call writes.
+    let mut name = [0u16; 261];
+    let null = std::ptr::null_mut();
+    // SAFETY: `file` holds its handle open for the whole call, the name
+    // buffer is as long as its size says, and the call may leave out every
+    // other part of the answer, given as null.
+    let named = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            null,
+            0,
+            null.cast(),
+            null.cast(),
+            null.cast(),
+            name.as_mut_ptr(),
+            261,
+        )
+    };
+    if named == 0 {
+        return Ok(None);
     }
-    Ok(Identity(u64::from(information[7]), u64::from(information[11]) << 32 | u64::from(information[12])))
+    let name = String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]);
+    if !name.eq_ignore_ascii_case("NTFS") && !name.eq_ignore_ascii_case("ReFS") {
+        return Ok(None);
+    }
+    let mut info = FileIdInfo { volume: 0, id: [0; 16] };
+    // SAFETY: as above, and `info` has the size and layout of the
+    // structure the call fills.
+    let filled = unsafe {
+        GetFileInformationByHandleEx(file.as_raw_handle(), FILE_ID_INFO, &mut info, size_of::<FileIdInfo>() as u32)
+    };
+    if filled == 0 || !names_a_file(&info.id) {
+        return Ok(None);
+    }
+    Ok(Some(Identity(info.volume, u128::from_le_bytes(info.id))))
+}
+
+/// Whether a 128-bit file id names a file: a file system without ids gives
+/// all zeros or all ones, in 64 bits or 128.
+#[cfg(windows)]
+fn names_a_file(id: &[u8; 16]) -> bool {
+    let unset = |half: &[u8]| half.iter().all(|&b| b == 0) || half.iter().all(|&b| b == 0xff);
+    !(unset(&id[..8]) && unset(&id[8..]))
+}
+
+/// `None`: an inode passes to another file once the last handle of the old
+/// one closes, so a file here keeps a handle for as long as it is open.
+#[cfg(not(windows))]
+fn lasting_identity(_: &File) -> std::io::Result<Option<Identity>> {
+    Ok(None)
 }
 
 /// The stem of the database `path` names: `path` without its extension when
@@ -272,6 +376,30 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::R
     Ok(())
 }
 
+/// A new handle, for reading, of the file `file` has open: the same file even
+/// when its path has since come to name another.
+#[cfg(windows)]
+fn reopen(file: &File) -> std::io::Result<File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReOpenFile(original: RawHandle, access: u32, share: u32, flags: u32) -> RawHandle;
+    }
+    const GENERIC_READ: u32 = 0x8000_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, as `File::open`
+    // shares a file.
+    const SHARE_ALL: u32 = 0x7;
+    // SAFETY: `file` holds its handle open for the whole call, and no flags
+    // are asked for, so the new handle reads synchronously as `file`'s does.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, SHARE_ALL, 0) };
+    if handle as isize == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the handle was just opened, and the file made from it is its
+    // only owner.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +408,30 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cbformat-file-{}-{name}", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// The device and inode of the file a handle has open: an identity no
+    /// other file takes while some handle of the file stays open, as in the
+    /// tests that open a file again at its path on Linux, which rename the
+    /// file they replace and so keep it.
+    #[cfg(unix)]
+    fn inode(file: &File) -> std::io::Result<Option<Identity>> {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        Ok(Some(Identity(m.dev(), u128::from(m.ino()))))
+    }
+
+    /// `path` opened as a file with a lasting identity, which holds no handle
+    /// between reads: every file on Windows, where the test folder is on
+    /// NTFS; on Linux, by [`inode`].
+    fn open_by_path(path: &Path) -> DbFile {
+        #[cfg(windows)]
+        let identify: Identify = lasting_identity;
+        #[cfg(unix)]
+        let identify: Identify = inode;
+        let f = DbFile::open_with(path.to_path_buf(), identify).unwrap();
+        assert!(matches!(f.inner.source, Source::Path { .. }), "the file has no lasting identity");
+        f
     }
 
     /// Closes `f`'s handles as the closer does once the file has been idle.
@@ -293,7 +445,7 @@ mod tests {
     #[test]
     fn an_idle_file_holds_no_handle_and_opens_one_again_to_read() {
         let path = temp("idle", b"0123456789");
-        let f = DbFile::open(path.clone()).unwrap();
+        let f = open_by_path(&path);
         let mut buf = [0u8; 4];
         f.read_into(3, &mut buf).unwrap();
         assert_eq!(f.spare_handles(), 1, "the read left its handle");
@@ -313,7 +465,7 @@ mod tests {
     #[test]
     fn the_closer_closes_the_handles_of_an_idle_file() {
         let path = temp("closer", b"0123456789");
-        let f = DbFile::open(path.clone()).unwrap();
+        let f = open_by_path(&path);
         f.read_into(0, &mut [0u8; 10]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(300);
         while f.spare_handles() > 0 {
@@ -331,7 +483,7 @@ mod tests {
     fn a_file_replaced_at_its_path_is_never_read_as_the_open_one() {
         let path = temp("renamed", b"first");
         let moved = path.with_extension("moved");
-        let f = DbFile::open(path.clone()).unwrap();
+        let f = open_by_path(&path);
         std::fs::rename(&path, &moved).unwrap();
         std::fs::write(&path, b"other").unwrap();
         let mut buf = [0u8; 5];
@@ -348,6 +500,32 @@ mod tests {
         std::fs::remove_file(&moved).unwrap();
     }
 
+    /// Where a file has no lasting identity, it keeps its handle and reads the
+    /// file it was opened on, whatever comes to its path: a file made in its
+    /// place, even one that took its inode, or a FIFO, which a reader opening
+    /// the path would wait on for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_a_lasting_identity_keeps_its_handle_and_its_file() {
+        let path = temp("kept", b"first");
+        let f = DbFile::open(path.clone()).unwrap();
+        assert!(matches!(f.inner.source, Source::Kept(_)));
+        let mut buf = [0u8; 5];
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"other").unwrap();
+        f.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"first");
+        std::fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
+        assert!(made.success());
+        f.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"first");
+        assert_eq!(f.size().unwrap(), 5);
+        assert_eq!(f.spare_handles(), 0, "readers share the kept handle");
+        drop(f);
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// Readers at the same time read what the file holds, each through a
     /// handle of its own, and leave the handles for the next reads.
     #[cfg(windows)]
@@ -355,7 +533,7 @@ mod tests {
     fn readers_at_the_same_time_read_through_handles_of_their_own() {
         let bytes: Vec<u8> = (0..1u32 << 20).map(|i| (i * 7 % 251) as u8).collect();
         let path = temp("readers", &bytes);
-        let f = DbFile::open(path.clone()).unwrap();
+        let f = open_by_path(&path);
         let most = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
             for t in 0..8u64 {
@@ -392,7 +570,7 @@ mod tests {
     #[test]
     fn an_idle_file_lets_a_writer_open_it_alone() {
         let path = temp("alone", b"0123456789");
-        let f = DbFile::open(path.clone()).unwrap();
+        let f = open_by_path(&path);
         f.with_handle(|_| {
             assert!(!opens_alone(&path), "a read holds a handle");
             Ok(())
@@ -416,5 +594,23 @@ mod tests {
         drop(holder);
         assert!(DbFile::open(path.clone()).is_ok());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The ids a file system without ids gives name no file.
+    #[cfg(windows)]
+    #[test]
+    fn unset_file_ids_name_no_file() {
+        let id = |low: u64, high: u64| {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&low.to_le_bytes());
+            id[8..].copy_from_slice(&high.to_le_bytes());
+            id
+        };
+        for unset in [id(0, 0), id(u64::MAX, 0), id(u64::MAX, u64::MAX), id(0, u64::MAX)] {
+            assert!(!names_a_file(&unset), "{unset:?}");
+        }
+        for set in [id(0x0005_0000_0000_1234, 0), id(1, 0), id(0, 1), id(u64::MAX, 1)] {
+            assert!(names_a_file(&set), "{set:?}");
+        }
     }
 }
