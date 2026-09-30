@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
-use crate::search::workers::threads;
+use crate::search::workers::{Worker, threads};
 
 use super::deep;
 use super::file::{Bad, write_at};
@@ -173,6 +173,12 @@ pub(super) struct Counted {
     _folded: Hold,
 }
 
+/// Games of a batch between two looks at foreground work (#149). A batch
+/// of the stream pass runs for milliseconds on every worker, which a cold
+/// search starting meanwhile would otherwise share whole; within it a
+/// background build gives way every so many games as well.
+const GIVE_WAY_EVERY: u32 = 256;
+
 /// The stream pass: reads records `plan.first..=plan.last` on at most half
 /// the shared workers, so that searches keep the rest, a block of the stream
 /// at a time, and writes each game's line to `writer`; counts what each line
@@ -181,12 +187,6 @@ pub(super) struct Counted {
 /// games from the standard start reach first within [`tree::SHALLOW_PLY`]
 /// plies, unless they do not fold into the room a worker has for them, when
 /// the tree's passes collect them as they do the others.
-/// Games of a batch between two looks at foreground work (#149). A batch
-/// of the stream pass runs for milliseconds on every worker, which a cold
-/// search starting meanwhile would otherwise share whole; within it a
-/// background build gives way every so many games as well.
-const GIVE_WAY_EVERY: u32 = 256;
-
 fn read_games(
     source: &dyn Source,
     plan: &Plan,
@@ -233,7 +233,93 @@ fn read_games(
     // Set once a worker's folded entries no longer fit its room, or when it
     // has none.
     let unfolded = AtomicBool::new(false);
-    let found = on_workers(want, progress, limits, |w| {
+    let pass = StreamPass {
+        source,
+        plan,
+        writer,
+        part_bits,
+        bits,
+        parts,
+        blocks,
+        batches,
+        next: &next,
+        reading,
+        room,
+        unfolded: &unfolded,
+        progress,
+    };
+    let found = on_workers(want, progress, limits, |w| pass.read(w))?;
+    let mut folded = Vec::new();
+    folded.try_reserve_exact(found.len()).map_err(|_| Refused::Busy)?;
+    for (entries, shallow_entries, postings, shallow) in found {
+        for (all, one) in counted.entries.iter_mut().zip(entries) {
+            *all += one;
+        }
+        for (all, one) in counted.shallow.iter_mut().zip(shallow_entries) {
+            *all += one;
+        }
+        for (all, one) in counted.postings.iter_mut().zip(postings) {
+            *all += one;
+        }
+        folded.push(shallow);
+    }
+    let merged = if unfolded.load(Ordering::Relaxed) { None } else { Shallow::merge(folded, progress)? };
+    match merged {
+        Some((entries, hold)) => {
+            counted.bytes += hold.bytes();
+            (counted.folded, counted._folded) = (entries, hold);
+        }
+        None => counted.shallow.iter_mut().for_each(|n| *n = 0),
+    }
+    Ok(counted)
+}
+
+/// The stream pass as its workers share it ([`StreamPass::read`]): the
+/// records to read and the stream their lines go to, the parts of the keys
+/// and the deep section's blocks they are counted in, the batches and the
+/// next one to take, what a worker holds to read them and the room for its
+/// folded entries, and whether a worker's folded entries no longer fit.
+struct StreamPass<'a> {
+    source: &'a dyn Source,
+    plan: &'a Plan,
+    writer: &'a stream::Writer,
+    part_bits: u8,
+    bits: u8,
+    parts: usize,
+    blocks: usize,
+    batches: u64,
+    next: &'a AtomicU64,
+    reading: usize,
+    room: usize,
+    unfolded: &'a AtomicBool,
+    progress: &'a Progress,
+}
+
+/// What a worker of the stream pass counted: the tree's entries by part,
+/// those of them it folded, and the deep section's postings by block; and
+/// its folded entries, with the hold of their room.
+type Tally = (Vec<u64>, Vec<u64>, Vec<u64>, (Shallow, Hold));
+
+impl StreamPass<'_> {
+    /// Worker `w`'s share of the stream pass: whole blocks of the stream, a
+    /// batch at a time, each game's line written to its part of the stream
+    /// and counted.
+    fn read(&self, w: &Worker<'_>) -> Result<Tally, SearchError> {
+        let StreamPass {
+            source,
+            plan,
+            writer,
+            part_bits,
+            bits,
+            parts,
+            blocks,
+            batches,
+            next,
+            reading,
+            room,
+            unfolded,
+            progress,
+        } = *self;
         let mut hold = reserve(reading, progress)?;
         // As much of the room as the budget has free now, by halves: a build
         // yields to searches, and does without the folded entries when a
@@ -314,30 +400,7 @@ fn read_games(
         // The worker's folded entries keep their room's hold until merged.
         hold.shrink(if room > 0 { Shallow::bytes(room) } else { 0 });
         Ok((entries, shallow_entries, postings, (shallow, hold)))
-    })?;
-    let mut folded = Vec::new();
-    folded.try_reserve_exact(found.len()).map_err(|_| Refused::Busy)?;
-    for (entries, shallow_entries, postings, shallow) in found {
-        for (all, one) in counted.entries.iter_mut().zip(entries) {
-            *all += one;
-        }
-        for (all, one) in counted.shallow.iter_mut().zip(shallow_entries) {
-            *all += one;
-        }
-        for (all, one) in counted.postings.iter_mut().zip(postings) {
-            *all += one;
-        }
-        folded.push(shallow);
     }
-    let merged = if unfolded.load(Ordering::Relaxed) { None } else { Shallow::merge(folded, progress)? };
-    match merged {
-        Some((entries, hold)) => {
-            counted.bytes += hold.bytes();
-            (counted.folded, counted._folded) = (entries, hold);
-        }
-        None => counted.shallow.iter_mut().for_each(|n| *n = 0),
-    }
-    Ok(counted)
 }
 
 /// The share of a pass's room, in percent, that its plan fills.
