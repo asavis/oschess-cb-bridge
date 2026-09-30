@@ -53,7 +53,9 @@ impl Heads {
     /// The heads file at `path`, when it was built for `generation` and a
     /// database of `records` records and reads back whole; `None` otherwise.
     pub fn open(path: &Path, generation: u64, records: u32) -> Option<Heads> {
-        let file = DbFile::open(path.to_path_buf()).ok()?;
+        // The bridge's own file, which it sweeps and rebuilds on a schedule
+        // of its own: kept open, never opened again at its path.
+        let file = DbFile::open_kept(path.to_path_buf()).ok()?;
         let mut h = [0u8; HEADER];
         file.read_into(0, &mut h).ok()?;
         if h[0..8] != MAGIC || u32_at(&h, 8) != VERSION || crc32(&h[..60]) != u32_at(&h, 60) {

@@ -149,7 +149,8 @@ with them.
   normalised path. It is stable while the path stays the same. The path itself
   is never sent.
 - A database's `generation` is an opaque string that changes whenever the bridge
-  sees the database's files change (sizes or modification times). Responses
+  sees the database's files change: their sizes, their modification times, or
+  the files themselves, as when one is replaced by a copy (#241). Responses
   that depend on the contents carry the generation they were read at. A client
   that sees it change in the middle of paging through a list starts the list
   again. The files are those the bridge reads: `.2cbh`, `.2cbg`, `.2cba`,
@@ -177,6 +178,24 @@ snapshot to coordinate with. The bridge therefore promises:
   move check apply to every read. A read after the save has finished is
   correct. The bridge cannot do better without a lock that ChessBase does not
   offer.
+- **Between reads, the bridge holds no file of a database open** (#241).
+  ChessBase opens the files of a database it saves so that no other program
+  may hold them, and a save fails with its "Save Error" while any other
+  program does. So on Windows, the bridge opens a database's files only to
+  read them, and closes them about a quarter of a second after its last read.
+  A save into a database fails while the bridge reads it, as for a list, a
+  search, an index build or games, and for that quarter of a second after.
+  Once the bridge is done with it, the save succeeds when made again. A read
+  that meets a file ChessBase holds fails at once, as a read of an unreadable
+  file does. A file opened again must be the one the database was opened on,
+  as it was then: the same volume, file id, size and time of last change. A
+  file that changed or was replaced since then is not read. The answer is
+  then the one for a read during a change. The database's generation changed
+  with the file, so a retry reads the database as it is now. This needs file ids that no other file takes while the file
+  lasts, which NTFS and ReFS give. On another file system, such as FAT, and on
+  Linux and macOS, a file opened again at its path could be another file.
+  There, the bridge keeps each file of an open database open, as every
+  version before did.
 - **A list window is as stored at the moment it was read.** A window read while
   ChessBase edits a game may show one row from before that edit and another
   from after it; the next request shows the new state.

@@ -1001,3 +1001,113 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
     }
     assert!(text.contains(&format!("{} [ready] Windowed", id_of(&a))), "{text}");
 }
+
+/// A listed database, once listed and read, holds none of its files open
+/// while nothing reads it: ChessBase, which opens a database's files so that
+/// no other handle may exist when it saves a game, can then save (#241). The
+/// test folder is on NTFS, whose files have a lasting identity.
+#[cfg(windows)]
+#[test]
+fn a_database_holds_no_file_open_while_nothing_reads_it() {
+    use common::{WAIT_LIMIT, answered, classic_fixture, fixture, index_dir, start_with_dir, until};
+    let dbs = [
+        fixture("closed-2cbh", &[]),
+        classic_fixture("closed-cbh", &[]),
+        cbformat::fixture::pgn_file("closed-pgn", b"[Event \"E\"]\n\n1. e4 e5 *\n"),
+    ];
+    let paths = [dbs[0].dir().join("db.2cbh"), dbs[1].dir().join("db.cbh"), dbs[2].dir().join("db.pgn")];
+    let dir = index_dir("closed");
+    let (port, _app) = start_with_dir(paths.clone(), &dir);
+    // The list opens every database, the games read each of them.
+    let (_, body) = get(port, "/v1/databases");
+    assert!(body.contains(r#""state":"ready""#), "{body}");
+    for path in &paths {
+        answered(port, &format!("/v1/databases/{}/games", id_of(path)));
+    }
+    let files: Vec<PathBuf> =
+        dbs.iter().flat_map(|db| std::fs::read_dir(db.dir()).unwrap()).map(|entry| entry.unwrap().path()).collect();
+    assert!(files.len() >= 10, "{files:?}");
+    until("no database file is open", WAIT_LIMIT, || files.iter().all(|file| opens_alone(file)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A database file replaced by a copy of the same bytes, size and time of
+/// change is read again at the next request: its generation changes with the
+/// file, so the catalog opens the database again rather than keep one whose
+/// file is refused as replaced, and answer `503 database_changing` for good
+/// (#241). On Windows the copy is made once the bridge holds none of the
+/// files, which is when a file is opened again at its path.
+#[test]
+fn a_file_replaced_by_a_copy_is_read_again() {
+    use common::{answered, fixture, index_dir, start_with_dir, without_generation};
+    let db = fixture("replaced-copy", &[]);
+    let path = db.dir().join("db.2cbh");
+    let dir = index_dir("replaced-copy");
+    let (port, _app) = start_with_dir([path.clone()], &dir);
+    let games = format!("/v1/databases/{}/games", id_of(&path));
+    let first = answered(port, &games);
+    #[cfg(windows)]
+    common::until("the header file is let go", common::WAIT_LIMIT, || opens_alone(&path));
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let moved = path.with_extension("moved");
+    std::fs::rename(&path, &moved).unwrap();
+    std::fs::write(&path, std::fs::read(&moved).unwrap()).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+    let again = answered(port, &games);
+    assert_ne!(first, again, "the generation is new");
+    assert_eq!(without_generation(&first), without_generation(&again));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A PGN file that leaves the list, has its header index swept, and comes
+/// back is read again. The index is the bridge's own, and the database opened
+/// on it keeps it open: were it opened again at its path, the database the
+/// catalog keeps for the unchanged file would find it gone and answer
+/// `503 database_changing` for good (#241).
+#[test]
+fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
+    use common::{answered, index_dir, serve_shared};
+    let root = Root::new("pgn-back");
+    std::fs::create_dir_all(root.path("bases")).unwrap();
+    let pgn = root.path("bases/Games.pgn");
+    std::fs::write(&pgn, "[Event \"E\"]\n[White \"W\"]\n[Black \"B\"]\n\n1. e4 e5 *\n").unwrap();
+    let listed = format!("databases = ['{}']\n", pgn.display());
+    std::fs::write(root.path("bridge.toml"), &listed).unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    let dir = index_dir("pgn-back");
+    catalog.use_data_dir(&dir);
+    let (port, app) = serve_shared(App::new("test", policy(), catalog));
+    let id = id_of(&pgn);
+    let games = format!("/v1/databases/{id}/games");
+    let first = answered(port, &games);
+    let index = bridge::folders::pgn_dir(&dir).join(format!("{id}.head"));
+    assert!(index.exists());
+    // On Windows, the PGN file is let go once idle, and so would the index
+    // be, were it closed between reads, by now or a little later.
+    #[cfg(windows)]
+    {
+        common::until("the PGN file is let go", common::WAIT_LIMIT, || opens_alone(&pgn));
+        std::thread::sleep(cbformat::file::IDLE * 3);
+    }
+
+    // Off the list, its index swept at once.
+    std::fs::write(root.path("bridge.toml"), "databases = []\n").unwrap();
+    assert!(app.catalog.entries().iter().all(|e| !e.listed()), "the file left the list");
+    app.catalog.set_sweep_grace(Duration::ZERO);
+    app.catalog.sweep_indexes();
+    assert!(!index.exists(), "the index was swept");
+
+    // Back on the list, unchanged: read as before.
+    std::fs::write(root.path("bridge.toml"), &listed).unwrap();
+    assert!(app.catalog.entries().iter().any(|e| e.id == id && e.listed()), "the file is back");
+    assert_eq!(answered(port, &games), first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether `file` opens for a writer that shares it with nobody, as ChessBase
+/// opens a database to save a game: whether no handle holds it.
+#[cfg(windows)]
+fn opens_alone(file: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(file).is_ok()
+}

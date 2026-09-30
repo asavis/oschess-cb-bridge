@@ -586,7 +586,9 @@ impl Database {
     /// for `stamp` and `page` from the whole of the file as it is now.
     pub fn open(pgn: &Path, index: &Path, stamp: u64, page: CodePage) -> Result<Database> {
         let text = DbFile::open(pgn.to_path_buf())?;
-        let index_file = DbFile::open(index.to_path_buf())?;
+        // The index is the bridge's own, which it sweeps and rebuilds on a
+        // schedule of its own: kept open, never opened again at its path.
+        let index_file = DbFile::open_kept(index.to_path_buf())?;
         let index_len = index_file.size()?;
         let bad = |what: &str| Error::Format(format!("PGN index {}: {what}", index.display()));
         if index_len < HEADER_SIZE {
