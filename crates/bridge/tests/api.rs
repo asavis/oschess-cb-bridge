@@ -145,6 +145,23 @@ fn malformed_requests_bodies_and_oversized_headers() {
     assert_eq!(get_reply(p, "/v1/nothing").status, 404);
 }
 
+/// A refusal reaches the client whole while the rest of the request is still
+/// coming: the bridge reads and drops it before it closes, since a close with
+/// unread bytes resets the connection and the client can lose the answer
+/// (#217). A head or a body four times the head limit is mostly unread when
+/// the refusal is written.
+#[test]
+fn a_refusal_is_read_to_its_end_while_the_request_goes_on() {
+    let db = database("api-linger", 1, 0, 0);
+    let p = start(&db, vec![], None).port;
+    let big = "x".repeat(MAX_HEAD * 4);
+    let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}"));
+    assert_eq!((r.status, r.body.contains("headers_too_large")), (431, true));
+    let head = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: {}", big.len());
+    let r = send(p, &format!("{head}\r\nConnection: close\r\n\r\n{big}"));
+    assert_eq!((r.status, r.body.contains("body_not_allowed")), (413, true));
+}
+
 #[test]
 fn game_windows() {
     let db = database("api-windows", 30, 0, 0);

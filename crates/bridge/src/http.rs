@@ -3,7 +3,7 @@
 //! chunks.
 
 use std::io::{self, IoSlice, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 /// The request line and headers together may not exceed this.
@@ -12,6 +12,11 @@ pub const MAX_HEAD: usize = 16 << 10;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request may take to arrive once it has begun.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a closing connection goes on reading what its client still sends;
+/// see [`Conn::close`].
+pub const LINGER: Duration = Duration::from_secs(2);
+/// At most this much is read and dropped while a connection closes.
+const LINGER_BYTES: usize = 1 << 20;
 
 pub struct Request {
     pub method: String,
@@ -188,6 +193,33 @@ impl Conn {
         framing.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
         write_both(&mut self.stream, head(response, &framing, keep_alive).as_bytes(), response.body.as_bytes())?;
         self.stream.flush()
+    }
+
+    /// Ends the connection. A close with unread bytes resets the connection,
+    /// and the reset can cost the client the answer written just before it:
+    /// the rest of a refused request, still arriving, did that (#217). So the
+    /// write side is shut first, which ends the answer, and what the client
+    /// still sends is read and dropped until it closes, `linger` has passed,
+    /// or [`LINGER_BYTES`] were dropped.
+    pub fn close(mut self, linger: Duration) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+        let deadline = Instant::now() + linger;
+        let mut dropped = 0;
+        let mut chunk = [0u8; 4096];
+        while dropped < LINGER_BYTES {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return;
+            };
+            if self.stream.set_read_timeout(Some(left)).is_err() {
+                return;
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => dropped += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -427,10 +459,37 @@ fn decode(s: &str, plus: bool) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use super::*;
 
     fn req(head: &str) -> Result<Request, ReadError> {
         parse(head.as_bytes())
+    }
+
+    /// A closing connection reads its client for `linger` at most when the
+    /// client neither sends nor closes, and for [`LINGER_BYTES`] at most when
+    /// it never stops sending.
+    #[test]
+    fn a_closing_connection_reads_its_client_within_bounds() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let conn = Conn::new(listener.accept().unwrap().0);
+        let started = Instant::now();
+        conn.close(Duration::from_millis(100));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100) && waited < Duration::from_secs(30), "{waited:?}");
+        drop(silent);
+        let sender = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            while s.write_all(&[b'x'; 1 << 16]).is_ok() {}
+        });
+        let conn = Conn::new(listener.accept().unwrap().0);
+        let started = Instant::now();
+        conn.close(Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(60), "the close waited for the linger");
+        sender.join().unwrap();
     }
 
     #[test]

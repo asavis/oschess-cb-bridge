@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::access::cors;
 use crate::api::{self, App};
-use crate::http::{Conn, REQUEST_TIMEOUT, ReadError, Refusal, Response};
+use crate::http::{Conn, LINGER, REQUEST_TIMEOUT, ReadError, Refusal, Response};
 use crate::reply::error;
 
 pub const MAX_CONNECTIONS: usize = 32;
@@ -81,10 +81,10 @@ fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: 
         let spawned =
             std::thread::Builder::new().name("bridge-conn".into()).stack_size(crate::THREAD_STACK).spawn(move || {
                 let conn = handle_connection(stream, &app);
-                // The slot is free before the socket closes: a client that has
-                // seen its connection end may open another at once and be served.
+                // The slot is free before the connection ends: a client that
+                // has seen it end may open another at once and be served.
                 drop(guard);
-                drop(conn);
+                conn.close(LINGER);
             });
         // A failed spawn drops the closure, and with it the guard and the stream.
         drop(spawned);
@@ -114,6 +114,9 @@ fn refuse_busy(stream: TcpStream, accepted: Instant, app: &App) {
     };
     let response = error(503, "busy", "Too many open connections");
     let _ = conn.write(&cors(response, app.policy.allowed_origin(origin.as_deref())), false);
+    // One thread answers every connection over the cap, so it waits for no
+    // client; the answer still ends before a reset could cut it.
+    conn.close(Duration::ZERO);
 }
 
 /// Serves the requests of one connection until it ends, and returns it still
