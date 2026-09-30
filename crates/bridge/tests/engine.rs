@@ -14,15 +14,16 @@ use bridge::engine::{self, Engine, EngineConfig};
 use bridge::sources::Sources;
 
 mod common;
-use common::{ORIGIN, app_of, exchange, get, get_reply, has_members, member, request, send, serve_shared};
+use common::{ORIGIN, TestBridge, app_of, exchange, get, get_reply, has_members, member, request, send};
 
 fn fake() -> EngineConfig {
     EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(1), Some(16))
 }
 
-/// A server with `engine`, and the port it listens on.
-fn start(engine: Engine) -> (u16, Arc<App>) {
-    serve_shared(App { engine, ..app_of([]) })
+/// The port of a bridge with `engine`, and the bridge.
+fn start(engine: Engine) -> (u16, TestBridge) {
+    let bridge = TestBridge::new(App { engine, ..app_of([]) });
+    (bridge.port, bridge)
 }
 
 /// An analysis being read: the response head, then its lines one by one.
@@ -97,16 +98,16 @@ const BEST: &str = r#"{"bestmove":"e2e4"}"#;
 /// bounded time (#61): an update waits for it, and not for one left running.
 #[test]
 fn an_analysis_is_work_while_it_streams() {
-    let (port, app) = start(Engine::new(fake()));
-    assert!(!app.engine.analyzing(Duration::from_secs(60)), "none yet");
+    let (port, bridge) = start(Engine::new(fake()));
+    assert!(!bridge.app.engine.analyzing(Duration::from_secs(60)), "none yet");
     let mut a = Analysis::open(port, "stream=tab1");
     assert_eq!(a.status, 200);
     assert!(a.line().is_some(), "it streams");
-    assert!(app.engine.analyzing(Duration::from_secs(60)));
-    assert!(!app.engine.analyzing(Duration::ZERO), "one running past the bound counts as none");
+    assert!(bridge.app.engine.analyzing(Duration::from_secs(60)));
+    assert!(!bridge.app.engine.analyzing(Duration::ZERO), "one running past the bound counts as none");
     drop(a);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while app.engine.analyzing(Duration::from_secs(60)) {
+    while bridge.app.engine.analyzing(Duration::from_secs(60)) {
         assert!(Instant::now() < deadline, "the analysis ends when its client leaves");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -114,8 +115,8 @@ fn an_analysis_is_work_while_it_streams() {
 
 #[test]
 fn streams_the_lines_of_a_search_to_its_best_move() {
-    let (port, app) = start(Engine::new(fake()));
-    assert_eq!(app.engine.name().as_deref(), Some("fake-uci"));
+    let (port, bridge) = start(Engine::new(fake()));
+    assert_eq!(bridge.app.engine.name().as_deref(), Some("fake-uci"));
     let mut a = Analysis::open(port, "moves=e2e4+e7e5&multipv=2&depth=6&stream=tab1");
     assert_eq!(a.status, 200);
     assert!(a.head.contains("Content-Type: application/x-ndjson"), "{}", a.head);
@@ -130,7 +131,7 @@ fn streams_the_lines_of_a_search_to_its_best_move() {
     }
     assert!(lines.iter().all(|l| !l.contains("searching")));
     // The engine said its own name.
-    assert_eq!(app.engine.name().as_deref(), Some("Fake UCI 1.0"));
+    assert_eq!(bridge.app.engine.name().as_deref(), Some("Fake UCI 1.0"));
 }
 
 /// The `nps` of the deepest line: what the fake engine was set to.
@@ -142,7 +143,7 @@ fn settings_of(lines: &[String]) -> (u64, u64, u64) {
 
 #[test]
 fn threads_and_hash_come_with_the_analysis_and_are_set_only_when_they_change() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let search = |extra: &str| {
         let mut a = Analysis::open(port, &format!("depth=2&stream=tab1{extra}"));
         assert_eq!(a.status, 200);
@@ -160,7 +161,7 @@ fn threads_and_hash_come_with_the_analysis_and_are_set_only_when_they_change() {
 fn configured_values_above_the_limits_start_and_stay_within_them() {
     let limits = bridge::engine::limits();
     let over = EngineConfig::new(env!("CARGO_BIN_EXE_fake-uci").into(), Some(u32::MAX), Some(u32::MAX));
-    let (port, _app) = start(Engine::new(over));
+    let (port, _bridge) = start(Engine::new(over));
     let (_, status) = get(port, "/v1/status");
     let (threads, hash) = (u64::from(limits.max_threads), u64::from(limits.max_hash_mb));
     let engine = member(&status, "engine");
@@ -181,19 +182,19 @@ fn configured_values_above_the_limits_start_and_stay_within_them() {
 
 #[test]
 fn stops_the_engine_when_the_client_leaves() {
-    let (port, app) = start(Engine::new(fake()));
+    let (port, bridge) = start(Engine::new(fake()));
     let mut a = Analysis::open(port, "stream=tab1");
     assert!(a.line().unwrap().starts_with(r#"{"info":"#));
     drop(a);
     // The engine was stopped, not lost: the next analysis finds it free.
     let mut b = Analysis::open(port, "depth=2&stream=tab1");
     assert_eq!(b.rest().last().unwrap(), BEST);
-    assert!(app.engine.is_running());
+    assert!(bridge.app.engine.is_running());
 }
 
 #[test]
 fn a_newer_analysis_takes_the_engine() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     // From another view: the first hears why it ended.
     let mut first = Analysis::open(port, "stream=tab1");
     assert!(first.line().is_some());
@@ -212,7 +213,7 @@ fn a_newer_analysis_takes_the_engine() {
 
 #[test]
 fn a_crashed_engine_ends_the_stream_and_starts_again() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let mut a = Analysis::open(port, "moves=h2h3&stream=tab1");
     let lines = a.rest();
     assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_exited"}"#), "{lines:?}");
@@ -222,7 +223,7 @@ fn a_crashed_engine_ends_the_stream_and_starts_again() {
 
 #[test]
 fn an_engine_that_ignores_stop_is_replaced() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let mut stubborn = Analysis::open(port, "moves=a2a3&stream=tab1");
     assert!(stubborn.line().is_some());
     let started = Instant::now();
@@ -234,7 +235,7 @@ fn an_engine_that_ignores_stop_is_replaced() {
 
 #[test]
 fn a_quiet_search_repeats_its_last_lines() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let mut a = Analysis::open(port, "moves=b2b3&stream=tab1");
     let first = a.line().unwrap();
     let started = Instant::now();
@@ -248,7 +249,7 @@ fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
     std::fs::create_dir_all(&dir).unwrap();
     let chatty = dir.join(format!("fake-uci-chatty{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(env!("CARGO_BIN_EXE_fake-uci"), &chatty).unwrap();
-    let (port, _app) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
     let started = Instant::now();
     let lines = Analysis::open(port, "depth=1").rest();
     assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_failed"}"#), "{lines:?}");
@@ -259,20 +260,20 @@ fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
 
 #[test]
 fn an_idle_engine_ends_its_process() {
-    let (port, app) = start(Engine::with_idle(fake(), Duration::from_millis(300)));
+    let (port, bridge) = start(Engine::with_idle(fake(), Duration::from_millis(300)));
     let mut a = Analysis::open(port, "depth=1");
     assert_eq!(a.rest().last().unwrap(), BEST);
-    assert!(app.engine.is_running());
+    assert!(bridge.app.engine.is_running());
     let deadline = Instant::now() + Duration::from_secs(5);
-    while app.engine.is_running() && Instant::now() < deadline {
+    while bridge.app.engine.is_running() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!app.engine.is_running(), "the idle engine still runs");
+    assert!(!bridge.app.engine.is_running(), "the idle engine still runs");
 }
 
 #[test]
 fn refuses_bad_input_and_a_missing_engine() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     for (query, parameter) in [
         ("moves=e2e5", "moves"),
         ("moves=e2e4%0Aquit", "moves"),
@@ -292,7 +293,7 @@ fn refuses_bad_input_and_a_missing_engine() {
         let body = a.body();
         assert!(body.contains(&format!(r#""parameter":"{parameter}""#)), "{query}: {body}");
     }
-    let (port, _app) = start(Engine::none());
+    let (port, _bridge) = start(Engine::none());
     let a = Analysis::open(port, "depth=1");
     assert_eq!(a.status, 409);
     assert!(a.body().contains(r#""code":"no_engine""#));
@@ -300,7 +301,7 @@ fn refuses_bad_input_and_a_missing_engine() {
 
 #[test]
 fn the_status_names_the_engine() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let (_, status) = get(port, "/v1/status");
     let limits = bridge::engine::limits();
     let engine = format!(
@@ -308,13 +309,13 @@ fn the_status_names_the_engine() {
         limits.max_threads, limits.max_hash_mb
     );
     assert!(has_members(&status, &engine), "{status}");
-    let (port, _app) = start(Engine::none());
+    let (port, _bridge) = start(Engine::none());
     assert!(get(port, "/v1/status").1.contains(r#""engine":null"#));
 }
 
 #[test]
 fn the_token_is_required() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let path = "/v1/engine/analyze?depth=1";
     let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {ORIGIN}\r\nConnection: close\r\n\r\n");
     let r = send(port, &raw);
@@ -327,7 +328,7 @@ fn the_token_is_required() {
 #[ignore = "needs BRIDGE_REAL_ENGINE"]
 fn a_real_engine_analyses() {
     let path = std::env::var("BRIDGE_REAL_ENGINE").expect("BRIDGE_REAL_ENGINE names an engine");
-    let (port, app) = start(Engine::new(EngineConfig::new(path.into(), Some(2), Some(64))));
+    let (port, bridge) = start(Engine::new(EngineConfig::new(path.into(), Some(2), Some(64))));
     let mut a = Analysis::open(port, "moves=e2e4+e7e5+g1f3&multipv=3&depth=14&stream=real");
     let lines = a.rest();
     assert!(lines.last().unwrap().starts_with(r#"{"bestmove":""#), "{lines:?}");
@@ -335,7 +336,7 @@ fn a_real_engine_analyses() {
         let number = format!(r#""multipv":{k},"#);
         assert!(lines.iter().any(|l| l.contains(r#""depth":14,"#) && l.contains(&number)), "{k}: {lines:?}");
     }
-    assert!(app.engine.name().unwrap().starts_with("Stockfish"), "{:?}", app.engine.name());
+    assert!(bridge.app.engine.name().unwrap().starts_with("Stockfish"), "{:?}", bridge.app.engine.name());
     // A search without a limit stops when its client leaves; the engine serves the next one.
     let mut b = Analysis::open(
         port,
@@ -397,11 +398,11 @@ fn the_engine_follows_bridge_toml() {
     let toml = dir.join("bridge.toml");
     let write = |text: &str| replace(&toml, text);
     write("port = 39581\n");
-    let (port, app) = start(Engine::following(Arc::new(Watched::new(toml.clone())), Duration::from_millis(50)));
-    assert!(!app.engine.is_configured());
+    let (port, bridge) = start(Engine::following(Arc::new(Watched::new(toml.clone())), Duration::from_millis(50)));
+    assert!(!bridge.app.engine.is_configured());
     let first = fake_copy(&dir, "engine-a");
     write(&engine_line(&first));
-    assert_eq!(app.engine.name().as_deref(), Some("engine-a"));
+    assert_eq!(bridge.app.engine.name().as_deref(), Some("engine-a"));
     let mut a = Analysis::open(port, "depth=2");
     assert_eq!(a.rest().last().unwrap(), BEST);
 
@@ -413,15 +414,15 @@ fn the_engine_follows_bridge_toml() {
     write(&engine_line(&second));
     let ended = running.rest_within(Duration::from_secs(3)).expect("the old search ran on");
     assert!(ended.iter().all(|l| l.starts_with(r#"{"info":"#) || l == r#"{"superseded":true}"#), "{ended:?}");
-    assert_eq!(app.engine.name().as_deref(), Some("engine-b"));
+    assert_eq!(bridge.app.engine.name().as_deref(), Some("engine-b"));
 
     // No engine at all, then a file that no longer parses keeps the engine it named.
     write("port = 39581\n");
-    assert!(!app.engine.is_configured());
+    assert!(!bridge.app.engine.is_configured());
     write(&engine_line(&first));
-    assert!(app.engine.is_configured());
+    assert!(bridge.app.engine.is_configured());
     write("engine = \n");
-    assert_eq!(app.engine.name().as_deref(), Some("engine-a"));
+    assert_eq!(bridge.app.engine.name().as_deref(), Some("engine-a"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -524,10 +525,10 @@ fn warm(port: u16, query: &str) -> (u16, String) {
 /// that an analysis asking for the same sends neither and only searches.
 #[test]
 fn a_warm_up_starts_the_engine_set_as_the_next_analysis_asks() {
-    let (port, app) = start(Engine::new(fake()));
-    assert!(!app.engine.is_running());
+    let (port, bridge) = start(Engine::new(fake()));
+    assert!(!bridge.app.engine.is_running());
     assert_eq!(warm(port, "threads=1&hash=64"), (200, r#"{"engine":"ready"}"#.to_string()));
-    assert!(app.engine.is_running());
+    assert!(bridge.app.engine.is_running());
     // The handshake set Threads and Hash, and the warm-up Hash 64: three. An
     // analysis with the configured 16 MB must set Hash back: four.
     let mut a = Analysis::open(port, "depth=2");
@@ -541,7 +542,7 @@ fn a_warm_up_starts_the_engine_set_as_the_next_analysis_asks() {
 
 #[test]
 fn a_warm_up_leaves_a_running_analysis_alone() {
-    let (port, _app) = start(Engine::new(fake()));
+    let (port, _bridge) = start(Engine::new(fake()));
     let mut a = Analysis::open(port, "movetime=800&stream=tab1");
     assert!(a.line().is_some(), "the analysis runs");
     assert_eq!(warm(port, "hash=64"), (200, r#"{"engine":"busy"}"#.to_string()));
@@ -552,7 +553,7 @@ fn a_warm_up_leaves_a_running_analysis_alone() {
 
 #[test]
 fn a_warm_up_refuses_bad_input_and_a_missing_engine() {
-    let (port, app) = start(Engine::new(fake()));
+    let (port, bridge) = start(Engine::new(fake()));
     for (query, parameter) in
         [("threads=0", "threads"), ("threads=x", "threads"), ("hash=15", "hash"), ("hash=x", "hash")]
     {
@@ -560,8 +561,8 @@ fn a_warm_up_refuses_bad_input_and_a_missing_engine() {
         assert_eq!(status, 400, "{query}");
         assert!(body.contains(parameter), "{query}: {body}");
     }
-    assert!(!app.engine.is_running(), "a refused warm-up starts nothing");
-    let (port, _app) = start(Engine::none());
+    assert!(!bridge.app.engine.is_running(), "a refused warm-up starts nothing");
+    let (port, _bridge) = start(Engine::none());
     let (status, body) = warm(port, "");
     assert_eq!(status, 409);
     assert!(body.contains("no_engine"), "{body}");
@@ -577,11 +578,11 @@ fn a_warm_up_of_an_engine_that_cannot_start_is_a_bad_gateway() {
         std::env::consts::EXE_SUFFIX
     ));
     let _ = std::fs::remove_file(&missing);
-    let (port, app) = start(Engine::new(EngineConfig::new(missing, Some(1), Some(16))));
+    let (port, bridge) = start(Engine::new(EngineConfig::new(missing, Some(1), Some(16))));
     let out = exchange(port, &request(port, "/v1/engine/warm")).unwrap();
     let (head, body) = out.split_once("\r\n\r\n").unwrap();
     assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{head}");
     let error = member(body, "error");
     assert!(has_members(error, r#""code":"engine_failed""#) && member(error, "message").starts_with('"'), "{body}");
-    assert!(!app.engine.is_running());
+    assert!(!bridge.app.engine.is_running());
 }

@@ -23,7 +23,7 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
 
 mod common;
-use common::{TOKEN, get, has_members, has_object, members, objects, policy, serve};
+use common::{TOKEN, TestBridge, get, has_members, has_object, members, objects, policy, settle};
 
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 
@@ -140,6 +140,8 @@ fn the_window_comes_first_then_bridge_toml_then_the_command_line() {
     assert!(catalog.get(&id_of(&d)).is_some());
     assert_eq!(catalog.get(&id_of(&c)).unwrap().format.name(), "2cbh");
     assert_eq!(catalog.get(&id_of(&old)).unwrap().format.name(), "cbh");
+    // The PGN file's index is built before the folder goes.
+    settle(&catalog);
 }
 
 /// Changes to the window list and to `bridge.toml` show on the next listing.
@@ -204,6 +206,7 @@ fn a_database_added_within_one_clock_tick_shows() {
     database_at(&root.path("folder"), "One");
     std::fs::write(root.path("bridge.toml"), format!("databases = ['{}']\n", root.path("folder").display())).unwrap();
     let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    catalog.use_data_dir(&root.path("data"));
     assert_eq!(names(&catalog), ["One"]);
     let folder = std::fs::File::open(root.path("folder")).unwrap();
     let before = folder.metadata().unwrap().modified().unwrap();
@@ -216,6 +219,8 @@ fn a_database_added_within_one_clock_tick_shows() {
     folder.set_modified(before).unwrap();
     assert_eq!(folder.metadata().unwrap().modified().unwrap(), before);
     assert_eq!(names(&catalog), ["One", "Three", "Two"]);
+    // The PGN file's index is built before the folder goes.
+    settle(&catalog);
 }
 
 /// Damaged, empty or absent lists give no databases and no panic; a list that
@@ -794,8 +799,8 @@ fn cloud_states_over_http() {
     let size = size_of(&files);
     let cloud = Arc::new(FakeCloud::with_files(files.clone(), false));
     let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
-    let port = serve(App::new("test", policy(), catalog));
-    let id = id_of(&db);
+    let bridge = TestBridge::new(App::new("test", policy(), catalog));
+    let (port, id) = (bridge.port, id_of(&db));
 
     let (status, body) = get(port, "/v1/databases");
     assert_eq!(status, 200);
@@ -848,7 +853,8 @@ fn a_refused_request_starts_no_download() {
     let cloud = Arc::new(FakeCloud::with_files(files_of(&db), false));
     let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
     let (id, entry) = (id_of(&db), catalog.get(&id_of(&db)).unwrap());
-    let port = serve(App::new("test", policy(), catalog));
+    let bridge = TestBridge::new(App::new("test", policy(), catalog));
+    let port = bridge.port;
     // A download started now would wait, and show.
     cloud.hold(true);
     let start = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR+w+KQkq+-+0+1";
@@ -940,6 +946,9 @@ fn the_snapshot_shows_cloud_states() {
     let ready = snapshot();
     assert_eq!(fields(&ready), (State::Ready, Some(1), None, None));
     assert_eq!((ready.name.as_str(), ready.generation), ("Remote", entry.generation()));
+    // Served as the app serves it, with its keeper: stopped, and its work
+    // waited for, before the folder goes.
+    settle(&app.catalog);
 }
 
 /// The members of a database's row in `GET /v1/databases` past its id, name

@@ -17,8 +17,8 @@ use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Pie
 
 mod common;
 use common::{
-    ANSWER_TIMEOUT, ORIGIN, Reply, TOKEN, app_of, connect, get_reply, has_members, has_object, member, object_with,
-    objects, send, serve_with_dir,
+    ANSWER_TIMEOUT, ORIGIN, Reply, TOKEN, TestBridge, app_of, connect, get_reply, has_members, has_object, member,
+    object_with, objects, send,
 };
 
 /// `games` games of 1.e4 won by white, white and black being "Morphy, Paul";
@@ -45,17 +45,21 @@ fn database(name: &str, games: u32, text: u32, broken: u32) -> TempDb {
     b.write(name)
 }
 
+/// A bridge serving a test's database, and the database's id. Declared after
+/// the database, it is dropped first: nothing works on the database's files
+/// once they go.
 struct Running {
     port: u16,
     id: String,
+    _bridge: TestBridge,
 }
 
 fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sync>>) -> Running {
     let path = db.dir().join("db.2cbh");
     let mut paths = vec![path.clone()];
     paths.extend(extra);
-    let (port, _) = serve_with_dir(App { between_reads: hook, ..app_of(paths) }, db.dir());
-    Running { port, id: id_of(&path) }
+    let bridge = TestBridge::new(App { between_reads: hook, ..app_of(paths) });
+    Running { port: bridge.port, id: id_of(&path), _bridge: bridge }
 }
 
 fn plain(port: u16, head: &str) -> Reply {
@@ -95,7 +99,8 @@ fn status_and_databases() {
 #[test]
 fn access_checks() {
     let db = database("api-access", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let host = format!("Host: 127.0.0.1:{p}");
     let auth = format!("Authorization: Bearer {TOKEN}");
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}"));
@@ -135,7 +140,8 @@ fn access_checks() {
 #[test]
 fn malformed_requests_bodies_and_oversized_headers() {
     let db = database("api-malformed", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 5"));
     assert_eq!((r.status, r.body.contains("body_not_allowed")), (413, true));
     let big = "x".repeat(17 << 10);
@@ -153,7 +159,8 @@ fn malformed_requests_bodies_and_oversized_headers() {
 #[test]
 fn a_refusal_is_read_to_its_end_while_the_request_goes_on() {
     let db = database("api-linger", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let big = "x".repeat(MAX_HEAD * 4);
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}"));
     assert_eq!((r.status, r.body.contains("headers_too_large")), (431, true));
@@ -303,7 +310,8 @@ fn appended_games_appear_on_the_next_request() {
 #[test]
 fn a_connection_serves_several_requests() {
     let db = database("api-keepalive", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let one = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
     let mut s = connect(p).unwrap();
     s.write_all(format!("{one}{one}").as_bytes()).unwrap();
@@ -323,7 +331,8 @@ fn a_connection_serves_several_requests() {
 fn answers_on_a_kept_connection_come_without_delay() {
     const DELAYED_ACK: Duration = Duration::from_millis(40);
     let db = database("api-no-delay", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let one = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
     let mut s = std::io::BufReader::new(connect(p).unwrap());
     let mut trips = Vec::new();
@@ -481,6 +490,11 @@ fn a_window_at_the_last_record_number() {
     assert_eq!(numbers("?offset=4294967294&limit=1"), [4294967295]);
     assert_eq!(numbers("?offset=4294967293&limit=5"), [4294967294, 4294967295]);
     assert_eq!(numbers("?sort=number-desc&limit=2"), [4294967295, 4294967294]);
+    // A list of so many records starts a build of the heads file (#106),
+    // which would read every one of them, for hours, and a dropped bridge
+    // waits for its background work. A change of the database stops the
+    // build at its next block.
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)).unwrap();
 }
 
 /// Refusals made before a request is routed carry CORS headers for an allowed
@@ -492,7 +506,8 @@ fn a_window_at_the_last_record_number() {
 #[test]
 fn refusals_before_routing_are_readable_by_the_page() {
     let db = database("api-refusals", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let host = format!("Host: 127.0.0.1:{p}");
     let big = format!("GET /v1/status HTTP/1.1\r\nOrigin: {ORIGIN}\r\n{host}\r\nX-Big: ");
     let big = format!("{big}{}", "x".repeat(MAX_HEAD + 1 - big.len()));
@@ -518,7 +533,8 @@ fn the_ipv6_loopback_is_served() {
         return;
     }
     let db = database("api-ipv6", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let mut s = TcpStream::connect(("::1", p)).unwrap();
     s.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
     let raw = format!(
@@ -624,7 +640,8 @@ fn unanswered(s: &TcpStream) -> bool {
 #[test]
 fn busy_and_misdirected_answers_carry_cors() {
     let db = database("api-busy", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:1\r\nOrigin: {ORIGIN}"));
     assert_eq!((r.status, r.header("access-control-allow-origin")), (421, Some(ORIGIN)));
     // That connection's slot was freed before it closed, so the next ones
@@ -672,7 +689,8 @@ fn a_game_whose_answer_would_be_huge_is_refused() {
 #[test]
 fn silent_queued_connections_do_not_delay_the_busy_answer() {
     let db = database("api-busy-queue", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let (serving, _) = hold_the_cap(p);
     let silent: Vec<TcpStream> = (0..12).map(|_| connect(p).unwrap()).collect();
     let started = Instant::now();

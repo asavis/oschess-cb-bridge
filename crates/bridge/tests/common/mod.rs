@@ -1,7 +1,8 @@
-//! What the test files share: a bridge served on a free port, the requests a
-//! test sends it and the reading of its answers, and the fixture of
-//! `docs/search-grammar.md`, written as a 2CBH database, as a classic one and
-//! as a PGN file with the same content. Each test file uses a part of it.
+//! What the test files share: a bridge served on a free port
+//! ([`TestBridge`]), the requests a test sends it and the reading of its
+//! answers, and the fixture of `docs/search-grammar.md`, written as a 2CBH
+//! database, as a classic one and as a PGN file with the same content. Each
+//! test file uses a part of it.
 //!
 //! The search memory budget (`search::memory`), the answer budget
 //! (`budget`) and the search workers (`search::workers`) are one per
@@ -42,15 +43,9 @@ pub const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 pub const ORIGIN: &str = DEFAULT_ORIGINS[0];
 
 /// The policy of a test's bridge: the default origins and [`TOKEN`]. Its port
-/// is the one [`serve`] binds.
+/// is the one [`TestBridge`] binds.
 pub fn policy() -> Policy {
     Policy { port: 0, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() }
-}
-
-/// Serves `app` on a free loopback port, from a thread of its own, its
-/// policy's port set to that one; the port.
-pub fn serve(app: App) -> u16 {
-    serve_shared(app).0
 }
 
 /// The app of a test's bridge serving the databases at `paths`, with
@@ -59,84 +54,126 @@ pub fn app_of(paths: impl IntoIterator<Item = PathBuf>) -> App {
     App::new("test", policy(), Catalog::new(paths))
 }
 
-/// Serves the databases at `paths` as [`serve_shared`] does, with their
-/// indexes in `dir` as in a data folder.
-pub fn start_with_dir(paths: impl IntoIterator<Item = PathBuf>, dir: &Path) -> (u16, Arc<App>) {
-    serve_with_dir(app_of(paths), dir)
-}
-
-/// Serves `app` as [`serve_shared`] does, with its indexes in `dir` as in a
-/// data folder.
-pub fn serve_with_dir(app: App, dir: &Path) -> (u16, Arc<App>) {
-    app.catalog.use_data_dir(dir);
-    serve_shared(app)
-}
-
-/// [`serve`], and the app served, for a test that asks it things as it serves.
-/// Its connections wait [`IDLE_TIMEOUT`] for a request.
-pub fn serve_shared(mut app: App) -> (u16, Arc<App>) {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    app.policy.port = port;
-    app.idle_timeout = IDLE_TIMEOUT;
-    let app = Arc::new(app);
-    let served = Arc::clone(&app);
-    std::thread::spawn(move || server::serve(listeners, served));
-    (port, app)
-}
-
-/// A bridge served for a test that gives up the position indexes it holds
-/// when dropped. A held index keeps its move stream mapped, and a mapped file
-/// cannot be replaced or removed on Windows: a test drops the bridge before
-/// it changes or removes the files, or starts another bridge that rebuilds
-/// them. Its threads go on listening, holding no index, until the process
-/// ends.
-pub struct Served {
+/// The one bridge a test serves (#238): `app` on a loopback port the harness
+/// binds itself, from a thread of its own, with a data folder, which holds
+/// its indexes, and its keeper off unless [`TestBridge::keep`] starts it. Its
+/// connections wait [`IDLE_TIMEOUT`] for a request.
+///
+/// Dropped, it waits until none of its background work runs ([`settle`]),
+/// gives up the position indexes it holds, and then removes its data folder
+/// when the folder is its own. Nothing writes to the folder once the drop
+/// returns (#236). A held index keeps its move stream mapped, and a mapped
+/// file cannot be replaced or removed on Windows: a test drops the bridge
+/// before it changes or removes the files, or starts another bridge that
+/// rebuilds them. Its threads go on listening, holding no index, until the
+/// process ends.
+pub struct TestBridge {
     pub port: u16,
-    app: Arc<App>,
+    pub app: Arc<App>,
+    dir: PathBuf,
+    /// Whether `dir` is the bridge's own, made for it and removed with it.
+    own: bool,
 }
 
-impl Served {
-    /// Serves `app` as [`serve`] does.
-    pub fn new(app: App) -> Served {
-        let (port, app) = serve_shared(app);
-        Served { port, app }
+impl TestBridge {
+    /// Serves `app` with a data folder of its own, empty.
+    pub fn new(app: App) -> TestBridge {
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bridge-test-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TestBridge::serve(app, dir, true)
     }
 
-    /// Serves `app` as [`serve_with_dir`] does, with its indexes in `dir`.
-    pub fn with_dir(app: App, dir: &Path) -> Served {
-        app.catalog.use_data_dir(dir);
-        Served::new(app)
+    /// Serves `app` with the data folder `dir`, which the test gives and
+    /// removes: for a test that makes the folder's files before the bridge
+    /// starts, looks at them once it is dropped, or starts another bridge on
+    /// the same folder.
+    pub fn in_dir(app: App, dir: &Path) -> TestBridge {
+        TestBridge::serve(app, dir.to_path_buf(), false)
     }
 
-    /// Serves the 2CBH database `db` with its indexes in `dir`, as in a data
-    /// folder: the bridge and the database's id.
-    pub fn database(db: &TempDb, dir: &Path) -> (Served, String) {
+    /// Serves the 2CBH database `db` with the data folder `dir`
+    /// ([`TestBridge::in_dir`]): the bridge and the database's id.
+    pub fn database(db: &TempDb, dir: &Path) -> (TestBridge, String) {
         let path = db.dir().join("db.2cbh");
-        (Served::with_dir(app_of([path.clone()]), dir), id_of(&path))
+        (TestBridge::in_dir(app_of([path.clone()]), dir), id_of(&path))
+    }
+
+    fn serve(mut app: App, dir: PathBuf, own: bool) -> TestBridge {
+        let listeners = server::bind(0).unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        app.policy.port = port;
+        app.idle_timeout = IDLE_TIMEOUT;
+        app.catalog.use_data_dir(&dir);
+        let app = Arc::new(app);
+        let served = Arc::clone(&app);
+        std::thread::spawn(move || server::serve(listeners, served));
+        TestBridge { port, app, dir, own }
+    }
+
+    /// The data folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Starts the keeper of the indexes of the databases in use, looking
+    /// every `tick`, with `quiet` as the quiet period.
+    pub fn keep(&self, tick: Duration, quiet: Duration) {
+        self.app.catalog.explorer.set_keeping(tick, quiet);
+        bridge::explorer::keeper::start(&self.app);
     }
 }
 
-impl Drop for Served {
+impl Drop for TestBridge {
     fn drop(&mut self) {
-        // Nothing writes to the bridge's folders once it is dropped (#236).
-        settle(&self.app);
+        // Stops the keeper, then waits for every build and write (#236).
+        settle(&self.app.catalog);
         self.app.catalog.explorer.release();
+        if self.own {
+            remove_settled(&self.dir);
+        }
     }
 }
 
-/// Waits until none of `app`'s background work runs, for [`WAIT_LIMIT`] at
-/// most ([`Catalog::settle`]), so that a test removes the bridge's folders
-/// with nothing writing to them (#236). What still runs then fails the test,
-/// by name, unless it is failing already.
-pub fn settle(app: &App) {
-    if let Err(Busy(running)) = app.catalog.settle(WAIT_LIMIT) {
-        let what = format!("{} still ran {WAIT_LIMIT:?} after the bridge was dropped", running.join(", "));
-        if std::thread::panicking() {
-            eprintln!("{what}");
-        } else {
-            panic!("{what}");
+/// Waits until none of `catalog`'s background work runs, for [`WAIT_LIMIT`]
+/// at most ([`Catalog::settle`]), so that a test removes the folders it
+/// reads or writes with nothing working on them (#236): a bridge's data
+/// folder, or the fixtures of a catalog a test opens itself. What still runs
+/// then fails the test, by name, unless it is failing already.
+pub fn settle(catalog: &Catalog) {
+    if let Err(Busy(running)) = catalog.settle(WAIT_LIMIT) {
+        fail(format!("{} still ran {WAIT_LIMIT:?} after the test was done with it", running.join(", ")));
+    }
+}
+
+/// Removes the folder `dir`, which nothing writes to any more: a folder left
+/// fails the test, by name, unless it is failing already. On Windows a file
+/// written a moment ago can be held open a while by a scanner of new files,
+/// and the removal is tried again meanwhile, for [`WAIT_LIMIT`] at most.
+fn remove_settled(dir: &Path) {
+    let mut last = None;
+    let patience = if cfg!(windows) { WAIT_LIMIT } else { Duration::ZERO };
+    let removed = poll(patience, || match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            last = Some(e);
+            None
         }
+        _ => Some(()),
+    });
+    if removed.is_none() {
+        fail(format!("the data folder {} was not removed: {last:?}", dir.display()));
+    }
+}
+
+/// Fails the test with `what`; a test that is failing already, as it unwinds,
+/// writes it to standard error instead of a second panic.
+fn fail(what: String) {
+    if std::thread::panicking() {
+        eprintln!("{what}");
+    } else {
+        panic!("{what}");
     }
 }
 

@@ -13,36 +13,37 @@ use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{Limited, WAIT_LIMIT, get, policy, serve_shared, sparse};
+use common::{Limited, TestBridge, WAIT_LIMIT, get, policy, sparse};
 
-struct Served {
-    port: u16,
+/// A sparse database served, and its id. The bridge is dropped before the
+/// database, so nothing works on its files once they go.
+struct Sparse {
+    bridge: TestBridge,
     id: String,
-    app: Arc<App>,
     _db: TempDb,
 }
 
-fn serve_sparse(name: &str, records: u64) -> Served {
+fn serve_sparse(name: &str, records: u64) -> Sparse {
     let db = sparse(name, records);
     let path = db.dir().join("db.2cbh");
-    let (port, app) = serve_shared(App::new("test", policy(), Catalog::new([path.clone()])));
-    Served { port, id: id_of(&path), app, _db: db }
+    let bridge = TestBridge::new(App::new("test", policy(), Catalog::new([path.clone()])));
+    Sparse { bridge, id: id_of(&path), _db: db }
 }
 
-impl Served {
+impl Sparse {
     /// The indexes searches on this database use, where a test holds them.
     fn indexes(&self) -> Arc<Indexes> {
-        self.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes
+        self.bridge.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes
     }
 
     /// Sends `query` on its own connection.
     fn send(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
-        let (port, path) = (self.port, format!("/v1/databases/{}/games?{query}", self.id));
+        let (port, path) = (self.bridge.port, format!("/v1/databases/{}/games?{query}", self.id));
         std::thread::spawn(move || get(port, &path))
     }
 
     fn get(&self, query: &str) -> (u16, String) {
-        get(self.port, &format!("/v1/databases/{}/games?{query}", self.id))
+        get(self.bridge.port, &format!("/v1/databases/{}/games?{query}", self.id))
     }
 }
 

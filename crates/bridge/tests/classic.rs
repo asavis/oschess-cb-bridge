@@ -1,7 +1,6 @@
 //! Classic databases through the HTTP API: listed, searched and served like
 //! 2CBH ones, and answering as a 2CBH copy of the same content answers.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bridge::catalog::id_of;
@@ -11,14 +10,8 @@ use chesscore::Board;
 
 mod common;
 use common::{
-    classic_fixture, fixture, get, has_members, has_object, member, object_with, start_with_dir, without_generation,
+    TestBridge, app_of, classic_fixture, fixture, get, has_members, has_object, member, object_with, without_generation,
 };
-
-fn index_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bridge-classic-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
 
 /// The fixture of `docs/search-grammar.md` in both formats, served together:
 /// the classic copy is listed as `cbh` and ready, and its lists, searches,
@@ -27,8 +20,8 @@ fn index_dir(name: &str) -> PathBuf {
 fn a_classic_copy_answers_as_its_2cbh_copy() {
     let (f2, fc) = (fixture("classic-api-2cbh", &[]), classic_fixture("classic-api-cbh", &[]));
     let (p2, pc) = (f2.dir().join("db.2cbh"), fc.dir().join("db.cbh"));
-    let dir = index_dir("copies");
-    let (port, _app) = start_with_dir([pc.clone(), p2.clone()], &dir);
+    let bridge = TestBridge::new(app_of([pc.clone(), p2.clone()]));
+    let port = bridge.port;
     let (ic, i2) = (id_of(&pc), id_of(&p2));
 
     let (status, body) = get(port, "/v1/databases");
@@ -90,7 +83,6 @@ fn a_classic_copy_answers_as_its_2cbh_copy() {
     let (_, body) = get(port, &format!("/v1/databases/{ic}/explorer?fen={start_fen}"));
     // Games 1-7 and 10: not the guiding text, and not the deleted game.
     assert!(has_members(&body, r#""index":{"records":10,"games":8}"#), "{body}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A classic game is served with its annotations; a move or annotation record
@@ -111,8 +103,8 @@ fn classic_games_are_rendered_within_the_limits() {
     b.annotations(&annotation_record(3, &items));
     let f = b.write("classic-api-limits");
     let path = f.dir().join("db.cbh");
-    let dir = index_dir("limits");
-    let (port, _app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let port = bridge.port;
     let id = id_of(&path);
 
     let (status, body) = get(port, &format!("/v1/databases/{id}/games/1?lang=en"));
@@ -124,5 +116,4 @@ fn classic_games_are_rendered_within_the_limits() {
         assert_eq!(status, 422, "{body}");
         assert!(body.contains(r#""code":"unreadable_game""#) && body.contains("-byte limit"), "{body}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
