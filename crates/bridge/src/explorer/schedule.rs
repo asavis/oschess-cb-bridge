@@ -420,7 +420,7 @@ mod tests {
     }
 
     fn next(events: &mpsc::Receiver<(&'static str, Priority, &'static str)>) -> (&'static str, Priority, &'static str) {
-        events.recv_timeout(Duration::from_secs(10)).expect("the builds go on")
+        events.recv_timeout(crate::search::workers::tests::PATIENCE).expect("the builds go on")
     }
 
     /// A stall for a [`stalled_build`], and the end the test waits on.
@@ -431,12 +431,12 @@ mod tests {
     /// Waits until the thread of a [`stalled_build`] has started its first
     /// batch and stalls.
     fn stalled(stalls: &mpsc::Receiver<()>) {
-        stalls.recv_timeout(Duration::from_secs(10)).expect("the build starts a batch");
+        stalls.recv_timeout(crate::search::workers::tests::PATIENCE).expect("the build starts a batch");
     }
 
     /// Has the stalled thread of a [`stalled_build`] go on.
     fn resume(stalls: &mpsc::Receiver<()>) {
-        stalls.recv_timeout(Duration::from_secs(10)).expect("the build stalls");
+        stalls.recv_timeout(crate::search::workers::tests::PATIENCE).expect("the build stalls");
     }
 
     /// A requested build stops the background build of another database

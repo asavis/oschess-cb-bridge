@@ -465,9 +465,11 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// How long a test asks a pass again while it is answered busy
-    /// ([`unbusy`]): far longer than the passes of this binary's other tests
-    /// ever hold the workers, as the waits of the integration tests are.
+    /// How long a test of this library waits for what must come, such as a
+    /// worker, a build's step or another thread's answer, before it fails:
+    /// far longer than a loaded machine holds any of them, as the waits of
+    /// the integration tests are (#238). [`unbusy`] asks a pass answered busy
+    /// again for as long.
     pub(crate) const PATIENCE: Duration = Duration::from_secs(300);
 
     /// Passes answered busy and asked again ([`unbusy`]).

@@ -931,7 +931,7 @@ pub(crate) mod tests {
         let (built, after) = std::thread::scope(|s| {
             let build = s.spawn(|| build_with(&Unread, &plan, &target, &progress, &limits));
             // Its stream pass starts reading, which takes a worker first.
-            let until = Instant::now() + Duration::from_secs(30);
+            let until = Instant::now() + workers::tests::PATIENCE;
             while progress.phase() != "reading" {
                 assert!(Instant::now() < until, "the build starts reading");
                 std::thread::sleep(Duration::from_millis(1));

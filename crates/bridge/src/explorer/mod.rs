@@ -828,7 +828,7 @@ mod tests {
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         let state = catalog.explorer.state(&entry.id);
         let settled = || {
-            let until = Instant::now() + Duration::from_secs(30);
+            let until = Instant::now() + workers::tests::PATIENCE;
             while matches!(*lock(&state), State::Working(_)) {
                 assert!(Instant::now() < until, "the build is over");
                 std::thread::sleep(Duration::from_millis(10));
@@ -900,7 +900,7 @@ mod tests {
         explorer.mark_in_use(&entry.id);
         let state = explorer.state(&entry.id);
         let settled = || {
-            let until = Instant::now() + Duration::from_secs(30);
+            let until = Instant::now() + workers::tests::PATIENCE;
             while matches!(*lock(&state), State::Working(_)) {
                 assert!(Instant::now() < until, "the build is over");
                 std::thread::sleep(Duration::from_millis(10));
