@@ -73,10 +73,12 @@ pub fn serve_with_dir(app: App, dir: &Path) -> (u16, Arc<App>) {
 }
 
 /// [`serve`], and the app served, for a test that asks it things as it serves.
+/// Its connections wait [`IDLE_TIMEOUT`] for a request.
 pub fn serve_shared(mut app: App) -> (u16, Arc<App>) {
     let listeners = server::bind(0).unwrap();
     let port = listeners[0].local_addr().unwrap().port();
     app.policy.port = port;
+    app.idle_timeout = IDLE_TIMEOUT;
     let app = Arc::new(app);
     let served = Arc::clone(&app);
     std::thread::spawn(move || server::serve(listeners, served));
@@ -134,6 +136,14 @@ pub fn request(port: u16, path: &str) -> String {
 /// that stops answering, or never closes a connection, into a failure that
 /// names the request instead of a run that hangs.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a test's bridge keeps an open connection waiting for a request,
+/// in place of [`bridge::http::IDLE_TIMEOUT`]. A loaded machine can stall a
+/// test between its connect and its write for longer than that; the bridge
+/// then closes the connection unanswered, as it should, and the test reads an
+/// empty answer or a reset, or finds the idle connections holding the
+/// connection cap gone (#217). No test's contract is that closing.
+pub const IDLE_TIMEOUT: Duration = WAIT_LIMIT;
 
 /// A connection to the bridge on `port` whose reads fail after
 /// [`ANSWER_TIMEOUT`] without a byte.

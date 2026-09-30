@@ -91,6 +91,9 @@ fn sniff_origin(head: &[u8]) -> Option<String> {
 pub struct Conn {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// How long to wait for a request to begin: [`IDLE_TIMEOUT`] unless
+    /// [`Conn::idle`] sets another.
+    idle: Duration,
 }
 
 impl Conn {
@@ -99,7 +102,14 @@ impl Conn {
         // by holding a small segment back for the client's delayed
         // acknowledgement, which costs 40 ms a request on Linux (#142).
         let _ = stream.set_nodelay(true);
-        Conn { stream, buf: Vec::new() }
+        Conn { stream, buf: Vec::new(), idle: IDLE_TIMEOUT }
+    }
+
+    /// The connection, waiting `idle` for each request to begin in place of
+    /// [`IDLE_TIMEOUT`].
+    pub fn idle(mut self, idle: Duration) -> Self {
+        self.idle = idle;
+        self
     }
 
     pub fn read_request(&mut self) -> Result<Request, Refusal> {
@@ -123,7 +133,7 @@ impl Conn {
                 return Err(too_large(&self.buf));
             }
             let timeout = match started {
-                None => IDLE_TIMEOUT.min(limit),
+                None => self.idle.min(limit),
                 Some(t) => match limit.checked_sub(t.elapsed()).filter(|d| !d.is_zero()) {
                     Some(left) => left,
                     None => return Err(ReadError::Dropped.quiet()),

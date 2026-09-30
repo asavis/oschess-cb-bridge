@@ -5,6 +5,7 @@ use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use cbformat::Error;
 use cbformat::game::RecordKind;
@@ -17,7 +18,7 @@ use crate::catalog::{Catalog, Entry, State};
 use crate::engine::{self, Engine, Limit, Search};
 use crate::explorer;
 use crate::foreground;
-use crate::http::{Request, Response};
+use crate::http::{IDLE_TIMEOUT, Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, not_found, ok, unavailable};
 use crate::rows::{LINE_BUFFER_BYTES, Lines, MAX_ROW_BYTES, Names, clip, row};
@@ -88,6 +89,11 @@ pub struct App {
     /// reached the bridge. The Windows app's first-run window stops waiting
     /// for it then.
     pub served: AtomicBool,
+    /// How long an open connection may wait for a request before the bridge
+    /// closes it: [`IDLE_TIMEOUT`]. The tests' bridges wait longer, since a
+    /// loaded machine can stall a test between its connect and its write
+    /// for longer than that (#217).
+    pub idle_timeout: Duration,
 }
 
 impl App {
@@ -95,7 +101,15 @@ impl App {
     /// between reads; a caller that needs either sets it with struct update
     /// syntax, `App { engine, ..App::new(..) }`.
     pub fn new(version: &'static str, policy: Policy, catalog: Catalog) -> App {
-        App { version, policy, catalog, between_reads: None, engine: Engine::none(), served: AtomicBool::new(false) }
+        App {
+            version,
+            policy,
+            catalog,
+            between_reads: None,
+            engine: Engine::none(),
+            served: AtomicBool::new(false),
+            idle_timeout: IDLE_TIMEOUT,
+        }
     }
 }
 

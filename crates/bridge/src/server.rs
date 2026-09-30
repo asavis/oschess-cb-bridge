@@ -120,7 +120,7 @@ fn refuse_busy(stream: TcpStream, accepted: Instant, app: &App) {
 /// open, for the caller to close.
 fn handle_connection(stream: TcpStream, app: &App) -> Conn {
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
-    let mut conn = Conn::new(stream);
+    let mut conn = Conn::new(stream).idle(app.idle_timeout);
     loop {
         let (mut response, keep_alive): (Response, bool) = match conn.read_request() {
             Ok(req) => (api::handle(app, &req), req.keep_alive),
