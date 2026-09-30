@@ -29,9 +29,6 @@ use super::stream::{Hit, Target};
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
-    // Asked for its explorer, the database is in use: the keeper rebuilds
-    // its index when it changes (#149).
-    app.catalog.explorer.mark_in_use(&entry.id);
     if req.param("variant").is_some_and(|v| v != "standard") {
         return unsupported();
     }
@@ -40,6 +37,10 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(board) => board,
         Err(answer) => return answer,
     };
+    // Asked for its explorer, the database is in use: the keeper rebuilds
+    // its index when it changes (#149). A request refused for its
+    // parameters does not ask for it.
+    app.catalog.explorer.mark_in_use(&entry.id);
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
@@ -423,7 +424,42 @@ fn top_game<S: Store>(db: &S, names: &mut Names<'_, S>, number: u32) -> Option<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Policy;
+    use crate::catalog::Catalog;
     use crate::explorer::format::Outcome;
+
+    /// An explorer request refused for its `variant` or its `fen` does not
+    /// mark its database in use; one that passes every check does, before
+    /// the database is opened (#181), as a list of a position does (#173).
+    #[test]
+    fn a_refused_request_marks_nothing_in_use() {
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-in-use-{}", std::process::id()));
+        let path = dir.join("Absent.2cbh");
+        let policy = Policy { port: 0, origins: Vec::new(), token: String::new() };
+        let app = App::new("test", policy, Catalog::new([path.clone()]));
+        let id = crate::catalog::id_of(&path);
+        let Some(entry) = app.catalog.get(&id) else { panic!("the database is not listed") };
+        let ask = |query: &str| route(&app, &entry, &Request::get(&format!("/v1/databases/{id}/explorer?{query}")));
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR+w+KQkq+-+0+1";
+        let with_variant = format!("fen={start}&variant=chess960");
+        for (query, status, code) in [
+            ("variant=chess960", 422, "unsupported"),
+            (with_variant.as_str(), 422, "unsupported"),
+            ("", 400, "bad_request"),
+            ("fen=nonsense", 400, "bad_request"),
+            ("fen=4k3/8/8/8/8/8/8/4KR1R+w+F+-+0+1", 422, "unsupported"),
+        ] {
+            let answer = ask(query);
+            let refused = answer.status == status && answer.body.contains(&format!(r#""code":"{code}""#));
+            assert!(refused, "{query}: {} {}", answer.status, answer.body);
+            assert!(!app.catalog.explorer.in_use(&id), "{query} marked the database in use");
+        }
+        let answer = ask(&format!("fen={start}&variant=standard"));
+        let missing =
+            r#"{"error":{"code":"database_unavailable","message":"The database is not ready","state":"missing"}}"#;
+        assert_eq!((answer.status, answer.body.as_str()), (409, missing));
+        assert!(app.catalog.explorer.in_use(&id));
+    }
 
     /// However many games a worker finds, what it keeps stays within what it
     /// reserved, and two workers' finds merge into the same answer as one's,
