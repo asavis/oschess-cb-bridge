@@ -347,6 +347,21 @@ mod tests {
             .expect("no free port from 20000 to 32767")
     }
 
+    /// A test bridge's port lies below the ports the system hands out for
+    /// port 0 and for connections, which Linux lists in
+    /// `ip_local_port_range`: so no other socket takes it between the look
+    /// and the start (#217).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_test_port_lies_below_the_dynamic_range() {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        let first: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+        for _ in 0..50 {
+            let port = free_port();
+            assert!((20000..first).contains(&port), "{port} is not below {first}");
+        }
+    }
+
     /// The port the settings of `dir` name.
     fn port_of(dir: &Path) -> u16 {
         config::load(&dir.join(config::FILE_NAME)).unwrap().port
