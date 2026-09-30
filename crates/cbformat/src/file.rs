@@ -9,17 +9,23 @@
 //! other files open, which that program may need next.
 //!
 //! A handle opened again at a file's path must be the file the database was
-//! opened on, which only an identity that no other file takes, then or
-//! later, can tell: the volume and 128-bit file id of NTFS and ReFS. Where a
-//! file has none, as an inode, which passes to another file once the last
-//! handle of the old one closes, or a FAT directory slot, the file keeps a
-//! handle for as long as it is open, as every file did before #241, and is
-//! never opened again at its path. ChessBase runs on Windows only.
+//! opened on, as it was then: the same volume and file id, the same size and
+//! the same time of last change. Only NTFS and ReFS give a file an id that
+//! no other file takes while that file lasts. NTFS gives an id again once
+//! the file's record has been reused 65,536 times, and then a file made with
+//! it would also need the same size and time of change, to 100 ns. A file
+//! that changed since the database was opened is refused too: the database's
+//! generation changed with it, and the catalog opens the database again.
+//! Where a file has no such id, the file keeps a handle for as long as it is
+//! open, as every file did before #241, and is never opened again at its
+//! path. An inode is one such id, since it passes to another file once the
+//! last handle of the old one closes, and a FAT directory slot is another.
+//! ChessBase runs on Windows only.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::{Error, Result};
 
@@ -41,14 +47,16 @@ pub struct DbFile {
 struct Inner {
     path: Box<Path>,
     source: Source,
+    /// How long the file keeps its handles after its last read: [`IDLE`].
+    idle: Duration,
     handles: Mutex<Handles>,
 }
 
 /// Where a reader that finds no spare handle gets one.
 enum Source {
-    /// The path, for a file whose identity no other file takes: a handle
-    /// opened there must have `identity`, as `identify` reads it. Between
-    /// reads, such a file holds no handle.
+    /// The path, for a file with an id no other file takes while it lasts:
+    /// a handle opened there must have `identity`, as `identify` reads it.
+    /// Between reads, such a file holds no handle.
     Path { identity: Identity, identify: Identify },
     /// A handle kept for as long as the file is open, which each reader opens
     /// again on Windows and the readers share elsewhere: for a file without
@@ -56,13 +64,30 @@ enum Source {
     Kept(Arc<File>),
 }
 
-/// Reads the identity of the file a handle has open, when it has one that no
-/// other file takes, then or later.
+/// Reads the identity of the file a handle has open, when the file has an id
+/// that no other file takes while it lasts.
 type Identify = fn(&File) -> std::io::Result<Option<Identity>>;
 
-/// Which file a handle has open: its volume and file id.
+/// Which file a handle has open, and as it is: its volume and file id, then
+/// its size and time of last change, the metadata a database's generation is
+/// made of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Identity(u64, u128);
+struct Identity {
+    volume: u64,
+    id: u128,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl Identity {
+    /// The identity of a file with the id `(volume, id)`, as `file` has it
+    /// open now. Elsewhere than on Windows only the tests give a file an id.
+    #[cfg(any(windows, test))]
+    fn of(file: &File, volume: u64, id: u128) -> std::io::Result<Identity> {
+        let m = file.metadata()?;
+        Ok(Identity { volume, id, len: m.len(), modified: m.modified().ok() })
+    }
+}
 
 /// The handles of a file that no read uses now, and when it was last read.
 struct Handles {
@@ -78,11 +103,12 @@ struct Handles {
 
 impl DbFile {
     pub fn open(path: PathBuf) -> Result<DbFile> {
-        DbFile::open_with(path, lasting_identity)
+        DbFile::open_with(path, lasting_identity, IDLE)
     }
 
-    /// [`DbFile::open`], reading the file's identity with `identify`.
-    fn open_with(path: PathBuf, identify: Identify) -> Result<DbFile> {
+    /// [`DbFile::open`], reading the file's identity with `identify`, and
+    /// keeping its handles for `idle` after its last read.
+    fn open_with(path: PathBuf, identify: Identify, idle: Duration) -> Result<DbFile> {
         let file = File::open(&path).map_err(|e| Error::Io(path.clone(), e))?;
         let identity = identify(&file).map_err(|e| Error::Io(path.clone(), e))?;
         let (source, first) = match identity {
@@ -92,6 +118,7 @@ impl DbFile {
         let inner = Arc::new(Inner {
             path: path.into_boxed_path(),
             source,
+            idle,
             handles: Mutex::new(Handles { spare: Vec::new(), last_read: Instant::now(), watched: false }),
         });
         if let Some(file) = first {
@@ -162,7 +189,9 @@ impl Inner {
             Source::Path { identity, identify } => {
                 let file = File::open(&self.path)?;
                 if identify(&file)?.as_ref() != Some(identity) {
-                    return Err(std::io::Error::other("the file was replaced since the database was opened"));
+                    return Err(std::io::Error::other(
+                        "the file changed or was replaced since the database was opened",
+                    ));
                 }
                 Ok(Arc::new(file))
             }
@@ -206,10 +235,11 @@ impl Inner {
     }
 
     /// Closes the handles no read uses when the file has not been read for
-    /// `idle` at `now`; whether the file still holds some, and stays watched.
-    fn close_idle(&self, now: Instant, idle: Duration) -> bool {
+    /// its idle time at `now`; whether the file still holds some, and stays
+    /// watched.
+    fn close_idle(&self, now: Instant) -> bool {
         let mut handles = lock(&self.handles);
-        if now.saturating_duration_since(handles.last_read) >= idle {
+        if now.saturating_duration_since(handles.last_read) >= self.idle {
             handles.spare.clear();
         }
         handles.watched = !handles.spare.is_empty();
@@ -243,7 +273,7 @@ fn close_idle_files() {
         }
         std::thread::sleep(TICK);
         let now = Instant::now();
-        lock(&CLOSER.watched).retain(|file| file.upgrade().is_some_and(|file| file.close_idle(now, IDLE)));
+        lock(&CLOSER.watched).retain(|file| file.upgrade().is_some_and(|file| file.close_idle(now)));
     }
 }
 
@@ -251,10 +281,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The volume and 128-bit id of the file `file` has open, on NTFS and ReFS,
-/// whose ids no other file of the volume takes; `None` on another file system
-/// or when the file system gives no id. FAT, for one, numbers a file by its
-/// directory slot, which a file made in its place takes over.
+/// The identity of the file `file` has open, with its volume and 128-bit id,
+/// on NTFS and ReFS, whose ids no other file of the volume takes while the
+/// file lasts; `None` on another file system or when the file system gives
+/// no id. FAT, for one, numbers a file by its directory slot, which a file
+/// made in its place takes over.
 #[cfg(windows)]
 fn lasting_identity(file: &File) -> std::io::Result<Option<Identity>> {
     use std::os::windows::io::{AsRawHandle, RawHandle};
@@ -314,7 +345,7 @@ fn lasting_identity(file: &File) -> std::io::Result<Option<Identity>> {
     if filled == 0 || !names_a_file(&info.id) {
         return Ok(None);
     }
-    Ok(Some(Identity(info.volume, u128::from_le_bytes(info.id))))
+    Identity::of(file, info.volume, u128::from_le_bytes(info.id)).map(Some)
 }
 
 /// Whether a 128-bit file id names a file: a file system without ids gives
@@ -418,18 +449,23 @@ mod tests {
     fn inode(file: &File) -> std::io::Result<Option<Identity>> {
         use std::os::unix::fs::MetadataExt;
         let m = file.metadata()?;
-        Ok(Some(Identity(m.dev(), u128::from(m.ino()))))
+        Identity::of(file, m.dev(), u128::from(m.ino())).map(Some)
     }
 
+    /// An idle time the closer never reaches in a test: the tests that close
+    /// idle handles by the clock of their own ([`close_now`]) use it, so that
+    /// the closer's thread never closes them first.
+    const LONG: Duration = Duration::from_secs(3600);
+
     /// `path` opened as a file with a lasting identity, which holds no handle
-    /// between reads: every file on Windows, where the test folder is on
-    /// NTFS; on Linux, by [`inode`].
-    fn open_by_path(path: &Path) -> DbFile {
+    /// between reads, kept for `idle` after the last: every file on Windows,
+    /// where the test folder is on NTFS; on Linux, by [`inode`].
+    fn open_by_path(path: &Path, idle: Duration) -> DbFile {
         #[cfg(windows)]
         let identify: Identify = lasting_identity;
         #[cfg(unix)]
         let identify: Identify = inode;
-        let f = DbFile::open_with(path.to_path_buf(), identify).unwrap();
+        let f = DbFile::open_with(path.to_path_buf(), identify, idle).unwrap();
         assert!(matches!(f.inner.source, Source::Path { .. }), "the file has no lasting identity");
         f
     }
@@ -437,7 +473,7 @@ mod tests {
     /// Closes `f`'s handles as the closer does once the file has been idle.
     fn close_now(f: &DbFile) {
         let last_read = lock(&f.inner.handles).last_read;
-        f.inner.close_idle(last_read + IDLE, IDLE);
+        f.inner.close_idle(last_read + f.inner.idle);
     }
 
     /// A file keeps its handles while it is read, holds none once idle, and
@@ -445,12 +481,12 @@ mod tests {
     #[test]
     fn an_idle_file_holds_no_handle_and_opens_one_again_to_read() {
         let path = temp("idle", b"0123456789");
-        let f = open_by_path(&path);
+        let f = open_by_path(&path, LONG);
         let mut buf = [0u8; 4];
         f.read_into(3, &mut buf).unwrap();
         assert_eq!(f.spare_handles(), 1, "the read left its handle");
         let last_read = lock(&f.inner.handles).last_read;
-        assert!(f.inner.close_idle(last_read + IDLE / 2, IDLE), "a file read just now keeps its handle");
+        assert!(f.inner.close_idle(last_read + LONG / 2), "a file read just now keeps its handle");
         assert_eq!(f.spare_handles(), 1);
         close_now(&f);
         assert_eq!(f.spare_handles(), 0, "an idle file holds no handle");
@@ -465,7 +501,7 @@ mod tests {
     #[test]
     fn the_closer_closes_the_handles_of_an_idle_file() {
         let path = temp("closer", b"0123456789");
-        let f = open_by_path(&path);
+        let f = open_by_path(&path, IDLE);
         f.read_into(0, &mut [0u8; 10]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(300);
         while f.spare_handles() > 0 {
@@ -483,21 +519,54 @@ mod tests {
     fn a_file_replaced_at_its_path_is_never_read_as_the_open_one() {
         let path = temp("renamed", b"first");
         let moved = path.with_extension("moved");
-        let f = open_by_path(&path);
+        let f = open_by_path(&path, LONG);
         std::fs::rename(&path, &moved).unwrap();
         std::fs::write(&path, b"other").unwrap();
         let mut buf = [0u8; 5];
-        // The closer may have closed the handle of the open by now.
-        match f.read_into(0, &mut buf) {
-            Ok(()) => assert_eq!(&buf, b"first"),
-            Err(e) => assert!(e.to_string().contains("replaced"), "{e}"),
-        }
+        f.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"first", "the handle of the open reads its file");
         close_now(&f);
         let refused = f.read_into(0, &mut buf).unwrap_err();
         assert!(refused.to_string().contains("replaced"), "{refused}");
         drop(f);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&moved).unwrap();
+    }
+
+    /// A file that changed since the database was opened is read while it
+    /// keeps a handle, and refused once that closed: the database it belongs
+    /// to is of an older generation, which the catalog opens again.
+    #[test]
+    fn a_file_changed_since_it_was_opened_is_refused_once_idle() {
+        use std::io::Write;
+        let path = temp("changed", b"first");
+        let f = open_by_path(&path, LONG);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b" game").unwrap();
+        let mut buf = [0u8; 5];
+        f.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"first");
+        close_now(&f);
+        let refused = f.read_into(0, &mut buf).unwrap_err();
+        assert!(refused.to_string().contains("changed"), "{refused}");
+        drop(f);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file deleted and made again at its path, once its handles closed,
+    /// is another file, refused whatever its bytes (Windows: on Linux, where
+    /// a new file may take the old one's inode, a file keeps its handle).
+    #[cfg(windows)]
+    #[test]
+    fn a_file_deleted_and_made_again_is_refused() {
+        let path = temp("remade", b"first");
+        let f = open_by_path(&path, LONG);
+        close_now(&f);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"first").unwrap();
+        let refused = f.read_into(0, &mut [0u8; 5]).unwrap_err();
+        assert!(refused.to_string().contains("replaced"), "{refused}");
+        drop(f);
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Where a file has no lasting identity, it keeps its handle and reads the
@@ -533,25 +602,22 @@ mod tests {
     fn readers_at_the_same_time_read_through_handles_of_their_own() {
         let bytes: Vec<u8> = (0..1u32 << 20).map(|i| (i * 7 % 251) as u8).collect();
         let path = temp("readers", &bytes);
-        let f = open_by_path(&path);
-        let most = std::sync::atomic::AtomicUsize::new(0);
+        let f = open_by_path(&path, LONG);
         std::thread::scope(|s| {
             for t in 0..8u64 {
-                let (f, bytes, most) = (&f, &bytes, &most);
+                let (f, bytes) = (&f, &bytes);
                 s.spawn(move || {
                     for i in 0..200u64 {
                         let at = (t * 131_071 + i * 4_099) % (bytes.len() as u64 - 4096);
                         let mut buf = [0u8; 4096];
                         f.read_into(at, &mut buf).unwrap();
                         assert_eq!(&buf[..], &bytes[at as usize..at as usize + 4096]);
-                        most.fetch_max(f.spare_handles(), std::sync::atomic::Ordering::Relaxed);
                     }
                 });
             }
         });
-        // The closer may close idle handles meanwhile, never more than 8 open.
-        let most = most.into_inner();
-        assert!((1..=8).contains(&most), "{most} spare handles");
+        let spare = f.spare_handles();
+        assert!((1..=8).contains(&spare), "{spare} spare handles");
         drop(f);
         std::fs::remove_file(&path).unwrap();
     }
@@ -570,7 +636,7 @@ mod tests {
     #[test]
     fn an_idle_file_lets_a_writer_open_it_alone() {
         let path = temp("alone", b"0123456789");
-        let f = open_by_path(&path);
+        let f = open_by_path(&path, LONG);
         f.with_handle(|_| {
             assert!(!opens_alone(&path), "a read holds a handle");
             Ok(())

@@ -186,11 +186,15 @@ snapshot to coordinate with. The bridge therefore promises:
   search, an index build or games, and for that quarter of a second after.
   Once the bridge is done with it, the save succeeds when made again. A read
   that meets a file ChessBase holds fails at once, as a read of an unreadable
-  file does. This needs files whose identity no other file takes later: NTFS
-  and ReFS give them one. On another file system, such as FAT, and on Linux
-  and macOS, a file opened again at its path could be another file. There,
-  the bridge keeps each file of an open database open, as every version
-  before did.
+  file does. A file opened again must be the one the database was opened on,
+  as it was then: the same volume, file id, size and time of last change. A
+  file that changed or was replaced since then is not read. The answer is
+  then the one for a read during a change, and a retry reads the database as
+  it is now. This needs file ids that no other file takes while the file
+  lasts, which NTFS and ReFS give. On another file system, such as FAT, and on
+  Linux and macOS, a file opened again at its path could be another file.
+  There, the bridge keeps each file of an open database open, as every
+  version before did.
 - **A list window is as stored at the moment it was read.** A window read while
   ChessBase edits a game may show one row from before that edit and another
   from after it; the next request shows the new state.
