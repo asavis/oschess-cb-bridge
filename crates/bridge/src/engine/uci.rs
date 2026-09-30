@@ -117,7 +117,14 @@ impl Process {
                         p.name = name.trim().chars().take(100).collect();
                     }
                 }
-                Err(_) => return Err("The file is not a UCI engine: it did not answer uciok".into()),
+                // The deadline passed while the engine wrote nothing more: the
+                // same failure as the check above, told the same way.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("The file is not a UCI engine: it did not answer uciok in time".into());
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("The file is not a UCI engine: it did not answer uciok".into());
+                }
             }
         }
         let options = [

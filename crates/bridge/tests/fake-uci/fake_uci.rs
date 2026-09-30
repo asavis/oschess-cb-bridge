@@ -7,6 +7,8 @@
 //! line and then nothing until it is stopped. Started under a name containing
 //! `chatty`, it answers `uci` with `id name` lines, never `uciok`, for as
 //! long as they can be written.
+//! Started under a name containing `silent`, it answers `uci` with nothing,
+//! and waits until its input ends.
 //!
 //! Its `nps` tells what it was set to (#58): `Threads` × 10⁹ + `Hash` × 10³ +
 //! how many `Threads` and `Hash` options it has been sent.
@@ -37,6 +39,9 @@ fn main() {
                 let words: Vec<&str> = command.split_whitespace().collect();
                 match words.as_slice() {
                     ["uci"] => {
+                        if std::env::args().next().is_some_and(|name| name.contains("silent")) {
+                            continue;
+                        }
                         if std::env::args().next().is_some_and(|name| name.contains("chatty")) {
                             while say(&format!("id name {}Engine", " ".repeat(60_000))) {}
                             return;

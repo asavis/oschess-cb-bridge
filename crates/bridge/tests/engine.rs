@@ -265,6 +265,24 @@ fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An engine that answers `uci` with nothing fails its handshake at the
+/// deadline, told as the deadline: the handshake's wait for a line ends there
+/// too, and a stalled engine meets it that way (#238's review).
+#[test]
+fn a_silent_engine_fails_its_handshake_at_its_deadline() {
+    let dir = std::env::temp_dir().join(format!("bridge-silent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let silent = dir.join(format!("fake-uci-silent{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-uci"), &silent).unwrap();
+    let (port, bridge) = start(Engine::new(EngineConfig::new(silent, Some(1), Some(16))));
+    bridge.app.engine.set_handshake(Duration::from_millis(300));
+    let lines = Analysis::open(port, "depth=1").rest();
+    let last = lines.last().unwrap_or_else(|| panic!("the handshake did not end within {WAIT_LIMIT:?}"));
+    assert!(has_members(last, r#""error":{"code":"engine_failed"}"#), "{lines:?}");
+    assert!(member(member(last, "error"), "message").contains("uciok in time"), "{last}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_idle_engine_ends_its_process() {
     let (port, bridge) = start(Engine::with_idle(fake(), Duration::from_millis(300)));
