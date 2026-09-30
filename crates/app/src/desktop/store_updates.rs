@@ -2,10 +2,10 @@
 //! update only while the app is closed, and the bridge runs in the tray all
 //! the time, so its copy would stay old. The app therefore looks for its own
 //! update through the Store API, on the direct channel's schedule, and
-//! installs it itself: silently when Windows allows it, as Windows closes the
-//! bridge and starts it again, and otherwise from the bridge's page in the
-//! Store. [`updates::store_step`] decides which, and
-//! [`updates::install_quietly`] keeps the silent install's order.
+//! installs it itself: silently when Windows allows it, and otherwise, when
+//! the user asks, through Windows' own dialog (#232); either way Windows
+//! closes the bridge and starts it again. [`updates::store_step`] decides
+//! which, and [`updates::install_store_update`] keeps the install's order.
 //!
 //! The Store does not say which version it installs: `StorePackageUpdate`
 //! names the package that has an update, not the update. So the notices name
@@ -22,10 +22,11 @@ use windows::Win32::System::Recovery::{REGISTER_APPLICATION_RESTART_FLAGS, Regis
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::core::{Interface, PCWSTR};
 
+use super::server::Shared;
 use super::shared;
 use super::windows::FLYOUT;
 use crate::channel::STORE_PAGE;
-use crate::updates::{self, StoreCalls, StoreStep};
+use crate::updates::{self, Installed, StoreCalls, StoreStep};
 
 /// What automatic looks told this run: `Some(false)` that an update waits,
 /// `Some(true)` that one is required. A notice is repeated only when it says
@@ -39,14 +40,28 @@ fn text(e: windows::core::Error) -> String {
     e.to_string()
 }
 
+/// Asks Windows to start the bridge again after it closes it for an install.
+fn register_restart() -> Result<(), String> {
+    unsafe { RegisterApplicationRestart(PCWSTR::null(), REGISTER_APPLICATION_RESTART_FLAGS(0)) }.map_err(text)
+}
+
+/// Waits until a Store install would lose no work and Windows would start the
+/// bridge again after it (`updates::store_ready`).
+fn wait_ready(shared: &Shared) {
+    while !updates::store_ready(&shared.view(), super::commands::installing(), super::updater::alive()) {
+        std::thread::sleep(READY_POLL);
+    }
+}
+
 /// Looks for an update through the Store and acts on it; `asked`: the user
-/// asked. A silent install closes the bridge, so this returns only when
-/// there was nothing to install, the Store page opened, the user was told,
-/// or something failed.
+/// asked. An install closes the bridge, so this returns only when there was
+/// nothing to install, the user declined Windows' dialog, the Store page
+/// opened, the user was told, or something failed.
 pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
     let context = StoreContext::GetDefault().map_err(text)?;
-    // A desktop app's Store context needs a window to own anything it shows;
-    // the flyout always exists, hidden until the tray mark is clicked.
+    // A desktop app's Store context needs a window to own anything it shows,
+    // Windows' update dialog included; the flyout always exists, hidden until
+    // the tray mark is clicked.
     if let Some(window) = app.get_webview_window(FLYOUT) {
         let hwnd = window.hwnd().map_err(|e| e.to_string())?;
         unsafe { context.cast::<IInitializeWithWindow>().map_err(text)?.Initialize(hwnd).map_err(text)? };
@@ -64,7 +79,34 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
             }
             Ok(())
         }
-        StoreStep::OpenStore => app.opener().open_url(STORE_PAGE, None::<&str>).map_err(|e| e.to_string()),
+        StoreStep::RequestInstall => {
+            let store = StoreCalls {
+                // The request downloads and installs in one call.
+                download: || Ok(true),
+                register_restart,
+                install: || {
+                    let state = context
+                        .RequestDownloadAndInstallStorePackageUpdatesAsync(&found)
+                        .and_then(|op| op.get())
+                        .and_then(|r| r.OverallState())
+                        .map_err(text)?;
+                    Ok(match state {
+                        StorePackageUpdateState::Completed => Installed::Completed,
+                        StorePackageUpdateState::Canceled => Installed::Declined,
+                        _ => Installed::Incomplete,
+                    })
+                },
+            };
+            let requested = shared.dir().and_then(|dir| {
+                updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || wait_ready(&shared))
+            });
+            // The Store page stays the way to update when Windows could not
+            // ask the user itself.
+            requested.or_else(|e| {
+                bridge::log!("update: {e}; opening the Store page");
+                app.opener().open_url(STORE_PAGE, None::<&str>).map_err(|e| e.to_string())
+            })
+        }
         StoreStep::Tell { mandatory } => {
             let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
             if told.is_none_or(|was| mandatory && !was) {
@@ -92,23 +134,19 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                             .and_then(|r| r.OverallState()),
                     )
                 },
-                register_restart: || {
-                    unsafe { RegisterApplicationRestart(PCWSTR::null(), REGISTER_APPLICATION_RESTART_FLAGS(0)) }
-                        .map_err(text)
-                },
+                register_restart,
                 install: || {
-                    completed(
+                    let done = completed(
                         context
                             .TrySilentDownloadAndInstallStorePackageUpdatesAsync(&found)
                             .and_then(|op| op.get())
                             .and_then(|r| r.OverallState()),
-                    )
+                    )?;
+                    Ok(if done { Installed::Completed } else { Installed::Incomplete })
                 },
             };
-            updates::install_quietly(&store, &dir, env!("CARGO_PKG_VERSION"), || {
-                while !updates::store_ready(&shared.view(), super::commands::installing(), super::updater::alive()) {
-                    std::thread::sleep(READY_POLL);
-                }
+            updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || {
+                wait_ready(&shared);
                 if asked {
                     super::updater::notify(app, strings.get("toast.update.installing.store").to_string(), "");
                 }

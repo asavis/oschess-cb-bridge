@@ -105,9 +105,12 @@ pub enum StoreStep {
     /// bridge is idle, then install; Windows closes the bridge and starts it
     /// again.
     InstallQuietly,
-    /// Windows would not install silently, and the user asked: the bridge's
-    /// page in the Microsoft Store opens, where «Update» installs it.
-    OpenStore,
+    /// Windows would not install silently, and the user asked (#232): wait
+    /// until the bridge is idle, then ask Windows to install, which shows its
+    /// own dialog; once the user accepts, Windows closes the bridge for the
+    /// install and starts it again. The bridge's page in the Microsoft Store
+    /// opens only when the request could not run.
+    RequestInstall,
     /// Windows would not install silently, and nobody asked: a notification
     /// says an update waits, or that it is required when the submission marks
     /// it mandatory.
@@ -121,6 +124,18 @@ pub fn store_ready(view: &View, installing: bool, alive: Duration) -> bool {
     idle(view, installing) && alive >= RESTARTABLE_AFTER
 }
 
+/// How a Store install that returned ended. Windows closes the bridge for an
+/// install that takes place, so the process that hears any of these runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Installed {
+    /// Windows reported the install complete anyway.
+    Completed,
+    /// The user declined it in Windows' dialog (#232): nothing failed.
+    Declined,
+    /// It did not complete.
+    Incomplete,
+}
+
 /// What installing a Store update needs from Windows, so that its order is
 /// tested without Windows (#153).
 pub trait StoreInstall {
@@ -129,9 +144,9 @@ pub trait StoreInstall {
     /// Asks Windows to start the bridge again after closing it.
     fn register_restart(&self) -> Result<(), String>;
     /// Installs the downloaded update; Windows closes the bridge for it, so
-    /// this returns only when the install did not take place: whether it
-    /// reported completion anyway.
-    fn install(&self) -> Result<bool, String>;
+    /// this returns only when the install did not take place, saying how it
+    /// ended.
+    fn install(&self) -> Result<Installed, String>;
 }
 
 /// A [`StoreInstall`] made of three calls, for a caller whose Windows types
@@ -146,7 +161,7 @@ impl<D, R, I> StoreInstall for StoreCalls<D, R, I>
 where
     D: Fn() -> Result<bool, String>,
     R: Fn() -> Result<(), String>,
-    I: Fn() -> Result<bool, String>,
+    I: Fn() -> Result<Installed, String>,
 {
     fn download(&self) -> Result<bool, String> {
         (self.download)()
@@ -154,17 +169,19 @@ where
     fn register_restart(&self) -> Result<(), String> {
         (self.register_restart)()
     }
-    fn install(&self) -> Result<bool, String> {
+    fn install(&self) -> Result<Installed, String> {
         (self.install)()
     }
 }
 
-/// Installs a Store update silently: it downloads first, then waits until
-/// `ready` (idle and restartable, [`store_ready`]) so that no work begun
-/// during the download is lost, notes where it started from in `dir`, asks
-/// for the restart and installs. A process still running after the install
-/// forgets the note.
-pub fn install_quietly(
+/// Installs a Store update, silently or through Windows' dialog (#232): it
+/// downloads first, then waits until `ready` (idle and restartable,
+/// [`store_ready`]) so that no work begun during the download is lost, notes
+/// where it started from in `dir`, asks for the restart and installs. A
+/// process still running after the install forgets the note. `Ok` when the
+/// install reported completion or the user declined it; the error says why
+/// it did not take place otherwise.
+pub fn install_store_update(
     store: &impl StoreInstall,
     dir: &Path,
     running: &str,
@@ -179,8 +196,8 @@ pub fn install_quietly(
     let installed = store.install();
     forget(dir);
     match installed? {
-        true => Ok(()),
-        false => Err("the Store install did not complete".into()),
+        Installed::Completed | Installed::Declined => Ok(()),
+        Installed::Incomplete => Err("the Store install did not complete".into()),
     }
 }
 
@@ -190,7 +207,7 @@ pub fn store_step(found: bool, silent: bool, mandatory: bool, asked: bool) -> St
     match (found, silent, asked) {
         (false, _, _) => StoreStep::Latest,
         (true, true, _) => StoreStep::InstallQuietly,
-        (true, false, true) => StoreStep::OpenStore,
+        (true, false, true) => StoreStep::RequestInstall,
         (true, false, false) => StoreStep::Tell { mandatory },
     }
 }
@@ -401,8 +418,8 @@ mod tests {
 
     /// What a Store look does: an update installs silently whenever Windows
     /// allows it, asked or not and mandatory or not; otherwise a look on
-    /// request opens the Store, and an automatic one tells, saying whether the
-    /// update is required.
+    /// request asks Windows to install it through its own dialog (#232), and
+    /// an automatic one tells, saying whether the update is required.
     #[test]
     fn a_store_look_installs_quietly_whenever_windows_allows_it() {
         use StoreStep::*;
@@ -410,10 +427,11 @@ mod tests {
         let cases = [
             (false, true, false, true, Latest),
             (false, false, true, false, Latest),
+            (false, false, false, true, Latest),
             (true, true, false, false, InstallQuietly),
             (true, true, true, true, InstallQuietly),
-            (true, false, false, true, OpenStore),
-            (true, false, true, true, OpenStore),
+            (true, false, false, true, RequestInstall),
+            (true, false, true, true, RequestInstall),
             (true, false, false, false, Tell { mandatory: false }),
             (true, false, true, false, Tell { mandatory: true }),
         ];
@@ -451,10 +469,10 @@ mod tests {
             self.events.borrow_mut().push("register".into());
             Ok(())
         }
-        fn install(&self) -> Result<bool, String> {
+        fn install(&self) -> Result<Installed, String> {
             let noted = std::fs::read_to_string(self.dir.join(FROM)).unwrap_or_default();
             self.events.borrow_mut().push(format!("install from {noted}"));
-            Ok(false)
+            Ok(Installed::Incomplete)
         }
     }
 
@@ -469,15 +487,54 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
         let store = FakeStore { events: &events, dir: &dir, downloaded: true };
-        let result = install_quietly(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into()));
+        let result = install_store_update(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into()));
         assert_eq!(result, Err("the Store install did not complete".into()));
         assert_eq!(*events.borrow(), ["download", "ready", "register", "install from 1.1.0"]);
         assert!(!dir.join(FROM).exists(), "a process still running forgets the note");
 
         events.borrow_mut().clear();
         let store = FakeStore { events: &events, dir: &dir, downloaded: false };
-        assert!(install_quietly(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into())).is_err());
+        assert!(install_store_update(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into())).is_err());
         assert_eq!(*events.borrow(), ["download"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request through Windows' dialog (#232) downloads in the call that
+    /// installs, so its own download is a no-op, and it keeps the silent
+    /// install's order: ready, note, restart, then the request. A user who
+    /// declines the dialog is no failure; a request that could not run is,
+    /// so that the Store page opens instead. A process still running
+    /// afterwards forgets the note either way.
+    #[test]
+    fn a_store_request_keeps_the_order_and_declining_it_is_no_failure() {
+        let dir = std::env::temp_dir().join(format!("bridge-app-store-request-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let request = |outcome: Result<Installed, String>| {
+            events.borrow_mut().clear();
+            let store = StoreCalls {
+                download: || Ok(true),
+                register_restart: || {
+                    events.borrow_mut().push("register".to_string());
+                    Ok(())
+                },
+                install: || {
+                    let noted = std::fs::read_to_string(dir.join(FROM)).unwrap_or_default();
+                    events.borrow_mut().push(format!("request from {noted}"));
+                    outcome.clone()
+                },
+            };
+            let result = install_store_update(&store, &dir, "1.2.0", || events.borrow_mut().push("ready".into()));
+            assert!(!dir.join(FROM).exists(), "a process still running forgets the note");
+            result
+        };
+        assert_eq!(request(Ok(Installed::Declined)), Ok(()));
+        assert_eq!(*events.borrow(), ["ready", "register", "request from 1.2.0"]);
+        assert_eq!(request(Ok(Installed::Completed)), Ok(()));
+        assert_eq!(request(Ok(Installed::Incomplete)), Err("the Store install did not complete".into()));
+        assert_eq!(request(Err("the dialog could not open".into())), Err("the dialog could not open".into()));
+        assert_eq!(*events.borrow(), ["ready", "register", "request from 1.2.0"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
