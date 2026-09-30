@@ -12,7 +12,7 @@ use cbformat::v2::{self, HEADER_RECORD_SIZE, MoveData, Record};
 use cbformat::view::Base;
 use cbformat::{Error, Result, cbh, pgnfile};
 
-use super::format::{NO_MOVE, Outcome, PRUNE_PLY, pack_move, structure};
+use super::format::{MAX_PLY, NO_MOVE, Outcome, pack_move, structure};
 use super::stream::{self, Departures, MAX_PLIES, SETUP_BYTES};
 use crate::store::{Head, Store};
 
@@ -31,7 +31,7 @@ pub struct Line {
     /// with the move played from it (`NO_MOVE` at the end) and its ply: a
     /// build counts them, and replays them from the move stream (#147).
     pub positions: Vec<(u64, u16, u8)>,
-    /// The structures the main line holds past [`PRUNE_PLY`], each once, in
+    /// The structures the main line holds past [`MAX_PLY`], each once, in
     /// the order it reaches them, which a build counts as well. A structure
     /// never comes back once it changed, so the last one is all a new one is
     /// compared with.
@@ -50,7 +50,7 @@ pub struct Line {
     /// The home pawns in the order the line lost them.
     pub departures: Departures,
     /// The position the walk is at, noted before its move is played: its
-    /// key, its structure past [`PRUNE_PLY`], and its home pawns.
+    /// key, its structure past [`MAX_PLY`], and its home pawns.
     here: u64,
     here_structure: u64,
     home: u16,
@@ -104,7 +104,7 @@ impl Line {
     /// Notes the position `board` at `ply`, before its move is played.
     fn at(&mut self, board: &Board, ply: u32) {
         self.here = board.hash();
-        if ply > u32::from(PRUNE_PLY) {
+        if ply > u32::from(MAX_PLY) {
             // Only a pawn's move or a capture changes a structure, and each
             // changes the pawns or the men.
             let now = (board.pieces(Piece::Pawn), board.occupied().count_ones());
@@ -128,7 +128,7 @@ impl Line {
         if ply <= u32::from(max_ply) {
             self.reach(self.here, mv, ply as u8);
         }
-        if ply > u32::from(PRUNE_PLY) {
+        if ply > u32::from(MAX_PLY) {
             let structure = self.here_structure;
             if self.structures.last() != Some(&structure) && self.structures.len() < MAX_STRUCTURES {
                 self.structures.push(structure);
@@ -723,7 +723,6 @@ pub fn average_elo(r: &impl Head) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::explorer::format::MAX_PLY;
 
     /// A classic game's walk keeps the 2CBH word of each main-line move, its
     /// castling as the standard castling word, and stops at the first move

@@ -32,12 +32,12 @@ use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
 use crate::search::workers::threads;
 
-use super::build::{Chunks, Counted, Out, PLANNED, Turns, from_bad};
+use super::build::{Chunks, Counted, Out, Passes, Turns, from_bad, plan_pass};
 use super::format::{
     BLOCK_DATA, BLOCK_ENTRY, BLOCK_KEYS, Block, Counts, KEY_ENTRY, MAX_BLOCK_DATA, MAX_PLY, NO_MOVE, TOP_GAMES,
-    encode_record, pack_move, part_of,
+    encode_record, order_moves, pack_move, part_of, rank_top,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, Room, grow, on_workers};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, grow, on_workers};
 use super::stream::{self, Stream};
 
 /// A position's run of entries this long or shorter is left as it is when a
@@ -397,50 +397,26 @@ pub(super) fn write(
     // The table: a block a part, and one for every 1,024 entries more, which
     // grows as it must.
     let table_bytes = BLOCK_ENTRY * (counts.len() + (total / 1024) as usize + 16);
-    let least = MIN_WORKER_ENTRIES * ENTRY_BYTES;
-    // The room of a worker whose pass starts at the largest part, which the
-    // passes take whenever the share holds it (`needed`).
+    // The room of a worker whose pass starts at the largest part (`needed`).
     let largest = (0..counts.len()).map(|part| needed(collected(part))).max().unwrap_or(MIN_WORKER_ENTRIES);
-    let largest = largest.saturating_mul(ENTRY_BYTES);
-    // Half the workers at most, as many as the share holds beside a quarter
-    // of it for the entries and beside that room, one at least.
-    let games = stream.header.records();
-    let rest = share.saturating_sub(table_bytes);
-    let fit = ((rest / 4 * 3).min(rest.saturating_sub(largest)) / WORKER_BYTES).max(1);
-    let want = threads().div_ceil(2).min(games.div_ceil(64) as usize).min(fit).max(1);
-    let room = share.checked_sub(table_bytes + want * WORKER_BYTES).ok_or(SearchError::TooLarge)?;
-    // No more than the entries take, twice over, and that room: a small
-    // database's build holds a little of the budget, however large its
-    // share, and takes one pass.
-    let entries: u64 = (0..counts.len()).map(collected).sum();
-    let usable = usize::try_from(entries).unwrap_or(usize::MAX).saturating_mul(2 * ENTRY_BYTES).saturating_add(largest);
-    let room = room.min(usable).min(limits.pass_bytes.unwrap_or(usize::MAX));
-    if room < least {
-        return Err(SearchError::TooLarge);
-    }
-    // The table's first room is reserved with the passes', so that the
-    // entries never take the room the table then waits for. While searches
-    // hold the budget, the passes take less room, but never less than the
-    // largest part's when the share holds it: the build waits for that
-    // rather than start a pass that a part alone would fill.
-    let (_memory, want, room) =
-        Room { fixed: table_bytes, each: WORKER_BYTES, workers: want, least: largest.clamp(least, room), room }
-            .reserve(progress)?;
-    let capacity = room / ENTRY_BYTES;
-    let want = want.min(capacity / MIN_WORKER_ENTRIES);
+    let passes = Passes {
+        table: table_bytes,
+        worker: WORKER_BYTES,
+        item: ENTRY_BYTES,
+        items: (0..counts.len()).map(collected).sum(),
+        least: MIN_WORKER_ENTRIES,
+        largest: largest.saturating_mul(ENTRY_BYTES),
+    };
+    let room = passes.room(share, threads(), stream.header.records(), limits.pass_bytes)?;
+    let (_memory, want, room) = room.reserve(progress)?;
+    let (capacity, want) = passes.capacity(room, want);
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let table_memory = Hold::default();
     let mut sink = Sink { at: out.offset, table, table_memory, keys: 0, blocks: 0, games: 0, progress };
     let mut first = 0;
     while first < counts.len() {
-        // As many parts as the room holds, but for a little, one at least.
-        let mut end = first;
-        let mut planned = 0;
-        while end < counts.len() && (end == first || planned + collected(end) <= (capacity * PLANNED / 100) as u64) {
-            planned += collected(end);
-            end += 1;
-        }
+        let (end, planned) = plan_pass(first, counts.len(), capacity, collected);
         let hi = AtomicUsize::new(end);
         progress.tree_passes.fetch_add(1, Ordering::Relaxed);
         let pass = Pass { stream, part_bits, first, hi: &hi, capacity, planned, folded, progress, limits };
@@ -494,8 +470,7 @@ impl Pass<'_> {
     fn collect(&self, want: usize) -> Result<Vec<Vec<Entry>>, SearchError> {
         let (first, last) = (self.stream.header.first_record, self.stream.header.last_record);
         let chunks = Chunks::new(first, last, want);
-        // Room for twice what a chunk adds, about.
-        let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
+        let spare = chunks.spare(self.planned);
         on_workers(want, self.progress, self.limits, |w| {
             let cap = self.capacity / w.count;
             let mut buf: Vec<Entry> = Vec::new();
@@ -833,19 +808,13 @@ impl Aggregate {
         if e.is_weighted() {
             return;
         }
-        // Higher rating first; among equal ratings, the later game.
-        let item = (e.elo(), e.game());
-        let at = self.top.partition_point(|&t| t > item);
-        if at < TOP_GAMES {
-            self.top.insert(at, item);
-            self.top.truncate(TOP_GAMES);
-        }
+        rank_top(&mut self.top, (e.elo(), e.game()));
     }
 
-    /// Writes the position `key` to `made`, its moves most played first,
+    /// Writes the position `key` to `made`, its moves in a record's order,
     /// and starts afresh.
     fn emit(&mut self, key: u64, made: &mut Blocks) -> Result<(), SearchError> {
-        self.moves.sort_unstable_by(|a, b| b.1.games.cmp(&a.1.games).then(a.0.cmp(&b.0)));
+        order_moves(&mut self.moves);
         made.push(key, &self.count, &self.moves, &self.top)?;
         made.games += self.count.games;
         self.count = Counts::default();

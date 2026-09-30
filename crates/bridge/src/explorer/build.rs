@@ -33,10 +33,8 @@ use crate::search::workers::threads;
 
 use super::deep;
 use super::file::{Bad, write_at};
-use super::format::{
-    DEEP_BLOCK_BITS, HEADER_LEN, Header, MAX_PLY, PRUNE_PLY, deep_bits, deep_bucket, part_bits, part_of,
-};
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, io, on_workers, opened, reserve};
+use super::format::{DEEP_BLOCK_BITS, HEADER_LEN, Header, MAX_PLY, deep_bits, deep_bucket, part_bits, part_of};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, Room, io, on_workers, opened, reserve};
 use super::source::{Line, Source, Workspace};
 use super::stream::{self, BATCH, Stream};
 use super::tree::{self, Shallow};
@@ -112,7 +110,7 @@ fn build_in(
     let deep = deep::write(&stream, &counted.postings, bits, &mut out, progress, share, limits)?;
     let header = Header {
         max_ply: MAX_PLY,
-        prune_ply: PRUNE_PLY,
+        prune_ply: MAX_PLY,
         first_record: plan.first,
         last_record: plan.last,
         generation: plan.generation,
@@ -343,7 +341,91 @@ fn read_games(
 }
 
 /// The share of a pass's room, in percent, that its plan fills.
-pub(super) const PLANNED: usize = 97;
+const PLANNED: usize = 97;
+
+/// The sizes of a section's passes, the tree's or the deep section's, which
+/// [`Passes::room`] plans within the build's share of the budget: what they
+/// hold beside the entries or postings they collect, and those. A section's
+/// passes take its units in order: the tree's parts of the keys, the deep
+/// section's blocks.
+pub(super) struct Passes {
+    /// The section's table, which the passes hold from the start.
+    pub table: usize,
+    /// What a worker holds besides its buffer.
+    pub worker: usize,
+    /// The bytes of an entry or a posting, and those the stream pass counted.
+    pub item: usize,
+    pub items: u64,
+    /// The fewest entries or postings a worker's buffer holds.
+    pub least: usize,
+    /// The room of a worker whose pass starts at the largest unit, which the
+    /// passes take whenever the share holds it; a worker's least room at
+    /// least, which is all that a section whose passes end inside a unit
+    /// needs.
+    pub largest: usize,
+}
+
+impl Passes {
+    /// What the passes reserve ([`Room::reserve`]) of the build's `share` of
+    /// the budget, for a database of `records` records, with `threads`
+    /// shared workers and at most `pass_bytes` of entries or postings in a
+    /// pass ([`Limits::pass_bytes`]). Half the workers at most, and one for
+    /// every 64 records at most: as many as the share holds beside a quarter
+    /// of it for the buffers and beside the largest unit's room, one at
+    /// least. The buffers take the rest of the share, but no more than the
+    /// entries or postings take, twice over, and that room: a small
+    /// database's build holds a little of the budget, however large its
+    /// share, and takes one pass. `TooLarge` when that is less than a
+    /// worker's least room.
+    pub fn room(
+        &self,
+        share: usize,
+        threads: usize,
+        records: u64,
+        pass_bytes: Option<usize>,
+    ) -> Result<Room, SearchError> {
+        let least = self.least * self.item;
+        let largest = self.largest.max(least);
+        let rest = share.saturating_sub(self.table);
+        let fit = ((rest / 4 * 3).min(rest.saturating_sub(largest)) / self.worker).max(1);
+        let workers = threads.div_ceil(2).min(records.div_ceil(64) as usize).min(fit).max(1);
+        let room = share.checked_sub(self.table + workers * self.worker).ok_or(SearchError::TooLarge)?;
+        let usable =
+            usize::try_from(self.items).unwrap_or(usize::MAX).saturating_mul(2 * self.item).saturating_add(largest);
+        let room = room.min(usable).min(pass_bytes.unwrap_or(usize::MAX));
+        if room < least {
+            return Err(SearchError::TooLarge);
+        }
+        // The table's first room is reserved with the passes', so that the
+        // buffers never take the room the table then waits for. While
+        // searches hold the budget, the passes take less room, but never
+        // less than the largest unit's when the share holds it: the build
+        // waits for that rather than start a pass that a unit alone would
+        // fill.
+        Ok(Room { fixed: self.table, each: self.worker, workers, least: largest.clamp(least, room), room })
+    }
+
+    /// The entries or postings that the buffers hold together in the `room`
+    /// reserved, and the workers of the `workers` reserved that each hold a
+    /// worker's least of them.
+    pub fn capacity(&self, room: usize, workers: usize) -> (usize, usize) {
+        let capacity = room / self.item;
+        (capacity, workers.min(capacity / self.least))
+    }
+}
+
+/// The units of a pass from `first` on, of a section's `units`, each of
+/// `count(unit)` entries or postings as the stream pass counted them: as many
+/// as `capacity` of them hold, but for a little ([`PLANNED`]), one at least.
+/// The unit after them, and the entries or postings planned.
+pub(super) fn plan_pass(first: usize, units: usize, capacity: usize, count: impl Fn(usize) -> u64) -> (usize, u64) {
+    let (mut end, mut planned) = (first, 0);
+    while end < units && (end == first || planned + count(end) <= (capacity * PLANNED / 100) as u64) {
+        planned += count(end);
+        end += 1;
+    }
+    (end, planned)
+}
 
 /// The games of a pass, handed to its workers a few at a time as each comes
 /// free.
@@ -351,6 +433,8 @@ pub(super) struct Chunks {
     next: AtomicU64,
     last: u64,
     size: u64,
+    /// The records of the pass.
+    records: u64,
     /// The workers still taking them.
     taking: AtomicU32,
 }
@@ -361,7 +445,8 @@ impl Chunks {
     pub fn new(first: u32, last: u32, workers: usize) -> Chunks {
         let records = (u64::from(last) + 1).saturating_sub(u64::from(first));
         let size = records.div_ceil(16 * workers.max(1) as u64).clamp(16, 1024);
-        Chunks { next: AtomicU64::new(u64::from(first)), last: u64::from(last), size, taking: AtomicU32::new(0) }
+        let next = AtomicU64::new(u64::from(first));
+        Chunks { next, last: u64::from(last), size, records, taking: AtomicU32::new(0) }
     }
 
     /// The next records to take, first and last; `None` once all are taken.
@@ -370,9 +455,12 @@ impl Chunks {
         (lo <= self.last).then(|| (lo as u32, (lo + self.size - 1).min(self.last) as u32))
     }
 
-    /// The records a chunk holds, the last one fewer.
-    pub fn size(&self) -> u64 {
-        self.size
+    /// The room a worker's buffer keeps free, in a pass that plans `planned`
+    /// entries or postings: twice what a chunk adds, about. A worker whose
+    /// buffer has less left takes no more chunks while another one does
+    /// ([`Taker`]).
+    pub fn spare(&self, planned: u64) -> usize {
+        (2 * planned * self.size).div_ceil(self.records.max(1)) as usize
     }
 
     /// A worker that starts taking chunks.
@@ -799,6 +887,55 @@ pub(crate) mod tests {
         drop(search);
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file is left");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A section's passes take half the workers at most, one for every 64
+    /// records at most, and as many as the share holds beside a quarter of it
+    /// for the buffers and beside the largest unit's room; the buffers take
+    /// the rest, but no more than the entries take twice over and that room,
+    /// nor than a pass may; a share without room for one worker and its least
+    /// is too small.
+    #[test]
+    fn passes_plan_their_room_within_the_share() {
+        let mb = 1 << 20;
+        let passes = Passes { table: mb, worker: 4 * mb, item: 16, items: 1 << 30, least: 64, largest: 0 };
+        let plan = |passes: &Passes, share: usize, records: u64, pass_bytes: Option<usize>| {
+            let room = passes.room(share, 32, records, pass_bytes).unwrap();
+            assert_eq!((room.fixed, room.each), (mb, 4 * mb));
+            (room.workers, room.least, room.room)
+        };
+        assert_eq!(plan(&passes, 1 << 34, 10_000_000, None), (16, 1024, (1 << 34) - 65 * mb));
+        assert_eq!(plan(&passes, 1 << 34, 200, None).0, 4, "a worker for every 64 records");
+        // Three workers fit beside a quarter of 16 MiB, two beside a largest
+        // unit's 8 MiB, which the passes then take whatever searches hold.
+        assert_eq!(plan(&passes, 17 * mb, 10_000_000, None), (3, 1024, 4 * mb));
+        let crowded = Passes { largest: 8 * mb, ..passes };
+        assert_eq!(plan(&crowded, 17 * mb, 10_000_000, None), (2, 8 * mb, 8 * mb));
+        let few = Passes { items: 1_000, ..passes };
+        assert_eq!(plan(&few, 1 << 34, 10_000_000, None), (16, 1024, 1_000 * 32 + 1024));
+        assert_eq!(plan(&passes, 1 << 34, 10_000_000, Some(4096)), (16, 1024, 4096));
+        for share in [5 * mb + 1023, 5 * mb - 1, 0] {
+            assert!(matches!(passes.room(share, 32, 10_000_000, None), Err(SearchError::TooLarge)), "{share}");
+        }
+        assert!(matches!(passes.room(1 << 34, 32, 10_000_000, Some(1023)), Err(SearchError::TooLarge)));
+        // Each worker kept holds a worker's least of the entries.
+        assert_eq!(passes.capacity(4 * mb, 3), (1 << 18, 3));
+        assert_eq!(passes.capacity(2048, 3), (128, 2));
+    }
+
+    /// A pass plans the units that nearly fill its room, one at least,
+    /// however large; and a worker's buffer keeps room for about twice what
+    /// a chunk of the pass adds.
+    #[test]
+    fn a_pass_plans_its_units() {
+        let counts = [5, 5, 100, 5, 0];
+        let count = |unit: usize| counts[unit];
+        assert_eq!(plan_pass(0, counts.len(), 12, count), (2, 10), "11 of 12 planned");
+        assert_eq!(plan_pass(2, counts.len(), 12, count), (3, 100), "one at least");
+        assert_eq!(plan_pass(3, counts.len(), 12, count), (5, 5));
+        assert_eq!(plan_pass(3, counts.len(), 0, count), (4, 5));
+        assert_eq!(Chunks::new(1, 1_000, 4).spare(500), 16);
+        assert_eq!(Chunks::new(5, 4, 1).spare(500), 16_000, "no records");
     }
 
     /// A worker whose buffer is full leaves the chunks to the others while

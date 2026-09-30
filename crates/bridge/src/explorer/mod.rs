@@ -24,7 +24,7 @@ pub mod source;
 pub mod stream;
 mod tree;
 
-pub use answer::{board, deep, ready, rebuilding, render, route, stats, uci, unsupported};
+pub use answer::{board, deep_stats, ready, rebuilding, render, route, stats, uci, unsupported};
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -40,7 +40,7 @@ use crate::search::SearchError;
 
 use build::Plan;
 use file::{Bad, IndexFile};
-use format::{MAX_PLY, PRUNE_PLY, Stats};
+use format::{MAX_PLY, Stats};
 use runs::{Limits, Progress, Timings, opened};
 use schedule::{Kind, Ran, Scheduler};
 use source::Source;
@@ -176,8 +176,7 @@ enum Kept {
     /// `<id>.idx` or `<id>.moves`: a database's index or its move stream.
     Index,
     /// `<id>.idx.partial` or `<id>.moves.partial`: a build's work, which
-    /// only the build running for `<id>` uses; or the `<id>.build` folder,
-    /// the work of a build of a version before #147.
+    /// only the build running for `<id>` uses.
     Work,
 }
 
@@ -190,7 +189,7 @@ pub fn is_index_file(name: &str) -> bool {
 /// The database id and kind of an index folder entry; `None` for anything
 /// the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
-    let (id, kind) = indexdir::db_id(name, &[".idx", ".moves", ".idx.partial", ".moves.partial", ".build"])?;
+    let (id, kind) = indexdir::db_id(name, &[".idx", ".moves", ".idx.partial", ".moves.partial"])?;
     Some((id, if kind < 2 { Kept::Index } else { Kept::Work }))
 }
 
@@ -388,9 +387,6 @@ impl Registry {
                         unlisted.still(id);
                     }
                 }
-                Kept::Work if path.is_dir() => {
-                    let _ = std::fs::remove_dir_all(&path);
-                }
                 Kept::Work => {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -544,11 +540,10 @@ fn index(
         Ok(None) => {}
     }
     // The files there can never answer again: they go before the build takes
-    // their room, and so does the work of an older version's build. A stream
-    // still mapped on Windows stays until the build replaces it.
+    // their room. A stream still mapped on Windows stays until the build
+    // replaces it.
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&moves);
-    let _ = std::fs::remove_dir_all(dir.join(format!("{id}.build")));
     let plan = Plan { first: 1, last: count, generation };
     let header = build::build_with(db, &plan, &path, progress, limits).map_err(Failure::Build)?;
     let file = opened(progress, || IndexFile::open(&path)).map_err(Failure::Open)?;
@@ -611,7 +606,7 @@ fn current(path: &Path, generation: u64, records: u32) -> Result<Option<Loaded>,
         Ok(file)
             if file.header.generation == generation
                 && file.header.max_ply == MAX_PLY
-                && file.header.prune_ply == PRUNE_PLY
+                && file.header.prune_ply == MAX_PLY
                 && file.header.first_record == 1
                 && file.header.last_record == records =>
         {
@@ -651,7 +646,7 @@ fn kept(path: &Path, generation: u64, records: u32) -> bool {
         (Some(i), Some(m)) => {
             i.generation == generation
                 && i.max_ply == MAX_PLY
-                && i.prune_ply == PRUNE_PLY
+                && i.prune_ply == MAX_PLY
                 && i.first_record == 1
                 && i.last_record == records
                 && m.generation == generation
@@ -998,10 +993,6 @@ mod tests {
         ] {
             touch(&name);
         }
-        for id in [gone, building, listed.as_str()] {
-            std::fs::create_dir_all(dir.join(format!("{id}.build")).join("runs")).unwrap();
-            std::fs::write(dir.join(format!("{id}.build")).join("runs").join("0"), b"run").unwrap();
-        }
         *lock(&catalog.explorer.state(building)) = State::Working(Arc::new(Progress::default()));
         let names = || {
             let mut n: Vec<String> =
@@ -1015,7 +1006,6 @@ mod tests {
             format!("{listed}.moves.old"),
             format!("{gone}.idx"),
             format!("{gone}.moves"),
-            format!("{building}.build"),
             format!("{building}.idx"),
             format!("{building}.moves"),
             format!("{building}.idx.partial"),
@@ -1041,11 +1031,7 @@ mod tests {
         *lock(&catalog.explorer.state(building)) = State::Idle;
         catalog.set_sweep_grace(indexdir::SWEEP_GRACE);
         catalog.sweep_indexes();
-        keep.retain(|n| {
-            !n.starts_with(&format!("{building}.build"))
-                && n != &format!("{building}.idx.partial")
-                && n != &format!("{building}.moves.partial")
-        });
+        keep.retain(|n| n != &format!("{building}.idx.partial") && n != &format!("{building}.moves.partial"));
         assert_eq!(names(), keep);
         std::fs::remove_dir_all(&dir).unwrap();
     }

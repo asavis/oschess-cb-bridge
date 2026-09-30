@@ -22,7 +22,7 @@ use crate::search::workers::{self, threads};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
-use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, structure, unpack_move};
+use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, order_moves, rank_top, structure, unpack_move};
 use super::runs::Progress;
 use super::source::average_elo;
 use super::stream::{Hit, Target};
@@ -196,7 +196,7 @@ impl Found {
     fn add(&mut self, mv: u16, counts: &Counts, best: (u16, u32), first: u32) {
         self.counts.merge(counts);
         self.add_move(Played { mv, counts: *counts, first });
-        self.rank(best);
+        rank_top(&mut self.top, best);
     }
 
     fn add_move(&mut self, played: Played) {
@@ -213,21 +213,13 @@ impl Found {
         }
     }
 
-    fn rank(&mut self, best: (u16, u32)) {
-        let at = self.top.partition_point(|&b| b > best);
-        if at < TOP_GAMES {
-            self.top.insert(at, best);
-            self.top.truncate(TOP_GAMES);
-        }
-    }
-
     fn merge(&mut self, other: &Found) {
         self.counts.merge(&other.counts);
         for &played in &other.moves {
             self.add_move(played);
         }
         for &best in &other.top {
-            self.rank(best);
+            rank_top(&mut self.top, best);
         }
     }
 
@@ -249,10 +241,10 @@ impl Found {
 /// counts once, with the move it played from its first visit.
 /// Counts add, moves add by code, and the notable games are the best of
 /// both, by rating, then number. `None` when no game reaches the position.
-/// Errors as [`deep`]'s, and `Corrupt` when the sums count more games than
-/// the index holds.
+/// Errors as [`deep_stats`]'s, and `Corrupt` when the sums count more games
+/// than the index holds.
 pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
-    let Some(mut tree) = loaded.lookup(board.hash())? else { return deep(loaded, board, cancel) };
+    let Some(mut tree) = loaded.lookup(board.hash())? else { return deep_stats(loaded, board, cancel) };
     let target = Target::of(board).beyond(loaded.base.header.max_ply);
     let Some(found) = replay(loaded, board, &target, true, cancel)? else { return Ok(Some(tree)) };
     tree.counts = sum(&tree.counts, &found.counts, loaded.games())?;
@@ -262,15 +254,12 @@ pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<S
             None => tree.moves.push((played.mv, played.counts)),
         }
     }
-    // Most played first, then by code, as the tree orders them.
-    tree.moves.sort_unstable_by(|a, b| b.1.games.cmp(&a.1.games).then(a.0.cmp(&b.0)));
+    order_moves(&mut tree.moves);
     // The tree ranks its games by the rating their stream entries keep.
     let mut top = found.top;
     for &game in &tree.top {
-        top.push((loaded.stream.entry(game)?.elo(), game));
+        rank_top(&mut top, (loaded.stream.entry(game)?.elo(), game));
     }
-    top.sort_unstable_by(|a, b| b.cmp(a));
-    top.truncate(TOP_GAMES);
     tree.top = top.iter().map(|b| b.1).collect();
     Ok(Some(tree))
 }
@@ -289,7 +278,7 @@ fn sum(a: &Counts, b: &Counts, games: u64) -> Result<Counts, Bad> {
 /// games have. `None` when none does. A replay stops at its next game once
 /// `cancel` is, and the answer is then `Busy`; a stream found damaged is
 /// `Corrupt`.
-pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
+pub fn deep_stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
     Ok(replay(loaded, board, &Target::of(board), false, cancel)?.map(Found::into_stats))
 }
 

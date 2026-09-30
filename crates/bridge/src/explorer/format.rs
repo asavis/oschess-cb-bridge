@@ -37,9 +37,6 @@ pub const TOP_GAMES: usize = 12;
 /// them, with the moves played from them. Every position past it is found
 /// through the deep section.
 pub const MAX_PLY: u8 = 20;
-/// The ply beyond which a position reached by one game only would be
-/// dropped: the tree's depth, so that none is (#147).
-pub const PRUNE_PLY: u8 = MAX_PLY;
 /// Buckets per deep block: a lookup reads one block, a few KiB, and walks to
 /// its bucket.
 pub const DEEP_BLOCK_BITS: u8 = 8;
@@ -52,6 +49,9 @@ pub const DEEP_BLOCK_ENTRY: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub max_ply: u8,
+    /// The ply beyond which a position reached by one game only was dropped
+    /// before version 5: the tree's depth, [`MAX_PLY`], since, so that none
+    /// is (#147). The byte stays in the header.
     pub prune_ply: u8,
     /// Records `first_record..=last_record` are indexed.
     pub first_record: u32,
@@ -289,6 +289,27 @@ impl Stats {
             top.push(u32::try_from(read_varint(b, &mut at)?).ok()?);
         }
         Some(Stats { counts: total, moves, top })
+    }
+}
+
+/// Puts a position's `moves` in the order its record holds them: most played
+/// first, then by code. The tree writes its records so, and an answer that
+/// adds games to a record orders its moves so again.
+#[inline]
+pub fn order_moves(moves: &mut [(u16, Counts)]) {
+    moves.sort_unstable_by(|a, b| b.1.games.cmp(&a.1.games).then(a.0.cmp(&b.0)));
+}
+
+/// Ranks `game`, its rating and number, among a position's notable games
+/// `top`, best first, which keeps [`TOP_GAMES`] of them: the higher rating
+/// first, and among equal ratings the later game. `top` has room for one
+/// more, which it takes while `game` is ranked.
+#[inline]
+pub fn rank_top(top: &mut Vec<(u16, u32)>, game: (u16, u32)) {
+    let at = top.partition_point(|&t| t > game);
+    if at < TOP_GAMES {
+        top.insert(at, game);
+        top.truncate(TOP_GAMES);
     }
 }
 
@@ -655,7 +676,7 @@ mod tests {
         }
         let h = Header {
             max_ply: MAX_PLY,
-            prune_ply: PRUNE_PLY,
+            prune_ply: MAX_PLY,
             first_record: 1,
             last_record: 99,
             generation: 5,

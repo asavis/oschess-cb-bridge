@@ -43,12 +43,12 @@ use crate::search::SearchError;
 use crate::search::memory::Refused;
 use crate::search::workers::threads;
 
-use super::build::{Chunks, Out, PLANNED, Turns, from_bad};
+use super::build::{Chunks, Out, Passes, Turns, from_bad, plan_pass};
 use super::format::{
-    DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, PRUNE_PLY, STRUCTURE_PIECES, deep_bucket, deep_print,
-    piece_shift, read_varint, structure_of, structures_in_vectors, structures_of, varint,
+    DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, STRUCTURE_PIECES, deep_bucket, deep_print, piece_shift,
+    read_varint, structure_of, structures_in_vectors, structures_of, varint,
 };
-use super::runs::{Limits, PassTime, Progress, Room, on_workers};
+use super::runs::{Limits, PassTime, Progress, on_workers};
 use super::source::MAX_STRUCTURES;
 use super::stream::{self, Stream};
 
@@ -369,42 +369,30 @@ pub(super) fn write(
     share: usize,
     limits: &Limits,
 ) -> Result<Section, SearchError> {
-    progress.start("structures", counts.iter().sum());
-    let table_bytes = counts.len() * DEEP_BLOCK_ENTRY;
-    // Half the workers at most, as many as the share holds beside a quarter
-    // of it for the postings, one at least.
-    let games = stream.header.records();
-    let fit = (share.saturating_sub(table_bytes) / 4 * 3 / WORKER_BYTES).max(1);
-    let want = threads().div_ceil(2).min(games.div_ceil(64) as usize).min(fit).max(1);
-    let room = share.checked_sub(table_bytes + want * WORKER_BYTES).ok_or(SearchError::TooLarge)?;
-    let least = MIN_WORKER_POSTINGS * 8;
-    // No more than the postings take, twice over: a small database's build
-    // holds a little of the budget, however large its share, and takes one
-    // pass.
     let postings: u64 = counts.iter().sum();
-    let usable = usize::try_from(postings).unwrap_or(usize::MAX).saturating_mul(2 * 8).saturating_add(least);
-    let room = room.min(usable).min(limits.pass_bytes.unwrap_or(usize::MAX));
-    if room < least {
-        return Err(SearchError::TooLarge);
-    }
-    let (_memory, want, room) =
-        Room { fixed: table_bytes, each: WORKER_BYTES, workers: want, least, room }.reserve(progress)?;
-    let capacity = room / 8;
-    let want = want.min(capacity / MIN_WORKER_POSTINGS);
+    progress.start("structures", postings);
+    let table_bytes = counts.len() * DEEP_BLOCK_ENTRY;
+    // A pass ends inside a bucket that alone fills the room ([`make_room`]),
+    // so a worker needs its least room, whatever the largest block.
+    let passes = Passes {
+        table: table_bytes,
+        worker: WORKER_BYTES,
+        item: 8,
+        items: postings,
+        least: MIN_WORKER_POSTINGS,
+        largest: 0,
+    };
+    let room = passes.room(share, threads(), stream.header.records(), limits.pass_bytes)?;
+    let (_memory, want, room) = room.reserve(progress)?;
+    let (capacity, want) = passes.capacity(room, want);
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let mut sink = Sink { at: out.offset, table, start: 0, crc: !0, postings: 0 };
     let (mut lo, mut split) = (0, Split::default());
     while lo < block_point(counts.len() as u64) {
-        // As many blocks as the room holds, but for a little, one at least,
-        // the one the last pass ended in counted whole.
-        let mut end = (lo >> (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)) as usize;
-        let first = end;
-        let mut planned = 0;
-        while end < counts.len() && (end == first || planned + counts[end] <= (capacity * PLANNED / 100) as u64) {
-            planned += counts[end];
-            end += 1;
-        }
+        // From the block the last pass ended in, counted whole.
+        let first = (lo >> (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)) as usize;
+        let (end, planned) = plan_pass(first, counts.len(), capacity, |block| counts[block]);
         let hi = AtomicU64::new(block_point(end as u64));
         progress.deep_passes.fetch_add(1, Ordering::Relaxed);
         let rest = AtomicU64::new(0);
@@ -481,8 +469,7 @@ impl Pass<'_> {
     fn collect(&self, want: usize) -> Result<Vec<Vec<u64>>, SearchError> {
         let (first, last) = (self.stream.header.first_record, self.stream.header.last_record);
         let chunks = Chunks::new(first, last, want);
-        // Room for twice what a chunk adds, about.
-        let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
+        let spare = chunks.spare(self.planned);
         on_workers(want, self.progress, self.limits, |w| {
             let cap = self.capacity / w.count;
             let mut kept = Kept {
@@ -524,7 +511,7 @@ impl Pass<'_> {
         let path = &self.stream.path;
         let record = self.stream.written(game).map_err(|e| from_bad(path, e))?;
         let entry = record.entry;
-        if !entry.indexed() || entry.plies <= u16::from(PRUNE_PLY) {
+        if !entry.indexed() || entry.plies <= u16::from(MAX_PLY) {
             return Ok(());
         }
         let start = record.start().map_err(|e| from_bad(path, e))?;
@@ -533,7 +520,7 @@ impl Pass<'_> {
         // The tree's plies hold no structure of the section: they are the
         // prefix's words, and the words past it follow ply 21, beyond the
         // tree's plies.
-        const { assert!(stream::PREFIX_WORDS == PRUNE_PLY as usize + 1 && PRUNE_PLY >= MAX_PLY) };
+        const { assert!(stream::PREFIX_WORDS == MAX_PLY as usize + 1) };
         let (prefix, past) = record.word_parts();
         line.play_all(prefix).ok_or_else(word)?;
         let within = Within::of(self.lo, self.hi.load(Ordering::Relaxed), self.bits, game);

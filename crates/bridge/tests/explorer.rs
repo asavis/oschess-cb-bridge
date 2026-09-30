@@ -694,7 +694,7 @@ fn every_position_of_every_game_is_found_at_any_depth() {
     let find = |ucis: &str| {
         let board = board_after(ucis);
         assert!(idx.lookup(board.hash()).unwrap().is_none(), "the tree does not hold it: {ucis}");
-        explorer::deep(&idx, &board, &Cancel::never()).unwrap()
+        explorer::deep_stats(&idx, &board, &Cancel::never()).unwrap()
     };
 
     // Ply 21, reached by game 1 alone, the first past the tree.
@@ -765,7 +765,7 @@ fn a_crowded_bucket_is_counted_whole() {
     let idx = prepared(&db, &dir);
     let board = board_after(&long);
     assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree's depth");
-    let stats = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    let stats = explorer::deep_stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
     assert_eq!(stats.counts.games, n as u64);
     assert_eq!(stats.counts.white + stats.counts.draws + stats.counts.black, n as u64);
     // The best rated first: the last games written.
@@ -827,7 +827,7 @@ fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
         (0..3)
             .map(|_| {
                 let at = Instant::now();
-                let stats = explorer::deep(&idx, board, &Cancel::never()).unwrap();
+                let stats = explorer::deep_stats(&idx, board, &Cancel::never()).unwrap();
                 (at.elapsed(), stats.map(|s| s.counts.games))
             })
             .min()
@@ -974,7 +974,7 @@ fn a_set_up_start_is_stored_and_replayed() {
         board.play_checked(uci.parse().unwrap()).unwrap();
     }
     assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree");
-    let found = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    let found = explorer::deep_stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
     assert_eq!(found.counts, Counts { games: 1, white: 0, draws: 1, black: 0 });
     assert_eq!(found.lookup_move("e8d8"), Some(1));
     drop(idx);
@@ -1050,7 +1050,7 @@ fn the_longest_line_is_replayed_to_its_end() {
     assert_eq!(idx.stream.entry(1).unwrap().plies, u16::MAX);
     let last = board_after(&format!("{}d2d4 g8f6 c1f4", hops(16_383)));
     assert!(idx.lookup(last.hash()).unwrap().is_none(), "past the tree");
-    let found = explorer::deep(&idx, &last, &Cancel::never()).unwrap().unwrap();
+    let found = explorer::deep_stats(&idx, &last, &Cancel::never()).unwrap().unwrap();
     assert_eq!(found.counts, Counts { games: 1, white: 1, draws: 0, black: 0 });
     assert!(found.moves.is_empty(), "the line ends there");
     drop(idx);
@@ -1341,7 +1341,7 @@ fn a_stream_of_many_blocks_holds_every_game() {
         let ucis = if ucis.is_empty() { long.as_str() } else { ucis };
         assert_eq!(idx.stream.game(n).unwrap().words, stream_words(None, ucis), "game {n}");
     }
-    let found = explorer::deep(&idx, &board_after(&long), &Cancel::never()).unwrap().unwrap();
+    let found = explorer::deep_stats(&idx, &board_after(&long), &Cancel::never()).unwrap().unwrap();
     assert_eq!(found.counts.games, u64::from(games / 3));
     drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1367,7 +1367,8 @@ fn files_from_different_builds_are_rebuilt() {
         let again = explorer::prepare(&d, 1, &dir, "db", &progress).unwrap();
         assert_eq!(progress.phase(), "structures", "{name} of another build: built again");
         assert_eq!(again.stream.header.build_id, again.base.header.build_id);
-        let alone = explorer::deep(&again, &board_after(&format!("e2e4 e7e5 {}d2d3", hops(15))), &Cancel::never());
+        let alone =
+            explorer::deep_stats(&again, &board_after(&format!("e2e4 e7e5 {}d2d3", hops(15))), &Cancel::never());
         assert_eq!(alone.unwrap().unwrap().counts.games, 1);
     }
     // A stream missing: both are built again.
@@ -1405,7 +1406,8 @@ fn positions_after_a_promotion_are_found() {
     for (i, p) in promotions.iter().enumerate() {
         let board = board_after(&format!("{before} {p}"));
         assert!(idx.lookup(board.hash()).unwrap().is_none(), "past the tree: {p}");
-        let found = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap_or_else(|| panic!("{p} not found"));
+        let found =
+            explorer::deep_stats(&idx, &board, &Cancel::never()).unwrap().unwrap_or_else(|| panic!("{p} not found"));
         assert_eq!((found.counts.games, found.top.clone()), (1, vec![i as u32 + 1]), "{p}");
         assert_eq!(found.lookup_move("f8e7"), Some(1), "{p}");
     }
@@ -1435,9 +1437,9 @@ fn a_superseded_replay_stops() {
     let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let old = Cancel::newest(&latest);
     let board = board_after(&long);
-    assert_eq!(explorer::deep(&idx, &board, &old).unwrap().unwrap().counts.games, 300);
+    assert_eq!(explorer::deep_stats(&idx, &board, &old).unwrap().unwrap().counts.games, 300);
     let _newer = Cancel::newest(&latest);
-    assert!(matches!(explorer::deep(&idx, &board, &old), Err(Bad::Busy)));
+    assert!(matches!(explorer::deep_stats(&idx, &board, &old), Err(Bad::Busy)));
     drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1576,7 +1578,7 @@ fn a_game_reaching_a_position_within_and_beyond_the_tree_counts_once() {
     assert_eq!(all.top, vec![2, 3, 1]);
     // The same games, all of them, whichever part counts them: game 2 at
     // ply 2 and game 3 at ply 42, each once.
-    let every = explorer::deep(&idx, &board, &Cancel::never()).unwrap().unwrap();
+    let every = explorer::deep_stats(&idx, &board, &Cancel::never()).unwrap().unwrap();
     assert_eq!((every.counts.games, every.lookup_move("g1f3")), (2, Some(2)), "game 1 is too short for the bucket");
     drop(idx);
     std::fs::remove_dir_all(&dir).unwrap();

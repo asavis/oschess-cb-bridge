@@ -222,7 +222,7 @@ pub(super) fn write_at(file: &File, mut offset: u64, mut buf: &[u8]) -> std::io:
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::explorer::format::{MAX_PLY, PRUNE_PLY};
+    use crate::explorer::format::MAX_PLY;
 
     /// A header that is valid by its own CRC but claims a table of 33,554,432
     /// blocks, in a sparse file of the length it names: refused before the
@@ -235,7 +235,7 @@ mod tests {
         let deep_offset = table_offset + u64::from(blocks) * BLOCK_ENTRY as u64;
         let h = Header {
             max_ply: MAX_PLY,
-            prune_ply: PRUNE_PLY,
+            prune_ply: MAX_PLY,
             first_record: 1,
             last_record: 1,
             generation: 1,
