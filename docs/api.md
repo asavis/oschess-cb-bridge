@@ -149,7 +149,8 @@ with them.
   normalised path. It is stable while the path stays the same. The path itself
   is never sent.
 - A database's `generation` is an opaque string that changes whenever the bridge
-  sees the database's files change (sizes or modification times). Responses
+  sees the database's files change: their sizes, their modification times, or
+  the files themselves, as when one is replaced by a copy (#241). Responses
   that depend on the contents carry the generation they were read at. A client
   that sees it change in the middle of paging through a list starts the list
   again. The files are those the bridge reads: `.2cbh`, `.2cbg`, `.2cba`,
@@ -189,8 +190,8 @@ snapshot to coordinate with. The bridge therefore promises:
   file does. A file opened again must be the one the database was opened on,
   as it was then: the same volume, file id, size and time of last change. A
   file that changed or was replaced since then is not read. The answer is
-  then the one for a read during a change, and a retry reads the database as
-  it is now. This needs file ids that no other file takes while the file
+  then the one for a read during a change. The database's generation changed
+  with the file, so a retry reads the database as it is now. This needs file ids that no other file takes while the file
   lasts, which NTFS and ReFS give. On another file system, such as FAT, and on
   Linux and macOS, a file opened again at its path could be another file.
   There, the bridge keeps each file of an open database open, as every

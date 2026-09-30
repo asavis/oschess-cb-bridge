@@ -289,12 +289,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(windows)]
 fn lasting_identity(file: &File) -> std::io::Result<Option<Identity>> {
     use std::os::windows::io::{AsRawHandle, RawHandle};
-    /// FILE_ID_INFO.
-    #[repr(C)]
-    struct FileIdInfo {
-        volume: u64,
-        id: [u8; 16],
-    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetVolumeInformationByHandleW(
@@ -307,10 +301,7 @@ fn lasting_identity(file: &File) -> std::io::Result<Option<Identity>> {
             file_system_name: *mut u16,
             file_system_name_size: u32,
         ) -> i32;
-        fn GetFileInformationByHandleEx(file: RawHandle, class: i32, information: *mut FileIdInfo, size: u32) -> i32;
     }
-    /// FILE_INFO_BY_HANDLE_CLASS's FileIdInfo.
-    const FILE_ID_INFO: i32 = 18;
     // MAX_PATH + 1, the most the call writes.
     let mut name = [0u16; 261];
     let null = std::ptr::null_mut();
@@ -336,16 +327,58 @@ fn lasting_identity(file: &File) -> std::io::Result<Option<Identity>> {
     if !name.eq_ignore_ascii_case("NTFS") && !name.eq_ignore_ascii_case("ReFS") {
         return Ok(None);
     }
+    match file_id_info(file) {
+        Some((volume, id)) if names_a_file(&id) => Identity::of(file, volume, u128::from_le_bytes(id)).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// The volume serial and 128-bit id of the file `file` has open, as
+/// FileIdInfo gives them; `None` when the file system gives none.
+#[cfg(windows)]
+fn file_id_info(file: &File) -> Option<(u64, [u8; 16])> {
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+    /// FILE_ID_INFO.
+    #[repr(C)]
+    struct FileIdInfo {
+        volume: u64,
+        id: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(file: RawHandle, class: i32, information: *mut FileIdInfo, size: u32) -> i32;
+    }
+    /// FILE_INFO_BY_HANDLE_CLASS's FileIdInfo.
+    const FILE_ID_INFO: i32 = 18;
     let mut info = FileIdInfo { volume: 0, id: [0; 16] };
-    // SAFETY: as above, and `info` has the size and layout of the
-    // structure the call fills.
+    // SAFETY: `file` holds its handle open for the whole call, and `info`
+    // has the size and layout of the structure the call fills.
     let filled = unsafe {
         GetFileInformationByHandleEx(file.as_raw_handle(), FILE_ID_INFO, &mut info, size_of::<FileIdInfo>() as u32)
     };
-    if filled == 0 || !names_a_file(&info.id) {
-        return Ok(None);
-    }
-    Identity::of(file, info.volume, u128::from_le_bytes(info.id)).map(Some)
+    (filled != 0).then_some((info.volume, info.id))
+}
+
+/// The volume and id of the file at `path`, whose metadata `meta` is, for a
+/// database's generation: a file put at the path in place of another, even
+/// one of the same size and time of change, has other ones (#241). On
+/// Windows they are read through a handle that asks for no access to the
+/// file's contents, which no program's sharing refuses or is refused by, and
+/// which reads nothing of a file kept in the cloud. `None` where they cannot
+/// be read.
+#[cfg(windows)]
+pub fn file_id(path: &Path, _meta: &std::fs::Metadata) -> Option<(u64, u128)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+    let file = std::fs::OpenOptions::new().access_mode(0).share_mode(0x7).open(path).ok()?;
+    file_id_info(&file).map(|(volume, id)| (volume, u128::from_le_bytes(id)))
+}
+
+/// [`file_id`] elsewhere: the device and inode, from the metadata.
+#[cfg(unix)]
+pub fn file_id(_path: &Path, meta: &std::fs::Metadata) -> Option<(u64, u128)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), u128::from(meta.ino())))
 }
 
 /// Whether a 128-bit file id names a file: a file system without ids gives

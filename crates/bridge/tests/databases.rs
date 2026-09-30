@@ -1031,6 +1031,34 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A database file replaced by a copy of the same bytes, size and time of
+/// change is read again at the next request: its generation changes with the
+/// file, so the catalog opens the database again rather than keep one whose
+/// file is refused as replaced, and answer `503 database_changing` for good
+/// (#241). On Windows the copy is made once the bridge holds none of the
+/// files, which is when a file is opened again at its path.
+#[test]
+fn a_file_replaced_by_a_copy_is_read_again() {
+    use common::{answered, fixture, index_dir, start_with_dir, without_generation};
+    let db = fixture("replaced-copy", &[]);
+    let path = db.dir().join("db.2cbh");
+    let dir = index_dir("replaced-copy");
+    let (port, _app) = start_with_dir([path.clone()], &dir);
+    let games = format!("/v1/databases/{}/games", id_of(&path));
+    let first = answered(port, &games);
+    #[cfg(windows)]
+    common::until("the header file is let go", common::WAIT_LIMIT, || opens_alone(&path));
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let moved = path.with_extension("moved");
+    std::fs::rename(&path, &moved).unwrap();
+    std::fs::write(&path, std::fs::read(&moved).unwrap()).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+    let again = answered(port, &games);
+    assert_ne!(first, again, "the generation is new");
+    assert_eq!(without_generation(&first), without_generation(&again));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Whether `file` opens for a writer that shares it with nobody, as ChessBase
 /// opens a database to save a game: whether no handle holds it.
 #[cfg(windows)]

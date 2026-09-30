@@ -347,8 +347,12 @@ impl Drop for Done {
 /// The metadata of the database at `path`, of `format`: its generation and
 /// files, the ones its reader opens ([`cbformat::view::Format::files`]), so
 /// that the search boosters and other optional classic files are neither
-/// read nor downloaded. Metadata only, following links: nothing is opened. A
-/// PGN database is its one file; another file has no generation.
+/// read nor downloaded. Metadata only, following links: nothing is read. Each
+/// file's id goes in with its size and time of change, so that a file put in
+/// place of another, even one of the same size and time, gives a new
+/// generation (#241). On Windows the id is read through a handle that asks
+/// for no access to the file's contents (`cbformat::file::file_id`). A PGN
+/// database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let mut hash = Hash::new();
     let mut files = Files { generation: None, present: Vec::new(), irregular: false, modified: None };
@@ -367,6 +371,7 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
             }
             Ok(m) => {
                 hash.write_meta(&m);
+                hash.write_id(cbformat::file::file_id(&path, &m));
                 files.modified = files.modified.max(m.modified().ok());
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
@@ -638,6 +643,18 @@ impl Hash {
         self.write(&modified.map_or(0, |d| d.as_nanos()).to_le_bytes());
     }
 
+    /// A file's volume and id, or a marker when they are not known.
+    fn write_id(&mut self, id: Option<(u64, u128)>) {
+        match id {
+            Some((volume, id)) => {
+                self.write(&[1]);
+                self.write(&volume.to_le_bytes());
+                self.write(&id.to_le_bytes());
+            }
+            None => self.write(&[0]),
+        }
+    }
+
     /// [`Hash::write_meta`] of the file at `path`, or a marker when it is missing.
     pub(crate) fn write_file(&mut self, path: &Path) {
         match std::fs::metadata(path) {
@@ -688,12 +705,34 @@ mod tests {
         // The version salt is what rebuilds the caches of an unchanged PGN
         // file once its reading changes: without it the generation is the
         // file's metadata alone.
+        let meta = std::fs::metadata(&path).unwrap();
         let mut metadata = Hash::new();
-        metadata.write_meta(&std::fs::metadata(&path).unwrap());
+        metadata.write_meta(&meta);
+        metadata.write_id(cbformat::file::file_id(&path, &meta));
         assert_ne!(generation, metadata.finish());
         let mut salted = Hash::new();
         salted.write(&cbformat::pgnfile::VERSION.to_le_bytes());
-        salted.write_meta(&std::fs::metadata(&path).unwrap());
+        salted.write_meta(&meta);
+        salted.write_id(cbformat::file::file_id(&path, &meta));
         assert_eq!(generation, salted.finish());
+    }
+
+    /// A file put in place of another, of the same bytes, size and time of
+    /// change, gives the database a new generation, so that the catalog opens
+    /// it again rather than keep one whose file was replaced (#241).
+    #[test]
+    fn a_file_replaced_by_a_copy_gives_a_new_generation() {
+        let f = cbformat::fixture::pgn_file("catalog-replaced", b"[White \"A\"]\n\n1. e4 *\n");
+        let path = f.dir().join("db.pgn");
+        let before = generation_of(&path, Format::Pgn, &System).generation.unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let moved = path.with_extension("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, std::fs::read(&moved).unwrap()).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let after = generation_of(&path, Format::Pgn, &System).generation.unwrap();
+        assert_ne!(before, after);
+        std::fs::remove_file(&moved).unwrap();
     }
 }
