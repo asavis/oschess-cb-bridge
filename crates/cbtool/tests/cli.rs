@@ -6,6 +6,7 @@ use std::process::Command;
 use cbformat::fixture::{Builder, DbItems, TempDb, annotations, lid_header, quiet, text};
 use cbformat::game::language;
 use cbformat::movetable::{self, Color, Piece};
+use cbformat::view::Format;
 
 /// A one-game database (1.e4) with an empty entity file.
 fn fixture(name: &str) -> TempDb {
@@ -142,7 +143,8 @@ fn databases_lists_the_window_and_the_state_of_each_entry() {
 }
 
 /// A database whose header is here but a companion file is not is reported
-/// with the companion's state and never opened: its record count stays `-`.
+/// with the companion's state and never opened: its record count stays `-`,
+/// also when another companion is missing, as the bridge reports it.
 /// Zero-block files stand for placeholders, which needs a Unix file system.
 #[cfg(unix)]
 #[test]
@@ -160,6 +162,8 @@ fn databases_never_opens_a_database_with_an_offline_companion() {
     hollow(&f.dir().join("db.2lid"));
     assert_eq!(row(), ["1", "2cbh", "cloud-only?", "3", "-", "Db"]);
     std::fs::remove_file(f.dir().join("db.2cbg")).unwrap();
+    assert_eq!(row(), ["1", "2cbh", "cloud-only?", "3", "-", "Db"]);
+    std::fs::remove_file(f.dir().join("db.2cbh")).unwrap();
     assert_eq!(row(), ["1", "2cbh", "missing", "3", "-", "Db"]);
 }
 
@@ -199,9 +203,9 @@ fn listed_classic(name: &str) -> TempDb {
 }
 
 /// A classic database is checked through every file its reader opens, as the
-/// bridge checks it: without its moves or one of its entity files it is
-/// missing, and without its annotations it is present. A present one is
-/// opened for its record count.
+/// bridge checks it: without its moves or one of its entity files it cannot
+/// be opened, and without its annotations it can. A present one is opened for
+/// its record count; without its main file it is missing.
 #[test]
 fn databases_checks_every_file_of_a_classic_database() {
     let f = listed_classic("cli-databases-classic");
@@ -210,11 +214,62 @@ fn databases_checks_every_file_of_a_classic_database() {
         let file = f.dir().join(name);
         let saved = std::fs::read(&file).unwrap();
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(first_database(f.dir()), ["1", "cbh", "missing", "5", "-", "Old"], "without {name}");
+        assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "unreadable", "Old"], "without {name}");
         std::fs::write(&file, saved).unwrap();
     }
     std::fs::remove_file(f.dir().join("db.cba")).unwrap();
     assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
+    std::fs::remove_file(f.dir().join("db.cbh")).unwrap();
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "missing", "5", "-", "Old"]);
+}
+
+/// `cbtool databases` decides whether a database is there and can be opened
+/// as the bridge's catalog decides it (#192): for a 2CBH and a classic
+/// database with each of their files removed in turn, and then a directory
+/// in its place, the row says what the bridge says. Only the main file
+/// decides whether a database is missing; a required companion missing makes
+/// it unreadable, and an optional one changes nothing.
+#[test]
+fn databases_decides_availability_as_the_bridge_does() {
+    use bridge::catalog::{Catalog, State};
+    let two = fixture_with("databases-as-the-bridge", 3, None);
+    let mut list = DbItems::new();
+    list.section("2cbg").database(two.dir().join("db.2cbh").to_str().unwrap(), "Db", [0, 28, 3, 1, 1037620, 1037559]);
+    std::fs::write(two.dir().join("DBItems.cbini"), list.bytes()).unwrap();
+    let classic = listed_classic("cli-databases-classic-as-the-bridge");
+    let cases = [(two.dir().join("db.2cbh"), Format::TwoCbh), (classic.dir().join("db.cbh"), Format::Cbh)];
+    for (path, format) in cases {
+        let dir = path.parent().unwrap();
+        let agree = |what: &str| {
+            let row = first_database(dir);
+            let bridge = Catalog::new([path.clone()]).entries()[0].state();
+            let (state, records) = (row[2].as_str(), row[4].as_str());
+            let same = match bridge {
+                State::Ready => state == "present" && records.parse::<u32>().is_ok(),
+                State::Missing => state == "missing" && records == "-",
+                State::Unreadable => {
+                    (state, records) == ("unreadable", "-") || (state, records) == ("present", "unreadable")
+                }
+                _ => false,
+            };
+            assert!(same, "{what}: cbtool lists {state} with records {records}, the bridge {}", bridge.name());
+        };
+        agree("every file");
+        let mut checked = 0;
+        for (file, _) in format.files(&path) {
+            let Ok(saved) = std::fs::read(&file) else { continue };
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            std::fs::remove_file(&file).unwrap();
+            agree(&format!("without {name}"));
+            std::fs::create_dir(&file).unwrap();
+            agree(&format!("with a directory for {name}"));
+            std::fs::remove_dir(&file).unwrap();
+            std::fs::write(&file, saved).unwrap();
+            checked += 1;
+        }
+        assert!(checked >= 4, "{checked} files of {} checked", path.display());
+        agree("every file again");
+    }
 }
 
 /// A classic database whose moves are kept only in the cloud is reported so
@@ -228,8 +283,8 @@ fn databases_never_opens_a_classic_database_with_offline_moves() {
     assert_eq!(first_database(f.dir()), ["1", "cbh", "cloud-only?", "5", "-", "Old"]);
 }
 
-/// A classic database whose moves are over 4 GiB is missing without its
-/// `.cbj`, which its reader then needs, and present with it. The move file is
+/// A classic database whose moves are over 4 GiB cannot be opened without its
+/// `.cbj`, which its reader then needs, and can with it. The move file is
 /// made sparse past 4 GiB, which needs a Unix file system; its first block
 /// keeps its data, so that it is not taken for a placeholder.
 #[cfg(unix)]
@@ -242,7 +297,7 @@ fn databases_requires_the_cbj_of_a_classic_database_over_4_gib() {
     assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "2", "Old"]);
     cbg.set_len(u64::from(u32::MAX) + 1).unwrap();
     assert_ne!(cbg.metadata().unwrap().blocks(), 0, "db.cbg holds no data");
-    assert_eq!(first_database(f.dir()), ["1", "cbh", "missing", "5", "-", "Old"]);
+    assert_eq!(first_database(f.dir()), ["1", "cbh", "present", "5", "unreadable", "Old"]);
     // A header of 64-bit offsets for no game: each keeps its `.cbh` offsets.
     let mut cbj = Vec::new();
     for v in [11i32, 120, 0] {
