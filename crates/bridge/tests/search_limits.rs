@@ -5,10 +5,13 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::search::Indexes;
+use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
@@ -39,12 +42,55 @@ impl Sparse {
     /// Sends `query` on its own connection.
     fn send(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
         let (port, path) = (self.bridge.port, format!("/v1/databases/{}/games?{query}", self.id));
-        std::thread::spawn(move || get(port, &path))
+        std::thread::spawn(move || unbusy(port, &path))
     }
 
     fn get(&self, query: &str) -> (u16, String) {
-        get(self.bridge.port, &format!("/v1/databases/{}/games?{query}", self.id))
+        unbusy(self.bridge.port, &format!("/v1/databases/{}/games?{query}", self.id))
     }
+}
+
+/// Busy answers [`unbusy`] asked again, for the test that shows it does.
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// `get`, asked again while the bridge answers `503 busy`, up to the suite's
+/// patience. The search memory and the workers are the process's: this
+/// binary's other tests can hold them for longer than a search waits for
+/// them on a loaded machine, and busy is the bridge's answer to that, not
+/// the answer these tests are about (#238).
+fn unbusy(port: u16, path: &str) -> (u16, String) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let (status, out) = get(port, path);
+        if status != 503 || !out.contains(r#""code":"busy""#) || Instant::now() >= deadline {
+            return (status, out);
+        }
+        BUSY.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A search answered busy while other work holds the search memory is asked
+/// again, and served once the memory is free: the seam of [`unbusy`].
+#[test]
+fn a_search_answered_busy_is_asked_again() {
+    let s = serve_sparse("limits-busy", 100_000);
+    let before = BUSY.load(Ordering::SeqCst);
+    // Every byte of the budget not held yet, so a search can reserve none.
+    let all = loop {
+        if let Ok(hold) = Hold::reserve(budget().saturating_sub(held())) {
+            break hold;
+        }
+    };
+    let search = s.send("q=needle");
+    let started = Instant::now();
+    while BUSY.load(Ordering::SeqCst) == before && !search.is_finished() {
+        assert!(started.elapsed() < WAIT_LIMIT, "no search was answered busy");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(all);
+    let (status, out) = search.join().unwrap();
+    assert_eq!(status, 200, "{out}");
 }
 
 /// A search with `q` in a stream makes the one still running in the same
