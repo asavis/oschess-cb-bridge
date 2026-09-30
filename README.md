@@ -164,7 +164,10 @@ The `--index` folder stands for the bridge's data folder: every index the
 child bridge builds, a PGN file's header index included, goes there as it
 would in the data folder, the position indexes in its `index` folder, and
 nothing goes into the data folder or the index folder themselves, so another
-run starts cold again with a new folder.
+run starts cold again with a new folder. The bridges after the first read the
+files the ones before wrote there, each started once the one before has
+ended, and the output records their lives among its rows: `bridge N started`
+before the Nth bridge starts, and `bridge N ended` once it has ended (#239).
 
 It prints only timings and counts, and for a failed answer its status and the
 bridge's error code; never a name, game, query or path, so its output can go
