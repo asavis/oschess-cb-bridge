@@ -44,10 +44,11 @@ const BUSY_QUEUE: usize = 64;
 /// would otherwise leave a thread draining for each answer (review of #231).
 const MAX_DRAINING: usize = MAX_CONNECTIONS;
 /// How long after acceptance the busy answer may wait for a request head, to
-/// read its `Origin`. The deadline runs from acceptance, not from the moment the
-/// refusing thread reaches the connection, so silent connections ahead in the
-/// queue cannot add their wait to the ones behind them.
-const BUSY_READ: Duration = Duration::from_millis(500);
+/// read its `Origin`, unless [`App::busy_read`] sets another. The deadline
+/// runs from acceptance, not from the moment the refusing thread reaches the
+/// connection, so silent connections ahead in the queue cannot add their wait
+/// to the ones behind them.
+pub const BUSY_READ: Duration = Duration::from_millis(500);
 /// What a connection past its deadline still gets: a read of the bytes already
 /// there, enough for a request that arrived in time.
 const BUSY_LAST_LOOK: Duration = Duration::from_millis(5);
@@ -129,12 +130,13 @@ impl Drop for Active {
 }
 
 /// Answers a connection over the cap `503 busy`. The request head is read
-/// until [`BUSY_READ`] after acceptance, so that an allowed page can read the
-/// answer and its retry delay through CORS.
+/// until [`App::busy_read`] after acceptance, and its first byte no longer
+/// than the app's idle wait, so that an allowed page can read the answer and
+/// its retry delay through CORS.
 fn refuse_busy(stream: TcpStream, accepted: Instant, app: &App) {
     let _ = stream.set_write_timeout(Some(BUSY_READ));
-    let mut conn = Conn::new(stream);
-    let wait = BUSY_READ.saturating_sub(accepted.elapsed()).max(BUSY_LAST_LOOK);
+    let mut conn = Conn::new(stream).idle(app.idle_timeout);
+    let wait = app.busy_read.saturating_sub(accepted.elapsed()).max(BUSY_LAST_LOOK);
     let origin = match conn.read_request_within(wait) {
         Ok(req) => req.header("origin").map(str::to_string),
         Err(refusal) => refusal.origin,
@@ -183,6 +185,16 @@ mod tests {
     use super::*;
     use crate::access::{DEFAULT_ORIGINS, Policy};
     use crate::catalog::Catalog;
+    use crate::search::workers::tests::PATIENCE;
+
+    /// A test's app on `port`, whose connections wait [`PATIENCE`] for a
+    /// request: a loaded machine can stall a test between its connect and its
+    /// write for longer than [`crate::http::IDLE_TIMEOUT`], which these tests
+    /// are not about (#217).
+    fn app_on(port: u16) -> App {
+        let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) };
+        App { idle_timeout: PATIENCE, ..App::new("test", policy, Catalog::new(Vec::new())) }
+    }
 
     /// A client that has read a connection to its end may open another at
     /// once: the slot is free before the socket closes. Freed after the close,
@@ -192,8 +204,7 @@ mod tests {
     fn a_connection_stops_counting_before_its_client_sees_it_close() {
         let listener = bind(0).unwrap().remove(0);
         let port = listener.local_addr().unwrap().port();
-        let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) };
-        let app = Arc::new(App::new("test", policy, Catalog::new(Vec::new())));
+        let app = Arc::new(app_on(port));
         let active = Arc::new(AtomicUsize::new(0));
         let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);
         let counted = active.clone();
@@ -220,8 +231,7 @@ mod tests {
     fn draining_connections_are_bounded() {
         let listener = bind(0).unwrap().remove(0);
         let port = listener.local_addr().unwrap().port();
-        let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) };
-        let app = Arc::new(App::new("test", policy, Catalog::new(Vec::new())));
+        let app = Arc::new(app_on(port));
         let draining = Arc::new(AtomicUsize::new(0));
         let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);
         let counted = draining.clone();
@@ -238,5 +248,54 @@ mod tests {
             kept.push(stream);
         }
         assert_eq!(draining.load(Ordering::SeqCst), MAX_DRAINING, "the first ones drain, the rest closed at once");
+    }
+
+    /// The busy answer waits for a request until [`App::busy_read`] after
+    /// the connection was accepted, not after the busy thread reaches it: a
+    /// connection accepted as long ago gets a last look only, so silent
+    /// connections queued ahead of a request add nothing to its wait, and an
+    /// allowed page's request that arrived in time is still read, its
+    /// `Origin` with it (#238). A busy read twice the test's patience tells
+    /// the two apart however slow the machine is: from acceptance, every
+    /// connection is answered at once; from the moment the thread reaches it,
+    /// the first silent one alone would hold it for the whole busy read, past
+    /// the patience of the request behind. The app's idle wait, which also
+    /// bounds the wait for a first byte, is as long. A test that timed the
+    /// answer failed under load.
+    #[test]
+    fn the_busy_wait_runs_from_acceptance() {
+        let busy_read = PATIENCE * 2;
+        let Some(accepted_at) = Instant::now().checked_sub(busy_read) else {
+            eprintln!("skipped: this computer's clock does not go back {busy_read:?}");
+            return;
+        };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Arc::new(App { busy_read, idle_timeout: busy_read, ..app_on(port) });
+        // The silent ones first, then the request: each accepted before the
+        // next connects, so that none overtakes another.
+        let (mut silent, mut accepted) = (Vec::new(), Vec::new());
+        for _ in 0..12 {
+            silent.push(TcpStream::connect(("127.0.0.1", port)).unwrap());
+            accepted.push(listener.accept().unwrap().0);
+        }
+        let mut asking = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let origin = DEFAULT_ORIGINS[0];
+        let request = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\n\r\n");
+        asking.write_all(request.as_bytes()).unwrap();
+        asking.set_read_timeout(Some(PATIENCE)).unwrap();
+        accepted.push(listener.accept().unwrap().0);
+        let refusing = std::thread::spawn(move || {
+            for stream in accepted {
+                refuse_busy(stream, accepted_at, &app);
+            }
+        });
+        let mut answer = String::new();
+        let read = asking.read_to_string(&mut answer);
+        assert!(read.is_ok(), "no answer within {PATIENCE:?}: {read:?}");
+        assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+        assert!(answer.contains(&format!("\r\nAccess-Control-Allow-Origin: {origin}\r\n")), "{answer}");
+        refusing.join().unwrap();
+        drop(silent);
     }
 }

@@ -56,8 +56,17 @@ pub fn app_of(paths: impl IntoIterator<Item = PathBuf>) -> App {
 
 /// The one bridge a test serves (#238): `app` on a loopback port the harness
 /// binds itself, from a thread of its own, with a data folder, which holds
-/// its indexes, and its keeper off unless [`TestBridge::keep`] starts it. Its
-/// connections wait [`IDLE_TIMEOUT`] for a request.
+/// its indexes, and its keeper off unless [`TestBridge::keep`] starts it.
+///
+/// The product's time-outs that a test runs through but is not about are
+/// [`WAIT_LIMIT`] (#238): its connections wait [`IDLE_TIMEOUT`] for a
+/// request, and a process of its engine [`WAIT_LIMIT`] for `uciok`
+/// (`Engine::set_handshake`), which a loaded machine can take longer than
+/// `engine::HANDSHAKE` to give. A test of either sets it back. Its busy
+/// answer waits `server::BUSY_READ` for a request's `Origin`: only the tests
+/// of that answer go over the connection cap, and a longer wait would let a
+/// silent connection they hold, queued over the cap, keep the one busy
+/// thread from the answers behind it.
 ///
 /// Dropped, it waits until none of its background work runs ([`settle`]),
 /// gives up the position indexes it holds, and then removes its data folder
@@ -106,6 +115,7 @@ impl TestBridge {
         let port = listeners[0].local_addr().unwrap().port();
         app.policy.port = port;
         app.idle_timeout = IDLE_TIMEOUT;
+        app.engine.set_handshake(WAIT_LIMIT);
         app.catalog.use_data_dir(&dir);
         let app = Arc::new(app);
         let served = Arc::clone(&app);
@@ -243,14 +253,19 @@ pub fn unanswered(s: &TcpStream) -> bool {
 pub struct Sent {
     stream: TcpStream,
     raw: String,
+    /// How long the test took from before it connected to its request's
+    /// last byte, which a loaded machine can stall: the bridge that waits a
+    /// while from acceptance for a request did not wait for one sent later.
+    pub took: Duration,
 }
 
 impl Sent {
     pub fn get(port: u16, path: &str) -> Sent {
         let raw = request(port, path);
+        let started = Instant::now();
         let mut stream = connect(port).expect("the bridge accepts");
         stream.write_all(raw.as_bytes()).expect("the bridge takes the request");
-        Sent { stream, raw }
+        Sent { stream, raw, took: started.elapsed() }
     }
 
     /// Whether the bridge has begun to answer, or closed the connection.
@@ -258,10 +273,15 @@ impl Sent {
         !unanswered(&self.stream)
     }
 
-    /// The status and body of the answer, waited for [`WAIT_LIMIT`] from now.
-    pub fn answer(mut self) -> (u16, String) {
+    /// The answer, waited for [`WAIT_LIMIT`] from now.
+    pub fn reply(mut self) -> Reply {
         let out = read_answer(&mut self.stream, &self.raw).expect("the bridge answers");
-        let reply = parse_reply(&out).unwrap_or_else(|| panic!("not an answer: {out}"));
+        parse_reply(&out).unwrap_or_else(|| panic!("not an answer: {out}"))
+    }
+
+    /// The status and body of the answer, waited for [`WAIT_LIMIT`] from now.
+    pub fn answer(self) -> (u16, String) {
+        let reply = self.reply();
         (reply.status, reply.body)
     }
 }

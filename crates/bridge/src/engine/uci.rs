@@ -13,8 +13,9 @@ use crate::json::{self, Obj};
 
 use super::{EngineConfig, MAX_MULTIPV, Outcome, Search, file_stem};
 
-/// How long the engine may take to answer `uci` with `uciok`.
-const HANDSHAKE: Duration = Duration::from_secs(5);
+/// How long the engine may take to answer `uci` with `uciok`, unless
+/// [`super::Engine::set_handshake`] sets another.
+pub const HANDSHAKE: Duration = Duration::from_secs(5);
 /// How long it may take to answer `isready`; the first allocates the hash.
 const READY: Duration = Duration::from_secs(30);
 /// How long a stopped search may take to name its best move.
@@ -62,7 +63,9 @@ pub(super) struct Process {
 }
 
 impl Process {
-    pub(super) fn start(config: &EngineConfig) -> Result<Process, String> {
+    /// Starts the engine of `config`, which may take `handshake` to answer
+    /// `uci` with `uciok`, and sets it up.
+    pub(super) fn start(config: &EngineConfig, handshake: Duration) -> Result<Process, String> {
         let mut command = Command::new(&config.program);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         if let Some(dir) = config.program.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -100,7 +103,7 @@ impl Process {
         if p.send("uci").is_err() {
             return Err("The engine closed its input".into());
         }
-        let deadline = Instant::now() + HANDSHAKE;
+        let deadline = Instant::now() + handshake;
         loop {
             // The deadline holds however much the engine writes: a line already
             // queued is not taken once it has passed.

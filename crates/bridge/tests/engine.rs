@@ -249,7 +249,9 @@ fn a_handshake_past_its_deadline_fails_however_much_the_engine_writes() {
     std::fs::create_dir_all(&dir).unwrap();
     let chatty = dir.join(format!("fake-uci-chatty{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(env!("CARGO_BIN_EXE_fake-uci"), &chatty).unwrap();
-    let (port, _bridge) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
+    let (port, bridge) = start(Engine::new(EngineConfig::new(chatty, Some(1), Some(16))));
+    // The handshake this test is about, at its real length.
+    bridge.app.engine.set_handshake(engine::HANDSHAKE);
     let lines = Analysis::open(port, "depth=1").rest();
     // The engine writes lines without end and never `uciok`: a deadline that
     // each line put off would never come, and the answer would stop until
@@ -506,13 +508,16 @@ fn a_failed_read_is_tried_again_and_a_pipe_is_never_read() {
 
 #[test]
 fn a_probe_accepts_only_a_uci_engine() {
-    assert_eq!(engine::probe(env!("CARGO_BIN_EXE_fake-uci").as_ref()).as_deref(), Ok("Fake UCI 1.0"));
+    // A handshake of the patience: a loaded machine can take longer than
+    // `engine::HANDSHAKE` to start the fake engine, and the test is not about it.
+    let probe = |program: &Path| engine::probe_within(program, WAIT_LIMIT);
+    assert_eq!(probe(env!("CARGO_BIN_EXE_fake-uci").as_ref()).as_deref(), Ok("Fake UCI 1.0"));
     let dir = std::env::temp_dir().join(format!("bridge-probe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let text = dir.join("notes.txt");
     std::fs::write(&text, "not an engine").unwrap();
-    assert!(engine::probe(&text).is_err());
-    assert!(engine::probe(&dir.join("missing.exe")).is_err());
+    assert!(probe(&text).is_err());
+    assert!(probe(&dir.join("missing.exe")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
