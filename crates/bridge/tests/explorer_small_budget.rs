@@ -283,7 +283,8 @@ fn a_replay_on_the_calling_thread_waits_for_a_worker() {
     // A worker takes 256 candidates at least: the calling thread replays 10.
     let candidates = |board: &Board| idx.base.deep_games(structure(board), false).unwrap().0.len();
     assert_eq!((candidates(&pooled), candidates(&inline)), (300, 10));
-    let games = |board: &Board, cancel: &Cancel| explorer::deep(&idx, board, cancel).map(|s| s.map(|s| s.counts.games));
+    let games =
+        |board: &Board, cancel: &Cancel| explorer::deep_stats(&idx, board, cancel).map(|s| s.map(|s| s.counts.games));
     assert_eq!(games(&pooled, &Cancel::never()).unwrap(), Some(300));
     assert_eq!(games(&inline, &Cancel::never()).unwrap(), Some(10));
 

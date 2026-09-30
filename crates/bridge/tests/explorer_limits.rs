@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bridge::catalog::{Catalog, id_of};
-use bridge::explorer::format::{BLOCK_ENTRY, DEEP_BLOCK_ENTRY, Header, MAX_PLY, MIN_DEEP_BITS, PRUNE_PLY};
+use bridge::explorer::format::{BLOCK_ENTRY, DEEP_BLOCK_ENTRY, Header, MAX_PLY, MIN_DEEP_BITS};
 use cbformat::fixture::{Builder, TempDb, annotations, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
@@ -167,7 +167,7 @@ fn an_index_file_claiming_a_huge_table_is_rebuilt() {
     let deep_offset = table_offset + u64::from(blocks) * BLOCK_ENTRY as u64;
     let h = Header {
         max_ply: MAX_PLY,
-        prune_ply: PRUNE_PLY,
+        prune_ply: MAX_PLY,
         first_record: 1,
         last_record: 10,
         generation,

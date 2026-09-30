@@ -22,16 +22,13 @@ use crate::search::workers::{self, threads};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
-use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, structure, unpack_move};
+use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, order_moves, rank_top, structure, unpack_move};
 use super::runs::Progress;
 use super::source::average_elo;
 use super::stream::{Hit, Target};
 use super::{Loaded, Lookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
-    // Asked for its explorer, the database is in use: the keeper rebuilds
-    // its index when it changes (#149).
-    app.catalog.explorer.mark_in_use(&entry.id);
     if req.param("variant").is_some_and(|v| v != "standard") {
         return unsupported();
     }
@@ -40,6 +37,10 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(board) => board,
         Err(answer) => return answer,
     };
+    // Asked for its explorer, the database is in use: the keeper rebuilds
+    // its index when it changes (#149). A request refused for its
+    // parameters does not ask for it.
+    app.catalog.explorer.mark_in_use(&entry.id);
     let open = match entry.open_to_read() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
@@ -196,7 +197,7 @@ impl Found {
     fn add(&mut self, mv: u16, counts: &Counts, best: (u16, u32), first: u32) {
         self.counts.merge(counts);
         self.add_move(Played { mv, counts: *counts, first });
-        self.rank(best);
+        rank_top(&mut self.top, best);
     }
 
     fn add_move(&mut self, played: Played) {
@@ -213,21 +214,13 @@ impl Found {
         }
     }
 
-    fn rank(&mut self, best: (u16, u32)) {
-        let at = self.top.partition_point(|&b| b > best);
-        if at < TOP_GAMES {
-            self.top.insert(at, best);
-            self.top.truncate(TOP_GAMES);
-        }
-    }
-
     fn merge(&mut self, other: &Found) {
         self.counts.merge(&other.counts);
         for &played in &other.moves {
             self.add_move(played);
         }
         for &best in &other.top {
-            self.rank(best);
+            rank_top(&mut self.top, best);
         }
     }
 
@@ -249,10 +242,10 @@ impl Found {
 /// counts once, with the move it played from its first visit.
 /// Counts add, moves add by code, and the notable games are the best of
 /// both, by rating, then number. `None` when no game reaches the position.
-/// Errors as [`deep`]'s, and `Corrupt` when the sums count more games than
-/// the index holds.
+/// Errors as [`deep_stats`]'s, and `Corrupt` when the sums count more games
+/// than the index holds.
 pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
-    let Some(mut tree) = loaded.lookup(board.hash())? else { return deep(loaded, board, cancel) };
+    let Some(mut tree) = loaded.lookup(board.hash())? else { return deep_stats(loaded, board, cancel) };
     let target = Target::of(board).beyond(loaded.base.header.max_ply);
     let Some(found) = replay(loaded, board, &target, true, cancel)? else { return Ok(Some(tree)) };
     tree.counts = sum(&tree.counts, &found.counts, loaded.games())?;
@@ -262,15 +255,12 @@ pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<S
             None => tree.moves.push((played.mv, played.counts)),
         }
     }
-    // Most played first, then by code, as the tree orders them.
-    tree.moves.sort_unstable_by(|a, b| b.1.games.cmp(&a.1.games).then(a.0.cmp(&b.0)));
+    order_moves(&mut tree.moves);
     // The tree ranks its games by the rating their stream entries keep.
     let mut top = found.top;
     for &game in &tree.top {
-        top.push((loaded.stream.entry(game)?.elo(), game));
+        rank_top(&mut top, (loaded.stream.entry(game)?.elo(), game));
     }
-    top.sort_unstable_by(|a, b| b.cmp(a));
-    top.truncate(TOP_GAMES);
     tree.top = top.iter().map(|b| b.1).collect();
     Ok(Some(tree))
 }
@@ -289,7 +279,7 @@ fn sum(a: &Counts, b: &Counts, games: u64) -> Result<Counts, Bad> {
 /// games have. `None` when none does. A replay stops at its next game once
 /// `cancel` is, and the answer is then `Busy`; a stream found damaged is
 /// `Corrupt`.
-pub fn deep(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
+pub fn deep_stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<Stats>, Bad> {
     Ok(replay(loaded, board, &Target::of(board), false, cancel)?.map(Found::into_stats))
 }
 
@@ -434,7 +424,42 @@ fn top_game<S: Store>(db: &S, names: &mut Names<'_, S>, number: u32) -> Option<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Policy;
+    use crate::catalog::Catalog;
     use crate::explorer::format::Outcome;
+
+    /// An explorer request refused for its `variant` or its `fen` does not
+    /// mark its database in use; one that passes every check does, before
+    /// the database is opened (#181), as a list of a position does (#173).
+    #[test]
+    fn a_refused_request_marks_nothing_in_use() {
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-in-use-{}", std::process::id()));
+        let path = dir.join("Absent.2cbh");
+        let policy = Policy { port: 0, origins: Vec::new(), token: String::new() };
+        let app = App::new("test", policy, Catalog::new([path.clone()]));
+        let id = crate::catalog::id_of(&path);
+        let Some(entry) = app.catalog.get(&id) else { panic!("the database is not listed") };
+        let ask = |query: &str| route(&app, &entry, &Request::get(&format!("/v1/databases/{id}/explorer?{query}")));
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR+w+KQkq+-+0+1";
+        let with_variant = format!("fen={start}&variant=chess960");
+        for (query, status, code) in [
+            ("variant=chess960", 422, "unsupported"),
+            (with_variant.as_str(), 422, "unsupported"),
+            ("", 400, "bad_request"),
+            ("fen=nonsense", 400, "bad_request"),
+            ("fen=4k3/8/8/8/8/8/8/4KR1R+w+F+-+0+1", 422, "unsupported"),
+        ] {
+            let answer = ask(query);
+            let refused = answer.status == status && answer.body.contains(&format!(r#""code":"{code}""#));
+            assert!(refused, "{query}: {} {}", answer.status, answer.body);
+            assert!(!app.catalog.explorer.in_use(&id), "{query} marked the database in use");
+        }
+        let answer = ask(&format!("fen={start}&variant=standard"));
+        let missing =
+            r#"{"error":{"code":"database_unavailable","message":"The database is not ready","state":"missing"}}"#;
+        assert_eq!((answer.status, answer.body.as_str()), (409, missing));
+        assert!(app.catalog.explorer.in_use(&id));
+    }
 
     /// However many games a worker finds, what it keeps stays within what it
     /// reserved, and two workers' finds merge into the same answer as one's,
