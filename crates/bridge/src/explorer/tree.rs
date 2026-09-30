@@ -29,15 +29,15 @@ use cbformat::replay;
 
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
-use crate::search::memory::{Cancel, Hold, Refused};
-use crate::search::workers::{self, threads};
+use crate::search::memory::{Hold, Refused};
+use crate::search::workers::threads;
 
-use super::build::{Chunks, Counted, Out, PLANNED, Turns, corrupt, from_bad};
+use super::build::{Chunks, Counted, Out, PLANNED, Turns, from_bad};
 use super::format::{
     BLOCK_DATA, BLOCK_ENTRY, BLOCK_KEYS, Block, Counts, KEY_ENTRY, MAX_BLOCK_DATA, MAX_PLY, NO_MOVE, TOP_GAMES,
     encode_record, pack_move, part_of,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, Room, grow};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, Room, grow, on_workers};
 use super::stream::{self, Stream};
 
 /// A position's run of entries this long or shorter is left as it is when a
@@ -443,7 +443,7 @@ pub(super) fn write(
         }
         let hi = AtomicUsize::new(end);
         progress.tree_passes.fetch_add(1, Ordering::Relaxed);
-        let pass = Pass { stream, part_bits, first, hi: &hi, capacity, planned, folded, progress };
+        let pass = Pass { stream, part_bits, first, hi: &hi, capacity, planned, folded, progress, limits };
         let started = Instant::now();
         // As many workers as each hold the pass's first part in its share
         // of the room, one at least.
@@ -457,7 +457,7 @@ pub(super) fn write(
         first = end;
     }
     if sink.games != total {
-        return Err(corrupt(&stream.path, "the move stream does not replay to the positions it was read with"));
+        return Err(SearchError::Bug("the move stream does not replay to the positions it was read with"));
     }
     out.offset = sink.at;
     let table_offset = out.offset;
@@ -481,6 +481,7 @@ struct Pass<'a> {
     /// it did without.
     folded: &'a [Entry],
     progress: &'a Progress,
+    limits: &'a Limits,
 }
 
 impl Pass<'_> {
@@ -495,7 +496,7 @@ impl Pass<'_> {
         let chunks = Chunks::new(first, last, want);
         // Room for twice what a chunk adds, about.
         let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
-        workers::run(want, 0, &Cancel::never(), |w| {
+        on_workers(want, self.progress, self.limits, |w| {
             let cap = self.capacity / w.count;
             let mut buf: Vec<Entry> = Vec::new();
             buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
@@ -535,7 +536,7 @@ impl Pass<'_> {
         }
         let start = record.start().map_err(|e| from_bad(path, e))?;
         let mut line = match &start {
-            Some(board) => Keys::of(board).ok_or_else(|| corrupt(path, "stream start"))?,
+            Some(board) => Keys::of(board).ok_or(SearchError::Bug("stream start"))?,
             None => standard_keys(),
         };
         // The positions to ply 20 and the moves played from them are the
@@ -549,7 +550,7 @@ impl Pass<'_> {
             *key = line.hash();
             reached = ply + 1;
             let Some(w) = words.get(ply) else { break };
-            let s = line.step(u16::from_le_bytes(*w)).ok_or_else(|| corrupt(path, "stream word"))?;
+            let s = line.step(u16::from_le_bytes(*w)).ok_or(SearchError::Bug("stream word"))?;
             *mv = s.mv;
             if ply < usize::from(MAX_PLY) {
                 line.apply(s);
@@ -752,7 +753,7 @@ fn write_parts(
     let write = |(at, bytes): (u64, Vec<u8>)| out.write(at, &bytes);
     let turns = Turns::new(end - first, want * OUT_BYTES, sink, &place, &write);
     let progress = pass.progress;
-    workers::run(want, 0, &Cancel::never(), |w| {
+    on_workers(want, progress, pass.limits, |w| {
         let stopped = || w.stopped() || progress.stopped();
         let mut made = Blocks::new().ok_or(Refused::Busy)?;
         let mut agg = Aggregate::new().ok_or(Refused::Busy)?;

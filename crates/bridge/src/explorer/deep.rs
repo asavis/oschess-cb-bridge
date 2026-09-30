@@ -40,15 +40,15 @@ use cbformat::movetable::{self, Captured, FIRST_CASTLE_960, MoveWord};
 
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
-use crate::search::memory::{Cancel, Refused};
-use crate::search::workers::{self, threads};
+use crate::search::memory::Refused;
+use crate::search::workers::threads;
 
-use super::build::{Chunks, Out, PLANNED, Turns, corrupt, from_bad};
+use super::build::{Chunks, Out, PLANNED, Turns, from_bad};
 use super::format::{
     DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, PRUNE_PLY, STRUCTURE_PIECES, deep_bucket, deep_print,
     piece_shift, read_varint, structure_of, structures_in_vectors, structures_of, varint,
 };
-use super::runs::{Limits, PassTime, Progress, Room};
+use super::runs::{Limits, PassTime, Progress, Room, on_workers};
 use super::source::MAX_STRUCTURES;
 use super::stream::{self, Stream};
 
@@ -408,7 +408,7 @@ pub(super) fn write(
         let hi = AtomicU64::new(block_point(end as u64));
         progress.deep_passes.fetch_add(1, Ordering::Relaxed);
         let rest = AtomicU64::new(0);
-        let pass = Pass { stream, bits, lo, hi: &hi, split, rest, capacity, planned, progress };
+        let pass = Pass { stream, bits, lo, hi: &hi, split, rest, capacity, planned, progress, limits };
         let started = Instant::now();
         let buffers = pass.collect(want)?;
         let replayed = Instant::now();
@@ -442,6 +442,7 @@ struct Pass<'a> {
     capacity: usize,
     planned: u64,
     progress: &'a Progress,
+    limits: &'a Limits,
 }
 
 /// A bucket that a pass ended inside: the game it put last, and the postings
@@ -482,7 +483,7 @@ impl Pass<'_> {
         let chunks = Chunks::new(first, last, want);
         // Room for twice what a chunk adds, about.
         let spare = (2 * self.planned * chunks.size()).div_ceil(self.stream.header.records().max(1)) as usize;
-        workers::run(want, 0, &Cancel::never(), |w| {
+        on_workers(want, self.progress, self.limits, |w| {
             let cap = self.capacity / w.count;
             let mut kept = Kept {
                 buf: Vec::new(),
@@ -528,7 +529,7 @@ impl Pass<'_> {
         }
         let start = record.start().map_err(|e| from_bad(path, e))?;
         let mut line = start.as_ref().map_or_else(Tracker::standard, Tracker::of);
-        let word = || corrupt(path, "stream word");
+        let word = || SearchError::Bug("stream word");
         // The tree's plies hold no structure of the section: they are the
         // prefix's words, and the words past it follow ply 21, beyond the
         // tree's plies.
@@ -761,8 +762,8 @@ fn write_blocks(
     let write = |(at, bytes): (u64, Vec<u8>)| out.write(at, &bytes);
     let turns = Turns::new(units as usize, want * OUT_BYTES, sink, &place, &write);
     let (rest, split) = (pass.rest.load(Ordering::Relaxed), Mutex::new(None));
-    let miscounted = || corrupt(&pass.stream.path, "the move stream does not replay to the postings it counted");
-    workers::run(want, 0, &Cancel::never(), |w| {
+    let miscounted = || SearchError::Bug("the move stream does not replay to the postings it counted");
+    on_workers(want, progress, pass.limits, |w| {
         let stopped = || w.stopped() || progress.stopped();
         let mut heads: Vec<&[u64]> = Vec::new();
         heads.try_reserve_exact(buffers.len()).map_err(|_| Refused::Busy)?;

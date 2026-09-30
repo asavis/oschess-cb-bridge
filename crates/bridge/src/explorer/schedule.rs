@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(next(&events), ("b", Priority::BelowNormal, "done"));
         // The stopped build starts again, from nothing, at its own priority.
         assert_eq!(next(&events), ("a", background_priority(), "run"));
-        assert!(!background.stop.load(Ordering::Relaxed));
+        assert!(!background.stopped());
         release_background.send(()).unwrap();
         assert_eq!(next(&events), ("a", background_priority(), "done"));
     }
@@ -434,7 +434,7 @@ mod tests {
         // another request no longer stops.
         scheduler.promote("c");
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!a.stop.load(Ordering::Relaxed));
+        assert!(!a.stopped());
         release_a.send(()).unwrap();
         assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
         assert_eq!(next(&events), ("c", Priority::BelowNormal, "run"));

@@ -28,15 +28,15 @@ use std::sync::{Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::search::SearchError;
-use crate::search::memory::{Cancel, Hold, Refused};
-use crate::search::workers::{self, threads};
+use crate::search::memory::{Hold, Refused};
+use crate::search::workers::threads;
 
 use super::deep;
 use super::file::{Bad, write_at};
 use super::format::{
     DEEP_BLOCK_BITS, HEADER_LEN, Header, MAX_PLY, PRUNE_PLY, deep_bits, deep_bucket, part_bits, part_of,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, io, opened, reserve};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, io, on_workers, opened, reserve};
 use super::source::{Line, Source, Workspace};
 use super::stream::{self, BATCH, Stream};
 use super::tree::{self, Shallow};
@@ -150,18 +150,15 @@ fn temporary(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// A failure of the file at `path` as a build's failure.
+/// A failure of the file at `path`, which the build wrote, as a build's
+/// failure: a file that does not hold what the build wrote there is a bug
+/// (#180), not the database's fault.
 pub(super) fn from_bad(path: &Path, e: Bad) -> SearchError {
     match e {
         Bad::Io(e) => io(path, e),
-        Bad::Corrupt(what) => corrupt(path, what),
+        Bad::Corrupt(what) => SearchError::Bug(what),
         Bad::Busy => SearchError::Busy,
     }
-}
-
-/// The file at `path` does not hold what it should.
-pub(super) fn corrupt(path: &Path, what: &str) -> SearchError {
-    io(path, std::io::Error::other(what.to_string()))
 }
 
 /// What the stream pass counted: the tree's entries in each part of the
@@ -238,7 +235,7 @@ fn read_games(
     // Set once a worker's folded entries no longer fit its room, or when it
     // has none.
     let unfolded = AtomicBool::new(false);
-    let found = workers::run(want, 0, &Cancel::never(), |w| {
+    let found = on_workers(want, progress, limits, |w| {
         let mut hold = reserve(reading, progress)?;
         // As much of the room as the budget has free now, by halves: a build
         // yields to searches, and does without the folded entries when a
@@ -615,8 +612,10 @@ impl<'a, T, M, W> Turns<'a, T, M, W> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::search::memory::Cancel;
+    use crate::search::workers;
 
     /// Units made on many workers, each taking its time, are placed in
     /// their order, some in pieces among them, and each piece written once,
@@ -678,13 +677,15 @@ mod tests {
     /// the test `name` of this binary in a child process with `workers`
     /// workers, which [`threads`] reads once a process, whatever the
     /// computer's processors, and checks it passed within `limit`: a child
-    /// still running then is killed, and the test fails.
-    fn in_child(name: &str, workers: usize, limit: Duration) -> bool {
+    /// still running then is killed, and the test fails. Each test's child
+    /// writes a log of its own, as the tests run beside each other.
+    pub(crate) fn in_child(name: &str, workers: usize, limit: Duration) -> bool {
         const CHILD: &str = "BRIDGE_BUILD_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             return true;
         }
-        let log = std::env::temp_dir().join(format!("bridge-build-child-{}.log", std::process::id()));
+        let test = name.rsplit("::").next().unwrap_or(name);
+        let log = std::env::temp_dir().join(format!("bridge-build-child-{}-{test}.log", std::process::id()));
         let file = File::create(&log).unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--nocapture", "--test-threads=1"])
@@ -747,6 +748,57 @@ mod tests {
             })
         }));
         assert!(ran.is_err(), "the panic reached the caller: {:?}", ran.ok());
+    }
+
+    /// Three records, which no build here reads.
+    struct Unread;
+
+    impl Source for Unread {
+        fn records(&self) -> u32 {
+            3
+        }
+
+        fn lines(&self, _: u32, _: u32, _: u8, _: &mut Workspace, _: &mut dyn FnMut(&Line)) -> cbformat::Result<()> {
+            unreachable!("no worker was free to read them")
+        }
+    }
+
+    /// A build whose pass waits for a worker while a search holds every one
+    /// stops once it is asked to, `Superseded`, rather than waiting on until
+    /// it gives up, and leaves no file (#180). The one worker runs in a child
+    /// process, which has it however many the computer or
+    /// `OSCHESS_BRIDGE_THREADS` gives this one.
+    #[test]
+    fn a_build_waiting_for_a_worker_stops_when_asked() {
+        let name = "explorer::build::tests::a_build_waiting_for_a_worker_stops_when_asked";
+        if !in_child(name, 1, Duration::from_secs(120)) {
+            return;
+        }
+        assert_eq!(threads(), 1);
+        let dir = std::env::temp_dir().join(format!("bridge-build-waiting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (target, progress, limits) = (dir.join("db.idx"), Progress::default(), Limits::default());
+        let plan = Plan { first: 1, last: 3, generation: 7 };
+        let search = workers::one(&Cancel::never()).unwrap();
+        let (built, after) = std::thread::scope(|s| {
+            let build = s.spawn(|| build_with(&Unread, &plan, &target, &progress, &limits));
+            // Its stream pass starts reading, which takes a worker first.
+            let until = Instant::now() + Duration::from_secs(30);
+            while progress.phase() != "reading" {
+                assert!(Instant::now() < until, "the build starts reading");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let asked = Instant::now();
+            progress.ask_stop();
+            let built = build.join().unwrap();
+            (built, asked.elapsed())
+        });
+        assert!(matches!(built, Err(SearchError::Superseded)), "{:?}", built.err());
+        assert!(after < limits.workers_wait / 2, "it stopped {after:?} after it was asked");
+        drop(search);
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file is left");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A worker whose buffer is full leaves the chunks to the others while

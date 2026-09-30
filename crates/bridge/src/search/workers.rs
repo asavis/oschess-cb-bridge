@@ -54,9 +54,9 @@ impl Drop for Slots {
 }
 
 /// Up to `want` workers, at least one: as many as are free, after waiting up
-/// to [`WAIT`] for the first.
-fn acquire(want: usize, cancel: &Cancel) -> Result<Slots, SearchError> {
-    let deadline = Instant::now() + WAIT;
+/// to `wait` for the first, then `WorkersBusy`.
+fn acquire(want: usize, cancel: &Cancel, wait: Duration) -> Result<Slots, SearchError> {
+    let deadline = Instant::now().checked_add(wait);
     let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let free = threads().saturating_sub(*taken);
@@ -68,9 +68,9 @@ fn acquire(want: usize, cancel: &Cancel) -> Result<Slots, SearchError> {
         if cancel.is_cancelled() {
             return Err(SearchError::Superseded);
         }
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.map_or(RECHECK, |d| d.saturating_duration_since(Instant::now()));
         if left.is_zero() {
-            return Err(SearchError::Busy);
+            return Err(SearchError::WorkersBusy);
         }
         // A background build may hold the workers: it does not give way to
         // the work of a thread that waits for them (#149).
@@ -82,10 +82,11 @@ fn acquire(want: usize, cancel: &Cancel) -> Result<Slots, SearchError> {
 
 /// One worker, for a pass so small that the calling thread runs it sooner
 /// than a worker started for it would. It counts as a started one does, is
-/// waited for as [`run`] waits for its first, up to [`WAIT`], then `Busy`,
-/// and is `Superseded` once `cancel` is; one free is taken under a lock.
+/// waited for as [`run`] waits for its first, up to [`WAIT`], then
+/// `WorkersBusy`, and is `Superseded` once `cancel` is; one free is taken
+/// under a lock.
 pub fn one(cancel: &Cancel) -> Result<Slots, SearchError> {
-    acquire(1, cancel)
+    acquire(1, cancel, WAIT)
 }
 
 /// Workers taken now, for tests and diagnostics.
@@ -139,16 +140,31 @@ impl Drop for Unwinding<'_> {
 /// [`step`] each of what they build, so the other half stays for the rest of
 /// what they build, and with little budget left it runs on fewer, down to one. When not even one buffer fits now, or a worker
 /// cannot be started, it answers `Busy`; a buffer larger than the whole budget
-/// is `TooLarge`. The first failure stops the other workers, and so does a
-/// worker's panic, which then reaches the caller once they have stopped.
+/// is `TooLarge`. It waits up to [`WAIT`] for its first worker, then answers
+/// `WorkersBusy`, and waits no longer once `cancel` is, `Superseded`. The
+/// first failure stops the other workers, and so does a worker's panic, which
+/// then reaches the caller once they have stopped.
 pub fn run<T: Send>(
     want: usize,
     workspace: usize,
     cancel: &Cancel,
     task: impl Fn(&Worker<'_>) -> Result<T, SearchError> + Sync,
 ) -> Result<Vec<T>, SearchError> {
+    run_waiting(want, workspace, cancel, WAIT, task)
+}
+
+/// [`run`], waiting up to `wait` for its first worker: an index build waits
+/// as long as it waits for memory, and stops waiting once it is asked to stop
+/// (#180).
+pub fn run_waiting<T: Send>(
+    want: usize,
+    workspace: usize,
+    cancel: &Cancel,
+    wait: Duration,
+    task: impl Fn(&Worker<'_>) -> Result<T, SearchError> + Sync,
+) -> Result<Vec<T>, SearchError> {
     let fit = (budget() / 2 / workspace.saturating_add(step())).max(1);
-    let mut slots = acquire(want.min(fit), cancel)?;
+    let mut slots = acquire(want.min(fit), cancel, wait)?;
     let _buffers = loop {
         match Hold::reserve(slots.0.checked_mul(workspace).ok_or(Refused::TooLarge)?) {
             Ok(hold) => break hold,

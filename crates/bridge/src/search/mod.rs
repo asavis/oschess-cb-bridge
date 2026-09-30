@@ -281,11 +281,18 @@ pub enum SearchError {
     TooLarge,
     /// The budget is taken by other searches now.
     Busy,
+    /// Every worker stayed taken by other passes for as long as this one
+    /// waited for one ([`workers::run`]).
+    WorkersBusy,
     /// A newer search on the same database replaced this one.
     Superseded,
     /// The position index that finds a position's games was found damaged
     /// (#148): it is dropped and built again.
     IndexDamaged,
+    /// What the bridge made itself does not hold what it should, such as the
+    /// move stream an index build wrote and reads back: a bug, not a fault of
+    /// the database (#180).
+    Bug(&'static str),
 }
 
 impl From<cbformat::Error> for SearchError {

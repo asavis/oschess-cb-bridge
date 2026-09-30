@@ -7,7 +7,7 @@
 //! claims, and one that does not fit now makes room by evicting what other
 //! searches retained, else waits for a retry.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// The budget when `OSCHESS_BRIDGE_SEARCH_MIB` does not set another: 1 GiB. A
@@ -194,11 +194,14 @@ fn evict_all() {
 }
 
 /// Whether a search is still wanted: a newer search on the same database
-/// supersedes it.
+/// supersedes it. The passes of an index build are wanted until the build is
+/// asked to stop (#180).
 #[derive(Clone, Default)]
 pub struct Cancel {
     latest: Option<Arc<AtomicU64>>,
     ticket: u64,
+    /// Raised once the work is no longer wanted.
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl Cancel {
@@ -211,11 +214,18 @@ impl Cancel {
     /// supersedes the one before it.
     pub fn newest(latest: &Arc<AtomicU64>) -> Cancel {
         let ticket = latest.fetch_add(1, Ordering::SeqCst) + 1;
-        Cancel { latest: Some(latest.clone()), ticket }
+        Cancel { latest: Some(latest.clone()), ticket, stop: None }
+    }
+
+    /// Work no longer wanted once `stop` is raised, as an index build's is
+    /// once it is asked to stop.
+    pub fn when(stop: &Arc<AtomicBool>) -> Cancel {
+        Cancel { stop: Some(Arc::clone(stop)), ..Cancel::default() }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.latest.as_ref().is_some_and(|l| l.load(Ordering::SeqCst) != self.ticket)
+            || self.stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
     }
 }
 
@@ -305,6 +315,17 @@ mod tests {
         let second = Cancel::newest(&latest);
         assert!(first.is_cancelled() && !second.is_cancelled());
         assert!(!Cancel::never().is_cancelled());
+    }
+
+    /// Work that a flag stops, as an index build's passes, is cancelled once
+    /// the flag is raised (#180).
+    #[test]
+    fn a_raised_flag_cancels() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let work = Cancel::when(&stop);
+        assert!(!work.is_cancelled());
+        stop.store(true, Ordering::Relaxed);
+        assert!(work.is_cancelled() && work.clone().is_cancelled());
     }
 
     #[test]
