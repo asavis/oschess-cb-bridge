@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::{Busy, Catalog, id_of};
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record};
@@ -119,7 +119,24 @@ impl Served {
 
 impl Drop for Served {
     fn drop(&mut self) {
+        // Nothing writes to the bridge's folders once it is dropped (#236).
+        settle(&self.app);
         self.app.catalog.explorer.release();
+    }
+}
+
+/// Waits until none of `app`'s background work runs, for [`WAIT_LIMIT`] at
+/// most ([`Catalog::settle`]), so that a test removes the bridge's folders
+/// with nothing writing to them (#236). What still runs then fails the test,
+/// by name, unless it is failing already.
+pub fn settle(app: &App) {
+    if let Err(Busy(running)) = app.catalog.settle(WAIT_LIMIT) {
+        let what = format!("{} still ran {WAIT_LIMIT:?} after the bridge was dropped", running.join(", "));
+        if std::thread::panicking() {
+            eprintln!("{what}");
+        } else {
+            panic!("{what}");
+        }
     }
 }
 

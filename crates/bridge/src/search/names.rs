@@ -390,8 +390,12 @@ impl NameTable {
             return;
         };
         let table = std::sync::Arc::clone(self);
+        // Listed before the thread starts, so that no wait for the writes
+        // to end looks between the start and the write (#236).
+        let writing = super::heads::Writing::new(indexdir::partial(&path));
         let _ =
             std::thread::Builder::new().name("bridge-names".into()).stack_size(crate::THREAD_STACK).spawn(move || {
+                let _writing = writing;
                 if let Err(e) = table.write_file(&path, kind, generation) {
                     // The file is named after the database's id.
                     let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -776,6 +780,25 @@ mod tests {
         assert!(peak <= FILE_WRITE_BUFFER + 4096, "{peak} bytes at the peak against a {FILE_WRITE_BUFFER}-byte buffer");
         let back = NameTable::open_file(&path, Kind::Players, 7, n).unwrap().unwrap();
         assert_eq!(back.len(), n);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A names file written later is being written from the moment
+    /// [`NameTable::write_later`] returns, before its thread starts (#236):
+    /// once no file is being written, it is in place.
+    #[test]
+    fn a_names_file_written_later_is_waited_for() {
+        let dir = std::env::temp_dir().join(format!("bridge-names-later-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0123456789abcdef.players");
+        let names = std::sync::Arc::new(table(&["Carlsen", "Kasparov"]));
+        names.to_be_written(path.clone(), Kind::Players, 7);
+        names.write_later();
+        let limit = std::time::Duration::from_secs(300);
+        assert!(super::super::heads::wait_written(std::time::Instant::now() + limit));
+        let back = NameTable::open_file(&path, Kind::Players, 7, 2).unwrap().unwrap();
+        assert_eq!((back.name(0), back.name(1)), ("Carlsen", "Kasparov"));
+        assert!(!indexdir::partial(&path).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

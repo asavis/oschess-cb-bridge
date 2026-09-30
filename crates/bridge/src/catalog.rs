@@ -385,6 +385,11 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     files
 }
 
+/// What still ran when [`Catalog::settle`] gave up waiting: the kinds of
+/// background work, by name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Busy(pub Vec<&'static str>);
+
 pub struct Catalog {
     /// The position indexes of the databases, and the queue that builds them.
     pub explorer: crate::explorer::Registry,
@@ -448,6 +453,46 @@ impl Catalog {
     /// The index builds of PGN files.
     pub fn pgn(&self) -> &pgnindex::Registry {
         &self.shared.pgn
+    }
+
+    /// Waits until none of this catalog's background work runs, so that
+    /// nothing writes to its folders any more (#236): stops the keeper, which
+    /// queues no build from then on, then waits for the index builds, the
+    /// heads, PGN and download queues and the names writers, the whole
+    /// process's, to be idle all at once, as the work of one may queue work
+    /// in another. It asks no build to stop, since a stopped build queues
+    /// itself again. After `limit`, `Busy` names what still runs. Tests call
+    /// it before they remove the folders; the keeper stays stopped.
+    pub fn settle(&self, limit: Duration) -> Result<(), Busy> {
+        self.explorer.stop_keeping();
+        let deadline = Instant::now() + limit;
+        let waits: [(&'static str, &dyn Fn(Instant) -> bool); 5] = [
+            ("index builds", &|until| self.explorer.wait_builds(until)),
+            (self.heads_queue.label(), &|until| self.heads_queue.wait_idle(until)),
+            (self.pgn().queue().label(), &|until| self.pgn().queue().wait_idle(until)),
+            (self.downloads().label(), &|until| self.downloads().wait_idle(until)),
+            ("names", &heads::wait_written),
+        ];
+        loop {
+            let mut quiet = true;
+            let mut busy = Vec::new();
+            for (name, wait) in &waits {
+                // Idle now, or waited for: a round without a wait finds all
+                // of them idle at once.
+                if !wait(Instant::now()) {
+                    quiet = false;
+                    if !wait(deadline) {
+                        busy.push(*name);
+                    }
+                }
+            }
+            if quiet {
+                return Ok(());
+            }
+            if !busy.is_empty() {
+                return Err(Busy(busy));
+            }
+        }
     }
 
     /// Keeps the indexes where the bridge whose data folder is `dir` keeps
@@ -734,5 +779,32 @@ mod tests {
         let after = generation_of(&path, Format::Pgn, &System).generation.unwrap();
         assert_ne!(before, after);
         std::fs::remove_file(&moved).unwrap();
+    }
+
+    /// Settling waits for background work that still writes to the catalog's
+    /// folders (#236): while a download is held, it gives up after its limit
+    /// naming the queue; once the download is let go and queues a heads job,
+    /// a queue settling looks at before the downloads, it returns only after
+    /// that job has written its file, so the folder can be removed.
+    #[test]
+    fn settling_waits_for_background_work_and_names_what_still_runs() {
+        let dir = std::env::temp_dir().join(format!("bridge-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = Catalog::new(Vec::new());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let file = dir.join("late.heads.partial");
+        let (heads, written) = (Arc::clone(&catalog.heads_queue), file.clone());
+        assert!(catalog.shared.downloads.submit(Box::new(move || {
+            let _ = held.recv();
+            assert!(heads.submit(Box::new(move || std::fs::write(&written, b"late").unwrap())));
+        })));
+        let Err(Busy(running)) = catalog.settle(Duration::from_millis(50)) else { panic!("settled while a job ran") };
+        // The names writers are the whole process's: another test's may run.
+        assert_eq!(running.into_iter().filter(|n| *n != "names").collect::<Vec<_>>(), ["download"]);
+        release.send(()).unwrap();
+        assert_eq!(catalog.settle(Duration::from_secs(300)), Ok(()));
+        assert!(file.exists(), "the heads job wrote before the catalog settled");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

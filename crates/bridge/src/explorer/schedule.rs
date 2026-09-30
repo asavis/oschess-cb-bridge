@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::machine::{self, Machine, Priority, System};
 use crate::sync::{lock, unpoisoned};
@@ -107,6 +107,8 @@ pub struct Scheduler {
     queues: Mutex<Queues>,
     /// Told when a build is queued, and when the power may have changed.
     changed: Condvar,
+    /// Told when the thread ends, both queues empty ([`Scheduler::wait_idle`]).
+    ended: Condvar,
     machine: Mutex<Arc<dyn Machine>>,
     /// How long a background build's threads give way at a time.
     patience: Mutex<Duration>,
@@ -119,6 +121,7 @@ impl Default for Scheduler {
         Scheduler {
             queues: Mutex::default(),
             changed: Condvar::new(),
+            ended: Condvar::new(),
             machine: Mutex::new(Arc::new(System)),
             patience: Mutex::new(PATIENCE),
             refuse: AtomicBool::new(false),
@@ -237,6 +240,20 @@ impl Scheduler {
         self.refuse.store(refuse, Ordering::Relaxed);
     }
 
+    /// Waits until no build waits or runs, until `deadline`: whether none
+    /// does (#236). A background build that waits for mains power counts as
+    /// waiting.
+    pub fn wait_idle(&self, deadline: Instant) -> bool {
+        let mut q = lock(&self.queues);
+        while q.thread {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return false;
+            };
+            q = unpoisoned(self.ended.wait_timeout(q, left)).0;
+        }
+        true
+    }
+
     /// The next build to run, marked running, its progress at its kind's
     /// priority and patience: the first requested one, else the first
     /// background one unless the computer runs on battery, when the thread
@@ -250,6 +267,7 @@ impl Scheduler {
             }
             if q.background.is_empty() {
                 q.thread = false;
+                self.ended.notify_all();
                 return None;
             }
             if !self.machine().on_battery() {
@@ -315,6 +333,7 @@ impl Drop for Exit<'_> {
                 let mut q = lock(&self.0.queues);
                 q.thread = false;
                 q.running = None;
+                self.0.ended.notify_all();
                 (std::mem::take(&mut q.requested), std::mem::take(&mut q.background))
             };
             drop(jobs);
@@ -520,5 +539,36 @@ mod tests {
         assert!(scheduler.submit("c", Kind::Background, Arc::clone(&p), build("c", &tx, &p, None)));
         assert_eq!(next(&events), ("c", background_priority(), "run"));
         assert_eq!(next(&events), ("c", background_priority(), "done"));
+    }
+
+    /// The builds are idle only once none waits or runs (#236): a wait ends
+    /// with `false` at its deadline while a build is held, and while a
+    /// background build waits for mains power, and with `true` once both have
+    /// run, when the thread ends rather than at its deadline.
+    #[test]
+    fn waits_until_no_build_waits_or_runs() {
+        const LIMIT: Duration = Duration::from_secs(300);
+        let scheduler = Arc::new(Scheduler::default());
+        let power = Arc::new(Power::default());
+        power.0.store(true, Ordering::Relaxed);
+        scheduler.set_machine(power.clone());
+        assert!(scheduler.wait_idle(Instant::now()), "idle before any build");
+        let (tx, events) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let (a, b) = (Arc::new(Progress::default()), Arc::new(Progress::default()));
+        assert!(scheduler.submit("a", Kind::Requested, Arc::clone(&a), build("a", &tx, &a, Some(held))));
+        assert_eq!(next(&events), ("a", Priority::BelowNormal, "run"));
+        assert!(scheduler.submit("b", Kind::Background, Arc::clone(&b), build("b", &tx, &b, None)));
+        assert!(!scheduler.wait_idle(Instant::now() + Duration::from_millis(50)), "a build runs");
+        release.send(()).unwrap();
+        assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
+        assert!(!scheduler.wait_idle(Instant::now() + Duration::from_millis(50)), "a build waits for mains power");
+        power.0.store(false, Ordering::Relaxed);
+        scheduler.poke();
+        let waited = Instant::now();
+        assert!(scheduler.wait_idle(waited + 2 * LIMIT));
+        assert!(waited.elapsed() < LIMIT, "woken when idle, not at the deadline");
+        assert_eq!(next(&events), ("b", background_priority(), "run"));
+        assert_eq!(next(&events), ("b", background_priority(), "done"));
     }
 }

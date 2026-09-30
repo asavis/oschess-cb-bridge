@@ -2,20 +2,26 @@
 //! position, at any ply, on databases built by hand.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use bridge::catalog::id_of;
+use bridge::api::App;
+use bridge::catalog::{Catalog, id_of};
 use bridge::explorer::paths;
 use bridge::explorer::stream::{BATCH, Header, SLOT_BYTES, TABLE_ENTRY};
+use bridge::fetch::Cloud;
 use bridge::search::memory::{Hold, budget, held};
+use bridge::sources::Sources;
 use cbformat::fixture::{Builder, TempDb, words};
 use cbformat::movetable::{self, Color, END_OF_LINE, MOVES, Piece};
 use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 
 mod common;
 use common::{
-    Served, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, poll, put,
-    serve_with_dir,
+    Served, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, policy, poll,
+    put, serve_with_dir,
 };
 
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -865,4 +871,99 @@ fn a_small_budget_answers_busy_and_never_panics() {
     assert!(busy > 0 && whole > 0, "{busy} busy, {whole} whole");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// How long [`Holding`] holds a build once the test begins to drop the
+/// bridge, unless the data folder is removed sooner: far longer than the
+/// removal takes once a drop that does not wait for the build returns.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// Every file on this computer. The build of a position index is held at its
+/// first look at the database's files, on the index thread, before it writes:
+/// until the test has removed the data folder, or for [`GRACE`] once it begins
+/// to drop the bridge. The build looks again once it has written its files.
+#[derive(Default)]
+struct Holding {
+    seen: Mutex<Seen>,
+    changed: Condvar,
+}
+
+/// What [`Holding`] has seen of the build, and been told by the test.
+#[derive(Default)]
+struct Seen {
+    /// The index thread's looks at the database's main file.
+    looks: usize,
+    /// When the test began to drop the bridge.
+    dropping: Option<Instant>,
+    /// Whether the test has removed the data folder.
+    removed: bool,
+}
+
+impl Cloud for Holding {
+    fn is_cloud_only(&self, path: &Path, _: &Metadata) -> bool {
+        if std::thread::current().name() != Some("bridge-index") || path.extension() != Some("2cbh".as_ref()) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap();
+        seen.looks += 1;
+        self.changed.notify_all();
+        let began = Instant::now();
+        while seen.looks == 1 && !seen.removed {
+            let until = seen.dropping.map_or(began + WAIT_LIMIT, |at| at + GRACE);
+            let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { break };
+            seen = self.changed.wait_timeout(seen, left).unwrap().0;
+        }
+        false
+    }
+
+    fn fetch(&self, _: &Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+        Err(std::io::Error::other("not for a test"))
+    }
+}
+
+impl Holding {
+    /// Tells the hook what the test did.
+    fn tell(&self, did: impl FnOnce(&mut Seen)) {
+        did(&mut self.seen.lock().unwrap());
+        self.changed.notify_all();
+    }
+
+    /// Waits until the index thread has looked `looks` times.
+    fn looked(&self, looks: usize) {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        let mut seen = self.seen.lock().unwrap();
+        while seen.looks < looks {
+            let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+            let Some(left) = left else { panic!("the build looked {} times, not {looks}", seen.looks) };
+            seen = self.changed.wait_timeout(seen, left).unwrap().0;
+        }
+    }
+}
+
+/// A bridge dropped while a build is to write into its data folder waits for
+/// the build to end (#236), so that nothing writes into the folder once the
+/// test removes it: a build held until the bridge is being dropped, or the
+/// folder removed, has written its files before the drop returns.
+#[test]
+fn a_dropped_bridge_leaves_nothing_writing_into_its_folder() {
+    let games: Vec<Game> = (0..3).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-dropped", &games);
+    let path = db.dir().join("db.2cbh");
+    let dir = index_dir("dropped");
+    std::fs::create_dir_all(&dir).unwrap();
+    let holding = Arc::new(Holding::default());
+    let sources = Sources { fixed: vec![path.clone()], ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, Arc::clone(&holding) as Arc<dyn Cloud>);
+    let bridge = Served::with_dir(App::new("test", policy(), catalog), &dir);
+    let (status, body) = get(bridge.port, &list(&id_of(&path), START, ""));
+    assert_eq!(status, 409, "{body}");
+    holding.looked(1);
+    holding.tell(|seen| seen.dropping = Some(Instant::now()));
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+    holding.tell(|seen| seen.removed = true);
+    holding.looked(2);
+    let written = dir.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!written, "the build wrote into the data folder after it was removed");
 }

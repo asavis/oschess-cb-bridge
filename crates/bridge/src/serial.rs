@@ -4,9 +4,10 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
-use crate::sync::lock;
+use crate::sync::{lock, unpoisoned};
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -15,6 +16,8 @@ type Job = Box<dyn FnOnce() + Send>;
 pub struct Serial {
     /// The jobs waiting, and whether a thread runs them.
     queue: Mutex<(VecDeque<Job>, bool)>,
+    /// Told when the thread ends, the queue empty ([`Serial::wait_idle`]).
+    idle: Condvar,
     /// Starting a thread fails, for tests.
     refuse: AtomicBool,
     /// What the jobs do, for the thread's name and messages.
@@ -24,7 +27,25 @@ pub struct Serial {
 impl Serial {
     /// A queue whose thread and messages are named `label`.
     pub fn labelled(label: &'static str) -> Serial {
-        Serial { queue: Mutex::default(), refuse: AtomicBool::new(false), label }
+        Serial { queue: Mutex::default(), idle: Condvar::new(), refuse: AtomicBool::new(false), label }
+    }
+
+    /// What the jobs do, as the thread is named.
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// Waits until no job waits or runs, until `deadline`: whether none does
+    /// (#236).
+    pub fn wait_idle(&self, deadline: Instant) -> bool {
+        let mut queue = lock(&self.queue);
+        while queue.1 || !queue.0.is_empty() {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return false;
+            };
+            queue = unpoisoned(self.idle.wait_timeout(queue, left)).0;
+        }
+        true
     }
 
     /// Queues `job`, starting the thread when none runs. When the thread
@@ -79,6 +100,7 @@ impl Serial {
                     Some(job) => job,
                     None => {
                         queue.1 = false;
+                        self.idle.notify_all();
                         return;
                     }
                 }
@@ -99,6 +121,7 @@ impl Drop for Exit<'_> {
             let jobs = {
                 let mut queue = lock(&self.0.queue);
                 queue.1 = false;
+                self.0.idle.notify_all();
                 std::mem::take(&mut queue.0)
             };
             drop(jobs);
@@ -136,5 +159,33 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// The queue is idle only once no job waits or runs (#236): a wait ends
+    /// with `false` at its deadline while a job is held, and with `true` once
+    /// every job queued has run, when the thread ends rather than at its
+    /// deadline.
+    #[test]
+    fn waits_until_no_job_waits_or_runs() {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+        let serial = Arc::new(Serial::labelled("test"));
+        assert!(serial.wait_idle(Instant::now()), "idle before any job");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let ran = Arc::new(AtomicU64::new(0));
+        let first = Arc::clone(&ran);
+        assert!(serial.submit(Box::new(move || {
+            let _ = held.recv();
+            first.fetch_add(1, Ordering::SeqCst);
+        })));
+        let second = Arc::clone(&ran);
+        assert!(serial.submit(Box::new(move || {
+            second.fetch_add(1, Ordering::SeqCst);
+        })));
+        assert!(!serial.wait_idle(Instant::now() + std::time::Duration::from_millis(50)), "a job runs");
+        release.send(()).unwrap();
+        let waited = Instant::now();
+        assert!(serial.wait_idle(waited + 2 * LIMIT));
+        assert!(waited.elapsed() < LIMIT, "woken when idle, not at the deadline");
+        assert_eq!(ran.load(Ordering::SeqCst), 2, "both ran before it was idle");
     }
 }

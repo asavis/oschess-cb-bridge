@@ -412,6 +412,12 @@ impl Registry {
         *s = State::Idle;
     }
 
+    /// Waits until no index build waits or runs, until `deadline`: whether
+    /// none does ([`crate::catalog::Catalog::settle`]).
+    pub fn wait_builds(&self, deadline: Instant) -> bool {
+        self.builds.wait_idle(deadline)
+    }
+
     /// Drops every index held in memory and leaves its files as they are: the
     /// next request opens them again. A build running goes on. Tests release a
     /// bridge's indexes before they change or remove the files, which a
@@ -735,6 +741,41 @@ mod tests {
         catalog.explorer.release();
         assert_eq!(Arc::strong_count(&loaded), 2, "held by the two requests alone");
         drop((loaded, again));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The builds are idle only once none waits or runs (#236): while another
+    /// database's build holds the queue, before the build a request queued, a
+    /// wait ends with `false` at its deadline; once both have run, with
+    /// `true`, and the requested index is written by then.
+    #[test]
+    fn waiting_for_the_builds_ends_once_the_index_is_written() {
+        let db = e4s("explorer-wait");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        catalog.explorer.set_dir(dir.clone());
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        assert!(catalog.explorer.wait_builds(Instant::now()), "idle before any build");
+        // Another database's build holds the queue until released.
+        let (release, held) = mpsc::channel::<()>();
+        assert!(catalog.explorer.builds.submit(
+            "0123456789abcdef",
+            Kind::Requested,
+            Arc::new(Progress::default()),
+            Box::new(move |_| {
+                let _ = held.recv();
+                Ran::Done
+            })
+        ));
+        let Lookup::Pending(_) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!("no build queued") };
+        assert!(!catalog.explorer.wait_builds(Instant::now() + Duration::from_millis(50)), "two builds wait or run");
+        release.send(()).unwrap();
+        assert!(catalog.explorer.wait_builds(Instant::now() + Duration::from_secs(300)));
+        assert!(paths(&dir, &entry.id).0.exists(), "the index was written before the wait ended");
+        assert!(catalog.explorer.building().is_empty(), "{:?}", catalog.explorer.building());
+        catalog.explorer.release();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

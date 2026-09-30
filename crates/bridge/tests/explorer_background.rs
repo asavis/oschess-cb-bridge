@@ -34,7 +34,7 @@ use cbformat::v2::Database;
 use chesscore::Board;
 
 mod common;
-use common::{WAIT_LIMIT, get, in_child, index_dir, policy, poll, serve_shared, until};
+use common::{WAIT_LIMIT, get, in_child, index_dir, policy, serve_shared, settle, until};
 
 const TICK: Duration = Duration::from_millis(50);
 /// What tells a child process that runs a test's body that it is one.
@@ -179,8 +179,8 @@ impl Cloud for Provider {
 }
 
 /// A bridge serving `catalog`, with its data folder `dir`; its keeper starts
-/// with [`Bridge::keep`]. Dropped, it stops its keeper, waits for its builds
-/// and gives up the indexes it holds.
+/// with [`Bridge::keep`]. Dropped, it stops its keeper, waits until none of
+/// its background work runs and gives up the indexes it holds.
 struct Bridge {
     port: u16,
     app: Arc<App>,
@@ -222,10 +222,9 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        let explorer = &self.app.catalog.explorer;
-        explorer.stop_keeping();
-        poll(WAIT_LIMIT, || explorer.building().is_empty().then_some(()));
-        explorer.release();
+        // Stops the keeper, then waits for every build and write (#236).
+        settle(&self.app);
+        self.app.catalog.explorer.release();
     }
 }
 
