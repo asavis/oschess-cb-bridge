@@ -9,10 +9,9 @@ use std::path::{Path, PathBuf};
 use crate::indexdir::{crc32, u32_at, u64_at};
 use crate::search::memory::{Hold, Refused};
 
-use super::deep::{BLOCK_BUCKETS, bucket_games};
 use super::format::{
-    BLOCK_ENTRY, BLOCK_KEYS, Block, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA, MAX_DEEP_BITS,
-    MIN_DEEP_BITS, MIN_RECORD, Stats, deep_bucket, deep_print,
+    BLOCK_BUCKETS, BLOCK_ENTRY, BLOCK_KEYS, Block, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, MAX_BLOCK_DATA,
+    MAX_DEEP_BITS, MIN_DEEP_BITS, MIN_RECORD, Stats, bucket_games, deep_bucket, deep_print,
 };
 
 /// Why an index file cannot be used.

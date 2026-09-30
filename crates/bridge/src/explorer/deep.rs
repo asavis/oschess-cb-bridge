@@ -30,13 +30,9 @@
 //! writes the same bytes.
 
 use std::cell::Cell;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-
-use chesscore::{Board, Color, Piece};
-
-use cbformat::movetable::{self, Captured, FIRST_CASTLE_960, MoveWord};
 
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
@@ -44,16 +40,15 @@ use crate::search::memory::Refused;
 use crate::search::workers::threads;
 
 use super::build::{Chunks, Out, Passes, Turns, from_bad, plan_pass};
+use super::follow::{CHANGES, Changes, Tracker};
 use super::format::{
-    DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, STRUCTURE_PIECES, deep_bucket, deep_print, piece_shift,
-    read_varint, structure_of, structures_in_vectors, structures_of, varint,
+    BLOCK_BUCKETS, DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, deep_bucket, deep_print, structure_of,
+    structures_in_vectors, structures_of, varint,
 };
 use super::runs::{Limits, PassTime, Progress, on_workers};
 use super::source::MAX_STRUCTURES;
 use super::stream::{self, Stream};
 
-/// Buckets per block.
-pub const BLOCK_BUCKETS: usize = 1 << DEEP_BLOCK_BITS;
 /// The least room a worker's postings take: twice a game's most, so that a
 /// pass that ends at a game keeps some.
 const MIN_WORKER_POSTINGS: usize = 2 * MAX_STRUCTURES;
@@ -106,246 +101,6 @@ fn place(p: u64) -> u64 {
 /// The first point of block `block`.
 fn block_point(block: u64) -> u64 {
     block << (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)
-}
-
-/// What a move word does to a structure, from the move table, so that a
-/// word is played without a branch: the pawns it takes off their squares or
-/// puts on theirs, white's then black's, which a xor applies; the change to
-/// the pieces' counts, a piece taken or a pawn promoted, which a wrapping add
-/// applies; and whether it may change the structure ([`CHANGED`]) and names
-/// a move of standard chess ([`NAMED`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-struct Effect {
-    pawns: [u64; 2],
-    pieces: u64,
-    flags: u64,
-}
-
-/// An [`Effect`] flag: a pawn's move or a capture.
-const CHANGED: u64 = 1;
-/// An [`Effect`] flag: a word that names a move of standard chess.
-const NAMED: u64 = 2;
-
-/// Room for the distinct effects of the move table's words, a power of two
-/// so that an index needs no check: its 45,357 words below the Chess960
-/// castlings have 1,282.
-const EFFECTS: usize = 2048;
-
-/// The index of each word's effect among the distinct ones, 0 for a word
-/// that names no move of standard chess, and the effects: two lookups a
-/// word, into tables of 2 bytes a word and 32 an effect of which 131 KB are
-/// in use, which a core's cache holds, where an effect a word would take
-/// 1.4 MB.
-fn effects() -> (&'static [u16; 1 << 16], &'static [Effect; EFFECTS]) {
-    type Tables = (Box<[u16; 1 << 16]>, Box<[Effect; EFFECTS]>);
-    static TABLES: OnceLock<Tables> = OnceLock::new();
-    let (of, effects) = TABLES.get_or_init(|| {
-        let (mut of, mut effects) = (vec![0u16; 1 << 16], vec![Effect::default()]);
-        let mut index = std::collections::HashMap::new();
-        for word in 0..FIRST_CASTLE_960 {
-            if let Some(e) = effect_of(word) {
-                of[usize::from(word)] = *index.entry(e).or_insert_with(|| {
-                    effects.push(e);
-                    effects.len() as u16 - 1
-                });
-            }
-        }
-        assert!(effects.len() <= EFFECTS, "{} effects", effects.len());
-        effects.resize(EFFECTS, Effect::default());
-        let boxed = |v: Vec<u16>| v.into_boxed_slice().try_into().expect("a word's index each");
-        (boxed(of), effects.into_boxed_slice().try_into().expect("room for every effect"))
-    });
-    (of, effects)
-}
-
-/// What `word` does to a structure; `None` when it names no move of standard
-/// chess.
-fn effect_of(word: u16) -> Option<Effect> {
-    let kind = |p: movetable::Piece| match p {
-        movetable::Piece::Knight => 0,
-        movetable::Piece::Bishop => 1,
-        movetable::Piece::Rook => 2,
-        _ => 3,
-    };
-    match movetable::decode(word)? {
-        MoveWord::Normal { color, piece, from, to, captured, promotion } => {
-            let (us, them) = match color {
-                movetable::Color::White => (Color::White, Color::Black),
-                movetable::Color::Black => (Color::Black, Color::White),
-            };
-            let pawn = piece == movetable::Piece::Pawn;
-            let (from, to) = (u64::from(from & 63), u64::from(to & 63));
-            let mut pawns = [0; 2];
-            // A pawn leaves its square, and stands on the other one unless it
-            // becomes a piece there.
-            if pawn {
-                pawns[us.index()] = 1 << from | u64::from(promotion.is_none()) << to;
-            }
-            // The pawn taken en passant stands beside the one that takes it:
-            // on the rank it leaves, the file it reaches.
-            pawns[them.index()] = match captured {
-                Captured::Pawn => 1 << to,
-                Captured::EnPassant => 1 << (from & 56 | to & 7),
-                _ => 0,
-            };
-            let taken_piece = match captured {
-                Captured::Knight => Some(movetable::Piece::Knight),
-                Captured::Bishop => Some(movetable::Piece::Bishop),
-                Captured::Rook => Some(movetable::Piece::Rook),
-                Captured::Queen => Some(movetable::Piece::Queen),
-                _ => None,
-            };
-            let mut delta = 0i64;
-            if let Some(p) = taken_piece {
-                delta -= 1 << piece_shift(kind(p), them);
-            }
-            if let Some(p) = promotion.filter(|_| pawn) {
-                delta += 1 << piece_shift(kind(p), us);
-            }
-            let changes = pawn || captured != Captured::Nothing;
-            Some(Effect { pawns, pieces: delta as u64, flags: NAMED | if changes { CHANGED } else { 0 } })
-        }
-        MoveWord::Castle { .. } => Some(Effect { flags: NAMED, ..Effect::default() }),
-        _ => None,
-    }
-}
-
-/// The words a line's replay plays at a time past the tree's plies, noting
-/// the changes of its structure ([`Tracker::play_noting`]).
-const CHANGES: usize = 64;
-
-/// The parts of a line's structure after each word of a run that may have
-/// changed it, each part in an array of its own, so that their structures
-/// are hashed several at a time ([`structures_of`]).
-struct Changes {
-    white: [u64; CHANGES],
-    black: [u64; CHANGES],
-    pieces: [u64; CHANGES],
-}
-
-impl Default for Changes {
-    fn default() -> Changes {
-        Changes { white: [0; CHANGES], black: [0; CHANGES], pieces: [0; CHANGES] }
-    }
-}
-
-/// A line's structure followed through its move words alone: each side's
-/// pawns and its pieces counted by kind, as [`super::format::structure`]
-/// hashes them. A word names the piece it moves, what it takes and what a
-/// pawn becomes, and the stream's words were checked when it was written, so
-/// no board is needed.
-#[derive(Clone, Copy)]
-pub struct Tracker {
-    pawns: [u64; 2],
-    pieces: u64,
-    of: &'static [u16; 1 << 16],
-    effects: &'static [Effect; EFFECTS],
-}
-
-impl PartialEq for Tracker {
-    fn eq(&self, other: &Tracker) -> bool {
-        (self.pawns, self.pieces) == (other.pawns, other.pieces)
-    }
-}
-
-impl std::fmt::Debug for Tracker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tracker").field("pawns", &self.pawns).field("pieces", &self.pieces).finish()
-    }
-}
-
-impl Tracker {
-    pub fn of(board: &Board) -> Tracker {
-        let mut pieces = 0u64;
-        for (i, piece) in STRUCTURE_PIECES.into_iter().enumerate() {
-            for color in [Color::White, Color::Black] {
-                pieces += u64::from(board.colored(piece, color).count_ones()) << piece_shift(i, color);
-            }
-        }
-        let pawns = |color| board.colored(Piece::Pawn, color);
-        let (of, effects) = effects();
-        Tracker { pawns: [pawns(Color::White), pawns(Color::Black)], pieces, of, effects }
-    }
-
-    /// The standard start's, counted once.
-    pub fn standard() -> Tracker {
-        static STANDARD: OnceLock<Tracker> = OnceLock::new();
-        *STANDARD.get_or_init(|| Tracker::of(stream::standard()))
-    }
-
-    /// The effect of `word`.
-    #[inline(always)]
-    fn effect(&self, word: u16) -> &'static Effect {
-        &self.effects[usize::from(self.of[usize::from(word)]) & (EFFECTS - 1)]
-    }
-
-    /// Plays `word`: whether the structure may have changed, which only a
-    /// pawn's move or a capture does; `None` for a word that names no move
-    /// of standard chess.
-    #[inline]
-    pub fn play(&mut self, word: u16) -> Option<bool> {
-        let e = self.effect(word);
-        if e.flags & NAMED == 0 {
-            return None;
-        }
-        self.apply(e);
-        Some(e.flags & CHANGED != 0)
-    }
-
-    /// Plays `words`, as [`Tracker::play`] plays each, without a branch a
-    /// word: `None` when one names no move of standard chess.
-    #[inline]
-    fn play_all(&mut self, words: &[[u8; 2]]) -> Option<()> {
-        let mut named = NAMED;
-        for w in words {
-            let e = self.effect(u16::from_le_bytes(*w));
-            named &= e.flags;
-            self.apply(e);
-        }
-        (named & NAMED != 0).then_some(())
-    }
-
-    /// [`Tracker::play_noting`], not inlined, so that the few registers it
-    /// plays in are all its own, when the changes' structures are hashed
-    /// apart from it, in vectors.
-    #[inline(never)]
-    fn play_noting_apart(&mut self, words: &[[u8; 2]], changes: &mut Changes) -> Option<usize> {
-        self.play_noting(words, changes)
-    }
-
-    /// Plays `words`, [`CHANGES`] at most, and notes in `changes` the parts
-    /// of the structure after each word that may have changed it, a pawn's
-    /// move or a capture: without a branch a word, since which words do is
-    /// unpredictable. The changes noted; `None` when a word names no move of
-    /// standard chess.
-    #[inline(always)]
-    fn play_noting(&mut self, words: &[[u8; 2]], changes: &mut Changes) -> Option<usize> {
-        let (mut noted, mut named) = (0, NAMED);
-        for w in words {
-            let e = self.effect(u16::from_le_bytes(*w));
-            named &= e.flags;
-            self.apply(e);
-            // No more noted than words played, so within `changes`.
-            let at = noted & (CHANGES - 1);
-            (changes.white[at], changes.black[at], changes.pieces[at]) = (self.pawns[0], self.pawns[1], self.pieces);
-            noted += (e.flags & CHANGED) as usize;
-        }
-        (named & NAMED != 0).then_some(noted)
-    }
-
-    /// Plays effect `e`, as [`Tracker::play`] does: a pawn leaves a square it
-    /// stands on and reaches one no pawn of its side stands on, and one taken
-    /// stood where it is taken, as the words were checked.
-    #[inline(always)]
-    fn apply(&mut self, e: &Effect) {
-        self.pawns[0] ^= e.pawns[0];
-        self.pawns[1] ^= e.pawns[1];
-        self.pieces = self.pieces.wrapping_add(e.pieces);
-    }
-
-    pub fn structure(&self) -> u64 {
-        structure_of(self.pawns[0], self.pawns[1], self.pieces)
-    }
 }
 
 /// The deep section as written: its postings, and where its table is.
@@ -987,51 +742,10 @@ fn put_bucket(
     Ok((n as u64, last))
 }
 
-/// The games of bucket `local` in a block's bytes that hold a structure of
-/// print `print`, at most `max_game` each, only those that hold it beyond the
-/// tree's plies when `beyond`; `None` when the block does not hold them as
-/// written.
-pub fn bucket_games(block: &[u8], local: usize, max_game: u32, print: u8, beyond: bool) -> Option<Vec<u32>> {
-    let mut at = 0;
-    for _ in 0..local {
-        let n = read_varint(block, &mut at)?;
-        for _ in 0..n {
-            read_varint(block, &mut at)?;
-        }
-    }
-    let n = read_varint(block, &mut at)?;
-    // A game comes once per print at most, and each posting takes a byte at
-    // least, so a damaged count never reserves more than the block's size.
-    if n > u64::from(max_game) << PRINT_BITS || n > (block.len() - at) as u64 {
-        return None;
-    }
-    let mut games = Vec::new();
-    games.try_reserve_exact(n as usize).ok()?;
-    let (mut game, mut last_print) = (0u64, 0u64);
-    for _ in 0..n {
-        let v = read_varint(block, &mut at)?;
-        let (delta, p) = (v >> 8, v >> 1 & 0x7f);
-        // Games ascend, from 1, and so do the prints of one game.
-        if delta == 0 && (game == 0 || p <= last_print) {
-            return None;
-        }
-        game += delta;
-        if game > u64::from(max_game) {
-            return None;
-        }
-        last_print = p;
-        if p == u64::from(print) && (!beyond || v & 1 == 1) {
-            games.push(game as u32);
-        }
-    }
-    Some(games)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::explorer::format::structure;
-    use chesscore::Move;
+    use crate::explorer::format::bucket_games;
 
     /// A structure of bucket `bucket` among `1 << bits` with print `print`.
     fn structure_in(bits: u8, bucket: u64, print: u64) -> u64 {
@@ -1088,34 +802,6 @@ mod tests {
         assert_eq!(bucket_games(&out, BLOCK_BUCKETS - 1, 100, 0, false), Some(vec![]));
         // A game past the database's last record is damage.
         assert_eq!(bucket_games(&out, 5, 8, 1, false), None);
-    }
-
-    /// A damaged bucket is refused: a delta that wraps around to a game
-    /// already listed, a game listed again with the same print or a lower
-    /// one, a first game of 0, and a count or a delta written past 64 bits,
-    /// which would read as 0 or 5 were the bits beyond cut off.
-    #[test]
-    fn a_damaged_bucket_is_refused() {
-        let bucket = |values: &[u64]| {
-            let mut b = Vec::new();
-            for &v in values {
-                varint(&mut b, v);
-            }
-            b
-        };
-        assert_eq!(bucket_games(&bucket(&[2, 5 << 8, u64::MAX - 2]), 0, 100, 0, false), None);
-        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 2, 2]), 0, 100, 1, false), None);
-        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 4, 2]), 0, 100, 1, false), None);
-        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 2, 4]), 0, 100, 1, false), Some(vec![5]));
-        // A database of one game lists it twice in a bucket where it holds
-        // two structures of different prints.
-        assert_eq!(bucket_games(&bucket(&[2, 1 << 8 | 2, 4]), 0, 1, 2, false), Some(vec![1]));
-        assert_eq!(bucket_games(&bucket(&[1, 2]), 0, 100, 1, false), None);
-        let long = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
-        assert_eq!(bucket_games(&long, 0, 100, 0, false), None);
-        let mut delta = vec![1, 0x85];
-        delta.extend(&long[1..]);
-        assert_eq!(bucket_games(&delta, 0, 100, 0, false), None);
     }
 
     /// A full buffer drops its repeats and goes on; one of many buckets ends
@@ -1254,120 +940,5 @@ mod tests {
         assert_eq!(bucket_games(&whole, 0, games, 5, false), every(1));
         assert_eq!(bucket_games(&whole, 0, games, 5, true), every(3));
         assert_eq!(bucket_games(&whole, 0, games, 6, true), every(7));
-    }
-
-    /// Following a line's words alone gives the structure a board gives, at
-    /// every ply, through captures of every kind, en passant, castling and
-    /// promotions to every piece, with and without a capture, from a set-up
-    /// start too; and it says so whenever the structure changes.
-    #[test]
-    fn a_tracked_structure_is_the_boards() {
-        let lines: [(Option<&str>, &str); 4] = [
-            (
-                None,
-                "e2e4 d7d5 e4d5 d8d5 b1c3 d5a5 d2d4 c7c6 g1f3 c8f5 f1c4 e7e6 e1h1 g8f6 c1d2 f8b4 c3e4 a5b6 \
-                 e4f6 g7f6 c4b3 b8d7 d2b4 b6b4 c2c3",
-            ),
-            (None, "e2e4 a7a6 e4e5 d7d5 e5d6 c7d6 d1g4 c8g4 f1a6 b8a6 g1f3 d8b6 e1h1 e8c8"),
-            (Some("r6r/1P4P1/8/8/2k5/8/1p4p1/R3K2R w KQ - 0 1"), "b7a8n g2h1q e1d2 b2a1r g7h8b c4b3 a8b6"),
-            (Some("4k3/1P6/8/8/8/8/6p1/R3K3 b Q - 0 1"), "g2g1q e1d2 e8d7 b7b8n d7c7 a1a7"),
-        ];
-        for (fen, ucis) in lines {
-            let mut board = fen.map_or_else(Board::startpos, |f| Board::from_fen(f).unwrap());
-            let mut tracked = Tracker::of(&board);
-            for uci in ucis.split_whitespace() {
-                let mut mv: Move = uci.parse().unwrap();
-                // Castling is the king onto its rook.
-                if board.piece_at(mv.from).is_some_and(|p| p.0 == Piece::King)
-                    && mv.from.file().abs_diff(mv.to.file()) == 2
-                {
-                    mv = Move::new(
-                        mv.from,
-                        chesscore::Square::new(if mv.to.file() > 4 { 7 } else { 0 }, mv.from.rank()),
-                        None,
-                    );
-                }
-                let word = cbformat::replay::word_of(&board, mv).unwrap();
-                let before = structure(&board);
-                board.play_checked(mv).unwrap();
-                let changed = tracked.play(word).unwrap();
-                assert_eq!(tracked.structure(), structure(&board), "{uci} in {ucis}");
-                if structure(&board) != before {
-                    assert!(changed, "{uci} changed the structure");
-                }
-            }
-        }
-        assert_eq!(Tracker::standard(), Tracker::of(&Board::startpos()));
-        assert_eq!(Tracker::of(&Board::startpos()).play(0), None, "word 0 names no move");
-        assert_eq!(Tracker::of(&Board::startpos()).play(movetable::NULL_MOVE), None);
-        assert_eq!(Tracker::of(&Board::startpos()).play(FIRST_CASTLE_960), None);
-    }
-
-    /// Each word's effect is looked up as it is made from the word, and a
-    /// word that names no move of standard chess, a Chess960 castling among
-    /// them, looks up none.
-    #[test]
-    fn each_word_looks_up_its_effect() {
-        let tracker = Tracker::of(&Board::startpos());
-        let mut named = 0;
-        for word in 0..=u16::MAX {
-            let made = if word < FIRST_CASTLE_960 { effect_of(word) } else { None };
-            named += usize::from(made.is_some());
-            assert_eq!(made.unwrap_or_default(), *tracker.effect(word), "{word:#x}");
-        }
-        assert!(named > 40_000, "{named}");
-    }
-
-    /// Words played a run at a time note the parts after each word that may
-    /// change the structure, as the words played one at a time say, and
-    /// lead to the same structure played all at once, over random games long
-    /// enough to promote; a run with a word that names no move fails.
-    #[test]
-    fn a_run_of_words_notes_each_change() {
-        let mut x = 0x2545_f491_4f6c_dd1du64;
-        let mut changed = 0;
-        for _ in 0..60 {
-            let mut board = Board::startpos();
-            let mut words = Vec::new();
-            for _ in 0..300 {
-                let moves = board.legal_moves();
-                if moves.is_empty() {
-                    break;
-                }
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                let mv = moves[(x % moves.len() as u64) as usize];
-                words.push(cbformat::replay::word_of(&board, mv).unwrap());
-                board.play_unchecked(mv);
-            }
-            let mut one = Tracker::of(&Board::startpos());
-            let mut expected = Vec::new();
-            for &w in &words {
-                if one.play(w).unwrap() {
-                    expected.push((one.pawns, one.pieces));
-                }
-            }
-            let bytes: Vec<[u8; 2]> = words.iter().map(|w| w.to_le_bytes()).collect();
-            let (mut run, mut noted) = (Tracker::of(&Board::startpos()), Vec::new());
-            let mut changes = Changes::default();
-            for words in bytes.chunks(CHANGES) {
-                let n = run.play_noting(words, &mut changes).unwrap();
-                let c = &changes;
-                noted.extend((0..n).map(|i| ([c.white[i], c.black[i]], c.pieces[i])));
-            }
-            assert_eq!(noted, expected);
-            assert_eq!(run, one);
-            let mut all = Tracker::of(&Board::startpos());
-            assert_eq!(all.play_all(&bytes), Some(()));
-            assert_eq!(all, one);
-            changed += noted.len();
-        }
-        assert!(changed > 1_000, "{changed}");
-        let mut run = Tracker::of(&Board::startpos());
-        let mut changes = Changes::default();
-        let e2e4 = cbformat::replay::word_of(&Board::startpos(), "e2e4".parse().unwrap()).unwrap();
-        assert_eq!(run.play_noting(&[e2e4.to_le_bytes(), [0, 0]], &mut changes), None);
-        assert_eq!(run.play_all(&[e2e4.to_le_bytes(), FIRST_CASTLE_960.to_le_bytes()]), None);
     }
 }

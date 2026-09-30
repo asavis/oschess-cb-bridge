@@ -47,9 +47,9 @@ use crate::search::{Members, Position, SearchError};
 use super::Loaded;
 use super::answer::{Keep, replay_with};
 use super::file::Bad;
+use super::follow::{Keys, standard_keys};
 use super::format::{MAX_PLY, Stats, TOP_GAMES};
 use super::stream::{Hit, Slot, Starts, Stream, Target, home_pawns};
-use super::tree::{Keys, standard_keys};
 
 /// The games of `board` in the index `loaded`, as a list narrows to them.
 pub struct Games<'a> {

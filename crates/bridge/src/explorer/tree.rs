@@ -18,14 +18,8 @@
 //! written once, in key order, and its blocks end where parts end, so any
 //! number of passes gives the same file.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-
-use chesscore::{Board, CastleSide, Color, Piece, Square, zobrist};
-
-use cbformat::movetable::{self, Captured, FIRST_CASTLE_960, MoveWord};
-use cbformat::replay;
 
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
@@ -33,9 +27,10 @@ use crate::search::memory::{Hold, Refused};
 use crate::search::workers::threads;
 
 use super::build::{Chunks, Counted, Out, Passes, Turns, from_bad, plan_pass};
+use super::follow::{Keys, standard_keys};
 use super::format::{
     BLOCK_DATA, BLOCK_ENTRY, BLOCK_KEYS, Block, Counts, KEY_ENTRY, MAX_BLOCK_DATA, MAX_PLY, NO_MOVE, TOP_GAMES,
-    encode_record, order_moves, pack_move, part_of, rank_top,
+    encode_record, order_moves, part_of, rank_top,
 };
 use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, grow, on_workers};
 use super::stream::{self, Stream};
@@ -65,230 +60,6 @@ const OUT_BYTES: usize = BLOCK_KEYS * KEY_ENTRY + MAX_BLOCK_DATA;
 /// made and not yet handed over, its share of those kept, and the room a
 /// crowded position folds in.
 pub const WORKER_BYTES: usize = BLOCK_KEYS * KEY_ENTRY + MAX_BLOCK_DATA + 2 * OUT_BYTES + FOLD_ENTRIES * ENTRY_BYTES;
-
-/// What a move word does to a position's key, from the move table, in 16
-/// bytes, one lookup a ply: the key's change (the piece off its square and
-/// onto the other, the piece taken, a pawn promoted, the rook of a castling,
-/// and the side to move); the pawns it moves and takes, which the deep
-/// section's [`deep::Tracker`] follows too: the square a pawn leaves (bits
-/// 0-5), the square it reaches (6-11), the square of a pawn taken (12-17),
-/// whether each is so (18-20), and whether black moves (21); the move as the
-/// index packs it, [`NO_MOVE`] for a word that names no move of standard
-/// chess; the castling rights the move ends ([`Keys::rights`]); and the
-/// square a pawn steps two squares to, plus one, else 0.
-///
-/// [`deep::Tracker`]: super::deep::Tracker
-#[derive(Clone, Copy, Default)]
-struct Step {
-    key: u64,
-    pawns: u32,
-    mv: u16,
-    ends: u8,
-    double: u8,
-}
-
-/// The step of each word below the Chess960 castlings.
-fn steps() -> &'static [Step] {
-    static STEPS: OnceLock<Vec<Step>> = OnceLock::new();
-    STEPS.get_or_init(|| (0..FIRST_CASTLE_960).map(step_of).collect())
-}
-
-/// The castling right of `color` on `side`, as a bit of [`Keys::rights`].
-fn right(color: Color, side: CastleSide) -> u8 {
-    1 << (2 * color.index() + side as usize)
-}
-
-fn step_of(word: u16) -> Step {
-    let Some(mv) = replay::standard_move(word) else { return Step::default() };
-    let side_of = |c: movetable::Color| if c == movetable::Color::White { Color::White } else { Color::Black };
-    let back = |c: Color| if c == Color::White { 0 } else { 7 };
-    let (key, pawns, ends, double) = match movetable::decode(word) {
-        Some(MoveWord::Normal { color, piece, captured, promotion, .. }) => {
-            let (us, them) = (side_of(color), !side_of(color));
-            let piece = board_piece(piece);
-            let mut key =
-                zobrist::piece(piece, us, mv.from) ^ zobrist::piece(promotion.map_or(piece, board_piece), us, mv.to);
-            let taken = match captured {
-                Captured::Nothing => None,
-                Captured::EnPassant => Some((Piece::Pawn, Square::new(mv.to.file(), mv.from.rank()))),
-                Captured::Pawn => Some((Piece::Pawn, mv.to)),
-                Captured::Knight => Some((Piece::Knight, mv.to)),
-                Captured::Bishop => Some((Piece::Bishop, mv.to)),
-                Captured::Rook => Some((Piece::Rook, mv.to)),
-                Captured::Queen => Some((Piece::Queen, mv.to)),
-            };
-            if let Some((p, at)) = taken {
-                key ^= zobrist::piece(p, them, at);
-            }
-            let pawn = piece == Piece::Pawn;
-            let pawn_taken = taken.filter(|t| t.0 == Piece::Pawn).map(|t| t.1);
-            let pawns = mv.from.index() as u32
-                | (mv.to.index() as u32) << 6
-                | pawn_taken.map_or(0, |at| at.index() as u32) << 12
-                | u32::from(pawn) << 18
-                | u32::from(pawn && promotion.is_none()) << 19
-                | u32::from(pawn_taken.is_some()) << 20
-                | u32::from(us == Color::Black) << 21;
-            // As a board ends them: a king's move ends both of its side's,
-            // a rook leaving a corner or taken on one ends that corner's.
-            let corner = |c: Color, at: Square| match at.file() {
-                0 if at.rank() == back(c) => right(c, CastleSide::Long),
-                7 if at.rank() == back(c) => right(c, CastleSide::Short),
-                _ => 0,
-            };
-            let mut ends = 0;
-            if piece == Piece::King {
-                ends |= right(us, CastleSide::Short) | right(us, CastleSide::Long);
-            }
-            if piece == Piece::Rook {
-                ends |= corner(us, mv.from);
-            }
-            if captured == Captured::Rook {
-                ends |= corner(them, mv.to);
-            }
-            let double = pawn && mv.from.rank().abs_diff(mv.to.rank()) == 2;
-            (key, pawns, ends, if double { mv.to.index() as u8 + 1 } else { 0 })
-        }
-        Some(MoveWord::Castle { color, side }) => {
-            let us = side_of(color);
-            // The king takes its own rook, and both end on their files.
-            let (king, rook) = match side {
-                movetable::CastleSide::Short => (6, 5),
-                movetable::CastleSide::Long => (2, 3),
-            };
-            let at = |file: u8| Square::new(file, back(us));
-            let key = zobrist::piece(Piece::King, us, mv.from)
-                ^ zobrist::piece(Piece::Rook, us, mv.to)
-                ^ zobrist::piece(Piece::King, us, at(king))
-                ^ zobrist::piece(Piece::Rook, us, at(rook));
-            let pawns = u32::from(us == Color::Black) << 21;
-            (key, pawns, right(us, CastleSide::Short) | right(us, CastleSide::Long), 0)
-        }
-        _ => return Step::default(),
-    };
-    Step { key: key ^ zobrist::white_to_move(), pawns, mv: pack_move(mv), ends, double }
-}
-
-fn board_piece(p: movetable::Piece) -> Piece {
-    match p {
-        movetable::Piece::King => Piece::King,
-        movetable::Piece::Queen => Piece::Queen,
-        movetable::Piece::Rook => Piece::Rook,
-        movetable::Piece::Bishop => Piece::Bishop,
-        movetable::Piece::Knight => Piece::Knight,
-        movetable::Piece::Pawn => Piece::Pawn,
-    }
-}
-
-/// A line's key followed through its move words alone, as the deep
-/// section's tracker follows its structure: a word names the piece it moves,
-/// what it takes and what a pawn becomes, and the stream's words were checked
-/// when it was written, so no board is needed. The key is the one
-/// [`Board::hash`] gives, the Polyglot key, whose en passant file counts only
-/// when a pawn of the side to move stands beside the pawn that has just
-/// stepped two squares: the pawns followed tell.
-#[derive(Clone, Copy)]
-pub(super) struct Keys {
-    /// The key without its en passant part, and that part, 0 for none.
-    key: u64,
-    en_passant: u64,
-    /// The castling rights left: bit `2 * colour + side`, white first, O-O
-    /// before O-O-O, as the keys have them.
-    rights: u8,
-    /// White's pawns, then black's.
-    pawns: [u64; 2],
-    steps: &'static [Step],
-}
-
-impl Keys {
-    /// The key of `board` to follow; `None` for a castling rook off its
-    /// corner, which a start the stream keeps never has
-    /// ([`stream::board_of`]).
-    pub(super) fn of(board: &Board) -> Option<Keys> {
-        let mut rights = 0;
-        for color in [Color::White, Color::Black] {
-            for (side, file) in [(CastleSide::Short, 7), (CastleSide::Long, 0)] {
-                match board.castling_rook(color, side) {
-                    None => {}
-                    Some(f) if f == file => rights |= right(color, side),
-                    Some(_) => return None,
-                }
-            }
-        }
-        let en_passant = board.en_passant().map_or(0, |sq| zobrist::en_passant(sq.file()));
-        let pawns = [board.colored(Piece::Pawn, Color::White), board.colored(Piece::Pawn, Color::Black)];
-        Some(Keys { key: board.hash() ^ en_passant, en_passant, rights, pawns, steps: steps() })
-    }
-
-    pub(super) fn hash(&self) -> u64 {
-        self.key ^ self.en_passant
-    }
-
-    /// The home pawns of the line's position ([`stream::home_pawns`]).
-    pub(super) fn home(&self) -> u16 {
-        stream::home_of(self.pawns[0], self.pawns[1])
-    }
-
-    /// The move `word` names, as the index packs it; `None` for a word that
-    /// names no move of standard chess.
-    pub(super) fn packed(&self, word: u16) -> Option<u16> {
-        self.step(word).map(|s| s.mv)
-    }
-
-    /// Plays `word`, which [`Keys::packed`] took.
-    pub(super) fn play(&mut self, word: u16) {
-        let Some(&s) = self.steps.get(usize::from(word)) else { return };
-        self.apply(s);
-    }
-
-    /// What `word` does, the move it names among it; `None` for a word that
-    /// names no move of standard chess. One lookup gives both.
-    #[inline]
-    fn step(&self, word: u16) -> Option<Step> {
-        self.steps.get(usize::from(word)).copied().filter(|s| s.mv != NO_MOVE)
-    }
-
-    /// Plays step `s`.
-    #[inline(always)]
-    fn apply(&mut self, s: Step) {
-        // Both sides' pawns at once, without a branch, as the deep section's
-        // tracker plays them: all ones in `black` when black moves.
-        let p = u64::from(s.pawns);
-        let black = (p >> 21 & 1).wrapping_neg();
-        let left = (p >> 18 & 1) << (p & 63);
-        let reached = (p >> 19 & 1) << (p >> 6 & 63);
-        let taken = (p >> 20 & 1) << (p >> 12 & 63);
-        let [white_pawns, black_pawns] = self.pawns;
-        self.pawns = [
-            white_pawns & !(left & !black | taken & black) | reached & !black,
-            black_pawns & !(left & black | taken & !black) | reached & black,
-        ];
-        self.key ^= s.key;
-        let ended = self.rights & s.ends;
-        if ended != 0 {
-            for color in [Color::White, Color::Black] {
-                for side in [CastleSide::Short, CastleSide::Long] {
-                    if ended & right(color, side) != 0 {
-                        self.key ^= zobrist::castle(color, side);
-                    }
-                }
-            }
-            self.rights &= !ended;
-        }
-        self.en_passant = 0;
-        if s.double != 0 {
-            // White steps to the fourth rank, black to the fifth; the pawns
-            // of the other side beside it may take en passant.
-            let to = s.double - 1;
-            let them = if to < 32 { Color::Black } else { Color::White };
-            let bit = 1u64 << to;
-            let beside = (bit << 1 & !0x0101_0101_0101_0101) | (bit >> 1 & !0x8080_8080_8080_8080);
-            if self.pawns[them.index()] & beside != 0 {
-                self.en_passant = zobrist::en_passant(to & 7);
-            }
-        }
-    }
-}
 
 /// A worker's entries of the positions [`SHALLOW_PLY`] names, folded as they
 /// fill its room.
@@ -557,12 +328,6 @@ impl Pass<'_> {
         }
         Ok(())
     }
-}
-
-/// The keys of the standard start to follow.
-pub(super) fn standard_keys() -> Keys {
-    static START: OnceLock<Keys> = OnceLock::new();
-    *START.get_or_init(|| Keys::of(stream::standard()).expect("the standard start castles from the corners"))
 }
 
 /// The entries a worker's buffer holds so that a pass whose first part has
@@ -1008,90 +773,6 @@ mod tests {
             assert!(hi.load(Ordering::Relaxed) >= 3, "{n}: the pass ends past part 2");
             assert_eq!(buf.iter().filter(|e| part_of(e.key, bits) == 2).count() as u64, n);
         }
-    }
-
-    /// Following a line's words alone gives the key a board gives, and the
-    /// move the index packs, at every ply: through castling on both sides,
-    /// captures of every kind, en passant with and without a pawn beside to
-    /// take, promotions, rooks leaving and taken on their corners, from the
-    /// standard start and from set-up ones, one with an en passant capture
-    /// to play first, over many random games.
-    #[test]
-    fn a_followed_key_is_the_boards() {
-        let starts = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r3k2r/pppq1ppp/2n1bn2/3pp3/1b1PP3/2N1BN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
-            "r3k2r/1P4P1/8/8/8/8/1p4p1/R3K2R w KQkq - 0 1",
-            "4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1",
-            "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
-        ];
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        // Plies, then those with an en passant part, a castling, a promotion,
-        // an en passant capture, and castling rights ended.
-        let mut seen = [0u32; 6];
-        for fen in starts {
-            let start = Board::from_fen(fen).unwrap();
-            for _ in 0..400 {
-                let mut board = start.clone();
-                let mut keys = Keys::of(&board).unwrap();
-                assert_eq!(keys.hash(), board.hash(), "{fen}");
-                for _ in 0..160 {
-                    let moves = board.legal_moves();
-                    if moves.is_empty() {
-                        break;
-                    }
-                    // Pawns' double steps, castling and captures often.
-                    let pick = moves
-                        .iter()
-                        .copied()
-                        .find(|m| {
-                            next() % 3 == 0
-                                && (m.from.rank().abs_diff(m.to.rank()) == 2 || board.piece_at(m.to).is_some())
-                        })
-                        .unwrap_or_else(|| moves[(next() % moves.len() as u64) as usize]);
-                    let word = replay::word_of(&board, pick).unwrap();
-                    assert_eq!(keys.packed(word), Some(pack_move(pick)));
-                    let castles = board.piece_at(pick.to).is_some_and(|p| p.1 == board.side_to_move());
-                    let en_passant =
-                        board.en_passant() == Some(pick.to) && board.piece_at(pick.from).unwrap().0 == Piece::Pawn;
-                    let rights = keys.rights;
-                    board.play_checked(pick).unwrap();
-                    keys.play(word);
-                    assert_eq!(keys.hash(), board.hash(), "{pick} from {fen}");
-                    let noted = [
-                        true,
-                        keys.en_passant != 0,
-                        castles,
-                        pick.promotion.is_some(),
-                        en_passant,
-                        keys.rights != rights,
-                    ];
-                    for (n, noted) in seen.iter_mut().zip(noted) {
-                        *n += u32::from(noted);
-                    }
-                }
-            }
-        }
-        assert!(seen[0] > 100_000 && seen.iter().all(|&n| n > 50), "{seen:?}");
-        // A word that names no move of standard chess.
-        assert_eq!(standard_keys().packed(0), None);
-        assert_eq!(standard_keys().packed(movetable::NULL_MOVE), None);
-        assert_eq!(standard_keys().packed(FIRST_CASTLE_960), None);
-        // A castling rook off its corner is no start of the stream.
-        let rooks = Board::from_fen("4k3/8/8/8/8/8/8/1R2K3 w - - 0 1").unwrap();
-        let mut odd = chesscore::BoardBuilder::empty();
-        for (i, square) in odd.squares.iter_mut().enumerate() {
-            *square = Square::from_index(i as u8).and_then(|sq| rooks.piece_at(sq));
-        }
-        odd.castling[0][1] = Some(1);
-        odd.chess960 = true;
-        assert!(Keys::of(&odd.build().unwrap()).is_none());
     }
 
     /// A worker's entries of the shallow positions fold into its room as
