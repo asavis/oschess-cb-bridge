@@ -1,6 +1,6 @@
 //! The server against `docs/api.md`, over real loopback connections.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -567,6 +567,41 @@ fn status_until(port: u16, status: u16, meanwhile: u16) -> Reply {
     }
 }
 
+/// Holds the connection cap with [`server::MAX_CONNECTIONS`] connections that
+/// send nothing, asking for `/v1/status` until the answer is `503`: those
+/// connections and that answer. Until the bridge has counted them all, a
+/// request is served. A loaded kernel can queue a request ahead of such a
+/// connection whose `connect` has returned (#217): the request takes the last
+/// slot, the connection is answered `busy` and closed, and the cap would never
+/// be reached again. Such a connection is replaced.
+fn hold_the_cap(port: u16) -> (Vec<TcpStream>, Reply) {
+    let mut held: Vec<TcpStream> = (0..server::MAX_CONNECTIONS).map(|_| connect(port).unwrap()).collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = get_reply(port, "/v1/status");
+        if r.status == 503 {
+            return (held, r);
+        }
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(Instant::now() < deadline, "still 200 after 10 s: {}", r.body);
+        for s in &mut held {
+            if !unanswered(s) {
+                *s = connect(port).unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Whether the bridge has neither answered nor closed `s`, a connection that
+/// sent nothing.
+fn unanswered(s: &TcpStream) -> bool {
+    s.set_nonblocking(true).unwrap();
+    let unanswered = matches!(s.peek(&mut [0]), Err(e) if e.kind() == ErrorKind::WouldBlock);
+    s.set_nonblocking(false).unwrap();
+    unanswered
+}
+
 /// Over the connection cap, the `busy` answer is readable by an allowed page,
 /// and so is a refused `Host`.
 #[test]
@@ -576,9 +611,8 @@ fn busy_and_misdirected_answers_carry_cors() {
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:1\r\nOrigin: {ORIGIN}"));
     assert_eq!((r.status, r.header("access-control-allow-origin")), (421, Some(ORIGIN)));
     // That connection's slot was freed before it closed, so the next ones
-    // are the only ones counted. Until they all are, a request is served.
-    let idle: Vec<TcpStream> = (0..server::MAX_CONNECTIONS).map(|_| connect(p).unwrap()).collect();
-    let r = status_until(p, 503, 200);
+    // are the only ones counted.
+    let (idle, r) = hold_the_cap(p);
     assert!(r.body.contains(r#""code":"busy""#));
     assert_eq!(r.header("retry-after"), Some("1"));
     assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
@@ -622,8 +656,7 @@ fn a_game_whose_answer_would_be_huge_is_refused() {
 fn silent_queued_connections_do_not_delay_the_busy_answer() {
     let db = database("api-busy-queue", 1, 0, 0);
     let p = start(&db, vec![], None).port;
-    let serving: Vec<TcpStream> = (0..server::MAX_CONNECTIONS).map(|_| connect(p).unwrap()).collect();
-    status_until(p, 503, 200);
+    let (serving, _) = hold_the_cap(p);
     let silent: Vec<TcpStream> = (0..12).map(|_| connect(p).unwrap()).collect();
     let started = Instant::now();
     let r = get_reply(p, "/v1/status");
