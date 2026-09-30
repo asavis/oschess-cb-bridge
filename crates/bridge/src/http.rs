@@ -216,7 +216,13 @@ impl Conn {
             match self.stream.read(&mut chunk) {
                 Ok(0) => return,
                 Ok(n) => dropped += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // A read time-out counts in the kernel's ticks and can end a
+                // little before the deadline; the loop looks at it again.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
                 Err(_) => return,
             }
         }

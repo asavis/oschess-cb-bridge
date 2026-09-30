@@ -254,18 +254,23 @@ fn one_bridge_runs_at_a_time() {
     assert_eq!(most, 1, "bridges running at once\n{text}");
 }
 
-/// The processes running now whose parent is `parent`.
+/// The processes running now whose parent is `parent`. The kernel lists
+/// each thread's children in `/proc/<pid>/task/<tid>/children`, so a look
+/// reads a file per thread of `parent` rather than every process's `stat`:
+/// looks that took long on a loaded machine missed a bridge that started and
+/// ended between two of them (#217).
 #[cfg(target_os = "linux")]
 fn children(parent: u32) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
-    let child = |e: std::fs::DirEntry| {
-        let pid: u32 = e.file_name().to_str()?.parse().ok()?;
-        let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
-        // `pid (name) state ppid …`, where the name may hold spaces and
-        // parentheses.
-        let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
-        let (state, ppid) = (fields.next()?, fields.next()?.parse::<u32>().ok()?);
-        (ppid == parent && state != "Z").then_some(pid)
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{parent}/task")) else { return Vec::new() };
+    let listed = tasks.flatten().filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok());
+    let running = |pid: &u32| {
+        // `pid (name) state …`, where the name may hold spaces and
+        // parentheses; an ended child waits as a zombie until it is reaped.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        stat.rfind(')').is_some_and(|end| stat[end + 1..].split_whitespace().next().is_some_and(|state| state != "Z"))
     };
-    entries.flatten().filter_map(child).collect()
+    listed
+        .flat_map(|l| l.split_whitespace().filter_map(|p| p.parse().ok()).collect::<Vec<u32>>())
+        .filter(running)
+        .collect()
 }
