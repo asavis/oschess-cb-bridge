@@ -4,11 +4,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::{Busy, Catalog, State, id_of};
 use bridge::explorer::paths;
 use bridge::explorer::stream::{BATCH, Header, SLOT_BYTES, TABLE_ENTRY};
 use bridge::fetch::Cloud;
@@ -21,7 +21,7 @@ use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 mod common;
 use common::{
     Served, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, policy, poll,
-    put, serve_with_dir,
+    put, serve_with_dir, until,
 };
 
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -966,4 +966,210 @@ fn a_dropped_bridge_leaves_nothing_writing_into_its_folder() {
     let written = dir.exists();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!written, "the build wrote into the data folder after it was removed");
+}
+
+/// How long a settle test gives a thread to reach where it waits, when
+/// nothing it does tells: far longer than that takes. It orders the steps
+/// that make a settle that is not safe end early; a safe one waits whatever
+/// their order.
+const PAUSE: Duration = Duration::from_millis(250);
+
+/// How long a settle given 25 ms may take to give up: far longer than that
+/// takes, far shorter than a wait for work the test holds until it looks.
+const SETTLE_BOUND: Duration = Duration::from_secs(5);
+
+/// A cloud provider for the settle tests (#236). It keeps the database's main
+/// file in the cloud while `cloud_only` is set; it holds the first look at
+/// the file from the thread named `holds` until let go; and a download of the
+/// file waits until let go, then does what the test gave it, and ends.
+struct Probe {
+    holds: &'static str,
+    seen: Mutex<Probed>,
+    changed: Condvar,
+    /// What the download does once let go, before it ends.
+    on_fetch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// What [`Probe`] has seen, and been told by the test.
+#[derive(Default)]
+struct Probed {
+    cloud_only: bool,
+    /// The looks at the main file from the thread [`Probe::holds`] names.
+    looks: usize,
+    /// The first of them goes on.
+    let_look: bool,
+    /// A download is fetching the main file.
+    fetching: bool,
+    /// The fetch goes on.
+    let_fetch: bool,
+}
+
+impl Probe {
+    fn holding(holds: &'static str) -> Probe {
+        Probe { holds, seen: Mutex::default(), changed: Condvar::new(), on_fetch: Mutex::new(None) }
+    }
+
+    /// Tells the probe what the test did.
+    fn tell(&self, did: impl FnOnce(&mut Probed)) {
+        did(&mut self.seen.lock().unwrap());
+        self.changed.notify_all();
+    }
+
+    /// Waits until `done` holds, for [`WAIT_LIMIT`] at most.
+    fn until<'a>(&self, mut seen: MutexGuard<'a, Probed>, done: impl Fn(&Probed) -> bool) -> MutexGuard<'a, Probed> {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        while !done(&seen) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { break };
+            seen = self.changed.wait_timeout(seen, left).unwrap().0;
+        }
+        seen
+    }
+
+    /// Waits until `done` holds, and fails the test with `what` when it does
+    /// not after [`WAIT_LIMIT`].
+    fn wait_for(&self, what: &str, done: impl Fn(&Probed) -> bool) {
+        let seen = self.until(self.seen.lock().unwrap(), &done);
+        assert!(done(&seen), "{what} (waited {WAIT_LIMIT:?})");
+    }
+}
+
+impl Cloud for Probe {
+    fn is_cloud_only(&self, path: &Path, _: &Metadata) -> bool {
+        if path.extension() != Some("2cbh".as_ref()) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap();
+        if std::thread::current().name() == Some(self.holds) {
+            seen.looks += 1;
+            self.changed.notify_all();
+            if seen.looks == 1 {
+                seen = self.until(seen, |s| s.let_look);
+            }
+        }
+        seen.cloud_only
+    }
+
+    fn fetch(&self, _: &Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+        let mut seen = self.seen.lock().unwrap();
+        seen.fetching = true;
+        self.changed.notify_all();
+        seen = self.until(seen, |s| s.let_fetch);
+        seen.cloud_only = false;
+        drop(seen);
+        if let Some(then) = self.on_fetch.lock().unwrap().take() {
+            then();
+        }
+        Ok(())
+    }
+}
+
+/// The catalog of the 2CBH database at `path`, seen through `probe`, with
+/// its data folder `dir`.
+fn probed(path: &Path, probe: &Arc<Probe>, dir: &Path) -> Arc<Catalog> {
+    let sources = Sources { fixed: vec![path.to_path_buf()], ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, Arc::clone(probe) as Arc<dyn Cloud>);
+    catalog.use_data_dir(dir);
+    Arc::new(catalog)
+}
+
+/// A settle does not end while a build runs that a download queued before it
+/// ended (#236), though the build was queued after the settle began, and the
+/// download ended before the settle could look at the downloads: work that
+/// passes from one queue to another counts all along.
+///
+/// The download runs as the settle begins. Meanwhile the PGN queue's lock is
+/// held where the queue logs a thread start it refuses, since standard error,
+/// which the test holds, keeps the line waiting: a settle that looks at the
+/// queues one after another waits there, having looked at the builds. Then
+/// the download queues the build of the database's index and ends. The build
+/// is held at its first look at the files, before it writes, until the test
+/// has seen whether the settle ended. The test runs in a process of its own,
+/// where no other test logs while standard error is held.
+#[test]
+fn a_settle_waits_for_a_build_that_an_ended_download_queued() {
+    const NAME: &str = "a_settle_waits_for_a_build_that_an_ended_download_queued";
+    if !common::in_child(NAME, "BRIDGE_POSITIONS_SETTLE_CHILD", &[]) {
+        return;
+    }
+    let games: Vec<Game> = (0..3).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-settle-download", &games);
+    let dir = index_dir("settle-download");
+    let probe = Arc::new(Probe::holding("bridge-index"));
+    let catalog = probed(&db.dir().join("db.2cbh"), &probe, &dir);
+    let entry = Arc::clone(&catalog.entries()[0]);
+    let Ok(open) = entry.open() else { panic!("the database does not open") };
+    *probe.on_fetch.lock().unwrap() = Some(Box::new({
+        let (catalog, entry, open) = (Arc::clone(&catalog), Arc::clone(&entry), open.clone());
+        move || drop(catalog.explorer.index(entry, &open))
+    }));
+    probe.tell(|seen| seen.cloud_only = true);
+    assert_eq!(entry.open_to_read().err(), Some(State::Downloading));
+    probe.wait_for("the download did not fetch", |seen| seen.fetching);
+
+    let pgn = Arc::clone(catalog.pgn().queue());
+    pgn.refuse_starts(true);
+    let stderr = std::io::stderr().lock();
+    let holder = std::thread::spawn({
+        let pgn = Arc::clone(&pgn);
+        move || pgn.submit(Box::new(|| {}))
+    });
+    std::thread::sleep(PAUSE);
+    let (tx, settled) = mpsc::channel();
+    let settling = std::thread::spawn({
+        let catalog = Arc::clone(&catalog);
+        move || tx.send(catalog.settle(WAIT_LIMIT)).unwrap()
+    });
+    std::thread::sleep(PAUSE);
+    probe.tell(|seen| seen.let_fetch = true);
+    until("the download did not end", WAIT_LIMIT, || entry.progress().is_none());
+    std::thread::sleep(PAUSE);
+    drop(stderr);
+    assert!(!holder.join().unwrap(), "the PGN queue started a thread");
+    pgn.refuse_starts(false);
+
+    probe.wait_for("the download queued no build", |seen| seen.looks >= 1);
+    let early = settled.recv_timeout(PAUSE);
+    probe.tell(|seen| seen.let_look = true);
+    assert!(early.is_err(), "settled while the build the download queued still ran: {early:?}");
+    assert_eq!(settled.recv_timeout(WAIT_LIMIT), Ok(Ok(())));
+    settling.join().unwrap();
+    let index = catalog.explorer.dir().unwrap();
+    assert!(paths(&index, &entry.id).0.exists(), "the build wrote its index before the catalog settled");
+    catalog.explorer.release();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A settle gives up at its limit while the keeper's look is held at the
+/// database's files, and names the keeper, rather than wait for the look to
+/// end (#236); once the look has ended, the catalog settles. The look runs
+/// on a thread of the test's, as the keeper's own thread runs it.
+#[test]
+fn a_settle_gives_up_on_a_keeper_held_in_its_look() {
+    let games: Vec<Game> = (0..3).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-settle-keeper", &games);
+    let dir = index_dir("settle-keeper");
+    let probe = Arc::new(Probe::holding("test-keeper"));
+    let catalog = probed(&db.dir().join("db.2cbh"), &probe, &dir);
+    let entries = catalog.entries();
+    let keeping = std::thread::Builder::new().name("test-keeper".into()).spawn({
+        let catalog = Arc::clone(&catalog);
+        move || catalog.explorer.keep(&entries)
+    });
+    let keeping = keeping.unwrap();
+    probe.wait_for("the keeper did not look at the files", |seen| seen.looks >= 1);
+
+    let (tx, settled) = mpsc::channel();
+    let began = Instant::now();
+    let settling = std::thread::spawn({
+        let catalog = Arc::clone(&catalog);
+        move || tx.send(catalog.settle(Duration::from_millis(25))).unwrap()
+    });
+    let settle = settled.recv_timeout(SETTLE_BOUND);
+    let took = began.elapsed();
+    probe.tell(|seen| seen.let_look = true);
+    keeping.join().unwrap();
+    settling.join().unwrap();
+    assert_eq!(settle, Ok(Err(Busy(vec!["keeper"]))), "a settle given 25 ms, after {took:?}");
+    assert_eq!(catalog.settle(WAIT_LIMIT), Ok(()));
+    let _ = std::fs::remove_dir_all(&dir);
 }

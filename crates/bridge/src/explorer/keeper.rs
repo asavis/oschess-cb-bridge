@@ -24,6 +24,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::activity::Active;
 use crate::api::App;
 use crate::catalog::{Entry, Opened};
 use crate::machine::{self, Machine};
@@ -38,6 +39,9 @@ pub const TICK: Duration = Duration::from_secs(60);
 /// How long a database keeps its generation before its index is rebuilt in
 /// the background.
 pub const QUIET: Duration = Duration::from_secs(60);
+/// The kind of work a look of the keeper counts as in the catalog's activity
+/// (#236).
+const LOOK: &str = "keeper";
 
 /// How often the keeper looks, how long a database must have kept its
 /// generation before its index is rebuilt in the background, and whether the
@@ -75,13 +79,12 @@ pub fn start(app: &Arc<App>) {
         std::thread::Builder::new().name("bridge-keeper".into()).stack_size(crate::THREAD_STACK).spawn(move || {
             while let Some(app) = app.upgrade() {
                 let registry = &app.catalog.explorer;
-                let Keeping { tick, stopped, .. } = *lock(&registry.keeping);
-                if stopped {
-                    return;
-                }
+                // The reading of the list counts as the look's work too.
+                let Some((Keeping { tick, .. }, look)) = registry.look() else { return };
                 if lock(&registry.dir).is_some() {
                     registry.keep(&app.catalog.entries());
                 }
+                drop(look);
                 drop(app);
                 std::thread::sleep(tick);
             }
@@ -101,22 +104,38 @@ impl Registry {
         (keeping.tick, keeping.quiet) = (tick, quiet);
     }
 
-    /// Stops the keeper for good, once the look it may be taking is over:
-    /// it queues no build from now on. Tests stop it before they remove the
-    /// files it would rebuild.
+    /// Stops the keeper for good, at once: no look begins from now on, and
+    /// the look it may be taking queues no more builds. That look counts as
+    /// the catalog's work until it ends, which
+    /// [`crate::catalog::Catalog::settle`] waits for, as long as it waits
+    /// for the rest (#236).
     pub fn stop_keeping(&self) {
         lock(&self.keeping).stopped = true;
+    }
+
+    /// How the keeper keeps, and a look counted as the catalog's work until
+    /// the guard is dropped; `None` once the keeper is stopped. The look is
+    /// counted under the lock a stop takes, so that either the stop comes
+    /// first and no look begins, or the stop finds the look counted. The
+    /// lock is held no longer: a stop never waits for a look (#236).
+    fn look(&self) -> Option<(Keeping, Active)> {
+        let keeping = lock(&self.keeping);
+        (!keeping.stopped).then(|| (*keeping, self.activity.begin(LOOK)))
+    }
+
+    fn stopped(&self) -> bool {
+        lock(&self.keeping).stopped
     }
 
     /// One look of the keeper at `entries`, the databases as listed now:
     /// queues a background build for each database in use whose index is not
     /// of the generation it has had for the quiet period. While the computer
     /// runs on battery, the background build running stops and waits. Does
-    /// nothing without an index folder the bridge was given.
+    /// nothing without an index folder the bridge was given, or once the
+    /// keeper is stopped.
     pub fn keep(&self, entries: &[Arc<Entry>]) {
-        // Held while it looks, so that a stop waits for the look to end.
-        let keeping = lock(&self.keeping);
-        let Some(dir) = lock(&self.dir).clone().filter(|_| !keeping.stopped) else { return };
+        let Some((keeping, _look)) = self.look() else { return };
+        let Some(dir) = lock(&self.dir).clone() else { return };
         let machine = self.builds.machine();
         if machine.on_battery() {
             self.builds.pause();
@@ -169,7 +188,8 @@ impl Registry {
                     since
                 }
             };
-            if now.duration_since(since) >= quiet {
+            // A keeper stopped while it looked queues nothing more.
+            if now.duration_since(since) >= quiet && !self.stopped() {
                 self.renew(entry, &open, &dir, &*machine);
             }
         }

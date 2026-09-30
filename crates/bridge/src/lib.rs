@@ -3,6 +3,7 @@
 //! specifies.
 
 pub mod access;
+pub mod activity;
 
 /// The stack of every thread the bridge starts: 1 MiB, half the standard
 /// library's default. Nothing a thread runs recurses with the data (move

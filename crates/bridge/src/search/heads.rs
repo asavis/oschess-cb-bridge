@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cbformat::file::DbFile;
@@ -23,7 +23,7 @@ use cbformat::file::DbFile;
 use super::slim::{ROW, Slim};
 use crate::indexdir::{self, Unlisted, crc32, u32_at, u64_at};
 use crate::store::Store;
-use crate::sync::{lock, unpoisoned};
+use crate::sync::lock;
 
 const MAGIC: [u8; 8] = *b"OSCBHDS\0";
 const VERSION: u32 = 1;
@@ -222,8 +222,6 @@ pub fn path(dir: &Path, id: &str) -> PathBuf {
 /// Partial files being written now, which the sweep leaves alone: a names
 /// file's writer is no build the registry tracks (#108).
 static WRITING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-/// Told when a write ends ([`wait_written`]).
-static WRITTEN: Condvar = Condvar::new();
 
 /// Marks `path` as being written until the guard drops.
 pub struct Writing(PathBuf);
@@ -241,21 +239,7 @@ impl Drop for Writing {
         if let Some(i) = writing.iter().position(|p| *p == self.0) {
             writing.swap_remove(i);
         }
-        WRITTEN.notify_all();
     }
-}
-
-/// Waits until no partial file is being written, in the whole process, until
-/// `deadline`: whether none is (#236).
-pub fn wait_written(deadline: Instant) -> bool {
-    let mut writing = lock(&WRITING);
-    while !writing.is_empty() {
-        let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
-            return false;
-        };
-        writing = unpoisoned(WRITTEN.wait_timeout(writing, left)).0;
-    }
-    true
 }
 
 fn being_written(path: &Path) -> bool {
@@ -443,28 +427,6 @@ mod tests {
         registry.sweep(&dir, &listed);
         assert!(!partial.exists(), "a partial file left by no writer goes");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The writes are idle only once no partial file is being written (#236):
-    /// a wait ends with `false` at its deadline while one is, and with `true`
-    /// once its writer has dropped its mark, when the mark drops rather than
-    /// at the deadline. The writers of other tests are waited for too.
-    #[test]
-    fn waits_until_no_file_is_being_written() {
-        const LIMIT: Duration = Duration::from_secs(300);
-        let partial = std::env::temp_dir().join(format!("bridge-heads-written-{}.players.partial", std::process::id()));
-        let writing = Writing::new(partial);
-        assert!(!wait_written(Instant::now() + Duration::from_millis(50)), "a file is being written");
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let writer = std::thread::spawn(move || {
-            let _ = held.recv();
-            drop(writing);
-        });
-        release.send(()).unwrap();
-        let waited = Instant::now();
-        assert!(wait_written(waited + 2 * LIMIT));
-        assert!(waited.elapsed() < LIMIT, "woken when the write ended, not at the deadline");
-        writer.join().unwrap();
     }
 
     /// A heads build whose job panics is recorded as failed (#172): no build

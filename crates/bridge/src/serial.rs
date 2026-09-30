@@ -4,10 +4,10 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
-use crate::sync::{lock, unpoisoned};
+use crate::activity::Activity;
+use crate::sync::lock;
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -16,42 +16,40 @@ type Job = Box<dyn FnOnce() + Send>;
 pub struct Serial {
     /// The jobs waiting, and whether a thread runs them.
     queue: Mutex<(VecDeque<Job>, bool)>,
-    /// Told when the thread ends, the queue empty ([`Serial::wait_idle`]).
-    idle: Condvar,
     /// Starting a thread fails, for tests.
     refuse: AtomicBool,
-    /// What the jobs do, for the thread's name and messages.
+    /// What the jobs do, for the thread's name and messages, and the kind of
+    /// work they count as.
     label: &'static str,
+    /// Where each job counts from when it is queued until it has run, or is
+    /// dropped unrun (#236).
+    activity: Arc<Activity>,
 }
 
 impl Serial {
     /// A queue whose thread and messages are named `label`.
     pub fn labelled(label: &'static str) -> Serial {
-        Serial { queue: Mutex::default(), idle: Condvar::new(), refuse: AtomicBool::new(false), label }
+        Serial::counted(label, Arc::default())
     }
 
-    /// What the jobs do, as the thread is named.
-    pub fn label(&self) -> &'static str {
-        self.label
-    }
-
-    /// Waits until no job waits or runs, until `deadline`: whether none does
-    /// (#236).
-    pub fn wait_idle(&self, deadline: Instant) -> bool {
-        let mut queue = lock(&self.queue);
-        while queue.1 || !queue.0.is_empty() {
-            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
-                return false;
-            };
-            queue = unpoisoned(self.idle.wait_timeout(queue, left)).0;
-        }
-        true
+    /// [`Serial::labelled`], whose jobs count in `activity`, a catalog's
+    /// ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(label: &'static str, activity: Arc<Activity>) -> Serial {
+        Serial { queue: Mutex::default(), refuse: AtomicBool::new(false), label, activity }
     }
 
     /// Queues `job`, starting the thread when none runs. When the thread
     /// cannot start, `job` is dropped unrun and `false` returned: nothing is
     /// left waiting for a thread that does not exist.
     pub fn submit(self: &Arc<Self>, job: Job) -> bool {
+        // Counted until it has run or is dropped unrun, a panic included. A
+        // job that queues work elsewhere queues it before it ends, so the
+        // count does not fall to nothing in between.
+        let active = self.activity.begin(self.label);
+        let job: Job = Box::new(move || {
+            let _active = active;
+            job();
+        });
         let mut queue = lock(&self.queue);
         queue.0.push_back(job);
         if queue.1 {
@@ -100,7 +98,6 @@ impl Serial {
                     Some(job) => job,
                     None => {
                         queue.1 = false;
-                        self.idle.notify_all();
                         return;
                     }
                 }
@@ -121,7 +118,6 @@ impl Drop for Exit<'_> {
             let jobs = {
                 let mut queue = lock(&self.0.queue);
                 queue.1 = false;
-                self.0.idle.notify_all();
                 std::mem::take(&mut queue.0)
             };
             drop(jobs);
@@ -132,6 +128,7 @@ impl Drop for Exit<'_> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -161,15 +158,20 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
-    /// The queue is idle only once no job waits or runs (#236): a wait ends
-    /// with `false` at its deadline while a job is held, and with `true` once
-    /// every job queued has run, when the thread ends rather than at its
-    /// deadline.
+    /// Each job counts in the queue's activity from when it is queued until
+    /// it has run (#236), a job that panics too, and a job dropped unrun
+    /// because no thread could start: a wait ends at its deadline, naming the
+    /// queue, while a job is held, and once every job queued has run, then
+    /// rather than at its deadline.
     #[test]
     fn waits_until_no_job_waits_or_runs() {
-        const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
-        let serial = Arc::new(Serial::labelled("test"));
-        assert!(serial.wait_idle(Instant::now()), "idle before any job");
+        const LIMIT: Duration = Duration::from_secs(300);
+        let activity = Arc::new(Activity::default());
+        let serial = Arc::new(Serial::counted("test", Arc::clone(&activity)));
+        serial.refuse_starts(true);
+        assert!(!serial.submit(Box::new(|| {})));
+        assert_eq!(activity.wait_idle(Instant::now()), Ok(()), "a job dropped unrun no longer counts");
+        serial.refuse_starts(false);
         let (release, held) = std::sync::mpsc::channel::<()>();
         let ran = Arc::new(AtomicU64::new(0));
         let first = Arc::clone(&ran);
@@ -177,15 +179,16 @@ mod tests {
             let _ = held.recv();
             first.fetch_add(1, Ordering::SeqCst);
         })));
+        assert!(serial.submit(Box::new(|| panic!("a job with a bug"))));
         let second = Arc::clone(&ran);
         assert!(serial.submit(Box::new(move || {
             second.fetch_add(1, Ordering::SeqCst);
         })));
-        assert!(!serial.wait_idle(Instant::now() + std::time::Duration::from_millis(50)), "a job runs");
+        assert_eq!(activity.wait_idle(Instant::now() + Duration::from_millis(50)), Err(vec!["test"]), "a job runs");
         release.send(()).unwrap();
         let waited = Instant::now();
-        assert!(serial.wait_idle(waited + 2 * LIMIT));
+        assert_eq!(activity.wait_idle(waited + 2 * LIMIT), Ok(()));
         assert!(waited.elapsed() < LIMIT, "woken when idle, not at the deadline");
-        assert_eq!(ran.load(Ordering::SeqCst), 2, "both ran before it was idle");
+        assert_eq!(ran.load(Ordering::SeqCst), 2, "every job ran before it was idle");
     }
 }

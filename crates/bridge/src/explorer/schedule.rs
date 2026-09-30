@@ -18,8 +18,9 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::activity::{Active, Activity};
 use crate::machine::{self, Machine, Priority, System};
 use crate::sync::{lock, unpoisoned};
 
@@ -35,6 +36,9 @@ const POWER_RECHECK: Duration = Duration::from_secs(10);
 /// started beside it, short enough that a build under foreground work that
 /// never ends still ends (#149).
 pub const PATIENCE: Duration = Duration::from_millis(500);
+
+/// The kind of work the builds count as in their activity (#236).
+const BUILDS: &str = "index builds";
 
 /// Why a build is queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +88,9 @@ struct Job {
     kind: Kind,
     progress: Arc<Progress>,
     work: Work,
+    /// Counts the build from when it is queued until it is over or dropped
+    /// unrun: a build stopped to wait for its turn again still counts.
+    _active: Active,
 }
 
 /// The build running: its database, its kind and its progress, through which
@@ -107,29 +114,35 @@ pub struct Scheduler {
     queues: Mutex<Queues>,
     /// Told when a build is queued, and when the power may have changed.
     changed: Condvar,
-    /// Told when the thread ends, both queues empty ([`Scheduler::wait_idle`]).
-    ended: Condvar,
     machine: Mutex<Arc<dyn Machine>>,
     /// How long a background build's threads give way at a time.
     patience: Mutex<Duration>,
     /// Starting the thread fails, for tests.
     refuse: AtomicBool,
+    /// Where each build counts until it is over (#236).
+    activity: Arc<Activity>,
 }
 
 impl Default for Scheduler {
     fn default() -> Scheduler {
-        Scheduler {
-            queues: Mutex::default(),
-            changed: Condvar::new(),
-            ended: Condvar::new(),
-            machine: Mutex::new(Arc::new(System)),
-            patience: Mutex::new(PATIENCE),
-            refuse: AtomicBool::new(false),
-        }
+        Scheduler::counted(Arc::default())
     }
 }
 
 impl Scheduler {
+    /// The queues of a catalog's builds, which count in `activity`
+    /// ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: Arc<Activity>) -> Scheduler {
+        Scheduler {
+            queues: Mutex::default(),
+            changed: Condvar::new(),
+            machine: Mutex::new(Arc::new(System)),
+            patience: Mutex::new(PATIENCE),
+            refuse: AtomicBool::new(false),
+            activity,
+        }
+    }
+
     /// How the builds see the computer: its power, and the disks' free space.
     pub fn machine(&self) -> Arc<dyn Machine> {
         Arc::clone(&lock(&self.machine))
@@ -160,7 +173,7 @@ impl Scheduler {
     /// build is dropped unrun and `false` returned.
     pub fn submit(self: &Arc<Self>, id: &str, kind: Kind, progress: Arc<Progress>, work: Work) -> bool {
         let mut q = lock(&self.queues);
-        let job = Job { id: id.to_string(), kind, progress, work };
+        let job = Job { id: id.to_string(), kind, progress, work, _active: self.activity.begin(BUILDS) };
         match kind {
             Kind::Requested => {
                 q.requested.push_back(job);
@@ -240,20 +253,6 @@ impl Scheduler {
         self.refuse.store(refuse, Ordering::Relaxed);
     }
 
-    /// Waits until no build waits or runs, until `deadline`: whether none
-    /// does (#236). A background build that waits for mains power counts as
-    /// waiting.
-    pub fn wait_idle(&self, deadline: Instant) -> bool {
-        let mut q = lock(&self.queues);
-        while q.thread {
-            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
-                return false;
-            };
-            q = unpoisoned(self.ended.wait_timeout(q, left)).0;
-        }
-        true
-    }
-
     /// The next build to run, marked running, its progress at its kind's
     /// priority and patience: the first requested one, else the first
     /// background one unless the computer runs on battery, when the thread
@@ -267,7 +266,6 @@ impl Scheduler {
             }
             if q.background.is_empty() {
                 q.thread = false;
-                self.ended.notify_all();
                 return None;
             }
             if !self.machine().on_battery() {
@@ -333,7 +331,6 @@ impl Drop for Exit<'_> {
                 let mut q = lock(&self.0.queues);
                 q.thread = false;
                 q.running = None;
-                self.0.ended.notify_all();
                 (std::mem::take(&mut q.requested), std::mem::take(&mut q.background))
             };
             drop(jobs);
@@ -345,6 +342,7 @@ impl Drop for Exit<'_> {
 mod tests {
     use std::path::Path;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     use super::*;
 
@@ -541,32 +539,40 @@ mod tests {
         assert_eq!(next(&events), ("c", background_priority(), "done"));
     }
 
-    /// The builds are idle only once none waits or runs (#236): a wait ends
-    /// with `false` at its deadline while a build is held, and while a
-    /// background build waits for mains power, and with `true` once both have
-    /// run, when the thread ends rather than at its deadline.
+    /// Each build counts in the scheduler's activity from when it is queued
+    /// until it is over (#236): while it runs, and while it waits for mains
+    /// power; one dropped unrun because no thread could start no longer
+    /// counts. A wait ends at its deadline, naming the builds, while one is
+    /// held and while one waits for mains power, and once both have run, then
+    /// rather than at its deadline.
     #[test]
     fn waits_until_no_build_waits_or_runs() {
         const LIMIT: Duration = Duration::from_secs(300);
-        let scheduler = Arc::new(Scheduler::default());
+        let activity = Arc::new(Activity::default());
+        let scheduler = Arc::new(Scheduler::counted(Arc::clone(&activity)));
         let power = Arc::new(Power::default());
         power.0.store(true, Ordering::Relaxed);
         scheduler.set_machine(power.clone());
-        assert!(scheduler.wait_idle(Instant::now()), "idle before any build");
         let (tx, events) = mpsc::channel();
+        let unrun = Arc::new(Progress::default());
+        scheduler.refuse_starts(true);
+        assert!(!scheduler.submit("x", Kind::Requested, Arc::clone(&unrun), build("x", &tx, &unrun, None)));
+        scheduler.refuse_starts(false);
+        assert_eq!(activity.wait_idle(Instant::now()), Ok(()), "a build dropped unrun no longer counts");
         let (release, held) = mpsc::channel();
         let (a, b) = (Arc::new(Progress::default()), Arc::new(Progress::default()));
         assert!(scheduler.submit("a", Kind::Requested, Arc::clone(&a), build("a", &tx, &a, Some(held))));
         assert_eq!(next(&events), ("a", Priority::BelowNormal, "run"));
         assert!(scheduler.submit("b", Kind::Background, Arc::clone(&b), build("b", &tx, &b, None)));
-        assert!(!scheduler.wait_idle(Instant::now() + Duration::from_millis(50)), "a build runs");
+        let briefly = || Instant::now() + Duration::from_millis(50);
+        assert_eq!(activity.wait_idle(briefly()), Err(vec![BUILDS]), "a build runs");
         release.send(()).unwrap();
         assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
-        assert!(!scheduler.wait_idle(Instant::now() + Duration::from_millis(50)), "a build waits for mains power");
+        assert_eq!(activity.wait_idle(briefly()), Err(vec![BUILDS]), "a build waits for mains power");
         power.0.store(false, Ordering::Relaxed);
         scheduler.poke();
         let waited = Instant::now();
-        assert!(scheduler.wait_idle(waited + 2 * LIMIT));
+        assert_eq!(activity.wait_idle(waited + 2 * LIMIT), Ok(()));
         assert!(waited.elapsed() < LIMIT, "woken when idle, not at the deadline");
         assert_eq!(next(&events), ("b", background_priority(), "run"));
         assert_eq!(next(&events), ("b", background_priority(), "done"));

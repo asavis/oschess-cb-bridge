@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cbformat::view::Base;
 
+use crate::activity::Activity;
 use crate::fetch::{Cloud, Progress, System};
 use crate::pgnindex::{self, Opening};
 use crate::search::Indexes;
@@ -108,12 +109,16 @@ pub struct Entry {
     shared: Arc<Shared>,
 }
 
-/// What entries share: how cloud files are seen, the download queue, and the
-/// index builds of PGN files.
+/// What entries share: how cloud files are seen, the download queue, the
+/// index builds of PGN files, and the catalog's background work.
 struct Shared {
     cloud: Arc<dyn Cloud>,
     downloads: Arc<Serial>,
     pgn: pgnindex::Registry,
+    /// The catalog's background work, counted until it ends: the jobs of its
+    /// queues, its index builds, the writers of its names files and the
+    /// keeper's looks ([`Catalog::settle`]).
+    activity: Arc<Activity>,
 }
 
 /// What stays with a database when the list is read again or the window
@@ -240,7 +245,7 @@ impl Entry {
             },
             _ => Base::open(&self.path).map_err(|_| State::Unreadable)?,
         };
-        let open = Opened { db: Arc::new(db), generation, indexes: Indexes::shared() };
+        let open = Opened { db: Arc::new(db), generation, indexes: Indexes::counted(&self.shared.activity) };
         *slot = Some(open.clone());
         Ok(open)
     }
@@ -385,8 +390,8 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     files
 }
 
-/// What still ran when [`Catalog::settle`] gave up waiting: the kinds of
-/// background work, by name.
+/// What still waited or ran when [`Catalog::settle`] gave up waiting: the
+/// kinds of background work, by name, in the order they first began.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Busy(pub Vec<&'static str>);
 
@@ -427,14 +432,15 @@ impl Catalog {
 
     /// The databases of `sources`, read now and again whenever they change.
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
-        let downloads = Arc::new(Serial::labelled("download"));
-        let shared = Arc::new(Shared { cloud, downloads, pgn: pgnindex::Registry::default() });
+        let activity = Arc::new(Activity::default());
+        let downloads = Arc::new(Serial::counted("download", Arc::clone(&activity)));
+        let pgn = pgnindex::Registry::counted(Arc::clone(&activity));
         let catalog = Catalog {
-            explorer: crate::explorer::Registry::default(),
+            explorer: crate::explorer::Registry::counted(Arc::clone(&activity)),
             heads: Arc::default(),
-            heads_queue: Arc::new(Serial::labelled("heads")),
+            heads_queue: Arc::new(Serial::counted("heads", Arc::clone(&activity))),
             sources,
-            shared,
+            shared: Arc::new(Shared { cloud, downloads, pgn, activity }),
             read: Mutex::default(),
             entries: Mutex::default(),
             after_read: Mutex::new(None),
@@ -455,44 +461,25 @@ impl Catalog {
         &self.shared.pgn
     }
 
-    /// Waits until none of this catalog's background work runs, so that
-    /// nothing writes to its folders any more (#236): stops the keeper, which
-    /// queues no build from then on, then waits for the index builds, the
-    /// heads, PGN and download queues and the names writers, the whole
-    /// process's, to be idle all at once, as the work of one may queue work
-    /// in another. It asks no build to stop, since a stopped build queues
-    /// itself again. After `limit`, `Busy` names what still runs. Tests call
-    /// it before they remove the folders; the keeper stays stopped.
+    /// Waits until none of this catalog's background work waits or runs, so
+    /// that nothing writes to its folders any more (#236): the jobs of its
+    /// heads, PGN and download queues, its index builds, the writers of its
+    /// names files and the keeper's look. Each counts in one count, the
+    /// catalog's, from when it is queued or begins until it ends, whichever
+    /// way it ends. Work that queues more work, in its own queue or another,
+    /// queues it before it ends, so the count falls to nothing only once
+    /// nothing waits or runs, and the wait is for that. The keeper is stopped
+    /// first and stays stopped: a look it is taking counts until it ends, and
+    /// no look begins after it. Only a request can queue work again, so tests
+    /// call it once they send none. It asks no build to stop, since a stopped
+    /// build queues itself again. After `limit`, from the call, `Busy` names
+    /// what still waits or runs, the keeper's look included.
     pub fn settle(&self, limit: Duration) -> Result<(), Busy> {
-        self.explorer.stop_keeping();
         let deadline = Instant::now() + limit;
-        let waits: [(&'static str, &dyn Fn(Instant) -> bool); 5] = [
-            ("index builds", &|until| self.explorer.wait_builds(until)),
-            (self.heads_queue.label(), &|until| self.heads_queue.wait_idle(until)),
-            (self.pgn().queue().label(), &|until| self.pgn().queue().wait_idle(until)),
-            (self.downloads().label(), &|until| self.downloads().wait_idle(until)),
-            ("names", &heads::wait_written),
-        ];
-        loop {
-            let mut quiet = true;
-            let mut busy = Vec::new();
-            for (name, wait) in &waits {
-                // Idle now, or waited for: a round without a wait finds all
-                // of them idle at once.
-                if !wait(Instant::now()) {
-                    quiet = false;
-                    if !wait(deadline) {
-                        busy.push(*name);
-                    }
-                }
-            }
-            if quiet {
-                return Ok(());
-            }
-            if !busy.is_empty() {
-                return Err(Busy(busy));
-            }
-        }
+        // Takes a lock that is never held across a look: a stop never waits
+        // for the look to end.
+        self.explorer.stop_keeping();
+        self.shared.activity.wait_idle(deadline).map_err(Busy)
     }
 
     /// Keeps the indexes where the bridge whose data folder is `dir` keeps
@@ -799,9 +786,7 @@ mod tests {
             let _ = held.recv();
             assert!(heads.submit(Box::new(move || std::fs::write(&written, b"late").unwrap())));
         })));
-        let Err(Busy(running)) = catalog.settle(Duration::from_millis(50)) else { panic!("settled while a job ran") };
-        // The names writers are the whole process's: another test's may run.
-        assert_eq!(running.into_iter().filter(|n| *n != "names").collect::<Vec<_>>(), ["download"]);
+        assert_eq!(catalog.settle(Duration::from_millis(50)), Err(Busy(vec!["download"])), "settled while a job ran");
         release.send(()).unwrap();
         assert_eq!(catalog.settle(Duration::from_secs(300)), Ok(()));
         assert!(file.exists(), "the heads job wrote before the catalog settled");

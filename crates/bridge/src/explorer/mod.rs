@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::activity::Activity;
 use crate::catalog::{Entry, Opened};
 use crate::indexdir::{self, Unlisted};
 use crate::machine::Machine;
@@ -155,21 +156,14 @@ pub struct Registry {
     keeping: Mutex<keeper::Keeping>,
     /// What builds may use; `None` for [`Limits::default`]. Tests set it.
     limits: Mutex<Option<Limits>>,
+    /// The catalog's background work, which the builds and the keeper's
+    /// looks count in (#236).
+    activity: Arc<Activity>,
 }
 
 impl Default for Registry {
     fn default() -> Registry {
-        Registry {
-            dir: Mutex::default(),
-            states: Mutex::default(),
-            builds: Arc::default(),
-            unlisted: Mutex::default(),
-            used: Mutex::default(),
-            picked: AtomicBool::new(false),
-            seen: Mutex::default(),
-            keeping: Mutex::default(),
-            limits: Mutex::default(),
-        }
+        Registry::counted(Arc::default())
     }
 }
 
@@ -196,6 +190,23 @@ fn index_entry(name: &str) -> Option<(&str, Kept)> {
 }
 
 impl Registry {
+    /// The indexes of a catalog's databases, whose builds and keeper count
+    /// in `activity` ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: Arc<Activity>) -> Registry {
+        Registry {
+            dir: Mutex::default(),
+            states: Mutex::default(),
+            builds: Arc::new(Scheduler::counted(Arc::clone(&activity))),
+            unlisted: Mutex::default(),
+            used: Mutex::default(),
+            picked: AtomicBool::new(false),
+            seen: Mutex::default(),
+            keeping: Mutex::default(),
+            limits: Mutex::default(),
+            activity,
+        }
+    }
+
     /// Keeps index files in `dir`.
     pub fn set_dir(&self, dir: PathBuf) {
         *lock(&self.dir) = Some(dir);
@@ -410,12 +421,6 @@ impl Registry {
             let _ = std::fs::remove_file(&l.stream.path);
         }
         *s = State::Idle;
-    }
-
-    /// Waits until no index build waits or runs, until `deadline`: whether
-    /// none does ([`crate::catalog::Catalog::settle`]).
-    pub fn wait_builds(&self, deadline: Instant) -> bool {
-        self.builds.wait_idle(deadline)
     }
 
     /// Drops every index held in memory and leaves its files as they are: the
@@ -682,7 +687,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::catalog::Catalog;
+    use crate::catalog::{Busy, Catalog};
     use crate::search::memory::Cancel;
     use crate::search::workers;
     use cbformat::fixture::{Builder, TempDb, quiet};
@@ -744,10 +749,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The builds are idle only once none waits or runs (#236): while another
-    /// database's build holds the queue, before the build a request queued, a
-    /// wait ends with `false` at its deadline; once both have run, with
-    /// `true`, and the requested index is written by then.
+    /// The builds count as the catalog's work until none waits or runs
+    /// (#236): while another database's build holds the queue, before the
+    /// build a request queued, settling gives up at its limit naming the
+    /// builds; once both have run, it settles, and the requested index is
+    /// written by then.
     #[test]
     fn waiting_for_the_builds_ends_once_the_index_is_written() {
         let db = e4s("explorer-wait");
@@ -757,7 +763,7 @@ mod tests {
         catalog.explorer.set_dir(dir.clone());
         let entry = Arc::clone(&catalog.entries()[0]);
         let Ok(open) = entry.open() else { panic!("the database does not open") };
-        assert!(catalog.explorer.wait_builds(Instant::now()), "idle before any build");
+        assert_eq!(catalog.settle(Duration::ZERO), Ok(()), "idle before any build");
         // Another database's build holds the queue until released.
         let (release, held) = mpsc::channel::<()>();
         assert!(catalog.explorer.builds.submit(
@@ -770,10 +776,11 @@ mod tests {
             })
         ));
         let Lookup::Pending(_) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!("no build queued") };
-        assert!(!catalog.explorer.wait_builds(Instant::now() + Duration::from_millis(50)), "two builds wait or run");
+        let busy = Busy(vec!["index builds"]);
+        assert_eq!(catalog.settle(Duration::from_millis(50)), Err(busy), "two builds wait or run");
         release.send(()).unwrap();
-        assert!(catalog.explorer.wait_builds(Instant::now() + Duration::from_secs(300)));
-        assert!(paths(&dir, &entry.id).0.exists(), "the index was written before the wait ended");
+        assert_eq!(catalog.settle(Duration::from_secs(300)), Ok(()));
+        assert!(paths(&dir, &entry.id).0.exists(), "the index was written before the catalog settled");
         assert!(catalog.explorer.building().is_empty(), "{:?}", catalog.explorer.building());
         catalog.explorer.release();
         std::fs::remove_dir_all(&dir).unwrap();

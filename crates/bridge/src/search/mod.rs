@@ -33,6 +33,7 @@ use names::{BitSet, Groups, Kind, NameTable, joint_ranks};
 use query::{Field, Query, Sort, SortKey};
 use scan::Control;
 
+use crate::activity::Activity;
 use crate::store::{Head, Store, with_store};
 use crate::sync::lock;
 
@@ -74,6 +75,9 @@ pub struct Indexes {
     gate: gate::Gate,
     /// The database's heads file at this generation, once it is ready (#106).
     heads: Mutex<Option<Arc<heads::Heads>>>,
+    /// The catalog's background work, which the writers of names files count
+    /// in (#236); none for indexes a test makes on their own.
+    activity: Option<Arc<Activity>>,
 }
 
 /// The value in `slot`, built by `build` the first time. Concurrent callers
@@ -113,7 +117,18 @@ impl Indexes {
 
     /// Indexes whose retained structures are evicted when the budget runs short.
     pub fn shared() -> Arc<Indexes> {
-        let indexes = Arc::new(Indexes::default());
+        Indexes::registered(Indexes::default())
+    }
+
+    /// [`Indexes::shared`], for a database of a catalog: the writers of its
+    /// names files count in the catalog's `activity`
+    /// ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: &Arc<Activity>) -> Arc<Indexes> {
+        Indexes::registered(Indexes { activity: Some(Arc::clone(activity)), ..Indexes::default() })
+    }
+
+    fn registered(indexes: Indexes) -> Arc<Indexes> {
+        let indexes = Arc::new(indexes);
         let weak: Weak<dyn Evict> = Arc::downgrade(&indexes) as Weak<dyn Evict>;
         memory::register(weak);
         indexes
@@ -160,7 +175,7 @@ impl Indexes {
             }
             Ok(table)
         })?;
-        table.write_later();
+        table.write_later(self.activity.as_ref());
         Ok(table)
     }
 
