@@ -3,20 +3,25 @@
 //! is damaged, of another generation or of another size is never believed.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use bridge::catalog::{Catalog, Opened};
 use bridge::search::heads::{self, BLOCK_ROWS, Built, Heads, ROWS_READ};
+use bridge::search::memory::Cancel;
+use bridge::search::workers;
 use bridge::search::{self, Indexes, NAME_FILES_READ, SearchError, Selection, SuggestField};
 use cbformat::codepage::CodePage;
 use cbformat::pgnfile;
 use cbformat::view::Base;
 
 mod common;
-use common::{WAIT_LIMIT, block, classic_fixture, fixture_of, pgn_fixture, rows, until};
+use common::{WAIT_LIMIT, block, classic_fixture, fixture_of, pgn_fixture, poll, rows, until};
 
 const ID: &str = "0123456789abcdef";
+
+/// Queries and suggestions answered busy, and asked again ([`asked`]).
+static BUSY: AtomicUsize = AtomicUsize::new(0);
 
 /// The document's fixture, then `n` more records, with players, events,
 /// dates, rounds, results, codes and ratings varying among them; every 97th
@@ -59,7 +64,24 @@ fn many(n: usize, kinds: &[&str]) -> Vec<String> {
     out
 }
 
-/// Every answer the database gives: the corpus's queries, sorts and suggestions.
+/// What `ask` answers, asked again while it is `WorkersBusy`, for
+/// [`WAIT_LIMIT`] at most (#247). A pass is answered busy, as a request is
+/// `503`, when every worker stays taken for as long as it waits for one
+/// (`workers::WAIT`), as the passes of this binary's other tests may take
+/// them all: that says nothing of the answer, and is never taken for it.
+fn asked<T>(what: &str, mut ask: impl FnMut() -> Result<T, SearchError>) -> Result<T, SearchError> {
+    let answer = poll(WAIT_LIMIT, || match ask() {
+        Err(SearchError::WorkersBusy) => {
+            BUSY.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        answer => Some(answer),
+    });
+    answer.unwrap_or_else(|| panic!("{what}: every worker stayed taken for {WAIT_LIMIT:?}"))
+}
+
+/// Every answer the database gives: the corpus's queries, sorts and
+/// suggestions, each asked until it is not busy ([`asked`]).
 fn answers(db: &Base, idx: &Indexes) -> Vec<String> {
     let mut out = Vec::new();
     let queries = block("corpus").into_iter().map(|l| l.rsplit_once("=>").unwrap().0.trim().to_string());
@@ -82,7 +104,7 @@ fn answers(db: &Base, idx: &Indexes) -> Vec<String> {
         .chain(extra.iter().map(|q| q.to_string()))
         .chain(sorts.iter().map(|s| format!("anand sort:{s}")));
     for q in all {
-        let got = match search::select(db, idx, Some(&q), None, None) {
+        let got = match asked(&q, || search::select(db, idx, Some(&q), None, None)) {
             Ok((Selection::All { descending }, _)) => format!("all {descending}"),
             Ok((Selection::Numbers(v), _)) => format!("{:?}", v.to_vec()),
             Err(SearchError::Unsupported(u)) => format!("unsupported {u}"),
@@ -92,7 +114,8 @@ fn answers(db: &Base, idx: &Indexes) -> Vec<String> {
     }
     for field in [SuggestField::Player, SuggestField::Event, SuggestField::Annotator] {
         for prefix in ["", "a", "c", "k", "ka", "l", "m", "t", "w", "z"] {
-            let got = search::suggest(db, idx, field, prefix, 20).map(|s| format!("{:?}", s.to_vec()));
+            let what = format!("{field:?} {prefix:?}");
+            let got = asked(&what, || search::suggest(db, idx, field, prefix, 20)).map(|s| format!("{:?}", s.to_vec()));
             out.push(format!("{field:?} {prefix:?} => {got:?}"));
         }
     }
@@ -144,6 +167,58 @@ fn every_answer_is_the_same_from_the_heads_file() {
     let (pgn, index) = (fp.dir().join("db.pgn"), fp.dir().join("db.head"));
     pgnfile::build(&pgn, &index, 1, CodePage::WESTERN, &mut |_| true).unwrap();
     same_with_heads(&Base::Pgn(pgnfile::Database::open(&pgn, &index, 1, CodePage::WESTERN).unwrap()), "pgn");
+}
+
+/// Whether this is the child that runs the test's body. The parent runs the
+/// test `name` again in a child process of its own with one worker, which no
+/// other test takes there, and checks it passed.
+fn in_child(name: &str) -> bool {
+    common::in_child(name, "BRIDGE_HEADS_CHILD", &[("OSCHESS_BRIDGE_THREADS", "1")])
+}
+
+/// A query answered busy is asked again, and its busy answer is never taken
+/// for the query's (#247): a pass is answered busy, as a request is `503`,
+/// when every worker stays taken for as long as it waits for one
+/// (`workers::WAIT`). Every worker is held as the answers with the heads file
+/// begin, and let go once a query was answered busy; they are the answers
+/// without it.
+#[test]
+fn a_query_answered_busy_is_asked_again() {
+    if !in_child("a_query_answered_busy_is_asked_again") {
+        return;
+    }
+    assert_eq!(workers::threads(), 1);
+    let two = fixture_of("heads-busy", &many(3_000, &["text", "analysis", "deleted"]));
+    let db = Base::open(two.dir().join("db.2cbh")).unwrap();
+    let plain = answers(&db, &Indexes::default());
+    let dir = scratch("busy");
+    let idx = Indexes::default();
+    idx.set_heads(Arc::new(built(&db, &heads::path(&dir, ID))));
+    let busy = BUSY.load(Ordering::SeqCst);
+    std::thread::scope(|s| {
+        // Another pass holds every worker until released, or until a failed
+        // check drops `release`.
+        let (release, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let holder = s.spawn(move || {
+            workers::run(workers::threads(), 0, &Cancel::never(), |_| {
+                let _ = held.lock().unwrap().recv();
+                Ok(())
+            })
+        });
+        until("every worker was taken", WAIT_LIMIT, || workers::taken() == workers::threads());
+        let answering = s.spawn(|| answers(&db, &idx));
+        until("a query was answered busy", WAIT_LIMIT, || {
+            BUSY.load(Ordering::SeqCst) > busy || answering.is_finished()
+        });
+        release.send(()).unwrap();
+        assert!(holder.join().unwrap().is_ok());
+        let got = answering.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        assert!(BUSY.load(Ordering::SeqCst) > busy, "a query was answered busy");
+        assert_eq!(got, plain);
+    });
+    assert_eq!(workers::taken(), 0, "every worker was returned");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
