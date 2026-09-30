@@ -95,12 +95,26 @@ that has not decoded real databases is not ready.
 
 A test that fails now and then, or a change to connections, threads, time-outs
 or waits, is run with `scripts/stress.py` on Linux, which loads the machine
-itself (#217). First hundreds of runs of the binaries concerned, which is where
-such failures show: `python3 scripts/stress.py --runs 300 --jobs 3 --bin api`.
-Then the whole suite: `python3 scripts/stress.py --runs 50 --jobs 5
---fail-fast`. The pull request gives both commands and their summaries. A
-failure under load is a finding like any other: name its cause before changing
-a wait.
+itself (#217, #235). A fix of a load failure is accepted in three steps, which
+its pull request reports:
+
+1. The cause is named, with the code it comes from, and reproduced
+   deterministically through a seam, a hook or an injected delay: the
+   reproduction fails on the old code every time and passes on the new one, and
+   stays in the suite when the seam is cheap.
+2. Every test binary the change touches, under load:
+   `python3 scripts/stress.py --bin <binary> --runs 200 --jobs 4
+   --min-slowdown 5`, and all 200 runs pass. A campaign whose loaded runs took
+   less than five times the run without the load is void (exit status 2) and
+   runs again under a harder load (`--hogs`, `--hog-nice 0`).
+3. The whole suite, as a smoke test:
+   `python3 scripts/stress.py --runs 16 --jobs 8 --fail-fast`.
+
+A failure in a test the change does not touch gets its own ticket and resets no
+count. The ticket gives the test, the commit, the message and the kept log; the
+stress command, the load average and the slowdown; whether the product, the
+test's design or the harness failed, and whether a user could meet it; and the
+cause with its reproduction, or the instrumentation that will name it.
 
 ## Code
 

@@ -27,11 +27,14 @@ failures count with the others.
 
 Each failed run keeps its output in `--out`, target/stress/<UTC time> by
 default, and the summary counts the failures by test. The exit status is 1
-when a run failed.
+when a run failed; 2 when none failed but `--min-slowdown` voids the campaign,
+its loaded runs having taken less than that many times the run without the
+load, which shows the load did not reach the tests.
 """
 
 import argparse
 import json
+import math
 import os
 import signal
 import statistics
@@ -142,6 +145,16 @@ def default_cpus(allowed):
     return set(ordered[: max(min(2, len(ordered)), len(ordered) // 4)])
 
 
+def slowdown(outcomes_by_run):
+    """How many times the run without the load (run 0) the loaded runs took,
+    by their median; `None` without both."""
+    unloaded = sum(o.seconds for o in outcomes_by_run.get(0, []))
+    loaded = [sum(o.seconds for o in outcomes) for run, outcomes in outcomes_by_run.items() if run != 0]
+    if not loaded or not unloaded:
+        return None
+    return statistics.median(loaded) / unloaded
+
+
 def summary(outcomes_by_run, loads):
     """The report after the runs: how many failed, how long a run took, and
     the failures by test, most frequent first. Run 0 is the run without the
@@ -159,8 +172,9 @@ def summary(outcomes_by_run, loads):
         seconds = [sum(o.seconds for o in outcomes) for outcomes in loaded.values()]
         median = statistics.median(seconds)
         timing = f"a run under load took {median:.1f} s (median), {max(seconds):.1f} s at most"
-        if unloaded_seconds:
-            timing += f", {median / unloaded_seconds:.1f} times the run without it"
+        factor = slowdown(outcomes_by_run)
+        if factor is not None:
+            timing += f", {factor:.1f} times the run without it"
         lines.append(timing)
     if loads:
         lines.append(f"load average {min(loads):.1f} to {max(loads):.1f}")
@@ -322,6 +336,15 @@ def write_log(out, name, outcomes):
     return path
 
 
+def slowdown_limit(text):
+    """`--min-slowdown`'s value: a finite number above 0. A NaN would compare
+    false against every slowdown and let every campaign pass."""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number above 0")
+    return value
+
+
 def interrupted(*_):
     """Ends the script on Ctrl-C or a plain kill, so that nothing it started
     outlives it; see `Live` for a signal that comes as a process starts."""
@@ -345,6 +368,11 @@ def arguments(argv):
     parser.add_argument("--hog-nice", type=int, default=19, help="the loops' nice value (default 19, the tests')")
     parser.add_argument("--timeout", type=int, default=1800, help="seconds a binary may run (default 1800)")
     parser.add_argument("--fail-fast", action="store_true", help="start no run after one failed")
+    parser.add_argument(
+        "--min-slowdown",
+        type=slowdown_limit,
+        help="void the campaign (exit 2) when its loaded runs took less than this many times run 0",
+    )
     parser.add_argument("--out", type=Path, help="where failed runs' output goes (default target/stress/<UTC time>)")
     parser.add_argument("libtest", nargs="*", help="after --: arguments for every test binary")
     args = parser.parse_args(argv)
@@ -382,7 +410,15 @@ def main(argv=None):
     print(f"output of failed runs: {out}")
     if stopped:
         return 130
-    return 0 if all(o.ok for outcomes in results.values() for o in outcomes) else 1
+    if not all(o.ok for outcomes in results.values() for o in outcomes):
+        return 1
+    factor = slowdown(results)
+    if args.min_slowdown is not None and (factor is None or factor < args.min_slowdown):
+        shown = "unknown" if factor is None else f"{factor:.1f} times"
+        limit = f"--min-slowdown {args.min_slowdown:g}"
+        print(f"void: the loaded runs took {shown} the run without the load, below {limit}")
+        return 2
+    return 0
 
 
 def stress(args, cpu_list, hogs, out, results, loads):
