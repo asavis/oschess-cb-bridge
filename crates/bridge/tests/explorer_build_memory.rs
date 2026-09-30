@@ -9,10 +9,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bridge::explorer::format::structure;
 use bridge::explorer::runs::{Limits, MEMORY_WAIT, Progress};
+use bridge::explorer::stream::BATCH;
 use bridge::explorer::{self, Loaded};
 use bridge::search::memory::{Hold, budget, held};
 use bridge::search::workers::threads;
@@ -22,7 +23,7 @@ use cbformat::v2::Database;
 use chesscore::Board;
 
 mod common;
-use common::{ChildTest, Ended, add_random_games, built_bytes, index_dir, is_child};
+use common::{CHILD_LIMIT, ChildTest, Ended, add_random_games, built_bytes, index_dir, is_child};
 
 /// The bytes the process has allocated and not freed, and the most since
 /// [`Counting::reset`].
@@ -156,12 +157,18 @@ const BOOKKEEPING: usize = 64 << 10;
 const CROWDED: u32 = 800_000;
 /// Games before them, of many structures.
 const OTHERS: u32 = 2_000;
+/// Games of the build that times this computer's pace ([`child_limit`]):
+/// one batch of the stream pass, which one worker reads, as a build at
+/// 16 MiB reads all of its games.
+const REFERENCE: u32 = BATCH as u32;
 
 /// A bucket of the deep section that 800,000 games of one structure crowd
 /// (#147) takes several passes of a small budget, on one worker and on many,
 /// each a range of its games. The index is byte for byte the one a build
 /// that holds the bucket at once writes, and its answers count every game.
 /// No build allocates more heap than its share of the budget in any phase.
+/// The builds take longer the busier the computer is, and so may the
+/// children ([`child_limit`]).
 #[test]
 fn a_crowded_bucket_is_built_in_parts_within_the_share() {
     const NAME: &str = "a_crowded_bucket_is_built_in_parts_within_the_share";
@@ -169,7 +176,7 @@ fn a_crowded_bucket_is_built_in_parts_within_the_share() {
         let var = |name| PathBuf::from(std::env::var_os(name).unwrap());
         return build_crowded(&var(DATABASE), &var(INDEX));
     }
-    let db = crowded("build-memory-crowded");
+    let db = crowded("build-memory-crowded", OTHERS, CROWDED);
     // One pass holds the bucket at 64 MiB; at 24 and 16 MiB none does. The
     // builds run beside each other.
     let settings = [(64, 16), (16, 1), (16, 16), (24, 16)];
@@ -179,8 +186,9 @@ fn a_crowded_bucket_is_built_in_parts_within_the_share() {
         .zip(&dirs.0)
         .map(|(&(mib, workers), dir)| child(NAME, mib, workers, &[(DATABASE, db.dir()), (INDEX, dir)]))
         .collect();
+    let limit = child_limit();
     // Each ended before any is checked, so that none outlives a failure.
-    let ended: Vec<Ended> = children.iter_mut().map(ChildTest::end).collect();
+    let ended: Vec<Ended> = children.iter_mut().map(|c| c.end_within(limit)).collect();
     ended.into_iter().for_each(passed);
     let built = settings.iter().zip(&dirs.0).map(|(&(mib, workers), dir)| {
         let passes: u64 = std::fs::read_to_string(dir.join("passes")).unwrap().trim().parse().unwrap();
@@ -194,12 +202,12 @@ fn a_crowded_bucket_is_built_in_parts_within_the_share() {
     }
 }
 
-/// [`OTHERS`] games of many structures, then [`CROWDED`] games of one. The
+/// `others` games of many structures, then `games` games of one. The
 /// crowded games' records are appended to the file as the builder wrote the
 /// first, so that the fixture is written without being held.
-fn crowded(name: &str) -> TempDb {
+fn crowded(name: &str, others: u32, games: u32) -> TempDb {
     let mut b = Builder::new();
-    add_random_games(&mut b, OTHERS as usize, 3);
+    add_random_games(&mut b, others as usize, 3);
     let mut line = vec![MOVES];
     line.extend(words(&mut Board::startpos(), &"g1f3 g8f6 f3g1 f6g8 ".repeat(6)));
     line.push(END_OF_LINE);
@@ -211,11 +219,31 @@ fn crowded(name: &str) -> TempDb {
     cbh.seek(SeekFrom::End(-192)).unwrap();
     cbh.read_exact(&mut record).unwrap();
     let mut out = std::io::BufWriter::with_capacity(1 << 20, cbh);
-    for _ in 1..CROWDED {
+    for _ in 1..games {
         out.write_all(&record).unwrap();
     }
     out.flush().unwrap();
     db
+}
+
+/// How long a child may take (#246): ten times as long as its build of
+/// [`OTHERS`] and [`CROWDED`] games would take at the pace this computer
+/// builds [`REFERENCE`] crowded games now, beside the children, and
+/// [`CHILD_LIMIT`] at least. A build at 16 MiB reads all its games on one
+/// worker, which takes half a minute on a quiet computer and as many times
+/// longer as the load holds that worker back, so no fixed limit fits it.
+fn child_limit() -> Duration {
+    warm_up();
+    let db = crowded("build-memory-reference", 0, REFERENCE);
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let dir = index_dir("reference");
+    let started = Instant::now();
+    drop(explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap());
+    let took = started.elapsed();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let limit = CHILD_LIMIT.max(took * (OTHERS + CROWDED) / REFERENCE * 10);
+    println!("{REFERENCE} crowded games built in {took:?}: each child may take {limit:?}");
+    limit
 }
 
 /// The child's build of the crowded database at `db` into `dir`: within its

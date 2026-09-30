@@ -1023,14 +1023,21 @@ impl ChildTest {
     /// Waits for the child to end, until [`CHILD_LIMIT`] after it started,
     /// when it is killed: how it ended, and what it wrote.
     pub fn end(&mut self) -> Ended {
-        let left = CHILD_LIMIT.saturating_sub(self.started.elapsed());
+        self.end_within(CHILD_LIMIT)
+    }
+
+    /// [`ChildTest::end`] until `limit` after the child started: for a child
+    /// whose work takes longer the busier the computer is, which the test
+    /// measures (#246).
+    pub fn end_within(&mut self, limit: Duration) -> Ended {
+        let left = limit.saturating_sub(self.started.elapsed());
         let status = poll(left, || self.child.try_wait().unwrap());
         if status.is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
         let output = String::from_utf8_lossy(&std::fs::read(&self.log).unwrap_or_default()).into_owned();
-        Ended { name: self.name.clone(), status, output }
+        Ended { name: self.name.clone(), status, output, limit }
     }
 }
 
@@ -1045,16 +1052,17 @@ impl Drop for ChildTest {
 /// How a child's run of its test ended, and what it wrote.
 pub struct Ended {
     name: String,
-    /// `None` when the child was killed at [`CHILD_LIMIT`].
+    /// `None` when the child was killed at `limit`.
     status: Option<ExitStatus>,
     output: String,
+    limit: Duration,
 }
 
 impl Ended {
     /// Checks that the child ran its one test and passed: what it wrote.
     pub fn passed(self) -> String {
         let Some(status) = self.status else {
-            panic!("{} did not end within {CHILD_LIMIT:?}:\n{}", self.name, self.output)
+            panic!("{} did not end within {:?}:\n{}", self.name, self.limit, self.output)
         };
         assert!(status.success() && self.output.contains("1 passed"), "{}: {status}\n{}", self.name, self.output);
         self.output
