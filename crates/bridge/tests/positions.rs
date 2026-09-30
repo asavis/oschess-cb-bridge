@@ -3,19 +3,20 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
-use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use bridge::explorer::paths;
 use bridge::explorer::stream::{BATCH, Header, SLOT_BYTES, TABLE_ENTRY};
 use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, words};
 use cbformat::movetable::{self, Color, END_OF_LINE, MOVES, Piece};
-use chesscore::{Board, Color as CColor, Move, Piece as CPiece, Square};
+use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 
 mod common;
-use common::{Served, get, lid, policy, put, serve_shared};
+use common::{
+    Served, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, poll, put,
+    serve_with_dir,
+};
 
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 /// 30 plies of a Queen's Gambit, which fourteen games of the fixture play.
@@ -81,23 +82,6 @@ impl Game {
 /// Knights out and back, `n` times: plies of play that keep one position.
 fn hops(n: usize) -> String {
     "g1f3 g8f6 f3g1 f6g8 ".repeat(n)
-}
-
-/// Plays `uci`, castling as the king's step.
-fn play(board: &mut Board, uci: &str) {
-    let mut mv: Move = uci.parse().unwrap();
-    if board.piece_at(mv.from).map(|p| p.0) == Some(CPiece::King) && mv.from.file().abs_diff(mv.to.file()) == 2 {
-        mv.to = Square::new(if mv.to.file() == 6 { 7 } else { 0 }, mv.from.rank());
-    }
-    board.play_checked(mv).unwrap();
-}
-
-fn board_after(ucis: &str) -> Board {
-    let mut board = Board::startpos();
-    for uci in ucis.split_whitespace() {
-        play(&mut board, uci);
-    }
-    board
 }
 
 /// `games` lines of legal moves drawn from `seed`, 20 to 100 plies each,
@@ -247,42 +231,9 @@ fn database(name: &str, games: &[Game]) -> TempDb {
     b.write(name)
 }
 
-fn index_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bridge-positions-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
-/// Serves `db`, with the indexes in `dir` as in a data folder; the bridge
-/// and the database's id.
-fn serve(db: &TempDb, dir: &Path) -> (Served, String) {
-    let path = db.dir().join("db.2cbh");
-    let app = App::new("test", policy(), Catalog::new([path.clone()]));
-    app.catalog.use_data_dir(dir);
-    (Served::new(app), id_of(&path))
-}
-
-fn fen_param(fen: &str) -> String {
-    fen.replace(' ', "%20").replace('/', "%2F")
-}
-
 /// The path of the list of the games of `fen`, with `extra` parameters.
 fn list(id: &str, fen: &str, extra: &str) -> String {
     format!("/v1/databases/{id}/games?fen={}{extra}", fen_param(fen))
-}
-
-/// Waits for a `200` answer to `path`: the index is built meanwhile.
-fn answered(port: u16, path: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (status, body) = get(port, path);
-        if status == 200 {
-            return body;
-        }
-        assert_eq!(status, 409, "{body}");
-        assert!(Instant::now() < deadline, "the index was not built: {body}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 /// The answer to `path` once the index is built: `200` at once, never the
@@ -299,37 +250,6 @@ fn number(body: &str, key: &str) -> u64 {
     let pat = format!("\"{key}\":");
     let at = body.find(&pat).unwrap_or_else(|| panic!("no {key} in {body}")) + pat.len();
     body[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap()
-}
-
-/// The objects of the array member `key` of the JSON text `body`, each as its
-/// text: a scan that keeps to strings and nesting.
-fn objects<'a>(body: &'a str, key: &str) -> Vec<&'a str> {
-    let open = format!(r#""{key}":["#);
-    let rest = &body[body.find(&open).unwrap_or_else(|| panic!("no {key} in {body}")) + open.len()..];
-    let (mut out, mut depth, mut from, mut in_string, mut escaped) = (Vec::new(), 0, 0, false, false);
-    for (at, c) in rest.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            _ if in_string => {}
-            '{' => {
-                if depth == 0 {
-                    from = at;
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    out.push(&rest[from..=at]);
-                }
-            }
-            ']' if depth == 0 => return out,
-            _ => {}
-        }
-    }
-    panic!("{key} is not closed in {body}")
 }
 
 /// The numbers of a list's rows, in order.
@@ -369,7 +289,7 @@ fn served(name: &str) -> (Vec<Game>, TempDb, Served, String, PathBuf) {
     let games = games();
     let db = database(&format!("positions-{name}"), &games);
     let dir = index_dir(name);
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     answered(bridge.port, &list(&id, START, ""));
     (games, db, bridge, id, dir)
 }
@@ -425,7 +345,7 @@ fn the_start_after_the_first_scan_lists_what_it_listed() {
     let reached = Reached::of(&games);
     let db = database("positions-starts", &games);
     let dir = index_dir("starts");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let boards = [Board::startpos(), board_after("d2d4 d7d5 c2c4 e7e6"), board_after("d2d4")];
     assert!(reached.games(&boards[0]).contains(&57), "the set-up game that comes home");
     for (round, sort) in ["number", "white"].into_iter().enumerate() {
@@ -500,7 +420,7 @@ fn positions_after_a_promotion_list_their_games() {
     assert_eq!((bishops & LIGHT).count_ones(), 2, "two bishops on light squares");
     let db = database("positions-promotions", &games);
     let dir = index_dir("promotions");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let reached = Reached::of(&games);
     let (mut within, mut beyond) = (0, 0);
     let mut lines: Vec<&Game> = Vec::new();
@@ -604,7 +524,7 @@ fn errors_are_the_explorers() {
     let games = games();
     let db = database("positions-errors", &games);
     let dir = index_dir("errors");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let (status, body) = get(bridge.port, &list(&id, START, ""));
     assert_eq!(status, 409, "the first request starts the build: {body}");
     assert!(body.contains(r#""state":"indexing""#) && body.contains(r#""progress":{"phase":"#), "{body}");
@@ -635,7 +555,7 @@ fn an_unsupported_qualifier_starts_no_build() {
     let games = games();
     let db = database("positions-unsupported", &games);
     let dir = index_dir("unsupported");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     for qualifier in ["tag", "created", "updated", "is", "has", "no"] {
         let (status, body) = get(bridge.port, &list(&id, START, &format!("&stream=tab&q={qualifier}%3Ax")));
         assert_eq!(status, 400, "{body}");
@@ -667,9 +587,7 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     let db = database("positions-streams", &games);
     let dir = index_dir("streams");
     let path = db.dir().join("db.2cbh");
-    let app = App::new("test", policy(), Catalog::new([path.clone()]));
-    app.catalog.use_data_dir(&dir);
-    let (port, app) = serve_shared(app);
+    let (port, app) = serve_with_dir(app_of([path.clone()]), &dir);
     let id = id_of(&path);
     answered(port, &list(&id, START, ""));
     let indexes = app.catalog.get(&id).unwrap().open().unwrap().indexes;
@@ -680,13 +598,13 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     };
     let d4 = board_after("d2d4").fen();
     let named = ask(d4.clone(), "&stream=tab");
-    assert!(held.arrived(1, Duration::from_secs(30)));
+    assert!(held.arrived(1, WAIT_LIMIT));
     // In orders of their own: the result of either, kept once it is found,
     // would answer the named one before it looks at a game, and so before it
     // could stop.
     let other = ask(d4.clone(), "&stream=other&sort=white");
     let unnamed = ask(d4.clone(), "&sort=number-desc");
-    assert!(held.arrived(3, Duration::from_secs(30)));
+    assert!(held.arrived(3, WAIT_LIMIT));
     // The newest in the stream is answered at once: only three are held.
     let (status, body) = get(port, &list(&id, &board_after("e2e4").fen(), "&stream=tab"));
     assert_eq!(status, 200, "{body}");
@@ -712,9 +630,7 @@ fn a_superseded_request_is_not_answered_from_kept_results() {
     let db = database("positions-streams-kept", &games);
     let dir = index_dir("streams-kept");
     let path = db.dir().join("db.2cbh");
-    let app = App::new("test", policy(), Catalog::new([path.clone()]));
-    app.catalog.use_data_dir(&dir);
-    let (port, app) = serve_shared(app);
+    let (port, app) = serve_with_dir(app_of([path.clone()]), &dir);
     let id = id_of(&path);
     let d4 = board_after("d2d4").fen();
     // The result of 1.d4, in the default order, kept.
@@ -725,7 +641,7 @@ fn a_superseded_request_is_not_answered_from_kept_results() {
         let path = list(&id, &d4, "&stream=tab");
         std::thread::spawn(move || get(port, &path))
     };
-    assert!(held.arrived(1, Duration::from_secs(30)));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let (status, body) = get(port, &list(&id, &board_after("e2e4").fen(), "&stream=tab"));
     assert_eq!(status, 200, "{body}");
     drop(held);
@@ -763,7 +679,7 @@ fn damaged(
     let before = Header::decode(&bytes).unwrap();
     damage(&mut bytes);
     std::fs::write(&path, &bytes).unwrap();
-    let (bridge, _) = serve(db, dir);
+    let (bridge, _) = Served::database(db, dir);
     let (status, body) = get(bridge.port, url);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("rebuilt") && body.contains(r#""state":"indexing""#), "{body}");
@@ -818,7 +734,7 @@ fn exchanged_slots_are_never_listed() {
         (1..=n).map(|r| Game::new(Kind::Game, None, if r <= 13 { "e2e4" } else { "d2d4" })).collect();
     let db = database("positions-exchanged", &games);
     let dir = index_dir("exchanged");
-    let (mut bridge, id) = serve(&db, &dir);
+    let (mut bridge, id) = Served::database(&db, &dir);
     let url = list(&id, &board_after("e2e4").fen(), "&line=1");
     let want: Vec<u32> = (1..=13).collect();
     assert_eq!(rows(&answered(bridge.port, &url)), want);
@@ -836,25 +752,20 @@ fn exchanged_slots_are_never_listed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-const CHILD: &str = "BRIDGE_POSITIONS_SMALL_BUDGET_CHILD";
+/// All of the search budget but `free` bytes, taken as soon as whatever else
+/// holds some of it, such as a build of the heads file in the background,
+/// gives that back.
+fn all_but(free: usize) -> Hold {
+    let taken = poll(WAIT_LIMIT, || Hold::reserve_quietly(budget().saturating_sub(held() + free)).ok());
+    taken.unwrap_or_else(|| panic!("no room to take all but {free} bytes: {} held", held()))
+}
 
 /// Whether this is the child that runs the test's body. The parent runs the
 /// test `name` in a child with a 16 MiB budget and one worker, and checks it
 /// passed: the budget is read once per process.
 fn in_child(name: &str) -> bool {
-    if std::env::var_os(CHILD).is_some() {
-        return true;
-    }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
-        .env("OSCHESS_BRIDGE_SEARCH_MIB", "16")
-        .env("OSCHESS_BRIDGE_THREADS", "1")
-        .output()
-        .unwrap();
-    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success() && text.contains("1 passed"), "{text}");
-    false
+    let env = [("OSCHESS_BRIDGE_SEARCH_MIB", "16"), ("OSCHESS_BRIDGE_THREADS", "1")];
+    common::in_child(name, "BRIDGE_POSITIONS_SMALL_BUDGET_CHILD", &env)
 }
 
 /// A list of a position's games in a sort order that is kept is answered
@@ -870,7 +781,7 @@ fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
     let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
     let db = database("positions-tight", &games);
     let dir = index_dir("tight");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let e4 = board_after("e2e4").fen();
     // The index built and its stream scanned once; the order by White kept.
     assert_eq!(number(&answered(bridge.port, &list(&id, &e4, "&sort=number")), "total"), u64::from(GAMES));
@@ -878,12 +789,7 @@ fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
     // Room for the list, 48 KB, and a little more, but not for part lists
     // besides it, twice as much again.
     let free = GAMES as usize * 4 + (32 << 10);
-    let taken = loop {
-        if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
-            break hold;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let taken = all_but(free);
     let kept = held();
     let body = at_once(bridge.port, &list(&id, &e4, "&sort=white"));
     assert_eq!(number(&body, "total"), u64::from(GAMES));
@@ -906,19 +812,14 @@ fn kept_starts_give_way_to_a_list() {
     let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
     let db = database("positions-starts-room", &games);
     let dir = index_dir("starts-room");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     // The index built without a list, so that no scan has found the starts.
     answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(START)));
     for sort in ["number", "number-desc"] {
         // Room for the list, 400 KB, the set, 12.5 KB, and a little more:
         // not for the starts besides, 25 KB.
         let free = GAMES * 4 + GAMES / 8 + (8 << 10);
-        let taken = loop {
-            if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
-                break hold;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let taken = all_but(free);
         let body = at_once(bridge.port, &list(&id, START, &format!("&sort={sort}")));
         assert_eq!(number(&body, "total"), GAMES as u64, "{sort}");
         drop(taken);
@@ -942,12 +843,7 @@ fn a_small_budget_answers_busy_and_never_panics() {
     let (mut busy, mut whole) = (0, 0);
     for (round, free) in [0usize, 64, 1 << 10, 8 << 10, 64 << 10, 256 << 10, 1 << 20, 4 << 20].into_iter().enumerate() {
         // A build of the heads file in the background may hold some a while.
-        let taken = loop {
-            if let Ok(hold) = Hold::reserve_quietly(budget().saturating_sub(held() + free)) {
-                break hold;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let taken = all_but(free);
         for board in &boards {
             // A query and a sort of this round alone, so that no result kept
             // before answers it.

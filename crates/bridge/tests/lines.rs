@@ -12,7 +12,7 @@ use cbformat::movetable::{self, ALTERNATIVE, Captured, Color, END_OF_LINE, MOVES
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{app_of, get, serve, string_member};
+use common::{app_of, get, member, members, objects, serve, string_member};
 
 /// Castling, a capture, a knight named by its file, a promotion with check,
 /// a mate: the games both formats hold, with the line each must answer.
@@ -169,17 +169,12 @@ fn start(paths: Vec<PathBuf>, between_reads: Option<Box<dyn Fn() + Send + Sync>>
 /// Each row's `line` member, verbatim, by the row's number: `"…"`, `null`,
 /// or absent.
 fn lines(body: &str) -> Vec<(u32, Option<String>)> {
-    body.split(r#"{"number":"#)
-        .skip(1)
+    objects(body, "rows")
+        .into_iter()
         .map(|row| {
-            let number = row[..row.find(',').unwrap()].parse().unwrap();
-            let row = &row[..row.find(r#"{"number":"#).unwrap_or(row.len())];
-            let line = row.find(r#""line":"#).map(|at| {
-                let value = &row[at + 7..];
-                match value.strip_prefix('"') {
-                    Some(text) => text[..text.find('"').unwrap()].to_string(),
-                    None => value[..4].to_string(),
-                }
+            let number = member(row, "number").parse().unwrap();
+            let line = members(row).into_iter().find(|(key, _)| *key == "line").map(|(_, value)| {
+                value.strip_prefix('"').and_then(|text| text.strip_suffix('"')).unwrap_or(value).to_string()
             });
             (number, line)
         })

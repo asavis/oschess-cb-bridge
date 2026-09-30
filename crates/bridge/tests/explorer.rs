@@ -2,11 +2,10 @@
 //! built by hand.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::id_of;
 use bridge::explorer::file::{Bad, IndexFile};
 use bridge::explorer::format::{
     BLOCK_ENTRY, Block, Counts, DEEP_BLOCK_ENTRY, HEADER_LEN, Header, KEY_ENTRY, Stats, pack_move,
@@ -23,7 +22,7 @@ use cbformat::v2::Database;
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{Served, get, policy};
+use common::{Served, answered, app_of, board_after, fen_param, get, index_dir, objects};
 
 /// A standard game of `ucis` with `result` (0 black, 1 draw, 2 white) and
 /// ratings; its record, for further changes.
@@ -127,24 +126,6 @@ fn classic_database(name: &str) -> TempDb {
 
 fn key_after(ucis: &str) -> u64 {
     board_after(ucis).hash()
-}
-
-fn board_after(ucis: &str) -> Board {
-    let mut b = Board::startpos();
-    for u in ucis.split_whitespace() {
-        let mut mv: Move = u.parse().unwrap();
-        if b.piece_at(mv.from).map(|p| p.0) == Some(CPiece::King) && mv.from.file().abs_diff(mv.to.file()) == 2 {
-            mv.to = chesscore::Square::new(if mv.to.file() == 6 { 7 } else { 0 }, mv.from.rank());
-        }
-        b.play_checked(mv).unwrap();
-    }
-    b
-}
-
-fn index_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bridge-explorer-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
 }
 
 fn prepared(db: &TempDb, dir: &Path) -> Loaded {
@@ -372,41 +353,18 @@ fn any_change_rebuilds_the_whole_index() {
     }
 }
 
-/// Serves `db`, with the indexes in `dir` as in a data folder; the bridge,
-/// which a test drops before it changes or removes the files in `dir`, and
-/// the database's id.
-fn serve(db: &TempDb, dir: &Path) -> (Served, String) {
-    let path = db.dir().join("db.2cbh");
-    let app = App::new("test", policy(), Catalog::new([path.clone()]));
-    app.catalog.use_data_dir(dir);
-    (Served::new(app), id_of(&path))
-}
-
-fn fen_param(fen: &str) -> String {
-    fen.replace(' ', "%20").replace('/', "%2F")
-}
-
 #[test]
 fn the_endpoint_builds_then_answers() {
     let db = database("explorer-http");
     let dir = index_dir("http");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let port = bridge.port;
     let url = |fen: &str| format!("/v1/databases/{id}/explorer?fen={}", fen_param(fen));
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     let (status, body) = get(port, &url(start));
     assert_eq!(status, 409, "the first request starts the build: {body}");
     assert!(body.contains(r#""state":"indexing""#) && body.contains(r#""progress":{"phase":"#), "{body}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let body = loop {
-        let (status, body) = get(port, &url(start));
-        if status == 200 {
-            break body;
-        }
-        assert_eq!(status, 409, "{body}");
-        assert!(Instant::now() < deadline, "the index was not built");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let body = answered(port, &url(start));
     let generation = format!(
         r#"{{"generation":"{:016x}","#,
         bridge::catalog::Catalog::new([db.dir().join("db.2cbh")]).entries()[0].generation().unwrap()
@@ -449,15 +407,7 @@ fn the_endpoint_builds_then_answers() {
     let (status, body) = get(port, &url(start));
     assert_eq!(status, 409, "{body}");
     assert!(body.contains(r#""state":"indexing""#), "{body}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let body = loop {
-        let (status, body) = get(port, &url(start));
-        if status == 200 {
-            break body;
-        }
-        assert!(Instant::now() < deadline, "the index was not rebuilt");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let body = answered(port, &url(start));
     assert!(body.contains(r#""games":1,"white":1,"draws":0,"black":0"#), "{body}");
     // Chess960: the two positions a Polyglot key cannot tell apart.
     for fen in ["4k3/8/8/8/8/8/8/4KR1R w F - 0 1", "4k3/8/8/8/8/8/8/4KR1R w H - 0 1"] {
@@ -475,37 +425,6 @@ fn the_endpoint_builds_then_answers() {
     assert_eq!(get(port, &format!("/v1/databases/0000000000000000/explorer?fen={}", fen_param(start))).0, 404);
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
-}
-
-/// The objects of the array member `key` of the JSON text `body`, each as its
-/// text: a scan that keeps to strings and nesting.
-fn objects<'a>(body: &'a str, key: &str) -> Vec<&'a str> {
-    let open = format!(r#""{key}":["#);
-    let rest = &body[body.find(&open).unwrap_or_else(|| panic!("no {key} in {body}")) + open.len()..];
-    let (mut out, mut depth, mut from, mut in_string, mut escaped) = (Vec::new(), 0, 0, false, false);
-    for (at, c) in rest.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            _ if in_string => {}
-            '{' => {
-                if depth == 0 {
-                    from = at;
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    out.push(&rest[from..=at]);
-                }
-            }
-            ']' if depth == 0 => return out,
-            _ => {}
-        }
-    }
-    panic!("{key} is not closed in {body}")
 }
 
 /// The `number` a row or a notable game begins with.
@@ -538,30 +457,16 @@ fn every_notable_game_is_its_games_row_and_its_year() {
     let pgn = common::pgn_fixture("explorer-rows-pgn", &pgn_rows);
     let paths = [two.dir().join("db.2cbh"), classic.dir().join("db.cbh"), pgn.dir().join("db.pgn")];
     let dir = index_dir("rows");
-    let app = App::new("test", policy(), Catalog::new(paths.clone()));
-    app.catalog.use_data_dir(&dir);
-    let bridge = Served::new(app);
+    let bridge = Served::with_dir(app_of(paths.clone()), &dir);
     let port = bridge.port;
-    // A PGN file is opened, and each index built, in the background.
-    let ready = |path: &str| {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let (status, body) = get(port, path);
-            if status != 409 {
-                assert_eq!(status, 200, "{path}: {body}");
-                return body;
-            }
-            assert!(Instant::now() < deadline, "{path} stayed {body}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
     let start = fen_param("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     // Games 1-7, 10 and 11 are indexed, and in the PGN file 8 and 9 as well.
     for (path, indexed) in paths.iter().zip([9, 9, 11]) {
         let id = id_of(path);
         let format = path.extension().unwrap().to_str().unwrap();
-        let answer = ready(&format!("/v1/databases/{id}/explorer?fen={start}"));
-        let list = ready(&format!("/v1/databases/{id}/games?limit=500"));
+        // A PGN file is opened, and each index built, in the background.
+        let answer = answered(port, &format!("/v1/databases/{id}/explorer?fen={start}"));
+        let list = answered(port, &format!("/v1/databases/{id}/games?limit=500"));
         let rows = objects(&list, "rows");
         let top = objects(&answer, "topGames");
         assert_eq!(top.len(), indexed, "{format}: {answer}");
@@ -592,17 +497,13 @@ fn a_restarted_bridge_answers_from_the_kept_index() {
     let db = database("explorer-restart");
     let dir = index_dir("restart");
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    let (first, id) = serve(&db, &dir);
+    let (first, id) = Served::database(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(start));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while get(first.port, &url).0 != 200 {
-        assert!(Instant::now() < deadline, "the index was not built");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    answered(first.port, &url);
     let file = dir.join("index").join(format!("{id}.idx"));
     let written = std::fs::metadata(&file).unwrap().modified().unwrap();
     drop(first);
-    let (bridge, _) = serve(&db, &dir);
+    let (bridge, _) = Served::database(&db, &dir);
     let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""games":5,"white":2,"draws":2,"black":1"#), "{body}");
@@ -728,19 +629,11 @@ fn every_position_of_every_game_is_found_at_any_depth() {
     assert_eq!(find(&format!("{one} g8f6 g1f3")), None);
 
     // Through the endpoint, as the analysis panel asks for it.
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let port = bridge.port;
     let fen = board_after(&one).fen();
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let body = loop {
-        let (status, body) = get(port, &url);
-        if status == 200 {
-            break body;
-        }
-        assert!(Instant::now() < deadline, "the index was not built: {body}");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let body = answered(port, &url);
     assert!(
         body.contains(r#""games":2,"white":0,"draws":1,"black":1,"moves":[{"uci":"g8f6","san":"Nf6","games":1"#),
         "{body}"
@@ -823,8 +716,11 @@ fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
         reached.play_checked(uci.parse().unwrap()).unwrap();
     }
     let never = Board::from_fen("k7/8/8/8/8/P7/8/7K b - - 0 1").unwrap();
-    let time = |board: &Board| {
-        (0..3)
+    // The fastest of `runs` lookups: a loaded machine holds back some of
+    // them, not all. The quick one is timed many times; holding back the
+    // slow one only makes it slower.
+    let time = |board: &Board, runs: usize| {
+        (0..runs)
             .map(|_| {
                 let at = Instant::now();
                 let stats = explorer::deep_stats(&idx, board, &Cancel::never()).unwrap();
@@ -833,9 +729,9 @@ fn a_classic_set_up_game_is_replayed_only_as_far_as_the_position() {
             .min()
             .unwrap()
     };
-    let (found, games) = time(&reached);
+    let (found, games) = time(&reached, 30);
     assert_eq!(games, Some(16));
-    let (missed, none) = time(&never);
+    let (missed, none) = time(&never, 3);
     assert_eq!(none, None);
     assert!(found * 5 < missed, "found in {found:?}, missed in {missed:?}");
     drop(idx);
@@ -1243,20 +1139,6 @@ fn deep_games(name: &str) -> TempDb {
     b.write(name)
 }
 
-/// Waits for a `200` answer to `path`: the index is built meanwhile.
-fn answered(port: u16, path: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let (status, body) = get(port, path);
-        if status == 200 {
-            return body;
-        }
-        assert_eq!(status, 409, "{body}");
-        assert!(Instant::now() < deadline, "the index was not built: {body}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// A stream record that fails its CRC, in its slot or in its tail, is found
 /// when a replay reads it: nothing is answered from it, the answer is `409`
 /// while both files are built again, and the next answers come from the new
@@ -1265,7 +1147,7 @@ fn answered(port: u16, path: &str) -> String {
 fn a_stream_record_that_fails_its_crc_is_rebuilt() {
     let db = deep_games("explorer-stream-crc");
     let dir = index_dir("stream-crc");
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let ucis = format!("e2e4 e7e5 {}d2d3", hops(15));
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after(&ucis).fen()));
     let found = r#""games":1,"white":1,"draws":0,"black":0"#;
@@ -1292,7 +1174,7 @@ fn a_stream_record_that_fails_its_crc_is_rebuilt() {
         drop(file);
         // A bridge started now opens the files, whose header and table are
         // sound, and finds the damage on the first replay.
-        let (bridge, _) = serve(&db, &dir);
+        let (bridge, _) = Served::database(&db, &dir);
         let (status, body) = get(bridge.port, &url);
         assert_eq!(status, 409, "{part}: {body}");
         assert!(body.contains("rebuilt"), "{part}: {body}");
@@ -1539,7 +1421,7 @@ fn a_tree_position_counts_the_games_that_reach_it_only_beyond_the_tree() {
     assert_eq!(explorer::stats(&idx, &start, &Cancel::never()).unwrap(), tree);
 
     // Through the endpoint, as the analysis panel asks for it.
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after("e2e4 e7e5").fen()));
     let body = answered(bridge.port, &url);
     assert!(
@@ -1727,7 +1609,7 @@ fn counts_that_no_sound_index_holds_are_rebuilt() {
 
     // Through the endpoint: `409` while the index is built again, then the
     // new one's answer.
-    let (bridge, id) = serve(&db, &dir);
+    let (bridge, id) = Served::database(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board.fen()));
     let found = r#""games":3,"white":1,"draws":1,"black":1"#;
     assert!(answered(bridge.port, &url).contains(found));
@@ -1735,7 +1617,7 @@ fn counts_that_no_sound_index_holds_are_rebuilt() {
     let path = dir.join("index").join(format!("{id}.idx"));
     let moves = vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))];
     replace_record(&path, board.hash(), &Stats { counts: max, moves, top: tree.top.clone() });
-    let (bridge, _) = serve(&db, &dir);
+    let (bridge, _) = Served::database(&db, &dir);
     let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("rebuilt"), "{body}");

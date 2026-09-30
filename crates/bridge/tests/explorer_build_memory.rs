@@ -8,12 +8,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bridge::explorer::format::structure;
-use bridge::explorer::runs::{Limits, Progress};
+use bridge::explorer::runs::{Limits, MEMORY_WAIT, Progress};
 use bridge::explorer::{self, Loaded};
 use bridge::search::memory::{Hold, budget, held};
 use bridge::search::workers::threads;
@@ -23,7 +22,7 @@ use cbformat::v2::Database;
 use chesscore::Board;
 
 mod common;
-use common::{add_random_games, built_bytes};
+use common::{ChildTest, Ended, add_random_games, built_bytes, index_dir, is_child};
 
 /// The bytes the process has allocated and not freed, and the most since
 /// [`Counting::reset`].
@@ -92,30 +91,18 @@ const CHILD: &str = "BRIDGE_BUILD_MEMORY_CHILD";
 const DATABASE: &str = "BRIDGE_BUILD_MEMORY_DATABASE";
 const INDEX: &str = "BRIDGE_BUILD_MEMORY_INDEX";
 
-/// Whether this is a child that runs a test's body.
-fn is_child() -> bool {
-    std::env::var_os(CHILD).is_some()
-}
-
 /// Starts test `name` in a child process with a budget of `mib` MiB,
 /// `workers` workers and `vars` set.
-fn child(name: &str, mib: usize, workers: usize, vars: &[(&str, &Path)]) -> Child {
-    std::process::Command::new(std::env::current_exe().unwrap())
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
-        .env("OSCHESS_BRIDGE_SEARCH_MIB", mib.to_string())
-        .env("OSCHESS_BRIDGE_THREADS", workers.to_string())
-        .envs(vars.iter().copied())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+fn child(name: &str, mib: usize, workers: usize, vars: &[(&str, &Path)]) -> ChildTest {
+    let (mib, workers) = (mib.to_string(), workers.to_string());
+    let mut env = vec![("OSCHESS_BRIDGE_SEARCH_MIB", mib.as_str()), ("OSCHESS_BRIDGE_THREADS", workers.as_str())];
+    env.extend(vars.iter().map(|&(name, path)| (name, path.to_str().unwrap())));
+    ChildTest::start(name, CHILD, &env)
 }
 
 /// Checks that a child passed, and shows what its build reported.
-fn passed(out: Output) {
-    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success() && text.contains("1 passed"), "{text}");
+fn passed(ended: Ended) {
+    let text = ended.passed();
     text.lines().filter(|l| l.contains(" MiB, ")).for_each(|l| println!("{l}"));
 }
 
@@ -130,21 +117,14 @@ impl Drop for Folders {
     }
 }
 
-/// A folder of its own for the index of a test.
-fn index_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bridge-build-memory-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
 /// The tree's table of blocks is reserved with the room of its passes
 /// (#147), so that a search holding all of the budget but the build's share,
 /// less the table's bytes or a few more or fewer, leaves no room the build
 /// waits for: an empty database builds at once.
 #[test]
 fn the_tree_table_is_reserved_with_its_passes() {
-    if !is_child() {
-        return passed(child("the_tree_table_is_reserved_with_its_passes", 64, 1, &[]).wait_with_output().unwrap());
+    if !is_child(CHILD) {
+        return passed(child("the_tree_table_is_reserved_with_its_passes", 64, 1, &[]).end());
     }
     assert_eq!((budget(), threads()), (64 << 20, 1));
     let db = Builder::new().write("build-memory-empty");
@@ -157,7 +137,9 @@ fn the_tree_table_is_reserved_with_its_passes() {
         let started = Instant::now();
         let loaded = explorer::prepare(&d, 1, &dir, "db", &Progress::default());
         let took = started.elapsed();
-        assert!(took < Duration::from_secs(10), "{less} bytes less: the build waited {took:?}");
+        // A build that waited would wait all of MEMORY_WAIT; an empty
+        // database builds in milliseconds.
+        assert!(took < MEMORY_WAIT / 2, "{less} bytes less: the build waited {took:?}");
         assert_eq!(loaded.unwrap().games(), 0);
         drop(search);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -183,7 +165,7 @@ const OTHERS: u32 = 2_000;
 #[test]
 fn a_crowded_bucket_is_built_in_parts_within_the_share() {
     const NAME: &str = "a_crowded_bucket_is_built_in_parts_within_the_share";
-    if is_child() {
+    if is_child(CHILD) {
         let var = |name| PathBuf::from(std::env::var_os(name).unwrap());
         return build_crowded(&var(DATABASE), &var(INDEX));
     }
@@ -192,14 +174,14 @@ fn a_crowded_bucket_is_built_in_parts_within_the_share() {
     // builds run beside each other.
     let settings = [(64, 16), (16, 1), (16, 16), (24, 16)];
     let dirs = Folders(settings.iter().map(|(mib, workers)| index_dir(&format!("crowded-{mib}-{workers}"))).collect());
-    let children: Vec<Child> = settings
+    let mut children: Vec<ChildTest> = settings
         .iter()
         .zip(&dirs.0)
         .map(|(&(mib, workers), dir)| child(NAME, mib, workers, &[(DATABASE, db.dir()), (INDEX, dir)]))
         .collect();
     // Each ended before any is checked, so that none outlives a failure.
-    let outputs: Vec<Output> = children.into_iter().map(|c| c.wait_with_output().unwrap()).collect();
-    outputs.into_iter().for_each(passed);
+    let ended: Vec<Ended> = children.iter_mut().map(ChildTest::end).collect();
+    ended.into_iter().for_each(passed);
     let built = settings.iter().zip(&dirs.0).map(|(&(mib, workers), dir)| {
         let passes: u64 = std::fs::read_to_string(dir.join("passes")).unwrap().trim().parse().unwrap();
         (format!("{mib} MiB, {workers} workers"), passes, built_bytes(&dir.join("db.idx")))

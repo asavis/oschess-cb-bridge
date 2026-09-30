@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::id_of;
+use bridge::http::MAX_HEAD;
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, annotations, arrows, lid_header, quiet, squares, symbols, text};
 use cbformat::game::language;
@@ -315,7 +316,8 @@ fn answers_on_a_kept_connection_come_without_delay() {
         let mut length = 0;
         loop {
             let mut line = String::new();
-            std::io::BufRead::read_line(&mut s, &mut line).unwrap();
+            let read = std::io::BufRead::read_line(&mut s, &mut line).unwrap();
+            assert!(read > 0, "the connection ended within an answer's head: {trips:?}");
             if line == "\r\n" {
                 break;
             }
@@ -465,18 +467,23 @@ fn a_window_at_the_last_record_number() {
 }
 
 /// Refusals made before a request is routed carry CORS headers for an allowed
-/// origin, so the page can read them.
+/// origin, so the page can read them. The head over 16 KiB is one byte over
+/// it, with no end: the bridge refuses it once it has read its last byte. Of
+/// a longer one, bytes that reach the bridge after it refused have its close
+/// reset the connection, and the client reads an error after the answer
+/// instead of its end (seen under load).
 #[test]
 fn refusals_before_routing_are_readable_by_the_page() {
     let db = database("api-refusals", 1, 0, 0);
     let p = start(&db, vec![], None).port;
     let host = format!("Host: 127.0.0.1:{p}");
-    for (head, status) in [
-        (format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}\r\nContent-Length: 1"), 413),
-        (format!("GET /v1/status?q=%zz HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}"), 400),
-        (format!("GET /v1/status HTTP/1.1\r\nOrigin: {ORIGIN}\r\n{host}\r\nX-Big: {}", "x".repeat(17 << 10)), 431),
+    let big = format!("GET /v1/status HTTP/1.1\r\nOrigin: {ORIGIN}\r\n{host}\r\nX-Big: ");
+    let big = format!("{big}{}", "x".repeat(MAX_HEAD + 1 - big.len()));
+    for (r, status) in [
+        (plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}\r\nContent-Length: 1")), 413),
+        (plain(p, &format!("GET /v1/status?q=%zz HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}")), 400),
+        (send(p, &big), 431),
     ] {
-        let r = plain(p, &head);
         assert_eq!(r.status, status);
         assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN), "{status}");
         assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After"), "{status}");
