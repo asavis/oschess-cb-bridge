@@ -11,6 +11,7 @@ use crate::explorer::runs::io;
 use crate::explorer::source::Line;
 use crate::indexdir::crc32;
 use crate::search::SearchError;
+use crate::sync::lock;
 
 use super::{
     ALIGN, BATCH, CRC_AT, Departures, Entry, HEADER_LEN, Header, INDEXED, MAX_PLIES, PREFIX_AT, PREFIX_BYTES,
@@ -83,7 +84,7 @@ impl Writer {
     fn append(&self, bytes: &[u8]) -> Result<u64, SearchError> {
         debug_assert!((bytes.len() as u64).is_multiple_of(ALIGN));
         let at = {
-            let mut end = self.end.lock().unwrap_or_else(|e| e.into_inner());
+            let mut end = lock(&self.end);
             let at = *end;
             *end += bytes.len() as u64;
             at
@@ -96,7 +97,7 @@ impl Writer {
     /// `build_id`: the table of blocks after them, then the header. The file
     /// is not synced: a torn one fails its CRCs and is rebuilt.
     pub fn finish(self, generation: u64, build_id: u64) -> Result<Header, SearchError> {
-        let table_offset = *self.end.lock().unwrap_or_else(|e| e.into_inner());
+        let table_offset = *lock(&self.end);
         let mut table = Vec::new();
         table.try_reserve_exact(TABLE_ENTRY * self.blocks.len()).map_err(|_| SearchError::TooLarge)?;
         for (at, crc) in &self.blocks {

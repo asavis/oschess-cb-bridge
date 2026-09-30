@@ -38,6 +38,7 @@ use crate::catalog::{Entry, Opened};
 use crate::indexdir::{self, Unlisted};
 use crate::machine::Machine;
 use crate::search::SearchError;
+use crate::sync::lock;
 
 use build::Plan;
 use file::{Bad, IndexFile};
@@ -604,25 +605,12 @@ impl Failure {
 /// for their tables now.
 fn current(path: &Path, generation: u64, records: u32) -> Result<Option<Loaded>, Bad> {
     let file = match IndexFile::open(path) {
-        Ok(file)
-            if file.header.generation == generation
-                && file.header.max_ply == MAX_PLY
-                && file.header.prune_ply == MAX_PLY
-                && file.header.first_record == 1
-                && file.header.last_record == records =>
-        {
-            file
-        }
+        Ok(file) if headers_match(&file.header, None, generation, records) => file,
         Err(Bad::Busy) => return Err(Bad::Busy),
         _ => return Ok(None),
     };
     match Stream::open(&stream::path_of(path)) {
-        Ok(stream)
-            if stream.header.generation == generation
-                && stream.header.build_id == file.header.build_id
-                && stream.header.first_record == 1
-                && stream.header.last_record == records =>
-        {
+        Ok(stream) if headers_match(&file.header, Some(&stream.header), generation, records) => {
             Ok(Some(Loaded::new(generation, file, stream)))
         }
         Err(Bad::Busy) => Err(Bad::Busy),
@@ -644,19 +632,28 @@ fn kept(path: &Path, generation: u64, records: u32) -> bool {
     let index = head::<{ format::HEADER_LEN }>(path).and_then(|b| format::Header::decode(&b));
     let moves = head::<{ stream::HEADER_LEN }>(&stream::path_of(path)).and_then(|b| stream::Header::decode(&b));
     match (index, moves) {
-        (Some(i), Some(m)) => {
-            i.generation == generation
-                && i.max_ply == MAX_PLY
-                && i.prune_ply == MAX_PLY
-                && i.first_record == 1
-                && i.last_record == records
-                && m.generation == generation
-                && m.build_id == i.build_id
-                && m.first_record == 1
-                && m.last_record == records
-        }
+        (Some(i), Some(m)) => headers_match(&i, Some(&m), generation, records),
         _ => false,
     }
+}
+
+/// Whether the header of an index file, `index`, and the header of its move
+/// stream, `moves`, are those of the whole index of a database of `records`
+/// records at `generation`, built together by this version: what [`current`]
+/// and [`kept`] ask. Without `moves`, whether `index` is, which [`current`]
+/// asks before it opens the stream.
+fn headers_match(index: &format::Header, moves: Option<&stream::Header>, generation: u64, records: u32) -> bool {
+    index.generation == generation
+        && index.max_ply == MAX_PLY
+        && index.prune_ply == MAX_PLY
+        && index.first_record == 1
+        && index.last_record == records
+        && moves.is_none_or(|m| {
+            m.generation == generation
+                && m.build_id == index.build_id
+                && m.first_record == 1
+                && m.last_record == records
+        })
 }
 
 /// Why a build failed, as its log line says it: a failed read names its file
@@ -672,10 +669,6 @@ fn describe(e: &SearchError) -> String {
         SearchError::IndexDamaged => "the position index is damaged".into(),
         SearchError::Bug(what) => format!("a bug in the build: {what}"),
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]

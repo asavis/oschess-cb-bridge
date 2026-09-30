@@ -27,9 +27,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use crate::indexdir;
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
 use crate::search::workers::{Worker, threads};
+use crate::sync::{lock, unpoisoned};
 
 use super::deep;
 use super::file::{Bad, write_at};
@@ -57,7 +59,8 @@ pub fn build_with(
     progress: &Progress,
     limits: &Limits,
 ) -> Result<Header, SearchError> {
-    let mut partials = Partials { paths: [temporary(target), temporary(&stream::path_of(target))], renamed: false };
+    let paths = [indexdir::partial(target), indexdir::partial(&stream::path_of(target))];
+    let mut partials = Partials { paths, renamed: false };
     let header = build_in(source, plan, target, progress, limits)?;
     partials.renamed = true;
     Ok(header)
@@ -91,8 +94,8 @@ fn build_in(
     if plan.last > MAX_GAME {
         return Err(SearchError::TooLarge);
     }
-    let (partial, moves) = (temporary(target), stream::path_of(target));
-    let moves_partial = temporary(&moves);
+    let (partial, moves) = (indexdir::partial(target), stream::path_of(target));
+    let moves_partial = indexdir::partial(&moves);
     let (part_bits, bits) = (part_bits(plan.last), deep_bits(plan.last));
     let started = Instant::now();
     let writer = stream::Writer::create(&moves_partial, plan.first, plan.last)?;
@@ -135,17 +138,10 @@ fn build_in(
     // different builds, which are rebuilt. On Windows an old file may be
     // mapped by an answer still in flight, which each rename waits for.
     let started = Instant::now();
-    stream::replace(&moves_partial, &moves).map_err(|e| io(&moves, e))?;
-    stream::replace(&partial, target).map_err(|e| io(target, e))?;
+    indexdir::replace(&moves_partial, &moves).map_err(|e| io(&moves, e))?;
+    indexdir::replace(&partial, target).map_err(|e| io(target, e))?;
     progress.time(|t| t.renaming = started.elapsed());
     Ok(header)
-}
-
-/// The file at `path` with `.partial` after its name.
-fn temporary(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(".partial");
-    path.with_file_name(name)
 }
 
 /// A failure of the file at `path`, which the build wrote, as a build's
@@ -728,13 +724,13 @@ impl<'a, T, M, W> Turns<'a, T, M, W> {
         stopped: &dyn Fn() -> bool,
     ) -> Result<(), SearchError> {
         let unit = unit as u32;
-        let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = lock(&self.state);
         // A piece fits when nothing is kept, however large.
         while q.next != unit && q.bytes > 0 && q.bytes + bytes > self.room {
             if stopped() {
                 return Err(SearchError::Superseded);
             }
-            q = self.written.wait_timeout(q, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+            q = unpoisoned(self.written.wait_timeout(q, Duration::from_millis(50))).0;
         }
         q.bytes += bytes;
         q.kept.entry(unit).or_default().push_back((made, bytes, last));
@@ -756,7 +752,7 @@ impl<'a, T, M, W> Turns<'a, T, M, W> {
             drop(q);
             self.written.notify_all();
             (self.write)(placed)?;
-            q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            q = lock(&self.state);
         }
         Ok(())
     }
@@ -892,7 +888,7 @@ pub(crate) mod tests {
                     turns.put(1, 1, 1, true, &|| w.stopped())?;
                     return turns.put(2, 2, 1, true, &|| w.stopped());
                 }
-                while turns.state.lock().unwrap_or_else(|e| e.into_inner()).bytes == 0 {
+                while lock(&turns.state).bytes == 0 {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 panic!("a bug in the worker making unit 0");

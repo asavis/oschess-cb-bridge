@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 use cbformat::codepage::CodePage;
 use cbformat::pgnfile;
 
-use crate::fetch::{Progress, Serial};
+use crate::fetch::Progress;
 use crate::indexdir::{self, Unlisted};
+use crate::serial::Serial;
+use crate::sync::lock;
 
 /// How long a failed build is reported before the next request tries again.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
@@ -210,10 +212,6 @@ fn system_code_page() -> CodePage {
 #[cfg(not(windows))]
 fn system_code_page() -> CodePage {
     CodePage::WESTERN
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]

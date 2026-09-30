@@ -17,10 +17,11 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::machine::{self, Machine, Priority, System};
+use crate::sync::{lock, unpoisoned};
 
 use super::runs::Progress;
 
@@ -257,7 +258,7 @@ impl Scheduler {
                     None => continue,
                 }
             }
-            q = self.changed.wait_timeout(q, POWER_RECHECK).unwrap_or_else(|e| e.into_inner()).0;
+            q = unpoisoned(self.changed.wait_timeout(q, POWER_RECHECK)).0;
         };
         q.running = Some(Running { id: job.id.clone(), kind: job.kind, progress: Arc::clone(&job.progress) });
         // Under the lock, so that a request that promotes the build from now
@@ -319,10 +320,6 @@ impl Drop for Exit<'_> {
             drop(jobs);
         }
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]

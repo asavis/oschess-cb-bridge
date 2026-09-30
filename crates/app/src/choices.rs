@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError, TryLockError};
 
 use bridge::config;
 use bridge::engines::Found;
@@ -27,7 +27,8 @@ pub struct Choices {
     saved: AtomicU64,
     /// One choice at a time: a slow probe cannot save its engine over a later one.
     choosing: Mutex<()>,
-    /// One installation at a time.
+    /// One installation at a time. An installation that panics leaves it
+    /// poisoned, not held: the next one takes it all the same.
     installing: Mutex<()>,
 }
 
@@ -48,7 +49,7 @@ impl Choices {
 
     /// Whether Stockfish is being installed now (#61): an update waits for it.
     pub fn installing(&self) -> bool {
-        self.installing.try_lock().is_err()
+        matches!(self.installing.try_lock(), Err(TryLockError::WouldBlock))
     }
 
     /// Chooses `engine` in the `bridge.toml` at `config_path` once `probe`
@@ -76,8 +77,10 @@ impl Choices {
         install: impl FnOnce() -> Result<PathBuf, String>,
         probe: impl FnOnce(&Path) -> Result<(), String>,
     ) -> Result<bool, String> {
-        let Ok(_installing) = self.installing.try_lock() else {
-            return Err("Stockfish is being installed already".into());
+        let _installing = match self.installing.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err("Stockfish is being installed already".into()),
         };
         let ticket = self.ticket();
         let exe = install()?;
@@ -300,6 +303,35 @@ mod tests {
         );
         assert_eq!(chosen, Ok(true));
         assert_eq!(*events.borrow(), ["install, installing true", "probe stockfish.exe"]);
+        assert_eq!(engine_in(&toml), Some(PathBuf::from("stockfish.exe")));
+        assert!(!choices.installing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An installation that panics leaves no installation running: the next
+    /// one starts, and is the only one while it runs.
+    #[test]
+    fn an_installation_that_panicked_leaves_the_next_free_to_start() {
+        let dir = folder("panicked");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            choices.install(&toml, || panic!("the installation panics"), accept)
+        }));
+        assert!(panicked.is_err());
+        assert!(choices.installing.is_poisoned());
+        assert!(!choices.installing(), "a panicked installation still counts as running");
+        let chosen = choices.install(
+            &toml,
+            || {
+                assert!(choices.installing());
+                let second = choices.install(&toml, || panic!("a second installation runs"), accept);
+                assert_eq!(second, Err("Stockfish is being installed already".into()));
+                Ok(PathBuf::from("stockfish.exe"))
+            },
+            accept,
+        );
+        assert_eq!(chosen, Ok(true));
         assert_eq!(engine_in(&toml), Some(PathBuf::from("stockfish.exe")));
         assert!(!choices.installing());
         let _ = std::fs::remove_dir_all(&dir);

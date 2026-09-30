@@ -27,10 +27,11 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::api::App;
 use crate::catalog::{Entry, Opened};
 use crate::machine::{self, Machine};
+use crate::sync::lock;
 
 use super::schedule::Kind;
 use super::source::Source;
-use super::{Registry, State, kept, lock, paths, room};
+use super::{Registry, State, kept, paths, room};
 
 /// How often the keeper looks at the databases in use.
 pub const TICK: Duration = Duration::from_secs(60);

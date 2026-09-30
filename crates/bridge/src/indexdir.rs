@@ -3,11 +3,12 @@
 //! names files in `index`, and the header index of a PGN file in `pgn`. Each
 //! kind has a registry, which sweeps its folder in its own way; this module
 //! holds what they have in common: the names of the files, how long they
-//! outlive their database's place on the list (#60), and the CRC-32 and
+//! outlive their database's place on the list (#60), how a build's file is
+//! written beside its place and renamed into it (#176), and the CRC-32 and
 //! fixed-width reads the files are checked and decoded with.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,61 @@ pub fn sweep_moved(dir: &Path, kept: impl Fn(&str) -> bool) {
         };
     }
     let _ = std::fs::remove_dir(dir);
+}
+
+/// The file a build writes `path` as until it renames it into place with
+/// [`replace`]: `path` with `.partial` after its name, which is how the sweeps
+/// know it.
+pub fn partial(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".partial");
+    PathBuf::from(p)
+}
+
+/// How long [`replace`] keeps trying: longer than a reader holds a file it
+/// replaces, an answer that has the old move stream mapped or a pass over a
+/// heads file. A build ends with it, and no request waits for a build.
+const REPLACE_WAIT: Duration = Duration::from_secs(60);
+
+/// How often [`replace`] tries again.
+const REPLACE_EVERY: Duration = Duration::from_millis(20);
+
+/// Renames the file a build wrote, `from`, to `to`, replacing the file there.
+/// On Windows a file that another handle holds cannot be replaced or moved:
+/// an answer still in flight maps the old move stream, a pass still reads a
+/// heads file removed as broken, an antivirus or indexing service opens a new
+/// file to scan it. Such a refusal ([`held`]) is tried again every
+/// [`REPLACE_EVERY`] for up to [`REPLACE_WAIT`]. Any other failure is
+/// returned at once, and so is every failure on other systems, where a rename
+/// replaces an open file and a refusal does not pass by waiting.
+pub fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    retried(|| std::fs::rename(from, to), held, REPLACE_WAIT)
+}
+
+/// Runs `op` until it succeeds, fails for a reason `transient` does not
+/// accept, or `wait` has passed, trying again every [`REPLACE_EVERY`]; what
+/// it gave last.
+fn retried(
+    mut op: impl FnMut() -> std::io::Result<()>,
+    transient: impl Fn(&std::io::Error) -> bool,
+    wait: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match op() {
+            Err(e) if transient(&e) && Instant::now() < deadline => std::thread::sleep(REPLACE_EVERY),
+            result => return result,
+        }
+    }
+}
+
+/// Whether a rename was refused, on Windows, because another handle holds one
+/// of its files: access denied, as a file open without sharing its deletion
+/// or one being deleted gives, a sharing or lock violation, or a mapped file.
+fn held(e: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_USER_MAPPED_FILE.
+    cfg!(windows)
+        && (e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(32 | 33 | 1224)))
 }
 
 /// The database id of an index folder entry named `<id><suffix>`, for one of
@@ -395,6 +451,113 @@ mod tests {
         sweep_moved(&dir, kept);
         assert!(!dir.exists(), "an emptied folder goes");
         sweep_moved(&dir, kept);
+    }
+
+    /// A build's file is its target's name with `.partial` after it, which
+    /// the sweeps and [`db_id`] know.
+    #[test]
+    fn a_partial_file_is_named_after_its_target() {
+        let target = Path::new("index").join("0123456789abcdef.idx");
+        assert_eq!(partial(&target), Path::new("index").join("0123456789abcdef.idx.partial"));
+        let name = partial(&target).file_name().unwrap().to_str().unwrap().to_owned();
+        assert_eq!(db_id(&name, &[".idx", ".idx.partial"]), Some(("0123456789abcdef", 1)));
+    }
+
+    /// A refusal that passes is tried again until the rename goes through; any
+    /// other failure is returned from the first try, without a wait; and a
+    /// refusal that stays is returned once the wait is over.
+    #[test]
+    fn a_passing_refusal_is_tried_again_and_nothing_else_is() {
+        let busy = || std::io::Error::from(std::io::ErrorKind::ResourceBusy);
+        let transient = |e: &std::io::Error| e.kind() == std::io::ErrorKind::ResourceBusy;
+        let mut tries = 0;
+        let passing = retried(
+            || {
+                tries += 1;
+                if tries < 3 { Err(busy()) } else { Ok(()) }
+            },
+            transient,
+            REPLACE_WAIT,
+        );
+        assert_eq!((passing.is_ok(), tries), (true, 3));
+
+        let mut tries = 0;
+        let failed = retried(
+            || {
+                tries += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            transient,
+            REPLACE_WAIT,
+        );
+        assert_eq!((failed.map_err(|e| e.kind()), tries), (Err(std::io::ErrorKind::NotFound), 1));
+
+        let mut tries = 0;
+        let staying = retried(
+            || {
+                tries += 1;
+                Err(busy())
+            },
+            transient,
+            Duration::from_millis(50),
+        );
+        assert_eq!(staying.map_err(|e| e.kind()), Err(std::io::ErrorKind::ResourceBusy));
+        assert!(tries >= 1);
+    }
+
+    /// Only Windows refuses a rename for a file another handle holds, so only
+    /// there is a refusal tried again: elsewhere access denied is final. A
+    /// missing file is final everywhere.
+    #[test]
+    fn only_a_windows_refusal_for_a_held_file_is_tried_again() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(held(&denied), cfg!(windows));
+        assert_eq!(held(&std::io::Error::from_raw_os_error(32)), cfg!(windows));
+        assert!(!held(&std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert!(!held(&std::io::Error::from(std::io::ErrorKind::StorageFull)));
+    }
+
+    /// A rename replaces the file at its target; a missing file is reported
+    /// at once, on every system.
+    #[test]
+    fn a_partial_file_replaces_its_target() {
+        let dir = std::env::temp_dir().join(format!("bridge-index-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("0123456789abcdef.heads");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(partial(&target), b"new").unwrap();
+        replace(&partial(&target), &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!partial(&target).exists());
+        let started = Instant::now();
+        let missing = replace(&partial(&target), &target).map_err(|e| e.kind());
+        assert_eq!(missing, Err(std::io::ErrorKind::NotFound));
+        assert!(started.elapsed() < REPLACE_WAIT, "a missing file was waited for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On Windows a target another handle holds without sharing its deletion
+    /// is replaced once the handle is let go, as a stream an answer maps is.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_target_is_replaced_once_let_go() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-index-replace-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("0123456789abcdef.moves");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(partial(&target), b"new").unwrap();
+        let holder = std::fs::OpenOptions::new().read(true).share_mode(0).open(&target).unwrap();
+        let let_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(holder);
+        });
+        replace(&partial(&target), &target).unwrap();
+        let_go.join().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

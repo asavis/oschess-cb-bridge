@@ -39,6 +39,7 @@ use cbformat::replay;
 use crate::indexdir::{crc32, crc32_update, u32_at, u64_at};
 use crate::search::memory::{Evict, Hold, Refused, register};
 use crate::search::{Adding, Members};
+use crate::sync::lock;
 
 use super::file::{Bad, read_at};
 use super::format::{NO_MOVE, Outcome, pack_move};
@@ -447,7 +448,7 @@ struct KeptStarts(Mutex<Option<Arc<Starts>>>);
 
 impl Evict for KeptStarts {
     fn evict(&self) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *lock(&self.0) = None;
     }
 }
 
@@ -593,7 +594,7 @@ impl Stream {
     /// The starts of the games, once a scan of every slot has found them,
     /// and while the stream keeps them.
     pub(super) fn starts(&self) -> Option<Arc<Starts>> {
-        self.starts.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.starts.0).clone()
     }
 
     /// Room for the starts of the games, which a scan of every slot finds
@@ -612,7 +613,7 @@ impl Stream {
     /// found to match the block's CRC; of two scans that found them at once,
     /// the first's.
     pub(super) fn keep(&self, starts: Starts) {
-        self.starts.0.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| Arc::new(starts));
+        lock(&self.starts.0).get_or_insert_with(|| Arc::new(starts));
     }
 
     /// The slot and the tail of record `number`, within the file.
@@ -769,21 +770,6 @@ pub fn build_id() -> u64 {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         nanos as u64 ^ u64::from(std::process::id()) << 32
     })
-}
-
-/// Renames the stream `from` to `to`, replacing the one there. On Windows a
-/// stream still mapped, by an answer in flight, cannot be replaced: the
-/// rename is tried again until that answer is done, for up to a minute.
-pub fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + super::runs::MEMORY_WAIT;
-    loop {
-        match std::fs::rename(from, to) {
-            Err(_) if cfg!(windows) && std::time::Instant::now() < deadline && from.exists() => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            other => return other,
-        }
-    }
 }
 
 #[cfg(test)]

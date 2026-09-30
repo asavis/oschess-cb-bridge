@@ -13,8 +13,10 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::sync::lock;
 
 /// The log's name in the data folder.
 pub const FILE_NAME: &str = "bridge.log";
@@ -142,15 +144,13 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year_of_era + era * 400 + i64::from(month <= 2), month, day)
 }
 
-fn lock(file: &Mutex<Option<File>>) -> MutexGuard<'_, Option<File>> {
-    file.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// For the tests that open the log: the log is one per process, and the
 /// tests of a binary run beside each other.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::sync::{Mutex, MutexGuard};
+
+    use crate::sync::lock;
 
     /// The log held by one test, which closes it when dropped.
     pub(crate) struct Held(#[allow(dead_code)] MutexGuard<'static, ()>);
@@ -159,12 +159,12 @@ pub(crate) mod testing {
     /// opens the log, itself or through `start::prepare`, holds it first.
     pub(crate) fn hold() -> Held {
         static ONE: Mutex<()> = Mutex::new(());
-        Held(ONE.lock().unwrap_or_else(PoisonError::into_inner))
+        Held(lock(&ONE))
     }
 
     impl Drop for Held {
         fn drop(&mut self) {
-            *super::lock(&super::FILE) = None;
+            *lock(&super::FILE) = None;
         }
     }
 }

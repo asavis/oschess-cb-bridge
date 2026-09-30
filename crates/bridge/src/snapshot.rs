@@ -9,6 +9,7 @@ use crate::api::App;
 use crate::catalog::{Entry, State};
 use crate::server;
 use crate::start::Bridge;
+use crate::sync::lock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -141,7 +142,7 @@ impl Background {
                 Ok(()) => "the server stopped".to_string(),
                 Err(e) => e.to_string(),
             };
-            *record.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+            *lock(&record) = Some(reason);
         })?;
         Ok(Background { app, port, stopped })
     }
@@ -161,7 +162,7 @@ impl Background {
         Snapshot {
             version: self.app.version,
             port: self.port,
-            stopped: self.stopped.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            stopped: lock(&self.stopped).clone(),
             databases,
             work,
             served: self.app.served.load(Ordering::Relaxed),

@@ -15,9 +15,10 @@ use cbformat::game::{Player, Tournament};
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
 use super::workers::{self, threads};
-use crate::indexdir::{crc32, crc32_update, u32_at, u64_at};
+use crate::indexdir::{self, crc32, crc32_update, u32_at, u64_at};
 pub use crate::store::Kind;
 use crate::store::Store;
+use crate::sync::{lock, unpoisoned};
 
 /// Ids of a type read in one worker's go.
 const IDS_PER_WORKER_MIN: usize = 4096;
@@ -195,7 +196,7 @@ impl NameTable {
             Ok(c)
         })?;
         let per = count.div_ceil(chunks.len()).max(1);
-        let hold = shared.into_inner().unwrap_or_else(|e| e.into_inner());
+        let hold = unpoisoned(shared.into_inner());
         Ok((per, chunks, hold))
     }
 
@@ -380,12 +381,12 @@ impl NameTable {
     /// Marks the table to be written as the names file `path` of `kind` at
     /// `generation`, by [`NameTable::write_later`].
     pub(super) fn to_be_written(&self, path: PathBuf, kind: Kind, generation: u64) {
-        *self.write_to.lock().unwrap_or_else(|e| e.into_inner()) = Some((path, kind, generation));
+        *lock(&self.write_to) = Some((path, kind, generation));
     }
 
     /// Writes the table on a thread of its own when it is marked to be, once.
     pub(super) fn write_later(self: &std::sync::Arc<Self>) {
-        let Some((path, kind, generation)) = self.write_to.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        let Some((path, kind, generation)) = lock(&self.write_to).take() else {
             return;
         };
         let table = std::sync::Arc::clone(self);
@@ -402,9 +403,7 @@ impl NameTable {
     /// Writes the table as the names file `path` of `kind` at `generation`:
     /// as `<path>.partial`, then renamed.
     pub fn write_file(&self, path: &Path, kind: Kind, generation: u64) -> std::io::Result<()> {
-        let mut partial = path.as_os_str().to_owned();
-        partial.push(".partial");
-        let partial = PathBuf::from(partial);
+        let partial = indexdir::partial(path);
         let _writing = super::heads::Writing::new(partial.clone());
         // The one buffer the write takes, reserved in the budget and
         // allocated fallibly: an optional background write that does not fit
@@ -449,7 +448,7 @@ impl NameTable {
         file.write_all(&h)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&partial, path)
+        indexdir::replace(&partial, path)
     }
 
     /// The table of `kind` from the names file `path`, when it was written
@@ -605,7 +604,7 @@ pub fn groups(table: &NameTable, cancel: &Cancel) -> Result<Held<Groups>, Search
         }
         (of_id, first_id)
     };
-    let mut hold = shared.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut hold = unpoisoned(shared.into_inner());
     hold.shrink((of_id.capacity() + first_id.capacity()) * 4);
     Ok(Held::new(Groups { of_id, first_id }, hold))
 }
