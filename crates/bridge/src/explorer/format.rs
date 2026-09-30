@@ -40,6 +40,8 @@ pub const MAX_PLY: u8 = 20;
 /// Buckets per deep block: a lookup reads one block, a few KiB, and walks to
 /// its bucket.
 pub const DEEP_BLOCK_BITS: u8 = 8;
+/// Buckets per deep block.
+pub const BLOCK_BUCKETS: usize = 1 << DEEP_BLOCK_BITS;
 /// The fewest and the most bucket bits a deep section has.
 pub const MIN_DEEP_BITS: u8 = DEEP_BLOCK_BITS;
 pub const MAX_DEEP_BITS: u8 = 24;
@@ -407,6 +409,46 @@ pub fn read_varint(b: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
+/// The games of bucket `local` in a block's bytes that hold a structure of
+/// print `print`, at most `max_game` each, only those that hold it beyond the
+/// tree's plies when `beyond`; `None` when the block does not hold them as
+/// written.
+pub fn bucket_games(block: &[u8], local: usize, max_game: u32, print: u8, beyond: bool) -> Option<Vec<u32>> {
+    let mut at = 0;
+    for _ in 0..local {
+        let n = read_varint(block, &mut at)?;
+        for _ in 0..n {
+            read_varint(block, &mut at)?;
+        }
+    }
+    let n = read_varint(block, &mut at)?;
+    // A game comes once per print at most, and each posting takes a byte at
+    // least, so a damaged count never reserves more than the block's size.
+    if n > u64::from(max_game) << PRINT_BITS || n > (block.len() - at) as u64 {
+        return None;
+    }
+    let mut games = Vec::new();
+    games.try_reserve_exact(n as usize).ok()?;
+    let (mut game, mut last_print) = (0u64, 0u64);
+    for _ in 0..n {
+        let v = read_varint(block, &mut at)?;
+        let (delta, p) = (v >> 8, v >> 1 & 0x7f);
+        // Games ascend, from 1, and so do the prints of one game.
+        if delta == 0 && (game == 0 || p <= last_print) {
+            return None;
+        }
+        game += delta;
+        if game > u64::from(max_game) {
+            return None;
+        }
+        last_print = p;
+        if p == u64::from(print) && (!beyond || v & 1 == 1) {
+            games.push(game as u32);
+        }
+    }
+    Some(games)
+}
+
 impl Header {
     /// The deep section's blocks.
     pub fn deep_blocks(&self) -> u64 {
@@ -430,12 +472,7 @@ pub fn deep_bits(records: u32) -> u8 {
 /// that hold its structure (#133). The pieces split what the pawns alone
 /// share widely: every pawnless ending has one pawn structure.
 pub fn structure(board: &Board) -> u64 {
-    let mut pieces = 0u64;
-    for (i, piece) in STRUCTURE_PIECES.into_iter().enumerate() {
-        for color in [Color::White, Color::Black] {
-            pieces += u64::from(board.colored(piece, color).count_ones()) << piece_shift(i, color);
-        }
-    }
+    let pieces = pieces_of(board);
     let pawns = |color| board.colored(Piece::Pawn, color);
     structure_of(pawns(Color::White), pawns(Color::Black), pieces)
 }
@@ -449,6 +486,21 @@ pub const STRUCTURE_PIECES: [Piece; 4] = [Piece::Knight, Piece::Bishop, Piece::R
 /// position.
 pub fn piece_shift(i: usize, color: Color) -> u32 {
     8 * i as u32 + if color == Color::White { 0 } else { 4 }
+}
+
+/// The pieces of `board` counted by kind ([`piece_shift`]): what a
+/// [`structure`] holds beside the pawns, and what a line's structure starts
+/// from when a build follows it through its words
+/// ([`super::follow::Tracker`]).
+#[inline]
+pub(super) fn pieces_of(board: &Board) -> u64 {
+    let mut pieces = 0u64;
+    for (i, piece) in STRUCTURE_PIECES.into_iter().enumerate() {
+        for color in [Color::White, Color::Black] {
+            pieces += u64::from(board.colored(piece, color).count_ones()) << piece_shift(i, color);
+        }
+    }
+    pieces
 }
 
 /// The structure of white pawns `white`, black pawns `black` and the pieces
@@ -725,6 +777,34 @@ mod tests {
         assert_eq!(read_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02], &mut at), None);
         let mut at = 0;
         assert_eq!(read_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x00], &mut at), None);
+    }
+
+    /// A damaged bucket is refused: a delta that wraps around to a game
+    /// already listed, a game listed again with the same print or a lower
+    /// one, a first game of 0, and a count or a delta written past 64 bits,
+    /// which would read as 0 or 5 were the bits beyond cut off.
+    #[test]
+    fn a_damaged_bucket_is_refused() {
+        let bucket = |values: &[u64]| {
+            let mut b = Vec::new();
+            for &v in values {
+                varint(&mut b, v);
+            }
+            b
+        };
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8, u64::MAX - 2]), 0, 100, 0, false), None);
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 2, 2]), 0, 100, 1, false), None);
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 4, 2]), 0, 100, 1, false), None);
+        assert_eq!(bucket_games(&bucket(&[2, 5 << 8 | 2, 4]), 0, 100, 1, false), Some(vec![5]));
+        // A database of one game lists it twice in a bucket where it holds
+        // two structures of different prints.
+        assert_eq!(bucket_games(&bucket(&[2, 1 << 8 | 2, 4]), 0, 1, 2, false), Some(vec![1]));
+        assert_eq!(bucket_games(&bucket(&[1, 2]), 0, 100, 1, false), None);
+        let long = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert_eq!(bucket_games(&long, 0, 100, 0, false), None);
+        let mut delta = vec![1, 0x85];
+        delta.extend(&long[1..]);
+        assert_eq!(bucket_games(&delta, 0, 100, 0, false), None);
     }
 
     #[test]
