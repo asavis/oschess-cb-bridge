@@ -143,6 +143,7 @@ fn merge(runs: &[Vec<u64>], parts: usize, cancel: &Cancel, out: &mut [u32]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::workers::tests::unbusy;
 
     /// Runs merged in any number of parts give the order one sort of all
     /// their keys gives: few key values, so that many keys tie on the value
@@ -177,7 +178,7 @@ mod tests {
             let want: Vec<u32> = all.iter().map(|&p| p as u32).collect();
             for parts in [1, 2, 3, 16, 40] {
                 let mut out = vec![0; want.len()];
-                merge(&runs, parts, &Cancel::never(), &mut out).unwrap();
+                unbusy(|| merge(&runs, parts, &Cancel::never(), &mut out)).unwrap();
                 assert_eq!(out, want, "{count} runs of about {per} keys in {parts} parts");
             }
         }

@@ -692,6 +692,14 @@ mod tests {
         b.write(name)
     }
 
+    /// Limits whose passes wait for a worker as long as a test asks again a
+    /// pass answered busy ([`workers::tests::PATIENCE`]), not
+    /// [`runs::WORKERS_WAIT`] (#251): the passes of this binary's other
+    /// tests, which run beside a build, may take every worker for longer.
+    fn patient() -> Limits {
+        Limits { workers_wait: workers::tests::PATIENCE, ..Limits::default() }
+    }
+
     /// The index kept on disk for the database as it is answers the first
     /// request after the bridge starts at once, even while the queue runs
     /// another database's build, and the file is only read. Released, it is
@@ -706,7 +714,7 @@ mod tests {
         let entry = Arc::clone(&catalog.entries()[0]);
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         // Built by the bridge before it restarted.
-        drop(prepare(&*open.db, open.generation, &dir, &entry.id, &Progress::default()).unwrap());
+        drop(prepare_with(&*open.db, open.generation, &dir, &entry.id, &Progress::default(), &patient()).unwrap());
         let (path, _) = paths(&dir, &entry.id);
         let written = std::fs::metadata(&path).unwrap().modified().unwrap();
         // Another database's build holds the queue until released.
@@ -906,7 +914,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-explorer-bug-partial-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Buggy { partial: dir.join("db.moves.partial"), written: AtomicBool::new(false) };
-        let built = std::panic::catch_unwind(|| prepare(&db, 7, &dir, "db", &Progress::default()).map(drop));
+        let built =
+            std::panic::catch_unwind(|| prepare_with(&db, 7, &dir, "db", &Progress::default(), &patient()).map(drop));
         assert!(built.is_err(), "the build panicked");
         assert!(db.written.load(Ordering::Relaxed), "the move stream was being written");
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file is left");
@@ -931,7 +940,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-explorer-kept-headers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let d = cbformat::v2::Database::open(db.dir().join("db.2cbh")).unwrap();
-        drop(prepare(&d, 7, &dir, "db", &Progress::default()).unwrap());
+        drop(prepare_with(&d, 7, &dir, "db", &Progress::default(), &patient()).unwrap());
         let (index, stream) = paths(&dir, "db");
         assert!(kept(&index, 7, 3));
         assert!(!kept(&index, 8, 3), "another generation");

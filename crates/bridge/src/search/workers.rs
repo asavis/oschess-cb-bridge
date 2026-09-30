@@ -460,8 +460,37 @@ fn sift_down<T: Copy, F: Fn(&T, &T) -> std::cmp::Ordering>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::sync::mpsc;
+
     use super::*;
+
+    /// How long a test asks a pass again while it is answered busy
+    /// ([`unbusy`]): far longer than the passes of this binary's other tests
+    /// ever hold the workers, as the waits of the integration tests are.
+    pub(crate) const PATIENCE: Duration = Duration::from_secs(300);
+
+    /// Passes answered busy and asked again ([`unbusy`]).
+    static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+    /// What `ask` answers, asked again while it is `WorkersBusy`, for
+    /// [`PATIENCE`] at most (#251). A pass is answered busy when every worker
+    /// stays taken for as long as it waits for one ([`WAIT`]), as the passes
+    /// of this binary's other tests, which run beside it, may take them all:
+    /// that says nothing of the answer, and is never taken for it.
+    #[track_caller]
+    pub(crate) fn unbusy<T>(mut ask: impl FnMut() -> Result<T, SearchError>) -> Result<T, SearchError> {
+        let end = Instant::now() + PATIENCE;
+        loop {
+            match ask() {
+                Err(SearchError::WorkersBusy) => {
+                    assert!(Instant::now() < end, "every worker stayed taken for {PATIENCE:?}");
+                    BUSY.fetch_add(1, Ordering::SeqCst);
+                }
+                answer => return answer,
+            }
+        }
+    }
 
     /// Items sorted on the workers come in the order one sort gives: many
     /// equal keys, told apart by their numbers, a few items, and none.
@@ -479,7 +508,7 @@ mod tests {
                 .collect();
             let mut want = items.clone();
             want.sort_unstable();
-            sort_by(&mut items, &|a: &(u32, u32), b: &(u32, u32)| a.cmp(b), &Cancel::never()).unwrap();
+            unbusy(|| sort_by(&mut items, &|a: &(u32, u32), b: &(u32, u32)| a.cmp(b), &Cancel::never())).unwrap();
             assert_eq!(items, want, "{n} items");
         }
     }
@@ -500,7 +529,7 @@ mod tests {
                 a.cmp(b)
             };
             let mut items: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
-            assert!(matches!(sort_by(&mut items, &cmp, &cancel), Err(SearchError::Superseded)), "{n} items");
+            assert!(matches!(unbusy(|| sort_by(&mut items, &cmp, &cancel)), Err(SearchError::Superseded)), "{n} items");
         }
     }
 
@@ -522,6 +551,50 @@ mod tests {
         let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success() && text.contains("1 passed"), "{text}");
         false
+    }
+
+    /// A sort answered busy is asked again, and its busy answer is never
+    /// taken for the sort's (#251): a pass is answered busy when every worker
+    /// stays taken for as long as it waits for one ([`WAIT`]), as the passes
+    /// of this binary's other tests may take them all. Every worker is held
+    /// as the sorts of `a_sort_on_the_workers_orders_as_one_sort` begin, and
+    /// let go once one of them was answered busy; they then sort as one sort
+    /// does. The one worker runs in a child process, where no other test
+    /// takes it.
+    #[test]
+    fn a_sort_answered_busy_is_asked_again() {
+        if !in_child_with_one_worker("search::workers::tests::a_sort_answered_busy_is_asked_again") {
+            return;
+        }
+        assert_eq!(threads(), 1);
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let end = Instant::now() + PATIENCE;
+            while !done() {
+                assert!(Instant::now() < end, "{what} within {PATIENCE:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let busy = BUSY.load(Ordering::SeqCst);
+        std::thread::scope(|s| {
+            // Another pass holds every worker until released, or until a
+            // failed check drops `release`.
+            let (release, held) = mpsc::channel::<()>();
+            let held = Mutex::new(held);
+            let holder = s.spawn(move || {
+                run(threads(), 0, &Cancel::never(), |_| {
+                    let _ = lock(&held).recv();
+                    Ok(())
+                })
+            });
+            until("every worker was taken", &|| taken() == threads());
+            let sorting = s.spawn(a_sort_on_the_workers_orders_as_one_sort);
+            until("a sort was answered busy", &|| BUSY.load(Ordering::SeqCst) > busy || sorting.is_finished());
+            release.send(()).unwrap();
+            assert!(holder.join().unwrap().is_ok());
+            sorting.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+            assert!(BUSY.load(Ordering::SeqCst) > busy, "a sort was answered busy");
+        });
+        assert_eq!(taken(), 0, "every worker was returned");
     }
 
     /// A long sort on one worker stops once superseded, before it starts or
@@ -569,15 +642,18 @@ mod tests {
 
     #[test]
     fn workers_are_bounded_and_returned() {
-        let got = run(1000, 0, &Cancel::never(), |w| {
-            assert!(w.count <= threads());
-            Ok((w.index, w.count))
+        let got = unbusy(|| {
+            run(1000, 0, &Cancel::never(), |w| {
+                assert!(w.count <= threads());
+                Ok((w.index, w.count))
+            })
         })
         .ok()
         .unwrap();
         assert_eq!(got.len(), got[0].1);
         assert!(got.iter().enumerate().all(|(i, &(index, _))| i == index));
-        let failed = run(4, 0, &Cancel::never(), |w| if w.index == 0 { Err(SearchError::Busy) } else { Ok(()) });
+        let failed =
+            unbusy(|| run(4, 0, &Cancel::never(), |w| if w.index == 0 { Err(SearchError::Busy) } else { Ok(()) }));
         assert!(matches!(failed, Err(SearchError::Busy)));
     }
 
@@ -589,7 +665,7 @@ mod tests {
         use crate::machine::{Priority, at, current};
         for priority in [Priority::Background, Priority::Lowest, Priority::BelowNormal, Priority::Normal] {
             let _at = at(priority);
-            let got = run(4, 0, &Cancel::never(), |_| Ok(current())).ok().unwrap();
+            let got = unbusy(|| run(4, 0, &Cancel::never(), |_| Ok(current()))).ok().unwrap();
             assert!(got.iter().all(|&p| p == priority), "{priority:?}: {got:?}");
         }
     }
@@ -610,6 +686,6 @@ mod tests {
             assert_eq!(counts, [1]);
         }
         // A buffer larger than the whole budget is too large on any number of workers.
-        assert!(matches!(run(2, budget() + 1, &Cancel::never(), |_| Ok(())), Err(SearchError::TooLarge)));
+        assert!(matches!(unbusy(|| run(2, budget() + 1, &Cancel::never(), |_| Ok(()))), Err(SearchError::TooLarge)));
     }
 }
