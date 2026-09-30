@@ -849,7 +849,9 @@ the oschess analysis panel shows it like its Lichess tabs.
   `/v1/status` lists the builds under `indexing`. A build that fails is
   answered `503 index_unavailable` for a minute, and the next request tries
   again; a failed build of a database in use is not tried again unasked until
-  the database changes.
+  the database changes, unless it failed only because searches kept every
+  search worker taken for as long as it waited for one: such a build is tried
+  again unasked within a minute.
 - **Changes.** The index belongs to the database's generation, and a change to
   the database rebuilds its index, about half a minute for the Mega Database
   on a quiet machine: at the next request for its positions, or, for a

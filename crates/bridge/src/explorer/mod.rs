@@ -111,11 +111,14 @@ enum State {
     Ready(Arc<Loaded>),
     /// The build of the database at `generation` failed at `at`, for `why`:
     /// requests are answered so for a minute, and no background build is
-    /// tried again until the database changes.
+    /// tried again until the database changes, unless it failed only for
+    /// being `busy`: searches held every worker for as long as it waited for
+    /// one, and the keeper tries it again at its next look (#180).
     Failed {
         at: Instant,
         why: String,
         generation: u64,
+        busy: bool,
     },
 }
 
@@ -280,7 +283,7 @@ impl Registry {
         }
         if let Err(why) = room(&*self.builds.machine(), &dir, &entry.id, records) {
             crate::log!("database {} is not indexed: {why}", entry.id);
-            *s = State::Failed { at: Instant::now(), why: why.clone(), generation: open.generation };
+            *s = State::Failed { at: Instant::now(), why: why.clone(), generation: open.generation, busy: false };
             return Lookup::Failed(why);
         }
         Lookup::Pending(self.queue(s, &state, entry, open, dir, Kind::Requested))
@@ -328,11 +331,11 @@ impl Registry {
             }
             if let Err(why) = room(&*machine, &dir, &entry.id, records) {
                 crate::log!("database {} is not indexed: {why}", entry.id);
-                *lock(&job_state) = State::Failed { at: Instant::now(), why, generation };
+                *lock(&job_state) = State::Failed { at: Instant::now(), why, generation, busy: false };
                 return Ran::Done;
             }
             let result = index(&*db, generation, &dir, &entry.id, &p, &limits.unwrap_or_default());
-            if result.is_err() && p.stop.load(Ordering::Relaxed) {
+            if result.is_err() && p.stopped() {
                 return Ran::Stopped;
             }
             let still = entry.generation() == Some(generation);
@@ -342,14 +345,15 @@ impl Registry {
                 Ok(_) => State::Idle,
                 Err(failure) => {
                     crate::log!("indexing database {} failed: {}", entry.id, failure.logged());
-                    State::Failed { at: Instant::now(), why: failure.answered(&dir), generation }
+                    let busy = failure.busy();
+                    State::Failed { at: Instant::now(), why: failure.answered(&dir), generation, busy }
                 }
             };
             Ran::Done
         };
         if !self.builds.submit(&id, kind, Arc::clone(&progress), Box::new(work)) {
             let why = "the index thread could not start".to_string();
-            *lock(state) = State::Failed { at: Instant::now(), why, generation };
+            *lock(state) = State::Failed { at: Instant::now(), why, generation, busy: false };
         }
         progress
     }
@@ -467,7 +471,7 @@ impl Drop for Unwinding<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             let (why, generation) = ("the build failed with a bug".to_string(), self.generation);
-            *lock(self.state) = State::Failed { at: Instant::now(), why, generation };
+            *lock(self.state) = State::Failed { at: Instant::now(), why, generation, busy: false };
         }
     }
 }
@@ -588,6 +592,12 @@ impl Failure {
             Failure::Open(e) => format!("{e:?}"),
         }
     }
+
+    /// Whether the build failed only because searches held every worker for
+    /// as long as a pass waited for one (#180), which the keeper tries again.
+    fn busy(&self) -> bool {
+        matches!(self, Failure::Build(SearchError::WorkersBusy))
+    }
 }
 
 /// The index file at `path` and its move stream when they are the whole
@@ -659,10 +669,12 @@ fn describe(e: &SearchError) -> String {
     match e {
         SearchError::TooLarge => "the search memory budget is too small to build this index".into(),
         SearchError::Busy => "the search memory stayed taken by searches; retry".into(),
+        SearchError::WorkersBusy => "the search workers stayed taken by searches; retry".into(),
         SearchError::Superseded => "the build was stopped".into(),
         SearchError::Read(e) => crate::log::error(e),
         SearchError::Unsupported(q) => q.clone(),
         SearchError::IndexDamaged => "the position index is damaged".into(),
+        SearchError::Bug(what) => format!("a bug in the build: {what}"),
     }
 }
 
@@ -676,6 +688,8 @@ mod tests {
 
     use super::*;
     use crate::catalog::Catalog;
+    use crate::search::memory::Cancel;
+    use crate::search::workers;
     use cbformat::fixture::{Builder, TempDb, quiet};
     use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
@@ -801,6 +815,76 @@ mod tests {
         assert_eq!(names, [format!("{}.idx", entry.id), format!("{}.moves", entry.id)]);
         drop(loaded);
         catalog.explorer.release();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A background build that meets every worker held by a search for longer
+    /// than it waits for one fails for being busy, and the keeper builds it
+    /// again at its next look (#180); a build that failed otherwise waits for
+    /// the database's next change. The one worker runs in a child process,
+    /// which has it however many the computer or `OSCHESS_BRIDGE_THREADS`
+    /// gives this one.
+    #[test]
+    fn the_keeper_tries_again_a_build_that_met_busy_workers() {
+        /// A computer on mains power, whose free disk space is not known.
+        struct Mains;
+        impl Machine for Mains {
+            fn on_battery(&self) -> bool {
+                false
+            }
+            fn free_bytes(&self, _: &Path) -> Option<u64> {
+                None
+            }
+        }
+        let name = "explorer::tests::the_keeper_tries_again_a_build_that_met_busy_workers";
+        if !build::tests::in_child(name, 1, Duration::from_secs(120)) {
+            return;
+        }
+        assert_eq!(workers::threads(), 1);
+        let db = e4s("explorer-busy-workers");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-busy-workers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        let explorer = &catalog.explorer;
+        explorer.set_dir(dir.clone());
+        explorer.set_machine(Arc::new(Mains));
+        explorer.set_keeping(keeper::TICK, Duration::ZERO);
+        explorer.set_limits(Limits { workers_wait: Duration::from_millis(100), ..Limits::default() });
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        explorer.mark_in_use(&entry.id);
+        let state = explorer.state(&entry.id);
+        let settled = || {
+            let until = Instant::now() + Duration::from_secs(30);
+            while matches!(*lock(&state), State::Working(_)) {
+                assert!(Instant::now() < until, "the build is over");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // A search holds the one worker all the while the build waits.
+        let search = workers::one(&Cancel::never()).unwrap();
+        explorer.keep(&catalog.entries());
+        settled();
+        match &*lock(&state) {
+            State::Failed { why, generation, busy: true, .. } => {
+                let want = "the search workers stayed taken by searches; retry";
+                assert_eq!((why.as_str(), *generation), (want, open.generation));
+            }
+            _ => panic!("the build did not fail for busy workers"),
+        }
+        // The search is over by the keeper's next look.
+        drop(search);
+        explorer.keep(&catalog.entries());
+        settled();
+        assert!(matches!(&*lock(&state), State::Ready(l) if l.generation == open.generation), "built again");
+        // A build that failed otherwise, its files gone, is not.
+        let why = "the index folder: denied".to_string();
+        *lock(&state) = State::Failed { at: Instant::now(), why, generation: open.generation, busy: false };
+        let (index, stream) = paths(&dir, &entry.id);
+        std::fs::remove_file(index).unwrap();
+        std::fs::remove_file(stream).unwrap();
+        explorer.keep(&catalog.entries());
+        assert!(matches!(*lock(&state), State::Failed { busy: false, .. }), "tried again");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -383,10 +383,16 @@ fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Re
         SearchError::TooLarge => {
             error(422, "database_too_large", "The database is too large to search or sort within the memory budget")
         }
-        SearchError::Busy => error(503, "busy", "Search memory is taken by other searches; retry"),
+        SearchError::Busy | SearchError::WorkersBusy => {
+            error(503, "busy", "Search memory is taken by other searches; retry")
+        }
         SearchError::Read(e) if changing(entry, generation, &e) => database_changing(),
         SearchError::Read(e) => internal(&entry.id, &e),
         SearchError::IndexDamaged => explorer::rebuilding(app, entry),
+        SearchError::Bug(what) => {
+            crate::log!("internal error on database {}: a bug: {what}", entry.id);
+            error(500, "internal", &format!("a bug: {what}"))
+        }
     }
 }
 

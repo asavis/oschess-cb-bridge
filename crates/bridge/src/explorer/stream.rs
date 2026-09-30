@@ -443,7 +443,7 @@ impl Writer {
         for (at, crc) in &self.blocks {
             let at = at.load(Ordering::Relaxed);
             if at == 0 {
-                return Err(io(&self.path, std::io::Error::other("a block of the move stream was not written")));
+                return Err(SearchError::Bug("a block of the move stream was not written"));
             }
             table.extend(at.to_le_bytes());
             table.extend(crc.load(Ordering::Relaxed).to_le_bytes());

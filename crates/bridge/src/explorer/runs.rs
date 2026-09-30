@@ -4,14 +4,15 @@
 //! give it back rather than taking theirs.
 
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::foreground;
 use crate::machine::{self, Priority};
 use crate::search::SearchError;
-use crate::search::memory::{Hold, Refused};
+use crate::search::memory::{Cancel, Hold, Refused};
+use crate::search::workers::{self, Worker};
 
 use super::file::Bad;
 use super::format::Outcome;
@@ -93,8 +94,10 @@ pub struct Progress {
     /// Where the build's time went.
     pub timings: Mutex<Timings>,
     /// Set to stop the build at its next batch (#149), through
-    /// [`Progress::ask_stop`].
-    pub stop: AtomicBool,
+    /// [`Progress::ask_stop`]. Its threads read it through
+    /// [`Progress::stopped`] alone, and its passes' waits for a worker
+    /// through [`Progress::cancel`] (#180).
+    stop: Arc<AtomicBool>,
     /// The priority its threads run at, as a [`Priority`] code: a request
     /// for the database raises a background build's while it runs.
     pub priority: AtomicU8,
@@ -117,7 +120,7 @@ impl Default for Progress {
             tree_passes: AtomicU64::new(0),
             deep_passes: AtomicU64::new(0),
             timings: Mutex::default(),
-            stop: AtomicBool::new(false),
+            stop: Arc::default(),
             priority: AtomicU8::new(Priority::Normal as u8),
             patience: AtomicU64::new(0),
         }
@@ -146,10 +149,17 @@ impl Progress {
     }
 
     /// Whether the build was asked to stop, which each of its threads asks
-    /// between batches; the thread takes the build's priority as it asks.
+    /// between batches, and while it waits; the thread takes the build's
+    /// priority as it asks.
     pub fn stopped(&self) -> bool {
         machine::follow(Priority::from_code(self.priority.load(Ordering::Relaxed)));
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// What stops its passes waiting for a worker ([`on_workers`]) once the
+    /// build is asked to stop.
+    fn cancel(&self) -> Cancel {
+        Cancel::when(&self.stop)
     }
 
     /// Asks the build to stop at its next batch: a thread giving way to
@@ -187,7 +197,7 @@ impl Progress {
             return;
         }
         foreground::wait(Duration::from_micros(patience), &|| {
-            self.patience.load(Ordering::Relaxed) == 0 || self.stop.load(Ordering::Relaxed)
+            self.patience.load(Ordering::Relaxed) == 0 || self.stopped()
         });
     }
 
@@ -312,6 +322,23 @@ pub fn io(path: &Path, e: std::io::Error) -> SearchError {
 
 /// How long a build waits for memory that searches hold before it gives up.
 pub const MEMORY_WAIT: Duration = Duration::from_secs(60);
+/// How long a pass of a build waits for a worker, while searches hold every
+/// one, before the build gives up (#180): as long as it waits for memory,
+/// where a search waits [`workers::WAIT`].
+pub const WORKERS_WAIT: Duration = MEMORY_WAIT;
+
+/// Runs `task` on up to `want` workers for a pass of the build that reports
+/// on `progress` ([`workers::run`]): the pass waits for its first worker up
+/// to `limits.workers_wait`, then fails `WorkersBusy`, and no longer once the
+/// build is asked to stop, `Superseded`.
+pub fn on_workers<T: Send>(
+    want: usize,
+    progress: &Progress,
+    limits: &Limits,
+    task: impl Fn(&Worker<'_>) -> Result<T, SearchError> + Sync,
+) -> Result<Vec<T>, SearchError> {
+    workers::run_waiting(want, 0, &progress.cancel(), limits.workers_wait, task)
+}
 
 /// Reserves `bytes` without evicting what searches keep, waiting while they
 /// hold the budget: a build yields to searches, and fails `Busy` only after
@@ -366,7 +393,7 @@ pub fn opened<T>(progress: &Progress, open: impl Fn() -> Result<T, Bad>) -> Resu
     let deadline = Instant::now() + MEMORY_WAIT;
     loop {
         match open() {
-            Err(Bad::Busy) if Instant::now() < deadline && !progress.stop.load(Ordering::Relaxed) => {
+            Err(Bad::Busy) if Instant::now() < deadline && !progress.stopped() => {
                 std::thread::sleep(Duration::from_millis(100));
             }
             other => return other,
@@ -398,11 +425,14 @@ pub struct Limits {
     /// the share holds, and of the entries a worker of the stream pass folds;
     /// tests use it to make many passes from few games.
     pub pass_bytes: Option<usize>,
+    /// How long a pass waits for a worker while searches hold every one:
+    /// [`WORKERS_WAIT`]; tests shorten it.
+    pub workers_wait: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { share: crate::search::memory::budget() / 2, pass_bytes: None }
+        Limits { share: crate::search::memory::budget() / 2, pass_bytes: None, workers_wait: WORKERS_WAIT }
     }
 }
 

@@ -15,7 +15,9 @@
 //! A database first seen has had its generation since its files last
 //! changed; a change seen afterwards starts the quiet period afresh.
 //! A build that failed, or had no room on the disk, is not tried again in the
-//! background until the database changes.
+//! background until the database changes; one that failed only because
+//! searches held every worker for as long as it waited for one is tried again
+//! at the keeper's next look (#180).
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -174,15 +176,16 @@ impl Registry {
 
     /// Queues a background build of the index of `entry` at the generation of
     /// `open`, unless its index is of that generation, in memory or on disk,
-    /// its build runs or waits, or its build at that generation failed. With
-    /// too little room on the disk, the build fails without being queued.
+    /// its build runs or waits, or its build at that generation failed for
+    /// another reason than busy workers. With too little room on the disk,
+    /// the build fails without being queued.
     fn renew(&self, entry: &Arc<Entry>, open: &Opened, dir: &Path, machine: &dyn Machine) {
         let state = self.state(&entry.id);
         let mut s = lock(&state);
         match &*s {
             State::Ready(l) if l.generation == open.generation => return,
             State::Working(_) => return,
-            State::Failed { generation, .. } if *generation == open.generation => return,
+            State::Failed { generation, busy: false, .. } if *generation == open.generation => return,
             _ => {}
         }
         let records = open.db.records();
@@ -191,7 +194,7 @@ impl Registry {
         }
         if let Err(why) = room(machine, dir, &entry.id, records) {
             crate::log!("database {} is not indexed in the background: {why}", entry.id);
-            *s = State::Failed { at: Instant::now(), why, generation: open.generation };
+            *s = State::Failed { at: Instant::now(), why, generation: open.generation, busy: false };
             return;
         }
         self.queue(s, &state, Arc::clone(entry), open, dir.to_path_buf(), Kind::Background);

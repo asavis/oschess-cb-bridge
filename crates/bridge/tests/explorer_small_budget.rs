@@ -175,7 +175,7 @@ fn a_share_too_small_is_refused_at_once() {
     let db = pawns("small-budget-refused", 2_000);
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
     let started = Instant::now();
-    let refused = watched(&d, "share", &Limits { share: 1 << 20, pass_bytes: None }).err().unwrap();
+    let refused = watched(&d, "share", &Limits { share: 1 << 20, ..Limits::default() }).err().unwrap();
     assert!(refused.contains("too small") && started.elapsed() < Duration::from_secs(10), "{refused}");
     let dir = std::env::temp_dir().join(format!("bridge-small-budget-share-{}", std::process::id()));
     let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
