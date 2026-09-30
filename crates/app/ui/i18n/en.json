@@ -42,7 +42,7 @@
   "toast.update.failed.body": "Try again later.",
   "toast.update.waiting.title": "A new version of the bridge is available",
   "toast.update.required.title": "The bridge needs updating",
-  "toast.update.waiting.body": "Open the bridge in the Microsoft Store and choose “Update”.",
+  "toast.update.waiting.body": "To update the bridge, choose “Check for updates” in its menu.",
 
   "flyout.working": "running",
   "flyout.notWorking": "not running",
