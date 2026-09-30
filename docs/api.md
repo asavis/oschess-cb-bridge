@@ -177,6 +177,12 @@ snapshot to coordinate with. The bridge therefore promises:
   move check apply to every read. A read after the save has finished is
   correct. The bridge cannot do better without a lock that ChessBase does not
   offer.
+- **The bridge never keeps ChessBase from saving.** ChessBase opens the files
+  of a database it saves so that no other program may hold them, so the bridge
+  holds a database's files open only while it reads them, and closes them a
+  fraction of a second after its last read (#241). A read that meets a file
+  ChessBase holds at that moment fails at once, as a read of an unreadable
+  file does, and a later one succeeds.
 - **A list window is as stored at the moment it was read.** A window read while
   ChessBase edits a game may show one row from before that edit and another
   from after it; the next request shows the new state.

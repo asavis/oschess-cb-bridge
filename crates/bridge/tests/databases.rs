@@ -23,7 +23,10 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
 
 mod common;
-use common::{TOKEN, get, has_members, has_object, members, objects, policy, serve};
+use common::{
+    TOKEN, WAIT_LIMIT, answered, classic_fixture, fixture, get, has_members, has_object, index_dir, members, objects,
+    policy, serve, start_with_dir, until,
+};
 
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 
@@ -1000,4 +1003,53 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
         }
     }
     assert!(text.contains(&format!("{} [ready] Windowed", id_of(&a))), "{text}");
+}
+
+/// A listed database, once listed and read, holds none of its files open
+/// while nothing reads it: ChessBase, which opens a database's files so that
+/// no other handle may exist when it saves a game, can then save (#241).
+#[test]
+fn a_database_holds_no_file_open_while_nothing_reads_it() {
+    let dbs = [
+        fixture("closed-2cbh", &[]),
+        classic_fixture("closed-cbh", &[]),
+        cbformat::fixture::pgn_file("closed-pgn", b"[Event \"E\"]\n\n1. e4 e5 *\n"),
+    ];
+    let paths = [dbs[0].dir().join("db.2cbh"), dbs[1].dir().join("db.cbh"), dbs[2].dir().join("db.pgn")];
+    let dir = index_dir("closed");
+    let (port, _app) = start_with_dir(paths.clone(), &dir);
+    // The list opens every database, the games read each of them.
+    let (_, body) = get(port, "/v1/databases");
+    assert!(body.contains(r#""state":"ready""#), "{body}");
+    for path in &paths {
+        answered(port, &format!("/v1/databases/{}/games", id_of(path)));
+    }
+    let files: Vec<PathBuf> =
+        dbs.iter().flat_map(|db| std::fs::read_dir(db.dir()).unwrap()).map(|entry| entry.unwrap().path()).collect();
+    assert!(files.len() >= 10, "{files:?}");
+    until("no database file is open", WAIT_LIMIT, || files.iter().all(|file| !held(file)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether this process holds `file` open: a link to it among its open
+/// files.
+#[cfg(target_os = "linux")]
+fn held(file: &Path) -> bool {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .any(|target| target == file)
+}
+
+/// Whether some handle keeps `file` from being opened by a writer that
+/// shares it with nobody, as ChessBase opens a database to save a game.
+#[cfg(windows)]
+fn held(file: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(file).is_err()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn held(_: &Path) -> bool {
+    false
 }
