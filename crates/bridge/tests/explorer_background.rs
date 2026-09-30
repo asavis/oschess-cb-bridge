@@ -398,7 +398,11 @@ fn nothing_is_built_in_the_background_for_a_cloud_only_unlisted_or_opening_datab
     assert_eq!(listed, [true, true, false, true]);
     let bridge = Bridge::new(catalog, &root);
     bridge.keep(Duration::ZERO);
-    until("the ready database was not built", WAIT_LIMIT, || built_for(&root, &ids[0]).is_some());
+    // A build renames its index into place before its state leaves
+    // `building()`, so the ready database's build is waited for to end too.
+    until("the ready database was not built", WAIT_LIMIT, || {
+        built_for(&root, &ids[0]).is_some() && bridge.building().iter().all(|(id, ..)| id != &ids[0])
+    });
     computer.looked();
     for (id, what) in ids[1..].iter().zip(["cloud-only", "unlisted", "opening"]) {
         assert!(built_for(&root, id).is_none(), "{what} was built");
@@ -431,7 +435,10 @@ fn the_startup_pick_is_the_largest_ready_database() {
     catalog.explorer.set_machine(computer.clone());
     let bridge = Bridge::new(catalog, &dir);
     bridge.keep(Duration::ZERO);
-    until("the largest ready database was not built", WAIT_LIMIT, || built_for(&dir, &ids[1]).is_some());
+    // Its build leaves `building()` after it renames the index into place.
+    until("the largest ready database was not built", WAIT_LIMIT, || {
+        built_for(&dir, &ids[1]).is_some() && bridge.building().iter().all(|(id, ..)| id != &ids[1])
+    });
     computer.looked();
     assert!(built_for(&dir, &ids[0]).is_none(), "a smaller database was built");
     assert!(built_for(&dir, &ids[2]).is_none(), "a cloud-only database was built");
