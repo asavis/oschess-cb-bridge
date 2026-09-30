@@ -3,9 +3,13 @@ name: stress
 # The tests that fail only on a loaded machine, looked for every night (#235)
 # with scripts/stress.py. On a schedule only: no pull request, issue, comment
 # or fork can start it, as the CI rule in CLAUDE.md requires; a collaborator can
-# start it by hand to check it. It runs only on our own Linux runner, and a
-# scheduled run does nothing unless main has changed since the last stress run
-# that finished, whatever that run found.
+# start it by hand on main to check it. It runs only on our own Linux runner.
+#
+# A night covers a commit of main when both campaigns ran all their runs to a
+# verdict, pass or fail; it then leaves a `stress-covered` artifact. A
+# scheduled run does nothing while main is still at the commit of the newest
+# such artifact. A failure before the campaigns, a time-out, or a campaign cut
+# short covers nothing, and the next night tries the same commit again.
 on:
   schedule:
     # 01:17 UTC, 02:17 or 03:17 in Vienna, while the runner is quiet.
@@ -23,27 +27,30 @@ concurrency:
 jobs:
   stress:
     name: stress (linux)
+    # Main only: coverage is of main's commits.
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, bridge-local]
-    timeout-minutes: 75
+    # The night's whole budget, setup and log upload included.
+    timeout-minutes: 100
     steps:
-      - name: Main changed since the last stress run
+      - name: Main changed since the last covered commit
         id: changed
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
         run: |
-          last=$(curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPOSITORY/actions/workflows/stress.yml/runs?status=completed&per_page=30" \
+          covered=$(curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPOSITORY/actions/artifacts?name=stress-covered&per_page=50" \
             | python3 -c '
           import json, sys
-          runs = json.load(sys.stdin)["workflow_runs"]
-          done = [r for r in runs if r["id"] != int(sys.argv[1]) and r["conclusion"] in ("success", "failure")]
-          print(done[0]["head_sha"] if done else "")
-          ' "$RUN_ID")
-          echo "last stress run at ${last:-none}; main at $GITHUB_SHA"
-          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$last" = "$GITHUB_SHA" ]; then
-            echo "::notice::main has not changed since the last stress run; nothing to do"
+          artifacts = json.load(sys.stdin)["artifacts"]
+          on_main = [a for a in artifacts if not a["expired"] and (a.get("workflow_run") or {}).get("head_branch") == "main"]
+          on_main.sort(key=lambda a: a["created_at"], reverse=True)
+          print(on_main[0]["workflow_run"]["head_sha"] if on_main else "")
+          ')
+          echo "last covered commit ${covered:-none}; main at $GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$covered" = "$GITHUB_SHA" ]; then
+            echo "::notice::main has not changed since the last covered commit; nothing to do"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -57,21 +64,48 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
-      - name: The binaries whose tests load has failed, 40 minutes at most
-        # A quarter of the CPUs, one busy loop at nice 10 on each: about eight
-        # times slower on a quiet machine, and void (exit 2) under five.
+      - name: The binaries whose tests load has failed, 20 runs
+        # The script's default load: a quarter of the CPUs, three nice-19 loops
+        # on each. No run starts after 60 minutes, and 70 stop it; fewer than
+        # 20 runs is incomplete (exit 3).
+        id: binaries
         if: steps.changed.outputs.run == 'true'
         run: |
-          cpus=$(( $(nproc) / 4 )); [ "$cpus" -ge 2 ] || cpus=2
-          python3 scripts/stress.py --runs 50 --jobs 2 --hogs "$cpus" --hog-nice 10 --min-slowdown 5 --time-limit 40 \
+          set +e
+          timeout -s TERM 70m python3 scripts/stress.py --runs 20 --min-runs 20 --jobs 4 --time-limit 60 \
             --bin api --bin databases --bin engine --bin explorer_background --bin explorer_parallel_merge \
             --bin positions --bin profile --out "$RUNNER_TEMP/stress/binaries"
-      - name: The whole suite, 15 minutes at most
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+      - name: The whole suite, 4 runs
+        # At once, 4 jobs; 25 minutes stop it.
+        id: suite
         if: steps.changed.outputs.run == 'true' && !cancelled()
         run: |
-          cpus=$(( $(nproc) / 4 )); [ "$cpus" -ge 2 ] || cpus=2
-          python3 scripts/stress.py --runs 8 --jobs 2 --hogs "$cpus" --hog-nice 10 --fail-fast --time-limit 15 \
+          set +e
+          timeout -s TERM 25m python3 scripts/stress.py --runs 4 --min-runs 4 --jobs 4 --fail-fast \
             --out "$RUNNER_TEMP/stress/suite"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+      - name: Note the covered commit
+        # Both campaigns reached a verdict: 0 passed, 1 found a failure.
+        if: >-
+          !cancelled()
+          && (steps.binaries.outputs.code == '0' || steps.binaries.outputs.code == '1')
+          && (steps.suite.outputs.code == '0' || steps.suite.outputs.code == '1')
+        run: echo "$GITHUB_SHA" > "$RUNNER_TEMP/stress-covered.txt"
+      - name: Keep the covered commit
+        if: >-
+          !cancelled()
+          && (steps.binaries.outputs.code == '0' || steps.binaries.outputs.code == '1')
+          && (steps.suite.outputs.code == '0' || steps.suite.outputs.code == '1')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-covered
+          path: ${{ runner.temp }}/stress-covered.txt
+          retention-days: 90
       - name: Keep the failed runs' output
         if: failure() && steps.changed.outputs.run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -30,7 +30,9 @@ failures count with the others.
 
 Each failed run keeps its output in `--out`, target/stress/<UTC time> by
 default, and the summary counts the failures by test. The exit status is 1
-when a run failed; 2 when none failed but `--min-slowdown` voids the campaign,
+when a run failed; 3 when none failed but fewer than `--min-runs` loaded runs
+ran (a time limit or a stop cut the campaign short); 2 when none failed but
+`--min-slowdown` voids the campaign,
 its loaded runs having taken less than that many times the run without the
 load, which shows the load did not reach the tests.
 """
@@ -376,6 +378,9 @@ def arguments(argv):
         "--time-limit", type=positive, help="start no run once this many minutes have passed since the load began"
     )
     parser.add_argument(
+        "--min-runs", type=int, help="count the campaign incomplete (exit 3) when fewer loaded runs than this ran"
+    )
+    parser.add_argument(
         "--min-slowdown",
         type=positive,
         help="void the campaign (exit 2) when its loaded runs took less than this many times run 0",
@@ -385,6 +390,8 @@ def arguments(argv):
     args = parser.parse_args(argv)
     if args.runs < 1 or args.jobs < 1:
         parser.error("--runs and --jobs take a number above 0")
+    if args.min_runs is not None and not 1 <= args.min_runs <= args.runs:
+        parser.error("--min-runs takes a number from 1 to --runs")
     return args
 
 
@@ -419,6 +426,10 @@ def main(argv=None):
         return 130
     if not all(o.ok for outcomes in results.values() for o in outcomes):
         return 1
+    loaded = sum(1 for run in results if run != 0)
+    if args.min_runs is not None and loaded < args.min_runs:
+        print(f"incomplete: {loaded} loaded runs ran, below --min-runs {args.min_runs}")
+        return 3
     factor = slowdown(results)
     if args.min_slowdown is not None and (factor is None or factor < args.min_slowdown):
         shown = "unknown" if factor is None else f"{factor:.1f} times"

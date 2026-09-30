@@ -177,6 +177,10 @@ class Arguments(unittest.TestCase):
         self.assertEqual(stress.arguments(["--time-limit", "40"]).time_limit, 40.0)
         self.assertIsNone(stress.arguments([]).min_slowdown)
         self.assertIsNone(stress.arguments([]).time_limit)
+        self.assertEqual(stress.arguments(["--runs", "50", "--min-runs", "20"]).min_runs, 20)
+        for bad in (["--min-runs", "0"], ["--runs", "5", "--min-runs", "6"]):
+            with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
+                stress.arguments(bad)
         for option in ("--min-slowdown", "--time-limit"):
             for bad in ("nan", "inf", "-inf", "0", "-2", "five"):
                 with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
@@ -422,6 +426,13 @@ class MinSlowdown(FakeRun):
 class TimeLimit(FakeRun):
     """`--time-limit` starts no run once its minutes have passed since the
     load began; the runs under way finish, and the campaign passes (#235)."""
+
+    def test_a_campaign_cut_below_its_minimum_is_incomplete(self):
+        args = ("--runs", "50", "--hogs", "0", "--time-limit", "0.03", "--min-runs", "40")
+        driver = self.start("run", *args, env_mode="slow")
+        self.assertEqual(driver.wait(timeout=120), 3)
+        with open(os.path.join(self.tmp, "driver.log")) as f:
+            self.assertIn("incomplete: ", f.read())
 
     def test_no_run_starts_after_the_limit(self):
         driver = self.start("run", "--runs", "50", "--hogs", "0", "--time-limit", "0.03", env_mode="slow")
