@@ -23,7 +23,7 @@ env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL \
   GIT_COMMITTER_EMAIL=287075638+oschess-codex-bot@users.noreply.github.com \
   CODEX_HOME=/home/asavi/.codex-oschess-bot \
   codex exec --dangerously-bypass-approvals-and-sandbox \
-    -c model=gpt-6-astra -c model_reasoning_effort=xhigh \
+    -c model=gpt-6.1-sol -c model_reasoning_effort=medium \
     -C <worktree> - < prompt.txt
 ```
 
@@ -41,7 +41,7 @@ The implementing session fills in the angle-bracketed values and adds nothing
 else: no crux, no focus, no summary of the change.
 
 ```
-You are <Codex gpt-6-astra | Claude sonnet>, performing the independent
+You are <Codex gpt-6.1-sol | Claude sonnet>, performing the independent
 cross-model review required by CLAUDE.md in the oschess-cb-bridge repository.
 The change under review was implemented by <the other backend>, so you are the
 required independent reviewer. This is REVIEW WORK ONLY.

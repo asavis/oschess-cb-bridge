@@ -29,7 +29,7 @@ The review gate follows the scheme of the `kidschessleague` project.
 
   | Author | Reviewer |
   |---|---|
-  | Claude | Codex `gpt-6-astra`, effort `xhigh` |
+  | Claude | Codex `gpt-6.1-sol`, effort `medium` |
   | Codex | Claude `sonnet`, effort `high` |
 
 - The implementing session is the delivery owner. It starts the review itself,
