@@ -20,7 +20,10 @@
 //! open, as every file did before #241, and is never opened again at its
 //! path. An inode is one such id, since it passes to another file once the
 //! last handle of the old one closes, and a FAT directory slot is another.
-//! ChessBase runs on Windows only.
+//! ChessBase runs on Windows only. A file of the reader's own, as an index it
+//! built, is kept open the same way ([`DbFile::open_kept`]): nobody else
+//! writes it, and its builder deletes and replaces it on a schedule of its
+//! own, which a database opened on it does not follow.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -104,6 +107,13 @@ struct Handles {
 impl DbFile {
     pub fn open(path: PathBuf) -> Result<DbFile> {
         DbFile::open_with(path, lasting_identity, IDLE)
+    }
+
+    /// [`DbFile::open`] for a file of the reader's own, as an index it built:
+    /// the file keeps a handle for as long as it is open and is never opened
+    /// again at its path, as every file was before #241.
+    pub fn open_kept(path: PathBuf) -> Result<DbFile> {
+        DbFile::open_with(path, no_identity, IDLE)
     }
 
     /// [`DbFile::open`], reading the file's identity with `identify`, and
@@ -389,6 +399,11 @@ fn names_a_file(id: &[u8; 16]) -> bool {
     !(unset(&id[..8]) && unset(&id[8..]))
 }
 
+/// No identity, for a file that keeps its handle whatever its file system.
+fn no_identity(_: &File) -> std::io::Result<Option<Identity>> {
+    Ok(None)
+}
+
 /// `None`: an inode passes to another file once the last handle of the old
 /// one closes, so a file here keeps a handle for as long as it is open.
 #[cfg(not(windows))]
@@ -624,6 +639,24 @@ mod tests {
         assert_eq!(&buf, b"first");
         assert_eq!(f.size().unwrap(), 5);
         assert_eq!(f.spare_handles(), 0, "readers share the kept handle");
+        drop(f);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file of the reader's own keeps its handle and its bytes, whatever
+    /// happens at its path meanwhile, as when its builder deletes it.
+    #[test]
+    fn a_kept_file_reads_its_own_bytes_after_its_path_is_deleted() {
+        let path = temp("own", b"first");
+        let f = DbFile::open_kept(path.clone()).unwrap();
+        assert!(matches!(f.inner.source, Source::Kept(_)));
+        std::fs::remove_file(&path).unwrap();
+        let mut buf = [0u8; 5];
+        f.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"first");
+        std::fs::write(&path, b"other").unwrap();
+        f.read_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"first");
         drop(f);
         std::fs::remove_file(&path).unwrap();
     }

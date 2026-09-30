@@ -1059,6 +1059,51 @@ fn a_file_replaced_by_a_copy_is_read_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A PGN file that leaves the list, has its header index swept, and comes
+/// back is read again. The index is the bridge's own, and the database opened
+/// on it keeps it open: were it opened again at its path, the database the
+/// catalog keeps for the unchanged file would find it gone and answer
+/// `503 database_changing` for good (#241).
+#[test]
+fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
+    use common::{answered, index_dir, serve_shared};
+    let root = Root::new("pgn-back");
+    std::fs::create_dir_all(root.path("bases")).unwrap();
+    let pgn = root.path("bases/Games.pgn");
+    std::fs::write(&pgn, "[Event \"E\"]\n[White \"W\"]\n[Black \"B\"]\n\n1. e4 e5 *\n").unwrap();
+    let listed = format!("databases = ['{}']\n", pgn.display());
+    std::fs::write(root.path("bridge.toml"), &listed).unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    let dir = index_dir("pgn-back");
+    catalog.use_data_dir(&dir);
+    let (port, app) = serve_shared(App::new("test", policy(), catalog));
+    let id = id_of(&pgn);
+    let games = format!("/v1/databases/{id}/games");
+    let first = answered(port, &games);
+    let index = bridge::folders::pgn_dir(&dir).join(format!("{id}.head"));
+    assert!(index.exists());
+    // On Windows, the PGN file is let go once idle, and so would the index
+    // be, were it closed between reads, by now or a little later.
+    #[cfg(windows)]
+    {
+        common::until("the PGN file is let go", common::WAIT_LIMIT, || opens_alone(&pgn));
+        std::thread::sleep(cbformat::file::IDLE * 3);
+    }
+
+    // Off the list, its index swept at once.
+    std::fs::write(root.path("bridge.toml"), "databases = []\n").unwrap();
+    assert!(app.catalog.entries().iter().all(|e| !e.listed()), "the file left the list");
+    app.catalog.set_sweep_grace(Duration::ZERO);
+    app.catalog.sweep_indexes();
+    assert!(!index.exists(), "the index was swept");
+
+    // Back on the list, unchanged: read as before.
+    std::fs::write(root.path("bridge.toml"), &listed).unwrap();
+    assert!(app.catalog.entries().iter().any(|e| e.id == id && e.listed()), "the file is back");
+    assert_eq!(answered(port, &games), first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Whether `file` opens for a writer that shares it with nobody, as ChessBase
 /// opens a database to save a game: whether no handle holds it.
 #[cfg(windows)]
