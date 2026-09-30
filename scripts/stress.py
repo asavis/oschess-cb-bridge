@@ -34,6 +34,7 @@ load, which shows the load did not reach the tests.
 
 import argparse
 import json
+import math
 import os
 import signal
 import statistics
@@ -335,6 +336,15 @@ def write_log(out, name, outcomes):
     return path
 
 
+def slowdown_limit(text):
+    """`--min-slowdown`'s value: a finite number above 0. A NaN would compare
+    false against every slowdown and let every campaign pass."""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number above 0")
+    return value
+
+
 def interrupted(*_):
     """Ends the script on Ctrl-C or a plain kill, so that nothing it started
     outlives it; see `Live` for a signal that comes as a process starts."""
@@ -360,7 +370,7 @@ def arguments(argv):
     parser.add_argument("--fail-fast", action="store_true", help="start no run after one failed")
     parser.add_argument(
         "--min-slowdown",
-        type=float,
+        type=slowdown_limit,
         help="void the campaign (exit 2) when its loaded runs took less than this many times run 0",
     )
     parser.add_argument("--out", type=Path, help="where failed runs' output goes (default target/stress/<UTC time>)")

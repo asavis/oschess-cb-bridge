@@ -106,9 +106,7 @@ its pull request reports:
    `python3 scripts/stress.py --bin <binary> --runs 200 --jobs 4
    --min-slowdown 5`, and all 200 runs pass. A campaign whose loaded runs took
    less than five times the run without the load is void (exit status 2) and
-   runs again under a harder load (`--hogs`, `--hog-nice 0`). Tests that even
-   that cannot slow fivefold wait rather than compute; the pull request says so
-   and rests on step 1.
+   runs again under a harder load (`--hogs`, `--hog-nice 0`).
 3. The whole suite, as a smoke test:
    `python3 scripts/stress.py --runs 16 --jobs 8 --fail-fast`.
 

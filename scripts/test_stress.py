@@ -1,6 +1,8 @@
 """The stress runner's parsing and report (#217): python3 -m unittest discover -s scripts"""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -164,6 +166,18 @@ class Slowdown(unittest.TestCase):
         api = stress.Binary("api", "api", "/t/api", "/repo")
         self.assertIsNone(stress.slowdown({1: [stress.Outcome(api, 6.0)]}))
         self.assertIsNone(stress.slowdown({0: [stress.Outcome(api, 2.0)]}))
+
+
+class Arguments(unittest.TestCase):
+    """The command line: `--min-slowdown` takes a finite number above 0 (a NaN
+    would let every campaign pass)."""
+
+    def test_takes_a_finite_slowdown_above_0(self):
+        self.assertEqual(stress.arguments(["--min-slowdown", "5"]).min_slowdown, 5.0)
+        self.assertIsNone(stress.arguments([]).min_slowdown)
+        for bad in ("nan", "inf", "-inf", "0", "-2", "five"):
+            with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
+                stress.arguments(["--min-slowdown", bad])
 
 
 class Summary(unittest.TestCase):
