@@ -265,6 +265,8 @@ if mode == "submit":
 
 
 def build():
+    if mode == "buildfail":
+        sys.exit("cargo test --no-run failed")
     if mode == "build":
         sleep = stress.Live.start(["sleep", "300"])
         with open(os.path.join(tmp, "pids"), "a") as f:
@@ -280,13 +282,20 @@ sys.exit(stress.main(["--out", os.path.join(tmp, "out"), *sys.argv[4:]]))
 # The fake test binary: it notes its process id and a child's, whose output
 # goes elsewhere. The first run (run 0) ends at once when `$1` is `quick`;
 # the others sleep until killed, or exit at once with 101 when it is `exit`;
-# every run passes at once when it is `fast`, and after a second when `slow`.
+# every run passes at once when it is `fast`, and after a second when `slow`;
+# with `failafter` (`slowfail`) run 0 passes and the others fail at once (after
+# a second). The build fails when the driver's mode is `buildfail`.
 FAKE_TEST = """#!/bin/sh
 sleep 300 >/dev/null 2>&1 &
 echo "$$ $!" >> pids
 if [ "$MODE" = exit ]; then exit 101; fi
 if [ "$MODE" = fast ]; then exit 0; fi
 if [ "$MODE" = slow ]; then sleep 1; exit 0; fi
+if [ "$MODE" = failafter ] || [ "$MODE" = slowfail ]; then
+  if [ ! -e first ]; then touch first; exit 0; fi
+  if [ "$MODE" = slowfail ]; then sleep 1; fi
+  exit 101
+fi
 if [ "$MODE" = quick ] && [ ! -e first ]; then touch first; exit 0; fi
 exec sleep 300
 """
@@ -442,6 +451,36 @@ class TimeLimit(FakeRun):
         self.assertIn("time limit: no run starts after 0.03 min", log)
         runs = int(log.split(" runs under load")[0].rsplit("\n", 1)[-1])
         self.assertTrue(1 <= runs < 50, runs)
+
+
+class DoneFile(FakeRun):
+    """`--done-file` is written only when the campaign ran all its required
+    runs, passed or failed, never after a failed build, a baseline that stops
+    it, or a cut (#235)."""
+
+    def campaign(self, mode, *args, env_mode):
+        done = os.path.join(self.tmp, "done")
+        driver = self.start(mode, *args, "--hogs", "0", "--done-file", done, env_mode=env_mode)
+        return driver.wait(timeout=120), os.path.exists(done)
+
+    def test_a_complete_passed_campaign_writes_it(self):
+        self.assertEqual(self.campaign("run", "--runs", "3", env_mode="fast"), (0, True))
+
+    def test_a_complete_failed_campaign_writes_it(self):
+        self.assertEqual(self.campaign("run", "--runs", "3", env_mode="failafter"), (1, True))
+        with open(os.path.join(self.tmp, "done")) as f:
+            self.assertEqual(f.read(), "3 loaded runs, 3 failed\n")
+
+    def test_a_failed_campaign_cut_short_writes_nothing(self):
+        args = ("--runs", "20", "--min-runs", "20", "--time-limit", "0.003")
+        self.assertEqual(self.campaign("run", *args, env_mode="slowfail"), (1, False))
+
+    def test_a_baseline_that_stops_the_campaign_writes_nothing(self):
+        args = ("--runs", "4", "--min-runs", "4", "--jobs", "4", "--fail-fast")
+        self.assertEqual(self.campaign("run", *args, env_mode="exit"), (1, False))
+
+    def test_a_failed_build_writes_nothing(self):
+        self.assertEqual(self.campaign("buildfail", "--runs", "3", env_mode="fast"), (1, False))
 
 
 if __name__ == "__main__":

@@ -29,7 +29,10 @@ the loaded runs with it; on a busy machine that run can fail too, and its
 failures count with the others.
 
 Each failed run keeps its output in `--out`, target/stress/<UTC time> by
-default, and the summary counts the failures by test. The exit status is 1
+default, and the summary counts the failures by test. `--done-file` is written
+only when the campaign ran all its required runs (`--min-runs`, else `--runs`),
+passed or failed: a failed build, a stop, or a campaign cut short writes
+nothing, whatever the exit status. The exit status is 1
 when a run failed; 3 when none failed but fewer than `--min-runs` loaded runs
 ran (a time limit or a stop cut the campaign short); 2 when none failed but
 `--min-slowdown` voids the campaign,
@@ -381,6 +384,11 @@ def arguments(argv):
         "--min-runs", type=int, help="count the campaign incomplete (exit 3) when fewer loaded runs than this ran"
     )
     parser.add_argument(
+        "--done-file",
+        type=Path,
+        help="write this file only when the campaign ran all its required runs, whether they passed or failed",
+    )
+    parser.add_argument(
         "--min-slowdown",
         type=positive,
         help="void the campaign (exit 2) when its loaded runs took less than this many times run 0",
@@ -422,11 +430,15 @@ def main(argv=None):
         print("stopped")
     print(summary(dict(sorted(results.items())), loads))
     print(f"output of failed runs: {out}")
+    loaded = sum(1 for run in results if run != 0)
+    required = args.runs if args.min_runs is None else args.min_runs
+    if args.done_file is not None and not stopped and loaded >= required:
+        failed = sum(1 for run, outcomes in results.items() if run != 0 and not all(o.ok for o in outcomes))
+        args.done_file.write_text(f"{loaded} loaded runs, {failed} failed\n", encoding="utf-8")
     if stopped:
         return 130
     if not all(o.ok for outcomes in results.values() for o in outcomes):
         return 1
-    loaded = sum(1 for run in results if run != 0)
     if args.min_runs is not None and loaded < args.min_runs:
         print(f"incomplete: {loaded} loaded runs ran, below --min-runs {args.min_runs}")
         return 3
