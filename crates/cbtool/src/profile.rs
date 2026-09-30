@@ -621,6 +621,15 @@ fn writing(dir: &Path) -> bool {
     entries.flatten().any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".partial")))
 }
 
+/// Whether names files may still come beside the heads file `heads` in the
+/// index folder `dir`. A bridge writes a name table's file only when it read
+/// the table beside a heads file it had (#108), and it builds a heads file
+/// only for a database of [`heads::MIN_RECORDS`] records or more: with no
+/// heads file, and none being written, none will come.
+fn names_may_come(dir: &Path, heads: &Path) -> bool {
+    heads.exists() || writing(dir)
+}
+
 pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let o = options(args)?;
     if !fresh(&o.index) {
@@ -1042,12 +1051,17 @@ impl Profile {
     /// The names files (#108): the second bridge, `again`, wrote its name
     /// tables beside the heads file. The bridges that replace it read them
     /// from there for their first sort by white, suggestion and player
-    /// search. The last of them.
+    /// search. The last of them. The names files are waited for a minute at
+    /// most, and only while they may still come ([`names_may_come`]).
     fn with_names(&mut self, again: Served, searches: &[(&str, String)]) -> AnyResult<Served> {
-        let heads = heads::path(&self.index_folder(), &self.id);
+        let folder = self.index_folder();
+        let heads = heads::path(&folder, &self.id);
         let names: Vec<PathBuf> = ["players", "tournaments"].iter().map(|k| heads.with_extension(k)).collect();
         let waited = Instant::now();
-        while !names.iter().all(|p| p.exists()) && waited.elapsed() < Duration::from_secs(60) {
+        while !names.iter().all(|p| p.exists())
+            && names_may_come(&folder, &heads)
+            && waited.elapsed() < Duration::from_secs(60)
+        {
             std::thread::sleep(Duration::from_millis(100));
         }
         let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
@@ -1422,6 +1436,27 @@ mod tests {
         assert!(!writing(&dir));
         std::fs::write(dir.join("0123456789abcdef.annotators.partial"), b"x").unwrap();
         assert!(writing(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The names files are waited for only while a heads file stands or a
+    /// file is being written, which may be the heads file (#239): a database
+    /// too small for one gets neither, and the wait ends at once.
+    #[test]
+    fn names_files_may_come_only_beside_a_heads_file() {
+        let dir = std::env::temp_dir().join(format!("cbtool-profile-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let heads = heads::path(&dir, "0123456789abcdef");
+        assert!(!names_may_come(&dir, &heads));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0123456789abcdef.idx"), b"x").unwrap();
+        assert!(!names_may_come(&dir, &heads));
+        let partial = dir.join("0123456789abcdef.heads.partial");
+        std::fs::write(&partial, b"x").unwrap();
+        assert!(names_may_come(&dir, &heads));
+        std::fs::remove_file(&partial).unwrap();
+        std::fs::write(&heads, b"x").unwrap();
+        assert!(names_may_come(&dir, &heads));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
