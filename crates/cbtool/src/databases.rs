@@ -26,10 +26,14 @@ pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
     for (i, e) in list.window_order().into_iter().enumerate() {
         let path = dbitems::local_path(dir, &e.path);
         // Every file the database would be opened through is checked from its
-        // metadata first; a database is opened only when all of them are here.
-        // A file of another format is checked alone.
-        let files = e.format.map_or_else(|| vec![(path.clone(), true)], |format| format.files(&path));
-        let files: Vec<(State, bool)> = files.iter().map(|(file, required)| (state_of(file), *required)).collect();
+        // metadata first, the main file first; a database is opened only when
+        // its main file is here, and every file of it that is here is a
+        // regular file kept on this computer. A file of another format is
+        // checked alone.
+        let files: Vec<State> = match e.format {
+            Some(format) => format.files(&path).iter().map(|(file, _)| state_of(file)).collect(),
+            None => vec![state_of(&path)],
+        };
         let state = combine(&files);
         let records = match (e.format, state) {
             // A PGN file is opened through an index built from it, never here.
@@ -91,12 +95,20 @@ impl State {
     }
 }
 
-/// A database's state from the states of its files: missing when a required
-/// file is missing, unreadable when any file that is there is not a regular
-/// file, otherwise cloud-only when any file that is there is.
-fn combine(files: &[(State, bool)]) -> State {
-    let present = || files.iter().filter(|(s, _)| *s != State::Missing).map(|(s, _)| *s);
-    if files.iter().any(|&(s, required)| required && s == State::Missing) {
+/// A database's state from the states of its files, the main file first, as
+/// the bridge decides it (`bridge::catalog`, `generation_of` and
+/// `Entry::open_files`): missing when the main file is, unreadable when any
+/// file that is there is not a regular file, otherwise cloud-only when any
+/// file that is there is. A missing companion, even a required one, leaves
+/// the database present: opening it then fails, and the records column says
+/// `unreadable`, as the bridge reports the database.
+///
+/// The one difference is [`State::MaybeCloudOnly`]: the bridge takes every
+/// file as local where Windows attributes do not say otherwise, while here a
+/// placeholder seen through WSL is guessed from its blocks.
+fn combine(files: &[State]) -> State {
+    let present = || files.iter().copied().filter(|&s| s != State::Missing);
+    if files.first().is_none_or(|&s| s == State::Missing) {
         State::Missing
     } else if present().any(|s| s == State::NotAFile) {
         State::NotAFile
@@ -149,22 +161,29 @@ mod tests {
     #[test]
     fn a_database_is_as_available_as_its_least_available_file() {
         use State::{CloudOnly as C, MaybeCloudOnly as M, Missing as X, Present as P};
-        let db = |h, g, l, a| combine(&[(h, true), (g, true), (l, true), (a, false)]);
+        let db = |h, g, l, a| combine(&[h, g, l, a]);
         assert_eq!(db(P, P, P, P), P);
         assert_eq!(db(P, P, P, X), P); // no annotation file: fine
-        assert_eq!(db(P, X, P, P), X);
+        // Without its main file there is no database, whatever else is here.
+        assert_eq!(db(X, P, P, P), X);
+        assert_eq!(db(X, C, P, P), X);
+        assert_eq!(db(X, X, X, X), X);
+        assert_eq!(combine(&[]), X);
+        // A missing companion leaves the database to be opened, and fail.
+        assert_eq!(db(P, X, P, P), P);
         // A resident header with an offline companion is not opened (Windows attributes).
         assert_eq!(db(P, P, C, P), C);
         assert_eq!(db(P, P, P, C), C);
         // The same through the zero-block heuristic elsewhere.
         assert_eq!(db(P, M, P, P), M);
         assert_eq!(db(M, P, C, P), C);
-        assert_eq!(db(C, X, P, P), X);
+        assert_eq!(db(C, X, P, P), C);
         // Anything but a regular file makes the database unreadable, even offline.
         use State::NotAFile as N;
         assert_eq!(db(P, N, P, P), N);
         assert_eq!(db(P, P, C, N), N);
-        assert_eq!(db(N, X, P, P), X);
+        assert_eq!(db(N, X, P, P), N);
+        assert_eq!(db(X, N, P, P), X);
     }
 
     #[test]

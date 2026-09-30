@@ -1,15 +1,15 @@
 //! What `info` and `verify` do differently for classic (`.cbh`) databases:
 //! their entity tables, and counting the moves from the positions before them.
-//! The run and the report are the 2CBH ones, through `view` (#66).
+//! The run, the record's reading and the report are the 2CBH ones
+//! ([`crate::verify`], through `view`, #66).
 
-use std::sync::Mutex;
-
-use cbformat::cbh::{self, Batch, Database};
-use cbformat::game::{RecordKind, Start};
-use cbformat::replay::TreeVisitor;
+use cbformat::cbh::{self, Batch, Database, Record};
+use cbformat::game::GameAnnotations;
+use cbformat::replay::{TreeStats, TreeVisitor};
 use chesscore::{Board, Move, Piece};
 
-use super::{LIMITS, Stats};
+use crate::LIMITS;
+use crate::verify::{Records, Stats};
 
 /// The lines of `info` after the record count.
 pub(crate) fn info(db: &Database) {
@@ -46,64 +46,23 @@ impl TreeVisitor for Counter<'_> {
     }
 }
 
-pub(crate) fn verify_record(batch: &Batch<'_>, id: u32, s: &mut Stats, failures: &Mutex<Vec<(u32, String)>>) {
-    let fail = |s: &mut Stats, msg: String| {
-        s.failures += 1;
-        let mut f = failures.lock().unwrap_or_else(|e| e.into_inner());
-        if f.len() < 50 {
-            f.push((id, msg));
-        }
-    };
-    let r = match batch.record(id) {
-        Ok(r) => r,
-        Err(e) => return fail(s, e.to_string()),
-    };
-    if r.is_deleted() {
-        s.deleted += 1;
+/// A classic database counts its moves from the position before each: its
+/// move records store no captured piece. It has no analyses ([`Record::kind`]).
+impl Records for Batch<'_> {
+    type Record = Record;
+
+    fn record(&self, id: u32) -> cbformat::Result<Record> {
+        Batch::record(self, id)
     }
-    match r.kind() {
-        RecordKind::Game => s.games += 1,
-        RecordKind::Text => {
-            s.texts += 1;
-            return;
-        }
-        RecordKind::Analysis | RecordKind::Unknown(_) => {
-            s.unknown_kind += 1;
-            return;
-        }
+
+    fn moves(&self, r: &Record, s: &mut Stats) -> cbformat::Result<TreeStats> {
+        let data = self.moves_of_within(r, LIMITS.game_bytes)?;
+        let game = data.moves()?;
+        s.count_start(game.is_chess960(), game.start());
+        cbh::walk(&game, &mut Counter(s))
     }
-    let data = match batch.moves_of_within(&r, LIMITS.game_bytes) {
-        Ok(d) => d,
-        Err(e) => return fail(s, e.to_string()),
-    };
-    let game = match data.moves() {
-        Ok(g) => g,
-        Err(e) => return fail(s, e.to_string()),
-    };
-    if game.is_chess960() {
-        s.chess960 += 1;
-    }
-    if matches!(game.start(), Ok(Start::Setup(_))) {
-        s.setups += 1;
-    }
-    let plies = match cbh::walk(&game, &mut Counter(s)) {
-        Ok(t) => {
-            s.main_plies += u64::from(t.main_line_plies);
-            s.total_plies += u64::from(t.total_plies);
-            t.total_plies
-        }
-        Err(e) => return fail(s, e.to_string()),
-    };
-    // Every annotation type has its size, so a classic record is never left
-    // incomplete: it decodes, or it is damaged.
-    match batch.annotations_of_within(&r, LIMITS.game_bytes) {
-        Ok(Some(a)) if !a.is_empty() => {
-            s.annotated += 1;
-            if let Err(e) = a.check_positions(plies).map(|n| s.count_past_end(n)) {
-                fail(s, format!("annotations: {e}"));
-            }
-        }
-        Ok(_) => {}
-        Err(e) => fail(s, format!("annotations: {e}")),
+
+    fn annotations(&self, r: &Record) -> cbformat::Result<Option<GameAnnotations>> {
+        self.annotations_of_within(r, LIMITS.game_bytes)
     }
 }
