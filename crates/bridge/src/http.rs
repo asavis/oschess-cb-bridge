@@ -488,10 +488,13 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let conn = Conn::new(listener.accept().unwrap().0);
+        // The bounds a loaded machine can stall a thread for and still pass:
+        // the tests' patience, and twice it for a wait told from it (#238).
+        let patience = crate::search::workers::tests::PATIENCE;
         let started = Instant::now();
         conn.close(Duration::from_millis(100));
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(100) && waited < Duration::from_secs(30), "{waited:?}");
+        assert!(waited >= Duration::from_millis(100) && waited < patience, "{waited:?}");
         drop(silent);
         let sender = std::thread::spawn(move || {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -499,8 +502,8 @@ mod tests {
         });
         let conn = Conn::new(listener.accept().unwrap().0);
         let started = Instant::now();
-        conn.close(Duration::from_secs(60));
-        assert!(started.elapsed() < Duration::from_secs(60), "the close waited for the linger");
+        conn.close(patience * 2);
+        assert!(started.elapsed() < patience, "the close waited for the linger");
         sender.join().unwrap();
     }
 

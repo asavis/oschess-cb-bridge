@@ -450,7 +450,9 @@ mod tests {
     #[test]
     fn a_build_with_patience_gives_way_to_foreground_work() {
         let _serial = lock(&foreground::tests::SERIAL);
-        let soon = Duration::from_secs(30);
+        // Far shorter than the hour's patience it is told from, and longer
+        // than a loaded machine stalls a thread (#238).
+        let soon = crate::search::workers::tests::PATIENCE;
         let progress = Arc::new(Progress::default());
         let giving = |progress: &Arc<Progress>| {
             let progress = Arc::clone(progress);

@@ -977,8 +977,9 @@ fn a_dropped_bridge_leaves_nothing_writing_into_its_folder() {
 const PAUSE: Duration = Duration::from_millis(250);
 
 /// How long a settle given 25 ms may take to give up: far longer than that
-/// takes, far shorter than a wait for work the test holds until it looks.
-const SETTLE_BOUND: Duration = Duration::from_secs(5);
+/// takes, however slow the machine (#238), and shorter than the probe holds
+/// the work the test holds until it looks, [`WAIT_LIMIT`].
+const SETTLE_BOUND: Duration = Duration::from_secs(WAIT_LIMIT.as_secs() / 2);
 
 /// A cloud provider for the settle tests (#236). It keeps the database's main
 /// file in the cloud while `cloud_only` is set; it holds the first look at
