@@ -172,12 +172,15 @@ class Arguments(unittest.TestCase):
     """The command line: `--min-slowdown` takes a finite number above 0 (a NaN
     would let every campaign pass)."""
 
-    def test_takes_a_finite_slowdown_above_0(self):
+    def test_takes_a_finite_slowdown_and_time_limit_above_0(self):
         self.assertEqual(stress.arguments(["--min-slowdown", "5"]).min_slowdown, 5.0)
+        self.assertEqual(stress.arguments(["--time-limit", "40"]).time_limit, 40.0)
         self.assertIsNone(stress.arguments([]).min_slowdown)
-        for bad in ("nan", "inf", "-inf", "0", "-2", "five"):
-            with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
-                stress.arguments(["--min-slowdown", bad])
+        self.assertIsNone(stress.arguments([]).time_limit)
+        for option in ("--min-slowdown", "--time-limit"):
+            for bad in ("nan", "inf", "-inf", "0", "-2", "five"):
+                with self.assertRaises(SystemExit, msg=bad), contextlib.redirect_stderr(io.StringIO()):
+                    stress.arguments([option, bad])
 
 
 class Summary(unittest.TestCase):
@@ -273,12 +276,13 @@ sys.exit(stress.main(["--out", os.path.join(tmp, "out"), *sys.argv[4:]]))
 # The fake test binary: it notes its process id and a child's, whose output
 # goes elsewhere. The first run (run 0) ends at once when `$1` is `quick`;
 # the others sleep until killed, or exit at once with 101 when it is `exit`;
-# every run passes at once when it is `fast`.
+# every run passes at once when it is `fast`, and after a second when `slow`.
 FAKE_TEST = """#!/bin/sh
 sleep 300 >/dev/null 2>&1 &
 echo "$$ $!" >> pids
 if [ "$MODE" = exit ]; then exit 101; fi
 if [ "$MODE" = fast ]; then exit 0; fi
+if [ "$MODE" = slow ]; then sleep 1; exit 0; fi
 if [ "$MODE" = quick ] && [ ! -e first ]; then touch first; exit 0; fi
 exec sleep 300
 """
@@ -413,6 +417,20 @@ class MinSlowdown(FakeRun):
     def test_a_campaign_at_the_slowdown_passes(self):
         driver = self.start("run", "--runs", "2", "--hogs", "0", "--min-slowdown", "0.01", env_mode="fast")
         self.assertEqual(driver.wait(timeout=60), 0)
+
+
+class TimeLimit(FakeRun):
+    """`--time-limit` starts no run once its minutes have passed since the
+    load began; the runs under way finish, and the campaign passes (#235)."""
+
+    def test_no_run_starts_after_the_limit(self):
+        driver = self.start("run", "--runs", "50", "--hogs", "0", "--time-limit", "0.03", env_mode="slow")
+        self.assertEqual(driver.wait(timeout=120), 0)
+        with open(os.path.join(self.tmp, "driver.log")) as f:
+            log = f.read()
+        self.assertIn("time limit: no run starts after 0.03 min", log)
+        runs = int(log.split(" runs under load")[0].rsplit("\n", 1)[-1])
+        self.assertTrue(1 <= runs < 50, runs)
 
 
 if __name__ == "__main__":

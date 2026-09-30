@@ -5,13 +5,16 @@ only.
 
     python3 scripts/stress.py --runs 300 --bin api --bin explorer_background
     python3 scripts/stress.py --runs 50 --jobs 5 --fail-fast
+    python3 scripts/stress.py --runs 50 --bin api --time-limit 40
 
 The tests are built once, as `cargo test` builds them, and their binaries run
 directly, each in its package's folder as `cargo test` runs it; doctests are
 left out. A run is every chosen binary once, in turn. `--jobs` makes that
 many runs at a time: every test process names its fixtures after its own
-process id, so runs at the same time never share one. Arguments after `--`
-go to every binary, such as a test name filter.
+process id, so runs at the same time never share one. `--time-limit` starts
+no run once that many minutes have passed since the loaded runs began, so a
+nightly job ends in time; the runs under way finish. Arguments after `--` go
+to every binary, such as a test name filter.
 
 The load is the script's own. The tests run at nice 19 on `--cpus`, beside
 `--hogs` busy loops at nice `--hog-nice` on the same CPUs, so a thread of a
@@ -336,9 +339,10 @@ def write_log(out, name, outcomes):
     return path
 
 
-def slowdown_limit(text):
-    """`--min-slowdown`'s value: a finite number above 0. A NaN would compare
-    false against every slowdown and let every campaign pass."""
+def positive(text):
+    """A finite number above 0, as `--min-slowdown` and `--time-limit` take.
+    A NaN would compare false against every slowdown or time and never
+    apply."""
     value = float(text)
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError(f"{text!r} is not a finite number above 0")
@@ -369,8 +373,11 @@ def arguments(argv):
     parser.add_argument("--timeout", type=int, default=1800, help="seconds a binary may run (default 1800)")
     parser.add_argument("--fail-fast", action="store_true", help="start no run after one failed")
     parser.add_argument(
+        "--time-limit", type=positive, help="start no run once this many minutes have passed since the load began"
+    )
+    parser.add_argument(
         "--min-slowdown",
-        type=slowdown_limit,
+        type=positive,
         help="void the campaign (exit 2) when its loaded runs took less than this many times run 0",
     )
     parser.add_argument("--out", type=Path, help="where failed runs' output goes (default target/stress/<UTC time>)")
@@ -463,8 +470,17 @@ def stress(args, cpu_list, hogs, out, results, loads):
     prefix = ["taskset", "-c", cpu_list, "nice", "-n", "19"]
     print(f"load: the tests at nice 19 on CPUs {cpu_list}, beside {hogs} loops at nice {args.hog_nice}", flush=True)
 
+    deadline = time.monotonic() + args.time_limit * 60 if args.time_limit else None
+    timed_out = threading.Event()
+
     def job():
         while not stop.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                with lock:
+                    if not timed_out.is_set():
+                        timed_out.set()
+                        print(f"time limit: no run starts after {args.time_limit:g} min", flush=True)
+                return
             with lock:
                 run = next(next_run, None)
             if run is None:

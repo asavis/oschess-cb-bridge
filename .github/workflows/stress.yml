@@ -1,0 +1,82 @@
+name: stress
+
+# The tests that fail only on a loaded machine, looked for every night (#235)
+# with scripts/stress.py. On a schedule only: no pull request, issue, comment
+# or fork can start it, as the CI rule in CLAUDE.md requires; a collaborator can
+# start it by hand to check it. It runs only on our own Linux runner, and a
+# scheduled run does nothing unless main has changed since the last stress run
+# that finished, whatever that run found.
+on:
+  schedule:
+    # 01:17 UTC, 02:17 or 03:17 in Vienna, while the runner is quiet.
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: stress
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: stress (linux)
+    runs-on: [self-hosted, linux, bridge-local]
+    timeout-minutes: 75
+    steps:
+      - name: Main changed since the last stress run
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          last=$(curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPOSITORY/actions/workflows/stress.yml/runs?status=completed&per_page=30" \
+            | python3 -c '
+          import json, sys
+          runs = json.load(sys.stdin)["workflow_runs"]
+          done = [r for r in runs if r["id"] != int(sys.argv[1]) and r["conclusion"] in ("success", "failure")]
+          print(done[0]["head_sha"] if done else "")
+          ' "$RUN_ID")
+          echo "last stress run at ${last:-none}; main at $GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$last" = "$GITHUB_SHA" ]; then
+            echo "::notice::main has not changed since the last stress run; nothing to do"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.changed.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          rustup toolchain install
+          rustc --version
+      - name: The binaries whose tests load has failed, 40 minutes at most
+        # A quarter of the CPUs, one busy loop at nice 10 on each: about eight
+        # times slower on a quiet machine, and void (exit 2) under five.
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          cpus=$(( $(nproc) / 4 )); [ "$cpus" -ge 2 ] || cpus=2
+          python3 scripts/stress.py --runs 50 --jobs 2 --hogs "$cpus" --hog-nice 10 --min-slowdown 5 --time-limit 40 \
+            --bin api --bin databases --bin engine --bin explorer_background --bin explorer_parallel_merge \
+            --bin positions --bin profile --out "$RUNNER_TEMP/stress/binaries"
+      - name: The whole suite, 15 minutes at most
+        if: steps.changed.outputs.run == 'true' && !cancelled()
+        run: |
+          cpus=$(( $(nproc) / 4 )); [ "$cpus" -ge 2 ] || cpus=2
+          python3 scripts/stress.py --runs 8 --jobs 2 --hogs "$cpus" --hog-nice 10 --fail-fast --time-limit 15 \
+            --out "$RUNNER_TEMP/stress/suite"
+      - name: Keep the failed runs' output
+        if: failure() && steps.changed.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-logs
+          path: ${{ runner.temp }}/stress
+          if-no-files-found: ignore
+          retention-days: 14

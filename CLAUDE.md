@@ -61,10 +61,13 @@ The review gate follows the scheme of the `kidschessleague` project.
 ## Checks
 
 This repository is public, so anyone can open a pull request, and nobody else
-may trigger tests or builds (owner decision, 2026-09-23). The only check
-workflow, `.github/workflows/ci.yml`, runs after a merge: on a push to `main`,
-which only collaborators can make, and only on our own runners (`bridge-local`
-for Linux, `bridge-windows` for Windows). Never add a workflow, trigger or job
+may trigger tests or builds (owner decision, 2026-09-23). The check workflow,
+`.github/workflows/ci.yml`, runs after a merge: on a push to `main`, which only
+collaborators can make, and only on our own runners (`bridge-local` for Linux,
+`bridge-windows` for Windows). `.github/workflows/stress.yml` runs
+`scripts/stress.py` at night on `bridge-local`, on a schedule, only when `main`
+has changed since its last run (owner decision on #235, 2026-09-30); a
+collaborator can also start it by hand. Never add a workflow, trigger or job
 that a pull request, an issue, a comment or a fork can start, and never route a
 job to GitHub's hosted runners. The one exception (owner decision on #23,
 2026-09-24) is `.github/workflows/release.yml`: it runs only on a version tag
