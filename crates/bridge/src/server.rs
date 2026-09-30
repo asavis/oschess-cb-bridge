@@ -37,6 +37,12 @@ pub fn bind(port: u16) -> io::Result<Vec<TcpListener>> {
 
 /// Connections over the cap waiting for their `busy` answer; more are closed.
 const BUSY_QUEUE: usize = 64;
+/// Connections at most that go on reading their client after the answer
+/// ([`Conn::close`]); past it a connection closes at once. A connection frees
+/// its slot before its client can see it end, so the cap no longer bounds a
+/// draining thread and its socket, and a client that keeps its sockets open
+/// would otherwise leave a thread draining for each answer (review of #231).
+const MAX_DRAINING: usize = MAX_CONNECTIONS;
 /// How long after acceptance the busy answer may wait for a request head, to
 /// read its `Origin`. The deadline runs from acceptance, not from the moment the
 /// refusing thread reaches the connection, so silent connections ahead in the
@@ -49,6 +55,7 @@ const BUSY_LAST_LOOK: Duration = Duration::from_millis(5);
 /// Serves connections from every listener until they fail.
 pub fn serve(listeners: Vec<TcpListener>, app: Arc<App>) -> io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
+    let draining = Arc::new(AtomicUsize::new(0));
     let (busy, refused) = mpsc::sync_channel::<(TcpStream, Instant)>(BUSY_QUEUE);
     let thread = |name: &str| std::thread::Builder::new().name(name.into()).stack_size(crate::THREAD_STACK);
     std::thread::scope(|scope| {
@@ -59,15 +66,26 @@ pub fn serve(listeners: Vec<TcpListener>, app: Arc<App>) -> io::Result<()> {
             }
         })?;
         for listener in listeners {
-            let (app, active, busy) = (app.clone(), active.clone(), busy.clone());
-            thread("bridge-accept").spawn_scoped(scope, move || accept(listener, app, active, busy))?;
+            let (app, active, draining, busy) = (app.clone(), active.clone(), draining.clone(), busy.clone());
+            thread("bridge-accept")
+                .spawn_scoped(scope, move || accept(listener, app, active, draining, busy, LINGER))?;
         }
         drop(busy);
         Ok(())
     })
 }
 
-fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: SyncSender<(TcpStream, Instant)>) {
+/// Accepts connections from `listener`, at most [`MAX_CONNECTIONS`] served
+/// at once counted in `active`, and at most [`MAX_DRAINING`] of them reading
+/// their client for `linger` after the answer, counted in `draining`.
+fn accept(
+    listener: TcpListener,
+    app: Arc<App>,
+    active: Arc<AtomicUsize>,
+    draining: Arc<AtomicUsize>,
+    busy: SyncSender<(TcpStream, Instant)>,
+    linger: Duration,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -77,14 +95,23 @@ fn accept(listener: TcpListener, app: Arc<App>, active: Arc<AtomicUsize>, busy: 
             continue;
         }
         let guard = Active(active.clone());
-        let app = app.clone();
+        let (app, draining) = (app.clone(), draining.clone());
         let spawned =
             std::thread::Builder::new().name("bridge-conn".into()).stack_size(crate::THREAD_STACK).spawn(move || {
                 let conn = handle_connection(stream, &app);
                 // The slot is free before the connection ends: a client that
                 // has seen it end may open another at once and be served.
                 drop(guard);
-                conn.close(LINGER);
+                // A drain slot is taken only while one is free, so `draining`
+                // never counts past the bound, even for a moment.
+                let drains =
+                    draining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| (d < MAX_DRAINING).then_some(d + 1));
+                if drains.is_ok() {
+                    let _drain = Active(draining);
+                    conn.close(linger);
+                } else {
+                    conn.close(Duration::ZERO);
+                }
             });
         // A failed spawn drops the closure, and with it the guard and the stream.
         drop(spawned);
@@ -170,7 +197,7 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);
         let counted = active.clone();
-        std::thread::spawn(move || accept(listener, app, counted, busy));
+        std::thread::spawn(move || accept(listener, app, counted, Arc::default(), busy, LINGER));
         let request = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
         let mut late = 0;
         for _ in 0..500 {
@@ -182,5 +209,34 @@ mod tests {
             late += usize::from(active.load(Ordering::SeqCst) != 0);
         }
         assert_eq!(late, 0, "connections still counted after their client saw them close");
+    }
+
+    /// Connections that read their client after the answer are bounded too
+    /// (review of #231): a client that keeps every socket it was answered on
+    /// open leaves [`MAX_DRAINING`] draining and no more, and is answered
+    /// whole every time. With a long linger, the first ones drain for the
+    /// whole test.
+    #[test]
+    fn draining_connections_are_bounded() {
+        let listener = bind(0).unwrap().remove(0);
+        let port = listener.local_addr().unwrap().port();
+        let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: "t".repeat(43) };
+        let app = Arc::new(App::new("test", policy, Catalog::new(Vec::new())));
+        let draining = Arc::new(AtomicUsize::new(0));
+        let (busy, _refused) = mpsc::sync_channel(BUSY_QUEUE);
+        let counted = draining.clone();
+        let linger = Duration::from_secs(300);
+        std::thread::spawn(move || accept(listener, app, Arc::default(), counted, busy, linger));
+        let mut kept = Vec::new();
+        for _ in 0..MAX_DRAINING * 3 {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(b"bad\r\n\r\n").unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).unwrap();
+            assert!(answer.starts_with(b"HTTP/1.1 400"), "{}", String::from_utf8_lossy(&answer));
+            assert!(draining.load(Ordering::SeqCst) <= MAX_DRAINING);
+            kept.push(stream);
+        }
+        assert_eq!(draining.load(Ordering::SeqCst), MAX_DRAINING, "the first ones drain, the rest closed at once");
     }
 }
