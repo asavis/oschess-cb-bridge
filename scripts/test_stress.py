@@ -198,12 +198,35 @@ class Summary(unittest.TestCase):
 
 # Runs stress.py's main with a fake build: `build` holds the build open with a
 # `sleep`; otherwise the build gives one test binary, the script `fake-test`.
+# `kill` sends the script a SIGTERM just before its first process group kill,
+# `submit` just after it hands its first run to a worker.
 DRIVER = """
-import importlib.util, os, sys
+import importlib.util, os, signal, sys
 spec = importlib.util.spec_from_file_location("stress", sys.argv[1])
 stress = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stress)
 mode, tmp = sys.argv[2], sys.argv[3]
+
+if mode == "kill":
+    real_killpg, fired = os.killpg, []
+
+    def killpg(group, sig):
+        if not fired:
+            fired.append(group)
+            os.kill(os.getpid(), signal.SIGTERM)
+        real_killpg(group, sig)
+
+    os.killpg = killpg
+
+if mode == "submit":
+
+    class Pool(stress.ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            future = super().submit(*args, **kwargs)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return future
+
+    stress.ThreadPoolExecutor = Pool
 
 
 def build():
@@ -324,6 +347,18 @@ class Lifecycle(unittest.TestCase):
         self.assert_all_end(pids + hogs)
         with open(os.path.join(self.tmp, "driver.log")) as f:
             self.assertNotIn("FAILED", f.read(), "a run the script cut short counted as failed")
+
+    def test_a_signal_as_a_group_is_killed(self):
+        driver = self.start("kill", "--hogs", "0", env_mode="exit")
+        self.assertEqual(driver.wait(timeout=60), 130)
+        self.assert_all_end(self.noted(1))
+
+    def test_a_signal_as_the_runs_are_handed_out(self):
+        driver = self.start("submit", "--runs", "3", "--jobs", "1", "--cpus", self.cpu, "--hogs", "0", env_mode="quick")
+        self.assertEqual(driver.wait(timeout=60), 130)
+        pids = self.noted(1)
+        self.assertLessEqual(len(pids), 4, "runs started after the signal")
+        self.assert_all_end(pids)
 
     def test_a_binary_s_leftover_children(self):
         driver = self.start("run", "--runs", "1", "--hogs", "0", env_mode="exit")

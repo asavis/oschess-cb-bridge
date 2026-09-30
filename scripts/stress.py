@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -201,9 +202,9 @@ class Live:
     script kills them itself when it ends early, and starts none after that.
 
     Python runs signal handlers in the main thread between two steps, so a
-    signal there could land after a process started and before it was
-    listed. While the main thread starts one, a signal is held (`held`), and
-    raised once the process is listed."""
+    signal could land between starting a process and listing it, or between
+    killing a group and forgetting it. While the main thread does either, a
+    signal is held (`held`), and raised once the list is true again."""
 
     lock = threading.Lock()
     groups = set()
@@ -212,36 +213,48 @@ class Live:
     pending = False
 
     @classmethod
-    def start(cls, args, **kwargs):
+    @contextmanager
+    def holding(cls, reraise=True):
+        """The list, locked, with signals to the main thread held until the
+        block ends; one that came is raised then, unless the script is
+        already stopping (`reraise` false)."""
         main = threading.current_thread() is threading.main_thread()
         if main:
             cls.held = True
         try:
             with cls.lock:
-                if cls.closed:
-                    raise Aborted
-                process = subprocess.Popen(args, start_new_session=True, **kwargs)
-                cls.groups.add(process.pid)
+                yield
         finally:
             if main:
                 cls.held = False
                 if cls.pending:
                     cls.pending = False
-                    raise KeyboardInterrupt
+                    if reraise:
+                        raise KeyboardInterrupt
+
+    @classmethod
+    def start(cls, args, **kwargs):
+        with cls.holding():
+            if cls.closed:
+                raise Aborted
+            process = subprocess.Popen(args, start_new_session=True, **kwargs)
+            cls.groups.add(process.pid)
         return process
 
     @classmethod
     def kill(cls, process):
-        with cls.lock:
-            cls.groups.discard(process.pid)
+        # The group stays listed until it is killed, so a signal before the
+        # kill leaves it to `kill_all`.
+        with cls.holding():
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            cls.groups.discard(process.pid)
 
     @classmethod
     def kill_all(cls):
-        with cls.lock:
+        with cls.holding(reraise=False):
             cls.closed = True
             for group in cls.groups:
                 try:
@@ -431,9 +444,8 @@ def stress(args, cpu_list, hogs, out, results, loads):
     # Busy loops that started before a signal are listed in `Live`, which
     # the caller kills, even when `Hogs` did not finish starting them.
     with Hogs(hogs, cpu_list, args.hog_nice), ThreadPoolExecutor(args.jobs) as pool:
-        futures = [pool.submit(job) for _ in range(args.jobs)]
         try:
-            for future in futures:
+            for future in [pool.submit(job) for _ in range(args.jobs)]:
                 future.result()
         except BaseException:
             # The workers wait on their tests: kill those first, or leaving
