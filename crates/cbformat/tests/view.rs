@@ -6,11 +6,13 @@ use std::path::Path;
 use cbformat::codepage::CodePage;
 use cbformat::fixture::{self, TempDb, quiet, text};
 use cbformat::fixture_cbh::{self, Tok, annotation_record, encode, move_record};
-use cbformat::game::{Date, Eco, GameResult, Head, RecordKind, Start, language};
+use cbformat::game::{
+    Annotation, Block, Date, Eco, GameAnnotations, GameResult, Head, PositionOrder, RecordKind, Source, Start, language,
+};
 use cbformat::movetable::{self, Color, Piece};
 use cbformat::pgn::{self, Options};
 use cbformat::replay::TreeVisitor;
-use cbformat::view::{Base, Format, Header, PositionOrder, format_of};
+use cbformat::view::{Base, Format, Header, format_of};
 use cbformat::{Limits, cbh, pgnfile, v2};
 use chesscore::{Board, Move};
 
@@ -106,11 +108,35 @@ fn both_formats_read_the_same() {
         assert!(!moves.is_chess960().unwrap());
         let a = base.annotations_of(&h).unwrap().unwrap();
         assert_eq!(a.blocks.len(), 5);
+        assert_eq!(a.source.position_order(), base.position_order(), "each reader records its format");
         let batch = base.batch(1, 10).unwrap();
         assert_eq!(batch.ids(), 1..=1);
         assert_eq!(batch.pgn(1, &options, limits).unwrap(), base.pgn(1, &options, limits).unwrap());
         assert_eq!(base.headers(1, 5).unwrap().len(), 1);
     }
+}
+
+/// The writer places annotations and reads their data as their own
+/// [`Source`] says, not as the database or the entry point they come
+/// through: the same medal on position 2, over the same 2CBH moves, is on
+/// `Nf3` and big-endian when classic, and on `c6` and little-endian when 2CBH.
+#[test]
+fn annotations_are_written_as_their_source_says() {
+    let f = two_cbh("source");
+    let db = v2::Database::open(f.base()).unwrap();
+    let data = db.moves_of(&db.record(1).unwrap()).unwrap();
+    let moves = data.moves().unwrap();
+    let medal = |source| GameAnnotations {
+        blocks: vec![Block {
+            position: 2,
+            annotations: vec![Annotation::Other { code: 0x22, data: vec![0, 0, 0, 4] }],
+        }],
+        source,
+        ..GameAnnotations::default()
+    };
+    let text = |source| pgn::movetext_annotated(&moves, &medal(source), &Options::default()).unwrap();
+    assert_eq!(text(Source::Classic), "1. e4 c5 (1... c6 2. d4) 2. Nf3 {[%mdl 4]}");
+    assert_eq!(text(Source::TwoCbh), "1. e4 c5 (1... c6 {[%mdl 67108864]} 2. d4) 2. Nf3");
 }
 
 #[test]

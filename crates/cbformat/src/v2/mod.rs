@@ -30,7 +30,7 @@ pub use record::Record;
 pub use window::MoveWindow;
 
 use crate::file::{self, DbFile};
-use crate::game::GameAnnotations;
+use crate::game::{GameAnnotations, Names};
 use crate::recordfile::{RecordFile, Run, span};
 
 pub const HEADER_RECORD_SIZE: usize = 192;
@@ -105,6 +105,16 @@ impl Database {
 
     pub fn entities(&self) -> &Entities {
         &self.entities
+    }
+
+    /// The players and the tournament game `record` names, which its PGN tags
+    /// hold: the one lookup of them that the PGN writer and
+    /// [`crate::view::Base::names`] share. The annotator, which the tags do
+    /// not hold, is left `None`.
+    pub(crate) fn tag_names(&self, record: &Record) -> Result<Names> {
+        let e = &self.entities;
+        let tournament = e.tournament(record.tournament())?;
+        Ok(Names { white: e.player(record.white())?, black: e.player(record.black())?, tournament, annotator: None })
     }
 
     /// The move record a game or analysis header points at.

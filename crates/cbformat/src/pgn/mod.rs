@@ -14,10 +14,9 @@ pub use san::{parse as parse_san, san};
 
 use chesscore::Board;
 
-use crate::game::{Date, Eco, GameAnnotations, GameResult, Player, RecordKind, Start, Tournament, language};
+use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Names, Player, RecordKind, Start, language};
 use crate::replay::{self, TreeStats, start_board};
 use crate::v2::{Database, GameMoves, Record};
-use crate::view::PositionOrder;
 use crate::{Error, Limits, Result};
 use comments::Commentary;
 use tree::{Bare, TreeBuilder, emit};
@@ -83,15 +82,14 @@ pub fn movetext_annotated(moves: &GameMoves<'_>, annotations: &GameAnnotations, 
 }
 
 fn write_movetext(moves: &GameMoves<'_>, annotations: Option<&GameAnnotations>, options: &Options) -> Result<String> {
-    write_tree(|tree| replay::walk(moves, tree), annotations, PositionOrder::Pgn, options)
+    write_tree(|tree| replay::walk(moves, tree), annotations, options)
 }
 
-/// The movetext of the tree `walk` plays, with its annotations numbered in
-/// `order`.
+/// The movetext of the tree `walk` plays, with its annotations placed and
+/// decoded as their [`crate::game::Source`] says.
 fn write_tree(
     walk: impl FnOnce(&mut TreeBuilder) -> Result<TreeStats>,
     annotations: Option<&GameAnnotations>,
-    order: PositionOrder,
     options: &Options,
 ) -> Result<String> {
     let mut tree = TreeBuilder::new();
@@ -105,7 +103,7 @@ fn write_tree(
             // move; in a game without moves it is damage, not something to
             // drop quietly.
             a.check_positions(stats.total_plies)?;
-            let mut commentary = Commentary::new(a, order, options, stats.total_plies, &tree.main_line());
+            let mut commentary = Commentary::new(a, options, stats.total_plies, &tree.main_line());
             commentary.game_comment(&mut out);
             emit(&tree, &mut commentary, &mut out);
         }
@@ -163,34 +161,18 @@ pub fn game_from(
     if r.kind() != RecordKind::Game {
         return Err(Error::Format(format!("record {} is not a game", r.id())));
     }
-    let e = db.entities();
-    let t = e.tournament(r.tournament())?;
-    let name = |pid| -> Result<Option<Player>> { e.player(pid) };
-    let start = moves.start()?;
-    let tags = Tags {
-        tournament: t,
-        date: r.played_date(),
-        round: (i32::from(r.round()), i32::from(r.subround())),
-        white: name(r.white())?,
-        black: name(r.black())?,
-        result: r.result(),
-        elo: (i32::from(r.white_elo()), i32::from(r.black_elo())),
-        eco: r.eco(),
-        start: (start != Start::Standard).then(|| start_board(&start)).transpose()?,
-        chess960: moves.is_chess960(),
-    };
+    let tags = Tags::new(r, db.tag_names(r)?, &moves.start()?, moves.is_chess960())?;
     let text = write_movetext(moves, annotations, options)?;
     Ok(finish(&tags, &text, annotations))
 }
 
 /// The tag roster of a game, from either format.
 struct Tags {
-    tournament: Option<Tournament>,
+    /// The players and the tournament; the annotator has no tag.
+    names: Names,
     date: Date,
     /// Round and sub-round, 0 when unknown.
     round: (i32, i32),
-    white: Option<Player>,
-    black: Option<Player>,
     result: GameResult,
     /// Ratings, 0 or less when unknown.
     elo: (i32, i32),
@@ -200,10 +182,28 @@ struct Tags {
     chess960: bool,
 }
 
+impl Tags {
+    /// The tags of the game `head`, whose players and tournament are `names`,
+    /// played from `start`, in either format: its header's fields are read
+    /// through [`Head`], which maps each of them once per format.
+    fn new(head: &impl Head, names: Names, start: &Start, chess960: bool) -> Result<Tags> {
+        Ok(Tags {
+            names,
+            date: head.played_date(),
+            round: head.round(),
+            result: head.result(),
+            elo: head.elo(),
+            eco: head.eco(),
+            start: (*start != Start::Standard).then(|| start_board(start)).transpose()?,
+            chess960,
+        })
+    }
+}
+
 /// The whole PGN record: tags, movetext and result, and how much of the
 /// annotations it holds.
 fn finish(tags: &Tags, text: &str, annotations: Option<&GameAnnotations>) -> Rendered {
-    let t = tags.tournament.as_ref();
+    let t = tags.names.tournament.as_ref();
     let name = |p: &Option<Player>| p.as_ref().map(|p| p.pgn()).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into());
     let mut out = String::new();
     tag(&mut out, "Event", t.map(|t| t.title.as_str()).filter(|s| !s.is_empty()).unwrap_or("?"));
@@ -213,8 +213,8 @@ fn finish(tags: &Tags, text: &str, annotations: Option<&GameAnnotations>) -> Ren
     let mut buf = [0; crate::game::ROUND_TEXT_BYTES];
     let round = crate::game::round_text(tags.round.0, tags.round.1, &mut buf);
     tag(&mut out, "Round", if round.is_empty() { "?" } else { round });
-    tag(&mut out, "White", &name(&tags.white));
-    tag(&mut out, "Black", &name(&tags.black));
+    tag(&mut out, "White", &name(&tags.names.white));
+    tag(&mut out, "Black", &name(&tags.names.black));
     tag(&mut out, "Result", tags.result.pgn());
     if tags.elo.0 > 0 {
         tag(&mut out, "WhiteElo", &tags.elo.0.to_string());

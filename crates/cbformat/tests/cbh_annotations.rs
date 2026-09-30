@@ -5,7 +5,7 @@ use cbformat::Limits;
 use cbformat::cbh::{Database, annotations};
 use cbformat::fixture::pgn_movetext;
 use cbformat::fixture_cbh::{Builder, Tok, annotation_record, encode, move_record};
-use cbformat::game::{Annotation, Arrow, Square, language};
+use cbformat::game::{Annotation, Arrow, Source, Square, language};
 use cbformat::pgn::{self, AnnotationStatus, Options};
 use chesscore::Board;
 
@@ -153,7 +153,9 @@ fn a_game_without_a_record_and_a_database_without_a_file() {
     let f = b.write("no-record");
     let db = Database::open(f.base()).unwrap();
     assert!(db.has_annotations());
-    assert!(db.annotations_of(&db.record(1).unwrap()).unwrap().unwrap().is_empty());
+    let none = db.annotations_of(&db.record(1).unwrap()).unwrap().unwrap();
+    assert!(none.is_empty());
+    assert_eq!(none.source, Source::Classic);
     assert_eq!(movetext(&db, &Options::default()), ("1. e4".to_string(), AnnotationStatus::None));
     std::fs::remove_file(f.dir().join("db.cba")).unwrap();
     let db = Database::open(f.base()).unwrap();
