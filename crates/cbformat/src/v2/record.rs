@@ -2,7 +2,7 @@
 //! with classic records are in [`crate::game`].
 
 use super::HEADER_RECORD_SIZE;
-use super::bytes::{le_i16, le_i32, le_i64, le_u16, le_u32};
+use crate::bytes::Fields;
 use crate::game::{Date, Eco, GameResult, Head, RecordKind};
 
 /// A 192-byte `.2cbh` record.
@@ -38,83 +38,83 @@ impl Record {
     /// Offset of the moves in `.2cbg` (games and analyses) or of the text body
     /// (guiding texts).
     pub fn moves_offset(&self) -> i64 {
-        le_i64(&self.b, 0x08)
+        self.b.le_i64::<0x08>()
     }
     pub fn annotations_offset(&self) -> i64 {
-        le_i64(&self.b, 0x10)
+        self.b.le_i64::<0x10>()
     }
     pub fn white(&self) -> i64 {
-        le_i64(&self.b, 0x18)
+        self.b.le_i64::<0x18>()
     }
     pub fn black(&self) -> i64 {
-        le_i64(&self.b, 0x20)
+        self.b.le_i64::<0x20>()
     }
     pub fn tournament(&self) -> i64 {
-        le_i64(&self.b, 0x28)
+        self.b.le_i64::<0x28>()
     }
     pub fn annotator(&self) -> i64 {
-        le_i64(&self.b, 0x30)
+        self.b.le_i64::<0x30>()
     }
     pub fn source(&self) -> i64 {
-        le_i64(&self.b, 0x38)
+        self.b.le_i64::<0x38>()
     }
     pub fn white_team(&self) -> i64 {
-        le_i64(&self.b, 0x40)
+        self.b.le_i64::<0x40>()
     }
     pub fn black_team(&self) -> i64 {
-        le_i64(&self.b, 0x48)
+        self.b.le_i64::<0x48>()
     }
     pub fn game_tag(&self) -> i64 {
-        le_i64(&self.b, 0x50)
+        self.b.le_i64::<0x50>()
     }
     /// A guiding text's author, a player id. Guiding texts share only their
     /// first eight bytes with games; the game accessors do not apply to them.
     pub fn text_author(&self) -> i64 {
-        le_i64(&self.b, 0x20)
+        self.b.le_i64::<0x20>()
     }
     /// The game tag holding a guiding text's title; see [`crate::v2::Entities::title`].
     pub fn text_title(&self) -> i64 {
-        le_i64(&self.b, 0x28)
+        self.b.le_i64::<0x28>()
     }
     /// The game tag holding an analysis's title.
     pub fn analysis_title(&self) -> i64 {
-        le_i64(&self.b, 0x18)
+        self.b.le_i64::<0x18>()
     }
     /// An analysis's author, a player id.
     pub fn analysis_author(&self) -> i64 {
-        le_i64(&self.b, 0x28)
+        self.b.le_i64::<0x28>()
     }
     pub fn result(&self) -> GameResult {
         GameResult::from_field(self.b[0x58])
     }
     pub fn round(&self) -> i16 {
-        le_i16(&self.b, 0x5a)
+        self.b.le_i16::<0x5a>()
     }
     pub fn subround(&self) -> i16 {
-        le_i16(&self.b, 0x5c)
+        self.b.le_i16::<0x5c>()
     }
     pub fn board(&self) -> i16 {
-        le_i16(&self.b, 0x5e)
+        self.b.le_i16::<0x5e>()
     }
     pub fn white_elo(&self) -> i16 {
-        le_i16(&self.b, 0x60)
+        self.b.le_i16::<0x60>()
     }
     pub fn black_elo(&self) -> i16 {
-        le_i16(&self.b, 0x70)
+        self.b.le_i16::<0x70>()
     }
     /// The ECO field: an opening code, a Chess960 start position, or nothing.
     pub fn eco(&self) -> Eco {
-        Eco::from_field(le_u16(&self.b, 0x80))
+        Eco::from_field(self.b.le_u16::<0x80>())
     }
     pub fn flags(&self) -> u32 {
-        le_u32(&self.b, 0x84)
+        self.b.le_u32::<0x84>()
     }
     /// Number of full moves in the main line.
     pub fn move_count(&self) -> i16 {
-        le_i16(&self.b, 0x8a)
+        self.b.le_i16::<0x8a>()
     }
     pub fn played_date(&self) -> Date {
-        Date(le_i32(&self.b, 0xbc))
+        Date(self.b.le_i32::<0xbc>())
     }
 }
 

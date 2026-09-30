@@ -103,7 +103,7 @@ fn symbols_graphics_languages_and_text_before() {
     assert_eq!(anns[1], Annotation::Symbols { on_move: 1, on_position: 0, prefix: 0 });
     let sq = |s: &str| {
         let b = s.as_bytes();
-        cbformat::movetable::from_cb_square((b[0] - b'a') * 8 + b[1] - b'1')
+        cbformat::movetable::from_cb_square((b[0] - b'a') * 8 + b[1] - b'1').index() as u8
     };
     assert_eq!(
         anns[2],

@@ -7,6 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::bytes::{Cursor, Fields};
 use crate::game::Date;
 use crate::view::Format;
 use crate::{Error, Result};
@@ -61,54 +62,40 @@ pub fn items(bytes: &[u8]) -> Result<Vec<Item>> {
     if bytes.len() as u64 > MAX_FILE {
         return Err(bad(format!("{} bytes, more than {MAX_FILE}", bytes.len())));
     }
-    if bytes.len() < 8 || bytes[..4] != MAGIC {
-        return Err(bad("no list header".into()));
+    let mut r = Cursor::new(bytes);
+    let header = r.array::<8>().filter(|h| h.field::<0, 4>() == &MAGIC).ok_or_else(|| bad("no list header".into()))?;
+    let payload = header.be_u32::<4>() as usize;
+    if payload != r.left() {
+        return Err(bad(format!("header says {payload} bytes follow, the file has {}", r.left())));
     }
-    let payload = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-    if payload != bytes.len() - 8 {
-        return Err(bad(format!("header says {payload} bytes follow, the file has {}", bytes.len() - 8)));
-    }
-    let mut r = Reader { b: bytes, at: 8 };
     let mut out = Vec::new();
-    while r.at < bytes.len() {
-        let at = r.at;
-        let tag = r.byte()?;
+    while r.left() > 0 {
+        let at = r.at();
+        let tag = r.u8().ok_or_else(|| past_end(&r))?;
         let value = match tag {
             TAG_SECTION => Value::Section,
-            TAG_BYTE => Value::Byte(r.byte()?),
-            TAG_INT => Value::Int(i32::from_le_bytes(r.take(4)?.try_into().unwrap())),
-            t if TAG_TEXTS.contains(&t) => Value::Text { tag: t, text: text(r.string()?) },
+            TAG_BYTE => Value::Byte(r.u8().ok_or_else(|| past_end(&r))?),
+            TAG_INT => Value::Int(r.le_i32().ok_or_else(|| past_end(&r))?),
+            t if TAG_TEXTS.contains(&t) => Value::Text { tag: t, text: text(string(&mut r)?) },
             // Items carry no length, so nothing after an unknown tag can be found.
             t => return Err(bad(format!("unknown item tag {t:#04x} at {at:#x}"))),
         };
-        let key = text(r.string()?);
+        let key = text(string(&mut r)?);
         out.push(Item { key, value });
     }
     Ok(out)
 }
 
-struct Reader<'a> {
-    b: &'a [u8],
-    at: usize,
+/// An item that runs past the end of the list, where `r` stopped reading it.
+fn past_end(r: &Cursor<'_>) -> Error {
+    Error::Format(format!("{FILE_NAME}: item at {:#x} runs past the end", r.at()))
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.at.checked_add(n).filter(|&e| e <= self.b.len());
-        let end = end.ok_or_else(|| Error::Format(format!("{FILE_NAME}: item at {:#x} runs past the end", self.at)))?;
-        let s = &self.b[self.at..end];
-        self.at = end;
-        Ok(s)
-    }
-    fn byte(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    /// A string: its byte length as a little-endian `int`, then the bytes.
-    fn string(&mut self) -> Result<&'a [u8]> {
-        let n = i32::from_le_bytes(self.take(4)?.try_into().unwrap());
-        let n = usize::try_from(n).map_err(|_| Error::Format(format!("{FILE_NAME}: string length {n}")))?;
-        self.take(n)
-    }
+/// A string: its byte length as a little-endian `int`, then the bytes.
+fn string<'a>(r: &mut Cursor<'a>) -> Result<&'a [u8]> {
+    let n = r.le_i32().ok_or_else(|| past_end(r))?;
+    let n = usize::try_from(n).map_err(|_| Error::Format(format!("{FILE_NAME}: string length {n}")))?;
+    r.take(n).ok_or_else(|| past_end(r))
 }
 
 /// UTF-8 when the bytes are valid UTF-8, otherwise one character per byte

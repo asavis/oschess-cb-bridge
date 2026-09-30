@@ -10,7 +10,7 @@
 //! first at every position), not in the PGN order 2CBH uses; the annotations
 //! say so by their [`Source`], which the PGN writer places them by.
 
-use super::bytes::{be_u16, be_u24, be_u32};
+use crate::bytes::{self, Fields};
 use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Source, Square, language};
 use crate::movetable::{Sq, from_cb_square};
 use crate::{Error, Result};
@@ -22,9 +22,9 @@ const ITEM_HEAD: usize = 6;
 /// The fixed bytes at 0x03 of every record.
 const MARK: [u8; 4] = [1, 0, 0x0e, 0x0e];
 
-/// The record's size from its head, which must be `HEAD` bytes.
-pub(super) fn record_size(head: &[u8]) -> usize {
-    be_u32(head, 0x0a) as usize
+/// The record's size from its head.
+pub(super) fn record_size(head: &[u8; HEAD]) -> usize {
+    head.be_u32::<0x0a>() as usize
 }
 
 /// Decodes the record of game `id`. Damage (a head that does not match the
@@ -34,28 +34,26 @@ pub(super) fn record_size(head: &[u8]) -> usize {
 /// the game is checked against the game by [`GameAnnotations::check_positions`].
 pub fn parse(record: &[u8], id: u32) -> Result<GameAnnotations> {
     let bad = |at: usize, what: &str| Error::Format(format!("classic annotations of game {id} at byte {at}: {what}"));
-    if record.len() < HEAD {
-        return Err(bad(0, "shorter than its head"));
-    }
-    if be_u24(record, 0) != id {
+    let Some(head) = record.first_chunk::<HEAD>() else { return Err(bad(0, "shorter than its head")) };
+    if head.be_u24::<0>() != id {
         return Err(bad(0, "the head names another game"));
     }
-    if record[3..7] != MARK {
+    if head.field::<3, 4>() != &MARK {
         return Err(bad(3, "unexpected head bytes"));
     }
-    if record_size(record) != record.len() {
+    if record_size(head) != record.len() {
         return Err(bad(0x0a, "size disagrees with the record"));
     }
     let mut out = GameAnnotations { source: Source::Classic, ..GameAnnotations::default() };
     let mut count = 0u32;
     let mut i = HEAD;
     while i < record.len() {
-        if record.len() - i < ITEM_HEAD {
+        let Some(item) = bytes::array::<ITEM_HEAD>(record, i) else {
             return Err(bad(i, "annotation head runs past the record"));
-        }
-        let position = int24(be_u24(record, i));
-        let type_code = record[i + 3];
-        let size = be_u16(record, i + 4) as usize;
+        };
+        let position = int24(item.be_u24::<0>());
+        let type_code = item[3];
+        let size = item.be_u16::<4>() as usize;
         if size < ITEM_HEAD || size > record.len() - i {
             return Err(bad(i, "annotation size out of range"));
         }
@@ -71,7 +69,7 @@ pub fn parse(record: &[u8], id: u32) -> Result<GameAnnotations> {
         count += 1;
         i += size;
     }
-    if be_u24(record, 7) != count + 1 {
+    if head.be_u24::<7>() != count + 1 {
         return Err(bad(7, "annotation count disagrees with the record"));
     }
     Ok(out)
@@ -123,7 +121,7 @@ fn annotation(t: u8, d: &[u8]) -> std::result::Result<Annotation, &'static str> 
 /// Squares here are numbered from 1, file by file.
 fn square(n: u8) -> std::result::Result<Sq, &'static str> {
     match n {
-        1..=64 => Ok(from_cb_square(n - 1)),
+        1..=64 => Ok(from_cb_square(n - 1).index() as Sq),
         _ => Err("square out of range"),
     }
 }

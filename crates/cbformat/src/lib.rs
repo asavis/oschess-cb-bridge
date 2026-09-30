@@ -12,6 +12,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+mod bytes;
 pub mod cbh;
 pub mod codepage;
 pub mod dbitems;

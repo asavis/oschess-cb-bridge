@@ -46,13 +46,9 @@ impl DbFile {
         }
     }
 
-    pub(crate) fn len(&self) -> Result<u64> {
-        self.file.metadata().map(|m| m.len()).map_err(|e| Error::Io(self.path.to_path_buf(), e))
-    }
-
-    /// The file's size in bytes.
+    /// The file's size in bytes now.
     pub fn size(&self) -> Result<u64> {
-        self.len()
+        self.file.metadata().map(|m| m.len()).map_err(|e| Error::Io(self.path.to_path_buf(), e))
     }
 
     /// Fills `buf` from `offset`; a short file is an error.

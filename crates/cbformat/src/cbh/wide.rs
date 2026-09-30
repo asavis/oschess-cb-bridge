@@ -8,12 +8,13 @@
 
 use std::path::PathBuf;
 
+use crate::bytes::Fields;
 use crate::file::DbFile;
 use crate::{Error, Result};
 
-const HEADER: u64 = 32;
+const HEADER: usize = 32;
 /// The shortest record that holds both offsets.
-const MIN_RECORD: u64 = 0x1e + 8;
+const MIN_RECORD: usize = 0x1e + 8;
 
 pub(super) struct Wide {
     file: DbFile,
@@ -29,12 +30,12 @@ impl Wide {
             Err(Error::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => return Err(bad("missing")),
             Err(e) => return Err(e),
         };
-        if file.len()? < HEADER {
+        if file.size()? < HEADER as u64 {
             return Err(bad("shorter than its header"));
         }
-        let h = file.read(0, HEADER as usize)?;
-        let int = |o: usize| i32::from_le_bytes(h[o..o + 4].try_into().unwrap_or_default());
-        let (record, count) = (int(4), int(8));
+        let mut h = [0u8; HEADER];
+        file.read_into(0, &mut h)?;
+        let (record, count) = (h.le_i32::<4>(), h.le_i32::<8>());
         if i64::from(record) < MIN_RECORD as i64 || record > 4096 {
             return Err(bad(&format!("record size {record} holds no 64-bit offsets")));
         }
@@ -48,10 +49,10 @@ impl Wide {
         if id == 0 || id > self.count {
             return Ok((u64::from(short.0), u64::from(short.1)));
         }
-        let at = HEADER + self.record * u64::from(id - 1);
-        let r = self.file.read(at, MIN_RECORD as usize)?;
-        let long = |o: usize| i64::from_be_bytes(r[o..o + 8].try_into().unwrap_or_default());
-        let (moves, annotations) = (long(0x1e), long(0x0c).max(0));
+        let at = HEADER as u64 + self.record * u64::from(id - 1);
+        let mut r = [0u8; MIN_RECORD];
+        self.file.read_into(at, &mut r)?;
+        let (moves, annotations) = (r.be_i64::<0x1e>(), r.be_i64::<0x0c>().max(0));
         let agrees = |wide: i64, short: u32| wide >= 0 && wide as u64 & 0xffff_ffff == u64::from(short);
         if !agrees(moves, short.0) || !agrees(annotations, short.1) {
             return Err(Error::Format(format!("game {id}: the offsets of .cbj and .cbh disagree")));

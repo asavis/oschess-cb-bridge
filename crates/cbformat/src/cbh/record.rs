@@ -3,7 +3,7 @@
 //! Integers are big-endian. Field encodings shared with 2CBH (result, ECO,
 //! date) decode to the [`crate::game`] types, so both formats read the same way.
 
-use super::bytes::{be_u16, be_u24, be_u32};
+use crate::bytes::Fields;
 use crate::game::{Date, Eco, GameResult, Head, RecordKind};
 
 /// Size of a `.cbh` record, and of the file header before the first one.
@@ -45,29 +45,29 @@ impl Record {
     }
     /// Offset of the moves (games) or of the text body (guiding texts) in `.cbg`.
     pub fn moves_offset(&self) -> u32 {
-        be_u32(&self.b, 0x01)
+        self.b.be_u32::<0x01>()
     }
     /// Offset of the annotations in `.cba`; 0 when the game has none.
     pub fn annotations_offset(&self) -> u32 {
-        if self.is_text() { 0 } else { be_u32(&self.b, 0x05) }
+        if self.is_text() { 0 } else { self.b.be_u32::<0x05>() }
     }
     pub fn white(&self) -> u32 {
-        if self.is_text() { 0 } else { be_u24(&self.b, 0x09) }
+        if self.is_text() { 0 } else { self.b.be_u24::<0x09>() }
     }
     pub fn black(&self) -> u32 {
-        if self.is_text() { 0 } else { be_u24(&self.b, 0x0c) }
+        if self.is_text() { 0 } else { self.b.be_u24::<0x0c>() }
     }
     pub fn tournament(&self) -> u32 {
-        be_u24(&self.b, if self.is_text() { 0x07 } else { 0x0f })
+        if self.is_text() { self.b.be_u24::<0x07>() } else { self.b.be_u24::<0x0f>() }
     }
     pub fn annotator(&self) -> u32 {
-        be_u24(&self.b, if self.is_text() { 0x0d } else { 0x12 })
+        if self.is_text() { self.b.be_u24::<0x0d>() } else { self.b.be_u24::<0x12>() }
     }
     pub fn source(&self) -> u32 {
-        be_u24(&self.b, if self.is_text() { 0x0a } else { 0x15 })
+        if self.is_text() { self.b.be_u24::<0x0a>() } else { self.b.be_u24::<0x15>() }
     }
     pub fn played_date(&self) -> Date {
-        Date(if self.is_text() { 0 } else { be_u24(&self.b, 0x18) as i32 })
+        Date(if self.is_text() { 0 } else { self.b.be_u24::<0x18>() as i32 })
     }
     pub fn result(&self) -> GameResult {
         GameResult::from_field(self.b[0x1b])
@@ -83,20 +83,20 @@ impl Record {
         self.b[if self.is_text() { 0x11 } else { 0x1e }]
     }
     pub fn white_elo(&self) -> u16 {
-        be_u16(&self.b, 0x1f)
+        self.b.be_u16::<0x1f>()
     }
     pub fn black_elo(&self) -> u16 {
-        be_u16(&self.b, 0x21)
+        self.b.be_u16::<0x21>()
     }
     /// The ECO field: an opening code, a Chess960 start position, or nothing.
     pub fn eco(&self) -> Eco {
-        Eco::from_field(be_u16(&self.b, 0x23))
+        Eco::from_field(self.b.be_u16::<0x23>())
     }
     pub fn medals(&self) -> u16 {
-        be_u16(&self.b, 0x25)
+        self.b.be_u16::<0x25>()
     }
     pub fn flags(&self) -> u32 {
-        be_u32(&self.b, if self.is_text() { 0x12 } else { 0x27 })
+        if self.is_text() { self.b.be_u32::<0x12>() } else { self.b.be_u32::<0x27>() }
     }
     /// Number of moves in the main line, capped at 255.
     pub fn move_count(&self) -> u8 {

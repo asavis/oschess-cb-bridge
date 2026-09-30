@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use super::bytes::{be_i32, be_i64, le_i32};
+use crate::bytes::{self, Cursor, Fields};
 use crate::file::DbFile;
 use crate::game::{Date, Player, Tournament};
 use crate::{Error, Result};
@@ -36,13 +36,14 @@ pub struct Entities {
 
 impl Entities {
     pub(super) fn new(file: DbFile) -> Result<Self> {
-        let len = file.len()?;
+        let len = file.size()?;
         if len < 8 {
             return Err(Error::Format(".2lid too short".into()));
         }
         let bad = |what: String| Error::Format(format!(".2lid header: {what}"));
-        let head = file.read(0, 8)?;
-        let (header_size, ntypes) = (be_i32(&head, 0), be_i32(&head, 4));
+        let mut head = [0u8; 8];
+        file.read_into(0, &mut head)?;
+        let (header_size, ntypes) = (head.be_i32::<0>(), head.be_i32::<4>());
         if !(1..=32).contains(&ntypes) {
             return Err(bad(format!("{ntypes} entity types")));
         }
@@ -52,20 +53,22 @@ impl Entities {
             return Err(bad(format!("size {header_size} for {ntypes} types in a {len}-byte file")));
         }
         let d = file.read(0, header_size)?;
+        // After the first 8 bytes, 20 per type: the checks above make room
+        // for every one.
+        let entries = d.get(8..).unwrap_or_default().as_chunks::<20>().0;
         let mut types = Vec::with_capacity(ntypes);
         let mut container_offset = Vec::with_capacity(ntypes);
         let mut block_size = 0usize;
-        for i in 0..ntypes {
-            let o = 8 + 20 * i;
-            let size = be_i32(&d, o);
+        for (i, t) in entries.iter().take(ntypes).enumerate() {
+            let size = t.be_i32::<0>();
             if !(0..=MAX_CONTAINER).contains(&size) {
                 return Err(bad(format!("type {i} container size {size}")));
             }
-            let count = be_i64(&d, o + 4);
+            let count = t.be_i64::<4>();
             if count < 0 {
                 return Err(bad(format!("type {i} count {count}")));
             }
-            types.push((size as usize, count, be_i64(&d, o + 12)));
+            types.push((size as usize, count, t.be_i64::<12>()));
             container_offset.push(block_size);
             block_size += size as usize; // at most 32 · MAX_CONTAINER
         }
@@ -117,7 +120,7 @@ impl Entities {
             return Ok(None);
         }
         let mut buf = self.file.read(o, want)?;
-        let Some(n) = usize::try_from(le_i32(&buf, 0)).ok().filter(|&n| n != 0 && n <= want - 4) else {
+        let Some(n) = length(&buf, 0).filter(|&n| n <= want - 4) else {
             return Ok(None);
         };
         buf.truncate(4 + n);
@@ -173,7 +176,7 @@ impl Entities {
             let at = i * self.block_size;
             let want = size.min(span.len().saturating_sub(at)).min(limit.saturating_add(4));
             let record = (want >= 4)
-                .then(|| usize::try_from(le_i32(span, at)).ok().filter(|&len| len != 0 && len <= want - 4))
+                .then(|| length(span, at).filter(|&len| len <= want - 4))
                 .flatten()
                 .map(|len| &span[at + 4..at + 4 + len]);
             each(record)?;
@@ -228,16 +231,24 @@ impl Entities {
     }
 }
 
+/// The length of the record in the container at `at` of `b`, the `int` it
+/// starts with: `None` for 0, an unused container, for a negative length,
+/// and when `b` ends before the `int` does.
+fn length(b: &[u8], at: usize) -> Option<usize> {
+    let n = bytes::array(b, at).map(|n| i32::from_le_bytes(*n))?;
+    usize::try_from(n).ok().filter(|&n| n != 0)
+}
+
 fn player_of(r: &[u8]) -> Option<Player> {
-    let mut c = Cursor(r, 0);
-    Some(Player { last: c.string()?, first: c.string()? })
+    let mut c = Cursor::new(r);
+    Some(Player { last: string(&mut c)?, first: string(&mut c)? })
 }
 
 fn tournament_of(r: &[u8]) -> Option<Tournament> {
-    let mut c = Cursor(r, 0);
-    let place = c.string()?;
-    let title = c.string()?;
-    let start = Date(c.i32()?);
+    let mut c = Cursor::new(r);
+    let place = string(&mut c)?;
+    let title = string(&mut c)?;
+    let start = Date(c.le_i32()?);
     Some(Tournament { title, place, start })
 }
 
@@ -253,11 +264,11 @@ impl Entities {
     /// [`Entities::title`] from a record of at most `limit` bytes.
     pub fn title_within(&self, id: i64, limit: usize) -> Result<Option<String>> {
         Ok(self.raw_within(GAME_TAG, id, limit)?.and_then(|r| {
-            let mut c = Cursor(&r, 0);
-            let count = c.i32()?;
+            let mut c = Cursor::new(&r);
+            let count = c.le_i32()?;
             for _ in 0..count.max(0) {
-                let _language = c.i32()?;
-                let title = c.string()?;
+                let _language = c.le_i32()?;
+                let title = string(&mut c)?;
                 if !title.is_empty() {
                     return Some(title);
                 }
@@ -267,19 +278,8 @@ impl Entities {
     }
 }
 
-struct Cursor<'a>(&'a [u8], usize);
-
-impl Cursor<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let v = self.0.get(self.1..self.1.checked_add(n)?)?;
-        self.1 += n;
-        Some(v)
-    }
-    fn i32(&mut self) -> Option<i32> {
-        self.take(4).map(|v| i32::from_le_bytes(v.try_into().unwrap()))
-    }
-    fn string(&mut self) -> Option<String> {
-        let n = usize::try_from(self.i32()?).ok()?;
-        self.take(n).map(|v| String::from_utf8_lossy(v).into_owned())
-    }
+/// A string: its byte length as an `int`, then the bytes, read as UTF-8.
+fn string(c: &mut Cursor<'_>) -> Option<String> {
+    let n = usize::try_from(c.le_i32()?).ok()?;
+    c.take(n).map(|v| String::from_utf8_lossy(v).into_owned())
 }

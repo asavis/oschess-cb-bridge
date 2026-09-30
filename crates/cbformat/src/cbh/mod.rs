@@ -11,13 +11,13 @@ use std::borrow::Cow;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
+use crate::bytes::{self, Fields};
 use crate::file::{self, DbFile};
 use crate::game::{GameAnnotations, Names, Source};
 use crate::recordfile::{RecordFile, Run, over_limit, span};
 use crate::{Error, Result};
 
 pub mod annotations;
-mod bytes;
 mod decode;
 mod entities;
 mod moves;
@@ -28,7 +28,6 @@ mod text;
 mod wide;
 mod window;
 
-use bytes::{be_u16, be_u24};
 pub use decode::{MAX_VARIATION_DEPTH, start_as_played, walk, walk_from};
 pub use entities::{Entities, Entity};
 pub use moves::GameMoves;
@@ -98,15 +97,17 @@ impl Database {
             file::with_extension(&stem, ext)
         };
         let headers = RecordFile::open(with(".cbh"), ".cbh")?;
-        let header = headers.file().read(0, RECORD_SIZE)?;
-        let record_size = be_u16(&header, 0x03);
+        let mut header = [0u8; RECORD_SIZE];
+        headers.file().read_into(0, &mut header)?;
+        let record_size = header.be_u16::<0x03>();
         if record_size as usize != RECORD_SIZE {
             return Err(Error::Format(format!(".cbh record size {record_size}, expected 46")));
         }
         let moves = DbFile::open(with(".cbg"))?;
         let annotations = DbFile::open_optional(with(".cba"))?;
-        let annotations_len = annotations.as_ref().map(DbFile::len).transpose()?;
-        let wide = if needs_wide(moves.len()?, annotations_len) { Some(wide::Wide::open(with(".cbj"))?) } else { None };
+        let annotations_len = annotations.as_ref().map(DbFile::size).transpose()?;
+        let wide =
+            if needs_wide(moves.size()?, annotations_len) { Some(wide::Wide::open(with(".cbj"))?) } else { None };
         let entities = Entities::open(with)?;
         Ok(Database { stem, headers, moves, annotations, wide, entities, format_version: header[0x05] })
     }
@@ -180,13 +181,13 @@ impl Database {
     fn move_extent(&self, record: &Record) -> Result<(u64, usize)> {
         let at = self.offsets(record)?.0;
         let bad = |what: &str| Error::Format(format!("move record at {at:#x}: {what}"));
-        let file_len = self.moves.len()?;
+        let file_len = self.moves.size()?;
         if at < MIN_FILE_HEADER || at + 4 > file_len {
             return Err(bad("offset out of range"));
         }
         let mut head = [0u8; 4];
         self.moves.read_into(at, &mut head)?;
-        let size = be_u24(&head, 1) as u64;
+        let size = u64::from(head.be_u24::<1>());
         if size < 4 {
             return Err(bad(&format!("size {size} is smaller than the record's head")));
         }
@@ -220,11 +221,13 @@ impl Database {
             return Ok(Some(GameAnnotations { source: Source::Classic, ..GameAnnotations::default() }));
         }
         let bad = |what: &str| Error::Format(format!("annotation record at {at:#x}: {what}"));
-        let file_len = file.len()?;
+        let file_len = file.size()?;
         if at < MIN_FILE_HEADER || at + annotations::HEAD as u64 > file_len {
             return Err(bad("offset out of range"));
         }
-        let size = annotations::record_size(&file.read(at, annotations::HEAD)?);
+        let mut head = [0u8; annotations::HEAD];
+        file.read_into(at, &mut head)?;
+        let size = annotations::record_size(&head);
         if size < annotations::HEAD || at + size as u64 > file_len {
             return Err(bad("runs past end of file"));
         }
@@ -261,7 +264,7 @@ impl Database {
         let offset = |r: &[u8; RECORD_SIZE]| u64::from(Record::from_bytes(0, r).moves_offset());
         let placed = match self.wide {
             Some(_) => None,
-            None => span(run.records().iter().map(offset), run.next().map(offset), self.moves.len()?, MIN_FILE_HEADER),
+            None => span(run.records().iter().map(offset), run.next().map(offset), self.moves.size()?, MIN_FILE_HEADER),
         };
         let (span_at, span) = match placed {
             Some(s) if s.end - s.start <= MAX_BATCH_SPAN => {
@@ -304,12 +307,11 @@ impl Batch<'_> {
     /// [`Database::moves_of_within`] refuses it, however the batch's buffer
     /// holds it.
     pub fn moves_of_within(&self, record: &Record, limit: usize) -> Result<MoveData<'_>> {
-        let inside = u64::from(record.moves_offset())
-            .checked_sub(self.span_at)
-            .and_then(|rel| usize::try_from(rel).ok())
-            .filter(|&rel| rel.saturating_add(4) <= self.span.len());
-        if let Some(rel) = inside {
-            let size = be_u24(&self.span, rel + 1) as usize;
+        let rel = u64::from(record.moves_offset()).checked_sub(self.span_at).and_then(|rel| usize::try_from(rel).ok());
+        if let Some(rel) = rel
+            && let Some(head) = bytes::array::<4>(&self.span, rel)
+        {
+            let size = head.be_u24::<1>() as usize;
             if (4..=limit).contains(&size) && rel + size <= self.span.len() {
                 return Ok(MoveData { bytes: Cow::Borrowed(&self.span[rel..rel + size]) });
             }

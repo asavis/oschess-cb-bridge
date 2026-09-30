@@ -166,7 +166,7 @@ fn other(code: u16) -> Annotation {
 /// A square numbered from 1, file by file (`a1` 1, `a2` 2, `b1` 9).
 fn square(r: &Reader<'_>, v: u8) -> Result<Sq> {
     match v {
-        1..=64 => Ok(from_cb_square(v - 1)),
+        1..=64 => Ok(from_cb_square(v - 1).index() as Sq),
         _ => Err(r.bad("square out of range")),
     }
 }

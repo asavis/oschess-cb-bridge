@@ -25,7 +25,7 @@ impl<const N: usize> RecordFile<N> {
     /// names the file in errors. The record count is taken now.
     pub(crate) fn open(path: PathBuf, name: &str) -> Result<Self> {
         let file = DbFile::open(path)?;
-        let len = file.len()?;
+        let len = file.size()?;
         let size = N as u64;
         if len < size || !len.is_multiple_of(size) {
             return Err(Error::Format(format!("{name} size {len} is not a multiple of {N}")));

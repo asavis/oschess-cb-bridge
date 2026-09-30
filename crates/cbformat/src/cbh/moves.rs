@@ -1,8 +1,8 @@
 //! A game's `.cbg` record: its encoding mode, start position and move stream.
 
-use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
+use chesscore::{Board, Color as CColor, Piece as CPiece};
 
-use super::bytes::{be_u16, be_u24};
+use crate::bytes::{Cursor, Fields};
 use crate::game::{Setup, Start};
 use crate::movetable::{Color, Piece, Sq, from_cb_square};
 use crate::{Error, Result};
@@ -16,8 +16,8 @@ const CHESS960_SIZE: usize = 8;
 #[derive(Clone, Copy)]
 pub struct GameMoves<'a> {
     flags: u8,
-    start: Option<&'a [u8]>,
-    chess960: Option<&'a [u8]>,
+    start: Option<&'a [u8; START_SIZE]>,
+    chess960: Option<&'a [u8; CHESS960_SIZE]>,
     stream: &'a [u8],
 }
 
@@ -29,31 +29,25 @@ impl<'a> GameMoves<'a> {
     /// Splits a whole `.cbg` record, its 4-byte head included.
     pub fn parse(record: &'a [u8]) -> Result<Self> {
         let bad = |what: String| Error::Format(format!("move record: {what}"));
-        if record.len() < 4 {
-            return Err(bad(format!("{} bytes", record.len())));
-        }
-        let size = be_u24(record, 1) as usize;
+        let mut c = Cursor::new(record);
+        let head = c.array::<4>().ok_or_else(|| bad(format!("{} bytes", record.len())))?;
+        let size = head.be_u24::<1>() as usize;
         if size != record.len() {
             return Err(bad(format!("size field {size} for a {}-byte record", record.len())));
         }
-        let flags = record[0];
-        let mut at = 4;
-        let mut take = |n: usize, what: &str| {
-            let part = record.get(at..at + n).ok_or_else(|| bad(format!("{what} runs past the record")))?;
-            at += n;
-            Ok::<_, Error>(part)
-        };
-        let start = if flags & 0x40 != 0 { Some(take(START_SIZE, "start position")?) } else { None };
+        let flags = head[0];
+        let past_end = |what: &str| bad(format!("{what} runs past the record"));
+        let start = if flags & 0x40 != 0 { Some(c.array().ok_or_else(|| past_end("start position"))?) } else { None };
         let mode = flags & 0x3f;
         let chess960 = if mode == 10 || mode == 11 {
             if start.is_none() {
                 return Err(bad("Chess960 game without a start position".into()));
             }
-            Some(take(CHESS960_SIZE, "Chess960 squares")?)
+            Some(c.array().ok_or_else(|| past_end("Chess960 squares"))?)
         } else {
             None
         };
-        Ok(GameMoves { flags, start, chess960, stream: &record[at..] })
+        Ok(GameMoves { flags, start, chess960, stream: c.rest() })
     }
 
     /// The encoding mode, the low 6 bits of the flags.
@@ -81,7 +75,7 @@ impl<'a> GameMoves<'a> {
         let castling = s[2] & 0x0f;
         let move_number = u16::from(s[3]).max(1);
         if let Some(extra) = self.chess960 {
-            let n = be_u16(extra, 6);
+            let n = extra.be_u16::<6>();
             let untouched = side_to_move == Color::White && castling == 0x0f && ep == 0 && move_number == 1;
             if untouched && Board::chess960(n).is_some_and(|b| same_placement(&b, &board)) {
                 return Ok(Start::Chess960(n));
@@ -90,7 +84,7 @@ impl<'a> GameMoves<'a> {
         let mut pieces: Vec<(Sq, Color, Piece)> = Vec::new();
         for (cb, p) in board.iter().enumerate() {
             if let Some((c, p)) = p {
-                pieces.push((from_cb_square(cb as u8), color(*c), piece(*p)));
+                pieces.push((from_cb_square(cb as u8).index() as Sq, Color::from(*c), Piece::from(*p)));
             }
         }
         Ok(Start::Setup(Setup {
@@ -113,7 +107,7 @@ impl<'a> GameMoves<'a> {
 /// squares, which a side's king and rook must still stand on to castle. One
 /// that is not a square on its side's back rank names nothing: a right then
 /// needs no particular king square and uses the outermost rook.
-fn named_squares(extra: &[u8]) -> ([Option<u8>; 2], [Option<u8>; 4]) {
+fn named_squares(extra: &[u8; CHESS960_SIZE]) -> ([Option<u8>; 2], [Option<u8>; 4]) {
     // Bytes 0-1: the kings; 2-5: white king's side, white queen's side, black
     // king's side, black queen's side.
     let file = |i: usize, back_rank: u8| (extra[i] < 64 && extra[i] % 8 == back_rank).then_some(extra[i] / 8);
@@ -152,31 +146,8 @@ pub(super) fn decode_board(bits: &[u8]) -> Result<CbBoard> {
     Ok(board)
 }
 
-/// The ChessBase square (file-major) as a board square.
-pub(super) fn cb_square(cb: u8) -> Square {
-    Square::new(cb / 8, cb % 8)
-}
-
 fn same_placement(b: &Board, cb: &CbBoard) -> bool {
-    (0..64u8).all(|s| b.piece_at(cb_square(s)).map(|(p, c)| (c, p)) == cb[s as usize])
-}
-
-fn color(c: CColor) -> Color {
-    match c {
-        CColor::White => Color::White,
-        CColor::Black => Color::Black,
-    }
-}
-
-fn piece(p: CPiece) -> Piece {
-    match p {
-        CPiece::King => Piece::King,
-        CPiece::Queen => Piece::Queen,
-        CPiece::Knight => Piece::Knight,
-        CPiece::Bishop => Piece::Bishop,
-        CPiece::Rook => Piece::Rook,
-        CPiece::Pawn => Piece::Pawn,
-    }
+    (0..64u8).all(|s| b.piece_at(from_cb_square(s)).map(|(p, c)| (c, p)) == cb[s as usize])
 }
 
 #[cfg(test)]
@@ -194,7 +165,6 @@ mod tests {
         assert_eq!(b[8], Some((CColor::Black, CPiece::Rook)));
         assert_eq!(b[11], Some((CColor::White, CPiece::Knight)));
         assert_eq!(b.iter().flatten().count(), 3);
-        assert_eq!(cb_square(11).to_string(), "b4");
     }
 
     #[test]
