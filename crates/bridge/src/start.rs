@@ -322,10 +322,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-start-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let port = server::bind(0).unwrap()[0].local_addr().unwrap().port();
+        let port = free_port();
         let web = web.map(|w| format!("web = \"{w}\"\n")).unwrap_or_default();
         std::fs::write(dir.join("bridge.toml"), format!("port = {port}\n{web}")).unwrap();
         dir
+    }
+
+    /// A free port for a test's bridge, which its start binds again. It lies
+    /// below the ports the system hands out for port 0 and for connections
+    /// (from 32768 on Linux by default, from 49152 on Windows), so no other
+    /// test takes it between this look and the start, as one took 45288 on a
+    /// loaded machine (#217). A port something holds is passed over.
+    fn free_port() -> u16 {
+        const FIRST: usize = 20000;
+        const COUNT: usize = 32768 - FIRST;
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let start = std::process::id() as usize * 31 + nanos as usize + calls * 997;
+        // 7919 is prime to COUNT, so the steps visit every port once.
+        (0..COUNT)
+            .map(|i| (FIRST + (start + i * 7919) % COUNT) as u16)
+            .find(|&port| server::bind(port).is_ok())
+            .expect("no free port from 20000 to 32767")
     }
 
     /// The port the settings of `dir` name.
