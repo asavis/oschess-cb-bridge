@@ -44,7 +44,8 @@ jobs:
         run: cargo test --locked
       - name: Script tests
         # The Store package's version, the app's as Cargo reads it and its
-        # mapping, and the packing steps (scripts/test_msix.py).
+        # mapping, and the packing steps (scripts/test_msix.py); the stress
+        # runner's parsing and report (scripts/test_stress.py).
         if: runner.os == 'Linux'
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Declared minimum Rust

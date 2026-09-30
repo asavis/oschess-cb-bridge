@@ -93,6 +93,15 @@ A change to the reader is also run with `cbtool verify` over every local
 database available, and the counts go in the pull request body. A reader change
 that has not decoded real databases is not ready.
 
+A test that fails now and then, or a change to connections, threads, time-outs
+or waits, is run with `scripts/stress.py` on Linux, which loads the machine
+itself (#217). First hundreds of runs of the binaries concerned, which is where
+such failures show: `python3 scripts/stress.py --runs 300 --jobs 3 --bin api`.
+Then the whole suite: `python3 scripts/stress.py --runs 50 --jobs 5
+--fail-fast`. The pull request gives both commands and their summaries. A
+failure under load is a finding like any other: name its cause before changing
+a wait.
+
 ## Code
 
 - Treat every database file as untrusted input: no panics, no unchecked
