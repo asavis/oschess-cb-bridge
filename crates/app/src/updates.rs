@@ -105,11 +105,12 @@ pub enum StoreStep {
     /// bridge is idle, then install; Windows closes the bridge and starts it
     /// again.
     InstallQuietly,
-    /// Windows would not install silently, and the user asked (#232): wait
-    /// until the bridge is idle, then ask Windows to install, which shows its
-    /// own dialog; once the user accepts, Windows closes the bridge for the
-    /// install and starts it again. The bridge's page in the Microsoft Store
-    /// opens only when the request could not run.
+    /// Windows would not install silently, and the user asked (#232): ask
+    /// Windows to download the update, then wait until the bridge is idle and
+    /// ask it to install; each request shows Windows' own dialog. Once the
+    /// user accepts the install, Windows closes the bridge for it and starts
+    /// it again. The bridge's page in the Microsoft Store opens only when a
+    /// request could not run.
     RequestInstall,
     /// Windows would not install silently, and nobody asked: a notification
     /// says an update waits, or that it is required when the submission marks
@@ -124,11 +125,11 @@ pub fn store_ready(view: &View, installing: bool, alive: Duration) -> bool {
     idle(view, installing) && alive >= RESTARTABLE_AFTER
 }
 
-/// How a Store install that returned ended. Windows closes the bridge for an
-/// install that takes place, so the process that hears any of these runs on.
+/// How a Store download or install ended. Windows closes the bridge for an
+/// install that takes place, so the process that hears how one ended runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Installed {
-    /// Windows reported the install complete anyway.
+pub enum StoreOutcome {
+    /// Windows reported it complete.
     Completed,
     /// The user declined it in Windows' dialog (#232): nothing failed.
     Declined,
@@ -139,14 +140,14 @@ pub enum Installed {
 /// What installing a Store update needs from Windows, so that its order is
 /// tested without Windows (#153).
 pub trait StoreInstall {
-    /// Downloads the update without installing it; whether it completed.
-    fn download(&self) -> Result<bool, String>;
+    /// Downloads the update without installing it.
+    fn download(&self) -> Result<StoreOutcome, String>;
     /// Asks Windows to start the bridge again after closing it.
     fn register_restart(&self) -> Result<(), String>;
     /// Installs the downloaded update; Windows closes the bridge for it, so
     /// this returns only when the install did not take place, saying how it
     /// ended.
-    fn install(&self) -> Result<Installed, String>;
+    fn install(&self) -> Result<StoreOutcome, String>;
 }
 
 /// A [`StoreInstall`] made of three calls, for a caller whose Windows types
@@ -159,36 +160,38 @@ pub struct StoreCalls<D, R, I> {
 
 impl<D, R, I> StoreInstall for StoreCalls<D, R, I>
 where
-    D: Fn() -> Result<bool, String>,
+    D: Fn() -> Result<StoreOutcome, String>,
     R: Fn() -> Result<(), String>,
-    I: Fn() -> Result<Installed, String>,
+    I: Fn() -> Result<StoreOutcome, String>,
 {
-    fn download(&self) -> Result<bool, String> {
+    fn download(&self) -> Result<StoreOutcome, String> {
         (self.download)()
     }
     fn register_restart(&self) -> Result<(), String> {
         (self.register_restart)()
     }
-    fn install(&self) -> Result<Installed, String> {
+    fn install(&self) -> Result<StoreOutcome, String> {
         (self.install)()
     }
 }
 
-/// Installs a Store update, silently or through Windows' dialog (#232): it
+/// Installs a Store update, silently or through Windows' dialogs (#232): it
 /// downloads first, then waits until `ready` (idle and restartable,
 /// [`store_ready`]) so that no work begun during the download is lost, notes
 /// where it started from in `dir`, asks for the restart and installs. A
 /// process still running after the install forgets the note. `Ok` when the
-/// install reported completion or the user declined it; the error says why
-/// it did not take place otherwise.
+/// install reported completion or the user declined the download or the
+/// install; the error says why it did not take place otherwise.
 pub fn install_store_update(
     store: &impl StoreInstall,
     dir: &Path,
     running: &str,
     wait_ready: impl FnOnce(),
 ) -> Result<(), String> {
-    if !store.download()? {
-        return Err("the Store download did not complete".into());
+    match store.download()? {
+        StoreOutcome::Completed => {}
+        StoreOutcome::Declined => return Ok(()),
+        StoreOutcome::Incomplete => return Err("the Store download did not complete".into()),
     }
     wait_ready();
     note_from(dir, running)?;
@@ -196,9 +199,25 @@ pub fn install_store_update(
     let installed = store.install();
     forget(dir);
     match installed? {
-        Installed::Completed | Installed::Declined => Ok(()),
-        Installed::Incomplete => Err("the Store install did not complete".into()),
+        StoreOutcome::Completed | StoreOutcome::Declined => Ok(()),
+        StoreOutcome::Incomplete => Err("the Store install did not complete".into()),
     }
+}
+
+/// Runs `job` on the thread `dispatch` hands it to, and waits on this one for
+/// what it returns (#232): Microsoft requires the Store requests that show
+/// Windows' dialogs to start on the UI thread, which must never wait for
+/// them. A dispatch that fails, or that drops the job without running it, as
+/// an event loop that has ended does, is an error, never a wait without end.
+pub fn run_on<T: Send + 'static>(
+    dispatch: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    dispatch(Box::new(move || {
+        let _ = tx.send(job());
+    }))?;
+    rx.recv().map_err(|_| "the job was dropped without running".to_string())?
 }
 
 /// The step for a look that `found` an update or not, when Windows allows
@@ -457,11 +476,11 @@ mod tests {
     struct FakeStore<'a> {
         events: &'a std::cell::RefCell<Vec<String>>,
         dir: &'a Path,
-        downloaded: bool,
+        downloaded: StoreOutcome,
     }
 
     impl StoreInstall for FakeStore<'_> {
-        fn download(&self) -> Result<bool, String> {
+        fn download(&self) -> Result<StoreOutcome, String> {
             self.events.borrow_mut().push("download".into());
             Ok(self.downloaded)
         }
@@ -469,10 +488,10 @@ mod tests {
             self.events.borrow_mut().push("register".into());
             Ok(())
         }
-        fn install(&self) -> Result<Installed, String> {
+        fn install(&self) -> Result<StoreOutcome, String> {
             let noted = std::fs::read_to_string(self.dir.join(FROM)).unwrap_or_default();
             self.events.borrow_mut().push(format!("install from {noted}"));
-            Ok(Installed::Incomplete)
+            Ok(StoreOutcome::Incomplete)
         }
     }
 
@@ -486,56 +505,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
-        let store = FakeStore { events: &events, dir: &dir, downloaded: true };
+        let store = FakeStore { events: &events, dir: &dir, downloaded: StoreOutcome::Completed };
         let result = install_store_update(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into()));
         assert_eq!(result, Err("the Store install did not complete".into()));
         assert_eq!(*events.borrow(), ["download", "ready", "register", "install from 1.1.0"]);
         assert!(!dir.join(FROM).exists(), "a process still running forgets the note");
 
         events.borrow_mut().clear();
-        let store = FakeStore { events: &events, dir: &dir, downloaded: false };
+        let store = FakeStore { events: &events, dir: &dir, downloaded: StoreOutcome::Incomplete };
         assert!(install_store_update(&store, &dir, "1.1.0", || events.borrow_mut().push("ready".into())).is_err());
         assert_eq!(*events.borrow(), ["download"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A request through Windows' dialog (#232) downloads in the call that
-    /// installs, so its own download is a no-op, and it keeps the silent
-    /// install's order: ready, note, restart, then the request. A user who
-    /// declines the dialog is no failure; a request that could not run is,
-    /// so that the Store page opens instead. A process still running
-    /// afterwards forgets the note either way.
+    /// A request through Windows' dialogs (#232) keeps the silent install's
+    /// order: the download, which asks the user, then ready, note, restart
+    /// and the install, which asks again, so work begun during the download
+    /// is not cut off. A user who declines either dialog is no failure; a
+    /// request that could not run is, so that the Store page opens instead.
+    /// A declined or failed download installs nothing and neither writes nor
+    /// forgets a note; a process still running after the install forgets its
+    /// own.
     #[test]
-    fn a_store_request_keeps_the_order_and_declining_it_is_no_failure() {
+    fn a_store_request_downloads_then_waits_then_installs_and_declining_is_no_failure() {
+        use StoreOutcome::*;
         let dir = std::env::temp_dir().join(format!("bridge-app-store-request-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let events = std::cell::RefCell::new(Vec::new());
-        let request = |outcome: Result<Installed, String>| {
+        let request = |download: Result<StoreOutcome, String>, install: Result<StoreOutcome, String>| {
             events.borrow_mut().clear();
             let store = StoreCalls {
-                download: || Ok(true),
+                download: || {
+                    events.borrow_mut().push("download".to_string());
+                    download.clone()
+                },
                 register_restart: || {
                     events.borrow_mut().push("register".to_string());
                     Ok(())
                 },
                 install: || {
                     let noted = std::fs::read_to_string(dir.join(FROM)).unwrap_or_default();
-                    events.borrow_mut().push(format!("request from {noted}"));
-                    outcome.clone()
+                    events.borrow_mut().push(format!("install from {noted}"));
+                    install.clone()
                 },
             };
-            let result = install_store_update(&store, &dir, "1.2.0", || events.borrow_mut().push("ready".into()));
-            assert!(!dir.join(FROM).exists(), "a process still running forgets the note");
-            result
+            install_store_update(&store, &dir, "1.2.0", || events.borrow_mut().push("ready".into()))
         };
-        assert_eq!(request(Ok(Installed::Declined)), Ok(()));
-        assert_eq!(*events.borrow(), ["ready", "register", "request from 1.2.0"]);
-        assert_eq!(request(Ok(Installed::Completed)), Ok(()));
-        assert_eq!(request(Ok(Installed::Incomplete)), Err("the Store install did not complete".into()));
-        assert_eq!(request(Err("the dialog could not open".into())), Err("the dialog could not open".into()));
-        assert_eq!(*events.borrow(), ["ready", "register", "request from 1.2.0"]);
+        // The error of a request started off the UI thread.
+        let failed = "0x80070578".to_string();
+
+        for (installed, result) in [
+            (Ok(Completed), Ok(())),
+            (Ok(Declined), Ok(())),
+            (Ok(Incomplete), Err("the Store install did not complete".to_string())),
+            (Err(failed.clone()), Err(failed.clone())),
+        ] {
+            assert_eq!(request(Ok(Completed), installed.clone()), result, "install {installed:?}");
+            assert_eq!(*events.borrow(), ["download", "ready", "register", "install from 1.2.0"], "{installed:?}");
+            assert!(!dir.join(FROM).exists(), "a process still running forgets the note");
+        }
+
+        note_from(&dir, "1.0.0").unwrap();
+        for (downloaded, result) in [
+            (Ok(Declined), Ok(())),
+            (Ok(Incomplete), Err("the Store download did not complete".to_string())),
+            (Err(failed.clone()), Err(failed.clone())),
+        ] {
+            assert_eq!(request(downloaded.clone(), Ok(Completed)), result, "download {downloaded:?}");
+            assert_eq!(*events.borrow(), ["download"], "{downloaded:?}: no wait, no restart, no install");
+            assert_eq!(
+                std::fs::read_to_string(dir.join(FROM)).unwrap(),
+                "1.0.0",
+                "{downloaded:?}: the note is untouched"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job handed to another thread runs there, and what it returns comes
+    /// back; a dispatch that fails, or drops the job without running it, is an
+    /// error rather than a wait without end (#232).
+    #[test]
+    fn a_job_run_on_another_thread_answers_or_fails() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let here = std::thread::current().id();
+        let spawn = |job: Box<dyn FnOnce() + Send>| {
+            std::thread::spawn(job);
+            Ok(())
+        };
+        assert_eq!(run_on(spawn, move || Ok(std::thread::current().id() != here)), Ok(true));
+        assert_eq!(run_on(spawn, || Err::<(), _>("0x80070578".to_string())), Err("0x80070578".to_string()));
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let job = |ran: &Arc<AtomicBool>| {
+            let ran = Arc::clone(ran);
+            move || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        assert_eq!(run_on(|_| Err("no event loop".to_string()), job(&ran)), Err("no event loop".to_string()));
+        let dropped = |job: Box<dyn FnOnce() + Send>| {
+            drop(job);
+            Ok(())
+        };
+        assert_eq!(run_on(dropped, job(&ran)), Err("the job was dropped without running".to_string()));
+        assert!(!ran.load(Ordering::SeqCst), "neither job ran");
     }
 
     /// The start after a Store install says it was updated when it runs

@@ -219,10 +219,12 @@ as the installer, and the app tells where it came from by its package identity
   is not metered), the app installs the update itself once it is idle;
   Windows closes it for the install and starts it again. Otherwise an
   automatic look notifies that an update waits, and «Check for updates» asks
-  Windows to install it once the bridge is idle (#232): Windows shows its own
-  update dialog, and when the user accepts, it closes the bridge for the
-  install and starts it again. Only when that request cannot run does the
-  bridge's page in the Store app open instead;
+  Windows for it (#232). Windows asks the user's permission to download the
+  update and, once it is downloaded and the bridge is idle, to install it;
+  when the user accepts the install, Windows closes the bridge for it and
+  starts it again. Declining either dialog leaves the bridge running on its
+  version. Only when a request cannot run does the bridge's page in the Store
+  app open instead;
 - «Start with Windows» enables the package's startup task instead of writing
   the Run value, which inside a package Windows would never read at sign-in. A
   task the user turned off in Windows' Startup apps settings can only be turned

@@ -11,7 +11,7 @@ pub const STARTUP_TASK: &str = "oschessBridgeStartup";
 
 /// The bridge's page in the Microsoft Store app (#153), which «Check for
 /// updates» opens when Windows would not install silently and could not show
-/// its own update dialog either (#232).
+/// its own update dialogs either (#232).
 pub const STORE_PAGE: &str = "ms-windows-store://pdp/?productid=9P65J7XR0RPZ";
 
 /// Where the app came from.
