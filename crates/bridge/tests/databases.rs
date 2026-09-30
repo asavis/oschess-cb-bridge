@@ -1009,7 +1009,7 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
 #[cfg(windows)]
 #[test]
 fn a_database_holds_no_file_open_while_nothing_reads_it() {
-    use common::{WAIT_LIMIT, answered, classic_fixture, fixture, index_dir, start_with_dir, until};
+    use common::{WAIT_LIMIT, answered, app_of, classic_fixture, fixture, index_dir, until};
     let dbs = [
         fixture("closed-2cbh", &[]),
         classic_fixture("closed-cbh", &[]),
@@ -1017,7 +1017,8 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
     ];
     let paths = [dbs[0].dir().join("db.2cbh"), dbs[1].dir().join("db.cbh"), dbs[2].dir().join("db.pgn")];
     let dir = index_dir("closed");
-    let (port, _app) = start_with_dir(paths.clone(), &dir);
+    let bridge = TestBridge::in_dir(app_of(paths.clone()), &dir);
+    let port = bridge.port;
     // The list opens every database, the games read each of them.
     let (_, body) = get(port, "/v1/databases");
     assert!(body.contains(r#""state":"ready""#), "{body}");
@@ -1028,6 +1029,7 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
         dbs.iter().flat_map(|db| std::fs::read_dir(db.dir()).unwrap()).map(|entry| entry.unwrap().path()).collect();
     assert!(files.len() >= 10, "{files:?}");
     until("no database file is open", WAIT_LIMIT, || files.iter().all(|file| opens_alone(file)));
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1039,11 +1041,12 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
 /// files, which is when a file is opened again at its path.
 #[test]
 fn a_file_replaced_by_a_copy_is_read_again() {
-    use common::{answered, fixture, index_dir, start_with_dir, without_generation};
+    use common::{answered, app_of, fixture, index_dir, without_generation};
     let db = fixture("replaced-copy", &[]);
     let path = db.dir().join("db.2cbh");
     let dir = index_dir("replaced-copy");
-    let (port, _app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::in_dir(app_of([path.clone()]), &dir);
+    let port = bridge.port;
     let games = format!("/v1/databases/{}/games", id_of(&path));
     let first = answered(port, &games);
     #[cfg(windows)]
@@ -1056,6 +1059,7 @@ fn a_file_replaced_by_a_copy_is_read_again() {
     let again = answered(port, &games);
     assert_ne!(first, again, "the generation is new");
     assert_eq!(without_generation(&first), without_generation(&again));
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1066,7 +1070,7 @@ fn a_file_replaced_by_a_copy_is_read_again() {
 /// `503 database_changing` for good (#241).
 #[test]
 fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
-    use common::{answered, index_dir, serve_shared};
+    use common::{answered, index_dir};
     let root = Root::new("pgn-back");
     std::fs::create_dir_all(root.path("bases")).unwrap();
     let pgn = root.path("bases/Games.pgn");
@@ -1075,8 +1079,8 @@ fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
     std::fs::write(root.path("bridge.toml"), &listed).unwrap();
     let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
     let dir = index_dir("pgn-back");
-    catalog.use_data_dir(&dir);
-    let (port, app) = serve_shared(App::new("test", policy(), catalog));
+    let bridge = TestBridge::in_dir(App::new("test", policy(), catalog), &dir);
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&pgn);
     let games = format!("/v1/databases/{id}/games");
     let first = answered(port, &games);
@@ -1101,6 +1105,7 @@ fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
     std::fs::write(root.path("bridge.toml"), &listed).unwrap();
     assert!(app.catalog.entries().iter().any(|e| e.id == id && e.listed()), "the file is back");
     assert_eq!(answered(port, &games), first);
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
