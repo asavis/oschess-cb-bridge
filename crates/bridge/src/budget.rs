@@ -4,6 +4,8 @@
 
 use std::sync::Mutex;
 
+use crate::sync::lock;
+
 pub const RESPONSE_BUDGET: usize = 128 << 20;
 
 static HELD: Mutex<usize> = Mutex::new(0);
@@ -14,7 +16,7 @@ pub struct Reservation(usize);
 
 /// Reserves `bytes`, or `None` when the budget cannot hold them now.
 pub fn reserve(bytes: usize) -> Option<Reservation> {
-    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = lock(&HELD);
     if bytes > RESPONSE_BUDGET - *held {
         return None;
     }
@@ -24,7 +26,7 @@ pub fn reserve(bytes: usize) -> Option<Reservation> {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        *HELD.lock().unwrap_or_else(|e| e.into_inner()) -= self.0;
+        *lock(&HELD) -= self.0;
     }
 }
 

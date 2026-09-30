@@ -10,6 +10,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::sync::lock;
+
 /// The budget when `OSCHESS_BRIDGE_SEARCH_MIB` does not set another: 1 GiB. A
 /// Mega Database of 12 million games needs about 330 MB with three sort orders.
 pub const DEFAULT_BUDGET_MIB: usize = 1024;
@@ -104,7 +106,7 @@ impl Drop for Hold {
 }
 
 fn take(bytes: usize) -> bool {
-    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = lock(&HELD);
     if bytes > budget() - *held {
         return false;
     }
@@ -113,12 +115,12 @@ fn take(bytes: usize) -> bool {
 }
 
 fn give(bytes: usize) {
-    *HELD.lock().unwrap_or_else(|e| e.into_inner()) -= bytes;
+    *lock(&HELD) -= bytes;
 }
 
 /// Bytes held in the budget now.
 pub fn held() -> usize {
-    *HELD.lock().unwrap_or_else(|e| e.into_inner())
+    *lock(&HELD)
 }
 
 /// A value and the budget its memory holds, returned with it.
@@ -156,7 +158,7 @@ impl<'a> Allowance<'a> {
     pub fn take(&mut self, bytes: usize) -> Result<(), Refused> {
         if bytes > self.left {
             let step = (bytes - self.left).max(step());
-            self.shared.lock().unwrap_or_else(|e| e.into_inner()).grow(step)?;
+            lock(self.shared).grow(step)?;
             self.left += step;
         }
         self.left -= bytes;
@@ -166,7 +168,7 @@ impl<'a> Allowance<'a> {
 
 impl Drop for Allowance<'_> {
     fn drop(&mut self) {
-        let mut hold = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hold = lock(self.shared);
         let keep = hold.bytes() - self.left;
         hold.shrink(keep);
     }
@@ -180,14 +182,13 @@ pub trait Evict: Send + Sync {
 static CACHES: Mutex<Vec<Weak<dyn Evict>>> = Mutex::new(Vec::new());
 
 pub fn register(cache: Weak<dyn Evict>) {
-    let mut caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut caches = lock(&CACHES);
     caches.retain(|c| c.strong_count() > 0);
     caches.push(cache);
 }
 
 fn evict_all() {
-    let live: Vec<Arc<dyn Evict>> =
-        CACHES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    let live: Vec<Arc<dyn Evict>> = lock(&CACHES).iter().filter_map(Weak::upgrade).collect();
     for cache in live {
         cache.evict();
     }
@@ -245,7 +246,7 @@ pub struct Streams {
 impl Streams {
     /// A new search in `stream`, which supersedes the one before it there.
     pub fn newest(&self, stream: &str) -> Cancel {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counters = lock(&self.counters);
         let entry = match counters.iter().position(|(s, _)| s == stream) {
             Some(i) => counters.remove(i).unwrap_or_else(|| (stream.to_string(), Arc::default())),
             None => (stream.to_string(), Arc::default()),

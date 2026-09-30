@@ -16,7 +16,7 @@ pub use crate::machine::{Limits, limits};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chesscore::{Board, Move, Piece, Square};
@@ -24,6 +24,7 @@ use chesscore::{Board, Move, Piece, Square};
 use crate::http::Sink;
 use crate::json::Obj;
 use crate::machine;
+use crate::sync::lock;
 
 use uci::{Pacer, Process, bestmove, info_json};
 
@@ -244,10 +245,6 @@ struct Inner {
     /// The engine's own name, once it has said it.
     name: Mutex<Option<String>>,
     slot: Mutex<Option<Process>>,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Engine {

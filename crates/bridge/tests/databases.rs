@@ -360,7 +360,7 @@ fn a_classic_database_follows_the_files_it_reads() {
     assert_eq!(entry.format.name(), "cbh");
     assert_eq!(states(&catalog), ["cloudOnly"]);
     let files: Vec<PathBuf> = CLASSIC.iter().map(|ext| db.with_extension(ext)).collect();
-    assert_eq!(entry.size(), size_of(&files));
+    assert_eq!(entry.open_sized().1, Some(size_of(&files)));
     assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
     wait_for(&entry, State::Ready);
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1, "the annotators' file only");
@@ -407,7 +407,7 @@ fn a_cloud_only_database_downloads_when_opened() {
     let catalog = Catalog::with_sources(root.sources(), cloud.clone());
     let entry = catalog.get(&id_of(&db)).unwrap();
     assert_eq!(states(&catalog), ["cloudOnly"]);
-    assert_eq!(entry.size(), size_of(&files));
+    assert_eq!(entry.open_sized().1, Some(size_of(&files)));
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0, "listing fetched a file");
 
     cloud.hold(true);

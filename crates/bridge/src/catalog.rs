@@ -11,11 +11,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cbformat::view::Base;
 
-use crate::fetch::{Cloud, Progress, Serial, System};
+use crate::fetch::{Cloud, Progress, System};
 use crate::pgnindex::{self, Opening};
 use crate::search::Indexes;
 use crate::search::heads::{self, Lookup};
+use crate::serial::Serial;
 use crate::sources::{Listed, Read, Sources};
+use crate::sync::lock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -123,6 +125,7 @@ struct Held {
     /// The download running or queued.
     running: Mutex<Option<Arc<Progress>>>,
     /// The last download read every file, yet a file kept its cloud-only mark.
+    /// Only tests read it, through [`Entry::marks_kept`].
     kept: AtomicBool,
 }
 
@@ -257,7 +260,10 @@ impl Entry {
     }
 
     /// Whether the last download read every file, yet the provider kept a
-    /// file marked cloud-only, so that the database stayed cloud-only.
+    /// file marked cloud-only, so that the database stayed cloud-only. For
+    /// tests: the bridge reports such a database `cloudOnly` as any other,
+    /// and its log says why.
+    #[doc(hidden)]
     pub fn marks_kept(&self) -> bool {
         self.held.kept.load(Ordering::Relaxed)
     }
@@ -265,11 +271,6 @@ impl Entry {
     /// The download running or queued, if any.
     pub fn progress(&self) -> Option<Arc<Progress>> {
         lock(&self.held.running).clone()
-    }
-
-    /// The size of the database's files, in bytes.
-    pub fn size(&self) -> u64 {
-        self.files().size()
     }
 
     /// Queues the reading of the database's cloud-only files, in order. The
@@ -339,10 +340,6 @@ impl Drop for Done {
     fn drop(&mut self) {
         *lock(&self.0.running) = None;
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The metadata of the database at `path`, of `format`: its generation and
@@ -418,7 +415,8 @@ impl Catalog {
 
     /// The databases of `sources`, read now and again whenever they change.
     pub fn with_sources(sources: Sources, cloud: Arc<dyn Cloud>) -> Catalog {
-        let shared = Arc::new(Shared { cloud, downloads: Arc::default(), pgn: pgnindex::Registry::default() });
+        let downloads = Arc::new(Serial::labelled("download"));
+        let shared = Arc::new(Shared { cloud, downloads, pgn: pgnindex::Registry::default() });
         let catalog = Catalog {
             explorer: crate::explorer::Registry::default(),
             heads: Arc::default(),

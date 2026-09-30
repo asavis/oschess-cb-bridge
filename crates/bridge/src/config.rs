@@ -145,7 +145,7 @@ impl From<Error> for String {
 /// The lock every write of `bridge.toml` in this process holds.
 fn changing() -> std::sync::MutexGuard<'static, ()> {
     static CHANGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    CHANGING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::sync::lock(&CHANGING)
 }
 
 /// Writes the default file at `path` unless there is a file; the caller
@@ -236,7 +236,7 @@ impl Watched {
     /// reader learns of a change once, whichever of them read it. The first
     /// read that succeeds counts as a change.
     pub fn look(&self, seen: &mut Seen) -> Look {
-        let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = crate::sync::lock(&self.last);
         let signature = crate::sources::signature(Some(&self.path));
         if last.signature != Some(signature) {
             match read_file(&self.path) {

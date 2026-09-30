@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::search::memory::{Evict, Hold, budget, register};
+use crate::sync::lock;
 
 /// A cached game: its rating, for ranking, and its `topGames` entry.
 pub type Game = (u16, Arc<str>);
@@ -76,8 +77,4 @@ impl Rendered {
     pub fn bytes(&self) -> usize {
         lock(&self.inner).hold.bytes()
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }

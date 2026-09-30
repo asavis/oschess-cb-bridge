@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::sync::{lock, unpoisoned};
+
 use super::SearchError;
 use super::memory::{Cancel, Hold, Refused, budget, step};
 
@@ -39,7 +41,7 @@ impl Slots {
     /// Returns the workers above `count`.
     fn shrink(&mut self, count: usize) {
         if count < self.0 {
-            *TAKEN.lock().unwrap_or_else(|e| e.into_inner()) -= self.0 - count;
+            *lock(&TAKEN) -= self.0 - count;
             self.0 = count;
             RETURNED.notify_all();
         }
@@ -48,7 +50,7 @@ impl Slots {
 
 impl Drop for Slots {
     fn drop(&mut self) {
-        *TAKEN.lock().unwrap_or_else(|e| e.into_inner()) -= self.0;
+        *lock(&TAKEN) -= self.0;
         RETURNED.notify_all();
     }
 }
@@ -57,7 +59,7 @@ impl Drop for Slots {
 /// to `wait` for the first, then `WorkersBusy`.
 fn acquire(want: usize, cancel: &Cancel, wait: Duration) -> Result<Slots, SearchError> {
     let deadline = Instant::now().checked_add(wait);
-    let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = lock(&TAKEN);
     loop {
         let free = threads().saturating_sub(*taken);
         if free > 0 {
@@ -74,9 +76,7 @@ fn acquire(want: usize, cancel: &Cancel, wait: Duration) -> Result<Slots, Search
         }
         // A background build may hold the workers: it does not give way to
         // the work of a thread that waits for them (#149).
-        taken = crate::foreground::aside(|| RETURNED.wait_timeout(taken, left.min(RECHECK)))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        taken = unpoisoned(crate::foreground::aside(|| RETURNED.wait_timeout(taken, left.min(RECHECK)))).0;
     }
 }
 
@@ -91,7 +91,7 @@ pub fn one(cancel: &Cancel) -> Result<Slots, SearchError> {
 
 /// Workers taken now, for tests and diagnostics.
 pub fn taken() -> usize {
-    *TAKEN.lock().unwrap_or_else(|e| e.into_inner())
+    *lock(&TAKEN)
 }
 
 /// What a worker is given: its number and the number of workers, a flag that
@@ -316,7 +316,7 @@ where
     let per = n.div_ceil(count);
     let chunks: Vec<Mutex<Option<&mut [T]>>> = items.chunks_mut(per).map(|c| Mutex::new(Some(c))).collect();
     each(chunks.len(), cancel, |k| {
-        if let Some(chunk) = chunks[k].lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(chunk) = lock(&chunks[k]).take() {
             chunk.sort_unstable_by(cmp);
         }
         Ok(())
@@ -416,7 +416,7 @@ where
     }
     run(parts, 0, cancel, |w| {
         for k in (w.index..parts).step_by(w.count) {
-            let part = slots[k].lock().unwrap_or_else(|e| e.into_inner()).take();
+            let part = lock(&slots[k]).take();
             if let Some(part) = part {
                 merge_part(k, part, &|| w.stopped() || cancel.is_cancelled())?;
             }

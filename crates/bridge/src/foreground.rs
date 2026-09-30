@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::sync::{lock, unpoisoned};
+
 /// The foreground work running, and the threads waiting for it to end.
 struct Foreground {
     running: AtomicUsize,
@@ -56,7 +58,7 @@ impl Foreground {
             if left.is_zero() {
                 return;
             }
-            held = self.changed.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
+            held = unpoisoned(self.changed.wait_timeout(held, left)).0;
         }
     }
 
@@ -66,7 +68,7 @@ impl Foreground {
     }
 
     fn held(&self) -> MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.lock)
     }
 }
 
@@ -198,7 +200,7 @@ pub(crate) mod tests {
     /// while the thread waits aside, even when the wait panics.
     #[test]
     fn work_set_aside_does_not_count() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = lock(&SERIAL);
         std::thread::spawn(|| {
             assert_eq!(aside(|| OWN.get()), 0);
             let first = begin();

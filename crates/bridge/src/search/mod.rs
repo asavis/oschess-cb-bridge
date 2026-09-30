@@ -34,6 +34,7 @@ use query::{Field, Query, Sort, SortKey};
 use scan::Control;
 
 use crate::store::{Head, Store, with_store};
+use crate::sync::lock;
 
 /// Searches whose results are kept for paging.
 const KEPT_RESULTS: usize = 4;
@@ -79,7 +80,7 @@ pub struct Indexes {
 /// wait for the one build instead of repeating it; a failed build stores
 /// nothing, and the next caller builds again.
 pub(super) fn cached<T, E>(slot: &Slot<T>, build: impl FnOnce() -> Result<T, E>) -> Result<Arc<T>, E> {
-    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = lock(slot);
     if let Some(v) = guard.as_ref() {
         return Ok(v.clone());
     }
@@ -91,7 +92,7 @@ pub(super) fn cached<T, E>(slot: &Slot<T>, build: impl FnOnce() -> Result<T, E>)
 impl Indexes {
     /// Passes read `heads` from now on, while it stays usable.
     pub fn set_heads(&self, heads: Arc<heads::Heads>) {
-        *self.heads.lock().unwrap_or_else(|e| e.into_inner()) = Some(heads);
+        *lock(&self.heads) = Some(heads);
     }
 
     /// Whether a heads file is set that passes still read.
@@ -103,7 +104,7 @@ impl Indexes {
     /// A file found broken is let go here, so that its handles close and
     /// Windows lets its replacement take its name.
     fn heads(&self) -> Option<Arc<heads::Heads>> {
-        let mut slot = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = lock(&self.heads);
         if slot.as_ref().is_some_and(|h| !h.usable()) {
             *slot = None;
         }
@@ -180,7 +181,7 @@ impl Indexes {
 
     /// Every record number in `sort` order.
     fn order<S: Store>(&self, db: &S, ctl: &Control<'_>, sort: Sort) -> Result<Numbers, SearchError> {
-        let slot = self.orders.lock().unwrap_or_else(|e| e.into_inner()).entry(sort).or_default().clone();
+        let slot = lock(&self.orders).entry(sort).or_default().clone();
         cached(&slot, || {
             // Refused before any name is read when the order itself cannot fit.
             if order::build_bytes(db.record_count()) > memory::budget() {
@@ -366,13 +367,8 @@ fn select_in<S: Store>(
     }
     let key = format!("{}|{}", sort.name(), q.trim());
     let at = position.map(|p| p.key());
-    let kept = idx
-        .results
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|k| k.query == key && k.position == at)
-        .map(|k| (k.numbers.clone(), k.games));
+    let kept =
+        lock(&idx.results).iter().find(|k| k.query == key && k.position == at).map(|k| (k.numbers.clone(), k.games));
     if let Some((numbers, games)) = kept {
         // A kept result answers at once, but not a request a newer one in its
         // stream has superseded meanwhile: that one gets `409 superseded`
@@ -390,7 +386,7 @@ fn select_in<S: Store>(
         members => search(db, idx, &ctl, &query, sort, members.as_ref())?,
     });
     drop(members);
-    let mut results = idx.results.lock().unwrap_or_else(|e| e.into_inner());
+    let mut results = lock(&idx.results);
     results.push_back(Kept { query: key, position: at, numbers: numbers.clone(), games });
     while results.len() > KEPT_RESULTS || results.iter().map(|k| k.numbers.len()).sum::<usize>() > KEPT_NUMBERS {
         if results.pop_front().is_none() {
@@ -510,7 +506,7 @@ fn gather<I: Iterator<Item = u32>>(
         rest = after;
     }
     workers::each(sizes.len(), cancel, |i| {
-        let mut place = places[i].lock().unwrap_or_else(|e| e.into_inner());
+        let mut place = lock(&places[i]);
         let n = place.len();
         match descending {
             false => place.iter_mut().zip(part(i)).for_each(|(o, x)| *o = x),

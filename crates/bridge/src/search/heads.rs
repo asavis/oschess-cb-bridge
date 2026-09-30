@@ -23,6 +23,7 @@ use cbformat::file::DbFile;
 use super::slim::{ROW, Slim};
 use crate::indexdir::{self, Unlisted, crc32, u32_at, u64_at};
 use crate::store::Store;
+use crate::sync::lock;
 
 const MAGIC: [u8; 8] = *b"OSCBHDS\0";
 const VERSION: u32 = 1;
@@ -122,11 +123,11 @@ pub enum Built {
 /// no path.
 pub fn build<S: Store>(db: &S, generation: u64, path: &Path, still: &dyn Fn() -> bool) -> Result<Built, String> {
     let records = db.record_count();
-    let partial = partial_path(path);
+    let partial = indexdir::partial(path);
     let result = write(db, generation, records, &partial, still);
     match result {
         Ok(true) => {
-            replace(&partial, path).map_err(|e| format!("renaming the new heads file: {e}"))?;
+            indexdir::replace(&partial, path).map_err(|e| format!("renaming the new heads file: {e}"))?;
             Heads::open(path, generation, records)
                 .map(Built::Ready)
                 .ok_or_else(|| "the new file does not read back".into())
@@ -151,24 +152,6 @@ pub fn build_base(
 ) -> Result<Built, String> {
     crate::store::with_store!(db, s => build(s, generation, path, still))
 }
-
-/// Renames `partial` to `path`. A pass still reading a broken file that was
-/// removed holds its name on Windows until the pass ends, so a refusal is
-/// tried again for a few seconds.
-fn replace(partial: &Path, path: &Path) -> std::io::Result<()> {
-    let until = Instant::now() + REPLACE_WAIT;
-    loop {
-        match std::fs::rename(partial, path) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && Instant::now() < until => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            result => return result,
-        }
-    }
-}
-
-/// How long [`replace`] waits for the readers of a removed file.
-const REPLACE_WAIT: Duration = Duration::from_secs(10);
 
 /// Writes the file; `false` when a record does not fit a row or the database
 /// changed meanwhile.
@@ -234,12 +217,6 @@ pub fn path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.heads"))
 }
 
-fn partial_path(path: &Path) -> PathBuf {
-    let mut p = path.as_os_str().to_owned();
-    p.push(".partial");
-    PathBuf::from(p)
-}
-
 /// Partial files being written now, which the sweep leaves alone: a names
 /// file's writer is no build the registry tracks (#108).
 static WRITING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -249,14 +226,14 @@ pub struct Writing(PathBuf);
 
 impl Writing {
     pub fn new(path: PathBuf) -> Writing {
-        WRITING.lock().unwrap_or_else(|e| e.into_inner()).push(path.clone());
+        lock(&WRITING).push(path.clone());
         Writing(path)
     }
 }
 
 impl Drop for Writing {
     fn drop(&mut self) {
-        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writing = lock(&WRITING);
         if let Some(i) = writing.iter().position(|p| *p == self.0) {
             writing.swap_remove(i);
         }
@@ -264,7 +241,7 @@ impl Drop for Writing {
 }
 
 fn being_written(path: &Path) -> bool {
-    WRITING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == path)
+    lock(&WRITING).iter().any(|p| p == path)
 }
 
 /// What the heads sweep keeps and removes: the heads file and the names
@@ -310,11 +287,11 @@ pub enum Lookup {
 impl Registry {
     /// Sets the size from which databases get a heads file, for tests.
     pub fn set_min_records(&self, n: u32) {
-        *self.min_records.lock().unwrap_or_else(|e| e.into_inner()) = Some(n);
+        *lock(&self.min_records) = Some(n);
     }
 
     fn min_records(&self) -> u32 {
-        self.min_records.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(MIN_RECORDS)
+        lock(&self.min_records).unwrap_or(MIN_RECORDS)
     }
 
     /// The heads of database `id` at `generation` with `records` records: the
@@ -324,7 +301,7 @@ impl Registry {
         if records < self.min_records() {
             return Lookup::None;
         }
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut states = lock(&self.states);
         match states.get(id) {
             Some(State::Ready(h)) if h.generation == generation && h.usable() => return Lookup::Ready(Arc::clone(h)),
             Some(State::Ready(h)) if h.generation == generation => {
@@ -351,7 +328,7 @@ impl Registry {
 
     /// Records how the build of `id` at `generation` ended.
     pub fn built(&self, id: &str, generation: u64, result: Result<Built, String>) -> Option<Arc<Heads>> {
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut states = lock(&self.states);
         let (state, ready) = match result {
             Ok(Built::Ready(h)) => {
                 let h = Arc::new(h);
@@ -381,12 +358,12 @@ impl Registry {
     pub fn sweep(&self, dir: &Path, listed: &std::collections::HashSet<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let now = Instant::now();
-        let mut unlisted = self.unlisted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut unlisted = lock(&self.unlisted);
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(id) = entry_id(name) else { continue };
-            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            let mut states = lock(&self.states);
             if matches!(states.get(id), Some(State::Working(_))) {
                 continue;
             }
@@ -407,7 +384,7 @@ impl Registry {
 }
 
 /// Records a heads build whose job panics as failed, as the job unwinds to
-/// the queue that catches it ([`crate::fetch::Serial`]) (#172): left
+/// the queue that catches it ([`crate::serial::Serial`]) (#172): left
 /// working, its database would never have its file built, and keep a partial
 /// file that no sweep removes. The next build starts after [`RETRY_AFTER`],
 /// and the sweep removes the partial file meanwhile. A normal return leaves
@@ -493,7 +470,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-heads-bug-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let id = crate::catalog::id_of(&db_path);
-        let partial = partial_path(&path(&dir, &id));
+        let partial = indexdir::partial(&path(&dir, &id));
         let buggy = Buggy { bug: AtomicBool::new(true), partial: partial.clone(), written: AtomicBool::new(false) };
         let cloud = Arc::new(buggy);
         let sources = Sources { fixed: vec![db_path], ..Sources::default() };
@@ -502,7 +479,7 @@ mod tests {
         catalog.heads.set_min_records(1);
         let entry = Arc::clone(&catalog.entries()[0]);
         let Ok(open) = entry.open() else { panic!("the database does not open") };
-        let states = || catalog.heads.states.lock().unwrap_or_else(|e| e.into_inner());
+        let states = || lock(&catalog.heads.states);
         catalog.attach_heads(&entry, &open);
         let until = Instant::now() + Duration::from_secs(30);
         while matches!(states().get(&id), Some(State::Working(_))) {

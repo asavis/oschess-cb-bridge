@@ -13,6 +13,7 @@ use crate::machine::{self, Priority};
 use crate::search::SearchError;
 use crate::search::memory::{Cancel, Hold, Refused};
 use crate::search::workers::{self, Worker};
+use crate::sync::lock;
 
 use super::file::Bad;
 use super::format::Outcome;
@@ -129,23 +130,23 @@ impl Default for Progress {
 
 impl Progress {
     pub fn start(&self, phase: &'static str, total: u64) {
-        *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase;
+        *lock(&self.phase) = phase;
         self.done.store(0, Ordering::Relaxed);
         self.total.store(total, Ordering::Relaxed);
     }
 
     pub fn phase(&self) -> &'static str {
-        *self.phase.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.phase)
     }
 
     /// Notes something of where the build's time went.
     pub fn time(&self, note: impl FnOnce(&mut Timings)) {
-        note(&mut self.timings.lock().unwrap_or_else(|e| e.into_inner()));
+        note(&mut lock(&self.timings));
     }
 
     /// Where the build's time went, so far.
     pub fn timings(&self) -> Timings {
-        self.timings.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.timings).clone()
     }
 
     /// Whether the build was asked to stop, which each of its threads asks
@@ -208,7 +209,7 @@ impl Progress {
         for count in [&self.positions, &self.skipped, &self.tree_passes, &self.deep_passes] {
             count.store(0, Ordering::Relaxed);
         }
-        *self.timings.lock().unwrap_or_else(|e| e.into_inner()) = Timings::default();
+        *lock(&self.timings) = Timings::default();
         self.stop.store(false, Ordering::Relaxed);
     }
 }
@@ -448,7 +449,7 @@ mod tests {
     /// patience goes on at once, and one with little waits no longer (#149).
     #[test]
     fn a_build_with_patience_gives_way_to_foreground_work() {
-        let _serial = foreground::tests::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = lock(&foreground::tests::SERIAL);
         let soon = Duration::from_secs(30);
         let progress = Arc::new(Progress::default());
         let giving = |progress: &Arc<Progress>| {

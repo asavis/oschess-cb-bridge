@@ -38,6 +38,7 @@ use crate::indexdir::crc32_update;
 use crate::search::SearchError;
 use crate::search::memory::Refused;
 use crate::search::workers::threads;
+use crate::sync::{lock, unpoisoned};
 
 use super::build::{Chunks, Out, Passes, Turns, from_bad, plan_pass};
 use super::follow::{CHANGES, Changes, Tracker};
@@ -568,7 +569,7 @@ fn write_blocks(
                     Count::After(_) => pass.split.left.checked_sub(n).ok_or_else(miscounted)?,
                 };
                 if !ends {
-                    *split.lock().unwrap_or_else(|e| e.into_inner()) = Some(Split { last, left });
+                    *lock(&split) = Some(Split { last, left });
                 } else if left != 0 {
                     return Err(miscounted());
                 }
@@ -584,7 +585,7 @@ fn write_blocks(
         }
         Ok(())
     })?;
-    Ok(split.into_inner().unwrap_or_else(|e| e.into_inner()))
+    Ok(unpoisoned(split.into_inner()))
 }
 
 /// What a pass puts before a bucket's postings.

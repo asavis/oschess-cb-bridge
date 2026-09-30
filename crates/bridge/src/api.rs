@@ -25,6 +25,7 @@ use crate::search::query::{Sort, Unsupported};
 use crate::search::{self, SearchError, Selection, SuggestField};
 use crate::snapshot::Database;
 use crate::store::{Head, Store, with_store};
+use crate::sync::{lock, unpoisoned};
 use crate::token;
 
 pub const API_VERSION: i64 = 1;
@@ -56,9 +57,9 @@ static RENDERS: Gate = Gate { held: Mutex::new(0), freed: Condvar::new() };
 
 impl Gate {
     fn enter(&self) -> GateGuard<'_> {
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = lock(&self.held);
         while *held >= MAX_RENDERS {
-            held = self.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+            held = unpoisoned(self.freed.wait(held));
         }
         *held += 1;
         GateGuard(self)
@@ -69,7 +70,7 @@ struct GateGuard<'a>(&'a Gate);
 
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
-        *self.0.held.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        *lock(&self.0.held) -= 1;
         self.0.freed.notify_one();
     }
 }
