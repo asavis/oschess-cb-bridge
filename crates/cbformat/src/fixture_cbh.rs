@@ -8,6 +8,7 @@
 use chesscore::{Board, CastleSide, Color, Move, Piece, Square};
 
 use crate::cbh::tables;
+use crate::movetable::{from_cb_square, to_cb_square};
 
 mod builder;
 pub use builder::Builder;
@@ -29,10 +30,6 @@ const KNIGHT: [(u8, u8); 8] = [(2, 1), (1, 2), (7, 2), (6, 1), (6, 7), (7, 6), (
 /// modulo 8, makes along it, if it lies on it.
 type Dir = fn((u8, u8)) -> Option<u8>;
 
-fn cb(s: Square) -> u8 {
-    s.file() * 8 + s.rank()
-}
-
 /// The encoder's own piece lists: per side, queens, rooks, bishops and
 /// knights by ChessBase square in scan order, and pawns by fixed number.
 #[derive(Clone)]
@@ -46,7 +43,7 @@ impl Lists {
         let mut l = Lists { kinds: Default::default(), pawns: [[None; 8]; 2] };
         let mut n = [0; 2];
         for s in 0..64u8 {
-            match b.piece_at(Square::new(s / 8, s % 8)) {
+            match b.piece_at(from_cb_square(s)) {
                 Some((Piece::Pawn, c)) => {
                     l.pawns[c.index()][n[c.index()]] = Some(s);
                     n[c.index()] += 1;
@@ -63,11 +60,11 @@ impl Lists {
     fn apply(&mut self, b: &Board, mv: Move) {
         let us = b.side_to_move();
         let (me, them) = (us.index(), (!us).index());
-        let (from, to) = (cb(mv.from), cb(mv.to));
+        let (from, to) = (to_cb_square(mv.from), to_cb_square(mv.to));
         let moving = b.piece_at(mv.from).unwrap().0;
         let target = b.piece_at(mv.to);
         if moving == Piece::King && target == Some((Piece::Rook, us)) {
-            let rook_to = if mv.to.file() > mv.from.file() { 5 } else { 3 } * 8 + mv.to.rank();
+            let rook_to = to_cb_square(Square::new(if mv.to.file() > mv.from.file() { 5 } else { 3 }, mv.to.rank()));
             let i = self.kinds[me][1].iter().position(|&s| s == to).unwrap();
             self.kinds[me][1][i] = rook_to;
             return;
@@ -75,7 +72,7 @@ impl Lists {
         let taken = match target {
             Some((p, _)) => Some((p, to)),
             None if moving == Piece::Pawn && mv.from.file() != mv.to.file() => {
-                Some((Piece::Pawn, mv.to.file() * 8 + mv.from.rank()))
+                Some((Piece::Pawn, to_cb_square(Square::new(mv.to.file(), mv.from.rank()))))
             }
             None => None,
         };
@@ -100,7 +97,7 @@ impl Lists {
     /// The one-byte code of a move of a non-king piece, when it has one.
     fn code(&self, b: &Board, mv: Move) -> Option<u8> {
         let us = b.side_to_move();
-        let (from, to) = (cb(mv.from), cb(mv.to));
+        let (from, to) = (to_cb_square(mv.from), to_cb_square(mv.to));
         let d = ((to / 8 + 8 - from / 8) % 8, (to % 8 + 8 - from % 8) % 8);
         let moving = b.piece_at(mv.from)?.0;
         if moving == Piece::King {
@@ -173,9 +170,9 @@ pub fn encode(start: &Board, toks: &[Tok<'_>], mode: u8, two_byte: bool) -> Vec<
                     let dest = Square::new(if side == CastleSide::Short { 6 } else { 2 }, us.back_rank());
                     let king = board.king(us);
                     let word = if mode == 10 {
-                        u16::from(cb(dest)) * 65
+                        u16::from(to_cb_square(dest)) * 65
                     } else {
-                        u16::from(cb(king)) | u16::from(cb(dest)) << 6
+                        u16::from(to_cb_square(king)) | u16::from(to_cb_square(dest)) << 6
                     };
                     (Some(Move::new(king, Square::new(rook, us.back_rank()), None)), word)
                 } else {
@@ -184,7 +181,7 @@ pub fn encode(start: &Board, toks: &[Tok<'_>], mode: u8, two_byte: bool) -> Vec<
                         [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight].iter().position(|&x| x == p).unwrap()
                             as u16
                     });
-                    (Some(mv), u16::from(cb(mv.from)) | u16::from(cb(mv.to)) << 6 | promo << 12)
+                    (Some(mv), u16::from(to_cb_square(mv.from)) | u16::from(to_cb_square(mv.to)) << 6 | promo << 12)
                 };
                 if simple {
                     let w = word | if var { 0x8000 } else { 0 };
@@ -250,7 +247,7 @@ pub fn start_position(pieces: &[(&str, Piece, Color)], black_to_move: bool, cast
     let mut board: [Option<(Piece, Color)>; 64] = [None; 64];
     for &(s, p, c) in pieces {
         let sq: Square = s.parse().expect("square");
-        board[cb(sq) as usize] = Some((p, c));
+        board[to_cb_square(sq) as usize] = Some((p, c));
     }
     let mut bits = Vec::new();
     for sq in board {

@@ -4,8 +4,8 @@
 
 use std::borrow::Cow;
 
-use super::bytes::be_u24;
 use super::{Database, MIN_FILE_HEADER, MoveData, Record};
+use crate::bytes::{self, Fields};
 use crate::recordfile::{over_limit, span};
 use crate::{Error, Result};
 
@@ -35,7 +35,8 @@ impl Database {
             return Ok(None);
         }
         let offset = |r: &Record| u64::from(r.moves_offset());
-        let Some(range) = span(records.iter().map(offset), next.map(offset), self.moves.len()?, MIN_FILE_HEADER) else {
+        let Some(range) = span(records.iter().map(offset), next.map(offset), self.moves.size()?, MIN_FILE_HEADER)
+        else {
             return Ok(None);
         };
         let Some(len) = usize::try_from(range.end - range.start).ok().filter(|&l| l <= buf.capacity()) else {
@@ -62,17 +63,14 @@ impl Database {
             return None;
         }
         let offset = u64::from(record.moves_offset());
-        let bytes = buf.get(..window.len)?;
+        let held = buf.get(..window.len)?;
         let rel = offset.checked_sub(window.at).and_then(|r| usize::try_from(r).ok())?;
-        if rel.saturating_add(4) > bytes.len() {
-            return None;
-        }
-        let size = be_u24(bytes, rel + 1) as usize;
+        let size = bytes::array::<4>(held, rel)?.be_u24::<1>() as usize;
         if size < 4 {
             let what = format!("move record at {offset:#x}: size {size} is smaller than the record's head");
             return Some(Err(Error::Format(what)));
         }
-        let whole = bytes.get(rel..rel + size)?;
+        let whole = held.get(rel..rel + size)?;
         if size > limit {
             return Some(Err(Error::Format(format!("move record at {offset:#x}: {}", over_limit(size, limit)))));
         }

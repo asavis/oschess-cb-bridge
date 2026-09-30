@@ -15,31 +15,6 @@ mod error;
 
 pub use error::MoveError;
 
-fn color(c: Color) -> CColor {
-    match c {
-        Color::White => CColor::White,
-        Color::Black => CColor::Black,
-    }
-}
-
-fn piece(p: Piece) -> CPiece {
-    match p {
-        Piece::King => CPiece::King,
-        Piece::Queen => CPiece::Queen,
-        Piece::Knight => CPiece::Knight,
-        Piece::Bishop => CPiece::Bishop,
-        Piece::Rook => CPiece::Rook,
-        Piece::Pawn => CPiece::Pawn,
-    }
-}
-
-fn side(s: CastleSide) -> Side {
-    match s {
-        CastleSide::Short => Side::Short,
-        CastleSide::Long => Side::Long,
-    }
-}
-
 /// A move-table square (rank-major, below 64 by construction).
 fn square(sq: movetable::Sq) -> Square {
     Square::new(sq & 7, sq >> 3)
@@ -63,9 +38,9 @@ pub fn start_board(start: &Start) -> Result<Board> {
 fn setup_board(s: &Setup) -> Result<Board> {
     let mut b = BoardBuilder::empty();
     for &(sq, c, p) in &s.pieces {
-        b.set(square(sq), Some((piece(p), color(c))));
+        b.set(square(sq), Some((p.into(), c.into())));
     }
-    b.side_to_move = color(s.side_to_move);
+    b.side_to_move = s.side_to_move.into();
     b.chess960 = s.chess960;
     for (c, long, short) in [(CColor::White, 0, 1), (CColor::Black, 2, 3)] {
         let back = c.back_rank();
@@ -183,11 +158,11 @@ fn normals() -> &'static [u32] {
                     };
                     u32::from(from & 63)
                         | u32::from(to & 63) << 6
-                        | (piece(p).index() as u32) << 12
+                        | (CPiece::from(p).index() as u32) << 12
                         | if c == Color::Black { BLACK } else { 0 }
                         | taken << 16
                         | if captured == Captured::EnPassant { EN_PASSANT } else { 0 }
-                        | promotion.map_or(0, |p| piece(p).index() as u32 + 1) << 20
+                        | promotion.map_or(0, |p| CPiece::from(p).index() as u32 + 1) << 20
                         | NORMAL
                 }
                 _ => 0,
@@ -203,15 +178,15 @@ fn decode_move(board: &Board, word: u16) -> std::result::Result<Move, MoveError>
     match decoded {
         MoveWord::Null => Err(MoveError::NullMove),
         MoveWord::Castle { color: c, side: s } | MoveWord::Castle960 { color: c, side: s, .. } => {
-            let c = color(c);
+            let c = CColor::from(c);
             if board.side_to_move() != c {
                 return Err(MoveError::CastlingOutOfTurn { word });
             }
-            let rook = board.castling_rook(c, side(s)).ok_or(MoveError::NoCastlingRight { word })?;
+            let rook = board.castling_rook(c, Side::from(s)).ok_or(MoveError::NoCastlingRight { word })?;
             Ok(Move::new(board.king(c), Square::new(rook, c.back_rank()), None))
         }
         MoveWord::Normal { color: c, piece: p, from, to, captured, promotion } => {
-            let (c, p, from, to) = (color(c), piece(p), square(from), square(to));
+            let (c, p, from, to) = (CColor::from(c), CPiece::from(p), square(from), square(to));
             if board.side_to_move() != c {
                 return Err(MoveError::OutOfTurn { word, color: c });
             }
@@ -242,7 +217,7 @@ fn decode_move(board: &Board, word: u16) -> std::result::Result<Move, MoveError>
             if captured == Captured::EnPassant && board.en_passant() != Some(to) {
                 return Err(MoveError::NoEnPassant { word, from, to });
             }
-            Ok(Move::new(from, to, promotion.map(piece)))
+            Ok(Move::new(from, to, promotion.map(CPiece::from)))
         }
     }
 }
@@ -254,9 +229,11 @@ fn decode_move(board: &Board, word: u16) -> std::result::Result<Move, MoveError>
 /// stream replays words that were checked when it was written with it.
 pub fn standard_move(word: u16) -> Option<Move> {
     match movetable::decode(word)? {
-        MoveWord::Normal { from, to, promotion, .. } => Some(Move::new(square(from), square(to), promotion.map(piece))),
+        MoveWord::Normal { from, to, promotion, .. } => {
+            Some(Move::new(square(from), square(to), promotion.map(CPiece::from)))
+        }
         MoveWord::Castle { color: c, side: s } => {
-            let rank = color(c).back_rank();
+            let rank = CColor::from(c).back_rank();
             let rook = if s == CastleSide::Short { 7 } else { 0 };
             Some(Move::new(Square::new(4, rank), Square::new(rook, rank), None))
         }
@@ -270,7 +247,7 @@ pub fn standard_move(word: u16) -> Option<Move> {
 /// names the move, as for one from an empty square.
 pub fn word_of(board: &Board, mv: Move) -> Option<u16> {
     let (p, c) = board.piece_at(mv.from)?;
-    let us = if c == CColor::White { Color::White } else { Color::Black };
+    let us = Color::from(c);
     if p == CPiece::King && board.colors(c) & mv.to.bit() != 0 {
         let side = if mv.to.file() > mv.from.file() { CastleSide::Short } else { CastleSide::Long };
         return movetable::encode(MoveWord::Castle { color: us, side });
@@ -287,23 +264,12 @@ pub fn word_of(board: &Board, mv: Move) -> Option<u16> {
     };
     movetable::encode(MoveWord::Normal {
         color: us,
-        piece: table_piece(p),
+        piece: p.into(),
         from: mv.from.index() as movetable::Sq,
         to: mv.to.index() as movetable::Sq,
         captured,
-        promotion: mv.promotion.map(table_piece),
+        promotion: mv.promotion.map(Piece::from),
     })
-}
-
-fn table_piece(p: CPiece) -> Piece {
-    match p {
-        CPiece::King => Piece::King,
-        CPiece::Queen => Piece::Queen,
-        CPiece::Knight => Piece::Knight,
-        CPiece::Bishop => Piece::Bishop,
-        CPiece::Rook => Piece::Rook,
-        CPiece::Pawn => Piece::Pawn,
-    }
 }
 
 /// Checks and plays `word` on `board`, including the null move. On error the

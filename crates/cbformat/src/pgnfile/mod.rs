@@ -38,6 +38,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::bytes::Fields;
 use crate::codepage::CodePage;
 use crate::file::DbFile;
 use crate::game::{Date, Eco, GameResult, Head, Player, RecordKind, Tournament};
@@ -55,8 +56,11 @@ const MAGIC: &[u8; 8] = b"OSPGNIDX";
 /// Raise it whenever the index's layout changes, or the text it yields for
 /// the same file does, as the decoding of code page text did in #120.
 pub const VERSION: u32 = 2;
-/// Bytes of one entry of the name table.
+/// Bytes of one entry of the name table: where its text starts in the index
+/// file (8 bytes), then its length (4).
 const ENTRY_SIZE: u64 = 12;
+const ENTRY_TEXT_AT: usize = 0;
+const ENTRY_LEN_AT: usize = 8;
 /// The longest name kept, in bytes of UTF-8; a longer one is cut.
 pub const MAX_NAME: usize = lex::MAX_TAG_VALUE;
 /// The name text a build may hold in memory. A file with more distinct names
@@ -75,23 +79,48 @@ const FLAG_CHESS960: u8 = 1;
 const FLAG_OTHER_VARIANT: u8 = 2;
 const FLAG_SETUP: u8 = 4;
 
+// Where each field of the index header starts, for the index's writer and
+// its reader; the table above gives their sizes.
+const MAGIC_AT: usize = 0;
+const VERSION_AT: usize = 8;
+const RECORD_SIZE_AT: usize = 12;
+const STAMP_AT: usize = 16;
+/// Bytes of the PGN file read: its length when built.
+const TEXT_LEN_AT: usize = 24;
+const GAMES_AT: usize = 32;
+const PLAYERS_AT: usize = 36;
+const TOURNAMENTS_AT: usize = 40;
+const ANNOTATORS_AT: usize = 44;
+const NAME_TABLE_AT: usize = 48;
+const PAGE_AT: usize = 56;
+
+// Where each field of a [`Record`] starts, for the index's writer and its
+// reader: where the game's text starts in the PGN file (8 bytes) and its
+// length (4); the white and black players, the tournament and the annotator
+// (4 each, ids in their tables stored one higher, 0 for none); the date (4);
+// the round, sub-round, white's and black's ratings, the ECO code and the
+// move count (2 each); the result and the flags (1 each). The rest is zero.
+const OFFSET_AT: usize = 0;
+const LEN_AT: usize = 8;
+const WHITE_AT: usize = 12;
+const BLACK_AT: usize = 16;
+const TOURNAMENT_AT: usize = 20;
+const ANNOTATOR_AT: usize = 24;
+const DATE_AT: usize = 28;
+const ROUND_AT: usize = 32;
+const SUBROUND_AT: usize = 34;
+const WHITE_ELO_AT: usize = 36;
+const BLACK_ELO_AT: usize = 38;
+const ECO_AT: usize = 40;
+const MOVES_AT: usize = 42;
+const RESULT_AT: usize = 44;
+const FLAGS_AT: usize = 45;
+
 /// The header of one game, as the index keeps it.
 #[derive(Clone, Copy)]
 pub struct Record {
     id: u32,
     b: [u8; RECORD_SIZE],
-}
-
-fn le_u16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn le_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().expect("four bytes"))
-}
-
-fn le_u64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().expect("eight bytes"))
 }
 
 /// A PGN file holds games only, none deleted.
@@ -159,62 +188,62 @@ impl Record {
     }
     /// Where the game's text starts in the PGN file, and its length.
     pub fn offset(&self) -> u64 {
-        le_u64(&self.b, 0)
+        self.b.le_u64::<OFFSET_AT>()
     }
     pub fn len(&self) -> u32 {
-        le_u32(&self.b, 8)
+        self.b.le_u32::<LEN_AT>()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     /// A name's id in its table, stored one higher so that 0 is none: -1.
-    fn name_id(&self, at: usize) -> i64 {
-        i64::from(le_u32(&self.b, at)) - 1
+    fn name_id<const AT: usize>(&self) -> i64 {
+        i64::from(self.b.le_u32::<AT>()) - 1
     }
     pub fn white(&self) -> i64 {
-        self.name_id(12)
+        self.name_id::<WHITE_AT>()
     }
     pub fn black(&self) -> i64 {
-        self.name_id(16)
+        self.name_id::<BLACK_AT>()
     }
     pub fn tournament(&self) -> i64 {
-        self.name_id(20)
+        self.name_id::<TOURNAMENT_AT>()
     }
     pub fn annotator(&self) -> i64 {
-        self.name_id(24)
+        self.name_id::<ANNOTATOR_AT>()
     }
     pub fn played_date(&self) -> Date {
-        Date(le_u32(&self.b, 28) as i32)
+        Date(self.b.le_i32::<DATE_AT>())
     }
     /// Round and sub-round; 0 when unknown.
     pub fn round(&self) -> (i16, i16) {
-        (le_u16(&self.b, 32) as i16, le_u16(&self.b, 34) as i16)
+        (self.b.le_i16::<ROUND_AT>(), self.b.le_i16::<SUBROUND_AT>())
     }
     /// White's and black's ratings; 0 when unknown.
     pub fn elo(&self) -> (i16, i16) {
-        (le_u16(&self.b, 36) as i16, le_u16(&self.b, 38) as i16)
+        (self.b.le_i16::<WHITE_ELO_AT>(), self.b.le_i16::<BLACK_ELO_AT>())
     }
     pub fn eco(&self) -> Eco {
-        Eco::from_field(le_u16(&self.b, 40))
+        Eco::from_field(self.b.le_u16::<ECO_AT>())
     }
     /// Full moves of the main line, counted as written.
     pub fn move_count(&self) -> i16 {
-        le_u16(&self.b, 42) as i16
+        self.b.le_i16::<MOVES_AT>()
     }
     pub fn result(&self) -> GameResult {
-        GameResult::from_field(self.b[44])
+        GameResult::from_field(self.b[RESULT_AT])
     }
     /// Whether the game is Chess960.
     pub fn is_chess960(&self) -> bool {
-        self.b[45] & FLAG_CHESS960 != 0
+        self.b[FLAGS_AT] & FLAG_CHESS960 != 0
     }
     /// Whether the game is of a variant other than chess and Chess960.
     pub fn is_other_variant(&self) -> bool {
-        self.b[45] & FLAG_OTHER_VARIANT != 0
+        self.b[FLAGS_AT] & FLAG_OTHER_VARIANT != 0
     }
     /// Whether the game starts from a position of its own (a `FEN` tag).
     pub fn has_setup(&self) -> bool {
-        self.b[45] & FLAG_SETUP != 0
+        self.b[FLAGS_AT] & FLAG_SETUP != 0
     }
 }
 
@@ -284,8 +313,8 @@ impl Building {
     fn record(&mut self, game: &Game) -> Result<[u8; RECORD_SIZE]> {
         let mut b = [0u8; RECORD_SIZE];
         let length = u32::try_from(game.end - game.start).unwrap_or(u32::MAX);
-        b[0..8].copy_from_slice(&game.start.to_le_bytes());
-        b[8..12].copy_from_slice(&length.to_le_bytes());
+        b.put::<OFFSET_AT, 8>(game.start.to_le_bytes());
+        b.put::<LEN_AT, 4>(length.to_le_bytes());
         let white = self.person(game, Tag::White, false)?;
         let black = self.person(game, Tag::Black, false)?;
         let (event, site) = (self.text(game, Tag::Event), self.text(game, Tag::Site));
@@ -296,26 +325,27 @@ impl Building {
             self.tournaments.intern((event, site), bytes, &mut self.held).ok_or_else(too_many_names)?
         };
         let annotator = self.person(game, Tag::Annotator, true)?;
-        for (at, id) in [(12, white), (16, black), (20, tournament), (24, annotator)] {
-            b[at..at + 4].copy_from_slice(&id.to_le_bytes());
-        }
+        b.put::<WHITE_AT, 4>(white.to_le_bytes());
+        b.put::<BLACK_AT, 4>(black.to_le_bytes());
+        b.put::<TOURNAMENT_AT, 4>(tournament.to_le_bytes());
+        b.put::<ANNOTATOR_AT, 4>(annotator.to_le_bytes());
         let tag = |t: Tag| game.tags.get(t).unwrap_or_default();
-        b[28..32].copy_from_slice(&(scan::date(tag(Tag::Date)).0 as u32).to_le_bytes());
+        b.put::<DATE_AT, 4>(scan::date(tag(Tag::Date)).0.to_le_bytes());
         let (round, sub) = scan::round(tag(Tag::Round));
-        let (white_elo, black_elo) = (scan::elo(tag(Tag::WhiteElo)), scan::elo(tag(Tag::BlackElo)));
-        for (at, v) in [(32, round), (34, sub), (36, white_elo), (38, black_elo)] {
-            b[at..at + 2].copy_from_slice(&(v as u16).to_le_bytes());
-        }
+        b.put::<ROUND_AT, 2>(round.to_le_bytes());
+        b.put::<SUBROUND_AT, 2>(sub.to_le_bytes());
+        b.put::<WHITE_ELO_AT, 2>(scan::elo(tag(Tag::WhiteElo)).to_le_bytes());
+        b.put::<BLACK_ELO_AT, 2>(scan::elo(tag(Tag::BlackElo)).to_le_bytes());
         let variant = scan::variant(tag(Tag::Variant));
         let eco = if variant == Variant::Chess960 { scan::CHESS960_ECO } else { scan::eco(tag(Tag::Eco)) };
-        b[40..42].copy_from_slice(&eco.to_le_bytes());
+        b.put::<ECO_AT, 2>(eco.to_le_bytes());
         // Full moves are the move numbers the plies cover, as ChessBase counts
         // them: a game set up with black to move starts with half a move.
         let black_first = tag(Tag::Fen).split(|&c| c == b' ').filter(|f| !f.is_empty()).nth(1) == Some(b"b");
         let moves = if black_first && game.plies > 0 { game.plies / 2 + 1 } else { game.plies.div_ceil(2) };
-        b[42..44].copy_from_slice(&(moves.min(i16::MAX as u32) as u16).to_le_bytes());
+        b.put::<MOVES_AT, 2>((moves.min(i16::MAX as u32) as u16).to_le_bytes());
         let result = ResultCode::of_tag(tag(Tag::Result)).or(game.termination).unwrap_or(ResultCode::UNKNOWN);
-        b[44] = result.0;
+        b.put::<RESULT_AT, 1>([result.0]);
         let mut flags = match variant {
             Variant::Standard => 0,
             Variant::Chess960 => FLAG_CHESS960,
@@ -324,7 +354,7 @@ impl Building {
         if !tag(Tag::Fen).trim_ascii().is_empty() {
             flags |= FLAG_SETUP;
         }
-        b[45] = flags;
+        b.put::<FLAGS_AT, 1>([flags]);
         Ok(b)
     }
 }
@@ -365,6 +395,9 @@ pub fn build(pgn: &Path, index: &Path, stamp: u64, page: CodePage, read: &mut dy
     }
 }
 
+/// Writes the index of `pgn` to `out_path` in three steps: the records as
+/// the games are read, the name table after them, and the header, which
+/// counts both, over the zeros written first in its place.
 fn write_index(
     pgn: &Path,
     out_path: &Path,
@@ -372,7 +405,7 @@ fn write_index(
     page: CodePage,
     read: &mut dyn FnMut(u64) -> bool,
 ) -> Result<u32> {
-    let mut file = File::open(pgn).map_err(io(pgn))?;
+    let file = File::open(pgn).map_err(io(pgn))?;
     let mut out = BufWriter::with_capacity(CHUNK, File::create(out_path).map_err(io(out_path))?);
     out.write_all(&[0; HEADER_SIZE as usize]).map_err(io(out_path))?;
     let mut building = Building {
@@ -382,6 +415,33 @@ fn write_index(
         annotators: Names::default(),
         held: 0,
     };
+    let (games, total) = read_games(pgn, file, &mut building, &mut out, out_path, read)?;
+    let names_at = HEADER_SIZE + u64::from(games) * RECORD_SIZE as u64;
+    write_names(&building, names_at, &mut out, out_path)?;
+    let counts = [
+        building.players.list.len() as u32,
+        building.tournaments.list.len() as u32,
+        building.annotators.list.len() as u32,
+    ];
+    let header = header(stamp, total, games, counts, names_at, page);
+    let mut file = out.into_inner().map_err(|e| Error::Io(out_path.to_path_buf(), e.into_error()))?;
+    file.seek(SeekFrom::Start(0)).map_err(io(out_path))?;
+    file.write_all(&header).map_err(io(out_path))?;
+    file.sync_all().map_err(io(out_path))?;
+    Ok(games)
+}
+
+/// Reads the games of `file`, the PGN file `pgn`, keeping their names in
+/// `building` and writing each one's record to `out`, the file `out_path`,
+/// as the game ends. The number of games, and the length of the text read.
+fn read_games(
+    pgn: &Path,
+    mut file: File,
+    building: &mut Building,
+    out: &mut impl Write,
+    out_path: &Path,
+    read: &mut dyn FnMut(u64) -> bool,
+) -> Result<(u32, u64)> {
     let mut games: u32 = 0;
     let failed: RefCell<Option<Error>> = RefCell::new(None);
     let mut splitter = Splitter::new(|game: &Game| {
@@ -442,14 +502,16 @@ fn write_index(
     }
     splitter.finish();
     drop(splitter);
-    if let Some(e) = failed.into_inner() {
-        return Err(e);
+    match failed.into_inner() {
+        Some(e) => Err(e),
+        None => Ok((games, total)),
     }
-    let counts = [
-        building.players.list.len() as u32,
-        building.tournaments.list.len() as u32,
-        building.annotators.list.len() as u32,
-    ];
+}
+
+/// Writes the name table to `out`, where it starts at `names_at` of the
+/// index: an entry for every player, each tournament's title and place and
+/// every annotator, then their texts in the same order.
+fn write_names(building: &Building, names_at: u64, out: &mut impl Write, out_path: &Path) -> Result<()> {
     let texts: Vec<&str> = building
         .players
         .list
@@ -458,35 +520,44 @@ fn write_index(
         .chain(building.tournaments.list.iter().flat_map(|(t, p)| [t.as_str(), p.as_str()]))
         .chain(building.annotators.list.iter().map(String::as_str))
         .collect();
-    let names_at = HEADER_SIZE + u64::from(games) * RECORD_SIZE as u64;
     let mut at = names_at + texts.len() as u64 * ENTRY_SIZE;
     for text in &texts {
         let mut entry = [0u8; ENTRY_SIZE as usize];
-        entry[..8].copy_from_slice(&at.to_le_bytes());
-        entry[8..].copy_from_slice(&(text.len() as u32).to_le_bytes());
+        entry.put::<ENTRY_TEXT_AT, 8>(at.to_le_bytes());
+        entry.put::<ENTRY_LEN_AT, 4>((text.len() as u32).to_le_bytes());
         out.write_all(&entry).map_err(io(out_path))?;
         at += text.len() as u64;
     }
     for text in &texts {
         out.write_all(text.as_bytes()).map_err(io(out_path))?;
     }
-    let mut header = [0u8; HEADER_SIZE as usize];
-    header[..8].copy_from_slice(MAGIC);
-    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&(RECORD_SIZE as u32).to_le_bytes());
-    header[16..24].copy_from_slice(&stamp.to_le_bytes());
-    header[24..32].copy_from_slice(&total.to_le_bytes());
-    header[32..36].copy_from_slice(&games.to_le_bytes());
-    for (i, count) in counts.iter().enumerate() {
-        header[36 + 4 * i..40 + 4 * i].copy_from_slice(&count.to_le_bytes());
-    }
-    header[48..56].copy_from_slice(&names_at.to_le_bytes());
-    header[56..58].copy_from_slice(&page.number().to_le_bytes());
-    let mut file = out.into_inner().map_err(|e| Error::Io(out_path.to_path_buf(), e.into_error()))?;
-    file.seek(SeekFrom::Start(0)).map_err(io(out_path))?;
-    file.write_all(&header).map_err(io(out_path))?;
-    file.sync_all().map_err(io(out_path))?;
-    Ok(games)
+    Ok(())
+}
+
+/// The index header: the build's `stamp`, the `total` bytes of the PGN file
+/// read, its `games`, the `counts` of players, tournaments and annotators,
+/// where the name table starts and the code `page`.
+fn header(
+    stamp: u64,
+    total: u64,
+    games: u32,
+    counts: [u32; 3],
+    names_at: u64,
+    page: CodePage,
+) -> [u8; HEADER_SIZE as usize] {
+    let mut h = [0u8; HEADER_SIZE as usize];
+    h.put::<MAGIC_AT, 8>(*MAGIC);
+    h.put::<VERSION_AT, 4>(VERSION.to_le_bytes());
+    h.put::<RECORD_SIZE_AT, 4>((RECORD_SIZE as u32).to_le_bytes());
+    h.put::<STAMP_AT, 8>(stamp.to_le_bytes());
+    h.put::<TEXT_LEN_AT, 8>(total.to_le_bytes());
+    h.put::<GAMES_AT, 4>(games.to_le_bytes());
+    h.put::<PLAYERS_AT, 4>(counts[0].to_le_bytes());
+    h.put::<TOURNAMENTS_AT, 4>(counts[1].to_le_bytes());
+    h.put::<ANNOTATORS_AT, 4>(counts[2].to_le_bytes());
+    h.put::<NAME_TABLE_AT, 8>(names_at.to_le_bytes());
+    h.put::<PAGE_AT, 2>(page.number().to_le_bytes());
+    h
 }
 
 /// A PGN file and its index.
@@ -516,21 +587,28 @@ impl Database {
     pub fn open(pgn: &Path, index: &Path, stamp: u64, page: CodePage) -> Result<Database> {
         let text = DbFile::open(pgn.to_path_buf())?;
         let index_file = DbFile::open(index.to_path_buf())?;
-        let index_len = index_file.len()?;
+        let index_len = index_file.size()?;
         let bad = |what: &str| Error::Format(format!("PGN index {}: {what}", index.display()));
         if index_len < HEADER_SIZE {
             return Err(bad("too short"));
         }
-        let h = index_file.read(0, HEADER_SIZE as usize)?;
-        if &h[..8] != MAGIC || le_u32(&h, 8) != VERSION || le_u32(&h, 12) != RECORD_SIZE as u32 {
+        let mut h = [0u8; HEADER_SIZE as usize];
+        index_file.read_into(0, &mut h)?;
+        if h.field::<MAGIC_AT, 8>() != MAGIC
+            || h.le_u32::<VERSION_AT>() != VERSION
+            || h.le_u32::<RECORD_SIZE_AT>() != RECORD_SIZE as u32
+        {
             return Err(bad("not an index of this version"));
         }
-        if le_u64(&h, 16) != stamp || le_u64(&h, 24) != text.len()? || le_u16(&h, 56) != page.number() {
+        if h.le_u64::<STAMP_AT>() != stamp
+            || h.le_u64::<TEXT_LEN_AT>() != text.size()?
+            || h.le_u16::<PAGE_AT>() != page.number()
+        {
             return Err(bad("built for another state of the file"));
         }
-        let games = le_u32(&h, 32);
-        let counts = [le_u32(&h, 36), le_u32(&h, 40), le_u32(&h, 44)];
-        let names_at = le_u64(&h, 48);
+        let games = h.le_u32::<GAMES_AT>();
+        let counts = [h.le_u32::<PLAYERS_AT>(), h.le_u32::<TOURNAMENTS_AT>(), h.le_u32::<ANNOTATORS_AT>()];
+        let names_at = h.le_u64::<NAME_TABLE_AT>();
         let entries = u64::from(counts[0]) + 2 * u64::from(counts[1]) + u64::from(counts[2]);
         if names_at != HEADER_SIZE + u64::from(games) * RECORD_SIZE as u64
             || names_at.checked_add(entries * ENTRY_SIZE).is_none_or(|end| end > index_len)
@@ -594,8 +672,9 @@ impl Database {
     /// Entry `n` of the name table's texts, read to at most `limit` bytes; a
     /// longer text, which only a damaged index holds, is empty.
     fn name(&self, n: u64, limit: usize) -> Result<String> {
-        let e = self.index.file().read(self.names_at + n * ENTRY_SIZE, ENTRY_SIZE as usize)?;
-        let (at, len) = (le_u64(&e, 0), le_u32(&e, 8) as usize);
+        let mut e = [0u8; ENTRY_SIZE as usize];
+        self.index.file().read_into(self.names_at + n * ENTRY_SIZE, &mut e)?;
+        let (at, len) = (e.le_u64::<ENTRY_TEXT_AT>(), e.le_u32::<ENTRY_LEN_AT>() as usize);
         if len > limit || at.checked_add(len as u64).is_none_or(|end| end > self.index_len) {
             return Ok(String::new());
         }

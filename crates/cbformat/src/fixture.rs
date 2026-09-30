@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
+use chesscore::{Board, Move, Piece as CPiece};
 
 use crate::Limits;
 use crate::movetable::{self, Captured, CastleSide, Color, MoveWord, Piece, Sq};
@@ -32,15 +32,6 @@ pub fn quiet(color: Color, piece: Piece, from: &str, to: &str) -> u16 {
 /// advance; castling is written as the king's step, `e1g1`. Panics on a move
 /// that is not legal there.
 pub fn words(board: &mut Board, ucis: &str) -> Vec<u16> {
-    let color = |c: CColor| if c == CColor::White { Color::White } else { Color::Black };
-    let piece = |p: CPiece| match p {
-        CPiece::King => Piece::King,
-        CPiece::Queen => Piece::Queen,
-        CPiece::Rook => Piece::Rook,
-        CPiece::Bishop => Piece::Bishop,
-        CPiece::Knight => Piece::Knight,
-        CPiece::Pawn => Piece::Pawn,
-    };
     let mut out = Vec::new();
     for uci in ucis.split_whitespace() {
         let mut mv: Move = uci.parse().unwrap();
@@ -48,7 +39,7 @@ pub fn words(board: &mut Board, ucis: &str) -> Vec<u16> {
         let word = if p == CPiece::King && mv.from.file().abs_diff(mv.to.file()) == 2 {
             let short = mv.to.file() == 6;
             mv.to = chesscore::Square::new(if short { 7 } else { 0 }, mv.from.rank());
-            MoveWord::Castle { color: color(c), side: if short { CastleSide::Short } else { CastleSide::Long } }
+            MoveWord::Castle { color: c.into(), side: if short { CastleSide::Short } else { CastleSide::Long } }
         } else {
             let captured = match board.piece_at(mv.to) {
                 Some((CPiece::Queen, _)) => Captured::Queen,
@@ -60,12 +51,12 @@ pub fn words(board: &mut Board, ucis: &str) -> Vec<u16> {
                 None => Captured::Nothing,
             };
             MoveWord::Normal {
-                color: color(c),
-                piece: piece(p),
+                color: c.into(),
+                piece: p.into(),
                 from: mv.from.index() as u8,
                 to: mv.to.index() as u8,
                 captured,
-                promotion: mv.promotion.map(piece),
+                promotion: mv.promotion.map(Piece::from),
             }
         };
         board.play_checked(mv).unwrap();
@@ -444,8 +435,7 @@ pub fn other(code: u16, data: &[u8]) -> Vec<u8> {
 
 /// A square numbered from 1, file by file, as annotations store it.
 fn cb_square(name: &str) -> u8 {
-    let s = sq(name);
-    (s % 8) * 8 + s / 8 + 1
+    movetable::to_cb_square(name.parse().expect("square")) + 1
 }
 
 /// A coloured-squares annotation from (colour, square) pairs.

@@ -5,7 +5,7 @@
 
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece, Square};
 
-use super::moves::cb_square;
+use crate::movetable::{from_cb_square, to_cb_square};
 use crate::{Error, Result};
 
 /// The kinds the compact encoder numbers, in list order.
@@ -58,16 +58,12 @@ fn kind_index(p: CPiece) -> Option<usize> {
     KINDS.iter().position(|&k| k == p)
 }
 
-pub(super) fn to_cb(s: Square) -> u8 {
-    s.file() * 8 + s.rank()
-}
-
 impl Pieces {
     pub(super) fn scan(board: &Board) -> Result<Self> {
         let mut p = Pieces { kinds: Default::default(), pawns: [[None; 8]; 2] };
         let mut next_pawn = [0usize; 2];
         for cb in 0..64u8 {
-            let Some((piece, c)) = board.piece_at(cb_square(cb)) else { continue };
+            let Some((piece, c)) = board.piece_at(from_cb_square(cb)) else { continue };
             let side = c.index();
             if piece == CPiece::Pawn {
                 let slot = p.pawns[side].get_mut(next_pawn[side]).ok_or_else(|| lists("more than eight pawns"))?;
@@ -85,7 +81,7 @@ impl Pieces {
     /// Follows `mv`, played by `us` from `before`, through the lists.
     pub(super) fn update(&mut self, before: &Board, us: CColor, mv: Move) -> Result<()> {
         let (me, them) = (us.index(), (!us).index());
-        let (from, to) = (to_cb(mv.from), to_cb(mv.to));
+        let (from, to) = (to_cb_square(mv.from), to_cb_square(mv.to));
         let moving = before.piece_at(mv.from).map(|(p, _)| p);
         let target = before.piece_at(mv.to);
         if moving == Some(CPiece::King) {
@@ -93,14 +89,14 @@ impl Pieces {
             // the king's destination.
             if target == Some((CPiece::Rook, us)) {
                 let file = if mv.to.file() > mv.from.file() { 5 } else { 3 };
-                let rook_to = to_cb(Square::new(file, mv.to.rank()));
+                let rook_to = to_cb_square(Square::new(file, mv.to.rank()));
                 return self.kinds[me][1].relocate(to, rook_to).then_some(()).ok_or_else(|| lists("castling rook"));
             }
         }
         let taken = match target {
             Some((p, c)) if c != us => Some((p, to)),
             _ if moving == Some(CPiece::Pawn) && mv.from.file() != mv.to.file() => {
-                Some((CPiece::Pawn, to_cb(Square::new(mv.to.file(), mv.from.rank()))))
+                Some((CPiece::Pawn, to_cb_square(Square::new(mv.to.file(), mv.from.rank()))))
             }
             _ => None,
         };

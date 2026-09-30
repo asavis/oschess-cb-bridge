@@ -1,12 +1,8 @@
 //! Set-up piece words: one word per piece and square of a set-up position.
 
-use super::{Color, FIRST_PIECE_WORD, LAST_PIECE_WORD, Piece, Sq, from_cb_square};
+use chesscore::Square;
 
-/// Rank-major square to ChessBase (file-major).
-fn to_cb_square(sq: Sq) -> u8 {
-    let (rank, file) = (sq / 8, sq % 8);
-    file * 8 + rank
-}
+use super::{Color, FIRST_PIECE_WORD, LAST_PIECE_WORD, Piece, Sq, from_cb_square, to_cb_square};
 
 /// The order of the non-pawn blocks of set-up piece words.
 const PIECE_ORDER: [Piece; 5] = [Piece::King, Piece::Queen, Piece::Knight, Piece::Bishop, Piece::Rook];
@@ -21,13 +17,14 @@ const BLACK_PAWNS: u16 = WHITE_PAWNS + 48;
 
 /// Decodes a set-up piece word (`0xc02d..=0xc30c`) as the piece and its square.
 pub fn decode_piece_word(word: u16) -> Option<(Color, Piece, Sq)> {
+    let square = |cb: u16| from_cb_square(cb as u8).index() as Sq;
     let piece = |base: u16, color| {
         let i = word - base;
-        (color, PIECE_ORDER[(i / 64) as usize], from_cb_square((i % 64) as u8))
+        (color, PIECE_ORDER[(i / 64) as usize], square(i % 64))
     };
     let pawn = |base: u16, color| {
         let i = word - base;
-        (color, Piece::Pawn, from_cb_square(((i / 6) * 8 + i % 6 + 1) as u8))
+        (color, Piece::Pawn, square((i / 6) * 8 + i % 6 + 1))
     };
     match word {
         FIRST_PIECE_WORD..BLACK_PIECES => Some(piece(WHITE_PIECES, Color::White)),
@@ -41,10 +38,7 @@ pub fn decode_piece_word(word: u16) -> Option<(Color, Piece, Sq)> {
 /// Encodes a set-up piece, the inverse of [`decode_piece_word`]. A pawn on the
 /// first or last rank, or a square above 63, returns `None`.
 pub fn encode_piece_word(color: Color, piece: Piece, sq: Sq) -> Option<u16> {
-    if sq >= 64 {
-        return None;
-    }
-    let cb = to_cb_square(sq) as u16;
+    let cb = u16::from(to_cb_square(Square::from_index(sq)?));
     match piece {
         Piece::Pawn => {
             let (file, rank) = (cb / 8, cb % 8);

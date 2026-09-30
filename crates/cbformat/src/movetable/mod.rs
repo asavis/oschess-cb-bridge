@@ -4,9 +4,16 @@
 //! each piece can make on an empty board, so a word means the same thing in any
 //! position and a game decodes without a board. The enumeration is rebuilt here
 //! once, on first use, from its generating rules.
+//!
+//! Its colours, pieces and castling sides are the vocabulary of the game model
+//! ([`crate::game`]); `From` converts each to and from `chesscore`'s, which
+//! the tree walks play on a board. [`from_cb_square`] and [`to_cb_square`]
+//! convert between ChessBase's numbering of the squares and `chesscore`'s.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+use chesscore::Square;
 
 mod pieces;
 
@@ -91,10 +98,69 @@ pub const FIRST_PIECE_WORD: u16 = 0xc02d;
 /// Last set-up piece word.
 pub const LAST_PIECE_WORD: u16 = 0xc30c;
 
-/// ChessBase square (file-major) to rank-major.
-pub fn from_cb_square(cb: u8) -> Sq {
-    let (file, rank) = (cb / 8, cb % 8);
-    rank * 8 + file
+/// The square ChessBase numbers `cb`, file by file: `a1` 0, `a2` 1, … `b1` 8,
+/// … `h8` 63. `cb` is below 64.
+pub fn from_cb_square(cb: u8) -> Square {
+    Square::new(cb / 8, cb % 8)
+}
+
+/// The number ChessBase gives `square`, file by file: the inverse of
+/// [`from_cb_square`].
+pub fn to_cb_square(square: Square) -> u8 {
+    square.file() * 8 + square.rank()
+}
+
+impl From<Color> for chesscore::Color {
+    fn from(c: Color) -> Self {
+        match c {
+            Color::White => chesscore::Color::White,
+            Color::Black => chesscore::Color::Black,
+        }
+    }
+}
+
+impl From<chesscore::Color> for Color {
+    fn from(c: chesscore::Color) -> Self {
+        match c {
+            chesscore::Color::White => Color::White,
+            chesscore::Color::Black => Color::Black,
+        }
+    }
+}
+
+impl From<Piece> for chesscore::Piece {
+    fn from(p: Piece) -> Self {
+        match p {
+            Piece::King => chesscore::Piece::King,
+            Piece::Queen => chesscore::Piece::Queen,
+            Piece::Knight => chesscore::Piece::Knight,
+            Piece::Bishop => chesscore::Piece::Bishop,
+            Piece::Rook => chesscore::Piece::Rook,
+            Piece::Pawn => chesscore::Piece::Pawn,
+        }
+    }
+}
+
+impl From<chesscore::Piece> for Piece {
+    fn from(p: chesscore::Piece) -> Self {
+        match p {
+            chesscore::Piece::King => Piece::King,
+            chesscore::Piece::Queen => Piece::Queen,
+            chesscore::Piece::Knight => Piece::Knight,
+            chesscore::Piece::Bishop => Piece::Bishop,
+            chesscore::Piece::Rook => Piece::Rook,
+            chesscore::Piece::Pawn => Piece::Pawn,
+        }
+    }
+}
+
+impl From<CastleSide> for chesscore::CastleSide {
+    fn from(s: CastleSide) -> Self {
+        match s {
+            CastleSide::Short => chesscore::CastleSide::Short,
+            CastleSide::Long => chesscore::CastleSide::Long,
+        }
+    }
 }
 
 fn sq(file: i8, rank: i8) -> Sq {
@@ -302,6 +368,34 @@ mod tests {
             })
         );
         assert!(matches!(decode(7), Some(MoveWord::Normal { from: 0, to: 1, .. })));
+    }
+
+    /// Each colour, piece and castling side converts to `chesscore`'s of
+    /// the same name and back, and the square numbers are ChessBase's, file
+    /// by file.
+    #[test]
+    fn vocabularies_and_square_numbers() {
+        for (ours, theirs) in [(Color::White, chesscore::Color::White), (Color::Black, chesscore::Color::Black)] {
+            assert_eq!((chesscore::Color::from(ours), Color::from(theirs)), (theirs, ours));
+        }
+        for (ours, theirs) in [
+            (Piece::King, chesscore::Piece::King),
+            (Piece::Queen, chesscore::Piece::Queen),
+            (Piece::Knight, chesscore::Piece::Knight),
+            (Piece::Bishop, chesscore::Piece::Bishop),
+            (Piece::Rook, chesscore::Piece::Rook),
+            (Piece::Pawn, chesscore::Piece::Pawn),
+        ] {
+            assert_eq!((chesscore::Piece::from(ours), Piece::from(theirs)), (theirs, ours));
+        }
+        assert_eq!(chesscore::CastleSide::from(CastleSide::Short), chesscore::CastleSide::Short);
+        assert_eq!(chesscore::CastleSide::from(CastleSide::Long), chesscore::CastleSide::Long);
+        for (cb, name) in [(0, "a1"), (1, "a2"), (8, "b1"), (11, "b4"), (63, "h8")] {
+            assert_eq!(from_cb_square(cb).to_string(), name);
+        }
+        for cb in 0..64 {
+            assert_eq!(to_cb_square(from_cb_square(cb)), cb);
+        }
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! A game's move record: its start and its move tree as words.
 
-use super::bytes::le_u16;
 use crate::game::{Setup, Start};
 use crate::movetable::{self, Color};
 use crate::{Error, Result};
@@ -30,20 +29,21 @@ impl<'a> GameMoves<'a> {
         if !content.len().is_multiple_of(2) {
             return Err(Error::Format("odd move stream length".into()));
         }
-        let word = |i: usize| le_u16(content, 2 * i);
-        let n = content.len() / 2;
+        let words = content.as_chunks::<2>().0;
+        let word = |i: usize| words.get(i).map(|w| u16::from_le_bytes(*w));
+        let n = words.len();
         if n == 0 {
             return Err(Error::Format("empty move stream".into()));
         }
         let mut i = 0;
         let start_from = 0;
-        if word(0) == movetable::START_POSITION {
+        if word(0) == Some(movetable::START_POSITION) {
             i = 1;
-            while i < n && word(i) != movetable::MOVES {
+            while i < n && word(i) != Some(movetable::MOVES) {
                 i += 1;
             }
         }
-        if i >= n || word(i) != movetable::MOVES {
+        if word(i) != Some(movetable::MOVES) {
             return Err(Error::Format("no move section".into()));
         }
         Ok(GameMoves { tag, start: &content[start_from..2 * i], tree: &content[2 * (i + 1)..] })

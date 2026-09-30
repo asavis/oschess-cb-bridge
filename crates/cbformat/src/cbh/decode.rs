@@ -10,10 +10,11 @@ use std::cell::Cell;
 
 use chesscore::{Board, CastleSide, Color as CColor, Move, Piece as CPiece, Square};
 
-use super::moves::{GameMoves, cb_square};
-use super::pieces::{KINDS, Pieces, to_cb};
+use super::moves::GameMoves;
+use super::pieces::{KINDS, Pieces};
 use super::tables;
 use crate::game::Start;
+use crate::movetable::{from_cb_square, to_cb_square};
 use crate::replay::{MoveError, TreeStats, TreeVisitor, start_board};
 use crate::{Error, Result};
 
@@ -144,7 +145,7 @@ impl<V: TreeVisitor> Walker<'_, V> {
     /// `g` or `c` square of the same rank.
     fn by_squares(&self, v: u16, chess960: bool) -> Result<Option<Move>> {
         let (from, to) = ((v & 63) as u8, (v >> 6 & 63) as u8);
-        let (from_sq, to_sq) = (cb_square(from), cb_square(to));
+        let (from_sq, to_sq) = (from_cb_square(from), from_cb_square(to));
         let us = self.board.side_to_move();
         let back = us.back_rank();
         if from == to {
@@ -198,7 +199,7 @@ impl<V: TreeVisitor> Walker<'_, V> {
         let (kind, index, delta) = match code {
             0 => return Ok(None),
             1..=8 => {
-                let from = to_cb(self.board.king(us));
+                let from = to_cb_square(self.board.king(us));
                 return self.ordinary(self.step(from, KING[(code - 1) as usize], None), u16::from(code));
             }
             9 => return self.castle(CastleSide::Short).map(Some),
@@ -243,7 +244,7 @@ impl<V: TreeVisitor> Walker<'_, V> {
     fn step(&self, from: u8, delta: (i8, i8), promotion: Option<CPiece>) -> Move {
         let x = (from / 8) as i8 + delta.0;
         let y = (from % 8) as i8 + delta.1;
-        Move::new(cb_square(from), Square::new(x.rem_euclid(8) as u8, y.rem_euclid(8) as u8), promotion)
+        Move::new(from_cb_square(from), Square::new(x.rem_euclid(8) as u8, y.rem_euclid(8) as u8), promotion)
     }
 
     fn compact(&mut self, s: &[u8], chess960: bool) -> Result<()> {

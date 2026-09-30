@@ -6,6 +6,7 @@
 use std::ops::Range;
 
 use super::decode_text;
+use crate::bytes::{Cursor, Fields};
 use crate::game::{Date, Eco};
 
 /// A player of a quoted game.
@@ -43,62 +44,43 @@ pub struct Quotation {
     pub set_up: bool,
 }
 
-/// Reads bytes in order: `None` past the end, or for [`quote_offsets`] the
-/// [`QuoteDamage`] there.
-struct Cursor<'a> {
-    b: &'a [u8],
-    i: usize,
+/// A classic string: a length byte, the text and a zero.
+fn classic(c: &mut Cursor<'_>) -> Option<String> {
+    let n = c.u8()? as usize;
+    let s = c.take(n)?;
+    c.take(1)?;
+    Some(decode_text(s))
 }
 
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.b.get(self.i..self.i.checked_add(n)?)?;
-        self.i += n;
-        Some(s)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn be16(&mut self) -> Option<u16> {
-        let b = self.take(2)?;
-        Some(u16::from_be_bytes([b[0], b[1]]))
-    }
-    fn le32(&mut self) -> Option<i32> {
-        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-    fn be32(&mut self) -> Option<i32> {
-        Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?))
-    }
-    /// A classic string: a length byte, the text and a zero.
-    fn classic(&mut self) -> Option<String> {
-        let n = self.u8()? as usize;
-        let s = self.take(n)?;
-        self.take(1)?;
-        Some(decode_text(s))
-    }
+/// A 2CBH quotation read in order for [`quote_offsets`]: a read that runs
+/// past the end is the [`QuoteDamage`] at the byte where it starts.
+struct Walk<'a>(Cursor<'a>);
 
-    /// Where the next `n` bytes lie, for [`quote_offsets`].
+impl Walk<'_> {
+    /// Where the next `n` bytes lie.
     fn span(&mut self, n: usize) -> Result<Range<usize>, QuoteDamage> {
-        let start = self.i;
-        self.take(n).map(|_| start..self.i).ok_or_else(|| self.damage(PAST_END))
+        let start = self.0.at();
+        self.0.take(n).map(|_| start..self.0.at()).ok_or_else(|| self.damage(PAST_END))
     }
     fn byte(&mut self) -> Result<u8, QuoteDamage> {
-        self.u8().ok_or_else(|| self.damage(PAST_END))
+        self.0.u8().ok_or_else(|| self.damage(PAST_END))
     }
     /// A non-negative `int` length that fits in what is left.
     fn length(&mut self) -> Result<usize, QuoteDamage> {
-        let n = self.le32().ok_or_else(|| self.damage(PAST_END))?;
-        let left = self.b.len().saturating_sub(self.i);
+        let n = self.0.le_i32().ok_or_else(|| self.damage(PAST_END))?;
+        let left = self.0.left();
         usize::try_from(n).ok().filter(|&n| n <= left).ok_or_else(|| self.damage("length out of range"))
     }
     fn damage(&self, what: &'static str) -> QuoteDamage {
-        QuoteDamage { at: self.i, what }
+        QuoteDamage { at: self.0.at(), what }
     }
 }
 
 /// The damage of a 2CBH quotation whose data ends before its layout does, in
 /// the `.2cba` reader's words.
 const PAST_END: &str = "runs past the end of the record";
+/// The fixed bytes of a 2CBH quotation after its header strings: 35, then 44.
+const FIXED: usize = 35 + 44;
 
 /// Where [`quote_offsets`] found a 2CBH quotation damaged: the offset in its
 /// data, and what is wrong there.
@@ -136,7 +118,7 @@ pub(crate) struct QuoteOffsets {
 /// bytes; 2 bytes; an `int` count of 5-byte moves; and 4 bytes. `Ok(None)` for
 /// a start of unknown meaning.
 pub(crate) fn quote_offsets(data: &[u8]) -> Result<Option<QuoteOffsets>, QuoteDamage> {
-    let mut c = Cursor { b: data, i: 0 };
+    let mut c = Walk(Cursor::new(data));
     if c.byte()? != 1 {
         return Err(c.damage("expected 01"));
     }
@@ -146,7 +128,7 @@ pub(crate) fn quote_offsets(data: &[u8]) -> Result<Option<QuoteOffsets>, QuoteDa
         c.span(usize::from(n))
     };
     let strings = [string()?, string()?, string()?, string()?, string()?, string()?];
-    let fixed = c.span(35 + 44)?;
+    let fixed = c.span(FIXED)?;
     for _ in 0..2 {
         c.span(5)?; // 01 00 01 00 00
         let n = c.length()?;
@@ -167,7 +149,7 @@ pub(crate) fn quote_offsets(data: &[u8]) -> Result<Option<QuoteOffsets>, QuoteDa
     let n = c.length()?;
     let moves = c.span(n.checked_mul(5).ok_or_else(|| c.damage("quotation move count"))?)?;
     c.span(4)?;
-    Ok(Some(QuoteOffsets { strings, fixed, set_up, moves, len: c.i }))
+    Ok(Some(QuoteOffsets { strings, fixed, set_up, moves, len: c.0.at() }))
 }
 
 impl Quotation {
@@ -178,24 +160,23 @@ impl Quotation {
         let at = quote_offsets(data).ok()??;
         let [wl, wf, bl, bf, site, event] =
             at.strings.map(|s| data.get(s).map(|s| decode_text(s.strip_suffix(&[0]).unwrap_or(s))));
-        let fixed = data.get(at.fixed)?;
-        let le16 = |o: usize| Some(u16::from_le_bytes([*fixed.get(o)?, *fixed.get(o + 1)?]));
+        let fixed: &[u8; FIXED] = data.get(at.fixed)?.try_into().ok()?;
         let moves = if at.set_up {
             Vec::new()
         } else {
             data.get(at.moves)?.as_chunks::<5>().0.iter().map(|m| [m[0], m[1]]).collect()
         };
         Some(Quotation {
-            white: QuotedPlayer { last: wl?, first: wf?, elo: le16(28)? },
-            black: QuotedPlayer { last: bl?, first: bf?, elo: le16(30)? },
+            white: QuotedPlayer { last: wl?, first: wf?, elo: fixed.le_u16::<28>() },
+            black: QuotedPlayer { last: bl?, first: bf?, elo: fixed.le_u16::<30>() },
             event: event?,
             site: site?,
-            date: Date(i32::from_le_bytes(fixed.get(0..4)?.try_into().ok()?)),
-            kind: *fixed.get(4)?,
-            round: *fixed.get(43)?,
-            subround: *fixed.get(44)? as i8,
-            result: *fixed.get(34)?,
-            eco: Eco::from_field(le16(32)?),
+            date: Date(fixed.le_i32::<0>()),
+            kind: fixed[4],
+            round: fixed[43],
+            subround: fixed[44] as i8,
+            result: fixed[34],
+            eco: Eco::from_field(fixed.le_u16::<32>()),
             moves,
             set_up: at.set_up,
         })
@@ -204,13 +185,13 @@ impl Quotation {
     /// A classic quotation's data. Its header is read; the moves of a classic
     /// quotation are not understood and stay in the data.
     pub fn parse_classic(data: &[u8]) -> Option<Quotation> {
-        let mut c = Cursor { b: data, i: 0 };
+        let mut c = Cursor::new(data);
         c.take(6)?; // size, mode, unknown
-        let (white, black) = (c.classic()?, c.classic()?);
-        let (white_elo, black_elo, eco) = (c.be16()?, c.be16()?, c.be16()?);
-        let (event, site) = (c.classic()?, c.classic()?);
-        let date = c.be32()?;
-        let kind = c.be16()?.to_le_bytes()[0];
+        let (white, black) = (classic(&mut c)?, classic(&mut c)?);
+        let (white_elo, black_elo, eco) = (c.be_u16()?, c.be_u16()?, c.be_u16()?);
+        let (event, site) = (classic(&mut c)?, classic(&mut c)?);
+        let date = c.be_i32()?;
+        let kind = c.be_u16()?.to_le_bytes()[0];
         c.take(2 + 4)?; // nation, unknown and rounds
         let subround = c.u8()? as i8;
         let round = c.u8()?;

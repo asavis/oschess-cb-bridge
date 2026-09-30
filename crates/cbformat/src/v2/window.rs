@@ -31,7 +31,7 @@ impl Database {
         buf: &mut Vec<u8>,
     ) -> Result<Option<MoveWindow>> {
         let offset = |r: &Record| position(r.moves_offset());
-        let Some(range) = span(records.iter().map(offset), next.map(offset), self.moves.len()?, FILE_HEADER) else {
+        let Some(range) = span(records.iter().map(offset), next.map(offset), self.moves.size()?, FILE_HEADER) else {
             return Ok(None);
         };
         let Some(len) = usize::try_from(range.end - range.start).ok().filter(|&l| l <= buf.capacity()) else {

@@ -6,6 +6,7 @@
 //! next one. A type whose layout is unknown therefore ends the decoding; what was
 //! decoded before it is kept and the record is marked incomplete.
 
+use crate::bytes::Cursor;
 use crate::game::annotations_text as decode_text;
 use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Source, Square, Unknown};
 use crate::{Error, Result};
@@ -28,12 +29,12 @@ impl GameAnnotations {
     /// [`Self::stopped_at`]. Whether each position names a move of the game
     /// is checked against the game by [`Self::check_positions`].
     pub fn parse(content: &[u8]) -> Result<Self> {
-        let mut r = Reader { b: content, i: 0 };
+        let mut r = Reader(Cursor::new(content));
         let mut out = GameAnnotations { source: Source::TwoCbh, ..GameAnnotations::default() };
         loop {
             let position = r.i32()?;
             if position == END_MARKER {
-                if r.i != content.len() {
+                if r.left() != 0 {
                     return Err(r.bad("bytes after the end marker"));
                 }
                 return Ok(out);
@@ -49,11 +50,11 @@ impl GameAnnotations {
             let mut annotations = Vec::with_capacity(count as usize);
             for _ in 0..count {
                 let type_code = r.u16()?;
-                let start = r.i;
+                let start = r.0.at();
                 match annotation(&mut r, type_code)? {
                     Some(mut a) => {
                         if let Annotation::Other { data, .. } = &mut a {
-                            *data = content[start..r.i].to_vec();
+                            *data = content[start..r.0.at()].to_vec();
                         }
                         annotations.push(a);
                     }
@@ -70,10 +71,9 @@ impl GameAnnotations {
     }
 }
 
-pub(super) struct Reader<'a> {
-    b: &'a [u8],
-    i: usize,
-}
+/// A record read in order by a [`Cursor`]: a read that runs past the end is
+/// an error at the byte where it starts.
+pub(super) struct Reader<'a>(Cursor<'a>);
 
 impl<'a> Reader<'a> {
     pub(super) fn bad(&self, what: &str) -> Error {
@@ -81,36 +81,32 @@ impl<'a> Reader<'a> {
     }
     /// [`Reader::bad`] at `n` bytes past the current one.
     pub(super) fn bad_ahead(&self, n: usize, what: &str) -> Error {
-        Error::Format(format!("annotations at byte {}: {what}", self.i.saturating_add(n)))
+        Error::Format(format!("annotations at byte {}: {what}", self.0.at().saturating_add(n)))
     }
-    pub(super) fn left(&self) -> usize {
-        self.b.len() - self.i
+    fn past_end(&self) -> Error {
+        self.bad("runs past the end of the record")
+    }
+    fn left(&self) -> usize {
+        self.0.left()
     }
     /// The bytes from here to the end of the record.
     pub(super) fn rest(&self) -> &'a [u8] {
-        self.b.get(self.i..).unwrap_or_default()
+        self.0.rest()
     }
     pub(super) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if n > self.left() {
-            return Err(self.bad("runs past the end of the record"));
-        }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
-        Ok(s)
+        self.0.take(n).ok_or_else(|| self.past_end())
     }
     pub(super) fn skip(&mut self, n: usize) -> Result<()> {
         self.take(n).map(|_| ())
     }
     pub(super) fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        self.0.u8().ok_or_else(|| self.past_end())
     }
     pub(super) fn u16(&mut self) -> Result<u16> {
-        let b = self.take(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+        self.0.le_u16().ok_or_else(|| self.past_end())
     }
     pub(super) fn i32(&mut self) -> Result<i32> {
-        let b = self.take(4)?;
-        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        self.0.le_i32().ok_or_else(|| self.past_end())
     }
     /// A non-negative `int` length that fits in what is left.
     pub(super) fn len(&mut self) -> Result<usize> {

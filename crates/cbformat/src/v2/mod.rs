@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use crate::{Error, Result};
 
 mod annotations;
-mod bytes;
 mod entities;
 mod frame;
 mod moves;
@@ -21,7 +20,6 @@ mod record;
 mod window;
 
 pub use annotations::ANNOTATION_TAG;
-use bytes::{le_i16, le_i64};
 pub use entities::{Entities, GAME_TAG, PLAYER, SOURCE, TEAM, TOURNAMENT};
 pub use frame::checksum;
 use frame::{MAX_FRAME_PART, frame_at, read_frame_into};
@@ -29,6 +27,7 @@ pub use moves::{GameMoves, Token};
 pub use record::Record;
 pub use window::MoveWindow;
 
+use crate::bytes::Fields;
 use crate::file::{self, DbFile};
 use crate::game::{GameAnnotations, Names};
 use crate::recordfile::{RecordFile, Run, span};
@@ -67,8 +66,9 @@ impl Database {
         let stem = file::stem(path.as_ref(), "2cbh");
         let with = |ext: &str| file::with_extension(&stem, ext);
         let headers = RecordFile::open(with(".2cbh"), ".2cbh")?;
-        let header = headers.file().read(0, HEADER_RECORD_SIZE)?;
-        let record_size = le_i16(&header, 0x0a);
+        let mut header = [0u8; HEADER_RECORD_SIZE];
+        headers.file().read_into(0, &mut header)?;
+        let record_size = header.le_i16::<0x0a>();
         if record_size as usize != HEADER_RECORD_SIZE {
             return Err(Error::Format(format!(".2cbh record size {record_size}, expected 192")));
         }
@@ -179,9 +179,9 @@ impl Database {
         // where the batch's last one ends, since move records are stored back
         // to back in id order.
         let run = self.headers.run(first, last, true)?;
-        let moves = Span::read(&self.moves, &run, 0x08)?;
+        let moves = Span::read::<0x08>(&self.moves, &run)?;
         let annotations = match &self.annotations {
-            Some(file) => Span::read(file, &run, 0x10)?,
+            Some(file) => Span::read::<0x10>(file, &run)?,
             None => Span::EMPTY,
         };
         Ok(Batch { db: self, run, moves, annotations })
@@ -269,11 +269,11 @@ struct Span {
 impl Span {
     const EMPTY: Span = Span { at: 0, bytes: Vec::new() };
 
-    /// The span of `file` for the offsets at `field` of the records of `run`.
-    fn read(file: &DbFile, run: &Run<HEADER_RECORD_SIZE>, field: usize) -> Result<Span> {
-        let offset = |r: &[u8; HEADER_RECORD_SIZE]| position(le_i64(r, field));
+    /// The span of `file` for the offsets at `FIELD` of the records of `run`.
+    fn read<const FIELD: usize>(file: &DbFile, run: &Run<HEADER_RECORD_SIZE>) -> Result<Span> {
+        let offset = |r: &[u8; HEADER_RECORD_SIZE]| position(r.le_i64::<FIELD>());
         let offsets = run.records().iter().map(offset);
-        match span(offsets, run.next().map(offset), file.len()?, FILE_HEADER) {
+        match span(offsets, run.next().map(offset), file.size()?, FILE_HEADER) {
             Some(s) if s.end - s.start <= MAX_BATCH_SPAN => {
                 Ok(Span { at: s.start, bytes: file.read(s.start, (s.end - s.start) as usize)? })
             }

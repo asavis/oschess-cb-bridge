@@ -5,6 +5,8 @@
 //! format stores it and gives `None` for a layout it does not know; a classic
 //! layout that no paired database confirms is not decoded.
 
+use crate::bytes::{Cursor, Fields};
+
 /// An engine's score, from White's point of view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Score {
@@ -54,23 +56,23 @@ impl Evaluation {
 /// classic format a big-endian `short` count and each entry as the same
 /// 32-bit value big-endian.
 pub fn evaluations(data: &[u8], classic: bool) -> Option<Vec<Evaluation>> {
-    let (count, entries) = if classic {
-        let count = u16::from_be_bytes([*data.first()?, *data.get(1)?]) as usize;
-        (count, data.get(2..)?)
+    let mut c = Cursor::new(data);
+    let count = if classic {
+        usize::from(c.be_u16()?)
     } else {
-        let len = i32::from_le_bytes(data.get(1..5)?.try_into().ok()?);
-        let count = u16::from_le_bytes([*data.get(5)?, *data.get(6)?]) as usize;
-        if data[0] != 1 || usize::try_from(len).ok()? != 2 + 4 * count {
+        let (one, len, count) = (c.u8()?, c.le_i32()?, usize::from(c.le_u16()?));
+        if one != 1 || usize::try_from(len).ok()? != 2 + 4 * count {
             return None;
         }
-        (count, data.get(7..)?)
+        count
     };
+    let entries = c.rest();
     if entries.len() != 4 * count {
         return None;
     }
     let entries = entries.as_chunks::<4>().0.iter().map(|e| {
         let e = if classic { [e[3], e[2], e[1], e[0]] } else { *e };
-        Evaluation { value: i16::from_le_bytes([e[0], e[1]]), depth: e[2], flag: e[3] }
+        Evaluation { value: e.le_i16::<0>(), depth: e[2], flag: e[3] }
     });
     Some(entries.collect())
 }
@@ -79,8 +81,7 @@ pub fn evaluations(data: &[u8], classic: bool) -> Option<Vec<Evaluation>> {
 /// centipawns, 1 moves to mate; 3 and 32 are **unknown**) and a depth.
 pub fn engine_evaluation(data: &[u8], classic: bool) -> Option<Score> {
     let d: &[u8; 6] = data.try_into().ok().filter(|_| !classic)?;
-    let short = |i: usize| i16::from_le_bytes([d[i], d[i + 1]]);
-    match (short(2), short(0)) {
+    match (d.le_i16::<2>(), d.le_i16::<0>()) {
         (0, v) => Some(Score::Centipawns(v)),
         (1, 0) => None,
         (1, v) => Some(Score::Mate(v)),
@@ -113,14 +114,15 @@ pub struct Stage {
 /// not decoded.
 pub fn time_control(data: &[u8], classic: bool) -> Option<[Stage; 3]> {
     let d: &[u8; 38] = data.try_into().ok().filter(|_| !classic)?;
-    if d[0] != 1 || d[34..] != [0; 4] {
+    if d[0] != 1 || d.field::<34, 4>() != &[0; 4] {
         return None;
     }
-    let stage = |k: usize| {
-        let s = &d[1 + 11 * k..12 + 11 * k];
-        let int = |i: usize| i32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
-        Stage { initial: int(0), increment: int(4), moves: u16::from_le_bytes([s[8], s[9]]), kind: s[10] }
+    let stage = |s: &[u8; 11]| Stage {
+        initial: s.le_i32::<0>(),
+        increment: s.le_i32::<4>(),
+        moves: s.le_u16::<8>(),
+        kind: s[10],
     };
-    let stages = [stage(0), stage(1), stage(2)];
+    let stages = [d.field::<1, 11>(), d.field::<12, 11>(), d.field::<23, 11>()].map(stage);
     stages.iter().all(|s| s.initial >= 0 && s.increment >= 0).then_some(stages)
 }

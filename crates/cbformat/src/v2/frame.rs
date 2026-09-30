@@ -3,7 +3,7 @@
 //! read, from bytes already read ([`frame_at`]) or from its file
 //! ([`read_frame_into`]).
 
-use super::bytes::{be_u64, le_i32, le_i64, le_u16};
+use crate::bytes::{self, Fields};
 use crate::file::DbFile;
 use crate::recordfile::over_limit;
 use crate::{Error, Result};
@@ -15,17 +15,14 @@ const FRAME_HEADER: usize = 0x1a;
 /// a Mega Database is about 1.2 MB, a guiding text.
 pub(super) const MAX_FRAME_PART: usize = 64 << 20;
 
-/// The content and spare sizes of a frame, from its first bytes.
-fn frame_sizes(frame: &[u8], offset: i64) -> Result<(usize, usize)> {
+/// The content and spare sizes of a frame, from its header.
+fn frame_sizes(head: &[u8; FRAME_HEADER], offset: i64) -> Result<(usize, usize)> {
     let bad = |what: &str| Error::Format(format!("record at {offset:#x}: {what}"));
-    if frame.len() < FRAME_HEADER {
-        return Err(bad("offset out of range"));
-    }
-    if frame[..8] != RECORD_MAGIC {
+    if head.field::<0, 8>() != &RECORD_MAGIC {
         return Err(bad("bad magic"));
     }
-    let a = usize::try_from(le_i32(frame, 8)).map_err(|_| bad("negative size"))?;
-    let b = usize::try_from(le_i32(frame, 12)).map_err(|_| bad("negative size"))?;
+    let a = usize::try_from(head.le_i32::<8>()).map_err(|_| bad("negative size"))?;
+    let b = usize::try_from(head.le_i32::<12>()).map_err(|_| bad("negative size"))?;
     if a > MAX_FRAME_PART || b > MAX_FRAME_PART {
         return Err(bad("record larger than 64 MiB"));
     }
@@ -37,19 +34,20 @@ fn frame_sizes(frame: &[u8], offset: i64) -> Result<(usize, usize)> {
 /// content.
 fn parse_frame(frame: &[u8], offset: i64, verify_checksum: bool) -> Result<(u16, &[u8])> {
     let bad = |what: &str| Error::Format(format!("record at {offset:#x}: {what}"));
-    let (a, b) = frame_sizes(frame, offset)?;
-    if FRAME_HEADER + a + b + 8 > frame.len() {
+    let head = frame.first_chunk().ok_or_else(|| bad("offset out of range"))?;
+    let (a, b) = frame_sizes(head, offset)?;
+    let (Some(content), Some(tail)) =
+        (frame.get(FRAME_HEADER..FRAME_HEADER + a), bytes::array(frame, FRAME_HEADER + a + b))
+    else {
         return Err(bad("runs past end of file"));
-    }
-    let tail = le_i64(frame, FRAME_HEADER + a + b);
-    if tail != (a + b + 34) as i64 {
+    };
+    if i64::from_le_bytes(*tail) != (a + b + 34) as i64 {
         return Err(bad("trailing length mismatch"));
     }
-    let content = &frame[FRAME_HEADER..FRAME_HEADER + a];
-    if verify_checksum && be_u64(frame, 0x10) != checksum(content) {
+    if verify_checksum && head.be_u64::<0x10>() != checksum(content) {
         return Err(bad("checksum mismatch"));
     }
-    Ok((le_u16(frame, 0x18), content))
+    Ok((head.le_u16::<0x18>(), content))
 }
 
 /// The tag and content of the frame at `offset` of a file, from `bytes`,
@@ -67,8 +65,8 @@ pub(super) fn frame_at<'a>(
     // A position that does not fit in `usize` (on a 32-bit target) lies
     // outside the bytes.
     let rel = u64::try_from(offset).ok()?.checked_sub(at).and_then(|rel| usize::try_from(rel).ok())?;
-    let frame = bytes.get(rel..).filter(|f| f.len() >= FRAME_HEADER)?;
-    let (a, b) = frame_sizes(frame, offset).ok()?;
+    let frame = bytes.get(rel..)?;
+    let (a, b) = frame_sizes(frame.first_chunk()?, offset).ok()?;
     if FRAME_HEADER + a + b + 8 > frame.len() {
         return None;
     }
@@ -93,7 +91,7 @@ pub(super) fn read_frame_into<'a>(
 ) -> Result<(u16, &'a [u8])> {
     let bad = |what: &str| Error::Format(format!("record at {offset:#x}: {what}"));
     let at = u64::try_from(offset).map_err(|_| bad("negative offset"))?;
-    let file_len = file.len()?;
+    let file_len = file.size()?;
     if at.checked_add(FRAME_HEADER as u64).is_none_or(|end| end > file_len) {
         return Err(bad("offset out of range"));
     }
