@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bridge::explorer::runs::{Limits, MEMORY_WAIT, Progress};
 use bridge::explorer::{self, Loaded};
@@ -57,7 +57,10 @@ fn build(d: &Database, name: &str, limits: &Limits) -> (Loaded, PathBuf, (u64, u
 }
 
 /// Passes on many workers write the index byte for byte as one pass of each
-/// kind does, however many passes the room makes: the room a test gives, or
+/// kind does, however many passes the room makes. The one pass is made with
+/// the workers after the first starting half a second late, as on a busy
+/// machine: a worker that fills up first leaves the rest to them (#237). The
+/// room a test gives makes many passes, and so does
 /// what a search leaves free while it holds all of the budget but 5 MiB,
 /// less than the build holds when it has the room, which leaves room for
 /// fewer workers than the build asks for, and less room. The move
@@ -71,8 +74,9 @@ fn passes_on_many_workers_write_the_same_index() {
     assert_eq!((budget(), threads()), (64 << 20, 16));
     let db = random_games("parallel-passes", 5_000, 11);
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let (one, one_dir, passes, most) = build(&d, "one", &Limits::default());
-    assert_eq!(passes, (1, 1));
+    let late = Limits { late_start: Duration::from_millis(500), ..Limits::default() };
+    let (one, one_dir, passes, most) = build(&d, "one", &late);
+    assert_eq!(passes, (1, 1), "the late workers took their share");
     let (many, many_dir, passes, _) = build(&d, "many", &Limits { pass_bytes: Some(256 << 10), ..Limits::default() });
     assert!(passes.0 > 2 && passes.1 > 2, "{passes:?}");
     // Room for one worker of each pass, and little beside it: less than the

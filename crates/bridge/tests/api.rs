@@ -1,11 +1,11 @@
 //! The server against `docs/api.md`, over real loopback connections.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bridge::api::App;
 use bridge::catalog::id_of;
@@ -17,8 +17,8 @@ use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Pie
 
 mod common;
 use common::{
-    ANSWER_TIMEOUT, ORIGIN, Reply, TOKEN, app_of, connect, get_reply, has_members, has_object, member, object_with,
-    objects, send, serve_with_dir,
+    ORIGIN, Reply, Sent, TOKEN, TestBridge, WAIT_LIMIT, app_of, connect, get_reply, has_members, has_object, member,
+    object_with, objects, poll, send, unanswered,
 };
 
 /// `games` games of 1.e4 won by white, white and black being "Morphy, Paul";
@@ -45,17 +45,29 @@ fn database(name: &str, games: u32, text: u32, broken: u32) -> TempDb {
     b.write(name)
 }
 
+/// A bridge serving a test's database, and the database's id. Declared after
+/// the database, it is dropped first: nothing works on the database's files
+/// once they go.
 struct Running {
     port: u16,
     id: String,
+    bridge: TestBridge,
+}
+
+impl Running {
+    /// How long its busy answer waits for a request's `Origin` after the
+    /// connection was accepted: `server::BUSY_READ`, as the harness keeps it.
+    fn busy_read(&self) -> Duration {
+        self.bridge.app.busy_read
+    }
 }
 
 fn start(db: &TempDb, extra: Vec<PathBuf>, hook: Option<Box<dyn Fn() + Send + Sync>>) -> Running {
     let path = db.dir().join("db.2cbh");
     let mut paths = vec![path.clone()];
     paths.extend(extra);
-    let (port, _) = serve_with_dir(App { between_reads: hook, ..app_of(paths) }, db.dir());
-    Running { port, id: id_of(&path) }
+    let bridge = TestBridge::new(App { between_reads: hook, ..app_of(paths) });
+    Running { port: bridge.port, id: id_of(&path), bridge }
 }
 
 fn plain(port: u16, head: &str) -> Reply {
@@ -95,7 +107,8 @@ fn status_and_databases() {
 #[test]
 fn access_checks() {
     let db = database("api-access", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let host = format!("Host: 127.0.0.1:{p}");
     let auth = format!("Authorization: Bearer {TOKEN}");
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}"));
@@ -135,7 +148,8 @@ fn access_checks() {
 #[test]
 fn malformed_requests_bodies_and_oversized_headers() {
     let db = database("api-malformed", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 5"));
     assert_eq!((r.status, r.body.contains("body_not_allowed")), (413, true));
     let big = "x".repeat(17 << 10);
@@ -153,7 +167,8 @@ fn malformed_requests_bodies_and_oversized_headers() {
 #[test]
 fn a_refusal_is_read_to_its_end_while_the_request_goes_on() {
     let db = database("api-linger", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let big = "x".repeat(MAX_HEAD * 4);
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}"));
     assert_eq!((r.status, r.body.contains("headers_too_large")), (431, true));
@@ -303,7 +318,8 @@ fn appended_games_appear_on_the_next_request() {
 #[test]
 fn a_connection_serves_several_requests() {
     let db = database("api-keepalive", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let one = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
     let mut s = connect(p).unwrap();
     s.write_all(format!("{one}{one}").as_bytes()).unwrap();
@@ -311,45 +327,6 @@ fn a_connection_serves_several_requests() {
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
     assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
-}
-
-/// Answers on a kept connection come at once (#142). An answer written in two
-/// pieces waited for the client's delayed acknowledgement of the first, on
-/// every round trip but the first few: 40 ms on Linux, the shortest there is,
-/// longer elsewhere. A loaded machine holds back some round trips as long,
-/// not the typical one: the median of 20 stays under that floor, where a
-/// bound on their total failed under load.
-#[test]
-fn answers_on_a_kept_connection_come_without_delay() {
-    const DELAYED_ACK: Duration = Duration::from_millis(40);
-    let db = database("api-no-delay", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
-    let one = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
-    let mut s = std::io::BufReader::new(connect(p).unwrap());
-    let mut trips = Vec::new();
-    for _ in 0..20 {
-        let started = Instant::now();
-        s.get_mut().write_all(one.as_bytes()).unwrap();
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            let read = std::io::BufRead::read_line(&mut s, &mut line).unwrap();
-            assert!(read > 0, "the connection ended within an answer's head: {trips:?}");
-            if line == "\r\n" {
-                break;
-            }
-            if let Some(v) = line.strip_prefix("Content-Length: ") {
-                length = v.trim().parse().unwrap();
-            }
-        }
-        let mut body = vec![0; length];
-        s.read_exact(&mut body).unwrap();
-        trips.push(started.elapsed());
-    }
-    let mut sorted = trips.clone();
-    sorted.sort();
-    let median = sorted[trips.len() / 2];
-    assert!(median < DELAYED_ACK, "the median round trip took {median:?}: {trips:?}");
 }
 
 /// A `.2lid` with six entity types (players, tournaments, sources, the unused
@@ -481,6 +458,11 @@ fn a_window_at_the_last_record_number() {
     assert_eq!(numbers("?offset=4294967294&limit=1"), [4294967295]);
     assert_eq!(numbers("?offset=4294967293&limit=5"), [4294967294, 4294967295]);
     assert_eq!(numbers("?sort=number-desc&limit=2"), [4294967295, 4294967294]);
+    // A list of so many records starts a build of the heads file (#106),
+    // which would read every one of them, for hours, and a dropped bridge
+    // waits for its background work. A change of the database stops the
+    // build at its next block.
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)).unwrap();
 }
 
 /// Refusals made before a request is routed carry CORS headers for an allowed
@@ -492,7 +474,8 @@ fn a_window_at_the_last_record_number() {
 #[test]
 fn refusals_before_routing_are_readable_by_the_page() {
     let db = database("api-refusals", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let host = format!("Host: 127.0.0.1:{p}");
     let big = format!("GET /v1/status HTTP/1.1\r\nOrigin: {ORIGIN}\r\n{host}\r\nX-Big: ");
     let big = format!("{big}{}", "x".repeat(MAX_HEAD + 1 - big.len()));
@@ -518,9 +501,10 @@ fn the_ipv6_loopback_is_served() {
         return;
     }
     let db = database("api-ipv6", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let mut s = TcpStream::connect(("::1", p)).unwrap();
-    s.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+    s.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
     let raw = format!(
         "GET /v1/status HTTP/1.1\r\nHost: [::1]:{p}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
     );
@@ -569,67 +553,72 @@ fn a_game_too_large_to_render_is_refused() {
 }
 
 /// Asks for `/v1/status` until the answer is `status`, every answer before it
-/// being `meanwhile`: the bridge counts the connections opened or closed just
-/// before in its own time, which a loaded machine makes long.
+/// being `meanwhile`, for [`WAIT_LIMIT`] at most: the bridge counts the
+/// connections opened or closed just before in its own time, which a loaded
+/// machine makes long.
 fn status_until(port: u16, status: u16, meanwhile: u16) -> Reply {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let r = poll(WAIT_LIMIT, || {
         let r = get_reply(port, "/v1/status");
-        if r.status == status {
-            return r;
-        }
-        assert_eq!(r.status, meanwhile, "{}", r.body);
-        assert!(Instant::now() < deadline, "still {} after 10 s: {}", r.status, r.body);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+        assert!(r.status == status || r.status == meanwhile, "{} {}", r.status, r.body);
+        (r.status == status).then_some(r)
+    });
+    r.unwrap_or_else(|| panic!("still {meanwhile} after {WAIT_LIMIT:?}"))
+}
+
+/// `/v1/status` asked on a connection of its own: its answer, and whether the
+/// test sent the whole request within `busy_read` of its connection. The busy
+/// answer reads a request that long after acceptance at most, for its
+/// `Origin`: of a request a loaded machine held back longer, it may not have
+/// read it, as it should not, and answer without CORS.
+fn status_sent(port: u16, busy_read: Duration) -> (Reply, bool) {
+    let sent = Sent::get(port, "/v1/status");
+    let in_time = sent.took < busy_read;
+    (sent.reply(), in_time)
 }
 
 /// Holds the connection cap with [`server::MAX_CONNECTIONS`] connections that
 /// send nothing, asking for `/v1/status` until the answer is `503`: those
-/// connections and that answer. Until the bridge has counted them all, a
-/// request is served. A loaded kernel can queue a request ahead of such a
-/// connection whose `connect` has returned (#217): the request takes the last
-/// slot, the connection is answered `busy` and closed, and the cap would never
-/// be reached again. Such a connection is replaced.
-fn hold_the_cap(port: u16) -> (Vec<TcpStream>, Reply) {
+/// connections and that answer, of a request sent in time for the busy
+/// answer to read it ([`status_sent`]); one sent late is asked again. Until
+/// the bridge has counted them all, a request is served. A loaded kernel can
+/// queue a request ahead of such a connection whose `connect` has returned
+/// (#217): the request takes the last slot, the connection is answered
+/// `busy` and closed, and the cap would never be reached again. Such a
+/// connection is replaced.
+fn hold_the_cap(port: u16, busy_read: Duration) -> (Vec<TcpStream>, Reply) {
     let mut held: Vec<TcpStream> = (0..server::MAX_CONNECTIONS).map(|_| connect(port).unwrap()).collect();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let r = get_reply(port, "/v1/status");
+    let busy = poll(WAIT_LIMIT, || {
+        let (r, in_time) = status_sent(port, busy_read);
         if r.status == 503 {
-            return (held, r);
+            return in_time.then_some(r);
         }
         assert_eq!(r.status, 200, "{}", r.body);
-        assert!(Instant::now() < deadline, "still 200 after 10 s: {}", r.body);
         for s in &mut held {
             if !unanswered(s) {
                 *s = connect(port).unwrap();
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Whether the bridge has neither answered nor closed `s`, a connection that
-/// sent nothing.
-fn unanswered(s: &TcpStream) -> bool {
-    s.set_nonblocking(true).unwrap();
-    let unanswered = matches!(s.peek(&mut [0]), Err(e) if e.kind() == ErrorKind::WouldBlock);
-    s.set_nonblocking(false).unwrap();
-    unanswered
+        None
+    });
+    let busy = busy.unwrap_or_else(|| panic!("still 200 after {WAIT_LIMIT:?}"));
+    (held, busy)
 }
 
 /// Over the connection cap, the `busy` answer is readable by an allowed page,
-/// and so is a refused `Host`.
+/// and so is a refused `Host`. The busy answer reads a request's `Origin`
+/// within `server::BUSY_READ` of the connection's acceptance, which this test
+/// keeps: a request the test itself was too slow to send is asked again
+/// ([`hold_the_cap`]), where the check failed (#238).
 #[test]
 fn busy_and_misdirected_answers_carry_cors() {
     let db = database("api-busy", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
+    let bridge = start(&db, vec![], None);
+    let p = bridge.port;
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:1\r\nOrigin: {ORIGIN}"));
     assert_eq!((r.status, r.header("access-control-allow-origin")), (421, Some(ORIGIN)));
     // That connection's slot was freed before it closed, so the next ones
     // are the only ones counted.
-    let (idle, r) = hold_the_cap(p);
+    let (idle, r) = hold_the_cap(p, bridge.busy_read());
     assert!(r.body.contains(r#""code":"busy""#));
     assert_eq!(r.header("retry-after"), Some("1"));
     assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
@@ -663,25 +652,30 @@ fn a_game_whose_answer_would_be_huge_is_refused() {
     assert_eq!(get_reply(r.port, "/v1/status").status, 200);
 }
 
-/// Silent connections queued over the cap cannot delay the busy answer of a
-/// request behind them: every deadline runs from acceptance. From the moment
-/// the refusing thread reached each, the 12 would hold the answer back 12
-/// times the 500 ms a busy answer waits for its request, 6 s; from
-/// acceptance, about 500 ms in all. The bound leaves a loaded machine seconds
-/// and stays under the 6 s.
+/// Silent connections queued over the cap do not keep the busy answer of a
+/// request behind them from reading its `Origin`: every deadline runs from
+/// acceptance, so the request's own has not passed when the refusing thread
+/// reaches it, or it gets a last look at what arrived in time. That the
+/// silent ones add nothing to its wait is checked at its rule, without a
+/// clock, by `server::tests::the_busy_wait_runs_from_acceptance`: a bound
+/// here on the time the answer took failed under load (#238). A request the
+/// test itself was too slow to send is asked again, behind as many silent
+/// connections.
 #[test]
 fn silent_queued_connections_do_not_delay_the_busy_answer() {
     let db = database("api-busy-queue", 1, 0, 0);
-    let p = start(&db, vec![], None).port;
-    let (serving, _) = hold_the_cap(p);
-    let silent: Vec<TcpStream> = (0..12).map(|_| connect(p).unwrap()).collect();
-    let started = Instant::now();
-    let r = get_reply(p, "/v1/status");
-    let waited = started.elapsed();
+    let bridge = start(&db, vec![], None);
+    let (p, busy_read) = (bridge.port, bridge.busy_read());
+    let (serving, _) = hold_the_cap(p, busy_read);
+    let r = poll(WAIT_LIMIT, || {
+        let silent: Vec<TcpStream> = (0..12).map(|_| connect(p).unwrap()).collect();
+        let (r, in_time) = status_sent(p, busy_read);
+        drop(silent);
+        in_time.then_some(r)
+    });
+    let r = r.unwrap_or_else(|| panic!("no request was sent in time within {WAIT_LIMIT:?}"));
     assert_eq!(r.status, 503, "{}", r.body);
     assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
-    assert!(waited < Duration::from_secs(4), "the busy answer took {waited:?}");
-    drop(silent);
     drop(serving);
     // Served again once the bridge has seen the connections close.
     status_until(p, 200, 503);

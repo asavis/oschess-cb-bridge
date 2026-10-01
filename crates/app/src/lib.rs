@@ -17,3 +17,10 @@ pub mod desktop;
 
 #[cfg(test)]
 mod window_rules;
+
+/// How long this crate's tests wait for what must come, such as another
+/// thread's answer, before they fail: far longer than a loaded machine stalls
+/// a thread, so that only what never comes, such as a deadlock, fails, and
+/// fails by name (#238). The bridge's tests wait as long.
+#[cfg(test)]
+pub(crate) const PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);

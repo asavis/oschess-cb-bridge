@@ -15,6 +15,7 @@ use cbformat::game::{Player, Tournament};
 use super::SearchError;
 use super::memory::{Allowance, Cancel, Held, Hold, Refused};
 use super::workers::{self, threads};
+use crate::activity::Activity;
 use crate::indexdir::{self, crc32, crc32_update, u32_at, u64_at};
 pub use crate::store::Kind;
 use crate::store::Store;
@@ -384,14 +385,20 @@ impl NameTable {
         *lock(&self.write_to) = Some((path, kind, generation));
     }
 
-    /// Writes the table on a thread of its own when it is marked to be, once.
-    pub(super) fn write_later(self: &std::sync::Arc<Self>) {
+    /// Writes the table on a thread of its own when it is marked to be, once;
+    /// the writer counts in `activity`, a catalog's, until it ends.
+    pub(super) fn write_later(self: &std::sync::Arc<Self>, activity: Option<&std::sync::Arc<Activity>>) {
         let Some((path, kind, generation)) = lock(&self.write_to).take() else {
             return;
         };
         let table = std::sync::Arc::clone(self);
+        // Counted before the thread starts, so that no settle looks between
+        // the start and the write (#236); dropped with the thread's work when
+        // it cannot start.
+        let active = activity.map(|a| a.begin("names"));
         let _ =
             std::thread::Builder::new().name("bridge-names".into()).stack_size(crate::THREAD_STACK).spawn(move || {
+                let _active = active;
                 if let Err(e) = table.write_file(&path, kind, generation) {
                     // The file is named after the database's id.
                     let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -641,6 +648,7 @@ impl BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::workers::tests::unbusy;
 
     /// A chunk as a names file holds it: first, count, names, lower, ends,
     /// lower ends, given.
@@ -779,6 +787,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A names file written later counts as the catalog's work from the
+    /// moment [`NameTable::write_later`] returns, before its thread starts
+    /// (#236): once no work is counted, it is in place.
+    #[test]
+    fn a_names_file_written_later_is_waited_for() {
+        let dir = std::env::temp_dir().join(format!("bridge-names-later-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0123456789abcdef.players");
+        let names = std::sync::Arc::new(table(&["Carlsen", "Kasparov"]));
+        names.to_be_written(path.clone(), Kind::Players, 7);
+        let activity = std::sync::Arc::new(Activity::default());
+        names.write_later(Some(&activity));
+        let limit = std::time::Duration::from_secs(300);
+        assert_eq!(activity.wait_idle(std::time::Instant::now() + limit), Ok(()));
+        let back = NameTable::open_file(&path, Kind::Players, 7, 2).unwrap().unwrap();
+        assert_eq!((back.name(0), back.name(1)), ("Carlsen", "Kasparov"));
+        assert!(!indexdir::partial(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_names_file_whose_chunks_do_not_cover_their_ids_is_never_used() {
         // Two names in one chunk, where one per chunk is declared: a lookup of
@@ -886,7 +914,10 @@ mod tests {
         let t = table(&names.iter().map(String::as_str).collect::<Vec<_>>());
         let latest = std::sync::Arc::new(AtomicU64::new(0));
         let old = Cancel::newest(&latest);
-        assert!(joint_ranks(&[&t], &old).is_ok() && groups(&t, &old).is_ok(), "not superseded yet");
+        assert!(
+            unbusy(|| joint_ranks(&[&t], &old)).is_ok() && unbusy(|| groups(&t, &old)).is_ok(),
+            "not superseded yet"
+        );
         let _newer = Cancel::newest(&latest);
         assert!(matches!(joint_ranks(&[&t], &old), Err(SearchError::Superseded)));
         assert!(matches!(groups(&t, &old), Err(SearchError::Superseded)));

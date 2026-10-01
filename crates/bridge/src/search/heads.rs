@@ -483,7 +483,7 @@ mod tests {
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         let states = || lock(&catalog.heads.states);
         catalog.attach_heads(&entry, &open);
-        let until = Instant::now() + Duration::from_secs(30);
+        let until = Instant::now() + crate::search::workers::tests::PATIENCE;
         while matches!(states().get(&id), Some(State::Working(_))) {
             assert!(Instant::now() < until, "the build is over");
             std::thread::sleep(Duration::from_millis(10));
@@ -499,7 +499,7 @@ mod tests {
             *at = at.checked_sub(RETRY_AFTER).expect("the clock goes back that far");
         }
         cloud.bug.store(false, Ordering::Relaxed);
-        let until = Instant::now() + Duration::from_secs(30);
+        let until = Instant::now() + crate::search::workers::tests::PATIENCE;
         while !open.indexes.has_usable_heads() {
             catalog.attach_heads(&entry, &open);
             assert!(Instant::now() < until, "a heads file was attached");

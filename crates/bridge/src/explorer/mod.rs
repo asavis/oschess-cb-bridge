@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::activity::Activity;
 use crate::catalog::{Entry, Opened};
 use crate::indexdir::{self, Unlisted};
 use crate::machine::Machine;
@@ -155,21 +156,14 @@ pub struct Registry {
     keeping: Mutex<keeper::Keeping>,
     /// What builds may use; `None` for [`Limits::default`]. Tests set it.
     limits: Mutex<Option<Limits>>,
+    /// The catalog's background work, which the builds and the keeper's
+    /// looks count in (#236).
+    activity: Arc<Activity>,
 }
 
 impl Default for Registry {
     fn default() -> Registry {
-        Registry {
-            dir: Mutex::default(),
-            states: Mutex::default(),
-            builds: Arc::default(),
-            unlisted: Mutex::default(),
-            used: Mutex::default(),
-            picked: AtomicBool::new(false),
-            seen: Mutex::default(),
-            keeping: Mutex::default(),
-            limits: Mutex::default(),
-        }
+        Registry::counted(Arc::default())
     }
 }
 
@@ -196,6 +190,23 @@ fn index_entry(name: &str) -> Option<(&str, Kept)> {
 }
 
 impl Registry {
+    /// The indexes of a catalog's databases, whose builds and keeper count
+    /// in `activity` ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: Arc<Activity>) -> Registry {
+        Registry {
+            dir: Mutex::default(),
+            states: Mutex::default(),
+            builds: Arc::new(Scheduler::counted(Arc::clone(&activity))),
+            unlisted: Mutex::default(),
+            used: Mutex::default(),
+            picked: AtomicBool::new(false),
+            seen: Mutex::default(),
+            keeping: Mutex::default(),
+            limits: Mutex::default(),
+            activity,
+        }
+    }
+
     /// Keeps index files in `dir`.
     pub fn set_dir(&self, dir: PathBuf) {
         *lock(&self.dir) = Some(dir);
@@ -676,7 +687,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::catalog::Catalog;
+    use crate::catalog::{Busy, Catalog};
     use crate::search::memory::Cancel;
     use crate::search::workers;
     use cbformat::fixture::{Builder, TempDb, quiet};
@@ -690,6 +701,14 @@ mod tests {
             b.game(e4);
         }
         b.write(name)
+    }
+
+    /// Limits whose passes wait for a worker as long as a test asks again a
+    /// pass answered busy ([`workers::tests::PATIENCE`]), not
+    /// [`runs::WORKERS_WAIT`] (#251): the passes of this binary's other
+    /// tests, which run beside a build, may take every worker for longer.
+    fn patient() -> Limits {
+        Limits { workers_wait: workers::tests::PATIENCE, ..Limits::default() }
     }
 
     /// The index kept on disk for the database as it is answers the first
@@ -706,7 +725,7 @@ mod tests {
         let entry = Arc::clone(&catalog.entries()[0]);
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         // Built by the bridge before it restarted.
-        drop(prepare(&*open.db, open.generation, &dir, &entry.id, &Progress::default()).unwrap());
+        drop(prepare_with(&*open.db, open.generation, &dir, &entry.id, &Progress::default(), &patient()).unwrap());
         let (path, _) = paths(&dir, &entry.id);
         let written = std::fs::metadata(&path).unwrap().modified().unwrap();
         // Another database's build holds the queue until released.
@@ -735,6 +754,43 @@ mod tests {
         catalog.explorer.release();
         assert_eq!(Arc::strong_count(&loaded), 2, "held by the two requests alone");
         drop((loaded, again));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The builds count as the catalog's work until none waits or runs
+    /// (#236): while another database's build holds the queue, before the
+    /// build a request queued, settling gives up at its limit naming the
+    /// builds; once both have run, it settles, and the requested index is
+    /// written by then.
+    #[test]
+    fn waiting_for_the_builds_ends_once_the_index_is_written() {
+        let db = e4s("explorer-wait");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        catalog.explorer.set_dir(dir.clone());
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        assert_eq!(catalog.settle(Duration::ZERO), Ok(()), "idle before any build");
+        // Another database's build holds the queue until released.
+        let (release, held) = mpsc::channel::<()>();
+        assert!(catalog.explorer.builds.submit(
+            "0123456789abcdef",
+            Kind::Requested,
+            Arc::new(Progress::default()),
+            Box::new(move |_| {
+                let _ = held.recv();
+                Ran::Done
+            })
+        ));
+        let Lookup::Pending(_) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!("no build queued") };
+        let busy = Busy(vec!["index builds"]);
+        assert_eq!(catalog.settle(Duration::from_millis(50)), Err(busy), "two builds wait or run");
+        release.send(()).unwrap();
+        assert_eq!(catalog.settle(Duration::from_secs(300)), Ok(()));
+        assert!(paths(&dir, &entry.id).0.exists(), "the index was written before the catalog settled");
+        assert!(catalog.explorer.building().is_empty(), "{:?}", catalog.explorer.building());
+        catalog.explorer.release();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -772,7 +828,7 @@ mod tests {
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         let state = catalog.explorer.state(&entry.id);
         let settled = || {
-            let until = Instant::now() + Duration::from_secs(30);
+            let until = Instant::now() + workers::tests::PATIENCE;
             while matches!(*lock(&state), State::Working(_)) {
                 assert!(Instant::now() < until, "the build is over");
                 std::thread::sleep(Duration::from_millis(10));
@@ -844,7 +900,7 @@ mod tests {
         explorer.mark_in_use(&entry.id);
         let state = explorer.state(&entry.id);
         let settled = || {
-            let until = Instant::now() + Duration::from_secs(30);
+            let until = Instant::now() + workers::tests::PATIENCE;
             while matches!(*lock(&state), State::Working(_)) {
                 assert!(Instant::now() < until, "the build is over");
                 std::thread::sleep(Duration::from_millis(10));
@@ -906,7 +962,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-explorer-bug-partial-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Buggy { partial: dir.join("db.moves.partial"), written: AtomicBool::new(false) };
-        let built = std::panic::catch_unwind(|| prepare(&db, 7, &dir, "db", &Progress::default()).map(drop));
+        let built =
+            std::panic::catch_unwind(|| prepare_with(&db, 7, &dir, "db", &Progress::default(), &patient()).map(drop));
         assert!(built.is_err(), "the build panicked");
         assert!(db.written.load(Ordering::Relaxed), "the move stream was being written");
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file is left");
@@ -931,7 +988,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-explorer-kept-headers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let d = cbformat::v2::Database::open(db.dir().join("db.2cbh")).unwrap();
-        drop(prepare(&d, 7, &dir, "db", &Progress::default()).unwrap());
+        drop(prepare_with(&d, 7, &dir, "db", &Progress::default(), &patient()).unwrap());
         let (index, stream) = paths(&dir, "db");
         assert!(kept(&index, 7, 3));
         assert!(!kept(&index, 8, 3), "another generation");

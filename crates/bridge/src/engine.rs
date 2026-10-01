@@ -12,6 +12,7 @@
 mod uci;
 
 pub use crate::machine::{Limits, limits};
+pub use uci::HANDSHAKE;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -208,6 +209,9 @@ pub struct Engine {
 
 struct Shared {
     idle: Duration,
+    /// How long a new process may take to answer `uci` with `uciok`
+    /// ([`Engine::set_handshake`]).
+    handshake: Mutex<Duration>,
     /// The configuration file the engine follows, as the database list does
     /// (#175); `None` for a fixed one.
     file: Option<Arc<crate::config::Watched>>,
@@ -266,6 +270,7 @@ impl Engine {
         let current = Current { config, inner, ..Current::default() };
         let shared = Shared {
             idle,
+            handshake: Mutex::new(HANDSHAKE),
             file: None,
             current: Mutex::new(current),
             analyses: AtomicUsize::new(0),
@@ -287,6 +292,7 @@ impl Engine {
     pub fn following(file: Arc<crate::config::Watched>, poll: Duration) -> Self {
         let shared = Shared {
             idle: IDLE,
+            handshake: Mutex::new(HANDSHAKE),
             file: Some(file),
             current: Mutex::default(),
             analyses: AtomicUsize::new(0),
@@ -326,6 +332,14 @@ impl Engine {
             }
         }
         current.inner.clone()
+    }
+
+    /// Sets how long a process started from now on may take to answer `uci`
+    /// with `uciok`: [`HANDSHAKE`] unless set. A loaded machine can take
+    /// longer than that to start the tests' engine, and the tests that are
+    /// not about the handshake set a longer one (#238).
+    pub fn set_handshake(&self, limit: Duration) {
+        *lock(&self.shared.handshake) = limit;
     }
 
     /// The engine's name for `/v1/status`: what it said in the handshake,
@@ -381,7 +395,7 @@ impl Engine {
             inner.superseded(stream, sink);
             return;
         }
-        let process = match inner.process(&mut slot) {
+        let process = match inner.process(&mut slot, *lock(&self.shared.handshake)) {
             Ok(p) => p,
             Err(e) => {
                 let _ = sink.line(&error_line("engine_failed", &e));
@@ -402,7 +416,7 @@ impl Engine {
     pub fn warm(&self, search: &Search) -> Warmed {
         let Some(inner) = self.current() else { return Warmed::NoEngine };
         let Ok(mut slot) = inner.slot.try_lock() else { return Warmed::Busy };
-        let p = match inner.process(&mut slot) {
+        let p = match inner.process(&mut slot, *lock(&self.shared.handshake)) {
             Ok(p) => p,
             Err(e) => return Warmed::Failed(e),
         };
@@ -462,17 +476,18 @@ impl Inner {
         inner
     }
 
-    /// The engine's process in `slot`: the one running, else a new one, whose
-    /// name is kept for `/v1/status`; one that has exited is replaced. Why a
-    /// new one did not start.
-    fn process<'a>(&self, slot: &'a mut Option<Process>) -> Result<&'a mut Process, String> {
+    /// The engine's process in `slot`: the one running, else a new one, which
+    /// has `handshake` to answer `uci` and whose name is kept for
+    /// `/v1/status`; one that has exited is replaced. Why a new one did not
+    /// start.
+    fn process<'a>(&self, slot: &'a mut Option<Process>, handshake: Duration) -> Result<&'a mut Process, String> {
         if slot.as_mut().is_some_and(|p| !p.alive()) {
             *slot = None;
         }
         match slot {
             Some(p) => Ok(p),
             None => {
-                let p = Process::start(&self.config)?;
+                let p = Process::start(&self.config, handshake)?;
                 *lock(&self.name) = Some(p.name.clone());
                 Ok(slot.insert(p))
             }
@@ -538,8 +553,13 @@ impl Inner {
 /// Whether `program` is a UCI engine: runs its handshake within the usual
 /// limits and ends it. The engine's name, or why it was refused.
 pub fn probe(program: &Path) -> Result<String, String> {
+    probe_within(program, HANDSHAKE)
+}
+
+/// [`probe`] with `handshake` in place of [`HANDSHAKE`] (tests).
+pub fn probe_within(program: &Path, handshake: Duration) -> Result<String, String> {
     let config = EngineConfig { program: program.to_path_buf(), threads: 1, hash_mb: 16 };
-    Process::start(&config).map(|p| p.name.clone())
+    Process::start(&config, handshake).map(|p| p.name.clone())
 }
 
 fn file_stem(path: &Path) -> String {

@@ -7,7 +7,7 @@ use cbformat::fixture::{Builder, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{app_of, get_reply, serve};
+use common::{TestBridge, app_of, get_reply};
 
 /// With the budget taken, large answers (a game, a list window) are refused
 /// `503 busy` before they are built; once it is returned they are served.
@@ -18,7 +18,8 @@ fn an_exhausted_budget_answers_busy_until_it_is_returned() {
     b.game(e4);
     let db = b.write("budget");
     let path = db.dir().join("db.2cbh");
-    let port = serve(app_of([path.clone()]));
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let port = bridge.port;
     let id = id_of(&path);
     let taken = reserve(RESPONSE_BUDGET - 64).unwrap();
     for p in [format!("/v1/databases/{id}/games/1"), format!("/v1/databases/{id}/games")] {

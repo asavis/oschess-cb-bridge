@@ -503,7 +503,8 @@ mod tests {
             std::thread::sleep(PORT_RETRY * 2);
             drop(held);
         });
-        let bridge = prepare(&dir, &Options { port_wait: Duration::from_secs(30), ..Options::default() }).unwrap();
+        let patience = crate::search::workers::tests::PATIENCE;
+        let bridge = prepare(&dir, &Options { port_wait: patience, ..Options::default() }).unwrap();
         freed.join().unwrap();
         assert_eq!(bridge.port, port);
         assert_eq!(logged(&dir, &failed), 2, "a start that waited and started is no failure");
@@ -520,9 +521,12 @@ mod tests {
         let dir = folder("refused-held", Some("https://example.com"));
         let port = port_of(&dir);
         let held = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        // A wait for the port twice the patience, which a start that waited
+        // would outlast.
+        let patience = crate::search::workers::tests::PATIENCE;
         let started = Instant::now();
-        let e = prepare(&dir, &Options { port_wait: Duration::from_secs(60), ..Options::default() }).err().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(60), "it does not wait");
+        let e = prepare(&dir, &Options { port_wait: patience * 2, ..Options::default() }).err().unwrap();
+        assert!(started.elapsed() < patience, "it does not wait");
         assert_eq!(e.cause, Cause::Other { port: Some(port) });
         assert_eq!(logged(&dir, "the bridge cannot start: "), 1);
         drop(held);

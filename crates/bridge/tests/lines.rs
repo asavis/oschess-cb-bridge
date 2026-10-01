@@ -12,7 +12,7 @@ use cbformat::movetable::{self, ALTERNATIVE, Captured, Color, END_OF_LINE, MOVES
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{app_of, get, member, members, objects, serve, string_member};
+use common::{TestBridge, app_of, get, member, members, objects, string_member};
 
 /// Castling, a capture, a knight named by its file, a promotion with check,
 /// a mate: the games both formats hold, with the line each must answer.
@@ -162,8 +162,8 @@ fn classic(name: &str) -> TempDb {
     b.write(name)
 }
 
-fn start(paths: Vec<PathBuf>, between_reads: Option<Box<dyn Fn() + Send + Sync>>) -> u16 {
-    serve(App { between_reads, ..app_of(paths) })
+fn start(paths: Vec<PathBuf>, between_reads: Option<Box<dyn Fn() + Send + Sync>>) -> TestBridge {
+    TestBridge::new(App { between_reads, ..app_of(paths) })
 }
 
 /// Each row's `line` member, verbatim, by the row's number: `"…"`, `null`,
@@ -213,7 +213,8 @@ fn served(port: u16, id: &str, number: u32) -> String {
 fn a_window_carries_each_games_main_line() {
     let (a, c) = (two_cbh("lines-2cbh"), classic("lines-cbh"));
     let (pa, pc) = (a.dir().join("db.2cbh"), c.dir().join("db.cbh"));
-    let port = start(vec![pa.clone(), pc.clone()], None);
+    let bridge = start(vec![pa.clone(), pc.clone()], None);
+    let port = bridge.port;
     for (path, count) in [(&pa, 10), (&pc, 8)] {
         let id = id_of(path);
         let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20&line=60"));
@@ -244,7 +245,8 @@ fn a_window_carries_each_games_main_line() {
 fn line_counts_plies_and_follows_search_and_sort() {
     let db = two_cbh("lines-plies");
     let path = db.dir().join("db.2cbh");
-    let port = start(vec![path.clone()], None);
+    let bridge = start(vec![path.clone()], None);
+    let port = bridge.port;
     let id = id_of(&path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3&line=3"));
     assert_eq!(status, 200, "{body}");
@@ -266,7 +268,8 @@ fn line_counts_plies_and_follows_search_and_sort() {
 fn a_window_without_line_is_unchanged_and_line_is_bounded() {
     let db = two_cbh("lines-bounds");
     let path = db.dir().join("db.2cbh");
-    let port = start(vec![path.clone()], None);
+    let bridge = start(vec![path.clone()], None);
+    let port = bridge.port;
     let id = id_of(&path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20"));
     assert_eq!(status, 200);
@@ -307,7 +310,8 @@ fn damage_before_the_first_move_is_no_line() {
     classic_game(&mut c, &[]);
     let cdb = c.write("lines-damage-cbh");
     let (pa, pc) = (a.dir().join("db.2cbh"), cdb.dir().join("db.cbh"));
-    let port = start(vec![pa.clone(), pc.clone()], None);
+    let bridge = start(vec![pa.clone(), pc.clone()], None);
+    let port = bridge.port;
     let (_, body) = get(port, &format!("/v1/databases/{}/games?line=60", id_of(&pa)));
     let null = || Some("null".to_string());
     assert_eq!(lines(&body), [(1, null()), (2, null()), (3, Some(String::new()))], "{body}");
@@ -330,7 +334,8 @@ fn a_change_while_lines_are_read_is_reported() {
             std::fs::write(&moves, bytes).unwrap();
         }
     };
-    let port = start(vec![path.clone()], Some(Box::new(hook)));
+    let bridge = start(vec![path.clone()], Some(Box::new(hook)));
+    let port = bridge.port;
     let id = id_of(&path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=3"));
     assert_eq!(status, 200, "a window without lines reads no move record: {body}");
@@ -364,7 +369,8 @@ fn a_cut_or_unterminated_tail_keeps_the_prefix_before_it() {
     c.game(&move_record(5, None, None, &stream))[0x1b] = 2;
     let cdb = c.write("lines-tail-cbh");
     let (pa, pc) = (a.dir().join("db.2cbh"), cdb.dir().join("db.cbh"));
-    let port = start(vec![pa.clone(), pc.clone()], None);
+    let bridge = start(vec![pa.clone(), pc.clone()], None);
+    let port = bridge.port;
     let e4 = || Some("e4".to_string());
     for plies in [1, 60] {
         let (status, body) = get(port, &format!("/v1/databases/{}/games?line={plies}", id_of(&pa)));
@@ -404,7 +410,8 @@ fn a_game_whose_offsets_are_cut_short_has_no_line() {
     cbj[32 + 0x1e..32 + 0x26].copy_from_slice(&far.to_be_bytes());
     std::fs::write(path(".cbj"), cbj).unwrap();
     let pc = path(".cbh");
-    let port = start(vec![pc.clone()], None);
+    let bridge = start(vec![pc.clone()], None);
+    let port = bridge.port;
     let (status, body) = get(port, &format!("/v1/databases/{}/games?line=1", id_of(&pc)));
     assert_eq!(status, 200, "{body}");
     assert_eq!(lines(&body), [(1, Some("e4".to_string())), (2, Some("null".to_string()))], "{body}");

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use cbformat::codepage::CodePage;
 use cbformat::pgnfile;
 
+use crate::activity::Activity;
 use crate::fetch::Progress;
 use crate::indexdir::{self, Unlisted};
 use crate::serial::Serial;
@@ -50,13 +51,7 @@ pub struct Registry {
 
 impl Default for Registry {
     fn default() -> Registry {
-        Registry {
-            dir: Mutex::default(),
-            builds: Mutex::default(),
-            queue: Arc::new(Serial::labelled("pgn")),
-            page: system_code_page(),
-            unlisted: Mutex::default(),
-        }
+        Registry::counted(Arc::default())
     }
 }
 
@@ -77,6 +72,18 @@ fn index_entry(name: &str) -> Option<(&str, Kept)> {
 }
 
 impl Registry {
+    /// The index builds of a catalog's PGN files, whose queue counts its
+    /// jobs in `activity` ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: Arc<Activity>) -> Registry {
+        Registry {
+            dir: Mutex::default(),
+            builds: Mutex::default(),
+            queue: Arc::new(Serial::counted("pgn", activity)),
+            page: system_code_page(),
+            unlisted: Mutex::default(),
+        }
+    }
+
     /// Keeps index files in `dir` (the bridge's data folder's `pgn`).
     pub fn set_dir(&self, dir: PathBuf) {
         *lock(&self.dir) = Some(dir);

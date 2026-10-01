@@ -5,51 +5,112 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bridge::api::App;
 use bridge::catalog::{Catalog, id_of};
 use bridge::search::Indexes;
+use bridge::search::memory::{Hold, budget, held};
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{Limited, WAIT_LIMIT, get, policy, serve_shared, sparse};
+use common::{Limited, TestBridge, WAIT_LIMIT, get, policy, sparse};
 
-struct Served {
-    port: u16,
+/// A sparse database served, and its id. The bridge is dropped before the
+/// database, so nothing works on its files once they go.
+struct Sparse {
+    bridge: TestBridge,
     id: String,
-    app: Arc<App>,
     _db: TempDb,
 }
 
-fn serve_sparse(name: &str, records: u64) -> Served {
+fn serve_sparse(name: &str, records: u64) -> Sparse {
     let db = sparse(name, records);
     let path = db.dir().join("db.2cbh");
-    let (port, app) = serve_shared(App::new("test", policy(), Catalog::new([path.clone()])));
-    Served { port, id: id_of(&path), app, _db: db }
+    let bridge = TestBridge::new(App::new("test", policy(), Catalog::new([path.clone()])));
+    Sparse { bridge, id: id_of(&path), _db: db }
 }
 
-impl Served {
+impl Sparse {
     /// The indexes searches on this database use, where a test holds them.
     fn indexes(&self) -> Arc<Indexes> {
-        self.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes
+        self.bridge.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes
     }
 
-    /// Sends `query` on its own connection.
+    /// Sends `query` on its own connection, once: a search sent again is a
+    /// new search in its stream, and would supersede the one a test holds.
     fn send(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
-        let (port, path) = (self.port, format!("/v1/databases/{}/games?{query}", self.id));
+        let (port, path) = (self.bridge.port, format!("/v1/databases/{}/games?{query}", self.id));
         std::thread::spawn(move || get(port, &path))
     }
 
     fn get(&self, query: &str) -> (u16, String) {
-        get(self.port, &format!("/v1/databases/{}/games?{query}", self.id))
+        unbusy(self.bridge.port, &format!("/v1/databases/{}/games?{query}", self.id))
     }
+}
+
+/// Busy answers [`unbusy`] asked again, for the test that shows it does.
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// `get`, asked again while the bridge answers `503 busy`, up to the suite's
+/// patience. The search memory and the workers are the process's: this
+/// binary's other tests can hold them for longer than a search waits for
+/// them on a loaded machine, and busy is the bridge's answer to that, not
+/// the answer these tests are about (#238).
+fn unbusy(port: u16, path: &str) -> (u16, String) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        let (status, out) = get(port, path);
+        if status != 503 || !out.contains(r#""code":"busy""#) || Instant::now() >= deadline {
+            return (status, out);
+        }
+        BUSY.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether this is the child that runs the test's body. A test that holds a
+/// search runs alone in a child process of its own: the search memory and the
+/// workers are the process's, and a held search whose release met them taken
+/// by another test answered busy, not superseded (#238). Sent again, it would
+/// be a new search, not the one the test is about.
+fn in_child(name: &str) -> bool {
+    common::in_child(name, "BRIDGE_SEARCH_LIMITS_CHILD", &[])
+}
+
+/// A search answered busy while other work holds the search memory is asked
+/// again, and served once the memory is free: the seam of [`unbusy`].
+#[test]
+fn a_search_answered_busy_is_asked_again() {
+    let s = serve_sparse("limits-busy", 100_000);
+    let before = BUSY.load(Ordering::SeqCst);
+    // Every byte of the budget not held yet, so a search can reserve none.
+    let all = loop {
+        if let Ok(hold) = Hold::reserve(budget().saturating_sub(held())) {
+            break hold;
+        }
+    };
+    let (port, path) = (s.bridge.port, format!("/v1/databases/{}/games?q=needle", s.id));
+    let search = std::thread::spawn(move || unbusy(port, &path));
+    let started = Instant::now();
+    while BUSY.load(Ordering::SeqCst) == before && !search.is_finished() {
+        assert!(started.elapsed() < WAIT_LIMIT, "no search was answered busy");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(all);
+    let (status, out) = search.join().unwrap();
+    assert_eq!(status, 200, "{out}");
 }
 
 /// A search with `q` in a stream makes the one still running in the same
 /// stream answer `409 superseded`, and the newer one is served.
 #[test]
 fn a_superseded_search_answers_409() {
+    if !in_child("a_superseded_search_answers_409") {
+        return;
+    }
     let s = serve_sparse("limits-superseded", 100_000);
     let indexes = s.indexes();
     let held = indexes.gate().hold(1);
@@ -66,6 +127,9 @@ fn a_superseded_search_answers_409() {
 /// Clearing the search box is a new query too: an empty `q=` supersedes.
 #[test]
 fn an_empty_q_supersedes_the_running_search() {
+    if !in_child("an_empty_q_supersedes_the_running_search") {
+        return;
+    }
     let s = serve_sparse("limits-empty-q", 100_000);
     let indexes = s.indexes();
     let held = indexes.gate().hold(1);
@@ -80,6 +144,9 @@ fn an_empty_q_supersedes_the_running_search() {
 /// Another stream, another origin or no stream at all never stops a search.
 #[test]
 fn other_streams_do_not_supersede() {
+    if !in_child("other_streams_do_not_supersede") {
+        return;
+    }
     let s = serve_sparse("limits-streams", 100_000);
     let indexes = s.indexes();
     let held = indexes.gate().hold(2);

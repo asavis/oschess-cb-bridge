@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::activity::{Active, Activity};
 use crate::machine::{self, Machine, Priority, System};
 use crate::sync::{lock, unpoisoned};
 
@@ -35,6 +36,9 @@ const POWER_RECHECK: Duration = Duration::from_secs(10);
 /// started beside it, short enough that a build under foreground work that
 /// never ends still ends (#149).
 pub const PATIENCE: Duration = Duration::from_millis(500);
+
+/// The kind of work the builds count as in their activity (#236).
+const BUILDS: &str = "index builds";
 
 /// Why a build is queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +88,9 @@ struct Job {
     kind: Kind,
     progress: Arc<Progress>,
     work: Work,
+    /// Counts the build from when it is queued until it is over or dropped
+    /// unrun: a build stopped to wait for its turn again still counts.
+    _active: Active,
 }
 
 /// The build running: its database, its kind and its progress, through which
@@ -112,21 +119,30 @@ pub struct Scheduler {
     patience: Mutex<Duration>,
     /// Starting the thread fails, for tests.
     refuse: AtomicBool,
+    /// Where each build counts until it is over (#236).
+    activity: Arc<Activity>,
 }
 
 impl Default for Scheduler {
     fn default() -> Scheduler {
+        Scheduler::counted(Arc::default())
+    }
+}
+
+impl Scheduler {
+    /// The queues of a catalog's builds, which count in `activity`
+    /// ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: Arc<Activity>) -> Scheduler {
         Scheduler {
             queues: Mutex::default(),
             changed: Condvar::new(),
             machine: Mutex::new(Arc::new(System)),
             patience: Mutex::new(PATIENCE),
             refuse: AtomicBool::new(false),
+            activity,
         }
     }
-}
 
-impl Scheduler {
     /// How the builds see the computer: its power, and the disks' free space.
     pub fn machine(&self) -> Arc<dyn Machine> {
         Arc::clone(&lock(&self.machine))
@@ -157,7 +173,7 @@ impl Scheduler {
     /// build is dropped unrun and `false` returned.
     pub fn submit(self: &Arc<Self>, id: &str, kind: Kind, progress: Arc<Progress>, work: Work) -> bool {
         let mut q = lock(&self.queues);
-        let job = Job { id: id.to_string(), kind, progress, work };
+        let job = Job { id: id.to_string(), kind, progress, work, _active: self.activity.begin(BUILDS) };
         match kind {
             Kind::Requested => {
                 q.requested.push_back(job);
@@ -326,6 +342,7 @@ impl Drop for Exit<'_> {
 mod tests {
     use std::path::Path;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     use super::*;
 
@@ -351,25 +368,51 @@ mod tests {
 
     /// A build that tells `events` of each run, `(id, priority, "run")`, and
     /// how it ended: it stops once asked to, and else ends once `release`
-    /// sends, or at once without one.
+    /// sends, or at once without one. It works in batches of up to 5 ms, each
+    /// waiting for the release, and starts each as the product's builds do:
+    /// its thread takes the build's priority and stops if asked
+    /// ([`Progress::stopped`]). After the release it starts one more batch,
+    /// its last, so that it ends at the priority a request gave it before the
+    /// release, however late its thread ran (#248).
     fn build(
         id: &'static str,
         events: &mpsc::Sender<(&'static str, Priority, &'static str)>,
         progress: &Arc<Progress>,
         release: Option<mpsc::Receiver<()>>,
     ) -> Work {
+        stalled_build(id, events, progress, release, None)
+    }
+
+    /// A [`build`] whose thread stalls on `stall` after the first batch it
+    /// starts, before it waits for its release, until the test resumes it
+    /// ([`resume`]): a thread the computer does not run for a while, as
+    /// under load (#248).
+    fn stalled_build(
+        id: &'static str,
+        events: &mpsc::Sender<(&'static str, Priority, &'static str)>,
+        progress: &Arc<Progress>,
+        release: Option<mpsc::Receiver<()>>,
+        mut stall: Option<mpsc::SyncSender<()>>,
+    ) -> Work {
         let (events, progress) = (events.clone(), Arc::clone(progress));
         Box::new(move |_| {
             let _ = events.send((id, machine::current(), "run"));
+            let mut released = false;
             loop {
                 if progress.stopped() {
                     let _ = events.send((id, machine::current(), "stopped"));
                     return Ran::Stopped;
                 }
-                match &release {
-                    Some(r) if r.recv_timeout(Duration::from_millis(5)).is_err() => continue,
-                    _ => break,
+                if released {
+                    break;
                 }
+                if let Some(stall) = stall.take() {
+                    // The test takes the first at once, the second when it
+                    // resumes the thread.
+                    let _ = stall.send(());
+                    let _ = stall.send(());
+                }
+                released = release.as_ref().is_none_or(|r| r.recv_timeout(Duration::from_millis(5)).is_ok());
             }
             let _ = events.send((id, machine::current(), "done"));
             Ran::Done
@@ -377,7 +420,23 @@ mod tests {
     }
 
     fn next(events: &mpsc::Receiver<(&'static str, Priority, &'static str)>) -> (&'static str, Priority, &'static str) {
-        events.recv_timeout(Duration::from_secs(10)).expect("the builds go on")
+        events.recv_timeout(crate::search::workers::tests::PATIENCE).expect("the builds go on")
+    }
+
+    /// A stall for a [`stalled_build`], and the end the test waits on.
+    fn stall() -> (mpsc::SyncSender<()>, mpsc::Receiver<()>) {
+        mpsc::sync_channel(0)
+    }
+
+    /// Waits until the thread of a [`stalled_build`] has started its first
+    /// batch and stalls.
+    fn stalled(stalls: &mpsc::Receiver<()>) {
+        stalls.recv_timeout(crate::search::workers::tests::PATIENCE).expect("the build starts a batch");
+    }
+
+    /// Has the stalled thread of a [`stalled_build`] go on.
+    fn resume(stalls: &mpsc::Receiver<()>) {
+        stalls.recv_timeout(crate::search::workers::tests::PATIENCE).expect("the build stalls");
     }
 
     /// A requested build stops the background build of another database
@@ -416,23 +475,28 @@ mod tests {
         let scheduler = Arc::new(Scheduler::default());
         let (tx, events) = mpsc::channel();
         let (release_a, held_a) = mpsc::channel();
+        let (stall_a, a_stalls) = stall();
         let a = Arc::new(Progress::default());
-        assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), build("a", &tx, &a, Some(held_a))));
+        let work = stalled_build("a", &tx, &a, Some(held_a), Some(stall_a));
+        assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), work));
         assert_eq!(next(&events), ("a", background_priority(), "run"));
+        stalled(&a_stalls);
         let (release_b, held_b) = mpsc::channel();
         let b = Arc::new(Progress::default());
         assert!(scheduler.submit("b", Kind::Background, Arc::clone(&b), build("b", &tx, &b, Some(held_b))));
         let c = Arc::new(Progress::default());
         assert!(scheduler.submit("c", Kind::Background, Arc::clone(&c), build("c", &tx, &c, None)));
-        // A request for `a`, running: it goes on, at a requested priority.
+        // A request for `a`, running, whose thread stalls in the batch it
+        // started before: it goes on, at a requested priority from its next
+        // batch, which comes after its release.
         scheduler.promote("a");
         assert_eq!(Priority::from_code(a.priority.load(Ordering::Relaxed)), Priority::BelowNormal);
         // A request for `c`, waiting: it goes before `b`, after `a`, which
         // another request no longer stops.
         scheduler.promote("c");
-        std::thread::sleep(Duration::from_millis(50));
         assert!(!a.stopped());
         release_a.send(()).unwrap();
+        resume(&a_stalls);
         assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
         assert_eq!(next(&events), ("c", Priority::BelowNormal, "run"));
         assert_eq!(next(&events), ("c", Priority::BelowNormal, "done"));
@@ -481,16 +545,21 @@ mod tests {
         scheduler.set_patience(patience);
         let (tx, events) = mpsc::channel();
         let (release_a, held_a) = mpsc::channel();
+        let (stall_a, a_stalls) = stall();
         let a = Arc::new(Progress::default());
         assert_eq!(a.patience(), Duration::ZERO, "a build not yet run");
-        assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), build("a", &tx, &a, Some(held_a))));
+        let work = stalled_build("a", &tx, &a, Some(held_a), Some(stall_a));
+        assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), work));
         assert_eq!(next(&events), ("a", background_priority(), "run"));
+        stalled(&a_stalls);
         assert_eq!(a.patience(), patience);
         scheduler.promote("a");
         assert_eq!(a.patience(), Duration::ZERO);
-        // Its thread takes the requested priority at its next batch.
-        std::thread::sleep(Duration::from_millis(50));
+        // Its thread, which stalls in the batch it started before, takes the
+        // requested priority at its next batch, which comes after its
+        // release.
         release_a.send(()).unwrap();
+        resume(&a_stalls);
         assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
         let (release_b, held_b) = mpsc::channel();
         let b = Arc::new(Progress::default());
@@ -520,5 +589,44 @@ mod tests {
         assert!(scheduler.submit("c", Kind::Background, Arc::clone(&p), build("c", &tx, &p, None)));
         assert_eq!(next(&events), ("c", background_priority(), "run"));
         assert_eq!(next(&events), ("c", background_priority(), "done"));
+    }
+
+    /// Each build counts in the scheduler's activity from when it is queued
+    /// until it is over (#236): while it runs, and while it waits for mains
+    /// power; one dropped unrun because no thread could start no longer
+    /// counts. A wait ends at its deadline, naming the builds, while one is
+    /// held and while one waits for mains power, and once both have run, then
+    /// rather than at its deadline.
+    #[test]
+    fn waits_until_no_build_waits_or_runs() {
+        const LIMIT: Duration = Duration::from_secs(300);
+        let activity = Arc::new(Activity::default());
+        let scheduler = Arc::new(Scheduler::counted(Arc::clone(&activity)));
+        let power = Arc::new(Power::default());
+        power.0.store(true, Ordering::Relaxed);
+        scheduler.set_machine(power.clone());
+        let (tx, events) = mpsc::channel();
+        let unrun = Arc::new(Progress::default());
+        scheduler.refuse_starts(true);
+        assert!(!scheduler.submit("x", Kind::Requested, Arc::clone(&unrun), build("x", &tx, &unrun, None)));
+        scheduler.refuse_starts(false);
+        assert_eq!(activity.wait_idle(Instant::now()), Ok(()), "a build dropped unrun no longer counts");
+        let (release, held) = mpsc::channel();
+        let (a, b) = (Arc::new(Progress::default()), Arc::new(Progress::default()));
+        assert!(scheduler.submit("a", Kind::Requested, Arc::clone(&a), build("a", &tx, &a, Some(held))));
+        assert_eq!(next(&events), ("a", Priority::BelowNormal, "run"));
+        assert!(scheduler.submit("b", Kind::Background, Arc::clone(&b), build("b", &tx, &b, None)));
+        let briefly = || Instant::now() + Duration::from_millis(50);
+        assert_eq!(activity.wait_idle(briefly()), Err(vec![BUILDS]), "a build runs");
+        release.send(()).unwrap();
+        assert_eq!(next(&events), ("a", Priority::BelowNormal, "done"));
+        assert_eq!(activity.wait_idle(briefly()), Err(vec![BUILDS]), "a build waits for mains power");
+        power.0.store(false, Ordering::Relaxed);
+        scheduler.poke();
+        let waited = Instant::now();
+        assert_eq!(activity.wait_idle(waited + 2 * LIMIT), Ok(()));
+        assert!(waited.elapsed() < LIMIT, "woken when idle, not at the deadline");
+        assert_eq!(next(&events), ("b", background_priority(), "run"));
+        assert_eq!(next(&events), ("b", background_priority(), "done"));
     }
 }

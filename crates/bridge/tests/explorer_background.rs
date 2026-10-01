@@ -34,7 +34,7 @@ use cbformat::v2::Database;
 use chesscore::Board;
 
 mod common;
-use common::{WAIT_LIMIT, get, in_child, index_dir, policy, poll, serve_shared, until};
+use common::{Sent, TestBridge, WAIT_LIMIT, get, in_child, index_dir, policy, until};
 
 const TICK: Duration = Duration::from_millis(50);
 /// What tells a child process that runs a test's body that it is one.
@@ -178,28 +178,28 @@ impl Cloud for Provider {
     }
 }
 
-/// A bridge serving `catalog`, with its data folder `dir`; its keeper starts
-/// with [`Bridge::keep`]. Dropped, it stops its keeper, waits for its builds
-/// and gives up the indexes it holds.
-struct Bridge {
-    port: u16,
-    app: Arc<App>,
+/// A bridge serving `catalog`, with its data folder `dir`, which the test
+/// removes once the bridge is dropped; its keeper starts with
+/// [`TestBridge::keep`].
+fn served(catalog: Catalog, dir: &Path) -> TestBridge {
+    TestBridge::in_dir(App::new("test", policy(), catalog), dir)
 }
 
-impl Bridge {
-    fn new(catalog: Catalog, dir: &Path) -> Bridge {
-        catalog.use_data_dir(dir);
-        let (port, app) = serve_shared(App::new("test", policy(), catalog));
-        Bridge { port, app }
-    }
+/// What these tests ask a bridge.
+trait Background {
+    fn explorer(&self, id: &str) -> (u16, String);
 
-    /// Starts the keeper, looking every [`TICK`], with `quiet` as the quiet
-    /// period.
-    fn keep(&self, quiet: Duration) {
-        self.app.catalog.explorer.set_keeping(TICK, quiet);
-        bridge::explorer::keeper::start(&self.app);
-    }
+    fn building(&self) -> Vec<(String, &'static str, u64, u64)>;
 
+    /// The indexes searches on database `id` use, where a test holds them.
+    fn indexes(&self, id: &str) -> Arc<Indexes>;
+
+    /// Sends a search on database `id`, whose answer the test reads once it
+    /// has let the search go: the answer's patience runs from then (#244).
+    fn search(&self, id: &str) -> Sent;
+}
+
+impl Background for TestBridge {
     fn explorer(&self, id: &str) -> (u16, String) {
         get(self.port, &format!("/v1/databases/{id}/explorer?fen={START}"))
     }
@@ -208,24 +208,12 @@ impl Bridge {
         self.app.catalog.explorer.building()
     }
 
-    /// The indexes searches on database `id` use, where a test holds them.
     fn indexes(&self, id: &str) -> Arc<Indexes> {
         self.app.catalog.get(id).unwrap().open().ok().unwrap().indexes
     }
 
-    /// Sends a search on database `id` from a thread of its own.
-    fn search(&self, id: &str) -> std::thread::JoinHandle<(u16, String)> {
-        let (port, path) = (self.port, format!("/v1/databases/{id}/games?q=x"));
-        std::thread::spawn(move || get(port, &path))
-    }
-}
-
-impl Drop for Bridge {
-    fn drop(&mut self) {
-        let explorer = &self.app.catalog.explorer;
-        explorer.stop_keeping();
-        poll(WAIT_LIMIT, || explorer.building().is_empty().then_some(()));
-        explorer.release();
+    fn search(&self, id: &str) -> Sent {
+        Sent::get(self.port, &format!("/v1/databases/{id}/games?q=x"))
     }
 }
 
@@ -236,8 +224,8 @@ fn a_changed_database_in_use_is_rebuilt_without_a_request() {
     let db = copies("background-changed", 20);
     let path = db.dir().join("db.2cbh");
     let (id, dir) = (id_of(&path), data_dir("changed"));
-    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
-    bridge.keep(Duration::from_millis(200));
+    let bridge = served(Catalog::new([path.clone()]), &dir);
+    bridge.keep(TICK, Duration::from_millis(200));
     // The only ready database is in use from the start.
     let first = generation(&path);
     until("the index was not built", WAIT_LIMIT, || built_for(&dir, &id) == Some(first));
@@ -286,8 +274,8 @@ fn a_database_that_keeps_changing_waits_until_it_is_quiet() {
     }));
     let catalog = Catalog::new([path.clone()]);
     catalog.explorer.set_machine(computer.clone());
-    let bridge = Bridge::new(catalog, &dir);
-    bridge.keep(Duration::from_secs(2));
+    let bridge = served(catalog, &dir);
+    bridge.keep(TICK, Duration::from_secs(2));
     let unbuilt = || {
         assert!(built_for(&dir, &id).is_none(), "built while it changed");
         assert!(bridge.building().is_empty(), "queued while it changed: {:?}", bridge.building());
@@ -327,8 +315,8 @@ fn a_requested_build_goes_before_a_background_one() {
     let catalog = Catalog::new(paths.clone());
     // Builds of many passes, so that the large one takes a while.
     catalog.explorer.set_limits(Limits { pass_bytes: Some(256 << 10), ..Limits::default() });
-    let bridge = Bridge::new(catalog, &dir);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &dir);
+    bridge.keep(TICK, Duration::ZERO);
     // The largest database is in use from the start: its build runs.
     until("the background build did not start", WAIT_LIMIT, || {
         phase(bridge.port, &a).is_some_and(|p| !["waiting", "checking"].contains(&p.as_str()))
@@ -396,8 +384,8 @@ fn nothing_is_built_in_the_background_for_a_cloud_only_unlisted_or_opening_datab
     let entries = catalog.entries();
     let listed: Vec<bool> = ids.iter().map(|id| entries.iter().any(|e| &e.id == id && e.listed())).collect();
     assert_eq!(listed, [true, true, false, true]);
-    let bridge = Bridge::new(catalog, &root);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &root);
+    bridge.keep(TICK, Duration::ZERO);
     // A build renames its index into place before its state leaves
     // `building()`, so the ready database's build is waited for to end too.
     until("the ready database was not built", WAIT_LIMIT, || {
@@ -433,8 +421,8 @@ fn the_startup_pick_is_the_largest_ready_database() {
     let catalog = Catalog::with_sources(Sources { fixed: paths.to_vec(), ..Sources::default() }, provider.clone());
     let computer = Arc::new(Computer::default());
     catalog.explorer.set_machine(computer.clone());
-    let bridge = Bridge::new(catalog, &dir);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &dir);
+    bridge.keep(TICK, Duration::ZERO);
     // Its build leaves `building()` after it renames the index into place.
     until("the largest ready database was not built", WAIT_LIMIT, || {
         built_for(&dir, &ids[1]).is_some() && bridge.building().iter().all(|(id, ..)| id != &ids[1])
@@ -462,8 +450,8 @@ fn too_little_free_space_answers_503_and_skips_background_builds() {
     *computer.free.lock().unwrap() = Some(100 << 20);
     let catalog = Catalog::new(paths.clone());
     catalog.explorer.set_machine(computer.clone());
-    let bridge = Bridge::new(catalog, &dir);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &dir);
+    bridge.keep(TICK, Duration::ZERO);
     computer.looked();
     assert!(bridge.building().is_empty(), "{:?}", bridge.building());
     assert!(built_for(&dir, &a).is_none());
@@ -501,7 +489,7 @@ fn a_queued_build_shows_waiting() {
     let catalog = Catalog::new(paths.clone());
     catalog.explorer.set_limits(Limits { pass_bytes: Some(256 << 10), ..Limits::default() });
     catalog.explorer.mark_in_use(&ids[2]);
-    let bridge = Bridge::new(catalog, &dir);
+    let bridge = served(catalog, &dir);
     assert_eq!(bridge.explorer(&ids[0]).0, 409);
     until("the build did not start", WAIT_LIMIT, || phase(bridge.port, &ids[0]).is_some_and(|p| p != "waiting"));
     let (status, body) = bridge.explorer(&ids[1]);
@@ -509,7 +497,7 @@ fn a_queued_build_shows_waiting() {
     assert!(body.contains(r#""progress":{"phase":"waiting","done":0,"total":0}"#), "{body}");
     assert_eq!(phase(bridge.port, &ids[1]).as_deref(), Some("waiting"));
     // The keeper queues the third, in use, behind them.
-    bridge.keep(Duration::ZERO);
+    bridge.keep(TICK, Duration::ZERO);
     until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &ids[2]).is_some());
     assert_eq!(phase(bridge.port, &ids[2]).as_deref(), Some("waiting"));
     until("the builds did not end", WAIT_LIMIT, || ids.iter().all(|id| built_for(&dir, id).is_some()));
@@ -532,8 +520,8 @@ fn a_background_build_waits_on_battery() {
     computer.battery.store(true, Ordering::SeqCst);
     let catalog = Catalog::new(paths.clone());
     catalog.explorer.set_machine(computer.clone());
-    let bridge = Bridge::new(catalog, &dir);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &dir);
+    bridge.keep(TICK, Duration::ZERO);
     until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &a).is_some());
     computer.looked();
     assert_eq!(phase(bridge.port, &a).as_deref(), Some("waiting"));
@@ -555,10 +543,9 @@ fn a_database_unchanged_for_the_quiet_period_is_built_at_the_first_look() {
     let path = db.dir().join("db.2cbh");
     backdate(db.dir());
     let (id, dir) = (id_of(&path), data_dir("old"));
-    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    let bridge = served(Catalog::new([path.clone()]), &dir);
     // A tick and a quiet period of an hour: only the first look can build it.
-    bridge.app.catalog.explorer.set_keeping(Duration::from_secs(3600), Duration::from_secs(60));
-    bridge::explorer::keeper::start(&bridge.app);
+    bridge.keep(Duration::from_secs(3600), Duration::from_secs(60));
     until("the index was not built at the first look", WAIT_LIMIT, || built_for(&dir, &id) == Some(generation(&path)));
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -573,9 +560,9 @@ fn a_replaced_database_with_old_modification_times_waits_until_it_is_quiet() {
     let path = db.dir().join("db.2cbh");
     backdate(db.dir());
     let (id, dir) = (id_of(&path), data_dir("replaced"));
-    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    let bridge = served(Catalog::new([path.clone()]), &dir);
     let quiet = Duration::from_secs(3);
-    bridge.keep(quiet);
+    bridge.keep(TICK, quiet);
     let first = generation(&path);
     until("the old database was not built at the first look", WAIT_LIMIT, || built_for(&dir, &id) == Some(first));
     until("the first build did not end", WAIT_LIMIT, || bridge.building().is_empty());
@@ -620,8 +607,8 @@ fn a_queued_background_build_is_dropped_when_its_database_goes_to_the_cloud() {
     let computer = Arc::new(Computer::default());
     computer.battery.store(true, Ordering::SeqCst);
     catalog.explorer.set_machine(computer.clone());
-    let bridge = Bridge::new(catalog, &root);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &root);
+    bridge.keep(TICK, Duration::ZERO);
     // The only database is in use from the start; on battery its build waits.
     until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("waiting"));
     let queued = generation(&path);
@@ -666,8 +653,8 @@ fn a_queued_background_build_is_dropped_when_its_renamed_database_leaves_the_lis
     let computer = Arc::new(Computer::default());
     computer.battery.store(true, Ordering::SeqCst);
     catalog.explorer.set_machine(computer.clone());
-    let bridge = Bridge::new(catalog, &root);
-    bridge.keep(Duration::ZERO);
+    let bridge = served(catalog, &root);
+    bridge.keep(TICK, Duration::ZERO);
     // The only database is in use from the start; on battery its build waits.
     until("the background build was not queued", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("waiting"));
     window(&["Renamed later"]);
@@ -708,13 +695,13 @@ fn a_background_build_gives_way_to_a_search() {
         took
     };
     let (id, dir) = (id_of(&path), data_dir("gives-way"));
-    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    let bridge = served(Catalog::new([path.clone()]), &dir);
     bridge.app.catalog.explorer.set_patience(LONG_PATIENCE);
     let indexes = bridge.indexes(&id);
     let held = indexes.gate().hold(1);
     let search = bridge.search(&id);
     assert!(held.arrived(1, WAIT_LIMIT));
-    bridge.keep(Duration::ZERO);
+    bridge.keep(TICK, Duration::ZERO);
     until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("reading"));
     // Twenty games take milliseconds to build: a build that went on would be
     // over in ten times as long as they took alone, or a second.
@@ -722,7 +709,7 @@ fn a_background_build_gives_way_to_a_search() {
     assert_eq!(bridge.building(), [(id.clone(), "reading", 0, 20)], "it went on while the search ran");
     assert!(built_for(&dir, &id).is_none());
     drop(held);
-    let (status, body) = search.join().unwrap();
+    let (status, body) = search.answer();
     assert_eq!(status, 200, "{body}");
     until("the build did not go on once the search ended", WAIT_LIMIT, || {
         built_for(&dir, &id) == Some(generation(&path))
@@ -746,21 +733,21 @@ fn a_requested_build_does_not_give_way() {
     let paths = [large.dir().join("db.2cbh"), small.dir().join("db.2cbh")];
     let (a, b) = (id_of(&paths[0]), id_of(&paths[1]));
     let dir = data_dir("no-way");
-    let bridge = Bridge::new(Catalog::new(paths.clone()), &dir);
+    let bridge = served(Catalog::new(paths.clone()), &dir);
     bridge.app.catalog.explorer.set_patience(LONG_PATIENCE);
     let indexes = bridge.indexes(&b);
     let held = indexes.gate().hold(1);
     let search = bridge.search(&b);
     assert!(held.arrived(1, WAIT_LIMIT));
     // The largest database is in use from the start: its build gives way.
-    bridge.keep(Duration::ZERO);
+    bridge.keep(TICK, Duration::ZERO);
     until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &a).as_deref() == Some("reading"));
     until("the requested build did not answer", WAIT_LIMIT, || bridge.explorer(&b).0 == 200);
     assert!(built_for(&dir, &a).is_none(), "the background build went on");
     until("the promoted build did not answer", WAIT_LIMIT, || bridge.explorer(&a).0 == 200);
-    assert!(!search.is_finished(), "the search ended");
+    assert!(!search.answered(), "the search ended");
     drop(held);
-    let (status, body) = search.join().unwrap();
+    let (status, body) = search.answer();
     assert_eq!(status, 200, "{body}");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -779,7 +766,7 @@ fn a_background_build_ends_while_a_search_never_does() {
     let db = copies("background-starved", 300);
     let path = db.dir().join("db.2cbh");
     let (id, dir) = (id_of(&path), data_dir("starved"));
-    let bridge = Bridge::new(Catalog::new([path.clone()]), &dir);
+    let bridge = served(Catalog::new([path.clone()]), &dir);
     let patience = Duration::from_millis(50);
     bridge.app.catalog.explorer.set_patience(patience);
     let indexes = bridge.indexes(&id);
@@ -787,13 +774,13 @@ fn a_background_build_ends_while_a_search_never_does() {
     let search = bridge.search(&id);
     assert!(held.arrived(1, WAIT_LIMIT));
     let started = Instant::now();
-    bridge.keep(Duration::ZERO);
+    bridge.keep(TICK, Duration::ZERO);
     until("the build did not end while the search ran", WAIT_LIMIT, || built_for(&dir, &id) == Some(generation(&path)));
     let took = started.elapsed();
     assert!(took >= patience * 5, "it gave way less than its patience per pass: {took:?}");
-    assert!(!search.is_finished(), "the search ended");
+    assert!(!search.answered(), "the search ended");
     drop(held);
-    let (status, body) = search.join().unwrap();
+    let (status, body) = search.answer();
     assert_eq!(status, 200, "{body}");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();

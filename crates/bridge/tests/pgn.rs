@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
 
 use bridge::catalog::{Catalog, State, id_of};
 use bridge::search::{self, Indexes, SearchError, Selection};
@@ -16,8 +15,8 @@ use cbformat::view::Base;
 
 mod common;
 use common::{
-    FixtureRow, block, fixture_of, get, has_members, has_object, member, object_with, pgn_fixture, rows,
-    start_with_dir, without_generation,
+    FixtureRow, TestBridge, WAIT_LIMIT, app_of, block, fixture_of, get, has_members, has_object, member, object_with,
+    pgn_fixture, poll, rows, without_generation,
 };
 
 fn scratch(name: &str) -> PathBuf {
@@ -29,24 +28,22 @@ fn scratch(name: &str) -> PathBuf {
 /// Asks for `path` until the answer is no longer a `409` for a database or an
 /// index still being prepared.
 fn get_ready(port: u16, path: &str) -> (u16, String) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    let mut last = String::new();
+    let answer = poll(WAIT_LIMIT, || {
         let answer = get(port, path);
-        if answer.0 != 409 {
-            return answer;
+        if answer.0 == 409 {
+            last = answer.1;
+            return None;
         }
-        assert!(Instant::now() < deadline, "{path} stayed {}", answer.1);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        Some(answer)
+    });
+    answer.unwrap_or_else(|| panic!("{path} stayed {last} for {WAIT_LIMIT:?}"))
 }
 
 fn wait_ready(catalog: &Catalog, path: &Path) {
     let entry = catalog.get(&id_of(path)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while entry.state() != State::Ready {
-        assert!(Instant::now() < deadline, "{} stayed {:?}", path.display(), entry.state());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let ready = poll(WAIT_LIMIT, || (entry.state() == State::Ready).then_some(()));
+    assert!(ready.is_some(), "{} stayed {:?} for {WAIT_LIMIT:?}", path.display(), entry.state());
 }
 
 /// The fixture of `docs/search-grammar.md` with what PGN cannot hold made a
@@ -70,8 +67,8 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
     let rows = pgn_rows();
     let (fp, f2) = (pgn_fixture("api-pgn", &rows), fixture_of("pgn-api-2cbh", &rows));
     let (pp, p2) = (fp.dir().join("db.pgn"), f2.dir().join("db.2cbh"));
-    let dir = scratch("copies");
-    let (port, app) = start_with_dir([pp.clone(), p2.clone()], &dir);
+    let bridge = TestBridge::new(app_of([pp.clone(), p2.clone()]));
+    let (port, app) = (bridge.port, &bridge.app);
     let (ip, i2) = (id_of(&pp), id_of(&p2));
     wait_ready(&app.catalog, &pp);
     let (status, body) = get(port, "/v1/databases");
@@ -121,7 +118,6 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
     let (status, body) = both(&url);
     assert_eq!(status, 200, "{body}");
     assert!(has_members(&body, r#""index":{"records":10,"games":10}"#), "{body}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn numbers(db: &Base, idx: &Indexes, q: &str) -> String {
@@ -171,8 +167,8 @@ fn games_are_served_as_written() {
     );
     let f = pgn_file("served", text.as_bytes());
     let path = f.dir().join("db.pgn");
-    let dir = scratch("served");
-    let (port, app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     wait_ready(&app.catalog, &path);
     for query in ["", "?lang=de", "?annotations=full"] {
@@ -189,7 +185,6 @@ fn games_are_served_as_written() {
     assert!(has_object(&body, r#""number":1,"kind":"game","white":"Morphy, Paul""#), "{body}");
     assert!(has_object(&body, r#""number":1,"moves":2,"eco":"","event":"Paris","site":"""#), "{body}");
     assert_eq!(get(port, &format!("/v1/databases/{id}/games/3")).0, 404);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A PGN file is `opening`, with the bytes read, until its index is built;
@@ -199,8 +194,8 @@ fn opening_restarting_and_changing() {
     let game = "[Event \"E\"]\n[White \"W\"]\n[Black \"B\"]\n\n1. e4 e5 *\n\n";
     let f = pgn_file("opening", game.repeat(3).as_bytes());
     let path = f.dir().join("db.pgn");
-    let dir = scratch("opening");
-    let (port, app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     // The build waits behind a job that holds the queue.
     let (release, hold) = mpsc::channel::<()>();
@@ -224,7 +219,7 @@ fn opening_restarting_and_changing() {
 
     // Started again, the bridge reads the index built before: no build runs.
     let catalog = Catalog::new(vec![path.clone()]);
-    catalog.use_data_dir(&dir);
+    catalog.use_data_dir(bridge.dir());
     catalog.pgn().queue().refuse_starts(true);
     assert_eq!(catalog.get(&id).unwrap().state(), State::Ready);
 
@@ -235,7 +230,6 @@ fn opening_restarting_and_changing() {
     assert!(body.contains(r#""state":"opening""#) || body.contains(r#""records":4"#), "{body}");
     wait_ready(&app.catalog, &path);
     assert!(get(port, "/v1/databases").1.contains(r#""records":4"#));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A folder in `bridge.toml` serves its PGN files as it serves its ChessBase
@@ -265,8 +259,8 @@ fn the_position_index_reads_main_lines() {
 [Event \"6\"]\n\n1. d4 -- 2. c4 *\n";
     let f = pgn_file("explorer", text.as_bytes());
     let path = f.dir().join("db.pgn");
-    let dir = scratch("explorer");
-    let (port, _app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let port = bridge.port;
     let id = id_of(&path);
     let after_e4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR%20b%20KQkq%20-%200%201";
     let (status, body) = get_ready(port, &format!("/v1/databases/{id}/explorer?fen={after_e4}"));
@@ -284,7 +278,6 @@ fn the_position_index_reads_main_lines() {
     let after_d4 = "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR%20b%20KQkq%20-%200%201";
     let (_, body) = get(port, &format!("/v1/databases/{id}/explorer?fen={after_d4}"));
     assert!(has_members(&body, r#""games":1,"moves":[]"#), "{body}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `line` members of a games window, in order: `None` for `null`.
@@ -312,8 +305,8 @@ fn rows_carry_the_main_line() {
 [Event \"10\"]\n\n*\n";
     let f = pgn_file("lines", text.as_bytes());
     let path = f.dir().join("db.pgn");
-    let dir = scratch("lines");
-    let (port, app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     wait_ready(&app.catalog, &path);
     let (status, body) = get(port, &format!("/v1/databases/{id}/games?limit=20&line=60"));
@@ -336,5 +329,4 @@ fn rows_carry_the_main_line() {
     assert_eq!(lines_of(&body), want.map(|w| w.map(String::from)), "{body}");
     let (_, body) = get(port, &format!("/v1/databases/{id}/games?limit=1&line=2"));
     assert_eq!(lines_of(&body), [Some("e4 e5".to_string())], "{body}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
