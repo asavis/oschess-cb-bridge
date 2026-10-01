@@ -322,10 +322,44 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-start-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let port = server::bind(0).unwrap()[0].local_addr().unwrap().port();
+        let port = free_port();
         let web = web.map(|w| format!("web = \"{w}\"\n")).unwrap_or_default();
         std::fs::write(dir.join("bridge.toml"), format!("port = {port}\n{web}")).unwrap();
         dir
+    }
+
+    /// A free port for a test's bridge, which its start binds again. It lies
+    /// below the ports the system hands out for port 0 and for connections
+    /// (from 32768 on Linux by default, from 49152 on Windows), so no other
+    /// test takes it between this look and the start, as one took 45288 on a
+    /// loaded machine (#217). A port something holds is passed over.
+    fn free_port() -> u16 {
+        const FIRST: usize = 20000;
+        const COUNT: usize = 32768 - FIRST;
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let start = std::process::id() as usize * 31 + nanos as usize + calls * 997;
+        // 7919 is prime to COUNT, so the steps visit every port once.
+        (0..COUNT)
+            .map(|i| (FIRST + (start + i * 7919) % COUNT) as u16)
+            .find(|&port| server::bind(port).is_ok())
+            .expect("no free port from 20000 to 32767")
+    }
+
+    /// A test bridge's port lies below the ports the system hands out for
+    /// port 0 and for connections, which Linux lists in
+    /// `ip_local_port_range`: so no other socket takes it between the look
+    /// and the start (#217).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_test_port_lies_below_the_dynamic_range() {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        let first: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+        for _ in 0..50 {
+            let port = free_port();
+            assert!((20000..first).contains(&port), "{port} is not below {first}");
+        }
     }
 
     /// The port the settings of `dir` name.
@@ -469,7 +503,8 @@ mod tests {
             std::thread::sleep(PORT_RETRY * 2);
             drop(held);
         });
-        let bridge = prepare(&dir, &Options { port_wait: Duration::from_secs(30), ..Options::default() }).unwrap();
+        let patience = crate::search::workers::tests::PATIENCE;
+        let bridge = prepare(&dir, &Options { port_wait: patience, ..Options::default() }).unwrap();
         freed.join().unwrap();
         assert_eq!(bridge.port, port);
         assert_eq!(logged(&dir, &failed), 2, "a start that waited and started is no failure");
@@ -486,9 +521,12 @@ mod tests {
         let dir = folder("refused-held", Some("https://example.com"));
         let port = port_of(&dir);
         let held = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        // A wait for the port twice the patience, which a start that waited
+        // would outlast.
+        let patience = crate::search::workers::tests::PATIENCE;
         let started = Instant::now();
-        let e = prepare(&dir, &Options { port_wait: Duration::from_secs(60), ..Options::default() }).err().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(60), "it does not wait");
+        let e = prepare(&dir, &Options { port_wait: patience * 2, ..Options::default() }).err().unwrap();
+        assert!(started.elapsed() < patience, "it does not wait");
         assert_eq!(e.cause, Cause::Other { port: Some(port) });
         assert_eq!(logged(&dir, "the bridge cannot start: "), 1);
         drop(held);

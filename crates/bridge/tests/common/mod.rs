@@ -1,7 +1,8 @@
-//! What the test files share: a bridge served on a free port, the requests a
-//! test sends it and the reading of its answers, and the fixture of
-//! `docs/search-grammar.md`, written as a 2CBH database, as a classic one and
-//! as a PGN file with the same content. Each test file uses a part of it.
+//! What the test files share: a bridge served on a free port
+//! ([`TestBridge`]), the requests a test sends it and the reading of its
+//! answers, and the fixture of `docs/search-grammar.md`, written as a 2CBH
+//! database, as a classic one and as a PGN file with the same content. Each
+//! test file uses a part of it.
 //!
 //! The search memory budget (`search::memory`), the answer budget
 //! (`budget`) and the search workers (`search::workers`) are one per
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::api::App;
-use bridge::catalog::{Catalog, id_of};
+use bridge::catalog::{Busy, Catalog, id_of};
 use bridge::server;
 use cbformat::fixture::{Builder, TempDb, quiet};
 use cbformat::fixture_cbh::{self, Tok, encode, move_record};
@@ -42,15 +43,9 @@ pub const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 pub const ORIGIN: &str = DEFAULT_ORIGINS[0];
 
 /// The policy of a test's bridge: the default origins and [`TOKEN`]. Its port
-/// is the one [`serve`] binds.
+/// is the one [`TestBridge`] binds.
 pub fn policy() -> Policy {
     Policy { port: 0, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() }
-}
-
-/// Serves `app` on a free loopback port, from a thread of its own, its
-/// policy's port set to that one; the port.
-pub fn serve(app: App) -> u16 {
-    serve_shared(app).0
 }
 
 /// The app of a test's bridge serving the databases at `paths`, with
@@ -59,65 +54,136 @@ pub fn app_of(paths: impl IntoIterator<Item = PathBuf>) -> App {
     App::new("test", policy(), Catalog::new(paths))
 }
 
-/// Serves the databases at `paths` as [`serve_shared`] does, with their
-/// indexes in `dir` as in a data folder.
-pub fn start_with_dir(paths: impl IntoIterator<Item = PathBuf>, dir: &Path) -> (u16, Arc<App>) {
-    serve_with_dir(app_of(paths), dir)
-}
-
-/// Serves `app` as [`serve_shared`] does, with its indexes in `dir` as in a
-/// data folder.
-pub fn serve_with_dir(app: App, dir: &Path) -> (u16, Arc<App>) {
-    app.catalog.use_data_dir(dir);
-    serve_shared(app)
-}
-
-/// [`serve`], and the app served, for a test that asks it things as it serves.
-pub fn serve_shared(mut app: App) -> (u16, Arc<App>) {
-    let listeners = server::bind(0).unwrap();
-    let port = listeners[0].local_addr().unwrap().port();
-    app.policy.port = port;
-    let app = Arc::new(app);
-    let served = Arc::clone(&app);
-    std::thread::spawn(move || server::serve(listeners, served));
-    (port, app)
-}
-
-/// A bridge served for a test that gives up the position indexes it holds
-/// when dropped. A held index keeps its move stream mapped, and a mapped file
-/// cannot be replaced or removed on Windows: a test drops the bridge before
-/// it changes or removes the files, or starts another bridge that rebuilds
-/// them. Its threads go on listening, holding no index, until the process
-/// ends.
-pub struct Served {
+/// The one bridge a test serves (#238): `app` on a loopback port the harness
+/// binds itself, from a thread of its own, with a data folder, which holds
+/// its indexes, and its keeper off unless [`TestBridge::keep`] starts it.
+///
+/// The product's time-outs that a test runs through but is not about are
+/// [`WAIT_LIMIT`] (#238): its connections wait [`IDLE_TIMEOUT`] for a
+/// request, and a process of its engine [`WAIT_LIMIT`] for `uciok`
+/// (`Engine::set_handshake`), which a loaded machine can take longer than
+/// `engine::HANDSHAKE` to give. A test of either sets it back. Its busy
+/// answer waits `server::BUSY_READ` for a request's `Origin`: only the tests
+/// of that answer go over the connection cap, and a longer wait would let a
+/// silent connection they hold, queued over the cap, keep the one busy
+/// thread from the answers behind it.
+///
+/// Dropped, it waits until none of its background work runs ([`settle`]),
+/// gives up the position indexes it holds, and then removes its data folder
+/// when the folder is its own. Nothing writes to the folder once the drop
+/// returns (#236). A held index keeps its move stream mapped, and a mapped
+/// file cannot be replaced or removed on Windows: a test drops the bridge
+/// before it changes or removes the files, or starts another bridge that
+/// rebuilds them. Its threads go on listening, holding no index, until the
+/// process ends.
+pub struct TestBridge {
     pub port: u16,
-    app: Arc<App>,
+    pub app: Arc<App>,
+    dir: PathBuf,
+    /// Whether `dir` is the bridge's own, made for it and removed with it.
+    own: bool,
 }
 
-impl Served {
-    /// Serves `app` as [`serve`] does.
-    pub fn new(app: App) -> Served {
-        let (port, app) = serve_shared(app);
-        Served { port, app }
+impl TestBridge {
+    /// Serves `app` with a data folder of its own, empty.
+    pub fn new(app: App) -> TestBridge {
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bridge-test-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TestBridge::serve(app, dir, true)
     }
 
-    /// Serves `app` as [`serve_with_dir`] does, with its indexes in `dir`.
-    pub fn with_dir(app: App, dir: &Path) -> Served {
-        app.catalog.use_data_dir(dir);
-        Served::new(app)
+    /// Serves `app` with the data folder `dir`, which the test gives and
+    /// removes: for a test that makes the folder's files before the bridge
+    /// starts, looks at them once it is dropped, or starts another bridge on
+    /// the same folder.
+    pub fn in_dir(app: App, dir: &Path) -> TestBridge {
+        TestBridge::serve(app, dir.to_path_buf(), false)
     }
 
-    /// Serves the 2CBH database `db` with its indexes in `dir`, as in a data
-    /// folder: the bridge and the database's id.
-    pub fn database(db: &TempDb, dir: &Path) -> (Served, String) {
+    /// Serves the 2CBH database `db` with the data folder `dir`
+    /// ([`TestBridge::in_dir`]): the bridge and the database's id.
+    pub fn database(db: &TempDb, dir: &Path) -> (TestBridge, String) {
         let path = db.dir().join("db.2cbh");
-        (Served::with_dir(app_of([path.clone()]), dir), id_of(&path))
+        (TestBridge::in_dir(app_of([path.clone()]), dir), id_of(&path))
+    }
+
+    fn serve(mut app: App, dir: PathBuf, own: bool) -> TestBridge {
+        let listeners = server::bind(0).unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        app.policy.port = port;
+        app.idle_timeout = IDLE_TIMEOUT;
+        app.engine.set_handshake(WAIT_LIMIT);
+        app.catalog.use_data_dir(&dir);
+        let app = Arc::new(app);
+        let served = Arc::clone(&app);
+        std::thread::spawn(move || server::serve(listeners, served));
+        TestBridge { port, app, dir, own }
+    }
+
+    /// The data folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Starts the keeper of the indexes of the databases in use, looking
+    /// every `tick`, with `quiet` as the quiet period.
+    pub fn keep(&self, tick: Duration, quiet: Duration) {
+        self.app.catalog.explorer.set_keeping(tick, quiet);
+        bridge::explorer::keeper::start(&self.app);
     }
 }
 
-impl Drop for Served {
+impl Drop for TestBridge {
     fn drop(&mut self) {
+        // Stops the keeper, then waits for every build and write (#236).
+        settle(&self.app.catalog);
         self.app.catalog.explorer.release();
+        if self.own {
+            remove_settled(&self.dir);
+        }
+    }
+}
+
+/// Waits until none of `catalog`'s background work runs, for [`WAIT_LIMIT`]
+/// at most ([`Catalog::settle`]), so that a test removes the folders it
+/// reads or writes with nothing working on them (#236): a bridge's data
+/// folder, or the fixtures of a catalog a test opens itself. What still runs
+/// then fails the test, by name, unless it is failing already.
+pub fn settle(catalog: &Catalog) {
+    if let Err(Busy(running)) = catalog.settle(WAIT_LIMIT) {
+        fail(format!("{} still ran {WAIT_LIMIT:?} after the test was done with it", running.join(", ")));
+    }
+}
+
+/// Removes the folder `dir`, which nothing writes to any more: a folder left
+/// fails the test, by name, unless it is failing already. On Windows a file
+/// written a moment ago can be held open a while by a scanner of new files,
+/// and the removal is tried again meanwhile, for [`WAIT_LIMIT`] at most.
+fn remove_settled(dir: &Path) {
+    let mut last = None;
+    let patience = if cfg!(windows) { WAIT_LIMIT } else { Duration::ZERO };
+    let removed = poll(patience, || match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            last = Some(e);
+            None
+        }
+        _ => Some(()),
+    });
+    if removed.is_none() {
+        fail(format!("the data folder {} was not removed: {last:?}", dir.display()));
+    }
+}
+
+/// Fails the test with `what`; a test that is failing already, as it unwinds,
+/// writes it to standard error instead of a second panic.
+fn fail(what: String) {
+    if std::thread::panicking() {
+        eprintln!("{what}");
+    } else {
+        panic!("{what}");
     }
 }
 
@@ -129,35 +195,94 @@ pub fn request(port: u16, path: &str) -> String {
     )
 }
 
-/// How long a test waits for the rest of an answer before it fails. Longer
-/// than any answer of these tests takes on a loaded machine, it turns a bridge
-/// that stops answering, or never closes a connection, into a failure that
-/// names the request instead of a run that hangs.
-pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a test's bridge keeps an open connection waiting for a request,
+/// in place of [`bridge::http::IDLE_TIMEOUT`]. A loaded machine can stall a
+/// test between its connect and its write for longer than that; the bridge
+/// then closes the connection unanswered, as it should, and the test reads an
+/// empty answer or a reset, or finds the idle connections holding the
+/// connection cap gone (#217). No test's contract is that closing.
+pub const IDLE_TIMEOUT: Duration = WAIT_LIMIT;
 
 /// A connection to the bridge on `port` whose reads fail after
-/// [`ANSWER_TIMEOUT`] without a byte.
+/// [`WAIT_LIMIT`] without a byte: a bridge that stops answering, or never
+/// closes a connection, fails the test by the request's name instead of
+/// hanging the run. A large answer on a loaded machine takes minutes (#253).
 pub fn connect(port: u16) -> std::io::Result<TcpStream> {
     let s = TcpStream::connect(("127.0.0.1", port))?;
-    s.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+    s.set_read_timeout(Some(WAIT_LIMIT))?;
     Ok(s)
 }
 
 /// Sends `raw` on a new connection and reads the whole answer, head and body;
 /// `None` when the connection is refused or cut. An answer that stops for
-/// [`ANSWER_TIMEOUT`] before the connection ends fails the test.
+/// [`WAIT_LIMIT`] before the connection ends fails the test.
 pub fn exchange(port: u16, raw: &str) -> Option<String> {
     let mut s = connect(port).ok()?;
     s.write_all(raw.as_bytes()).ok()?;
+    read_answer(&mut s, raw)
+}
+
+/// The rest of the answer to `raw` on `s`, to the connection's end; `None`
+/// when the connection is cut.
+fn read_answer(s: &mut TcpStream, raw: &str) -> Option<String> {
     let mut out = Vec::new();
     match s.read_to_end(&mut out) {
         Ok(_) => String::from_utf8(out).ok(),
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => panic!(
-            "no end of the answer to {:?} within {ANSWER_TIMEOUT:?}: {}",
+            "no end of the answer to {:?} within {WAIT_LIMIT:?}: {}",
             raw.lines().next().unwrap_or_default(),
             String::from_utf8_lossy(&out)
         ),
         Err(_) => None,
+    }
+}
+
+/// Whether the bridge has neither answered nor closed `s`, looking without
+/// waiting.
+pub fn unanswered(s: &TcpStream) -> bool {
+    s.set_nonblocking(true).unwrap();
+    let unanswered = matches!(s.peek(&mut [0]), Err(e) if e.kind() == ErrorKind::WouldBlock);
+    s.set_nonblocking(false).unwrap();
+    unanswered
+}
+
+/// [`request`]`(port, path)` sent on a connection of its own, whose answer
+/// the test reads later ([`Sent::answer`]): for a request the test holds
+/// back, whose answer's patience must run from when it lets the request go,
+/// not from the send (#244).
+pub struct Sent {
+    stream: TcpStream,
+    raw: String,
+    /// How long the test took from before it connected to its request's
+    /// last byte, which a loaded machine can stall: the bridge that waits a
+    /// while from acceptance for a request did not wait for one sent later.
+    pub took: Duration,
+}
+
+impl Sent {
+    pub fn get(port: u16, path: &str) -> Sent {
+        let raw = request(port, path);
+        let started = Instant::now();
+        let mut stream = connect(port).expect("the bridge accepts");
+        stream.write_all(raw.as_bytes()).expect("the bridge takes the request");
+        Sent { stream, raw, took: started.elapsed() }
+    }
+
+    /// Whether the bridge has begun to answer, or closed the connection.
+    pub fn answered(&self) -> bool {
+        !unanswered(&self.stream)
+    }
+
+    /// The answer, waited for [`WAIT_LIMIT`] from now.
+    pub fn reply(mut self) -> Reply {
+        let out = read_answer(&mut self.stream, &self.raw).expect("the bridge answers");
+        parse_reply(&out).unwrap_or_else(|| panic!("not an answer: {out}"))
+    }
+
+    /// The status and body of the answer, waited for [`WAIT_LIMIT`] from now.
+    pub fn answer(self) -> (u16, String) {
+        let reply = self.reply();
+        (reply.status, reply.body)
     }
 }
 
@@ -996,14 +1121,21 @@ impl ChildTest {
     /// Waits for the child to end, until [`CHILD_LIMIT`] after it started,
     /// when it is killed: how it ended, and what it wrote.
     pub fn end(&mut self) -> Ended {
-        let left = CHILD_LIMIT.saturating_sub(self.started.elapsed());
+        self.end_within(CHILD_LIMIT)
+    }
+
+    /// [`ChildTest::end`] until `limit` after the child started: for a child
+    /// whose work takes longer the busier the computer is, which the test
+    /// measures (#246).
+    pub fn end_within(&mut self, limit: Duration) -> Ended {
+        let left = limit.saturating_sub(self.started.elapsed());
         let status = poll(left, || self.child.try_wait().unwrap());
         if status.is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
         let output = String::from_utf8_lossy(&std::fs::read(&self.log).unwrap_or_default()).into_owned();
-        Ended { name: self.name.clone(), status, output }
+        Ended { name: self.name.clone(), status, output, limit }
     }
 }
 
@@ -1018,16 +1150,17 @@ impl Drop for ChildTest {
 /// How a child's run of its test ended, and what it wrote.
 pub struct Ended {
     name: String,
-    /// `None` when the child was killed at [`CHILD_LIMIT`].
+    /// `None` when the child was killed at `limit`.
     status: Option<ExitStatus>,
     output: String,
+    limit: Duration,
 }
 
 impl Ended {
     /// Checks that the child ran its one test and passed: what it wrote.
     pub fn passed(self) -> String {
         let Some(status) = self.status else {
-            panic!("{} did not end within {CHILD_LIMIT:?}:\n{}", self.name, self.output)
+            panic!("{} did not end within {:?}:\n{}", self.name, self.limit, self.output)
         };
         assert!(status.success() && self.output.contains("1 passed"), "{}: {status}\n{}", self.name, self.output);
         self.output

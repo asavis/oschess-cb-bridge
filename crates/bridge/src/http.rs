@@ -3,7 +3,7 @@
 //! chunks.
 
 use std::io::{self, IoSlice, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 /// The request line and headers together may not exceed this.
@@ -12,6 +12,11 @@ pub const MAX_HEAD: usize = 16 << 10;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request may take to arrive once it has begun.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a closing connection goes on reading what its client still sends;
+/// see [`Conn::close`].
+pub const LINGER: Duration = Duration::from_secs(2);
+/// At most this much is read and dropped while a connection closes.
+const LINGER_BYTES: usize = 1 << 20;
 
 pub struct Request {
     pub method: String,
@@ -91,6 +96,9 @@ fn sniff_origin(head: &[u8]) -> Option<String> {
 pub struct Conn {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// How long to wait for a request to begin: [`IDLE_TIMEOUT`] unless
+    /// [`Conn::idle`] sets another.
+    idle: Duration,
 }
 
 impl Conn {
@@ -99,16 +107,31 @@ impl Conn {
         // by holding a small segment back for the client's delayed
         // acknowledgement, which costs 40 ms a request on Linux (#142).
         let _ = stream.set_nodelay(true);
-        Conn { stream, buf: Vec::new() }
+        Conn { stream, buf: Vec::new(), idle: IDLE_TIMEOUT }
     }
 
+    /// The connection, waiting `idle` for each request to begin in place of
+    /// [`IDLE_TIMEOUT`].
+    pub fn idle(mut self, idle: Duration) -> Self {
+        self.idle = idle;
+        self
+    }
+
+    /// The next request: its first byte within the connection's idle wait,
+    /// the rest within [`REQUEST_TIMEOUT`] of it.
     pub fn read_request(&mut self) -> Result<Request, Refusal> {
-        self.read_request_within(REQUEST_TIMEOUT)
+        self.read_request_waiting(self.idle, REQUEST_TIMEOUT)
     }
 
     /// [`Conn::read_request`] with `limit` in place of [`REQUEST_TIMEOUT`],
     /// and no longer than that to wait for the first byte either.
     pub fn read_request_within(&mut self, limit: Duration) -> Result<Request, Refusal> {
+        self.read_request_waiting(self.idle.min(limit), limit)
+    }
+
+    /// Waits `idle` for a request to begin, then `limit` from its first byte
+    /// for the rest of it.
+    fn read_request_waiting(&mut self, idle: Duration, limit: Duration) -> Result<Request, Refusal> {
         let mut started = (!self.buf.is_empty()).then(Instant::now);
         loop {
             let too_large = |buf: &[u8]| Refusal { error: ReadError::TooLarge, origin: sniff_origin(buf) };
@@ -123,7 +146,7 @@ impl Conn {
                 return Err(too_large(&self.buf));
             }
             let timeout = match started {
-                None => IDLE_TIMEOUT.min(limit),
+                None => idle,
                 Some(t) => match limit.checked_sub(t.elapsed()).filter(|d| !d.is_zero()) {
                     Some(left) => left,
                     None => return Err(ReadError::Dropped.quiet()),
@@ -163,13 +186,40 @@ impl Conn {
     }
 
     pub fn write(&mut self, response: &Response, keep_alive: bool) -> io::Result<()> {
-        let mut framing = String::new();
-        if !response.body.is_empty() {
-            framing.push_str("Content-Type: application/json; charset=utf-8\r\n");
+        write_answer(&mut self.stream, response, keep_alive)
+    }
+
+    /// Ends the connection. A close with unread bytes resets the connection,
+    /// and the reset can cost the client the answer written just before it:
+    /// the rest of a refused request, still arriving, did that (#217). So the
+    /// write side is shut first, which ends the answer, and what the client
+    /// still sends is read and dropped until it closes, `linger` has passed,
+    /// or [`LINGER_BYTES`] were dropped.
+    pub fn close(mut self, linger: Duration) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+        let deadline = Instant::now() + linger;
+        let mut dropped = 0;
+        let mut chunk = [0u8; 4096];
+        while dropped < LINGER_BYTES {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return;
+            };
+            if self.stream.set_read_timeout(Some(left)).is_err() {
+                return;
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => dropped += n,
+                // A read time-out counts in the kernel's ticks and can end a
+                // little before the deadline; the loop looks at it again.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
         }
-        framing.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-        write_both(&mut self.stream, head(response, &framing, keep_alive).as_bytes(), response.body.as_bytes())?;
-        self.stream.flush()
     }
 }
 
@@ -189,10 +239,22 @@ fn head(response: &Response, framing: &str, keep_alive: bool) -> String {
     head
 }
 
+/// Writes `response` whole, its head and its body, to `out`: see
+/// [`write_both`].
+fn write_answer(out: &mut impl Write, response: &Response, keep_alive: bool) -> io::Result<()> {
+    let mut framing = String::new();
+    if !response.body.is_empty() {
+        framing.push_str("Content-Type: application/json; charset=utf-8\r\n");
+    }
+    framing.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+    write_both(out, head(response, &framing, keep_alive).as_bytes(), response.body.as_bytes())?;
+    out.flush()
+}
+
 /// Writes `head` then `body` as one vectored write, so that they usually leave
 /// in the same segments, without copying the body: an answer's memory is
 /// reserved once, for the body (#142).
-fn write_both(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::Result<()> {
+fn write_both(stream: &mut impl Write, head: &[u8], body: &[u8]) -> io::Result<()> {
     let mut slices = [IoSlice::new(head), IoSlice::new(body)];
     let mut rest = &mut slices[..];
     while !rest.is_empty() {
@@ -409,10 +471,40 @@ fn decode(s: &str, plus: bool) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use super::*;
 
     fn req(head: &str) -> Result<Request, ReadError> {
         parse(head.as_bytes())
+    }
+
+    /// A closing connection reads its client for `linger` at most when the
+    /// client neither sends nor closes, and for [`LINGER_BYTES`] at most when
+    /// it never stops sending.
+    #[test]
+    fn a_closing_connection_reads_its_client_within_bounds() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let conn = Conn::new(listener.accept().unwrap().0);
+        // The bounds a loaded machine can stall a thread for and still pass:
+        // the tests' patience, and twice it for a wait told from it (#238).
+        let patience = crate::search::workers::tests::PATIENCE;
+        let started = Instant::now();
+        conn.close(Duration::from_millis(100));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100) && waited < patience, "{waited:?}");
+        drop(silent);
+        let sender = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            while s.write_all(&[b'x'; 1 << 16]).is_ok() {}
+        });
+        let conn = Conn::new(listener.accept().unwrap().0);
+        let started = Instant::now();
+        conn.close(patience * 2);
+        assert!(started.elapsed() < patience, "the close waited for the linger");
+        sender.join().unwrap();
     }
 
     #[test]
@@ -457,6 +549,93 @@ mod tests {
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 3").err(), Some(ReadError::Body));
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked").err(), Some(ReadError::Body));
         assert!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 0").is_ok());
+    }
+
+    /// How long a connection waits for a request to begin, told by the read
+    /// time-out it sets before its first read: `idle` in full, even past
+    /// [`REQUEST_TIMEOUT`] (#217), and no longer than a limit given.
+    #[test]
+    fn a_request_is_awaited_for_the_idle_wait() {
+        let wait = |idle: Option<Duration>, limit: Option<Duration>| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let mut conn = Conn::new(listener.accept().unwrap().0);
+            if let Some(idle) = idle {
+                conn = conn.idle(idle);
+            }
+            // The client has left, so the first read ends at once.
+            drop(client);
+            let read = match limit {
+                Some(limit) => conn.read_request_within(limit),
+                None => conn.read_request(),
+            };
+            assert_eq!(read.err().map(|r| r.error), Some(ReadError::Closed));
+            conn.stream.read_timeout().unwrap()
+        };
+        assert_eq!(wait(None, None), Some(IDLE_TIMEOUT));
+        let long = REQUEST_TIMEOUT * 30;
+        assert_eq!(wait(Some(long), None), Some(long));
+        let short = Duration::from_millis(500);
+        assert_eq!(wait(Some(long), Some(short)), Some(short));
+        assert_eq!(wait(None, Some(short)), Some(short));
+    }
+
+    /// A writer that takes all it is given in each write, as a socket with
+    /// room for it does, and counts the writes.
+    #[derive(Default)]
+    struct Counting {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.writes += 1;
+            let before = self.bytes.len();
+            bufs.iter().for_each(|b| self.bytes.extend_from_slice(b));
+            Ok(self.bytes.len() - before)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An answer is one write, its head and its body together (#142): written
+    /// in two, the second waited on a kept connection for the client's
+    /// delayed acknowledgement of the first, 40 ms on Linux and longer
+    /// elsewhere. A test that timed round trips failed under load (#250);
+    /// this one counts the writes.
+    #[test]
+    fn an_answer_is_one_write() {
+        for (response, keep_alive) in [
+            (Response::json(200, r#"{"a":1}"#.into()).header("Vary", "Origin"), true),
+            (Response::json(200, "x".repeat(1 << 20)), false),
+            (Response::empty(204), true),
+        ] {
+            let mut out = Counting::default();
+            write_answer(&mut out, &response, keep_alive).unwrap();
+            assert_eq!(out.writes, 1, "{}", response.status);
+            let text = String::from_utf8(out.bytes).unwrap();
+            assert!(text.starts_with("HTTP/1.1 ") && text.ends_with(&format!("\r\n\r\n{}", response.body)));
+        }
+    }
+
+    /// A connection the bridge accepts sends each write at once, without
+    /// holding a small one back for the client's acknowledgement of the one
+    /// before (#142): `Conn::new`, through which the bridge serves or refuses
+    /// every connection, turns Nagle's algorithm off.
+    #[test]
+    fn an_accepted_connection_sends_without_delay() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let accepted = listener.accept().unwrap().0;
+        assert!(!accepted.nodelay().unwrap(), "a new socket delays small writes");
+        assert!(Conn::new(accepted).stream.nodelay().unwrap());
     }
 
     /// The bytes a client reads when `send` writes to the connection accepted

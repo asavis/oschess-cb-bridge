@@ -23,7 +23,9 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use chesscore::Board;
 
 mod common;
-use common::{TOKEN, get, has_members, has_object, members, objects, policy, serve};
+use common::{
+    TOKEN, TestBridge, WAIT_LIMIT, get, has_members, has_object, members, objects, policy, poll, settle, until,
+};
 
 const NUMBERS: [i64; 6] = [0, 28, 1, 1, 1037620, 1037559];
 
@@ -140,6 +142,8 @@ fn the_window_comes_first_then_bridge_toml_then_the_command_line() {
     assert!(catalog.get(&id_of(&d)).is_some());
     assert_eq!(catalog.get(&id_of(&c)).unwrap().format.name(), "2cbh");
     assert_eq!(catalog.get(&id_of(&old)).unwrap().format.name(), "cbh");
+    // The PGN file's index is built before the folder goes.
+    settle(&catalog);
 }
 
 /// Changes to the window list and to `bridge.toml` show on the next listing.
@@ -204,6 +208,7 @@ fn a_database_added_within_one_clock_tick_shows() {
     database_at(&root.path("folder"), "One");
     std::fs::write(root.path("bridge.toml"), format!("databases = ['{}']\n", root.path("folder").display())).unwrap();
     let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    catalog.use_data_dir(&root.path("data"));
     assert_eq!(names(&catalog), ["One"]);
     let folder = std::fs::File::open(root.path("folder")).unwrap();
     let before = folder.metadata().unwrap().modified().unwrap();
@@ -216,6 +221,8 @@ fn a_database_added_within_one_clock_tick_shows() {
     folder.set_modified(before).unwrap();
     assert_eq!(folder.metadata().unwrap().modified().unwrap(), before);
     assert_eq!(names(&catalog), ["One", "Three", "Two"]);
+    // The PGN file's index is built before the folder goes.
+    settle(&catalog);
 }
 
 /// Damaged, empty or absent lists give no databases and no panic; a list that
@@ -387,11 +394,8 @@ fn size_of(files: &[PathBuf]) -> u64 {
 }
 
 fn wait_for(entry: &Entry, state: State) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while entry.state() != state {
-        assert!(Instant::now() < deadline, "still {:?}, waiting for {state:?}", entry.state());
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let reached = poll(WAIT_LIMIT, || (entry.state() == state).then_some(()));
+    assert!(reached.is_some(), "still {:?} after {WAIT_LIMIT:?}, waiting for {state:?}", entry.state());
 }
 
 /// Listing never reads a cloud-only database; opening it for games downloads
@@ -522,11 +526,7 @@ fn a_database_moved_back_to_the_cloud_is_cloud_only_again() {
 
 /// Waits until the database's download, running or queued, has ended.
 fn wait_for_download(entry: &Entry) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while entry.progress().is_some() {
-        assert!(Instant::now() < deadline, "the download does not end");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    until("the download does not end", WAIT_LIMIT, || entry.progress().is_none());
 }
 
 /// A companion file moved to the cloud while the download of another ran
@@ -649,14 +649,14 @@ fn a_database_answers_while_the_sources_are_read() {
         let catalog = Arc::clone(&catalog);
         std::thread::spawn(move || names(&catalog))
     };
-    read.recv_timeout(Duration::from_secs(10)).expect("the sources were not read");
+    read.recv_timeout(WAIT_LIMIT).expect("the sources were not read");
 
     let (tx, rx) = mpsc::channel();
     let (reader, ids) = (Arc::clone(&catalog), [id_of(&one), id_of(&two)]);
     std::thread::spawn(move || {
         let _ = tx.send(ids.map(|id| reader.get(&id).map(|e| e.state())));
     });
-    let answers = rx.recv_timeout(Duration::from_secs(10)).expect("a request waited for the sources");
+    let answers = rx.recv_timeout(WAIT_LIMIT).expect("a request waited for the sources");
     assert_eq!(answers, [Some(State::Ready), None]);
     drop(release);
     assert_eq!(listing.join().unwrap(), ["One", "Two"]);
@@ -705,8 +705,7 @@ fn files_that_are_not_regular_are_never_opened() {
         let startup = bridge::config::load_or_create(&pipe_config).is_err();
         tx.send((listed, games, ready, config, startup)).unwrap();
     });
-    let (listed, games, ready, config, startup) =
-        rx.recv_timeout(Duration::from_secs(20)).expect("a pipe blocked the bridge");
+    let (listed, games, ready, config, startup) = rx.recv_timeout(WAIT_LIMIT).expect("a pipe blocked the bridge");
     let listed: Vec<(&str, &str)> = listed.iter().map(|(n, s)| (n.as_str(), *s)).collect();
     assert_eq!(listed, [("Good", "ready"), ("Companion", "unreadable"), ("Header", "unreadable")]);
     assert_eq!(games, Some(State::Unreadable));
@@ -794,8 +793,8 @@ fn cloud_states_over_http() {
     let size = size_of(&files);
     let cloud = Arc::new(FakeCloud::with_files(files.clone(), false));
     let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
-    let port = serve(App::new("test", policy(), catalog));
-    let id = id_of(&db);
+    let bridge = TestBridge::new(App::new("test", policy(), catalog));
+    let (port, id) = (bridge.port, id_of(&db));
 
     let (status, body) = get(port, "/v1/databases");
     assert_eq!(status, 200);
@@ -823,16 +822,13 @@ fn cloud_states_over_http() {
     assert!(has_object(&body, &format!("\"download\":{{\"present\":0,\"total\":{size}}}")), "{body}");
 
     cloud.hold(false);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let (status, body) = get(port, &format!("/v1/databases/{id}/games"));
-        if status == 200 {
-            assert!(body.contains("\"total\":1"), "{body}");
-            break;
-        }
-        assert!(Instant::now() < deadline, "{status} {body}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let mut last = (0, String::new());
+    let body = poll(WAIT_LIMIT, || {
+        last = get(port, &format!("/v1/databases/{id}/games"));
+        (last.0 == 200).then(|| last.1.clone())
+    });
+    let body = body.unwrap_or_else(|| panic!("still {} {} after {WAIT_LIMIT:?}", last.0, last.1));
+    assert!(body.contains("\"total\":1"), "{body}");
     let (_, body) = get(port, "/v1/databases");
     assert!(has_object(&body, "\"state\":\"ready\",\"records\":1"), "{body}");
 }
@@ -848,7 +844,8 @@ fn a_refused_request_starts_no_download() {
     let cloud = Arc::new(FakeCloud::with_files(files_of(&db), false));
     let catalog = Catalog::with_sources(Sources { fixed: vec![db.clone()], ..Sources::default() }, cloud.clone());
     let (id, entry) = (id_of(&db), catalog.get(&id_of(&db)).unwrap());
-    let port = serve(App::new("test", policy(), catalog));
+    let bridge = TestBridge::new(App::new("test", policy(), catalog));
+    let port = bridge.port;
     // A download started now would wait, and show.
     cloud.hold(true);
     let start = "rnbqkbnr%2Fpppppppp%2F8%2F8%2F8%2F8%2FPPPPPPPP%2FRNBQKBNR+w+KQkq+-+0+1";
@@ -940,6 +937,9 @@ fn the_snapshot_shows_cloud_states() {
     let ready = snapshot();
     assert_eq!(fields(&ready), (State::Ready, Some(1), None, None));
     assert_eq!((ready.name.as_str(), ready.generation), ("Remote", entry.generation()));
+    // Served as the app serves it, with its keeper: stopped, and its work
+    // waited for, before the folder goes.
+    settle(&app.catalog);
 }
 
 /// The members of a database's row in `GET /v1/databases` past its id, name
@@ -986,7 +986,7 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
         let mut out = child.stdout.take().unwrap();
         text.clear();
         let mut buf = [0u8; 256];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT_LIMIT;
         while !text.contains("Windowed") && Instant::now() < deadline {
             match out.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1009,7 +1009,7 @@ fn the_bridge_reads_the_window_of_the_documents_folder() {
 #[cfg(windows)]
 #[test]
 fn a_database_holds_no_file_open_while_nothing_reads_it() {
-    use common::{WAIT_LIMIT, answered, classic_fixture, fixture, index_dir, start_with_dir, until};
+    use common::{WAIT_LIMIT, answered, app_of, classic_fixture, fixture, index_dir, until};
     let dbs = [
         fixture("closed-2cbh", &[]),
         classic_fixture("closed-cbh", &[]),
@@ -1017,7 +1017,8 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
     ];
     let paths = [dbs[0].dir().join("db.2cbh"), dbs[1].dir().join("db.cbh"), dbs[2].dir().join("db.pgn")];
     let dir = index_dir("closed");
-    let (port, _app) = start_with_dir(paths.clone(), &dir);
+    let bridge = TestBridge::in_dir(app_of(paths.clone()), &dir);
+    let port = bridge.port;
     // The list opens every database, the games read each of them.
     let (_, body) = get(port, "/v1/databases");
     assert!(body.contains(r#""state":"ready""#), "{body}");
@@ -1028,6 +1029,7 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
         dbs.iter().flat_map(|db| std::fs::read_dir(db.dir()).unwrap()).map(|entry| entry.unwrap().path()).collect();
     assert!(files.len() >= 10, "{files:?}");
     until("no database file is open", WAIT_LIMIT, || files.iter().all(|file| opens_alone(file)));
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1039,11 +1041,12 @@ fn a_database_holds_no_file_open_while_nothing_reads_it() {
 /// files, which is when a file is opened again at its path.
 #[test]
 fn a_file_replaced_by_a_copy_is_read_again() {
-    use common::{answered, fixture, index_dir, start_with_dir, without_generation};
+    use common::{answered, app_of, fixture, index_dir, without_generation};
     let db = fixture("replaced-copy", &[]);
     let path = db.dir().join("db.2cbh");
     let dir = index_dir("replaced-copy");
-    let (port, _app) = start_with_dir([path.clone()], &dir);
+    let bridge = TestBridge::in_dir(app_of([path.clone()]), &dir);
+    let port = bridge.port;
     let games = format!("/v1/databases/{}/games", id_of(&path));
     let first = answered(port, &games);
     #[cfg(windows)]
@@ -1056,6 +1059,7 @@ fn a_file_replaced_by_a_copy_is_read_again() {
     let again = answered(port, &games);
     assert_ne!(first, again, "the generation is new");
     assert_eq!(without_generation(&first), without_generation(&again));
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1066,7 +1070,7 @@ fn a_file_replaced_by_a_copy_is_read_again() {
 /// `503 database_changing` for good (#241).
 #[test]
 fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
-    use common::{answered, index_dir, serve_shared};
+    use common::{answered, index_dir};
     let root = Root::new("pgn-back");
     std::fs::create_dir_all(root.path("bases")).unwrap();
     let pgn = root.path("bases/Games.pgn");
@@ -1075,8 +1079,8 @@ fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
     std::fs::write(root.path("bridge.toml"), &listed).unwrap();
     let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
     let dir = index_dir("pgn-back");
-    catalog.use_data_dir(&dir);
-    let (port, app) = serve_shared(App::new("test", policy(), catalog));
+    let bridge = TestBridge::in_dir(App::new("test", policy(), catalog), &dir);
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&pgn);
     let games = format!("/v1/databases/{id}/games");
     let first = answered(port, &games);
@@ -1101,6 +1105,7 @@ fn a_pgn_file_back_on_the_list_after_its_index_was_swept_is_read() {
     std::fs::write(root.path("bridge.toml"), &listed).unwrap();
     assert!(app.catalog.entries().iter().any(|e| e.id == id && e.listed()), "the file is back");
     assert_eq!(answered(port, &games), first);
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

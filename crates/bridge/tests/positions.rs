@@ -2,20 +2,26 @@
 //! position, at any ply, on databases built by hand.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::time::{Duration, Instant};
 
-use bridge::catalog::id_of;
+use bridge::api::App;
+use bridge::catalog::{Busy, Catalog, State, id_of};
 use bridge::explorer::paths;
 use bridge::explorer::stream::{BATCH, Header, SLOT_BYTES, TABLE_ENTRY};
+use bridge::fetch::Cloud;
 use bridge::search::memory::{Hold, budget, held};
+use bridge::sources::Sources;
 use cbformat::fixture::{Builder, TempDb, words};
 use cbformat::movetable::{self, Color, END_OF_LINE, MOVES, Piece};
 use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 
 mod common;
 use common::{
-    Served, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, poll, put,
-    serve_with_dir,
+    TestBridge, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, policy, poll,
+    put, until,
 };
 
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -285,11 +291,11 @@ impl Reached {
 
 /// The games of the fixture, served, once the index is built: the games, the
 /// database, the bridge, its id, and its index folder.
-fn served(name: &str) -> (Vec<Game>, TempDb, Served, String, PathBuf) {
+fn served(name: &str) -> (Vec<Game>, TempDb, TestBridge, String, PathBuf) {
     let games = games();
     let db = database(&format!("positions-{name}"), &games);
     let dir = index_dir(name);
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     answered(bridge.port, &list(&id, START, ""));
     (games, db, bridge, id, dir)
 }
@@ -345,7 +351,7 @@ fn the_start_after_the_first_scan_lists_what_it_listed() {
     let reached = Reached::of(&games);
     let db = database("positions-starts", &games);
     let dir = index_dir("starts");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let boards = [Board::startpos(), board_after("d2d4 d7d5 c2c4 e7e6"), board_after("d2d4")];
     assert!(reached.games(&boards[0]).contains(&57), "the set-up game that comes home");
     for (round, sort) in ["number", "white"].into_iter().enumerate() {
@@ -420,7 +426,7 @@ fn positions_after_a_promotion_list_their_games() {
     assert_eq!((bishops & LIGHT).count_ones(), 2, "two bishops on light squares");
     let db = database("positions-promotions", &games);
     let dir = index_dir("promotions");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let reached = Reached::of(&games);
     let (mut within, mut beyond) = (0, 0);
     let mut lines: Vec<&Game> = Vec::new();
@@ -524,7 +530,7 @@ fn errors_are_the_explorers() {
     let games = games();
     let db = database("positions-errors", &games);
     let dir = index_dir("errors");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let (status, body) = get(bridge.port, &list(&id, START, ""));
     assert_eq!(status, 409, "the first request starts the build: {body}");
     assert!(body.contains(r#""state":"indexing""#) && body.contains(r#""progress":{"phase":"#), "{body}");
@@ -555,7 +561,7 @@ fn an_unsupported_qualifier_starts_no_build() {
     let games = games();
     let db = database("positions-unsupported", &games);
     let dir = index_dir("unsupported");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     for qualifier in ["tag", "created", "updated", "is", "has", "no"] {
         let (status, body) = get(bridge.port, &list(&id, START, &format!("&stream=tab&q={qualifier}%3Ax")));
         assert_eq!(status, 400, "{body}");
@@ -587,7 +593,8 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     let db = database("positions-streams", &games);
     let dir = index_dir("streams");
     let path = db.dir().join("db.2cbh");
-    let (port, app) = serve_with_dir(app_of([path.clone()]), &dir);
+    let bridge = TestBridge::in_dir(app_of([path.clone()]), &dir);
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     answered(port, &list(&id, START, ""));
     let indexes = app.catalog.get(&id).unwrap().open().unwrap().indexes;
@@ -617,7 +624,7 @@ fn a_newer_request_in_the_same_stream_supersedes() {
         assert_eq!(status, 200, "{body}");
         assert_eq!(number(&body, "total"), Reached::of(&games).games(&board_after("d2d4")).len() as u64);
     }
-    app.catalog.explorer.release();
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -630,7 +637,8 @@ fn a_superseded_request_is_not_answered_from_kept_results() {
     let db = database("positions-streams-kept", &games);
     let dir = index_dir("streams-kept");
     let path = db.dir().join("db.2cbh");
-    let (port, app) = serve_with_dir(app_of([path.clone()]), &dir);
+    let bridge = TestBridge::in_dir(app_of([path.clone()]), &dir);
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     let d4 = board_after("d2d4").fen();
     // The result of 1.d4, in the default order, kept.
@@ -648,7 +656,7 @@ fn a_superseded_request_is_not_answered_from_kept_results() {
     let (status, body) = older.join().unwrap();
     assert_eq!(status, 409, "{body}");
     assert!(body.contains(r#""code":"superseded""#), "{body}");
-    app.catalog.explorer.release();
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -667,19 +675,19 @@ fn slot_at(bytes: &[u8], n: u32) -> usize {
 /// `url` is answered `409` while both files are built again, then `want`
 /// from the new build. The new bridge.
 fn damaged(
-    bridge: Served,
+    bridge: TestBridge,
     (db, dir, id): (&TempDb, &Path, &str),
     url: &str,
     want: &[u32],
     damage: impl FnOnce(&mut [u8]),
-) -> Served {
+) -> TestBridge {
     drop(bridge);
     let path = dir.join("index").join(format!("{id}.moves"));
     let mut bytes = std::fs::read(&path).unwrap();
     let before = Header::decode(&bytes).unwrap();
     damage(&mut bytes);
     std::fs::write(&path, &bytes).unwrap();
-    let (bridge, _) = Served::database(db, dir);
+    let (bridge, _) = TestBridge::database(db, dir);
     let (status, body) = get(bridge.port, url);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("rebuilt") && body.contains(r#""state":"indexing""#), "{body}");
@@ -734,7 +742,7 @@ fn exchanged_slots_are_never_listed() {
         (1..=n).map(|r| Game::new(Kind::Game, None, if r <= 13 { "e2e4" } else { "d2d4" })).collect();
     let db = database("positions-exchanged", &games);
     let dir = index_dir("exchanged");
-    let (mut bridge, id) = Served::database(&db, &dir);
+    let (mut bridge, id) = TestBridge::database(&db, &dir);
     let url = list(&id, &board_after("e2e4").fen(), "&line=1");
     let want: Vec<u32> = (1..=13).collect();
     assert_eq!(rows(&answered(bridge.port, &url)), want);
@@ -781,7 +789,7 @@ fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
     let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
     let db = database("positions-tight", &games);
     let dir = index_dir("tight");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let e4 = board_after("e2e4").fen();
     // The index built and its stream scanned once; the order by White kept.
     assert_eq!(number(&answered(bridge.port, &list(&id, &e4, "&sort=number")), "total"), u64::from(GAMES));
@@ -812,7 +820,7 @@ fn kept_starts_give_way_to_a_list() {
     let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
     let db = database("positions-starts-room", &games);
     let dir = index_dir("starts-room");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     // The index built without a list, so that no scan has found the starts.
     answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(START)));
     for sort in ["number", "number-desc"] {
@@ -865,4 +873,306 @@ fn a_small_budget_answers_busy_and_never_panics() {
     assert!(busy > 0 && whole > 0, "{busy} busy, {whole} whole");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// How long [`Holding`] holds a build once the test begins to drop the
+/// bridge, unless the data folder is removed sooner: far longer than the
+/// removal takes once a drop that does not wait for the build returns.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// Every file on this computer. The build of a position index is held at its
+/// first look at the database's files, on the index thread, before it writes:
+/// until the test has removed the data folder, or for [`GRACE`] once it begins
+/// to drop the bridge. The build looks again once it has written its files.
+#[derive(Default)]
+struct Holding {
+    seen: Mutex<Seen>,
+    changed: Condvar,
+}
+
+/// What [`Holding`] has seen of the build, and been told by the test.
+#[derive(Default)]
+struct Seen {
+    /// The index thread's looks at the database's main file.
+    looks: usize,
+    /// When the test began to drop the bridge.
+    dropping: Option<Instant>,
+    /// Whether the test has removed the data folder.
+    removed: bool,
+}
+
+impl Cloud for Holding {
+    fn is_cloud_only(&self, path: &Path, _: &Metadata) -> bool {
+        if std::thread::current().name() != Some("bridge-index") || path.extension() != Some("2cbh".as_ref()) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap();
+        seen.looks += 1;
+        self.changed.notify_all();
+        let began = Instant::now();
+        while seen.looks == 1 && !seen.removed {
+            let until = seen.dropping.map_or(began + WAIT_LIMIT, |at| at + GRACE);
+            let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { break };
+            seen = self.changed.wait_timeout(seen, left).unwrap().0;
+        }
+        false
+    }
+
+    fn fetch(&self, _: &Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+        Err(std::io::Error::other("not for a test"))
+    }
+}
+
+impl Holding {
+    /// Tells the hook what the test did.
+    fn tell(&self, did: impl FnOnce(&mut Seen)) {
+        did(&mut self.seen.lock().unwrap());
+        self.changed.notify_all();
+    }
+
+    /// Waits until the index thread has looked `looks` times.
+    fn looked(&self, looks: usize) {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        let mut seen = self.seen.lock().unwrap();
+        while seen.looks < looks {
+            let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+            let Some(left) = left else { panic!("the build looked {} times, not {looks}", seen.looks) };
+            seen = self.changed.wait_timeout(seen, left).unwrap().0;
+        }
+    }
+}
+
+/// A bridge dropped while a build is to write into its data folder waits for
+/// the build to end (#236), so that nothing writes into the folder once the
+/// test removes it: a build held until the bridge is being dropped, or the
+/// folder removed, has written its files before the drop returns.
+#[test]
+fn a_dropped_bridge_leaves_nothing_writing_into_its_folder() {
+    let games: Vec<Game> = (0..3).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-dropped", &games);
+    let path = db.dir().join("db.2cbh");
+    let dir = index_dir("dropped");
+    std::fs::create_dir_all(&dir).unwrap();
+    let holding = Arc::new(Holding::default());
+    let sources = Sources { fixed: vec![path.clone()], ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, Arc::clone(&holding) as Arc<dyn Cloud>);
+    let bridge = TestBridge::in_dir(App::new("test", policy(), catalog), &dir);
+    let (status, body) = get(bridge.port, &list(&id_of(&path), START, ""));
+    assert_eq!(status, 409, "{body}");
+    holding.looked(1);
+    holding.tell(|seen| seen.dropping = Some(Instant::now()));
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+    holding.tell(|seen| seen.removed = true);
+    holding.looked(2);
+    let written = dir.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!written, "the build wrote into the data folder after it was removed");
+}
+
+/// How long a settle test gives a thread to reach where it waits, when
+/// nothing it does tells: far longer than that takes. It orders the steps
+/// that make a settle that is not safe end early; a safe one waits whatever
+/// their order.
+const PAUSE: Duration = Duration::from_millis(250);
+
+/// How long a settle given 25 ms may take to give up: far longer than that
+/// takes, however slow the machine (#238), and shorter than the probe holds
+/// the work the test holds until it looks, [`WAIT_LIMIT`].
+const SETTLE_BOUND: Duration = Duration::from_secs(WAIT_LIMIT.as_secs() / 2);
+
+/// A cloud provider for the settle tests (#236). It keeps the database's main
+/// file in the cloud while `cloud_only` is set; it holds the first look at
+/// the file from the thread named `holds` until let go; and a download of the
+/// file waits until let go, then does what the test gave it, and ends.
+struct Probe {
+    holds: &'static str,
+    seen: Mutex<Probed>,
+    changed: Condvar,
+    /// What the download does once let go, before it ends.
+    on_fetch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// What [`Probe`] has seen, and been told by the test.
+#[derive(Default)]
+struct Probed {
+    cloud_only: bool,
+    /// The looks at the main file from the thread [`Probe::holds`] names.
+    looks: usize,
+    /// The first of them goes on.
+    let_look: bool,
+    /// A download is fetching the main file.
+    fetching: bool,
+    /// The fetch goes on.
+    let_fetch: bool,
+}
+
+impl Probe {
+    fn holding(holds: &'static str) -> Probe {
+        Probe { holds, seen: Mutex::default(), changed: Condvar::new(), on_fetch: Mutex::new(None) }
+    }
+
+    /// Tells the probe what the test did.
+    fn tell(&self, did: impl FnOnce(&mut Probed)) {
+        did(&mut self.seen.lock().unwrap());
+        self.changed.notify_all();
+    }
+
+    /// Waits until `done` holds, for [`WAIT_LIMIT`] at most.
+    fn until<'a>(&self, mut seen: MutexGuard<'a, Probed>, done: impl Fn(&Probed) -> bool) -> MutexGuard<'a, Probed> {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        while !done(&seen) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { break };
+            seen = self.changed.wait_timeout(seen, left).unwrap().0;
+        }
+        seen
+    }
+
+    /// Waits until `done` holds, and fails the test with `what` when it does
+    /// not after [`WAIT_LIMIT`].
+    fn wait_for(&self, what: &str, done: impl Fn(&Probed) -> bool) {
+        let seen = self.until(self.seen.lock().unwrap(), &done);
+        assert!(done(&seen), "{what} (waited {WAIT_LIMIT:?})");
+    }
+}
+
+impl Cloud for Probe {
+    fn is_cloud_only(&self, path: &Path, _: &Metadata) -> bool {
+        if path.extension() != Some("2cbh".as_ref()) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap();
+        if std::thread::current().name() == Some(self.holds) {
+            seen.looks += 1;
+            self.changed.notify_all();
+            if seen.looks == 1 {
+                seen = self.until(seen, |s| s.let_look);
+            }
+        }
+        seen.cloud_only
+    }
+
+    fn fetch(&self, _: &Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+        let mut seen = self.seen.lock().unwrap();
+        seen.fetching = true;
+        self.changed.notify_all();
+        seen = self.until(seen, |s| s.let_fetch);
+        seen.cloud_only = false;
+        drop(seen);
+        if let Some(then) = self.on_fetch.lock().unwrap().take() {
+            then();
+        }
+        Ok(())
+    }
+}
+
+/// The catalog of the 2CBH database at `path`, seen through `probe`, with
+/// its data folder `dir`.
+fn probed(path: &Path, probe: &Arc<Probe>, dir: &Path) -> Arc<Catalog> {
+    let sources = Sources { fixed: vec![path.to_path_buf()], ..Sources::default() };
+    let catalog = Catalog::with_sources(sources, Arc::clone(probe) as Arc<dyn Cloud>);
+    catalog.use_data_dir(dir);
+    Arc::new(catalog)
+}
+
+/// A settle does not end while a build runs that a download queued before it
+/// ended (#236), though the build was queued after the settle began, and the
+/// download ended before the settle could look at the downloads: work that
+/// passes from one queue to another counts all along.
+///
+/// The download runs as the settle begins. Meanwhile the PGN queue's lock is
+/// held where the queue logs a thread start it refuses, since standard error,
+/// which the test holds, keeps the line waiting: a settle that looks at the
+/// queues one after another waits there, having looked at the builds. Then
+/// the download queues the build of the database's index and ends. The build
+/// is held at its first look at the files, before it writes, until the test
+/// has seen whether the settle ended. The test runs in a process of its own,
+/// where no other test logs while standard error is held.
+#[test]
+fn a_settle_waits_for_a_build_that_an_ended_download_queued() {
+    const NAME: &str = "a_settle_waits_for_a_build_that_an_ended_download_queued";
+    if !common::in_child(NAME, "BRIDGE_POSITIONS_SETTLE_CHILD", &[]) {
+        return;
+    }
+    let games: Vec<Game> = (0..3).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-settle-download", &games);
+    let dir = index_dir("settle-download");
+    let probe = Arc::new(Probe::holding("bridge-index"));
+    let catalog = probed(&db.dir().join("db.2cbh"), &probe, &dir);
+    let entry = Arc::clone(&catalog.entries()[0]);
+    let Ok(open) = entry.open() else { panic!("the database does not open") };
+    *probe.on_fetch.lock().unwrap() = Some(Box::new({
+        let (catalog, entry, open) = (Arc::clone(&catalog), Arc::clone(&entry), open.clone());
+        move || drop(catalog.explorer.index(entry, &open))
+    }));
+    probe.tell(|seen| seen.cloud_only = true);
+    assert_eq!(entry.open_to_read().err(), Some(State::Downloading));
+    probe.wait_for("the download did not fetch", |seen| seen.fetching);
+
+    let pgn = Arc::clone(catalog.pgn().queue());
+    pgn.refuse_starts(true);
+    let stderr = std::io::stderr().lock();
+    let holder = std::thread::spawn({
+        let pgn = Arc::clone(&pgn);
+        move || pgn.submit(Box::new(|| {}))
+    });
+    std::thread::sleep(PAUSE);
+    let (tx, settled) = mpsc::channel();
+    let settling = std::thread::spawn({
+        let catalog = Arc::clone(&catalog);
+        move || tx.send(catalog.settle(WAIT_LIMIT)).unwrap()
+    });
+    std::thread::sleep(PAUSE);
+    probe.tell(|seen| seen.let_fetch = true);
+    until("the download did not end", WAIT_LIMIT, || entry.progress().is_none());
+    std::thread::sleep(PAUSE);
+    drop(stderr);
+    assert!(!holder.join().unwrap(), "the PGN queue started a thread");
+    pgn.refuse_starts(false);
+
+    probe.wait_for("the download queued no build", |seen| seen.looks >= 1);
+    let early = settled.recv_timeout(PAUSE);
+    probe.tell(|seen| seen.let_look = true);
+    assert!(early.is_err(), "settled while the build the download queued still ran: {early:?}");
+    assert_eq!(settled.recv_timeout(WAIT_LIMIT), Ok(Ok(())));
+    settling.join().unwrap();
+    let index = catalog.explorer.dir().unwrap();
+    assert!(paths(&index, &entry.id).0.exists(), "the build wrote its index before the catalog settled");
+    catalog.explorer.release();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A settle gives up at its limit while the keeper's look is held at the
+/// database's files, and names the keeper, rather than wait for the look to
+/// end (#236); once the look has ended, the catalog settles. The look runs
+/// on a thread of the test's, as the keeper's own thread runs it.
+#[test]
+fn a_settle_gives_up_on_a_keeper_held_in_its_look() {
+    let games: Vec<Game> = (0..3).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
+    let db = database("positions-settle-keeper", &games);
+    let dir = index_dir("settle-keeper");
+    let probe = Arc::new(Probe::holding("test-keeper"));
+    let catalog = probed(&db.dir().join("db.2cbh"), &probe, &dir);
+    let entries = catalog.entries();
+    let keeping = std::thread::Builder::new().name("test-keeper".into()).spawn({
+        let catalog = Arc::clone(&catalog);
+        move || catalog.explorer.keep(&entries)
+    });
+    let keeping = keeping.unwrap();
+    probe.wait_for("the keeper did not look at the files", |seen| seen.looks >= 1);
+
+    let (tx, settled) = mpsc::channel();
+    let began = Instant::now();
+    let settling = std::thread::spawn({
+        let catalog = Arc::clone(&catalog);
+        move || tx.send(catalog.settle(Duration::from_millis(25))).unwrap()
+    });
+    let settle = settled.recv_timeout(SETTLE_BOUND);
+    let took = began.elapsed();
+    probe.tell(|seen| seen.let_look = true);
+    keeping.join().unwrap();
+    settling.join().unwrap();
+    assert_eq!(settle, Ok(Err(Busy(vec!["keeper"]))), "a settle given 25 ms, after {took:?}");
+    assert_eq!(catalog.settle(WAIT_LIMIT), Ok(()));
+    let _ = std::fs::remove_dir_all(&dir);
 }

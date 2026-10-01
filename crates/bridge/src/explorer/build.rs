@@ -494,7 +494,9 @@ pub(super) struct Chunks {
     size: u64,
     /// The records of the pass.
     records: u64,
-    /// The workers still taking them.
+    /// The workers still taking them: all of the pass's workers from the
+    /// first one's start, so that one that starts late counts from the
+    /// beginning (#237).
     taking: AtomicU32,
 }
 
@@ -522,9 +524,16 @@ impl Chunks {
         (2 * planned * self.size).div_ceil(self.records.max(1)) as usize
     }
 
-    /// A worker that starts taking chunks.
-    pub fn taker(&self) -> Taker<'_> {
-        self.taking.fetch_add(1, Ordering::Relaxed);
+    /// One of the pass's `workers` workers, taking chunks. The first one to
+    /// start counts them all: a worker whose buffer is full then leaves the
+    /// chunks to the ones that have not started yet, rather than finding
+    /// itself the only one taking them and going past full, which ended the
+    /// pass early for all and made more passes the later the others started
+    /// (#237). None of them is left out: a worker that fails before it takes
+    /// a chunk stops the whole pass.
+    pub fn taker(&self, workers: usize) -> Taker<'_> {
+        let workers = u32::try_from(workers.max(1)).unwrap_or(u32::MAX);
+        let _ = self.taking.compare_exchange(0, workers, Ordering::AcqRel, Ordering::Relaxed);
         Taker { chunks: self, last: false }
     }
 }
@@ -545,11 +554,13 @@ impl Taker<'_> {
     /// worker's buffer is `full` while another worker still takes them.
     pub fn take(&mut self, full: bool) -> Option<(u32, u32)> {
         if full && !self.last {
-            let taking = &self.chunks.taking;
-            if taking.fetch_sub(1, Ordering::AcqRel) > 1 {
+            // Leaves them to the others while another takes them; the count
+            // never drops to 0, so no taker starts the count again.
+            let others =
+                self.chunks.taking.fetch_update(Ordering::AcqRel, Ordering::Acquire, |t| (t > 1).then(|| t - 1));
+            if others.is_ok() {
                 return None;
             }
-            taking.fetch_add(1, Ordering::AcqRel);
             self.last = true;
         }
         self.chunks.take()
@@ -931,7 +942,7 @@ pub(crate) mod tests {
         let (built, after) = std::thread::scope(|s| {
             let build = s.spawn(|| build_with(&Unread, &plan, &target, &progress, &limits));
             // Its stream pass starts reading, which takes a worker first.
-            let until = Instant::now() + Duration::from_secs(30);
+            let until = Instant::now() + workers::tests::PATIENCE;
             while progress.phase() != "reading" {
                 assert!(Instant::now() < until, "the build starts reading");
                 std::thread::sleep(Duration::from_millis(1));
@@ -998,19 +1009,37 @@ pub(crate) mod tests {
     }
 
     /// A worker whose buffer is full leaves the chunks to the others while
-    /// another takes them, and the last one taking them goes on, full or not,
-    /// one that starts late among them.
+    /// another takes them, and the last one taking them goes on, full or not.
     #[test]
     fn the_last_worker_taking_chunks_goes_on() {
         let chunks = Chunks::new(1, 100_000, 3);
-        let mut takers: Vec<Taker<'_>> = (0..3).map(|_| chunks.taker()).collect();
+        let mut takers: Vec<Taker<'_>> = (0..3).map(|_| chunks.taker(3)).collect();
         assert!(takers.iter_mut().all(|t| t.take(false).is_some()));
         assert!(takers[0].take(true).is_none() && takers[1].take(true).is_none());
         assert!(takers[2].take(true).is_some(), "the last one goes on");
         assert!(takers[2].take(true).is_some());
-        let mut late = chunks.taker();
-        assert!(late.take(true).is_none(), "the last one still takes them");
-        assert!(takers[2].take(true).is_some());
+    }
+
+    /// The pass's workers count as taking chunks from the first one's start:
+    /// a worker that is full before the others start leaves the chunks to
+    /// them, and the last of them to start goes on (#237). Counted as they
+    /// started, the first one found itself alone, went past full, and ended
+    /// the pass early for all.
+    #[test]
+    fn a_full_worker_leaves_the_chunks_to_workers_not_started_yet() {
+        let chunks = Chunks::new(1, 100_000, 3);
+        let mut first = chunks.taker(3);
+        assert!(first.take(false).is_some());
+        assert!(first.take(true).is_none(), "two have not started");
+        let mut second = chunks.taker(3);
+        assert!(second.take(true).is_none(), "one has not started");
+        let mut third = chunks.taker(3);
+        assert!(third.take(true).is_some(), "the last one goes on, full or not");
+        let mut rest = 0;
+        while third.take(true).is_some() {
+            rest += 1;
+        }
+        assert!(rest > 0 && chunks.take().is_none(), "every chunk is taken");
     }
 
     /// Chunks cover the records once each, whatever the workers, up to the

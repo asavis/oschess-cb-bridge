@@ -7,7 +7,7 @@ use bridge::log;
 use cbformat::fixture_cbh::Builder;
 
 mod common;
-use common::{get, start_with_dir};
+use common::{TestBridge, app_of, get};
 
 /// A classic database whose guiding text points into the `.cbg` file's own
 /// header: a list window and a sort both read its title, and fail with a
@@ -32,7 +32,8 @@ fn a_damaged_database_answers_internal_and_is_logged_by_its_id() {
     }
     drop(built);
     let path = folder.join("Private Games.cbh");
-    let (port, _app) = start_with_dir([path.clone()], &top);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let port = bridge.port;
     let id = id_of(&path);
 
     for query in ["", "?sort=tournament"] {
@@ -47,5 +48,6 @@ fn a_damaged_database_answers_internal_and_is_logged_by_its_id() {
     for private in [folder.to_str().unwrap(), "Jane Doe", "Private Games.cbh", "Private Games"] {
         assert!(!log.contains(private), "{private} in {log}");
     }
+    drop(bridge);
     let _ = std::fs::remove_dir_all(&top);
 }

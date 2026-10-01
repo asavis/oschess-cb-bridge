@@ -33,6 +33,7 @@ use names::{BitSet, Groups, Kind, NameTable, joint_ranks};
 use query::{Field, Query, Sort, SortKey};
 use scan::Control;
 
+use crate::activity::Activity;
 use crate::store::{Head, Store, with_store};
 use crate::sync::lock;
 
@@ -74,6 +75,9 @@ pub struct Indexes {
     gate: gate::Gate,
     /// The database's heads file at this generation, once it is ready (#106).
     heads: Mutex<Option<Arc<heads::Heads>>>,
+    /// The catalog's background work, which the writers of names files count
+    /// in (#236); none for indexes a test makes on their own.
+    activity: Option<Arc<Activity>>,
 }
 
 /// The value in `slot`, built by `build` the first time. Concurrent callers
@@ -113,7 +117,18 @@ impl Indexes {
 
     /// Indexes whose retained structures are evicted when the budget runs short.
     pub fn shared() -> Arc<Indexes> {
-        let indexes = Arc::new(Indexes::default());
+        Indexes::registered(Indexes::default())
+    }
+
+    /// [`Indexes::shared`], for a database of a catalog: the writers of its
+    /// names files count in the catalog's `activity`
+    /// ([`crate::catalog::Catalog::settle`]).
+    pub fn counted(activity: &Arc<Activity>) -> Arc<Indexes> {
+        Indexes::registered(Indexes { activity: Some(Arc::clone(activity)), ..Indexes::default() })
+    }
+
+    fn registered(indexes: Indexes) -> Arc<Indexes> {
+        let indexes = Arc::new(indexes);
         let weak: Weak<dyn Evict> = Arc::downgrade(&indexes) as Weak<dyn Evict>;
         memory::register(weak);
         indexes
@@ -160,7 +175,7 @@ impl Indexes {
             }
             Ok(table)
         })?;
-        table.write_later();
+        table.write_later(self.activity.as_ref());
         Ok(table)
     }
 
@@ -614,6 +629,7 @@ fn search<S: Store>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use workers::tests::unbusy;
 
     /// Parts gathered on the workers keep their order, reversed when asked,
     /// and the first `count` numbers only; a part the set leaves empty takes
@@ -630,12 +646,15 @@ mod tests {
         }
         const WORDS: usize = PART_NUMBERS / 64;
         let parts = set.words().div_ceil(WORDS);
-        let sizes = workers::each(parts, &cancel, |i| Ok(set.count_in(i * WORDS..(i + 1) * WORDS))).unwrap();
+        let sizes = unbusy(|| workers::each(parts, &cancel, |i| Ok(set.count_in(i * WORDS..(i + 1) * WORDS)))).unwrap();
         assert_eq!(sizes.len(), 5);
         assert_eq!(sizes[1], 0);
         for (count, descending) in [(numbers.len(), false), (numbers.len(), true), (20_000, false), (20_000, true)] {
             let mut out = Vec::with_capacity(count);
-            gather(&mut out, count, &sizes, descending, &cancel, |i| set.iter_in(i * WORDS..(i + 1) * WORDS)).unwrap();
+            unbusy(|| {
+                gather(&mut out, count, &sizes, descending, &cancel, |i| set.iter_in(i * WORDS..(i + 1) * WORDS))
+            })
+            .unwrap();
             let mut want: Vec<u32> = numbers.iter().copied().take(count).collect();
             if descending {
                 want.reverse();
@@ -648,9 +667,10 @@ mod tests {
             let numbers = order.get(i * PART_NUMBERS..).unwrap_or(&[]);
             numbers.iter().take(PART_NUMBERS).copied().filter(|&n| set.contains(n))
         };
-        let sizes = workers::each(order.len().div_ceil(PART_NUMBERS), &cancel, |i| Ok(part(i).count())).unwrap();
+        let sizes =
+            unbusy(|| workers::each(order.len().div_ceil(PART_NUMBERS), &cancel, |i| Ok(part(i).count()))).unwrap();
         let mut out = Vec::with_capacity(numbers.len());
-        gather(&mut out, numbers.len(), &sizes, false, &cancel, part).unwrap();
+        unbusy(|| gather(&mut out, numbers.len(), &sizes, false, &cancel, part)).unwrap();
         assert_eq!(out, numbers.iter().rev().copied().collect::<Vec<_>>());
     }
 }

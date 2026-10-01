@@ -10,7 +10,31 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::view::Base;
 
 mod common;
-use common::{DOC, block, block_in, classic_fixture, fixture, lid, put};
+use common::{DOC, WAIT_LIMIT, block, block_in, classic_fixture, fixture, lid, poll, put};
+
+/// Whether this is the child that runs the test's body. A test that holds a
+/// search and checks which one a newer one supersedes runs alone in a child
+/// process of its own: the workers are the process's, and a held search that
+/// met them taken by another test would answer busy, and sent again would be
+/// a newer search (#238). Sparse files, and so those tests, need Unix.
+#[cfg(unix)]
+fn in_child(name: &str) -> bool {
+    common::in_child(name, "BRIDGE_SEARCH_CHILD", &[])
+}
+
+/// `ask`, asked again while it answers `WorkersBusy`, up to [`WAIT_LIMIT`]:
+/// the search workers are the process's, and this binary's other tests can
+/// hold them for longer than a pass waits for one (`workers::WAIT`) on a
+/// loaded machine, as heads' `asked()` and the library's `unbusy` know (#247,
+/// #251). Busy is the bridge's answer to that, not the answer under test, and
+/// a busy answer is never kept.
+fn unbusy<T>(mut ask: impl FnMut() -> Result<T, SearchError>) -> Result<T, SearchError> {
+    let answer = poll(WAIT_LIMIT, || match ask() {
+        Err(SearchError::WorkersBusy) => None,
+        answer => Some(answer),
+    });
+    answer.unwrap_or_else(|| panic!("every worker stayed taken for {WAIT_LIMIT:?}"))
+}
 
 #[test]
 fn blocks_read_the_same_with_crlf_line_ends() {
@@ -21,7 +45,7 @@ fn blocks_read_the_same_with_crlf_line_ends() {
 }
 
 fn numbers(db: &Base, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
-    match search::select(db, idx, Some(q), None, None) {
+    match unbusy(|| search::select(db, idx, Some(q), None, None)) {
         Ok((Selection::All { descending }, _)) => {
             let all = 1..=db.record_count();
             Ok(if descending { all.rev().collect() } else { all.collect() })
@@ -71,18 +95,40 @@ fn the_conformance_corpus_holds_on_a_classic_copy() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// [`unbusy`] asks a call again while it answers `WorkersBusy`, returns the
+/// first answer that is not busy, and passes any other error through. A real
+/// busy answer comes only after the product's `workers::WAIT` (5 s): with the
+/// one worker of a child held while a search started, the search failed 3 of
+/// 3 on `WorkersBusy` without [`unbusy`] and passed 3 of 3 with it. That
+/// reproduction costs the binary 5 s a run, which no load can slow, so it was
+/// kept out of the suite; heads' `a_query_answered_busy_is_asked_again`
+/// shows the product's busy answer itself.
+#[test]
+fn unbusy_asks_again_while_the_workers_are_busy() {
+    // Counted here, not in a static the binary's other tests also add to.
+    let mut calls = 0;
+    let answer = unbusy(|| {
+        calls += 1;
+        if calls <= 3 { Err(SearchError::WorkersBusy) } else { Ok(7) }
+    });
+    assert!(matches!(answer, Ok(7)), "{answer:?}");
+    assert_eq!(calls, 4, "each busy answer was asked again, and the first other answer kept");
+    assert!(matches!(unbusy(|| Err::<(), _>(SearchError::Superseded)), Err(SearchError::Superseded)));
+}
+
 #[test]
 fn results_are_cached_and_the_url_sort_wins() {
     let f = fixture("search-cache", &[]);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
-    let first = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
-    let again = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
+    let first = unbusy(|| search::select(&db, &idx, Some("player:morphy sort:white"), None, None)).ok().unwrap();
+    let again = unbusy(|| search::select(&db, &idx, Some("player:morphy sort:white"), None, None)).ok().unwrap();
     let (Selection::Numbers(a), Selection::Numbers(b)) = (first.0, again.0) else { panic!("numbers expected") };
     assert!(std::sync::Arc::ptr_eq(&a, &b), "the second request reuses the first result");
     // The URL's sort wins over the query's token.
-    let by_param =
-        search::select(&db, &idx, Some("player:morphy sort:white"), None, search::query::Sort::parse("number-desc"));
+    let by_param = unbusy(|| {
+        search::select(&db, &idx, Some("player:morphy sort:white"), None, search::query::Sort::parse("number-desc"))
+    });
     let Ok((Selection::Numbers(v), sort)) = by_param else { panic!("numbers expected") };
     assert_eq!((v.as_slice(), sort.name().as_str()), (&[9, 3, 2, 1][..], "number-desc"));
 }
@@ -148,7 +194,8 @@ fn suggested(
     prefix: &str,
     limit: usize,
 ) -> Result<Vec<(String, u32)>, SearchError> {
-    search::suggest(db, idx, field, prefix, limit).map(|list| list.iter().map(|s| (s.name.clone(), s.games)).collect())
+    unbusy(|| search::suggest(db, idx, field, prefix, limit))
+        .map(|list| list.iter().map(|s| (s.name.clone(), s.games)).collect())
 }
 
 type Edit<'a> = &'a dyn Fn(&mut [u8; 192]);
@@ -241,14 +288,13 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
     let f = common::sparse("search-too-large", 200_000_000);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
-    let started = std::time::Instant::now();
     assert!(matches!(
         search::select(&db, &idx, None, None, search::query::Sort::parse("date")),
         Err(SearchError::TooLarge)
     ));
+    // Refused before it reads: a bound on the time it took stood for this,
+    // and failed on a loaded machine however little was done (#238).
     assert_eq!(idx.scanned(), 0, "not a record was read");
-    // Nothing is read, which takes milliseconds: a loaded machine has room.
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 /// A newer search on the same database stops the one still scanning, each of
@@ -258,6 +304,9 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
 #[cfg(unix)]
 #[test]
 fn a_newer_search_stops_the_older_one() {
+    if !in_child("a_newer_search_stops_the_older_one") {
+        return;
+    }
     const RECORDS: u64 = 8_000_000;
     let f = common::sparse("search-superseded", RECORDS);
     let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
@@ -270,12 +319,12 @@ fn a_newer_search_stops_the_older_one() {
         })
     };
     let first = run("needle");
-    common::until("the first search read a record", common::WAIT_LIMIT, || idx.scanned() > 0);
+    common::until("the first search read a record", WAIT_LIMIT, || idx.scanned() > 0);
     // The second is the newest in the stream as it waits at its start,
     // having read nothing, until it is let go.
     let held = idx.gate().hold(1);
     let second = run("other");
-    assert!(held.arrived(1, common::WAIT_LIMIT));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let superseded = idx.scanned();
     let first = first.join().unwrap();
     assert!(matches!(first, Err(SearchError::Superseded)), "{first:?}");
@@ -339,6 +388,9 @@ fn suggestions_keep_the_best_of_many() {
 #[cfg(unix)]
 #[test]
 fn only_the_same_stream_supersedes() {
+    if !in_child("only_the_same_stream_supersedes") {
+        return;
+    }
     let f = common::sparse("search-streams", 100_000);
     let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
@@ -348,9 +400,9 @@ fn only_the_same_stream_supersedes() {
         std::thread::spawn(move || search::select(&db1, &idx1, Some(q), stream, None).map(|_| ()))
     };
     let named = run("needle", Some("tab"));
-    assert!(held.arrived(1, common::WAIT_LIMIT));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let unnamed = run("pin", None);
-    assert!(held.arrived(2, common::WAIT_LIMIT));
+    assert!(held.arrived(2, WAIT_LIMIT));
     assert!(search::select(&db, &idx, Some(""), Some("tab"), None).is_ok(), "an empty q");
     drop(held);
     assert!(matches!(named.join().unwrap(), Err(SearchError::Superseded)));

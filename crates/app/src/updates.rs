@@ -369,7 +369,7 @@ mod tests {
         });
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "it waits for the running look");
         drop(running);
-        rx.recv_timeout(Duration::from_secs(10)).expect("then it runs");
+        rx.recv_timeout(crate::PATIENCE).expect("then it runs");
         asked.join().unwrap();
         assert!(GATE.enter(false).is_some(), "and the gate is free again");
     }

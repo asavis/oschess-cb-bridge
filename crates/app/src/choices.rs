@@ -352,7 +352,7 @@ mod tests {
                 let (tx, rx) = mpsc::channel();
                 let toml = toml.clone();
                 std::thread::spawn(move || tx.send(CHOICES.choose(&toml, PathBuf::from("lc0.exe"), accept)));
-                rx.recv_timeout(Duration::from_secs(10)).expect("a choice does not wait for an installation")?;
+                rx.recv_timeout(crate::PATIENCE).expect("a choice does not wait for an installation")?;
                 Ok(PathBuf::from("stockfish.exe"))
             },
             |exe| {
@@ -384,7 +384,7 @@ mod tests {
                 })
             })
         };
-        probing.recv_timeout(Duration::from_secs(10)).expect("the slow probe runs");
+        probing.recv_timeout(crate::PATIENCE).expect("the slow probe runs");
         let (done_tx, done) = mpsc::channel();
         let later = {
             let toml = toml.clone();
@@ -393,7 +393,7 @@ mod tests {
         assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "the later choice waits for the probe");
         go.send(()).unwrap();
         assert_eq!(slow.join().unwrap(), Ok(()));
-        assert_eq!(done.recv_timeout(Duration::from_secs(10)).expect("then it is saved"), Ok(()));
+        assert_eq!(done.recv_timeout(crate::PATIENCE).expect("then it is saved"), Ok(()));
         later.join().unwrap().unwrap();
         assert_eq!(engine_in(&toml), Some(PathBuf::from("later.exe")));
         let _ = std::fs::remove_dir_all(&dir);
