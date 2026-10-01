@@ -10,7 +10,37 @@ use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 use cbformat::view::Base;
 
 mod common;
-use common::{DOC, block, block_in, classic_fixture, fixture, lid, put};
+use common::{DOC, WAIT_LIMIT, block, block_in, classic_fixture, fixture, lid, poll, put};
+
+/// Whether this is the child that runs the test's body. A test that holds a
+/// search and checks which one a newer one supersedes runs alone in a child
+/// process of its own: the workers are the process's, and a held search that
+/// met them taken by another test would answer busy, and sent again would be
+/// a newer search (#238).
+fn in_child(name: &str) -> bool {
+    common::in_child(name, "BRIDGE_SEARCH_CHILD", &[])
+}
+
+/// Calls [`unbusy`] answered `WorkersBusy` and asked again, for the test
+/// that shows it does.
+static WORKERS_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `ask`, asked again while it answers `WorkersBusy`, up to [`WAIT_LIMIT`]:
+/// the search workers are the process's, and this binary's other tests can
+/// hold them for longer than a pass waits for one (`workers::WAIT`) on a
+/// loaded machine, as heads' `asked()` and the library's `unbusy` know (#247,
+/// #251). Busy is the bridge's answer to that, not the answer under test, and
+/// a busy answer is never kept.
+fn unbusy<T>(mut ask: impl FnMut() -> Result<T, SearchError>) -> Result<T, SearchError> {
+    let answer = poll(WAIT_LIMIT, || match ask() {
+        Err(SearchError::WorkersBusy) => {
+            WORKERS_BUSY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+        answer => Some(answer),
+    });
+    answer.unwrap_or_else(|| panic!("every worker stayed taken for {WAIT_LIMIT:?}"))
+}
 
 #[test]
 fn blocks_read_the_same_with_crlf_line_ends() {
@@ -21,7 +51,7 @@ fn blocks_read_the_same_with_crlf_line_ends() {
 }
 
 fn numbers(db: &Base, idx: &Indexes, q: &str) -> Result<Vec<u32>, String> {
-    match search::select(db, idx, Some(q), None, None) {
+    match unbusy(|| search::select(db, idx, Some(q), None, None)) {
         Ok((Selection::All { descending }, _)) => {
             let all = 1..=db.record_count();
             Ok(if descending { all.rev().collect() } else { all.collect() })
@@ -71,18 +101,64 @@ fn the_conformance_corpus_holds_on_a_classic_copy() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// A search answered `WorkersBusy` while every worker is taken is asked
+/// again, and answered once one is free: the seam of [`unbusy`]. In a child
+/// with one worker, which no other test takes there.
+#[test]
+fn a_search_answered_workers_busy_is_asked_again() {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, mpsc};
+
+    use bridge::search::memory::Cancel;
+    use bridge::search::workers;
+    if !common::in_child(
+        "a_search_answered_workers_busy_is_asked_again",
+        "BRIDGE_SEARCH_ONE_WORKER_CHILD",
+        &[("OSCHESS_BRIDGE_THREADS", "1")],
+    ) {
+        return;
+    }
+    assert_eq!(workers::threads(), 1);
+    let f = fixture("search-workers-busy", &[]);
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    let busy = WORKERS_BUSY.load(Ordering::SeqCst);
+    std::thread::scope(|s| {
+        let (release, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let holder = s.spawn(move || {
+            workers::run(workers::threads(), 0, &Cancel::never(), |_| {
+                let _ = held.lock().unwrap().recv();
+                Ok(())
+            })
+        });
+        common::until("the worker was taken", WAIT_LIMIT, || workers::taken() == workers::threads());
+        let searching = s.spawn(|| numbers(&db, &idx, "player:morphy"));
+        common::until("a search was answered busy", WAIT_LIMIT, || {
+            WORKERS_BUSY.load(Ordering::SeqCst) > busy || searching.is_finished()
+        });
+        release.send(()).unwrap();
+        assert!(holder.join().unwrap().is_ok());
+        let got = searching.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        assert!(WORKERS_BUSY.load(Ordering::SeqCst) > busy, "a search was answered busy");
+        assert!(got.is_ok_and(|v| !v.is_empty()), "the search was answered");
+    });
+    assert_eq!(workers::taken(), 0, "the worker was returned");
+}
+
 #[test]
 fn results_are_cached_and_the_url_sort_wins() {
     let f = fixture("search-cache", &[]);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
     let idx = Indexes::default();
-    let first = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
-    let again = search::select(&db, &idx, Some("player:morphy sort:white"), None, None).ok().unwrap();
+    let first = unbusy(|| search::select(&db, &idx, Some("player:morphy sort:white"), None, None)).ok().unwrap();
+    let again = unbusy(|| search::select(&db, &idx, Some("player:morphy sort:white"), None, None)).ok().unwrap();
     let (Selection::Numbers(a), Selection::Numbers(b)) = (first.0, again.0) else { panic!("numbers expected") };
     assert!(std::sync::Arc::ptr_eq(&a, &b), "the second request reuses the first result");
     // The URL's sort wins over the query's token.
-    let by_param =
-        search::select(&db, &idx, Some("player:morphy sort:white"), None, search::query::Sort::parse("number-desc"));
+    let by_param = unbusy(|| {
+        search::select(&db, &idx, Some("player:morphy sort:white"), None, search::query::Sort::parse("number-desc"))
+    });
     let Ok((Selection::Numbers(v), sort)) = by_param else { panic!("numbers expected") };
     assert_eq!((v.as_slice(), sort.name().as_str()), (&[9, 3, 2, 1][..], "number-desc"));
 }
@@ -148,7 +224,8 @@ fn suggested(
     prefix: &str,
     limit: usize,
 ) -> Result<Vec<(String, u32)>, SearchError> {
-    search::suggest(db, idx, field, prefix, limit).map(|list| list.iter().map(|s| (s.name.clone(), s.games)).collect())
+    unbusy(|| search::suggest(db, idx, field, prefix, limit))
+        .map(|list| list.iter().map(|s| (s.name.clone(), s.games)).collect())
 }
 
 type Edit<'a> = &'a dyn Fn(&mut [u8; 192]);
@@ -257,6 +334,9 @@ fn a_sort_that_cannot_fit_is_refused_up_front() {
 #[cfg(unix)]
 #[test]
 fn a_newer_search_stops_the_older_one() {
+    if !in_child("a_newer_search_stops_the_older_one") {
+        return;
+    }
     const RECORDS: u64 = 8_000_000;
     let f = common::sparse("search-superseded", RECORDS);
     let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
@@ -269,12 +349,12 @@ fn a_newer_search_stops_the_older_one() {
         })
     };
     let first = run("needle");
-    common::until("the first search read a record", common::WAIT_LIMIT, || idx.scanned() > 0);
+    common::until("the first search read a record", WAIT_LIMIT, || idx.scanned() > 0);
     // The second is the newest in the stream as it waits at its start,
     // having read nothing, until it is let go.
     let held = idx.gate().hold(1);
     let second = run("other");
-    assert!(held.arrived(1, common::WAIT_LIMIT));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let superseded = idx.scanned();
     let first = first.join().unwrap();
     assert!(matches!(first, Err(SearchError::Superseded)), "{first:?}");
@@ -338,6 +418,9 @@ fn suggestions_keep_the_best_of_many() {
 #[cfg(unix)]
 #[test]
 fn only_the_same_stream_supersedes() {
+    if !in_child("only_the_same_stream_supersedes") {
+        return;
+    }
     let f = common::sparse("search-streams", 100_000);
     let db = std::sync::Arc::new(Base::open(f.dir().join("db.2cbh")).unwrap());
     let idx = std::sync::Arc::new(Indexes::default());
@@ -347,9 +430,9 @@ fn only_the_same_stream_supersedes() {
         std::thread::spawn(move || search::select(&db1, &idx1, Some(q), stream, None).map(|_| ()))
     };
     let named = run("needle", Some("tab"));
-    assert!(held.arrived(1, common::WAIT_LIMIT));
+    assert!(held.arrived(1, WAIT_LIMIT));
     let unnamed = run("pin", None);
-    assert!(held.arrived(2, common::WAIT_LIMIT));
+    assert!(held.arrived(2, WAIT_LIMIT));
     assert!(search::select(&db, &idx, Some(""), Some("tab"), None).is_ok(), "an empty q");
     drop(held);
     assert!(matches!(named.join().unwrap(), Err(SearchError::Superseded)));
