@@ -14,7 +14,8 @@ writes, next to this script:
   pixel that lands the most of its lines on whole pixels (#74);
 - icon.ico and icon.png: the logo on a light rounded tile, the app's icon;
 - msix/*.png: the same icon for the Microsoft Store package (#112): its store
-  logo, its tiles, and its app list and taskbar icons at their target sizes.
+  logo, its tiles, and its app list and taskbar icons at their target sizes,
+  unplated for a dark taskbar and light-unplated for a light one (#262).
 
 The outputs are committed; run this again only when the logo or a colour
 changes. The oschess name and logo are not covered by the AGPL-3.0 licence
@@ -44,7 +45,12 @@ ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 # The package's images by file name, as crates/app/msix/AppxManifest.xml names
 # them, and the target sizes Windows picks the app list and taskbar icon from.
 MSIX = {"StoreLogo.png": 50, "Square150x150Logo.png": 150, "Square44x44Logo.png": 44}
-MSIX_TARGET_SIZES = (16, 24, 32, 48, 256)
+MSIX_TARGET_SIZES = (16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 256)
+# A dark taskbar takes the unplated form, a light one the light-unplated form.
+# Without the light form, Windows finds the near-white tile too pale for a
+# light taskbar and lays the plated Square44x44Logo.png on the accent colour
+# instead (#262).
+MSIX_UNPLATED = ("unplated", "lightunplated")
 MARK = "#1d140f"
 TILE = "#fffdf9"
 TILE_BORDER = "#eadfd3"
@@ -289,7 +295,8 @@ def main():
     os.makedirs(os.path.join(HERE, "msix"), exist_ok=True)
     msix = dict(MSIX)
     for size in MSIX_TARGET_SIZES:
-        msix[f"Square44x44Logo.targetsize-{size}_altform-unplated.png"] = size
+        for form in MSIX_UNPLATED:
+            msix[f"Square44x44Logo.targetsize-{size}_altform-{form}.png"] = size
     for name, size in msix.items():
         with open(os.path.join(HERE, "msix", name), "wb") as f:
             f.write(dict(images).get(size) or png(app_icon(size, polys)))

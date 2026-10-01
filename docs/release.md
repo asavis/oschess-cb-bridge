@@ -255,6 +255,12 @@ through `resources.pri`. A package without it, as the Store's 1.0.5 was, shows
 `Square44x44Logo.png` on the taskbar and in the Start menu, laid on a plate of
 the accent colour that shows in the tile's rounded corners.
 
+A dark taskbar takes the `altform-unplated` images, a light one the
+`altform-lightunplated` images. With only the former, as the Store's 1.3.0 and
+1.3.1 had, a light taskbar finds the near-white tile too pale for it and
+falls back to the same plate (#262). `icons/generate.py` draws both forms, the
+same image, at every target size Windows asks for.
+
 The Store takes a package version whose first part is above 0, whose parts
 are at most 65535 and whose fourth part is 0. The package version is the
 app's with a fourth part of 0, so the Store shows the version the app does:
