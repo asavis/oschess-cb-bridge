@@ -124,6 +124,58 @@ fn a_superseded_search_answers_409() {
     assert!(out.contains(r#""code":"superseded""#), "{out}");
 }
 
+/// The answer to a search in stream `tab-1` that the gate holds at its start
+/// and lets go once every byte of the search memory is taken; a newer search
+/// in the same stream is served while it is held when `superseded`.
+fn released_into_taken_memory(name: &str, superseded: bool) -> (u16, String) {
+    let s = serve_sparse(name, 100_000);
+    let indexes = s.indexes();
+    let gate = indexes.gate().hold(1);
+    let first = s.send("q=needle&stream=tab-1");
+    assert!(gate.arrived(1, WAIT_LIMIT));
+    if superseded {
+        let (status, out) = s.get("q=other&stream=tab-1");
+        assert_eq!(status, 200, "{out}");
+    }
+    // Every byte of the budget not held yet, so the held search can reserve none.
+    let all = loop {
+        if let Ok(hold) = Hold::reserve(budget().saturating_sub(held())) {
+            break hold;
+        }
+    };
+    drop(gate);
+    let answer = first.join().unwrap();
+    drop(all);
+    answer
+}
+
+/// A superseded search answers `409 superseded` when the search memory is
+/// taken as it goes on (#259). Its first reservation was refused before it
+/// looked whether it was still wanted, and it answered `503 busy`: a page
+/// that retries busy answers would send the obsolete search again, which
+/// would then supersede the one the user typed.
+#[test]
+fn a_superseded_search_that_meets_taken_memory_answers_409() {
+    if !in_child("a_superseded_search_that_meets_taken_memory_answers_409") {
+        return;
+    }
+    let (status, out) = released_into_taken_memory("limits-superseded-busy", true);
+    assert_eq!(status, 409, "{out}");
+    assert!(out.contains(r#""code":"superseded""#), "{out}");
+}
+
+/// A search in a stream that nothing superseded still answers `503 busy`
+/// when the search memory is taken (#259).
+#[test]
+fn a_search_still_wanted_that_meets_taken_memory_answers_busy() {
+    if !in_child("a_search_still_wanted_that_meets_taken_memory_answers_busy") {
+        return;
+    }
+    let (status, out) = released_into_taken_memory("limits-wanted-busy", false);
+    assert_eq!(status, 503, "{out}");
+    assert!(out.contains(r#""code":"busy""#), "{out}");
+}
+
 /// Clearing the search box is a new query too: an empty `q=` supersedes.
 #[test]
 fn an_empty_q_supersedes_the_running_search() {

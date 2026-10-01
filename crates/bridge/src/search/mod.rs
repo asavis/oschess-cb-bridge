@@ -369,11 +369,31 @@ fn select_in<S: Store>(
         _ => Cancel::never(),
     };
     idx.gate.enter();
+    // A superseded search answers so, whatever else stopped it (#259). Taken
+    // memory or workers can refuse it before it next looks whether it is
+    // still wanted, and their `busy` would ask the page to send it again,
+    // where it would supersede the newer search.
+    selected(db, idx, q, sort_param, position, &cancel).map_err(|e| match e {
+        SearchError::Busy | SearchError::WorkersBusy if cancel.is_cancelled() => SearchError::Superseded,
+        e => e,
+    })
+}
+
+/// [`select_in`] once the search has started, which a newer search in its
+/// stream supersedes when `cancel` says so.
+fn selected<S: Store>(
+    db: &S,
+    idx: &Indexes,
+    q: Option<&str>,
+    sort_param: Option<Sort>,
+    position: Option<&dyn Position>,
+    cancel: &Cancel,
+) -> Result<(Selection, Sort, u64), SearchError> {
     let q = q.unwrap_or("");
     let query = query::parse(q).map_err(|u| SearchError::Unsupported(u.0))?;
     let sort = sort_param.or(query.sort).unwrap_or(Sort::DEFAULT);
     let heads = idx.heads();
-    let ctl = Control { cancel: &cancel, scanned: &idx.scanned, heads: heads.as_deref() };
+    let ctl = Control { cancel, scanned: &idx.scanned, heads: heads.as_deref() };
     if query.terms.is_empty() && position.is_none() {
         return Ok(match sort.key {
             SortKey::Number => (Selection::All { descending: sort.descending }, sort, 0),
@@ -393,7 +413,7 @@ fn select_in<S: Store>(
         }
         return Ok((Selection::Numbers(numbers), sort, games));
     }
-    let members = position.map(|p| p.games(&cancel)).transpose()?;
+    let members = position.map(|p| p.games(cancel)).transpose()?;
     let games = members.as_ref().map_or(0, Members::count);
     // A position no game reaches needs neither a sort order nor a pass.
     let numbers = Arc::new(match &members {
