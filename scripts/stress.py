@@ -5,13 +5,16 @@ only.
 
     python3 scripts/stress.py --runs 300 --bin api --bin explorer_background
     python3 scripts/stress.py --runs 50 --jobs 5 --fail-fast
+    python3 scripts/stress.py --runs 50 --bin api --time-limit 40
 
 The tests are built once, as `cargo test` builds them, and their binaries run
 directly, each in its package's folder as `cargo test` runs it; doctests are
 left out. A run is every chosen binary once, in turn. `--jobs` makes that
 many runs at a time: every test process names its fixtures after its own
-process id, so runs at the same time never share one. Arguments after `--`
-go to every binary, such as a test name filter.
+process id, so runs at the same time never share one. `--time-limit` starts
+no run once that many minutes have passed since the loaded runs began, so a
+nightly job ends in time; the runs under way finish. Arguments after `--` go
+to every binary, such as a test name filter.
 
 The load is the script's own. The tests run at nice 19 on `--cpus`, beside
 `--hogs` busy loops at nice `--hog-nice` on the same CPUs, so a thread of a
@@ -26,8 +29,13 @@ the loaded runs with it; on a busy machine that run can fail too, and its
 failures count with the others.
 
 Each failed run keeps its output in `--out`, target/stress/<UTC time> by
-default, and the summary counts the failures by test. The exit status is 1
-when a run failed; 2 when none failed but `--min-slowdown` voids the campaign,
+default, and the summary counts the failures by test. `--done-file` is written
+only when the campaign ran all its required runs (`--min-runs`, else `--runs`),
+passed or failed: a failed build, a stop, or a campaign cut short writes
+nothing, whatever the exit status. The exit status is 1
+when a run failed; 3 when none failed but fewer than `--min-runs` loaded runs
+ran (a time limit or a stop cut the campaign short); 2 when none failed but
+`--min-slowdown` voids the campaign,
 its loaded runs having taken less than that many times the run without the
 load, which shows the load did not reach the tests.
 """
@@ -336,9 +344,10 @@ def write_log(out, name, outcomes):
     return path
 
 
-def slowdown_limit(text):
-    """`--min-slowdown`'s value: a finite number above 0. A NaN would compare
-    false against every slowdown and let every campaign pass."""
+def positive(text):
+    """A finite number above 0, as `--min-slowdown` and `--time-limit` take.
+    A NaN would compare false against every slowdown or time and never
+    apply."""
     value = float(text)
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError(f"{text!r} is not a finite number above 0")
@@ -369,8 +378,19 @@ def arguments(argv):
     parser.add_argument("--timeout", type=int, default=1800, help="seconds a binary may run (default 1800)")
     parser.add_argument("--fail-fast", action="store_true", help="start no run after one failed")
     parser.add_argument(
+        "--time-limit", type=positive, help="start no run once this many minutes have passed since the load began"
+    )
+    parser.add_argument(
+        "--min-runs", type=int, help="count the campaign incomplete (exit 3) when fewer loaded runs than this ran"
+    )
+    parser.add_argument(
+        "--done-file",
+        type=Path,
+        help="write this file only when the campaign ran all its required runs, whether they passed or failed",
+    )
+    parser.add_argument(
         "--min-slowdown",
-        type=slowdown_limit,
+        type=positive,
         help="void the campaign (exit 2) when its loaded runs took less than this many times run 0",
     )
     parser.add_argument("--out", type=Path, help="where failed runs' output goes (default target/stress/<UTC time>)")
@@ -378,6 +398,8 @@ def arguments(argv):
     args = parser.parse_args(argv)
     if args.runs < 1 or args.jobs < 1:
         parser.error("--runs and --jobs take a number above 0")
+    if args.min_runs is not None and not 1 <= args.min_runs <= args.runs:
+        parser.error("--min-runs takes a number from 1 to --runs")
     return args
 
 
@@ -408,10 +430,18 @@ def main(argv=None):
         print("stopped")
     print(summary(dict(sorted(results.items())), loads))
     print(f"output of failed runs: {out}")
+    loaded = sum(1 for run in results if run != 0)
+    required = args.runs if args.min_runs is None else args.min_runs
+    if args.done_file is not None and not stopped and loaded >= required:
+        failed = sum(1 for run, outcomes in results.items() if run != 0 and not all(o.ok for o in outcomes))
+        args.done_file.write_text(f"{loaded} loaded runs, {failed} failed\n", encoding="utf-8")
     if stopped:
         return 130
     if not all(o.ok for outcomes in results.values() for o in outcomes):
         return 1
+    if args.min_runs is not None and loaded < args.min_runs:
+        print(f"incomplete: {loaded} loaded runs ran, below --min-runs {args.min_runs}")
+        return 3
     factor = slowdown(results)
     if args.min_slowdown is not None and (factor is None or factor < args.min_slowdown):
         shown = "unknown" if factor is None else f"{factor:.1f} times"
@@ -463,8 +493,17 @@ def stress(args, cpu_list, hogs, out, results, loads):
     prefix = ["taskset", "-c", cpu_list, "nice", "-n", "19"]
     print(f"load: the tests at nice 19 on CPUs {cpu_list}, beside {hogs} loops at nice {args.hog_nice}", flush=True)
 
+    deadline = time.monotonic() + args.time_limit * 60 if args.time_limit else None
+    timed_out = threading.Event()
+
     def job():
         while not stop.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                with lock:
+                    if not timed_out.is_set():
+                        timed_out.set()
+                        print(f"time limit: no run starts after {args.time_limit:g} min", flush=True)
+                return
             with lock:
                 run = next(next_run, None)
             if run is None:

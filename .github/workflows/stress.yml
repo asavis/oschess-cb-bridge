@@ -1,0 +1,109 @@
+name: stress
+
+# The tests that fail only on a loaded machine, looked for every night (#235)
+# with scripts/stress.py. On a schedule only: no pull request, issue, comment
+# or fork can start it, as the CI rule in CLAUDE.md requires; a collaborator can
+# start it by hand on main to check it. It runs only on our own Linux runner.
+#
+# A night covers a commit of main when both campaigns ran all their runs to a
+# verdict, pass or fail: each writes its `--done-file` only then, and the night
+# leaves a `stress-covered` artifact. A
+# scheduled run does nothing while main is still at the commit of the newest
+# such artifact. A failure before the campaigns, a time-out, or a campaign cut
+# short covers nothing, and the next night tries the same commit again.
+on:
+  schedule:
+    # 01:17 UTC, 02:17 or 03:17 in Vienna, while the runner is quiet.
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: stress
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: stress (linux)
+    # Main only: coverage is of main's commits.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, bridge-local]
+    # The night's whole budget, setup and log upload included.
+    timeout-minutes: 100
+    steps:
+      - name: Main changed since the last covered commit
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          covered=$(curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPOSITORY/actions/artifacts?name=stress-covered&per_page=50" \
+            | python3 -c '
+          import json, sys
+          artifacts = json.load(sys.stdin)["artifacts"]
+          on_main = [a for a in artifacts if not a["expired"] and (a.get("workflow_run") or {}).get("head_branch") == "main"]
+          on_main.sort(key=lambda a: a["created_at"], reverse=True)
+          print(on_main[0]["workflow_run"]["head_sha"] if on_main else "")
+          ')
+          echo "last covered commit ${covered:-none}; main at $GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$covered" = "$GITHUB_SHA" ]; then
+            echo "::notice::main has not changed since the last covered commit; nothing to do"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.changed.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          rustup toolchain install
+          rustc --version
+      - name: The binaries whose tests load has failed, 20 runs
+        # The script's default load: a quarter of the CPUs, three nice-19 loops
+        # on each. No run starts after 60 minutes, and 70 stop it; fewer than
+        # 20 runs is incomplete (exit 3) and writes no done file.
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          timeout -s TERM 70m python3 scripts/stress.py --runs 20 --min-runs 20 --jobs 4 --time-limit 60 \
+            --bin api --bin databases --bin engine --bin explorer_background --bin explorer_parallel_merge \
+            --bin positions --bin profile --out "$RUNNER_TEMP/stress/binaries" \
+            --done-file "$RUNNER_TEMP/stress/binaries.done"
+      - name: The whole suite, 4 runs
+        # At once, 4 jobs; 25 minutes stop it.
+        if: steps.changed.outputs.run == 'true' && !cancelled()
+        run: |
+          timeout -s TERM 25m python3 scripts/stress.py --runs 4 --min-runs 4 --jobs 4 --fail-fast \
+            --out "$RUNNER_TEMP/stress/suite" --done-file "$RUNNER_TEMP/stress/suite.done"
+      - name: Note the covered commit
+        # Both campaigns ran all their runs to a verdict, passed or failed.
+        id: covered
+        if: steps.changed.outputs.run == 'true' && !cancelled()
+        run: |
+          if [ -f "$RUNNER_TEMP/stress/binaries.done" ] && [ -f "$RUNNER_TEMP/stress/suite.done" ]; then
+            echo "$GITHUB_SHA" > "$RUNNER_TEMP/stress-covered.txt"
+            echo "covered=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::a campaign did not run all its runs; main stays uncovered for the next night"
+          fi
+      - name: Keep the covered commit
+        if: steps.covered.outputs.covered == 'true' && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-covered
+          path: ${{ runner.temp }}/stress-covered.txt
+          retention-days: 90
+      - name: Keep the failed runs' output
+        if: failure() && steps.changed.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-logs
+          path: ${{ runner.temp }}/stress
+          if-no-files-found: ignore
+          retention-days: 14
