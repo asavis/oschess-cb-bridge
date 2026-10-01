@@ -21,6 +21,11 @@
 //! from the bridge's start to the index ready, with the mode the build ran in
 //! (`OSCHESS_BRIDGE_BACKGROUND_MODE`) and how long it gave way to the flows at
 //! most at a time, replaces the build the first explorer request starts.
+//!
+//! The profile starts a bridge after another, each once the one before has
+//! ended, and records their lives among its rows (#239): `bridge N started`
+//! before the `N`th bridge's process exists, and `bridge N ended` once that
+//! process has been reaped, numbered from 1.
 
 mod json;
 
@@ -174,6 +179,8 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
 /// connection the flows ask it on, and the lines it prints after its port,
 /// each with when it came.
 struct Served {
+    /// Which bridge of the profile it is, from 1, for the record.
+    n: usize,
     child: Child,
     /// Held open for the bridge's life: the bridge ends when it closes.
     _input: ChildStdin,
@@ -245,12 +252,22 @@ impl Drop for Served {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        record(self.n, "ended");
     }
 }
 
-/// A bridge serving `o`'s database; one that keeps its indexes when
-/// `background`.
-fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
+/// A line of the record of the profile's bridges, `bridge <n> <event>`, on
+/// standard output with the rows. A line that cannot be written is left out,
+/// as a drop must not panic.
+fn record(n: usize, event: &str) {
+    let _ = writeln!(std::io::stdout(), "bridge {n} {event}");
+}
+
+/// The `n`th bridge of the profile, serving `o`'s database; one that keeps
+/// its indexes when `background`. Its start is recorded before its process
+/// exists, and its end once the process has been reaped, here when it does
+/// not start and else when it is dropped.
+fn spawn(o: &Options, n: usize, background: bool) -> AnyResult<Served> {
     let mut command = Command::new(std::env::current_exe()?);
     command.arg("profile-serve").arg(&o.db).arg(&o.index);
     if background {
@@ -259,7 +276,9 @@ fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
     if let Some(exe) = &o.engine {
         command.arg(exe);
     }
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    record(n, "started");
+    let child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+    let mut child = child.inspect_err(|_| record(n, "ended"))?;
     let input = child.stdin.take();
     let mut line = String::new();
     let mut out = child.stdout.take().map(BufReader::new);
@@ -268,6 +287,7 @@ fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
     let (Some(port), Some(out), Some(input)) = (port, out, input) else {
         let _ = child.kill();
         let _ = child.wait();
+        record(n, "ended");
         return Err("the bridge did not start".into());
     };
     // Its later lines, until it ends.
@@ -279,7 +299,7 @@ fn spawn(o: &Options, background: bool) -> AnyResult<Served> {
             }
         }
     });
-    Ok(Served { child, _input: input, c: Client::new(port), background, lines, built: OnceCell::new() })
+    Ok(Served { n, child, _input: input, c: Client::new(port), background, lines, built: OnceCell::new() })
 }
 
 /// A failed answer, by its status and the bridge's error code only: a code is
@@ -601,6 +621,15 @@ fn writing(dir: &Path) -> bool {
     entries.flatten().any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".partial")))
 }
 
+/// Whether names files may still come beside the heads file `heads` in the
+/// index folder `dir`. A bridge writes a name table's file only when it read
+/// the table beside a heads file it had (#108), and it builds a heads file
+/// only for a database of [`heads::MIN_RECORDS`] records or more: with no
+/// heads file, and none being written, none will come.
+fn names_may_come(dir: &Path, heads: &Path) -> bool {
+    heads.exists() || writing(dir)
+}
+
 pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let o = options(args)?;
     if !fresh(&o.index) {
@@ -614,7 +643,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     // The first bridge: the flows that open the database and fill its caches,
     // and the position index's build.
     let launched = Instant::now();
-    let mut served = spawn(&p.o, p.o.background)?;
+    let mut served = spawn(&p.o, 1, p.o.background)?;
     let Some(records) = p.opening(&mut served, ms(launched.elapsed())) else { return Ok(false) };
     p.sorts(&mut served);
     p.windows(&mut served, records);
@@ -670,8 +699,9 @@ impl Profile {
     /// no index unasked, its caches empty, and the index folder holding what
     /// the bridges before it wrote.
     fn respawn(&self, before: Served) -> AnyResult<Served> {
+        let n = before.n + 1;
         self.end(before);
-        spawn(&self.o, false)
+        spawn(&self.o, n, false)
     }
 
     /// Ends `bridge` once it has written its files, as its index builds and
@@ -985,9 +1015,10 @@ impl Profile {
     /// A new bridge in place of the `first`, timed from once the first has
     /// ended to its first answer from the position index the first one built.
     fn new_bridge(&mut self, first: Served) -> AnyResult<Served> {
+        let n = first.n + 1;
         self.end(first);
         let t = Instant::now();
-        let mut again = spawn(&self.o, false)?;
+        let mut again = spawn(&self.o, n, false)?;
         let mut open = Samples::default();
         open.get(&mut again.c, &self.explorer(START_FEN), true);
         let took = ms(t.elapsed());
@@ -1020,12 +1051,17 @@ impl Profile {
     /// The names files (#108): the second bridge, `again`, wrote its name
     /// tables beside the heads file. The bridges that replace it read them
     /// from there for their first sort by white, suggestion and player
-    /// search. The last of them.
+    /// search. The last of them. The names files are waited for a minute at
+    /// most, and only while they may still come ([`names_may_come`]).
     fn with_names(&mut self, again: Served, searches: &[(&str, String)]) -> AnyResult<Served> {
-        let heads = heads::path(&self.index_folder(), &self.id);
+        let folder = self.index_folder();
+        let heads = heads::path(&folder, &self.id);
         let names: Vec<PathBuf> = ["players", "tournaments"].iter().map(|k| heads.with_extension(k)).collect();
         let waited = Instant::now();
-        while !names.iter().all(|p| p.exists()) && waited.elapsed() < Duration::from_secs(60) {
+        while !names.iter().all(|p| p.exists())
+            && names_may_come(&folder, &heads)
+            && waited.elapsed() < Duration::from_secs(60)
+        {
             std::thread::sleep(Duration::from_millis(100));
         }
         let have = if names.iter().all(|p| p.exists()) { "from the names files" } else { "no names files" };
@@ -1400,6 +1436,27 @@ mod tests {
         assert!(!writing(&dir));
         std::fs::write(dir.join("0123456789abcdef.annotators.partial"), b"x").unwrap();
         assert!(writing(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The names files are waited for only while a heads file stands or a
+    /// file is being written, which may be the heads file (#239): a database
+    /// too small for one gets neither, and the wait ends at once.
+    #[test]
+    fn names_files_may_come_only_beside_a_heads_file() {
+        let dir = std::env::temp_dir().join(format!("cbtool-profile-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let heads = heads::path(&dir, "0123456789abcdef");
+        assert!(!names_may_come(&dir, &heads));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0123456789abcdef.idx"), b"x").unwrap();
+        assert!(!names_may_come(&dir, &heads));
+        let partial = dir.join("0123456789abcdef.heads.partial");
+        std::fs::write(&partial, b"x").unwrap();
+        assert!(names_may_come(&dir, &heads));
+        std::fs::remove_file(&partial).unwrap();
+        std::fs::write(&heads, b"x").unwrap();
+        assert!(names_may_come(&dir, &heads));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

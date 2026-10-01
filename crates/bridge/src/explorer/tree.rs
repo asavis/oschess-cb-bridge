@@ -248,7 +248,10 @@ impl Pass<'_> {
             buf.try_reserve_exact(cap).map_err(|_| Refused::Busy)?;
             let mut scratch: Vec<Entry> = Vec::new();
             scratch.try_reserve_exact(FOLD_ENTRIES).map_err(|_| Refused::Busy)?;
-            let mut taker = chunks.taker();
+            if w.index > 0 {
+                std::thread::sleep(self.limits.late_start);
+            }
+            let mut taker = chunks.taker(w.count);
             loop {
                 // A background build gives way to foreground work before it
                 // takes its next chunk, so that none waits for it (#149).
