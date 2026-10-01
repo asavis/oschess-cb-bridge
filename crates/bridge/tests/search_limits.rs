@@ -39,10 +39,11 @@ impl Sparse {
         self.bridge.app.catalog.get(&self.id).unwrap().open().ok().unwrap().indexes
     }
 
-    /// Sends `query` on its own connection.
+    /// Sends `query` on its own connection, once: a search sent again is a
+    /// new search in its stream, and would supersede the one a test holds.
     fn send(&self, query: &str) -> std::thread::JoinHandle<(u16, String)> {
         let (port, path) = (self.bridge.port, format!("/v1/databases/{}/games?{query}", self.id));
-        std::thread::spawn(move || unbusy(port, &path))
+        std::thread::spawn(move || get(port, &path))
     }
 
     fn get(&self, query: &str) -> (u16, String) {
@@ -70,6 +71,15 @@ fn unbusy(port: u16, path: &str) -> (u16, String) {
     }
 }
 
+/// Whether this is the child that runs the test's body. A test that holds a
+/// search runs alone in a child process of its own: the search memory and the
+/// workers are the process's, and a held search whose release met them taken
+/// by another test answered busy, not superseded (#238). Sent again, it would
+/// be a new search, not the one the test is about.
+fn in_child(name: &str) -> bool {
+    common::in_child(name, "BRIDGE_SEARCH_LIMITS_CHILD", &[])
+}
+
 /// A search answered busy while other work holds the search memory is asked
 /// again, and served once the memory is free: the seam of [`unbusy`].
 #[test]
@@ -82,7 +92,8 @@ fn a_search_answered_busy_is_asked_again() {
             break hold;
         }
     };
-    let search = s.send("q=needle");
+    let (port, path) = (s.bridge.port, format!("/v1/databases/{}/games?q=needle", s.id));
+    let search = std::thread::spawn(move || unbusy(port, &path));
     let started = Instant::now();
     while BUSY.load(Ordering::SeqCst) == before && !search.is_finished() {
         assert!(started.elapsed() < WAIT_LIMIT, "no search was answered busy");
@@ -97,6 +108,9 @@ fn a_search_answered_busy_is_asked_again() {
 /// stream answer `409 superseded`, and the newer one is served.
 #[test]
 fn a_superseded_search_answers_409() {
+    if !in_child("a_superseded_search_answers_409") {
+        return;
+    }
     let s = serve_sparse("limits-superseded", 100_000);
     let indexes = s.indexes();
     let held = indexes.gate().hold(1);
@@ -113,6 +127,9 @@ fn a_superseded_search_answers_409() {
 /// Clearing the search box is a new query too: an empty `q=` supersedes.
 #[test]
 fn an_empty_q_supersedes_the_running_search() {
+    if !in_child("an_empty_q_supersedes_the_running_search") {
+        return;
+    }
     let s = serve_sparse("limits-empty-q", 100_000);
     let indexes = s.indexes();
     let held = indexes.gate().hold(1);
@@ -127,6 +144,9 @@ fn an_empty_q_supersedes_the_running_search() {
 /// Another stream, another origin or no stream at all never stops a search.
 #[test]
 fn other_streams_do_not_supersede() {
+    if !in_child("other_streams_do_not_supersede") {
+        return;
+    }
     let s = serve_sparse("limits-streams", 100_000);
     let indexes = s.indexes();
     let held = indexes.gate().hold(2);
