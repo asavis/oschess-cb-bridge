@@ -22,10 +22,6 @@ fn in_child(name: &str) -> bool {
     common::in_child(name, "BRIDGE_SEARCH_CHILD", &[])
 }
 
-/// Calls [`unbusy`] answered `WorkersBusy` and asked again, for the test
-/// that shows it does.
-static WORKERS_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// `ask`, asked again while it answers `WorkersBusy`, up to [`WAIT_LIMIT`]:
 /// the search workers are the process's, and this binary's other tests can
 /// hold them for longer than a pass waits for one (`workers::WAIT`) on a
@@ -34,10 +30,7 @@ static WORKERS_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// a busy answer is never kept.
 fn unbusy<T>(mut ask: impl FnMut() -> Result<T, SearchError>) -> Result<T, SearchError> {
     let answer = poll(WAIT_LIMIT, || match ask() {
-        Err(SearchError::WorkersBusy) => {
-            WORKERS_BUSY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            None
-        }
+        Err(SearchError::WorkersBusy) => None,
         answer => Some(answer),
     });
     answer.unwrap_or_else(|| panic!("every worker stayed taken for {WAIT_LIMIT:?}"))
@@ -112,19 +105,14 @@ fn the_conformance_corpus_holds_on_a_classic_copy() {
 /// shows the product's busy answer itself.
 #[test]
 fn unbusy_asks_again_while_the_workers_are_busy() {
-    use std::sync::atomic::Ordering;
-    let before = WORKERS_BUSY.load(Ordering::SeqCst);
-    let mut left = 3;
+    // Counted here, not in a static the binary's other tests also add to.
+    let mut calls = 0;
     let answer = unbusy(|| {
-        if left > 0 {
-            left -= 1;
-            Err(SearchError::WorkersBusy)
-        } else {
-            Ok(7)
-        }
+        calls += 1;
+        if calls <= 3 { Err(SearchError::WorkersBusy) } else { Ok(7) }
     });
     assert!(matches!(answer, Ok(7)), "{answer:?}");
-    assert_eq!(WORKERS_BUSY.load(Ordering::SeqCst) - before, 3, "each busy answer was asked again");
+    assert_eq!(calls, 4, "each busy answer was asked again, and the first other answer kept");
     assert!(matches!(unbusy(|| Err::<(), _>(SearchError::Superseded)), Err(SearchError::Superseded)));
 }
 
