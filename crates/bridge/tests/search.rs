@@ -16,7 +16,8 @@ use common::{DOC, WAIT_LIMIT, block, block_in, classic_fixture, fixture, lid, po
 /// search and checks which one a newer one supersedes runs alone in a child
 /// process of its own: the workers are the process's, and a held search that
 /// met them taken by another test would answer busy, and sent again would be
-/// a newer search (#238).
+/// a newer search (#238). Sparse files, and so those tests, need Unix.
+#[cfg(unix)]
 fn in_child(name: &str) -> bool {
     common::in_child(name, "BRIDGE_SEARCH_CHILD", &[])
 }
