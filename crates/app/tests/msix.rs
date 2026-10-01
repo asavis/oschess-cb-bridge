@@ -48,11 +48,17 @@ fn every_image_the_manifest_names_is_drawn() {
         assert!(drawn.join(file).is_file(), "icons/msix/{file}");
     }
     // Windows takes the app list and taskbar icons from these, found through
-    // the resources.pri scripts/msix.py writes; without them it lays the
-    // 44-pixel one on a plate of the accent colour.
-    for size in [16, 24, 32, 48, 256] {
-        let file = format!("Square44x44Logo.targetsize-{size}_altform-unplated.png");
-        assert!(drawn.join(&file).is_file(), "icons/msix/{file}");
+    // the resources.pri scripts/msix.py writes: the unplated form on a dark
+    // taskbar, the light-unplated one on a light taskbar. Without the form the
+    // taskbar asks for, it lays the 44-pixel one on a plate of the accent
+    // colour (#197, #262).
+    for size in [16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 256] {
+        let mut forms = Vec::new();
+        for form in ["unplated", "lightunplated"] {
+            let file = format!("Square44x44Logo.targetsize-{size}_altform-{form}.png");
+            forms.push(std::fs::read(drawn.join(&file)).unwrap_or_else(|_| panic!("icons/msix/{file}")));
+        }
+        assert_eq!(forms[0], forms[1], "the {size} px icon is the same on a light and a dark taskbar");
     }
 }
 

@@ -18,10 +18,10 @@ for installing it by hand (docs/release.md). The version comes from the app's
 x.y.z by package_version.
 
 Windows finds the images named by size and theme (targetsize-24_altform-
-unplated and the like) only through the package's resources.pri, which
-makepri.exe writes. Without it Windows takes Square44x44Logo.png for the
-taskbar and the Start menu and lays it on a plate of the accent colour, which
-shows in the tile's rounded corners.
+unplated, targetsize-24_altform-lightunplated and the like) only through the
+package's resources.pri, which makepri.exe writes. Without it Windows takes
+Square44x44Logo.png for the taskbar and the Start menu and lays it on a plate
+of the accent colour, which shows in the tile's rounded corners.
 
 The package is left unsigned: the Store signs it. makeappx.exe and makepri.exe
 come from --makeappx and --makepri or from the newest Windows SDK;
