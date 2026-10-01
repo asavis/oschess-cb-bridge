@@ -20,8 +20,8 @@ use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 
 mod common;
 use common::{
-    Served, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, policy, poll,
-    put, serve_with_dir, until,
+    TestBridge, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, policy, poll,
+    put, until,
 };
 
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -291,11 +291,11 @@ impl Reached {
 
 /// The games of the fixture, served, once the index is built: the games, the
 /// database, the bridge, its id, and its index folder.
-fn served(name: &str) -> (Vec<Game>, TempDb, Served, String, PathBuf) {
+fn served(name: &str) -> (Vec<Game>, TempDb, TestBridge, String, PathBuf) {
     let games = games();
     let db = database(&format!("positions-{name}"), &games);
     let dir = index_dir(name);
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     answered(bridge.port, &list(&id, START, ""));
     (games, db, bridge, id, dir)
 }
@@ -351,7 +351,7 @@ fn the_start_after_the_first_scan_lists_what_it_listed() {
     let reached = Reached::of(&games);
     let db = database("positions-starts", &games);
     let dir = index_dir("starts");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let boards = [Board::startpos(), board_after("d2d4 d7d5 c2c4 e7e6"), board_after("d2d4")];
     assert!(reached.games(&boards[0]).contains(&57), "the set-up game that comes home");
     for (round, sort) in ["number", "white"].into_iter().enumerate() {
@@ -426,7 +426,7 @@ fn positions_after_a_promotion_list_their_games() {
     assert_eq!((bishops & LIGHT).count_ones(), 2, "two bishops on light squares");
     let db = database("positions-promotions", &games);
     let dir = index_dir("promotions");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let reached = Reached::of(&games);
     let (mut within, mut beyond) = (0, 0);
     let mut lines: Vec<&Game> = Vec::new();
@@ -530,7 +530,7 @@ fn errors_are_the_explorers() {
     let games = games();
     let db = database("positions-errors", &games);
     let dir = index_dir("errors");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let (status, body) = get(bridge.port, &list(&id, START, ""));
     assert_eq!(status, 409, "the first request starts the build: {body}");
     assert!(body.contains(r#""state":"indexing""#) && body.contains(r#""progress":{"phase":"#), "{body}");
@@ -561,7 +561,7 @@ fn an_unsupported_qualifier_starts_no_build() {
     let games = games();
     let db = database("positions-unsupported", &games);
     let dir = index_dir("unsupported");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     for qualifier in ["tag", "created", "updated", "is", "has", "no"] {
         let (status, body) = get(bridge.port, &list(&id, START, &format!("&stream=tab&q={qualifier}%3Ax")));
         assert_eq!(status, 400, "{body}");
@@ -593,7 +593,8 @@ fn a_newer_request_in_the_same_stream_supersedes() {
     let db = database("positions-streams", &games);
     let dir = index_dir("streams");
     let path = db.dir().join("db.2cbh");
-    let (port, app) = serve_with_dir(app_of([path.clone()]), &dir);
+    let bridge = TestBridge::in_dir(app_of([path.clone()]), &dir);
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     answered(port, &list(&id, START, ""));
     let indexes = app.catalog.get(&id).unwrap().open().unwrap().indexes;
@@ -623,7 +624,7 @@ fn a_newer_request_in_the_same_stream_supersedes() {
         assert_eq!(status, 200, "{body}");
         assert_eq!(number(&body, "total"), Reached::of(&games).games(&board_after("d2d4")).len() as u64);
     }
-    app.catalog.explorer.release();
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -636,7 +637,8 @@ fn a_superseded_request_is_not_answered_from_kept_results() {
     let db = database("positions-streams-kept", &games);
     let dir = index_dir("streams-kept");
     let path = db.dir().join("db.2cbh");
-    let (port, app) = serve_with_dir(app_of([path.clone()]), &dir);
+    let bridge = TestBridge::in_dir(app_of([path.clone()]), &dir);
+    let (port, app) = (bridge.port, &bridge.app);
     let id = id_of(&path);
     let d4 = board_after("d2d4").fen();
     // The result of 1.d4, in the default order, kept.
@@ -654,7 +656,7 @@ fn a_superseded_request_is_not_answered_from_kept_results() {
     let (status, body) = older.join().unwrap();
     assert_eq!(status, 409, "{body}");
     assert!(body.contains(r#""code":"superseded""#), "{body}");
-    app.catalog.explorer.release();
+    drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -673,19 +675,19 @@ fn slot_at(bytes: &[u8], n: u32) -> usize {
 /// `url` is answered `409` while both files are built again, then `want`
 /// from the new build. The new bridge.
 fn damaged(
-    bridge: Served,
+    bridge: TestBridge,
     (db, dir, id): (&TempDb, &Path, &str),
     url: &str,
     want: &[u32],
     damage: impl FnOnce(&mut [u8]),
-) -> Served {
+) -> TestBridge {
     drop(bridge);
     let path = dir.join("index").join(format!("{id}.moves"));
     let mut bytes = std::fs::read(&path).unwrap();
     let before = Header::decode(&bytes).unwrap();
     damage(&mut bytes);
     std::fs::write(&path, &bytes).unwrap();
-    let (bridge, _) = Served::database(db, dir);
+    let (bridge, _) = TestBridge::database(db, dir);
     let (status, body) = get(bridge.port, url);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("rebuilt") && body.contains(r#""state":"indexing""#), "{body}");
@@ -740,7 +742,7 @@ fn exchanged_slots_are_never_listed() {
         (1..=n).map(|r| Game::new(Kind::Game, None, if r <= 13 { "e2e4" } else { "d2d4" })).collect();
     let db = database("positions-exchanged", &games);
     let dir = index_dir("exchanged");
-    let (mut bridge, id) = Served::database(&db, &dir);
+    let (mut bridge, id) = TestBridge::database(&db, &dir);
     let url = list(&id, &board_after("e2e4").fen(), "&line=1");
     let want: Vec<u32> = (1..=13).collect();
     assert_eq!(rows(&answered(bridge.port, &url)), want);
@@ -787,7 +789,7 @@ fn a_list_in_a_kept_order_needs_no_room_but_its_own() {
     let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
     let db = database("positions-tight", &games);
     let dir = index_dir("tight");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let e4 = board_after("e2e4").fen();
     // The index built and its stream scanned once; the order by White kept.
     assert_eq!(number(&answered(bridge.port, &list(&id, &e4, "&sort=number")), "total"), u64::from(GAMES));
@@ -818,7 +820,7 @@ fn kept_starts_give_way_to_a_list() {
     let games: Vec<Game> = (0..GAMES).map(|_| Game::new(Kind::Game, None, "e2e4")).collect();
     let db = database("positions-starts-room", &games);
     let dir = index_dir("starts-room");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     // The index built without a list, so that no scan has found the starts.
     answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(START)));
     for sort in ["number", "number-desc"] {
@@ -954,7 +956,7 @@ fn a_dropped_bridge_leaves_nothing_writing_into_its_folder() {
     let holding = Arc::new(Holding::default());
     let sources = Sources { fixed: vec![path.clone()], ..Sources::default() };
     let catalog = Catalog::with_sources(sources, Arc::clone(&holding) as Arc<dyn Cloud>);
-    let bridge = Served::with_dir(App::new("test", policy(), catalog), &dir);
+    let bridge = TestBridge::in_dir(App::new("test", policy(), catalog), &dir);
     let (status, body) = get(bridge.port, &list(&id_of(&path), START, ""));
     assert_eq!(status, 409, "{body}");
     holding.looked(1);
@@ -975,8 +977,9 @@ fn a_dropped_bridge_leaves_nothing_writing_into_its_folder() {
 const PAUSE: Duration = Duration::from_millis(250);
 
 /// How long a settle given 25 ms may take to give up: far longer than that
-/// takes, far shorter than a wait for work the test holds until it looks.
-const SETTLE_BOUND: Duration = Duration::from_secs(5);
+/// takes, however slow the machine (#238), and shorter than the probe holds
+/// the work the test holds until it looks, [`WAIT_LIMIT`].
+const SETTLE_BOUND: Duration = Duration::from_secs(WAIT_LIMIT.as_secs() / 2);
 
 /// A cloud provider for the settle tests (#236). It keeps the database's main
 /// file in the cloud while `cloud_only` is set; it holds the first look at

@@ -214,10 +214,90 @@ fn rows_taken_before_the_background_build_starts_say_so() {
 /// Every bridge a profile starts keeps its indexes in the one `--index`
 /// folder, and sweeps it as it starts of the partial files there, which only
 /// the process writing them can tell from abandoned ones (#191). So one
-/// bridge runs at a time: the one before has ended when the next starts.
+/// bridge runs at a time: the one before has ended when the next starts, as
+/// the profile's own record says (#239). Looks at `/proc` while it runs
+/// check the record against the kernel: they can miss a bridge that lived
+/// between two of them, so they do not count the bridges, but they never see
+/// two at once when one ran at a time, nor more bridges than ran.
 #[cfg(target_os = "linux")]
 #[test]
 fn one_bridge_runs_at_a_time() {
+    let run = watched("cbtool-profile-one-bridge", usize::MAX);
+    let text = &run.text;
+    assert!(run.status.success(), "{text}");
+    // The first bridge, the one after it, and one for each names flow.
+    let bridges = recorded(text).unwrap_or_else(|why| panic!("{why}\n{text}"));
+    assert!(bridges >= 4, "{bridges} bridges\n{text}");
+    assert!(run.most <= 1, "{} bridges running at once\n{text}", run.most);
+    assert!(run.seen.len() <= bridges, "{:?} seen, {bridges} recorded\n{text}", run.seen);
+}
+
+/// Why the record counts the bridges, and not looks at `/proc` (#239): a
+/// watcher descheduled for a short bridge's life misses it, as one did under
+/// load, seeing 3 of 4 bridges. One stalled once it has seen three misses
+/// the rest every time, and the record still names them all, each ended
+/// before the next started.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_record_names_the_bridges_a_stalled_watcher_misses() {
+    let run = watched("cbtool-profile-stalled-watcher", 3);
+    let text = &run.text;
+    assert!(run.status.success(), "{text}");
+    assert!(run.seen.len() < 4, "{:?} seen\n{text}", run.seen);
+    let bridges = recorded(text).unwrap_or_else(|why| panic!("{why}\n{text}"));
+    assert!(bridges >= 4, "{bridges} bridges\n{text}");
+}
+
+/// How many bridges the profile's record in `text` names, when it names them
+/// one after another: `bridge 1 started`, `bridge 1 ended`, `bridge 2
+/// started` and so on, each ended before the next started.
+fn recorded(text: &str) -> Result<usize, String> {
+    let record: Vec<&str> = text.lines().filter(|l| l.starts_with("bridge ")).collect();
+    for (i, line) in record.iter().enumerate() {
+        let expected = format!("bridge {} {}", i / 2 + 1, if i % 2 == 0 { "started" } else { "ended" });
+        if *line != expected {
+            return Err(format!("record line {} is {line:?}, not {expected:?}", i + 1));
+        }
+    }
+    if record.len() % 2 == 1 {
+        return Err(format!("bridge {} never ended", record.len() / 2 + 1));
+    }
+    Ok(record.len() / 2)
+}
+
+/// The record's check counts bridges named one after another among the rows,
+/// and fails a bridge that started before the one before it ended, one that
+/// never ended, and one out of turn.
+#[test]
+fn a_record_names_its_bridges_one_after_another() {
+    let rows = "flow case\nopening   bridge process start\n";
+    assert_eq!(recorded(rows), Ok(0));
+    let two = "bridge 1 started\nsort x\nbridge 1 ended\nbridge 2 started\nbridge 2 ended\n";
+    assert_eq!(recorded(&format!("{rows}{two}")), Ok(2));
+    assert!(recorded("bridge 1 started\nbridge 2 started\nbridge 1 ended\nbridge 2 ended\n").is_err());
+    assert!(recorded("bridge 1 started\nbridge 1 ended\nbridge 2 started\n").is_err());
+    assert!(recorded("bridge 1 started\nbridge 1 ended\nbridge 3 started\nbridge 3 ended\n").is_err());
+    assert!(recorded("bridge 1 ended\nbridge 1 started\n").is_err());
+}
+
+/// A profile's run, watched from `/proc` ([`watched`]).
+#[cfg(target_os = "linux")]
+struct Watched {
+    /// Its output: the rows and the record of its bridges.
+    text: String,
+    status: std::process::ExitStatus,
+    /// The bridges the looks saw, by process id.
+    seen: std::collections::HashSet<u32>,
+    /// The most bridges one look saw running.
+    most: usize,
+}
+
+/// `cbtool profile` on a database of two games written as `name`, its
+/// bridges looked at in `/proc` every millisecond until it ends. Once the
+/// looks have seen `stall_at` bridges, they stop until it ends, as a watcher
+/// descheduled that long would.
+#[cfg(target_os = "linux")]
+fn watched(name: &str, stall_at: usize) -> Watched {
     use cbformat::fixture::{Builder, quiet};
     use cbformat::movetable::{self, Color, Piece};
     use std::process::Stdio;
@@ -226,7 +306,7 @@ fn one_bridge_runs_at_a_time() {
     let e4 = b.moves(1, &[movetable::MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), movetable::END_OF_LINE]);
     b.game(e4);
     b.game(e4);
-    let db = b.write("cbtool-profile-one-bridge");
+    let db = b.write(name);
     let out = db.dir().join("profile.txt");
     let mut profile = Command::new(env!("CARGO_BIN_EXE_cbtool"))
         .arg("profile")
@@ -237,21 +317,20 @@ fn one_bridge_runs_at_a_time() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let (mut started, mut most) = (std::collections::HashSet::new(), 0);
+    let (mut seen, mut most) = (std::collections::HashSet::new(), 0);
     let status = loop {
+        if seen.len() >= stall_at {
+            break profile.wait().unwrap();
+        }
         if let Some(status) = profile.try_wait().unwrap() {
             break status;
         }
         let running = children(profile.id());
         most = most.max(running.len());
-        started.extend(running);
+        seen.extend(running);
         std::thread::sleep(std::time::Duration::from_millis(1));
     };
-    let text = std::fs::read_to_string(&out).unwrap();
-    assert!(status.success(), "{text}");
-    // The first bridge, the one after it, and one for each names flow.
-    assert!(started.len() >= 4, "{started:?}\n{text}");
-    assert_eq!(most, 1, "bridges running at once\n{text}");
+    Watched { text: std::fs::read_to_string(&out).unwrap(), status, seen, most }
 }
 
 /// The processes running now whose parent is `parent`. The kernel lists

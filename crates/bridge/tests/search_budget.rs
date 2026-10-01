@@ -152,9 +152,13 @@ fn concurrent_searches_share_the_workers_and_the_budget() {
     assert_eq!(held(), before + room.bytes(), "every byte came back");
     drop(room);
     let all = Hold::reserve(budget() - held()).unwrap();
-    let started = std::time::Instant::now();
+    let scanned = idx.scanned();
     assert!(matches!(search::select(&db, &idx, Some("needle-last"), None, None), Err(SearchError::Busy)));
-    assert!(started.elapsed() < std::time::Duration::from_secs(1), "refused without waiting");
+    // Refused at once, before a record is read: a search never waits for
+    // memory. A bound on the time the refusal took stood for this, which a
+    // loaded machine could break (#238).
+    assert_eq!(idx.scanned(), scanned, "refused without reading");
+    assert_eq!(taken(), 0, "and without keeping a worker");
     drop(all);
     assert_eq!(held(), before);
 }

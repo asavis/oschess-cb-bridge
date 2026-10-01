@@ -22,7 +22,7 @@ use cbformat::v2::Database;
 use chesscore::{Board, Color as CColor, Move, Piece as CPiece};
 
 mod common;
-use common::{Served, answered, app_of, board_after, fen_param, get, index_dir, objects};
+use common::{TestBridge, answered, app_of, board_after, fen_param, get, index_dir, objects};
 
 /// A standard game of `ucis` with `result` (0 black, 1 draw, 2 white) and
 /// ratings; its record, for further changes.
@@ -357,7 +357,7 @@ fn any_change_rebuilds_the_whole_index() {
 fn the_endpoint_builds_then_answers() {
     let db = database("explorer-http");
     let dir = index_dir("http");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let port = bridge.port;
     let url = |fen: &str| format!("/v1/databases/{id}/explorer?fen={}", fen_param(fen));
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -457,7 +457,7 @@ fn every_notable_game_is_its_games_row_and_its_year() {
     let pgn = common::pgn_fixture("explorer-rows-pgn", &pgn_rows);
     let paths = [two.dir().join("db.2cbh"), classic.dir().join("db.cbh"), pgn.dir().join("db.pgn")];
     let dir = index_dir("rows");
-    let bridge = Served::with_dir(app_of(paths.clone()), &dir);
+    let bridge = TestBridge::in_dir(app_of(paths.clone()), &dir);
     let port = bridge.port;
     let start = fen_param("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     // Games 1-7, 10 and 11 are indexed, and in the PGN file 8 and 9 as well.
@@ -497,13 +497,13 @@ fn a_restarted_bridge_answers_from_the_kept_index() {
     let db = database("explorer-restart");
     let dir = index_dir("restart");
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    let (first, id) = Served::database(&db, &dir);
+    let (first, id) = TestBridge::database(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(start));
     answered(first.port, &url);
     let file = dir.join("index").join(format!("{id}.idx"));
     let written = std::fs::metadata(&file).unwrap().modified().unwrap();
     drop(first);
-    let (bridge, _) = Served::database(&db, &dir);
+    let (bridge, _) = TestBridge::database(&db, &dir);
     let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""games":5,"white":2,"draws":2,"black":1"#), "{body}");
@@ -629,7 +629,7 @@ fn every_position_of_every_game_is_found_at_any_depth() {
     assert_eq!(find(&format!("{one} g8f6 g1f3")), None);
 
     // Through the endpoint, as the analysis panel asks for it.
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let port = bridge.port;
     let fen = board_after(&one).fen();
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&fen));
@@ -1147,7 +1147,7 @@ fn deep_games(name: &str) -> TempDb {
 fn a_stream_record_that_fails_its_crc_is_rebuilt() {
     let db = deep_games("explorer-stream-crc");
     let dir = index_dir("stream-crc");
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let ucis = format!("e2e4 e7e5 {}d2d3", hops(15));
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after(&ucis).fen()));
     let found = r#""games":1,"white":1,"draws":0,"black":0"#;
@@ -1174,7 +1174,7 @@ fn a_stream_record_that_fails_its_crc_is_rebuilt() {
         drop(file);
         // A bridge started now opens the files, whose header and table are
         // sound, and finds the damage on the first replay.
-        let (bridge, _) = Served::database(&db, &dir);
+        let (bridge, _) = TestBridge::database(&db, &dir);
         let (status, body) = get(bridge.port, &url);
         assert_eq!(status, 409, "{part}: {body}");
         assert!(body.contains("rebuilt"), "{part}: {body}");
@@ -1421,7 +1421,7 @@ fn a_tree_position_counts_the_games_that_reach_it_only_beyond_the_tree() {
     assert_eq!(explorer::stats(&idx, &start, &Cancel::never()).unwrap(), tree);
 
     // Through the endpoint, as the analysis panel asks for it.
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board_after("e2e4 e7e5").fen()));
     let body = answered(bridge.port, &url);
     assert!(
@@ -1609,7 +1609,7 @@ fn counts_that_no_sound_index_holds_are_rebuilt() {
 
     // Through the endpoint: `409` while the index is built again, then the
     // new one's answer.
-    let (bridge, id) = Served::database(&db, &dir);
+    let (bridge, id) = TestBridge::database(&db, &dir);
     let url = format!("/v1/databases/{id}/explorer?fen={}", fen_param(&board.fen()));
     let found = r#""games":3,"white":1,"draws":1,"black":1"#;
     assert!(answered(bridge.port, &url).contains(found));
@@ -1617,7 +1617,7 @@ fn counts_that_no_sound_index_holds_are_rebuilt() {
     let path = dir.join("index").join(format!("{id}.idx"));
     let moves = vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))];
     replace_record(&path, board.hash(), &Stats { counts: max, moves, top: tree.top.clone() });
-    let (bridge, _) = Served::database(&db, &dir);
+    let (bridge, _) = TestBridge::database(&db, &dir);
     let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("rebuilt"), "{body}");

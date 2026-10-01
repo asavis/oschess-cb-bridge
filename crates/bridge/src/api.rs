@@ -24,6 +24,7 @@ use crate::reply::{bad_parameter, error, error_with, not_found, ok, unavailable}
 use crate::rows::{LINE_BUFFER_BYTES, Lines, MAX_ROW_BYTES, Names, clip, row};
 use crate::search::query::{Sort, Unsupported};
 use crate::search::{self, SearchError, Selection, SuggestField};
+use crate::server::BUSY_READ;
 use crate::snapshot::Database;
 use crate::store::{Head, Store, with_store};
 use crate::sync::{lock, unpoisoned};
@@ -94,6 +95,12 @@ pub struct App {
     /// loaded machine can stall a test between its connect and its write
     /// for longer than that (#217).
     pub idle_timeout: Duration,
+    /// How long after its acceptance a connection over the cap may take to
+    /// send its request, whose `Origin` its `503 busy` answers:
+    /// [`BUSY_READ`]. A test of the busy answer sets a longer one to tell a
+    /// wait from acceptance from a wait that each silent connection ahead
+    /// adds to (#238).
+    pub busy_read: Duration,
 }
 
 impl App {
@@ -109,6 +116,7 @@ impl App {
             engine: Engine::none(),
             served: AtomicBool::new(false),
             idle_timeout: IDLE_TIMEOUT,
+            busy_read: BUSY_READ,
         }
     }
 }

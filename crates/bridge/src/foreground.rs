@@ -154,11 +154,14 @@ pub(crate) mod tests {
     /// waits not at all while none runs.
     #[test]
     fn a_thread_waits_while_foreground_work_runs() {
+        // Twice the tests' patience: a wait of it is told from none, or from
+        // one of a short patience, however slow the machine is (#238).
+        let patience = crate::search::workers::tests::PATIENCE;
         let fg = Arc::new(Foreground::new());
-        let long = Duration::from_secs(60);
+        let long = patience * 2;
         let started = Instant::now();
         fg.wait(long, &|| false);
-        assert!(started.elapsed() < Duration::from_secs(1), "nothing ran");
+        assert!(started.elapsed() < patience, "nothing ran");
 
         // Until the work ends.
         fg.raise(2);
@@ -179,7 +182,7 @@ pub(crate) mod tests {
         let started = Instant::now();
         fg.wait(Duration::from_millis(100), &|| false);
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(100) && waited < Duration::from_secs(30), "{waited:?}");
+        assert!(waited >= Duration::from_millis(100) && waited < patience, "{waited:?}");
 
         // Until woken with enough waited.
         let enough = Arc::new(AtomicBool::new(false));

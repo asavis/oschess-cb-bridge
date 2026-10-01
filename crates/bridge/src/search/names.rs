@@ -648,6 +648,7 @@ impl BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::workers::tests::unbusy;
 
     /// A chunk as a names file holds it: first, count, names, lower, ends,
     /// lower ends, given.
@@ -913,7 +914,10 @@ mod tests {
         let t = table(&names.iter().map(String::as_str).collect::<Vec<_>>());
         let latest = std::sync::Arc::new(AtomicU64::new(0));
         let old = Cancel::newest(&latest);
-        assert!(joint_ranks(&[&t], &old).is_ok() && groups(&t, &old).is_ok(), "not superseded yet");
+        assert!(
+            unbusy(|| joint_ranks(&[&t], &old)).is_ok() && unbusy(|| groups(&t, &old)).is_ok(),
+            "not superseded yet"
+        );
         let _newer = Cancel::newest(&latest);
         assert!(matches!(joint_ranks(&[&t], &old), Err(SearchError::Superseded)));
         assert!(matches!(groups(&t, &old), Err(SearchError::Superseded)));

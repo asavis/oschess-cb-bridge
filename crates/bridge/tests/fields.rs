@@ -7,7 +7,7 @@ use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
 use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
 mod common;
-use common::{app_of, get, member, objects, serve, string_member};
+use common::{TestBridge, app_of, get, member, objects, string_member};
 
 /// A date (year, month, day, 0 unknown), an ECO field as stored, and a round
 /// and sub-round as 2CBH stores them, signed.
@@ -60,7 +60,8 @@ fn numbers(body: &str) -> Vec<u32> {
 fn the_list_the_search_and_the_pgn_agree() {
     let db = database("fields");
     let path = db.dir().join("db.2cbh");
-    let port = serve(app_of([path.clone()]));
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let port = bridge.port;
     let id = id_of(&path);
     let list = get_ok(port, &format!("/v1/databases/{id}/games?limit=20"));
     let rows = objects(&list, "rows");
