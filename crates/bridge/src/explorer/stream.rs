@@ -46,7 +46,7 @@ use super::format::{NO_MOVE, Outcome, pack_move};
 use super::map::Map;
 
 pub const MAGIC: [u8; 8] = *b"OSCBMOV\0";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const HEADER_LEN: usize = 128;
 /// The words of a line kept in its record's slot: the tree's depth, 20 plies,
 /// and one more, the move from its last position.
@@ -58,6 +58,9 @@ pub const SLOT_BYTES: usize = 64;
 /// Where a slot's prefix words start, and where its CRC is.
 const PREFIX_AT: usize = 16;
 const CRC_AT: usize = SLOT_BYTES - 4;
+/// Where a slot keeps the move number of a set-up start (#272): the
+/// number the start's side to move plays next, 0 for the standard start.
+const START_MOVE_AT: usize = CRC_AT - 2;
 /// A set-up start in a tail: 18 words.
 pub const SETUP_BYTES: usize = 36;
 /// The most plies of a line the stream keeps; the line ends there.
@@ -316,8 +319,9 @@ pub fn setup_of(board: &Board) -> [u8; SETUP_BYTES] {
     s
 }
 
-/// The position [`setup_of`] wrote; `None` when the bytes hold none.
-pub fn board_of(s: &[u8]) -> Option<Board> {
+/// The position [`setup_of`] wrote, at move `number`; `None` when the bytes
+/// hold none.
+pub fn board_of(s: &[u8], number: u16) -> Option<Board> {
     let s: &[u8; SETUP_BYTES] = s.try_into().ok()?;
     let mut b = BoardBuilder::empty();
     for i in 0..64u8 {
@@ -340,6 +344,7 @@ pub fn board_of(s: &[u8]) -> Option<Board> {
         }
     }
     b.en_passant_file = (s[34] < 8).then_some(s[34]);
+    b.fullmove_number = number.max(1);
     b.build().ok()
 }
 
@@ -730,6 +735,7 @@ pub(super) struct Record<'a> {
     prefix: &'a [u8],
     past: &'a [u8],
     setup: Option<&'a [u8]>,
+    start_move: u16,
 }
 
 impl<'a> Record<'a> {
@@ -744,6 +750,7 @@ impl<'a> Record<'a> {
             prefix: &slot[PREFIX_AT..PREFIX_AT + 2 * plies.min(PREFIX_WORDS)],
             past,
             setup: (setup > 0).then_some(start),
+            start_move: u16::from_le_bytes([slot[START_MOVE_AT], slot[START_MOVE_AT + 1]]),
         }
     }
 
@@ -758,9 +765,9 @@ impl<'a> Record<'a> {
         (self.prefix.as_chunks::<2>().0, self.past.as_chunks::<2>().0)
     }
 
-    /// The set-up start; `None` for the standard one.
+    /// The set-up start, at its move number; `None` for the standard one.
     pub fn start(&self) -> Result<Option<Board>, Bad> {
-        self.setup.map(|s| board_of(s).ok_or(Bad::Corrupt("stream set-up"))).transpose()
+        self.setup.map(|s| board_of(s, self.start_move).ok_or(Bad::Corrupt("stream set-up"))).transpose()
     }
 }
 
@@ -819,6 +826,11 @@ mod tests {
         Some((words, n.is_multiple_of(11).then(|| setup_of(&Board::from_fen(fen).unwrap()))))
     }
 
+    /// The move number record `n`'s set-up start is at, when it has one.
+    fn start_move_of(n: u32) -> u16 {
+        (n % 997 + 1) as u16
+    }
+
     /// A stream of records `1..=records`, more than a block, written by two
     /// workers whose appends interleave and whose blocks end in reverse
     /// order; each block's tails fill the buffer more than once.
@@ -832,7 +844,9 @@ mod tests {
         for n in 1..=split {
             for (part, number) in [(&mut a, n), (&mut b, n + split)] {
                 if let Some((words, setup)) = line_of(number).filter(|_| number <= records) {
-                    part.add(&Line::of(number, words, setup, Outcome::Draw)).unwrap();
+                    let mut line = Line::of(number, words, setup, Outcome::Draw);
+                    line.start_move = setup.map_or(0, |_| start_move_of(number));
+                    part.add(&line).unwrap();
                 }
             }
         }
@@ -861,7 +875,9 @@ mod tests {
                     assert!(game.entry.indexed(), "{n}");
                     assert_eq!(game.words, words, "{n}");
                     assert_eq!(game.entry.setup(), setup.is_some(), "{n}");
-                    assert_eq!(game.start.map(|b| setup_of(&b)), setup, "{n}");
+                    assert_eq!(game.start.as_ref().map(setup_of), setup, "{n}");
+                    let number = game.start.as_ref().map(Board::fullmove_number);
+                    assert_eq!(number, setup.map(|_| start_move_of(n)), "the set-up start's move number: {n}");
                     assert_eq!(game.entry.outcome(), Outcome::Draw);
                     games += 1;
                     plies += words.len() as u64;
@@ -906,7 +922,7 @@ mod tests {
         for (at, what) in [
             (slot_of[9] + 5, "plies"),
             (slot_of[9] + PREFIX_AT + 3, "prefix"),
-            (slot_of[9] + 58, "zero"),
+            (slot_of[9] + START_MOVE_AT, "start-move"),
             (slot_of[9] + CRC_AT + 1, "crc"),
             (tail_of + 600, "tail"),
         ] {
@@ -984,7 +1000,7 @@ mod tests {
         for (what, change, sound) in [
             ("entry", Change::Byte(2, 5), [false, true]),
             ("prefix", Change::Byte(2, PREFIX_AT + 3), [false, true]),
-            ("zero", Change::Byte(2, 58), [false, true]),
+            ("start-move", Change::Byte(2, START_MOVE_AT), [false, true]),
             ("crc", Change::Byte(2, CRC_AT + 1), [false, true]),
             ("last-block", Change::Byte(last, 0), [true, false]),
             ("within", Change::Exchange(2, 9), [false, true]),
@@ -1057,7 +1073,7 @@ mod tests {
             let board = Board::from_fen(fen).unwrap();
             let s = setup_of(&board);
             assert_eq!(s[35], 0);
-            let back = board_of(&s).unwrap();
+            let back = board_of(&s, 1).unwrap();
             assert_eq!(back.hash(), board.hash(), "{fen}");
             assert_eq!(back.fen().split(' ').take(4).collect::<Vec<_>>(), fen.split(' ').take(4).collect::<Vec<_>>());
         }
@@ -1066,6 +1082,6 @@ mod tests {
         // does not hold it either.
         let no_capture = Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - e3 0 1").unwrap();
         assert_eq!(setup_of(&no_capture)[34], 8);
-        assert_eq!(board_of(&[0; SETUP_BYTES]), None, "no kings");
+        assert_eq!(board_of(&[0; SETUP_BYTES], 1), None, "no kings");
     }
 }

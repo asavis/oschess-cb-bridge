@@ -616,7 +616,7 @@ others.
 | `exclude` | Pieces none of which stands on its square, written as `look`; at most four on one square |
 | `material` | Counts of each side's kinds: `Q0,q0,R1..2,p..4`, a kind's letter (no king) and a count, or a range `a..b` with either end open, from 0 to 16; a kind named once at most. A kind left out is any count |
 | `mirror` | `none` (the default); `horizontal`, the fragment flipped a↔h as well; `vertical`, flipped rank 1↔8 with the colours changed as well, so `Bh7` finds a white bishop on h7 or a black one on h2; `both`, all four forms. Material is never mirrored |
-| `first`, `last` | Move numbers from 1 to 999 (default 1 and 999): a position counts only from move `first` to move `last`, the move number being the one its side to move plays next |
+| `first`, `last` | Move numbers from 1 to 999 (default 1 and 999): a position counts only from move `first` to move `last`, the move number being the one its side to move plays next. A set-up game's moves are numbered from its start's move number, as the database stores it |
 | `length` | Plies, 1 to 99 (default 1): the fragment and the material must hold for that many positions in a row |
 
 A game matches when its main line, from its start, holds the fragment, in

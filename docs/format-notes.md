@@ -650,7 +650,7 @@ it means the same in any position and needs no board to decode.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBMOV\0` |
-  | 8 | 4 | format version, 3 |
+  | 8 | 4 | format version, 4 |
   | 12 | 4 | header length, 128 |
   | 16 | 1 | prefix words per record, *W* = 21 |
   | 20 | 4 | first record, 1 |
@@ -666,8 +666,9 @@ it means the same in any position and needs no board to decode.
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
   The other bytes are zero. Version 1, whose directory, prefix and tail
-  areas lay apart with a CRC for each MiB, and version 2, whose block table
-  held no CRCs of the blocks' slots, are rebuilt.
+  areas lay apart with a CRC for each MiB, version 2, whose block table
+  held no CRCs of the blocks' slots, and version 3, whose slots kept no
+  set-up start's move number (#272), are rebuilt.
 - **Body**, from 128 to the block table: the tails and the blocks of slots,
   each starting at a multiple of 64 bytes, in the order the build's workers
   appended them. A worker takes the records of one block at a time and
@@ -685,7 +686,7 @@ it means the same in any position and needs no board to decode.
   | 6 | 2 | bits 0-1: outcome (white, draw, black, other, as the index counts it); bits 2-13: average rating, as the index ranks by it; bit 14: set-up start; bit 15: indexed (a standard game, not deleted, whose moves could be read) |
   | 8 | 8 | home-pawn departures: bits 0-59 the first 15 home pawns to leave home, in order, 4 bits each (white a-h 0-7, black a-h 8-15); bits 60-63 how many, 15 meaning 15 or 16 |
   | 16 | 42 | words 0 to *W* − 1 of its line, then `0xffff` after its end |
-  | 58 | 2 | zero |
+  | 58 | 2 | the move number of a set-up start, as the database stores it (the move its side to move plays next); 0 for the standard start |
   | 60 | 4 | CRC-32 of the record's number (4 bytes), bytes 0-59 and its tail |
 
   A record the index does not hold has zeros for bytes 0-15 and no words.

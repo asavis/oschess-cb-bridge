@@ -29,6 +29,10 @@ const GREEK_GIFT: &str = "e2e4 e7e6 d2d4 d7d5 b1c3 g8f6 c1g5 f8e7 e4e5 f6d7 h2h4
 const BISHOP_H2: &str = "h2h4 e7e6 h1h3 f8d6 h3a3 d6h2 a3a4";
 /// A rook endgame, set up.
 const ROOK_ENDING: &str = "4k3/r7/8/8/8/8/R7/4K3 w - - 0 1";
+/// The same set up at move 30, black to move, and a white rook alone at
+/// move 50: their move numbers are the set-up's own.
+const ROOK_ENDING_30: &str = "4k3/r7/8/8/8/8/R7/4K3 b - - 0 30";
+const ROOK_AT_50: &str = "4k3/8/8/8/8/8/R7/4K3 w - - 0 50";
 
 /// A record of the fixture: its start, the standard one without, its moves
 /// in UCI, and whether it is deleted.
@@ -100,6 +104,8 @@ fn games() -> Vec<Game> {
         standard(GREEK_GIFT),
         standard(BISHOP_H2),
         Game { start: Some(ROOK_ENDING), ucis: "a2a3 a7a6 e1e2 e8e7 a3a4".into(), deleted: false },
+        Game { start: Some(ROOK_ENDING_30), ucis: "a7a6 a2a3 e8e7 a3a4".into(), deleted: false },
+        Game { start: Some(ROOK_AT_50), ucis: String::new(), deleted: false },
         Game { start: None, ucis: NAJDORF.into(), deleted: true },
         standard(&format!("{}e2e4", hops(6))),
     ];
@@ -113,7 +119,7 @@ fn move_record(g: &Game) -> Vec<u16> {
     if let Some(fen) = g.start {
         let board = Board::from_fen(fen).unwrap();
         let side = u16::from(board.side_to_move() == CColor::Black);
-        stream.extend([movetable::START_POSITION, 1, side, 0]);
+        stream.extend([movetable::START_POSITION, board.fullmove_number(), side, 0]);
         for i in 0..64u8 {
             if let Some((p, c)) = board.piece_at(Square::from_index(i).unwrap()) {
                 let color = if c == CColor::White { Color::White } else { Color::Black };
@@ -300,6 +306,10 @@ fn wants() -> Vec<Want> {
         // The rook ending's white rook on a3 is this one mirrored a↔h.
         Want::new(&[("look", "Rh3"), ("material", "R1,r1,P0,p0"), ("mirror", "both")]),
         Want::new(&[("or", "Ke2,ke7"), ("material", "Q0"), ("length", "3")]),
+        // A set-up start's moves are numbered from its own move number.
+        Want::new(&[("look", "Ra2"), ("first", "50"), ("last", "50")]),
+        Want::new(&[("look", "Ra2,ke8"), ("last", "1")]),
+        Want::new(&[("look", "ra6"), ("first", "31"), ("last", "31")]),
     ]
 }
 

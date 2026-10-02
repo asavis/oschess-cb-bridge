@@ -161,6 +161,9 @@ enum MaskState {
     Building {
         progress: Arc<Progress>,
         stop: Arc<AtomicBool>,
+        /// The index whose masks are built once this build, stopped, has
+        /// ended, with their progress: both write the same file.
+        next: Option<(Arc<Loaded>, Arc<Progress>)>,
     },
     Ready(Arc<masks::Masks>),
     /// The build failed at `at`: requests are answered so for a minute, or
@@ -181,9 +184,22 @@ struct MaskBuilds {
     /// Searches by a fragment or by material replay every game, without
     /// masks: `cbtool profile-serve --no-masks` compares the two.
     off: AtomicBool,
+    /// Where a test holds the next build before it starts.
+    #[cfg(test)]
+    pause: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl MaskBuilds {
+    fn new(activity: Arc<Activity>) -> MaskBuilds {
+        MaskBuilds {
+            slots: Mutex::default(),
+            activity,
+            off: AtomicBool::new(false),
+            #[cfg(test)]
+            pause: Mutex::default(),
+        }
+    }
+
     /// The masks of the games of database `id`'s index `loaded`: the ones in
     /// memory, else the file kept beside the index for that build, else the
     /// build that makes them, started now on a thread of its own at
@@ -193,21 +209,26 @@ impl MaskBuilds {
     fn lookup(self: &Arc<Self>, id: &str, loaded: &Arc<Loaded>) -> MaskLookup {
         let build_id = loaded.stream.header.build_id;
         let mut slots = lock(&self.slots);
-        if let Some(slot) = slots.get(id) {
-            match &slot.state {
+        if let Some(slot) = slots.get_mut(id) {
+            match &mut slot.state {
                 MaskState::Ready(m) if slot.build_id == build_id => return MaskLookup::Ready(Arc::clone(m)),
-                MaskState::Building { progress, stop } => {
+                MaskState::Building { progress, stop, next } => {
                     if slot.build_id == build_id {
                         return MaskLookup::Pending(Arc::clone(progress));
                     }
-                    // It stops at its next block of games, and ends then.
+                    // It stops at its next block of games; the masks of
+                    // `loaded` are built once it has ended.
                     stop.store(true, Ordering::Relaxed);
+                    if let Some((_, waiting)) = next.as_ref().filter(|(n, _)| n.stream.header.build_id == build_id) {
+                        return MaskLookup::Pending(Arc::clone(waiting));
+                    }
                     let waiting = Arc::new(Progress::default());
                     waiting.start("masks", u64::from(loaded.records()));
+                    *next = Some((Arc::clone(loaded), Arc::clone(&waiting)));
                     return MaskLookup::Pending(waiting);
                 }
                 MaskState::Failed { at, why, again }
-                    if slot.build_id == build_id && !again && at.elapsed() < RETRY_AFTER_FAILURE =>
+                    if slot.build_id == build_id && !*again && at.elapsed() < RETRY_AFTER_FAILURE =>
                 {
                     return MaskLookup::Failed(why.clone());
                 }
@@ -221,12 +242,32 @@ impl MaskBuilds {
             slots.insert(id.to_string(), MaskSlot { build_id, state: MaskState::Ready(Arc::clone(&m)) });
             return MaskLookup::Ready(m);
         }
-        let (progress, stop) = (Arc::new(Progress::default()), Arc::new(AtomicBool::new(false)));
+        let progress = Arc::new(Progress::default());
         progress.start("masks", u64::from(loaded.records()));
-        let state = MaskState::Building { progress: Arc::clone(&progress), stop: Arc::clone(&stop) };
+        self.start(&mut slots, id, loaded, Arc::clone(&progress));
+        match slots.get(id).map(|slot| &slot.state) {
+            Some(MaskState::Failed { why, .. }) => MaskLookup::Failed(why.clone()),
+            _ => MaskLookup::Pending(progress),
+        }
+    }
+
+    /// Starts the build of the masks of database `id`'s index `loaded`, whose
+    /// state `slots` holds, on a thread of its own at below-normal priority.
+    /// Once it ends, the build of the masks of the next index starts when one
+    /// stopped it, else its masks or its failure are kept.
+    fn start(
+        self: &Arc<Self>,
+        slots: &mut HashMap<String, MaskSlot>,
+        id: &str,
+        loaded: &Arc<Loaded>,
+        progress: Arc<Progress>,
+    ) {
+        let build_id = loaded.stream.header.build_id;
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = MaskState::Building { progress: Arc::clone(&progress), stop: Arc::clone(&stop), next: None };
         slots.insert(id.to_string(), MaskSlot { build_id, state });
-        drop(slots);
-        let (all, key, loaded, p) = (Arc::clone(self), id.to_string(), Arc::clone(loaded), Arc::clone(&progress));
+        let (all, key, loaded) = (Arc::clone(self), id.to_string(), Arc::clone(loaded));
+        let path = masks::path_of(&loaded.base.path);
         // Counted among the catalog's background work until its masks are
         // written or given up (#236).
         let active = self.activity.begin(MASKS);
@@ -234,10 +275,19 @@ impl MaskBuilds {
             std::thread::Builder::new().name("bridge-masks".into()).stack_size(crate::THREAD_STACK).spawn(move || {
                 let _active = active;
                 crate::machine::follow(crate::machine::Priority::BelowNormal);
-                let result = masks::build(&loaded.stream, &path, &p, &Cancel::when(&stop));
+                #[cfg(test)]
+                if let Some(pause) = lock(&all.pause).take() {
+                    let _ = pause.recv();
+                }
+                let result = masks::build(&loaded.stream, &path, &progress, &Cancel::when(&stop));
                 let mut slots = lock(&all.slots);
                 // Masks of a build of the index no longer wanted are left as they are.
                 let Some(slot) = slots.get_mut(&key).filter(|s| s.build_id == build_id) else { return };
+                if let MaskState::Building { next: Some((next, waiting)), .. } = &slot.state {
+                    let (next, waiting) = (Arc::clone(next), Arc::clone(waiting));
+                    all.start(&mut slots, &key, &next, waiting);
+                    return;
+                }
                 slot.state = match result {
                     Ok(m) => MaskState::Ready(Arc::new(m)),
                     Err(unbuilt) => {
@@ -249,11 +299,9 @@ impl MaskBuilds {
             });
         if spawned.is_err() {
             let why = "the masks thread could not start".to_string();
-            let failed = MaskState::Failed { at: Instant::now(), why: why.clone(), again: true };
-            lock(&self.slots).insert(id.to_string(), MaskSlot { build_id, state: failed });
-            return MaskLookup::Failed(why);
+            let failed = MaskState::Failed { at: Instant::now(), why, again: true };
+            slots.insert(id.to_string(), MaskSlot { build_id, state: failed });
         }
-        MaskLookup::Pending(progress)
     }
 
     /// Whether database `id` has masks in memory, built or not, or a build
@@ -269,11 +317,14 @@ impl MaskBuilds {
 
     /// Lets go of the masks of database `id`. A build of them is stopped and
     /// kept until it ends, so that no other build writes its file meanwhile
-    /// ([`MaskBuilds::lookup`]).
+    /// ([`MaskBuilds::lookup`]), and no build follows it.
     fn forget(&self, id: &str) {
         let mut slots = lock(&self.slots);
-        match slots.get(id).map(|slot| &slot.state) {
-            Some(MaskState::Building { stop, .. }) => stop.store(true, Ordering::Relaxed),
+        match slots.get_mut(id).map(|slot| &mut slot.state) {
+            Some(MaskState::Building { stop, next, .. }) => {
+                stop.store(true, Ordering::Relaxed);
+                *next = None;
+            }
             _ => drop(slots.remove(id)),
         }
     }
@@ -350,11 +401,7 @@ impl Registry {
             seen: Mutex::default(),
             keeping: Mutex::default(),
             limits: Mutex::default(),
-            masks: Arc::new(MaskBuilds {
-                slots: Mutex::default(),
-                activity: Arc::clone(&activity),
-                off: AtomicBool::new(false),
-            }),
+            masks: Arc::new(MaskBuilds::new(Arc::clone(&activity))),
             activity,
         }
     }
@@ -995,6 +1042,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The database changed while its masks were built (#272): the build for
+    /// the former index is stopped and leaves no file, and the masks of the
+    /// new index are built once it has ended, with no other request.
+    #[test]
+    fn the_masks_of_a_new_index_follow_a_stopped_build() {
+        let db = e4s("explorer-masks-next");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-masks-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        catalog.explorer.set_dir(dir.clone());
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        let built = |sub: &str| {
+            let (dir, id) = (dir.join(sub), &entry.id);
+            Arc::new(prepare_with(&*open.db, open.generation, &dir, id, &Progress::default(), &patient()).unwrap())
+        };
+        let (old, new) = (built("old"), built("new"));
+        assert_ne!(old.stream.header.build_id, new.stream.header.build_id);
+        // The build of the former index's masks waits until released.
+        let (release, held) = mpsc::channel();
+        *lock(&catalog.explorer.masks.pause) = Some(held);
+        let MaskLookup::Pending(_) = catalog.explorer.masks(&entry.id, &old) else { panic!("not building") };
+        let MaskLookup::Pending(waiting) = catalog.explorer.masks(&entry.id, &new) else { panic!("not waiting") };
+        let MaskLookup::Pending(again) = catalog.explorer.masks(&entry.id, &new) else { panic!("not waiting") };
+        assert!(Arc::ptr_eq(&waiting, &again), "the new masks wait with one progress");
+        release.send(()).unwrap();
+        catalog.settle(workers::tests::PATIENCE).unwrap();
+        assert!(!masks::path_of(&old.base.path).exists(), "the stopped build left a file");
+        assert!(masks::Masks::open(&masks::path_of(&new.base.path), &new.stream).is_some(), "no new masks");
+        let MaskLookup::Ready(_) = catalog.explorer.masks(&entry.id, &new) else {
+            panic!("the new masks are not kept")
+        };
+        drop((old, new));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The builds count as the catalog's work until none waits or runs
     /// (#236): while another database's build holds the queue, before the
     /// build a request queued, settling gives up at its limit naming the
@@ -1290,8 +1373,11 @@ mod tests {
         }
         *lock(&catalog.explorer.state(building)) = State::Working(Arc::new(Progress::default()));
         // A build of masks (#272) writes its file as an index build does.
-        let mask_build =
-            MaskState::Building { progress: Arc::new(Progress::default()), stop: Arc::new(AtomicBool::new(false)) };
+        let mask_build = MaskState::Building {
+            progress: Arc::new(Progress::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+            next: None,
+        };
         lock(&catalog.explorer.masks.slots).insert(masking.into(), MaskSlot { build_id: 1, state: mask_build });
         let names = || {
             let mut n: Vec<String> =
