@@ -82,7 +82,11 @@ fn status_and_databases() {
     let r = start(&db, vec![pgn, PathBuf::from("/no/such/base.2cbh")], None);
     let s = get_reply(r.port, "/v1/status");
     assert_eq!(s.status, 200, "{}", s.body);
-    assert!(has_members(&s.body, r#""bridge":{"version":"test","api":1,"features":["explorerSearch"]}"#), "{}", s.body);
+    assert!(
+        has_members(&s.body, r#""bridge":{"version":"test","api":1,"features":["explorerSearch","fragmentSearch"]}"#),
+        "{}",
+        s.body
+    );
     // The PGN file is opened in the background: its index is built first.
     assert!(
         s.body.contains(r#""ready":1"#) && s.body.contains(r#""missing":1"#) && s.body.contains(r#""opening":1"#),

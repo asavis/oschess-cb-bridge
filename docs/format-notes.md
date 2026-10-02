@@ -747,6 +747,71 @@ it means the same in any position and needs no board to decode.
   drops both files as a failed CRC does. The games beyond the tree's plies
   are those the replay above finds.
 
+## Masks (the bridge's own file)
+
+`<id>.masks` (#272), beside the move stream: for each record, what its main
+line ever had, so that a search by a position fragment or by material rules
+most games out before it replays the rest from the move stream. It plays the
+part of ChessBase's search booster (`.cbb`), in a layout of its own: a
+database's `.cbb` is never read, since it may be missing or stale, and the
+Mega Database, a 2CBH database, has none.
+
+- **Built on demand**, by the first search by a fragment on the database,
+  from the move stream of the index it searches: on a thread of its own at
+  below-normal priority, its records replayed on at most half the search
+  workers, 4,096 at a time. A build writes `<id>.masks.partial`, then renames
+  it; one stopped, because its index was replaced meanwhile, removes its
+  file, and the next build waits for it to end. It belongs to the stream's
+  build: a stream of another build, after the database changed, makes it
+  stale. The build of a new index deletes it first and, when the database
+  had masks, builds them again once the index is ready.
+- **Header** (64 bytes):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 8 | magic `OSCBMSK\0` |
+  | 8 | 4 | format version, 1 |
+  | 12 | 4 | row length, 64 |
+  | 16 | 4 | rows per block, *B* = 4,096 |
+  | 20 | 4 | first record, as in the stream |
+  | 24 | 4 | last record, *R*, as in the stream |
+  | 32 | 8 | build id of the stream it was built from |
+  | 40 | 4 | blocks, ⌈*R*/*B*⌉ |
+  | 44 | 4 | CRC-32 of the block table |
+  | 60 | 4 | CRC-32 of bytes 0-59 |
+
+  The other bytes are zero. A file whose header does not match the stream,
+  or whose length is not the header's, is built again.
+- **Row**, 64 bytes a record, in record order from offset 64. Every position
+  of the main line, the start included, adds to it:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 16 | the squares white's, then black's pawns stood on, a bit a square, a1 bit 0 to h8 bit 63 |
+  | 16 | 16 | the same for knights and bishops |
+  | 32 | 16 | the same for rooks and queens |
+  | 48 | 10 | for white, then black, and for pawns, knights, bishops, rooks and queens, a byte: the least the side had in its low half, the most in its high half, 15 meaning 15 or more |
+  | 58 | 1 | bit 0: indexed, as in the stream's slot |
+  | 59 | 5 | zero |
+
+  A record the index does not hold is all zeros. Kings are not kept, so a
+  fragment's king never rules a game out.
+- **Block table**, after the rows: the CRC-32 of each block's rows, 4 bytes
+  a block. The table is checked against the header's CRC when the file
+  opens, and a block against its CRC the first time a search reads it while
+  the file is open. A failure drops the index and its masks, as a damaged
+  stream does. A file takes 64 bytes a record, 4 a block and 64 more.
+- **Ruling games out.** A game may match only when, for some form of the
+  fragment, each piece of Look-for (but a king) stood on its square in the
+  line's pawns, minor pieces or major pieces, and when an Or names pieces,
+  one of them did (a king always may), and each material range meets the
+  least and the most of its kind. Points and Exclude rule nothing out. The
+  rest are replayed from the move stream, unchecked, until the first
+  stretch that holds the filter; a replay stops early once the line has
+  fewer men or pawns of a side than every form and the material need, or
+  lacks a pawn on its home rank that every form looks for, as a line only
+  ever loses those.
+
 # The classic format (`.cbh`)
 
 `cbformat::cbh` reads the previous ChessBase format, the `.cbh` family, from

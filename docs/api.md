@@ -129,18 +129,18 @@ with them.
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
 | 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
-| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer and the games of a position, `state: "indexing"` with `progress` while the position index is built or waits to be built |
-| 409 | `superseded` | A newer search (`q` or `fen`) on the same database replaced this one while it ran; the page shows the newer answer |
+| 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer and the games of a position or of a fragment, `state: "indexing"` with `progress` while the position index is built or waits to be built, or a fragment search's masks are built |
+| 409 | `superseded` | A newer search (`q`, `fen` or a fragment) on the same database replaced this one while it ran; the page shows the newer answer |
 | 413 | `body_not_allowed` | The request has a body |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
-| 422 | `unsupported` | The position or variant of the explorer or of `fen` is Chess960, which the position index does not hold; `variant` names it |
+| 422 | `unsupported` | The position or variant of the explorer, of `fen` or of a fragment is Chess960, which the position index does not hold; `variant` names it |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `internal` | A bug; the bridge logs it with the database's `id`, in `bridge.log` in its data folder and, in a console, on standard error |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
-| 503 | `index_unavailable` | The position index could not be built; the message says why, too little free disk space among the reasons, and the next request after a minute tries again |
+| 503 | `index_unavailable` | The position index, or the masks of a fragment search, could not be built; the message says why, too little free disk space among the reasons, and the next request after a minute tries again |
 | 503 | `busy` | Too many open connections, too many large answers being sent at once, or search memory taken by other searches; `Retry-After: 1` |
 
 ## Database identity and generations
@@ -255,7 +255,7 @@ streams; a forgotten stream starts afresh.
 
 ```json
 {
-  "bridge": { "version": "0.4.0", "api": 1, "features": ["explorerSearch"] },
+  "bridge": { "version": "0.4.0", "api": 1, "features": ["explorerSearch", "fragmentSearch"] },
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
   "download": { "present": 104857600, "total": 734003200 },
   "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ],
@@ -266,7 +266,9 @@ streams; a forgotten stream starts afresh.
 The web app calls it first. `api` below the version it was written for means
 the bridge is too old; the app then offers the download link. `features`
 names the optional features of version 1 this bridge has, each once (#270):
-`explorerSearch`, the explorer's `q` and its `filter` acknowledgement (#268).
+`explorerSearch`, the explorer's `q` and its `filter` acknowledgement (#268);
+`fragmentSearch`, the games of a position fragment and of material, with
+their `fragment` acknowledgement (#272, [Games of a fragment](#games-of-a-fragment)).
 A client offers a feature only when it finds it named. A bridge older than
 the list sends no `features`, which a client reads as an empty list, and a
 client ignores names it does not know (Compatibility, rule 2: a field only
@@ -279,7 +281,9 @@ be built (see `GET /v1/databases/{id}/explorer`). Each has the database
 `id`, its `phase`, and `done` of `total`. The phases are `waiting` (queued
 behind another build), `checking` (records), `reading` (records),
 `positions` (the tree's entries) and `structures` (the deep section's
-postings). A client shows a phase it does not know as it shows these.
+postings), and `masks` while the masks of a database's games are built for a
+search by a fragment ([Games of a fragment](#games-of-a-fragment)). A client
+shows a phase it does not know as it shows these.
 `engine` names the engine the analysis
 board can use (see `GET /v1/engine/analyze`), or is `null` when `bridge.toml`
 names none. The name is the one the engine gave for itself, or its file's
@@ -469,7 +473,7 @@ of the same games answers, apart from what the format has otherwise:
 ### `GET /v1/databases/{id}/games`
 
 One window of the database's records, sorted and optionally searched or
-narrowed to the games of a position.
+narrowed to the games of a position or of a position fragment.
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -480,7 +484,8 @@ narrowed to the games of a position.
 | `stream` | | The client's name for this list, which lets a newer search replace an older one ([Cancellation](#cancellation)); an invalid name is `400 bad_request` |
 | `line` | | Plies of each game's main line to add to its row, 1 to 60 (below); any other value is `400 bad_request`. Without it, rows are as shown |
 | `fen` | | A position in FEN: the window holds only the games whose main line reaches it, at any ply ([Games of a position](#games-of-a-position)); `total` counts them |
-| `variant` | `standard` | With `fen`: any value other than `standard` is `422 unsupported` |
+| `variant` | `standard` | With `fen` or a fragment: any value other than `standard` is `422 unsupported` |
+| `look`, `nowhite`, `noblack`, `or`, `exclude`, `material`, `mirror`, `first`, `last`, `length` | | A position fragment and material: the window holds only the games whose main line holds them ([Games of a fragment](#games-of-a-fragment)); `total` counts them |
 
 Sort keys: `number`, `white`, `black`, `whiteElo`, `blackElo`, `result`,
 `moves`, `eco`, `tournament` (alias `event`), `date`, `round`, `annotator` —
@@ -521,7 +526,7 @@ and has no other key.
 
 | Field | Meaning |
 |---|---|
-| `total` | Rows matching `q` and `fen` (all records without either) |
+| `total` | Rows matching `q` and `fen` or a fragment (all records without any) |
 | `number` | The record's number in the database, from 1, as ChessBase numbers it |
 | `kind` | `game`, `text` (a guiding text) or `analysis` |
 | `white`, `black`, `event`, `site`, `annotator` | As in the PGN tags; empty when unknown. Names are `Last, First`; a classic database's annotator is as stored |
@@ -593,6 +598,89 @@ the index also checks those first plies against their CRCs, once: some 8 ms
 more for 12 million generated games on 16 threads. The result is kept with the
 latest searches, so the next windows of the same position, sort and `q` are
 read from it, in about 2 ms.
+
+#### Games of a fragment
+
+A position fragment and material find games by what stands where, as the
+Position and Material tabs of ChessBase's game filter do (#272): the games
+whose main line holds them, at some ply, each game once. Every parameter is
+optional, but `mirror`, `first`, `last` and `length` apply only to one of the
+others.
+
+| Parameter | Meaning |
+|---|---|
+| `look` | Pieces that all stand on their squares: `Nd5,pd6`, a piece's letter as FEN writes it (white in upper case, `K Q R B N P`) and its square, comma-separated, 32 at most |
+| `nowhite` | Squares no white piece stands on: `c2,c4`. With `noblack` on the same square, the square is empty. ChessBase's white and black points |
+| `noblack` | Squares no black piece stands on |
+| `or` | Pieces of which at least one stands on its square, written as `look` |
+| `exclude` | Pieces none of which stands on its square, written as `look`; at most four on one square |
+| `material` | Counts of each side's kinds: `Q0,q0,R1..2,p..4`, a kind's letter (no king) and a count, or a range `a..b` with either end open, from 0 to 16; a kind named once at most. A kind left out is any count |
+| `mirror` | `none` (the default); `horizontal`, the fragment flipped a↔h as well; `vertical`, flipped rank 1↔8 with the colours changed as well, so `Bh7` finds a white bishop on h7 or a black one on h2; `both`, all four forms. Material is never mirrored |
+| `first`, `last` | Move numbers from 1 to 999 (default 1 and 999): a position counts only from move `first` to move `last`, the move number being the one its side to move plays next |
+| `length` | Plies, 1 to 99 (default 1): the fragment and the material must hold for that many positions in a row |
+
+A game matches when its main line, from its start, holds the fragment, in
+one of its forms, and the material, for `length` consecutive positions whose
+move numbers lie from `first` to `last`. A position holds the fragment when
+every piece of `look` stands on its square, no white piece on a `nowhite`
+square and no black one on a `noblack` square, no piece of `exclude` on its
+square, and, when `or` names pieces, one of them on its square. As with
+`fen`, the games are standard chess only, from the standard start or a set-up
+position, never deleted games, guiding texts or analyses, and only main
+lines: a variation is not searched.
+
+Each row gains one more field, the first match:
+
+| Field | Meaning |
+|---|---|
+| `match.ply` | The first position of the first such stretch: 0 is the game's start position, `n` the position after its `n`th move, so a client opens the game there |
+
+    "match": { "ply": 24 }
+
+`q` narrows the games further, a game matching both. `sort`, `offset`,
+`limit`, `stream` and `line` apply as without a fragment, and `total` counts
+the games that match. `fen` together with a fragment or material is
+`400 bad_request` naming `fen`.
+
+The answer acknowledges the filter as `position` acknowledges `fen`, every
+parameter in one form, the fragment's pieces ordered by colour, kind and
+square:
+
+    "fragment": { "look": "Nd5,pd6", "nowhite": "", "noblack": "", "or": "", "exclude": "", "material": "", "mirror": "horizontal", "first": 1, "last": 999, "length": 1, "games": 4182 }
+
+`games` counts the games that match before `q`. A bridge without this search
+ignores its parameters and answers the whole list without `fragment`: a
+client that sent a fragment and finds no `fragment` treats the list as not
+filtered. `/v1/status` names the search among its features,
+`fragmentSearch`, and a client offers it only then.
+
+A parameter that cannot be read is `400 bad_request` naming it: a piece or a
+square that is not one, more than 32 pieces on a board or four on an
+Exclude square, an empty or doubled material range, a mirror, move number or
+length out of its bounds, `first` after `last`, or `mirror`, `first`, `last`
+or `length` without a fragment or material. A `variant` other than `standard`
+is `422 unsupported`.
+
+The search needs the position index, and the index's masks of the games:
+for each game, the squares each side's pawns, minor pieces and major pieces
+stood on and the least and the most of each kind it had, at any ply. A game
+whose masks lack what the filter needs cannot match, and is never replayed;
+the others are replayed from the index's move stream. The first search by a
+fragment on a database starts the masks' build, as ChessBase's search
+booster: until the index and then the masks are ready, the request is
+answered `409 database_unavailable` with `state: "indexing"` and `progress`,
+whose `phase` is `masks` while they are built, and `/v1/status` lists the
+build under `indexing`. The masks are kept beside the index, 64 bytes a
+record, and belong to its build: a change to the database, which builds the
+index again, makes them stale, and a database that has masks has them built
+again right after its new index, before a search asks for them. A build
+that fails is answered `503 index_unavailable` for a minute, and the next
+request tries again. A database's own `.cbb` is never read.
+
+The result is kept with the latest searches, so the next windows of the same
+filter, sort and `q` are read from it; `match.ply` is found again for the
+window's games alone. A newer search in the same `stream` replaces a running
+one ([Cancellation](#cancellation)).
 
 ### `GET /v1/databases/{id}/games/{number}`
 
