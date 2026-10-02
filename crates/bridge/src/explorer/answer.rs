@@ -26,6 +26,7 @@ use crate::store::{Head, Store, with_store};
 use super::file::Bad;
 use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, order_moves, rank_top, structure, unpack_move};
 use super::masks::Masks;
+use super::recent;
 use super::runs::Progress;
 use super::source::average_elo;
 use super::stream::{Hit, Target};
@@ -61,8 +62,13 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(loaded) => loaded,
         Err(answer) => return answer,
     };
+    // Searches read the heads file when one is ready, as a list's do. Its
+    // build starts with the explorer's first answer, once the index is
+    // ready, so that a search that narrows a later answer finds it (#268):
+    // without it, the search's one pass reads every record of the database.
+    app.catalog.attach_heads(entry, &open);
     if let Some(q) = narrowing {
-        return match narrowed(app, entry, &open, &loaded, &board, &q) {
+        return match narrowed(&open, &loaded, &board, &q) {
             Ok((stats, games)) => ok(render_with(&open.db, &board, stats, &loaded, Some(Filter { q: &q, games }))),
             Err(Narrowing::Search(e)) => crate::api::search_error(app, entry, open.generation, e),
             Err(Narrowing::Index(Bad::Busy)) => busy(),
@@ -90,16 +96,13 @@ enum Narrowing {
 /// the next positions ([`search::matching`]). Each is replayed from the move
 /// stream to its first visit, where the move it played from there, its
 /// outcome and its rating are read. `None` when no game is selected.
-fn narrowed(
-    app: &App,
-    entry: &Entry,
-    open: &Opened,
-    loaded: &Loaded,
-    board: &Board,
-    q: &str,
-) -> Result<(Option<Stats>, u64), Narrowing> {
-    // Searches read the heads file when one is ready, as a list's do.
-    app.catalog.attach_heads(entry, open);
+fn narrowed(open: &Opened, loaded: &Loaded, board: &Board, q: &str) -> Result<(Option<Stats>, u64), Narrowing> {
+    // The same position and search asked for again are answered from the
+    // latest answers kept.
+    let key = (loaded.stream.header.build_id, open.generation, board.hash(), q.trim().to_string());
+    if let Some(kept) = recent::cache().get(&key) {
+        return Ok((kept.stats.clone(), kept.games));
+    }
     let selected = match search::matching(&open.db, &open.indexes, q).map_err(Narrowing::Search)? {
         Some(selected) => selected,
         None => return Err(Narrowing::Search(SearchError::Bug("a search with terms selects a set"))),
@@ -107,7 +110,10 @@ fn narrowed(
     let cancel = Cancel::never();
     let games = super::positions::games(loaded, board, &cancel).map_err(Narrowing::Search)?;
     let found = walk(loaded, board, &games, &selected, &cancel).map_err(Narrowing::Index)?;
-    Ok((found.filter(|f| f.counts.games > 0).map(Found::into_stats), games.count()))
+    let stats = found.filter(|f| f.counts.games > 0).map(Found::into_stats);
+    let games = games.count();
+    recent::cache().put(key, Arc::new(recent::Narrowed { stats: stats.clone(), games }));
+    Ok((stats, games))
 }
 
 /// The games of `board` in `games` that are in `selected`, each replayed to
