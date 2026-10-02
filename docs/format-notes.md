@@ -696,7 +696,8 @@ it means the same in any position and needs no board to decode.
   a byte for the side to move, 0 white; a byte of castling rights, bits as in
   the set-up section above; the en passant file 0-7 when a capture is
   possible, else 8; a zero byte); then words *W* to plies − 1. A start equal
-  to the standard one is no set-up. A file takes 64 bytes a record and 2
+  to the standard one at move 1 is no set-up; at any other move it is one,
+  so that its moves keep their numbers. A file takes 64 bytes a record and 2
   bytes for each ply past the 21st, 36 more for a set-up start, up to 63
   bytes of padding after each append of tails, and 12 bytes a block.
 - **Block table**, at the end of the body: for each block the offset of its

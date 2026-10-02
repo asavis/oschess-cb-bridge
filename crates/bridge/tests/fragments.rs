@@ -33,6 +33,8 @@ const ROOK_ENDING: &str = "4k3/r7/8/8/8/8/R7/4K3 w - - 0 1";
 /// move 50: their move numbers are the set-up's own.
 const ROOK_ENDING_30: &str = "4k3/r7/8/8/8/8/R7/4K3 b - - 0 30";
 const ROOK_AT_50: &str = "4k3/8/8/8/8/8/R7/4K3 w - - 0 50";
+/// The standard start's pieces, at move 50: a set-up all the same.
+const START_AT_50: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 50";
 
 /// A record of the fixture: its start, the standard one without, its moves
 /// in UCI, and whether it is deleted.
@@ -106,6 +108,7 @@ fn games() -> Vec<Game> {
         Game { start: Some(ROOK_ENDING), ucis: "a2a3 a7a6 e1e2 e8e7 a3a4".into(), deleted: false },
         Game { start: Some(ROOK_ENDING_30), ucis: "a7a6 a2a3 e8e7 a3a4".into(), deleted: false },
         Game { start: Some(ROOK_AT_50), ucis: String::new(), deleted: false },
+        Game { start: Some(START_AT_50), ucis: "e2e4 e7e5".into(), deleted: false },
         Game { start: None, ucis: NAJDORF.into(), deleted: true },
         standard(&format!("{}e2e4", hops(6))),
     ];
@@ -118,8 +121,15 @@ fn move_record(g: &Game) -> Vec<u16> {
     let mut stream = Vec::new();
     if let Some(fen) = g.start {
         let board = Board::from_fen(fen).unwrap();
+        let castling = [(CColor::White, 1, 0), (CColor::White, 2, 7), (CColor::Black, 4, 0), (CColor::Black, 8, 7)]
+            .iter()
+            .filter(|(c, _, file)| {
+                let side = if *file == 7 { chesscore::CastleSide::Short } else { chesscore::CastleSide::Long };
+                board.castling_rook(*c, side).is_some()
+            })
+            .fold(0u16, |bits, (_, bit, _)| bits | bit);
         let side = u16::from(board.side_to_move() == CColor::Black);
-        stream.extend([movetable::START_POSITION, board.fullmove_number(), side, 0]);
+        stream.extend([movetable::START_POSITION, board.fullmove_number(), side | castling << 8, 0]);
         for i in 0..64u8 {
             if let Some((p, c)) = board.piece_at(Square::from_index(i).unwrap()) {
                 let color = if c == CColor::White { Color::White } else { Color::Black };
@@ -310,6 +320,7 @@ fn wants() -> Vec<Want> {
         Want::new(&[("look", "Ra2"), ("first", "50"), ("last", "50")]),
         Want::new(&[("look", "Ra2,ke8"), ("last", "1")]),
         Want::new(&[("look", "ra6"), ("first", "31"), ("last", "31")]),
+        Want::new(&[("look", "Ke1,Pe4"), ("first", "50"), ("last", "50")]),
     ]
 }
 

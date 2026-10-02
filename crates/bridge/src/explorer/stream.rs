@@ -348,7 +348,8 @@ pub fn board_of(s: &[u8], number: u16) -> Option<Board> {
     b.build().ok()
 }
 
-/// The standard start as [`setup_of`] writes it: a line from it is no set-up.
+/// The standard start as [`setup_of`] writes it: a line from it at move 1 is
+/// no set-up.
 pub(super) fn standard_setup() -> &'static [u8; SETUP_BYTES] {
     static START: OnceLock<[u8; SETUP_BYTES]> = OnceLock::new();
     START.get_or_init(|| setup_of(standard()))

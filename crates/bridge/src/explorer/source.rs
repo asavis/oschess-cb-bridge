@@ -100,8 +100,11 @@ impl Line {
     /// Notes the line's start, `board`: a set-up start is kept.
     fn start(&mut self, board: &Board) {
         let setup = stream::setup_of(board);
-        self.setup = (setup != *stream::standard_setup()).then_some(setup);
-        self.start_move = self.setup.map_or(0, |_| board.fullmove_number().max(1));
+        // A start at another move than the first is kept, whatever its
+        // pieces: its moves are numbered from it (#272).
+        let number = board.fullmove_number().max(1);
+        self.setup = (setup != *stream::standard_setup() || number != 1).then_some(setup);
+        self.start_move = self.setup.map_or(0, |_| number);
         self.home = stream::home_pawns(board);
     }
 
