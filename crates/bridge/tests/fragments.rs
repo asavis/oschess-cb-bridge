@@ -177,7 +177,7 @@ fn database(name: &str, games: &[Game]) -> TempDb {
 /// A filter as the test reads it, apart from the bridge's own reading: its
 /// parameters, and the brute force that finds its games.
 struct Want {
-    params: Vec<(&'static str, &'static str)>,
+    params: Vec<(&'static str, String)>,
 }
 
 /// A piece a board lists: its colour, its kind and its square.
@@ -208,11 +208,11 @@ fn flip(sq: Square, files: bool, ranks: bool) -> Square {
 }
 
 impl Want {
-    fn new(params: &[(&'static str, &'static str)]) -> Want {
-        Want { params: params.to_vec() }
+    fn new(params: &[(&'static str, &str)]) -> Want {
+        Want { params: params.iter().map(|(n, v)| (*n, v.to_string())).collect() }
     }
 
-    fn param(&self, name: &str) -> &'static str {
+    fn param(&self, name: &str) -> &str {
         self.params.iter().find(|(n, _)| *n == name).map_or("", |(_, v)| v)
     }
 
@@ -324,6 +324,75 @@ fn wants() -> Vec<Want> {
     ]
 }
 
+/// `n` filters drawn from `seed`, each from a position of a game of
+/// `games`: some of its men to look for, at times a point, an Or, an
+/// Exclude, a material range, a mirror and a window, so that most find games
+/// and the rest test what finds none.
+fn random_wants(games: &[Game], n: usize, seed: u64) -> Vec<Want> {
+    let mut x = seed | 1;
+    let mut next = move |below: usize| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % below as u64) as usize
+    };
+    let letter = |(p, c): (CPiece, CColor)| {
+        let l = match p {
+            CPiece::King => 'K',
+            CPiece::Queen => 'Q',
+            CPiece::Rook => 'R',
+            CPiece::Bishop => 'B',
+            CPiece::Knight => 'N',
+            CPiece::Pawn => 'P',
+        };
+        if c == CColor::White { l } else { l.to_ascii_lowercase() }
+    };
+    (0..n)
+        .map(|_| {
+            let game = &games[next(games.len())];
+            let positions = game.positions();
+            let board = &positions[next(positions.len())];
+            let squares: Vec<Square> = (0..64u8).filter_map(Square::from_index).collect();
+            let (taken, empty): (Vec<Square>, Vec<Square>) =
+                squares.iter().partition(|&&sq| board.piece_at(sq).is_some());
+            let man = |sq: Square| format!("{}{sq}", letter(board.piece_at(sq).unwrap()));
+            let mut params: Vec<(&'static str, String)> = Vec::new();
+            let look: Vec<String> = (0..1 + next(3)).map(|_| man(taken[next(taken.len())])).collect();
+            params.push(("look", look.join(",")));
+            if next(3) == 0 {
+                params.push((["nowhite", "noblack"][next(2)], empty[next(empty.len())].to_string()));
+            }
+            if next(4) == 0 {
+                let absent = format!("{}{}", ['Q', 'r', 'B', 'n'][next(4)], empty[next(empty.len())]);
+                params.push(("or", format!("{},{absent}", man(taken[next(taken.len())]))));
+            }
+            if next(4) == 0 {
+                params.push(("exclude", format!("{}{}", ['P', 'n', 'B', 'q'][next(4)], empty[next(empty.len())])));
+            }
+            if next(4) == 0 {
+                let (piece, color) = [(CPiece::Pawn, CColor::White), (CPiece::Rook, CColor::Black)][next(2)];
+                let count = taken.iter().filter(|&&sq| board.piece_at(sq) == Some((piece, color))).count();
+                params.push((
+                    "material",
+                    format!("{}{}..{}", letter((piece, color)), count.saturating_sub(1), count + 1),
+                ));
+            }
+            if next(2) == 0 {
+                params.push(("mirror", ["horizontal", "vertical", "both"][next(3)].to_string()));
+            }
+            let at = usize::from(board.fullmove_number());
+            if next(3) == 0 {
+                params.push(("first", (1 + next(at)).to_string()));
+                params.push(("last", (at + next(20)).to_string()));
+            }
+            if next(3) == 0 {
+                params.push(("length", (1 + next(4)).to_string()));
+            }
+            Want { params }
+        })
+        .collect()
+}
+
 /// The path of the list of the games of database `id` that `want` finds,
 /// with `extra` parameters.
 fn list(id: &str, want: &Want, extra: &str) -> String {
@@ -367,6 +436,16 @@ fn served(name: &str, masks_off: bool) -> (Vec<Game>, TempDb, TestBridge, String
 fn every_filter_lists_the_games_a_replay_finds_with_masks_and_without() {
     for masks_off in [false, true] {
         let (games, _db, bridge, id, dir) = served(if masks_off { "oracle-plain" } else { "oracle" }, masks_off);
+        let mut found = 0;
+        for want in random_wants(&games, 60, 0x2720_f4a6_0001) {
+            let expected = want.games(&games);
+            let body = answered(bridge.port, &list(&id, &want, ""));
+            let got: BTreeMap<u32, u32> = rows(&body).into_iter().map(|(n, ply)| (n, ply.unwrap())).collect();
+            assert_eq!(got, expected, "{}", want.query());
+            assert!(body.contains(&format!(r#""total":{},"#, expected.len())), "{body}");
+            found += usize::from(!expected.is_empty());
+        }
+        assert!(found > 40, "{found} of 60 drawn filters find games");
         for want in wants() {
             let expected = want.games(&games);
             let body = answered(bridge.port, &list(&id, &want, ""));

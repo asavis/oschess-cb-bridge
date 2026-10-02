@@ -35,6 +35,11 @@ pub const MAX_LENGTH: u16 = 99;
 /// The highest count a material range names: a side has 16 men at most.
 pub const MAX_COUNT: u8 = 16;
 
+/// The squares any man stands on.
+fn occupied(r: &Replayer) -> Bitboard {
+    r.colors(Color::White) | r.colors(Color::Black)
+}
+
 /// Each side's pawns' home rank ([`Color::index`]): white's second, black's
 /// seventh.
 const HOME_RANKS: [Bitboard; 2] = [0x0000_0000_0000_ff00, 0x00ff_0000_0000_0000];
@@ -143,6 +148,9 @@ pub struct Filter {
     /// form, which is also the filter's key among the latest searches.
     text: [(&'static str, String); 7],
     pub key: u64,
+    /// The squares any form of the fragment names: a move that changes none
+    /// of them leaves the fragment held or not as it was.
+    squares: Bitboard,
 }
 
 fn refuse(name: &'static str, message: impl Into<String>) -> Refusal {
@@ -351,7 +359,10 @@ impl Filter {
         ];
         let mut hasher = std::hash::DefaultHasher::new();
         ("fragment", &text, first, last, length).hash(&mut hasher);
-        Ok(Some(Filter { variants, material, first, last, length, text, key: hasher.finish() }))
+        let squares = variants.iter().fold(0, |all, v| {
+            all | v.nowhite | v.noblack | [v.look, v.or, v.exclude].iter().flatten().flatten().fold(0, |a, b| a | b)
+        });
+        Ok(Some(Filter { variants, material, first, last, length, text, key: hasher.finish(), squares }))
     }
 
     /// The filter as the answer acknowledges it, with the games that match
@@ -371,7 +382,12 @@ impl Filter {
     /// Whether the position `r` holds the fragment, in any of its forms, and
     /// the material.
     pub fn holds(&self, r: &Replayer) -> bool {
-        self.material_holds(r) && self.variants.iter().any(|v| v.holds(r))
+        self.material_holds(r) && self.fragment_holds(r)
+    }
+
+    /// Whether the position `r` holds the fragment, in any of its forms.
+    fn fragment_holds(&self, r: &Replayer) -> bool {
+        self.variants.iter().any(|v| v.holds(r))
     }
 
     fn material_holds(&self, r: &Replayer) -> bool {
@@ -422,26 +438,46 @@ impl Filter {
         let (moves, mut words) = (moves(), words);
         let mut stretch: Option<u32> = None;
         let mut ply = 0u32;
+        // What the position holds, found again only after a move that can
+        // change it: the fragment when the move changes one of its squares,
+        // the material when it captures or promotes, and the reach when it
+        // captures or moves a pawn.
+        let (mut fragment, mut material) = (self.fragment_holds(&r), self.material_holds(&r));
+        let mut reachable = !self.out_of_reach(&r);
         loop {
             let number = fullmove + (ply + black_first) / 2;
             if number > last {
                 return Ok(None);
             }
-            if number >= first && self.holds(&r) {
+            if number >= first && fragment && material {
                 let from = *stretch.get_or_insert(ply);
                 if ply - from + 1 >= length {
                     return Ok(Some(from));
                 }
             } else {
                 stretch = None;
-                if self.out_of_reach(&r) {
+                if !reachable {
                     return Ok(None);
                 }
             }
             let Some(word) = words.next() else { return Ok(None) };
             let mv = moves.get(usize::from(word)).copied().flatten().ok_or(Bad::Corrupt("stream word"))?;
+            let (before, pawns) = (occupied(&r), r.pieces(Piece::Pawn));
             r.play(mv);
             ply += 1;
+            // Castling and en passant change squares beside the move's own.
+            let after = occupied(&r);
+            let changed = (before ^ after) | mv.from.bit() | mv.to.bit();
+            let captured = before.count_ones() != after.count_ones();
+            if changed & self.squares != 0 {
+                fragment = self.fragment_holds(&r);
+            }
+            if captured || mv.promotion.is_some() {
+                material = self.material_holds(&r);
+            }
+            if captured || pawns & mv.from.bit() != 0 {
+                reachable = !self.out_of_reach(&r);
+            }
         }
     }
 
