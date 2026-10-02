@@ -645,6 +645,44 @@ impl BitSet {
     }
 }
 
+/// Each tournament's type byte, by id (#268): what `timecontrol:` reads of a
+/// game's tournament, 0 for an unused or unreadable entry. The tournaments are
+/// read on the workers, many at a time, each worker a range of ids in order,
+/// as their names are; the bytes are held in the budget.
+pub fn tournament_kinds<S: Store>(db: &S, cancel: &Cancel) -> Result<Held<Vec<u8>>, SearchError> {
+    let count = usize::try_from(db.name_count(Kind::Tournaments)).unwrap_or(usize::MAX);
+    if count > u32::MAX as usize {
+        return Err(Refused::TooLarge.into());
+    }
+    let hold = Hold::reserve(count)?;
+    let want = threads().min(count.div_ceil(IDS_PER_WORKER_MIN)).max(1);
+    let parts = workers::run(want, NAME_WORKSPACE, cancel, |w| {
+        let per = count.div_ceil(w.count).max(1);
+        let (first, end) = ((w.index * per).min(count), ((w.index + 1) * per).min(count));
+        let mut kinds: Vec<u8> = Vec::new();
+        kinds.try_reserve_exact(end - first).map_err(|_| Refused::Busy)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(NAME_READ).map_err(|_| Refused::Busy)?;
+        buf.resize(NAME_READ, 0);
+        let mut id = first;
+        while id < end {
+            if w.stopped() || cancel.is_cancelled() {
+                return Err(SearchError::Superseded);
+            }
+            let read = db.read_tournaments(id as i64..end as i64, &mut buf, &mut |t: Option<Tournament>| {
+                kinds.push(t.map_or(0, |t| t.kind));
+                Ok::<(), SearchError>(())
+            })?;
+            id += (read as usize).max(1);
+        }
+        Ok(kinds)
+    })?;
+    let mut all = Vec::new();
+    all.try_reserve_exact(count).map_err(|_| Refused::Busy)?;
+    parts.iter().for_each(|part| all.extend_from_slice(part));
+    Ok(Held::new(all, hold))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

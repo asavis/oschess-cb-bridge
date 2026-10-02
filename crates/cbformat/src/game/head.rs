@@ -1,7 +1,7 @@
 //! A header record's fields as every format reads them (#66): what the game
 //! list, the search, the sort and the PGN take from a header, in one shape.
 
-use super::{Date, Eco, GameResult, RecordKind};
+use super::{Date, Eco, GameResult, RecordKind, TimeControl};
 
 /// A header record: a game, a guiding text or an analysis. Entity ids are
 /// those of the database's own tables, which differ between formats; every
@@ -32,4 +32,10 @@ pub trait Head: Copy + Send + Sync {
     fn move_count(&self) -> i32;
     /// The record as stored.
     fn bytes(&self) -> &[u8];
+    /// The game's own time control, where the format keeps one for each
+    /// game, as a PGN file's `TimeControl` tag does (#268); `None` where it is
+    /// the game's tournament's, as in both ChessBase formats.
+    fn time_control(&self) -> Option<TimeControl> {
+        None
+    }
 }

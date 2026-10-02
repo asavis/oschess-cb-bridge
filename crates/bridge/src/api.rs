@@ -399,7 +399,7 @@ fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
 }
 
 /// The answer to a search that could not finish.
-fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Response {
+pub(crate) fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Response {
     match e {
         SearchError::Unsupported(qualifier) => unsupported_qualifier(&qualifier),
         SearchError::Superseded => error(409, "superseded", "A newer search on this database replaced this one"),

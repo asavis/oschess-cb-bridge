@@ -107,7 +107,12 @@ impl Builder {
 
     /// Adds a tournament and returns its id.
     pub fn tournament(&mut self, title: &str, place: &str) -> u32 {
-        self.tournaments.push(data(70, &[(0, 40, title.as_bytes()), (40, 30, place.as_bytes())]));
+        self.tournament_of_kind(title, place, 0)
+    }
+
+    /// Adds a tournament whose type byte is `kind` and returns its id.
+    pub fn tournament_of_kind(&mut self, title: &str, place: &str, kind: u8) -> u32 {
+        self.tournaments.push(data(0x4b, &[(0, 40, title.as_bytes()), (40, 30, place.as_bytes()), (0x4a, 1, &[kind])]));
         self.tournaments.len() as u32 - 1
     }
 

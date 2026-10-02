@@ -163,8 +163,8 @@ fn suggestions_by_prefix_and_count() {
 #[test]
 fn texts_and_analyses_by_their_own_layout() {
     let extra = [
-        "11 | analysis | - | - | Morphy's openings | ????.??.?? | - | * | - | 0 | 0 | 0 | Tal, Mikhail",
-        "12 | text     | - | - | Aaa survey        | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm",
+        "11 | analysis | - | - | Morphy's openings | ????.??.?? | - | * | - | 0 | 0 | 0 | Tal, Mikhail | -",
+        "12 | text     | - | - | Aaa survey        | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm | -",
     ];
     let f = fixture("search-other", &extra);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
@@ -415,9 +415,9 @@ fn only_the_same_stream_supersedes() {
 #[test]
 fn classic_and_2cbh_copies_agree() {
     let extra = [
-        "11 | text | - | - | Aaa survey | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm",
-        "12 | game | Tal, Mikhail | Morphy, Paul | Aaa survey | 1960.05.07 | 3 | 1-0 | A00 | 12 | 2700 | 0 | Tal, Mikhail",
-        "13 | text | - | - | Zugzwang | ????.??.?? | - | * | - | 0 | 0 | 0 | -",
+        "11 | text | - | - | Aaa survey | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm | -",
+        "12 | game | Tal, Mikhail | Morphy, Paul | Aaa survey | 1960.05.07 | 3 | 1-0 | A00 | 12 | 2700 | 0 | Tal, Mikhail | normal",
+        "13 | text | - | - | Zugzwang | ????.??.?? | - | * | - | 0 | 0 | 0 | - | -",
     ];
     let (f2, fc) = (fixture("search-pair-2cbh", &extra), classic_fixture("search-pair-cbh", &extra));
     let two = Base::open(f2.dir().join("db.2cbh")).unwrap();

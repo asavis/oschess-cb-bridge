@@ -34,7 +34,10 @@ const TOURNAMENT_TITLE: Range<usize> = 0..40;
 const TOURNAMENT_PLACE: Range<usize> = 40..70;
 /// The start date, an `int`.
 const TOURNAMENT_START: Range<usize> = 0x46..0x4a;
-const TOURNAMENT_DATA: usize = end(&[TOURNAMENT_TITLE, TOURNAMENT_PLACE, TOURNAMENT_START]);
+/// The type byte (#268): every `.cbt` of the 251 databases examined stores 90
+/// bytes of data a record.
+const TOURNAMENT_KIND: Range<usize> = 0x4a..0x4b;
+const TOURNAMENT_DATA: usize = end(&[TOURNAMENT_TITLE, TOURNAMENT_PLACE, TOURNAMENT_START, TOURNAMENT_KIND]);
 const ANNOTATOR_NAME: Range<usize> = 0..45;
 const ANNOTATOR_DATA: usize = end(&[ANNOTATOR_NAME]);
 /// The source's title.
@@ -169,6 +172,7 @@ impl Entities {
             title: text(field(&d, TOURNAMENT_TITLE)),
             place: text(field(&d, TOURNAMENT_PLACE)),
             start: Date(field(&d, TOURNAMENT_START).try_into().map_or(0, i32::from_le_bytes)),
+            kind: field(&d, TOURNAMENT_KIND).first().copied().unwrap_or(0),
         }))
     }
 

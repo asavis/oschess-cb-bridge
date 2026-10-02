@@ -14,7 +14,7 @@
 //! | Offset | Size | Field |
 //! |---|---|---|
 //! | 0 | 8 | `OSPGNIDX` |
-//! | 8 | 4 | version, 2 |
+//! | 8 | 4 | version, 3 |
 //! | 12 | 4 | record size, 48 |
 //! | 16 | 8 | the stamp the index was built for, which its user chooses |
 //! | 24 | 8 | bytes of the PGN file read |
@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use crate::bytes::Fields;
 use crate::codepage::CodePage;
 use crate::file::DbFile;
-use crate::game::{Date, Eco, GameResult, Head, Player, RecordKind, Tournament};
+use crate::game::{Date, Eco, GameResult, Head, Player, RecordKind, TimeControl, Tournament};
 use crate::recordfile::{RecordFile, over_limit};
 use crate::{Error, Result};
 
@@ -54,8 +54,9 @@ const HEADER_SIZE: u64 = 64;
 const MAGIC: &[u8; 8] = b"OSPGNIDX";
 /// The index format's version, which an index must carry to be opened.
 /// Raise it whenever the index's layout changes, or the text it yields for
-/// the same file does, as the decoding of code page text did in #120.
-pub const VERSION: u32 = 2;
+/// the same file does, as the decoding of code page text did in #120, and the
+/// time control a record keeps did in #268.
+pub const VERSION: u32 = 3;
 /// Bytes of one entry of the name table: where its text starts in the index
 /// file (8 bytes), then its length (4).
 const ENTRY_SIZE: u64 = 12;
@@ -99,7 +100,8 @@ const PAGE_AT: usize = 56;
 // length (4); the white and black players, the tournament and the annotator
 // (4 each, ids in their tables stored one higher, 0 for none); the date (4);
 // the round, sub-round, white's and black's ratings, the ECO code and the
-// move count (2 each); the result and the flags (1 each). The rest is zero.
+// move count (2 each); the result, the flags and the time control's bits (1
+// each, #268). The rest is zero.
 const OFFSET_AT: usize = 0;
 const LEN_AT: usize = 8;
 const WHITE_AT: usize = 12;
@@ -115,6 +117,7 @@ const ECO_AT: usize = 40;
 const MOVES_AT: usize = 42;
 const RESULT_AT: usize = 44;
 const FLAGS_AT: usize = 45;
+const TIME_CONTROL_AT: usize = 46;
 
 /// The header of one game, as the index keeps it.
 #[derive(Clone, Copy)]
@@ -172,6 +175,9 @@ impl Head for Record {
     fn bytes(&self) -> &[u8] {
         Record::bytes(self)
     }
+    fn time_control(&self) -> Option<TimeControl> {
+        Some(Record::time_control(self))
+    }
 }
 
 impl Record {
@@ -214,6 +220,10 @@ impl Record {
     }
     pub fn played_date(&self) -> Date {
         Date(self.b.le_i32::<DATE_AT>())
+    }
+    /// The time control its `TimeControl` tag gives ([`TimeControl::of_pgn`]).
+    pub fn time_control(&self) -> TimeControl {
+        TimeControl::of_kind(self.b[TIME_CONTROL_AT])
     }
     /// Round and sub-round; 0 when unknown.
     pub fn round(&self) -> (i16, i16) {
@@ -355,6 +365,7 @@ impl Building {
             flags |= FLAG_SETUP;
         }
         b.put::<FLAGS_AT, 1>([flags]);
+        b.put::<TIME_CONTROL_AT, 1>([TimeControl::of_pgn(tag(Tag::TimeControl)).bits()]);
         Ok(b)
     }
 }
@@ -720,7 +731,12 @@ impl Database {
 
     pub fn tournament_within(&self, id: i64, limit: usize) -> Result<Option<Tournament>> {
         let Some(slot) = self.slot(NameKind::Tournaments, id) else { return Ok(None) };
-        Ok(Some(Tournament { title: self.name(slot, limit)?, place: self.name(slot + 1, limit)?, start: Date(0) }))
+        Ok(Some(Tournament {
+            title: self.name(slot, limit)?,
+            place: self.name(slot + 1, limit)?,
+            start: Date(0),
+            kind: 0,
+        }))
     }
 
     pub fn annotator(&self, id: i64) -> Result<Option<String>> {

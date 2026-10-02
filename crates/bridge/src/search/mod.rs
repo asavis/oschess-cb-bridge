@@ -55,6 +55,8 @@ pub struct Indexes {
     /// Where annotators are not players.
     annotators: Slot<NameTable>,
     titles: Slot<NameTable>,
+    /// Each tournament's type byte, by id, for `timecontrol:` (#268).
+    tournament_kinds: Slot<Held<Vec<u8>>>,
     player_ranks: Slot<Held<Vec<Vec<u32>>>>,
     annotator_ranks: Slot<Held<Vec<Vec<u32>>>>,
     /// Tournaments and titles in one name order: `[tournaments, titles]`.
@@ -268,6 +270,7 @@ impl Evict for Indexes {
         clear(&self.tournaments);
         clear(&self.annotators);
         clear(&self.titles);
+        clear(&self.tournament_kinds);
     }
 }
 
@@ -609,12 +612,17 @@ fn search<S: Store>(
     };
     let events = uses(&[Field::Text, Field::Event]);
     let (tournaments, titles) = (load(events, Kind::Tournaments)?, load(events, Kind::Titles)?);
+    let kinds = match uses(&[Field::TimeControl]) {
+        true => Some(cached(&idx.tournament_kinds, || names::tournament_kinds(db, ctl.cancel))?),
+        false => None,
+    };
     let tables = scan::Tables {
         players: players.as_deref(),
         annotators: annotators.as_deref(),
         annotators_are_players: S::ANNOTATORS_ARE_PLAYERS,
         tournaments: tournaments.as_deref(),
         titles: titles.as_deref(),
+        tournament_kinds: kinds.as_deref().map(|k| k.as_slice()),
     };
     let sets = Mutex::new(Hold::default());
     let matcher = scan::Matcher::new(query, &tables, &mut Allowance::new(&sets))?;

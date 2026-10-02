@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cbformat::game::{ROUND_TEXT_BYTES, round_text};
+use cbformat::game::{ROUND_TEXT_BYTES, TimeControl, round_text};
 use cbformat::v2::HEADER_RECORD_SIZE;
 
 use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
@@ -182,6 +182,17 @@ enum Test {
     Round(String),
     Moves(IntCmp),
     Elo(IntCmp),
+    WhiteElo(IntCmp),
+    BlackElo(IntCmp),
+    /// A game of time control `class` (#268): one whose own time control is
+    /// of it, where its format keeps one ([`Head::time_control`]), else one
+    /// whose tournament is: for a normal game, a tournament outside `marked`,
+    /// the tournaments marked with any time control; else one inside it, the
+    /// tournaments marked with `class`.
+    TimeControl {
+        class: TimeControl,
+        marked: BitSet,
+    },
     Never,
 }
 
@@ -208,6 +219,9 @@ pub struct Tables<'a> {
     pub annotators_are_players: bool,
     pub tournaments: Option<&'a NameTable>,
     pub titles: Option<&'a NameTable>,
+    /// Each tournament's type byte, by id; `None` where no term reads the time
+    /// control (#268).
+    pub tournament_kinds: Option<&'a [u8]>,
 }
 
 /// The fields of a record that is not a game: guiding texts and analyses have
@@ -228,7 +242,7 @@ impl<'a> Matcher<'a> {
     /// The query compiled against `tables`; the id sets its name terms need
     /// are taken from `allow`.
     pub fn new(query: &Query, tables: &Tables<'a>, allow: &mut Allowance<'_>) -> Result<Matcher<'a>, Refused> {
-        let mut set = |t: Option<&NameTable>, needle: &str| match t {
+        let set = |t: Option<&NameTable>, needle: &str, allow: &mut Allowance<'_>| match t {
             Some(t) => t.containing(needle, allow),
             None => BitSet::new(0, allow),
         };
@@ -239,21 +253,21 @@ impl<'a> Matcher<'a> {
                 let needle = v.text.to_lowercase();
                 tests.push(match term.field {
                     Field::Text => Test::Text {
-                        players: set(tables.players, &needle)?,
+                        players: set(tables.players, &needle, allow)?,
                         annotators: match tables.annotators_are_players {
                             true => None,
-                            false => Some(set(tables.annotators, &needle)?),
+                            false => Some(set(tables.annotators, &needle, allow)?),
                         },
-                        tournaments: set(tables.tournaments, &needle)?,
-                        titles: set(tables.titles, &needle)?,
+                        tournaments: set(tables.tournaments, &needle, allow)?,
+                        titles: set(tables.titles, &needle, allow)?,
                     },
-                    Field::White => Test::Players(set(tables.players, &needle)?, Role::White),
-                    Field::Black => Test::Players(set(tables.players, &needle)?, Role::Black),
-                    Field::Player => Test::Players(set(tables.players, &needle)?, Role::Either),
-                    Field::Annotator => Test::Players(set(tables.annotators, &needle)?, Role::Annotator),
+                    Field::White => Test::Players(set(tables.players, &needle, allow)?, Role::White),
+                    Field::Black => Test::Players(set(tables.players, &needle, allow)?, Role::Black),
+                    Field::Player => Test::Players(set(tables.players, &needle, allow)?, Role::Either),
+                    Field::Annotator => Test::Players(set(tables.annotators, &needle, allow)?, Role::Annotator),
                     Field::Event => Test::Event {
-                        tournaments: set(tables.tournaments, &needle)?,
-                        titles: set(tables.titles, &needle)?,
+                        tournaments: set(tables.tournaments, &needle, allow)?,
+                        titles: set(tables.titles, &needle, allow)?,
                     },
                     Field::Result => Test::Result(v.text.clone()),
                     Field::Round => Test::Round(needle),
@@ -261,6 +275,12 @@ impl<'a> Matcher<'a> {
                     Field::Date => date_test(v),
                     Field::Moves => Test::Moves(int_cmp(v)),
                     Field::Elo => Test::Elo(int_cmp(v)),
+                    Field::WhiteElo => Test::WhiteElo(int_cmp(v)),
+                    Field::BlackElo => Test::BlackElo(int_cmp(v)),
+                    Field::TimeControl => match time_control(&v.text) {
+                        Some(class) => Test::TimeControl { class, marked: marked(tables, class, allow)? },
+                        None => Test::Never,
+                    },
                 });
             }
             terms.push(CompiledTerm { negated: term.negated, tests });
@@ -277,6 +297,31 @@ impl<'a> Matcher<'a> {
         }
         self.terms.iter().all(|t| t.tests.iter().any(|test| test.holds(r, other.as_ref())) != t.negated)
     }
+}
+
+/// The time control a `timecontrol:` value names; `None` for any other value.
+fn time_control(value: &str) -> Option<TimeControl> {
+    Some(match value {
+        "normal" => TimeControl::NORMAL,
+        "rapid" => TimeControl::RAPID,
+        "blitz" => TimeControl::BLITZ,
+        "correspondence" => TimeControl::CORRESPONDENCE,
+        _ => return None,
+    })
+}
+
+/// The ids of the tournaments whose type bytes mark them with time control
+/// `class`, or with any for [`TimeControl::NORMAL`], which none marks.
+fn marked(tables: &Tables<'_>, class: TimeControl, allow: &mut Allowance<'_>) -> Result<BitSet, Refused> {
+    let kinds = tables.tournament_kinds.unwrap_or_default();
+    let mut set = BitSet::new(kinds.len(), allow)?;
+    for (id, &kind) in kinds.iter().enumerate() {
+        let own = TimeControl::of_kind(kind);
+        if if class == TimeControl::NORMAL { own != TimeControl::NORMAL } else { own.is(class) } {
+            set.insert(id);
+        }
+    }
+    Ok(set)
 }
 
 fn date_test(v: &Value) -> Test {
@@ -339,6 +384,20 @@ impl Test {
                 let (white, black) = r.elo();
                 [white, black].into_iter().any(|e| e > 0 && cmp.holds(i64::from(e)))
             }
+            Test::WhiteElo(cmp) => {
+                let (white, _) = r.elo();
+                white > 0 && cmp.holds(i64::from(white))
+            }
+            Test::BlackElo(cmp) => {
+                let (_, black) = r.elo();
+                black > 0 && cmp.holds(i64::from(black))
+            }
+            // A game without a tournament, or with one that cannot be read,
+            // is in no marked tournament: normal.
+            Test::TimeControl { class, marked } => match r.time_control() {
+                Some(own) => own.is(*class),
+                None => marked.contains_id(r.tournament()) != (*class == TimeControl::NORMAL),
+            },
             Test::Never => false,
         }
     }

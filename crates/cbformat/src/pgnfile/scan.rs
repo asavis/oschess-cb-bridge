@@ -12,7 +12,7 @@ use super::lex::{Sink, Token};
 use crate::game::Date;
 
 /// The tags the reader looks at, in the order of [`Tags`].
-pub const TAG_NAMES: [&str; 14] = [
+pub const TAG_NAMES: [&str; 15] = [
     "White",
     "Black",
     "Event",
@@ -27,6 +27,7 @@ pub const TAG_NAMES: [&str; 14] = [
     "FEN",
     "SetUp",
     "Variant",
+    "TimeControl",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,9 +46,10 @@ pub enum Tag {
     Fen,
     SetUp,
     Variant,
+    TimeControl,
 }
 
-const TAGS: [Tag; 14] = [
+const TAGS: [Tag; 15] = [
     Tag::White,
     Tag::Black,
     Tag::Event,
@@ -62,6 +64,7 @@ const TAGS: [Tag; 14] = [
     Tag::Fen,
     Tag::SetUp,
     Tag::Variant,
+    Tag::TimeControl,
 ];
 
 impl Tag {
@@ -74,7 +77,7 @@ impl Tag {
 /// tag. A value is at most [`super::lex::MAX_TAG_VALUE`] bytes.
 #[derive(Clone, Debug, Default)]
 pub struct Tags {
-    values: [Vec<u8>; 14],
+    values: [Vec<u8>; 15],
     present: u16,
 }
 

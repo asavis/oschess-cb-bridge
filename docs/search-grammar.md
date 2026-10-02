@@ -55,6 +55,9 @@ read whole.
 | `date:` | the date as `YYYY.MM.DD`, `?` for unknown parts | see below; comparable |
 | `moves:` | full moves of the main line | equals the whole number; comparable |
 | `elo:` | either player's rating | equals the whole number; comparable; an unknown rating (0) never matches |
+| `whiteelo:` | White's rating | as `elo:`, for White alone |
+| `blackelo:` | Black's rating | as `elo:`, for Black alone |
+| `timecontrol:`, `tc:` | the game's time control | `normal`, `rapid`, `blitz` or `correspondence` (also `corr`), ignoring case; see below |
 | `sort:` | the order of the results | see Sorting |
 
 Names are shown and matched as `Last, First`.
@@ -77,8 +80,8 @@ On the comparable fields a value may be `>v`, `>=v`, `<v`, `<=v` or a range
 `2400..` means `>=2400` and `..*` is dropped. On any other field these
 characters are part of the value.
 
-- **Numbers** (`moves:`, `elo:`): a value that is not a whole number matches
-  nothing.
+- **Numbers** (`moves:`, `elo:`, `whiteelo:`, `blackelo:`): a value that is
+  not a whole number matches nothing.
 - **ECO codes** compare as text. `>C5` and `<=C5` treat `C5` as covering every
   code that starts with it, so `eco:<=C5` includes `C59`, `eco:>C5` starts at
   `C60`, and `eco:C60..C69` includes both ends.
@@ -93,6 +96,28 @@ characters are part of the value.
     the same "covering" rule as ECO codes, and skips any date with a `?` within
     the length of its longest end (`date:>=1951-07` skips `1951.??.??`);
   - a comparison or range with an end that is not a date matches nothing.
+
+### Time control
+
+A game's time control is its tournament's, as ChessBase marks it in the
+tournament's type byte (#268): blitz, rapid or correspondence, and normal when
+none of them is marked. A tournament marked more than one way matches each.
+A game without a tournament is normal.
+
+A PGN file has no such mark: each game's own `TimeControl` tag gives it,
+classed by FIDE's limits on its first period, whose time is its seconds and 60
+times its increment:
+
+- at most 10 minutes is `blitz`, bullet included (`180+2`, `300+5`);
+- less than 60 minutes is `rapid` (`900+10`);
+- 60 minutes or more is `normal` (`5400+30`, `40/7200:3600`);
+- `-`, a period that gives an hour or more a move (`1/86400`), or an increment
+  of an hour or more is `correspondence`;
+- a missing tag, `?`, or a value not read as these forms is `normal`, as a
+  ChessBase tournament without a mark is.
+
+A sandclock period (`*180`) counts its seconds. Any other value of
+`timecontrol:` matches nothing.
 
 ## Sorting
 
@@ -130,8 +155,8 @@ ChessBase database and are ignored like any unknown key.
 
 - A bare word searches players, tournament and annotator; in the Library it
   searches a chapter's title and tags.
-- `elo:` is new here. The oschess web app offers it for ChessBase databases
-  only.
+- `elo:`, `whiteelo:`, `blackelo:` and `timecontrol:` (`tc:`) are new here.
+  The oschess web app offers them for ChessBase databases only.
 - The Library-only qualifiers are refused instead of applied.
 - The sort keys are those of the list above.
 
@@ -144,20 +169,22 @@ code. The ninth record is a game marked deleted, and deleted games are
 searched like the others. The eighth is a guiding text: its event column is
 its title and its annotator column its author, and the other columns do not
 apply to it. All records share one move record; the header's
-move count is what `moves:` reads.
+move count is what `moves:` reads. The time control is the event's, as its
+tournament's type byte marks it, and a PGN copy writes it in each game's
+`TimeControl` tag.
 
 ```fixture
-# number | kind    | white                 | black                 | event         | date       | round | result  | eco | moves | white elo | black elo | annotator
-1        | game    | Morphy, Paul          | Anderssen, Adolf      | Paris m       | 1858.12.20 | 1     | 1-0     | C52 | 17    | 0         | 0         | -
-2        | game    | Anderssen, Adolf      | Morphy, Paul          | Paris m       | 1858.12.21 | 2     | 0-1     | B20 | 32    | 0         | 0         | -
-3        | game    | Morphy, Paul          | Anderssen, Adolf      | Paris m       | 1858.12.22 | 3     | 1/2-1/2 | C51 | 45    | 0         | 0         | Nimzowitsch, Aron
-4        | game    | Steinitz, Wilhelm     | Lasker, Emanuel       | St Petersburg | 1895.12.13 | 1     | 0-1     | C62 | 60    | 2640      | 2690      | -
-5        | game    | Lasker, Emanuel       | Capablanca, Jose Raul | St Petersburg | 1914.04.21 | 1(2)  | 1/2-1/2 | D63 | 38    | 2720      | 2725      | Nimzowitsch, Aron
-6        | game    | Capablanca, Jose Raul | Lasker, Emanuel       | St Petersburg | 1914.05.10 | 7     | 1-0     | C68 | 38    | 2725      | 2720      | -
-7        | game    | Tal, Mikhail          | Lasker, Emanuel       | Riga Club Ch  | 1951.??.?? | -     | *       | -   | 0     | 2300      | 0         | -
-8        | text    | -                     | -                     | London        | ????.??.?? | -     | *       | -   | 0     | 0         | 0         | -
-9        | deleted | Morphy, Paul          | Steinitz, Wilhelm     | London        | ????.??.?? | 5     | 1-0     | C52 | 28    | 0         | 0         | -
-10       | game    | Capablanca, Jose Raul | Tal, Mikhail          | Riga Club Ch  | 1951.07.01 | 2     | 0-1     | E60 | 50    | 2500      | 2600      | Tal, Mikhail
+# number | kind    | white                 | black                 | event         | date       | round | result  | eco | moves | white elo | black elo | annotator         | time control
+1        | game    | Morphy, Paul          | Anderssen, Adolf      | Paris m       | 1858.12.20 | 1     | 1-0     | C52 | 17    | 0         | 0         | -                 | normal
+2        | game    | Anderssen, Adolf      | Morphy, Paul          | Paris m       | 1858.12.21 | 2     | 0-1     | B20 | 32    | 0         | 0         | -                 | normal
+3        | game    | Morphy, Paul          | Anderssen, Adolf      | Paris m       | 1858.12.22 | 3     | 1/2-1/2 | C51 | 45    | 0         | 0         | Nimzowitsch, Aron | normal
+4        | game    | Steinitz, Wilhelm     | Lasker, Emanuel       | St Petersburg | 1895.12.13 | 1     | 0-1     | C62 | 60    | 2640      | 2690      | -                 | rapid
+5        | game    | Lasker, Emanuel       | Capablanca, Jose Raul | St Petersburg | 1914.04.21 | 1(2)  | 1/2-1/2 | D63 | 38    | 2720      | 2725      | Nimzowitsch, Aron | rapid
+6        | game    | Capablanca, Jose Raul | Lasker, Emanuel       | St Petersburg | 1914.05.10 | 7     | 1-0     | C68 | 38    | 2725      | 2720      | -                 | rapid
+7        | game    | Tal, Mikhail          | Lasker, Emanuel       | Riga Club Ch  | 1951.??.?? | -     | *       | -   | 0     | 2300      | 0         | -                 | blitz
+8        | text    | -                     | -                     | London        | ????.??.?? | -     | *       | -   | 0     | 0         | 0         | -                 | -
+9        | deleted | Morphy, Paul          | Steinitz, Wilhelm     | London        | ????.??.?? | 5     | 1-0     | C52 | 28    | 0         | 0         | -                 | corr
+10       | game    | Capablanca, Jose Raul | Tal, Mikhail          | Riga Club Ch  | 1951.07.01 | 2     | 0-1     | E60 | 50    | 2500      | 2600      | Tal, Mikhail      | blitz
 ```
 
 ## Conformance corpus
@@ -218,6 +245,24 @@ elo:>=2700                         => 5 6
 elo:2600                           => 10
 elo:<2400                          => 7
 elo:>=2700 elo:<2721               => 5 6
+whiteelo:>=2700                    => 5 6
+whiteelo:2300..2600                => 7 10
+whiteelo:<2400                     => 7
+blackelo:>=2700                    => 5 6
+blackelo:..2600                    => 10
+blackelo:2600..                    => 4 5 6 10
+whiteelo:>=2500 blackelo:>=2600    => 4 5 6 10
+-whiteelo:>=2700                   => 1 2 3 4 7 9 10
+whiteelo:x                         => none
+timecontrol:normal                 => 1 2 3
+TimeControl:Rapid                  => 4 5 6
+tc:blitz                           => 7 10
+tc:correspondence                  => 9
+tc:corr                            => 9
+tc:normal,blitz                    => 1 2 3 7 10
+-tc:normal                         => 4 5 6 7 9 10
+tc:bullet                          => none
+tc:normal moves:>20                => 2 3
 player:morphy sort:moves           => 3 2 9 1
 player:morphy sort:moves-asc       => 1 9 2 3
 tournament:"st petersburg" sort:white => 6 5 4

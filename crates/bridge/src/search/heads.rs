@@ -26,7 +26,8 @@ use crate::store::Store;
 use crate::sync::lock;
 
 const MAGIC: [u8; 8] = *b"OSCBHDS\0";
-const VERSION: u32 = 1;
+/// 2 since a row keeps a PGN game's time control (#268).
+const VERSION: u32 = 2;
 const HEADER: usize = 64;
 /// Rows a block holds and one CRC covers: one worker's batch in a pass.
 pub const BLOCK_ROWS: u32 = super::scan::CHUNK;

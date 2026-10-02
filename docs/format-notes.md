@@ -44,6 +44,30 @@ with `(3, 2)` in place of `(3, 1)`; what follows is either further `(−1, 1)`
 pairs or zero bytes. The header size field at 0x00 is authoritative, and the
 entity blocks start there.
 
+## Tournaments: the type byte follows the start date
+
+A 2CBH tournament entity holds its place and its title as strings, then its
+start date as an `int`, and then one byte, its type (#268). The classic
+format's `.cbt` record holds the same byte at 0x4a, after the start date at
+0x46: every `.cbt` of the 251 classic databases examined stores 90 bytes of
+data a record. Its bits `0x20`, `0x40` and `0x80` mark blitz, rapid and
+correspondence, as a game quotation's copy of the byte does; the low bits are
+the kind of event.
+
+Evidence, counting tournaments whose title names the time control:
+
+- the Mega Database's 111,168 tournaments: `0x20` is set in 1,239 of the
+  1,339 whose title contains "blitz" and in 1,881 others, `0x40` in 1,588 of
+  the 1,710 whose title contains "rapid" and in 2,861 others, and `0x80` in
+  20 tournaments;
+- the 251 classic databases' tournaments: `0x80` is set in 251 of the 364
+  whose title names a correspondence event and in no other, `0x40` in 20 of
+  the 26 whose title contains "rapid", and `0x20` in 16 of the 29 whose title
+  contains "blitz".
+
+A title is a weak witness, which is why some marked tournaments name no time
+control and some that name one are not marked; the bridge reads the mark.
+
 ## Promotion captures
 
 The 16 words for a pawn capture on the rank before promotion are ordered by the

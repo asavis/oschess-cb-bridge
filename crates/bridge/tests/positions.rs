@@ -340,6 +340,142 @@ fn every_position_lists_the_games_a_replay_finds() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The ratings, result and year [`database`] gives record `n`.
+fn fields_of(n: u32) -> (i64, i64, u32, i32) {
+    let n = i64::from(n);
+    (1800 + n * 37 % 700, 1900 + n * 53 % 600, (n % 3) as u32, 1990 + (n * 7 % 35) as i32)
+}
+
+/// What a narrowed explorer answer counts, by brute force: the games of
+/// `games` that `selected` keeps and that reach `board`, each at its first
+/// visit, with the move it played from there.
+struct Narrowed {
+    games: u64,
+    /// White wins, draws and Black wins.
+    results: [u64; 3],
+    /// Each move with its games, most played first, then by its first game.
+    moves: Vec<(String, u64)>,
+    /// The numbers of the notable games, the higher average rating first,
+    /// then the later game.
+    top: Vec<u32>,
+}
+
+impl Narrowed {
+    fn of(games: &[Game], board: &Board, selected: impl Fn(u32) -> bool) -> Narrowed {
+        let (mut count, mut results) = (0, [0u64; 3]);
+        let mut moves: Vec<(String, u64, u32)> = Vec::new();
+        let mut ranked: Vec<(i64, u32)> = Vec::new();
+        for (n, g) in (1u32..).zip(games).filter(|(n, g)| g.indexed() && selected(*n)) {
+            let Some(at) = g.positions().iter().position(|p| p.hash() == board.hash()) else { continue };
+            count += 1;
+            let (white, black, result, _) = fields_of(n);
+            // Result 2 is a White win, 1 a draw and 0 a Black win.
+            results[2 - result as usize] += 1;
+            if let Some(uci) = g.ucis.split_whitespace().nth(at) {
+                match moves.iter_mut().find(|m| m.0 == uci) {
+                    Some(m) => m.1 += 1,
+                    None => moves.push((uci.to_string(), 1, n)),
+                }
+            }
+            ranked.push(((white + black) / 2, n));
+        }
+        moves.sort_by_key(|m| (std::cmp::Reverse(m.1), m.2));
+        ranked.sort_by_key(|&r| std::cmp::Reverse(r));
+        Narrowed {
+            games: count,
+            results,
+            moves: moves.into_iter().map(|m| (m.0, m.1)).collect(),
+            top: ranked.into_iter().take(12).map(|r| r.1).collect(),
+        }
+    }
+}
+
+/// A search: its text, as a parameter, and the records it selects.
+type Search = (&'static str, &'static str, fn(u32) -> bool);
+
+/// The text of the first string member `"key":"…"` of a JSON text.
+fn text<'a>(body: &'a str, key: &str) -> &'a str {
+    let pat = format!("\"{key}\":\"");
+    let at = body.find(&pat).unwrap_or_else(|| panic!("no {key} in {body}")) + pat.len();
+    &body[at..at + body[at..].find('"').unwrap()]
+}
+
+/// For every position of every game of the fixture to its 60th ply, an
+/// explorer answer narrowed by a search (#268) counts exactly the games a
+/// brute-force replay finds among those the search selects: their results,
+/// the moves they played from their first visit in order, and their notable
+/// games, and it acknowledges the search with the games before it.
+#[test]
+fn a_narrowed_answer_counts_the_games_a_replay_finds() {
+    let (games, _db, bridge, id, dir) = served("narrowed");
+    let reached = Reached::of(&games);
+    let searches: [Search; 3] = [
+        ("whiteelo:>=2100 blackelo:..2300", "whiteelo%3A%3E%3D2100%20blackelo%3A..2300", |n| {
+            let (white, black, _, _) = fields_of(n);
+            white >= 2100 && black <= 2300
+        }),
+        ("-result:1-0 date:2000..", "-result%3A1-0%20date%3A2000..", |n| {
+            let (_, _, result, year) = fields_of(n);
+            result != 2 && year >= 2000
+        }),
+        ("tc:normal", "tc%3Anormal", |_| true),
+    ];
+    let mut positions: BTreeMap<u64, Board> = BTreeMap::new();
+    for g in games.iter().filter(|g| g.kind != Kind::Chess960) {
+        for board in g.positions().into_iter().take(61) {
+            positions.entry(board.hash()).or_insert(board);
+        }
+    }
+    let (mut narrowed, mut emptied, mut kept) = (0, 0, 0);
+    for (i, board) in positions.values().enumerate() {
+        let (q, param, selected) = searches[i % searches.len()];
+        let fen = board.fen();
+        let path = format!("/v1/databases/{id}/explorer?fen={}&q={param}", fen_param(&fen));
+        let body = at_once(bridge.port, &path);
+        let want = Narrowed::of(&games, board, selected);
+        let before = reached.games(board).len() as u64;
+        assert!(body.contains(&format!(r#""filter":{{"q":"{q}","games":{before}}}"#)), "{path}: {body}");
+        let counts = (number(&body, "games"), number(&body, "white"), number(&body, "draws"), number(&body, "black"));
+        assert_eq!(counts, (want.games, want.results[0], want.results[1], want.results[2]), "{path}");
+        let moves: Vec<(String, u64)> =
+            objects(&body, "moves").iter().map(|m| (text(m, "uci").to_string(), number(m, "games"))).collect();
+        assert_eq!(moves, want.moves, "{path}");
+        let top: Vec<u32> = objects(&body, "topGames").iter().map(|g| number(g, "number") as u32).collect();
+        assert_eq!(top, want.top, "{path}");
+        narrowed += usize::from(want.games > 0 && want.games < before);
+        emptied += usize::from(want.games == 0 && before > 0);
+        kept += usize::from(want.games > 0 && want.games == before);
+    }
+    // Most positions are one game's: a search keeps it or leaves it out.
+    assert!(narrowed > 20 && emptied > 100 && kept > 100, "{narrowed} narrowed, {emptied} emptied, {kept} kept");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A search without terms, or none, leaves the answer whole and
+/// unacknowledged; a qualifier only the Library has is refused as a list
+/// refuses it, and so is the answer of a position that is not one.
+#[test]
+fn a_search_without_terms_narrows_nothing() {
+    let (_games, _db, bridge, id, dir) = served("unnarrowed");
+    let path = |extra: &str| format!("/v1/databases/{id}/explorer?fen={}{extra}", fen_param(START));
+    let whole = at_once(bridge.port, &path(""));
+    assert!(!whole.contains("\"filter\""), "{whole}");
+    for extra in ["&q=", "&q=%20%20", "&q=sort%3Adate"] {
+        assert_eq!(at_once(bridge.port, &path(extra)), whole, "{extra}");
+    }
+    let (status, body) = get(bridge.port, &path("&q=tag%3Ax"));
+    assert_eq!(
+        (status, text(&body, "code"), text(&body, "qualifier")),
+        (400, "unsupported_qualifier", "tag"),
+        "{body}"
+    );
+    let (status, body) = get(bridge.port, &format!("/v1/databases/{id}/explorer?fen=nonsense&q=tc%3Ablitz"));
+    assert_eq!((status, text(&body, "code")), (400, "bad_request"), "{body}");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The first scan of the stream reads every slot, and notes which games start
 /// from the standard position and which from a set-up one (#142); a scan for
 /// the standard start after it takes the first as they are and replays the
