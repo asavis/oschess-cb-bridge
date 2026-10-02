@@ -255,7 +255,7 @@ streams; a forgotten stream starts afresh.
 
 ```json
 {
-  "bridge": { "version": "0.4.0", "api": 1 },
+  "bridge": { "version": "0.4.0", "api": 1, "features": ["explorerSearch"] },
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
   "download": { "present": 104857600, "total": 734003200 },
   "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ],
@@ -264,7 +264,13 @@ streams; a forgotten stream starts afresh.
 ```
 
 The web app calls it first. `api` below the version it was written for means
-the bridge is too old; the app then offers the download link. `databases`
+the bridge is too old; the app then offers the download link. `features`
+names the optional features of version 1 this bridge has, each once (#270):
+`explorerSearch`, the explorer's `q` and its `filter` acknowledgement (#268).
+A client offers a feature only when it finds it named. A bridge older than
+the list sends no `features`, which a client reads as an empty list, and a
+client ignores names it does not know (Compatibility, rule 2: a field only
+added; a later feature adds its name). `databases`
 counts the databases in each state; `opening` counts the PGN files being read
 for their header index (see [PGN files](#pgn-files)). `download` is there while databases are
 being downloaded: the bytes on this computer and in all, over all of them.
