@@ -421,7 +421,7 @@ pub(crate) fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchE
 
 /// The answer to a search text that uses `qualifier`, which only the oschess
 /// Library has (`docs/search-grammar.md`).
-fn unsupported_qualifier(qualifier: &str) -> Response {
+pub(crate) fn unsupported_qualifier(qualifier: &str) -> Response {
     error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
         o.str("qualifier", qualifier)
     })

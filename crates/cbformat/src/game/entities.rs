@@ -83,9 +83,10 @@ impl TimeControl {
         }
         let first = value.split(|&b| b == b':').next().unwrap_or_default();
         let first = first.strip_prefix(b"*").unwrap_or(first);
-        let (moves, rest) = match first.iter().position(|&b| b == b'/') {
-            Some(at) => (seconds(&first[..at]), &first[at + 1..]),
-            None => (Some(1), first),
+        // A period of `moves/seconds` gives its seconds to that many moves.
+        let (moves, rest, per_moves) = match first.iter().position(|&b| b == b'/') {
+            Some(at) => (seconds(&first[..at]), &first[at + 1..], true),
+            None => (Some(1), first, false),
         };
         let (base, increment) = match rest.iter().position(|&b| b == b'+') {
             Some(at) => (seconds(&rest[..at]), seconds(&rest[at + 1..])),
@@ -93,7 +94,7 @@ impl TimeControl {
         };
         let (Some(moves), Some(base), Some(increment)) = (moves, base, increment) else { return TimeControl::NORMAL };
         const HOUR: u64 = 3_600;
-        let per_move_period = value.contains(&b'/') && moves > 0 && base / moves >= HOUR;
+        let per_move_period = per_moves && moves > 0 && base / moves >= HOUR;
         if per_move_period || increment >= HOUR {
             return TimeControl::CORRESPONDENCE;
         }
@@ -145,6 +146,11 @@ mod tests {
             ("2700+15", TimeControl::NORMAL),
             ("5400+30", TimeControl::NORMAL),
             ("40/7200:3600", TimeControl::NORMAL),
+            // Only the first period counts: a later `moves/seconds` one is not it.
+            ("3600:40/7200", TimeControl::NORMAL),
+            ("3600:/", TimeControl::NORMAL),
+            ("600:1/86400", TimeControl::BLITZ),
+            ("1/3600", TimeControl::CORRESPONDENCE),
             ("40/5400+30:1800+30", TimeControl::NORMAL),
             ("*180", TimeControl::BLITZ),
             ("-", TimeControl::CORRESPONDENCE),

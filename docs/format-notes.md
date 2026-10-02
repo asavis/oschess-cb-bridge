@@ -52,7 +52,9 @@ format's `.cbt` record holds the same byte at 0x4a, after the start date at
 0x46: every `.cbt` of the 251 classic databases examined stores 90 bytes of
 data a record. Its bits `0x20`, `0x40` and `0x80` mark blitz, rapid and
 correspondence, as a game quotation's copy of the byte does; the low bits are
-the kind of event.
+the kind of event. The reader takes the byte where a record holds it: a file of
+shorter records, which only a damaged database has, opens as before, its
+tournaments without a type, so normal.
 
 Evidence, counting tournaments whose title names the time control:
 

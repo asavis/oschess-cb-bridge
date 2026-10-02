@@ -781,8 +781,9 @@ With `q` the answer also acknowledges the search (#268):
   - `sort:` tokens are ignored, and a `q` with no term left, empty or only a
     sort, is the answer without it, with no `filter`.
   - A qualifier only the Library has is `400 unsupported_qualifier`, as in a
-    list; the other refusals, `409` while the index is built and `503`, are
-    those of the answer without `q`.
+    list, before the database or its index is looked at: such a request
+    starts no build. The other refusals, `409` while the index is built and
+    `503`, are those of the answer without `q`.
   - The records `q` selects are found by one pass over the database's
     headers and kept as a set, a bit a record, with the latest four such
     searches: the next positions narrowed by the same `q` need no pass. The

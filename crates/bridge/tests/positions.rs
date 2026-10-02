@@ -690,8 +690,9 @@ fn errors_are_the_explorers() {
 
 /// The games of a position with a `q` that uses a qualifier only the
 /// Library has are refused before the database is opened: nothing is built
-/// or queued for its index (#173). A list without the qualifier then starts
-/// the build.
+/// or queued for its index (#173), and the explorer narrowed by such a `q`
+/// is refused alike (#268). A list without the qualifier then starts the
+/// build.
 #[test]
 fn an_unsupported_qualifier_starts_no_build() {
     let games = games();
@@ -699,14 +700,16 @@ fn an_unsupported_qualifier_starts_no_build() {
     let dir = index_dir("unsupported");
     let (bridge, id) = TestBridge::database(&db, &dir);
     for qualifier in ["tag", "created", "updated", "is", "has", "no"] {
-        let (status, body) = get(bridge.port, &list(&id, START, &format!("&stream=tab&q={qualifier}%3Ax")));
-        assert_eq!(status, 400, "{body}");
-        assert_eq!(
-            body,
-            format!(
-                r#"{{"error":{{"code":"unsupported_qualifier","message":"ChessBase databases do not have this qualifier","qualifier":"{qualifier}"}}}}"#
-            )
+        let refused = format!(
+            r#"{{"error":{{"code":"unsupported_qualifier","message":"ChessBase databases do not have this qualifier","qualifier":"{qualifier}"}}}}"#
         );
+        let (status, body) = get(bridge.port, &list(&id, START, &format!("&stream=tab&q={qualifier}%3Ax")));
+        assert_eq!((status, body.as_str()), (400, refused.as_str()));
+        // The explorer narrowed by such a search is refused alike, before
+        // its index is looked at (#268).
+        let explorer = format!("/v1/databases/{id}/explorer?fen={}&q={qualifier}%3Ax", fen_param(START));
+        let (status, body) = get(bridge.port, &explorer);
+        assert_eq!((status, body.as_str()), (400, refused.as_str()));
     }
     let (_, status) = get(bridge.port, "/v1/status");
     assert!(!status.contains(r#""indexing""#), "{status}");

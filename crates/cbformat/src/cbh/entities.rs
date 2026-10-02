@@ -34,10 +34,11 @@ const TOURNAMENT_TITLE: Range<usize> = 0..40;
 const TOURNAMENT_PLACE: Range<usize> = 40..70;
 /// The start date, an `int`.
 const TOURNAMENT_START: Range<usize> = 0x46..0x4a;
-/// The type byte (#268): every `.cbt` of the 251 databases examined stores 90
-/// bytes of data a record.
+const TOURNAMENT_DATA: usize = end(&[TOURNAMENT_TITLE, TOURNAMENT_PLACE, TOURNAMENT_START]);
+/// The type byte (#268), read where a record holds it. Every `.cbt` of the
+/// 251 databases examined stores 90 bytes of data a record, but a file of
+/// shorter records opens as before, its tournaments without a type: normal.
 const TOURNAMENT_KIND: Range<usize> = 0x4a..0x4b;
-const TOURNAMENT_DATA: usize = end(&[TOURNAMENT_TITLE, TOURNAMENT_PLACE, TOURNAMENT_START, TOURNAMENT_KIND]);
 const ANNOTATOR_NAME: Range<usize> = 0..45;
 const ANNOTATOR_DATA: usize = end(&[ANNOTATOR_NAME]);
 /// The source's title.
@@ -57,7 +58,8 @@ const fn end(fields: &[Range<usize>]) -> usize {
 }
 
 /// The bytes `at` of a record's `data`, which [`EntityFile::open`] makes
-/// long enough to hold them.
+/// long enough to hold them, but for the tournament's type byte; empty where
+/// the record stops before them.
 fn field(data: &[u8], at: Range<usize>) -> &[u8] {
     data.get(at).unwrap_or_default()
 }

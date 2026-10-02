@@ -39,6 +39,15 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(board) => board,
         Err(answer) => return answer,
     };
+    // A search is read before the database: a qualifier only the Library has
+    // is refused as a list refuses it, whatever state the database is in. A
+    // search with terms narrows the answer; one without, or none, does not.
+    let q = req.param("q").map(|q| q.chars().take(MAX_QUERY_CHARS).collect::<String>());
+    let narrowing = match q.as_deref().map(query::parse) {
+        Some(Err(unsupported)) => return crate::api::unsupported_qualifier(&unsupported.0),
+        Some(Ok(parsed)) => q.filter(|_| !parsed.terms.is_empty()),
+        None => None,
+    };
     // Asked for its explorer, the database is in use: the keeper rebuilds
     // its index when it changes (#149). A request refused for its
     // parameters does not ask for it.
@@ -51,22 +60,13 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(loaded) => loaded,
         Err(answer) => return answer,
     };
-    let q = req.param("q").map(|q| q.chars().take(MAX_QUERY_CHARS).collect::<String>());
-    match q.as_deref().map(query::parse) {
-        Some(Err(unsupported)) => {
-            return crate::api::search_error(app, entry, open.generation, SearchError::Unsupported(unsupported.0));
-        }
-        // A search with terms narrows the answer; one without, or none, does not.
-        Some(Ok(parsed)) if !parsed.terms.is_empty() => {
-            let q = q.unwrap_or_default();
-            return match narrowed(app, entry, &open, &loaded, &board, &q) {
-                Ok((stats, games)) => ok(render_with(&open.db, &board, stats, &loaded, Some(Filter { q: &q, games }))),
-                Err(Narrowing::Search(e)) => crate::api::search_error(app, entry, open.generation, e),
-                Err(Narrowing::Index(Bad::Busy)) => busy(),
-                Err(Narrowing::Index(_)) => rebuilding(app, entry),
-            };
-        }
-        _ => {}
+    if let Some(q) = narrowing {
+        return match narrowed(app, entry, &open, &loaded, &board, &q) {
+            Ok((stats, games)) => ok(render_with(&open.db, &board, stats, &loaded, Some(Filter { q: &q, games }))),
+            Err(Narrowing::Search(e)) => crate::api::search_error(app, entry, open.generation, e),
+            Err(Narrowing::Index(Bad::Busy)) => busy(),
+            Err(Narrowing::Index(_)) => rebuilding(app, entry),
+        };
     }
     match stats(&loaded, &board, &Cancel::never()) {
         Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
