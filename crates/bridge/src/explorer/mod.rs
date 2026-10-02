@@ -20,6 +20,7 @@ pub mod keeper;
 mod map;
 pub mod masks;
 pub mod positions;
+pub mod recent;
 pub mod rendered;
 pub mod runs;
 pub mod schedule;

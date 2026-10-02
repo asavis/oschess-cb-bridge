@@ -881,8 +881,13 @@ With `q` the answer also acknowledges the search (#268):
   - The records `q` selects are found by one pass over the database's
     headers and kept as a set, a bit a record, with the latest four such
     searches: the next positions narrowed by the same `q` need no pass. The
-    position's games among them are replayed from the index's move stream to
-    their first visit, on at most half of the search workers.
+    pass reads the database's heads file, whose build the explorer's first
+    answer starts once the index is ready, and every header record until it
+    is built. The position's games among them are replayed from the index's
+    move stream to their first visit, on at most half of the search workers.
+    The latest 64 narrowed answers are kept, within the search memory, so a
+    position asked for again with the same `q`, as when a user steps back
+    through a game, is answered without a replay.
   - Searches by `timecontrol:`, `whiteelo:`, `blackelo:` and `date:` narrow
     the reference to the games a player prepares from: normal games of
     rated players in a span of years, for example.

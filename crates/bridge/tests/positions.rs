@@ -21,7 +21,7 @@ use chesscore::{Board, Color as CColor, Piece as CPiece, Square};
 mod common;
 use common::{
     TestBridge, WAIT_LIMIT, answered, app_of, board_after, fen_param, get, index_dir, lid, objects, play, policy, poll,
-    put, until,
+    put, settle, until,
 };
 
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -432,6 +432,8 @@ fn a_narrowed_answer_counts_the_games_a_replay_finds() {
         let fen = board.fen();
         let path = format!("/v1/databases/{id}/explorer?fen={}&q={param}", fen_param(&fen));
         let body = at_once(bridge.port, &path);
+        // Asked again, it is the answer kept, the same.
+        assert_eq!(at_once(bridge.port, &path), body, "{path}");
         let want = Narrowed::of(&games, board, selected);
         let before = reached.games(board).len() as u64;
         assert!(body.contains(&format!(r#""filter":{{"q":"{q}","games":{before}}}"#)), "{path}: {body}");
@@ -448,6 +450,24 @@ fn a_narrowed_answer_counts_the_games_a_replay_finds() {
     }
     // Most positions are one game's: a search keeps it or leaves it out.
     assert!(narrowed > 20 && emptied > 100 && kept > 100, "{narrowed} narrowed, {emptied} emptied, {kept} kept");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The explorer's first answer starts the build of the database's heads file
+/// (#106) once its index is ready, so that a search that narrows a later
+/// answer reads the heads file instead of every record of the database.
+#[test]
+fn the_explorer_starts_the_heads_file() {
+    let games = games();
+    let db = database("positions-heads", &games);
+    let dir = index_dir("explorer-heads");
+    let (bridge, id) = TestBridge::database(&db, &dir);
+    bridge.app.catalog.heads.set_min_records(1);
+    let heads = bridge::search::heads::path(&dir.join("index"), &id);
+    answered(bridge.port, &format!("/v1/databases/{id}/explorer?fen={}", fen_param(START)));
+    settle(&bridge.app.catalog);
+    assert!(heads.exists(), "no heads file after the explorer answered");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
