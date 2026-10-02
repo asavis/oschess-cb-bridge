@@ -112,14 +112,16 @@ impl<'a, S: Store> Names<'a, S> {
     }
 }
 
-/// One list row, and a game's `line` when the window has `lines`.
+/// One list row, a game's `line` when the window has `lines`, and the ply
+/// at which a fragment search found it, `matched` (#272).
 pub(crate) fn row<S: Store>(
     names: &mut Names<'_, S>,
     lines: &mut Option<Lines>,
     r: &S::Head,
+    matched: Option<u32>,
 ) -> cbformat::Result<String> {
     let row = row_obj(names, r)?;
-    Ok(match lines {
+    let row = match lines {
         Some(lines) if matches!(r.kind(), RecordKind::Game) => {
             match names.db.main_line(r, lines.plies, &mut lines.buf)? {
                 Some(line) => row.str("line", &line),
@@ -127,6 +129,10 @@ pub(crate) fn row<S: Store>(
             }
         }
         _ => row,
+    };
+    Ok(match matched {
+        Some(ply) => row.raw("match", &Obj::new().num("ply", i64::from(ply)).done()),
+        None => row,
     }
     .done())
 }

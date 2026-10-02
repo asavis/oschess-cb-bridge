@@ -15,8 +15,10 @@ pub mod deep;
 pub mod file;
 pub mod follow;
 pub mod format;
+pub mod fragment;
 pub mod keeper;
 mod map;
+pub mod masks;
 pub mod positions;
 pub mod rendered;
 pub mod runs;
@@ -25,7 +27,7 @@ pub mod source;
 pub mod stream;
 mod tree;
 
-pub use answer::{board, deep_stats, ready, rebuilding, render, route, stats, uci, unsupported};
+pub use answer::{board, deep_stats, ready, ready_masks, rebuilding, render, route, stats, uci, unsupported};
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -39,6 +41,7 @@ use crate::catalog::{Entry, Opened};
 use crate::indexdir::{self, Unlisted};
 use crate::machine::Machine;
 use crate::search::SearchError;
+use crate::search::memory::Cancel;
 use crate::sync::lock;
 
 use build::Plan;
@@ -136,6 +139,197 @@ pub enum Lookup {
     Busy,
 }
 
+/// The background work of a build of masks, as [`Activity`] names it.
+const MASKS: &str = "mask builds";
+
+/// What a search by a fragment or by material finds of a database's masks
+/// (#272).
+pub enum MaskLookup {
+    Ready(Arc<masks::Masks>),
+    /// Being built: the request is answered `409` with the progress.
+    Pending(Arc<Progress>),
+    Failed(String),
+}
+
+/// The masks of the games of one build of a database's index.
+struct MaskSlot {
+    build_id: u64,
+    state: MaskState,
+}
+
+enum MaskState {
+    Building {
+        progress: Arc<Progress>,
+        stop: Arc<AtomicBool>,
+        /// The index whose masks are built once this build, stopped, has
+        /// ended, with their progress: both write the same file.
+        next: Option<(Arc<Loaded>, Arc<Progress>)>,
+    },
+    Ready(Arc<masks::Masks>),
+    /// The build failed at `at`: requests are answered so for a minute, or
+    /// built again at once when it was stopped or failed only for want of a
+    /// worker or of memory (`again`).
+    Failed {
+        at: Instant,
+        why: String,
+        again: bool,
+    },
+}
+
+/// The masks of each database's games, by its id, and their builds (#272).
+struct MaskBuilds {
+    slots: Mutex<HashMap<String, MaskSlot>>,
+    /// The catalog's background work, which the builds count in (#236).
+    activity: Arc<Activity>,
+    /// Searches by a fragment or by material replay every game, without
+    /// masks: `cbtool profile-serve --no-masks` compares the two.
+    off: AtomicBool,
+    /// Where a test holds the next build before it starts.
+    #[cfg(test)]
+    pause: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl MaskBuilds {
+    fn new(activity: Arc<Activity>) -> MaskBuilds {
+        MaskBuilds {
+            slots: Mutex::default(),
+            activity,
+            off: AtomicBool::new(false),
+            #[cfg(test)]
+            pause: Mutex::default(),
+        }
+    }
+
+    /// The masks of the games of database `id`'s index `loaded`: the ones in
+    /// memory, else the file kept beside the index for that build, else the
+    /// build that makes them, started now on a thread of its own at
+    /// below-normal priority. A build of masks for another build of the index
+    /// is stopped, and its masks are never used; the new build starts once it
+    /// has ended, since both write the same file.
+    fn lookup(self: &Arc<Self>, id: &str, loaded: &Arc<Loaded>) -> MaskLookup {
+        let build_id = loaded.stream.header.build_id;
+        let mut slots = lock(&self.slots);
+        if let Some(slot) = slots.get_mut(id) {
+            match &mut slot.state {
+                MaskState::Ready(m) if slot.build_id == build_id => return MaskLookup::Ready(Arc::clone(m)),
+                MaskState::Building { progress, stop, next } => {
+                    if slot.build_id == build_id {
+                        return MaskLookup::Pending(Arc::clone(progress));
+                    }
+                    // It stops at its next block of games; the masks of
+                    // `loaded` are built once it has ended.
+                    stop.store(true, Ordering::Relaxed);
+                    if let Some((_, waiting)) = next.as_ref().filter(|(n, _)| n.stream.header.build_id == build_id) {
+                        return MaskLookup::Pending(Arc::clone(waiting));
+                    }
+                    let waiting = Arc::new(Progress::default());
+                    waiting.start("masks", u64::from(loaded.records()));
+                    *next = Some((Arc::clone(loaded), Arc::clone(&waiting)));
+                    return MaskLookup::Pending(waiting);
+                }
+                MaskState::Failed { at, why, again }
+                    if slot.build_id == build_id && !*again && at.elapsed() < RETRY_AFTER_FAILURE =>
+                {
+                    return MaskLookup::Failed(why.clone());
+                }
+                _ => {}
+            }
+        }
+        slots.remove(id);
+        let path = masks::path_of(&loaded.base.path);
+        if let Some(m) = masks::Masks::open(&path, &loaded.stream) {
+            let m = Arc::new(m);
+            slots.insert(id.to_string(), MaskSlot { build_id, state: MaskState::Ready(Arc::clone(&m)) });
+            return MaskLookup::Ready(m);
+        }
+        let progress = Arc::new(Progress::default());
+        progress.start("masks", u64::from(loaded.records()));
+        self.start(&mut slots, id, loaded, Arc::clone(&progress));
+        match slots.get(id).map(|slot| &slot.state) {
+            Some(MaskState::Failed { why, .. }) => MaskLookup::Failed(why.clone()),
+            _ => MaskLookup::Pending(progress),
+        }
+    }
+
+    /// Starts the build of the masks of database `id`'s index `loaded`, whose
+    /// state `slots` holds, on a thread of its own at below-normal priority.
+    /// Once it ends, the build of the masks of the next index starts when one
+    /// stopped it, else its masks or its failure are kept.
+    fn start(
+        self: &Arc<Self>,
+        slots: &mut HashMap<String, MaskSlot>,
+        id: &str,
+        loaded: &Arc<Loaded>,
+        progress: Arc<Progress>,
+    ) {
+        let build_id = loaded.stream.header.build_id;
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = MaskState::Building { progress: Arc::clone(&progress), stop: Arc::clone(&stop), next: None };
+        slots.insert(id.to_string(), MaskSlot { build_id, state });
+        let (all, key, loaded) = (Arc::clone(self), id.to_string(), Arc::clone(loaded));
+        let path = masks::path_of(&loaded.base.path);
+        // Counted among the catalog's background work until its masks are
+        // written or given up (#236).
+        let active = self.activity.begin(MASKS);
+        let spawned =
+            std::thread::Builder::new().name("bridge-masks".into()).stack_size(crate::THREAD_STACK).spawn(move || {
+                let _active = active;
+                crate::machine::follow(crate::machine::Priority::BelowNormal);
+                #[cfg(test)]
+                if let Some(pause) = lock(&all.pause).take() {
+                    let _ = pause.recv();
+                }
+                let result = masks::build(&loaded.stream, &path, &progress, &Cancel::when(&stop));
+                let mut slots = lock(&all.slots);
+                // Masks of a build of the index no longer wanted are left as they are.
+                let Some(slot) = slots.get_mut(&key).filter(|s| s.build_id == build_id) else { return };
+                if let MaskState::Building { next: Some((next, waiting)), .. } = &slot.state {
+                    let (next, waiting) = (Arc::clone(next), Arc::clone(waiting));
+                    all.start(&mut slots, &key, &next, waiting);
+                    return;
+                }
+                slot.state = match result {
+                    Ok(m) => MaskState::Ready(Arc::new(m)),
+                    Err(unbuilt) => {
+                        crate::log!("the masks of database {key} were not built: {}", unbuilt.why);
+                        let why = "the masks could not be built".into();
+                        MaskState::Failed { at: Instant::now(), why, again: unbuilt.again }
+                    }
+                };
+            });
+        if spawned.is_err() {
+            let why = "the masks thread could not start".to_string();
+            let failed = MaskState::Failed { at: Instant::now(), why, again: true };
+            slots.insert(id.to_string(), MaskSlot { build_id, state: failed });
+        }
+    }
+
+    /// Whether database `id` has masks in memory, built or not, or a build
+    /// of them.
+    fn known(&self, id: &str) -> bool {
+        lock(&self.slots).contains_key(id)
+    }
+
+    /// Whether the masks of database `id` are being built, writing their file.
+    fn building(&self, id: &str) -> bool {
+        lock(&self.slots).get(id).is_some_and(|slot| matches!(slot.state, MaskState::Building { .. }))
+    }
+
+    /// Lets go of the masks of database `id`. A build of them is stopped and
+    /// kept until it ends, so that no other build writes its file meanwhile
+    /// ([`MaskBuilds::lookup`]), and no build follows it.
+    fn forget(&self, id: &str) {
+        let mut slots = lock(&self.slots);
+        match slots.get_mut(id).map(|slot| &mut slot.state) {
+            Some(MaskState::Building { stop, next, .. }) => {
+                stop.store(true, Ordering::Relaxed);
+                *next = None;
+            }
+            _ => drop(slots.remove(id)),
+        }
+    }
+}
+
 /// The indexes of all databases, the queues that build them one at a time
 /// ([`schedule`]), and what the keeper of the databases in use knows
 /// ([`keeper`]).
@@ -159,6 +353,8 @@ pub struct Registry {
     /// The catalog's background work, which the builds and the keeper's
     /// looks count in (#236).
     activity: Arc<Activity>,
+    /// The masks of each database's games, and their builds (#272).
+    masks: Arc<MaskBuilds>,
 }
 
 impl Default for Registry {
@@ -169,10 +365,11 @@ impl Default for Registry {
 
 /// What a file in the index folder is, by its name.
 enum Kept {
-    /// `<id>.idx` or `<id>.moves`: a database's index or its move stream.
+    /// `<id>.idx`, `<id>.moves` or `<id>.masks`: a database's index, its
+    /// move stream, or the masks of its games (#272).
     Index,
-    /// `<id>.idx.partial` or `<id>.moves.partial`: a build's work, which
-    /// only the build running for `<id>` uses.
+    /// `<id>.idx.partial`, `<id>.moves.partial` or `<id>.masks.partial`: a
+    /// build's work, which only the build running for `<id>` uses.
     Work,
 }
 
@@ -185,8 +382,9 @@ pub fn is_index_file(name: &str) -> bool {
 /// The database id and kind of an index folder entry; `None` for anything
 /// the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
-    let (id, kind) = indexdir::db_id(name, &[".idx", ".moves", ".idx.partial", ".moves.partial"])?;
-    Some((id, if kind < 2 { Kept::Index } else { Kept::Work }))
+    let (id, kind) =
+        indexdir::db_id(name, &[".idx", ".moves", ".masks", ".idx.partial", ".moves.partial", ".masks.partial"])?;
+    Some((id, if kind < 3 { Kept::Index } else { Kept::Work }))
 }
 
 impl Registry {
@@ -203,8 +401,26 @@ impl Registry {
             seen: Mutex::default(),
             keeping: Mutex::default(),
             limits: Mutex::default(),
+            masks: Arc::new(MaskBuilds::new(Arc::clone(&activity))),
             activity,
         }
+    }
+
+    /// Searches by a fragment or by material replay every game from now on,
+    /// without masks, when `off`.
+    pub fn set_masks_off(&self, off: bool) {
+        self.masks.off.store(off, Ordering::Relaxed);
+    }
+
+    /// Whether searches by a fragment or by material go without masks.
+    pub fn masks_off(&self) -> bool {
+        self.masks.off.load(Ordering::Relaxed)
+    }
+
+    /// The masks of the games of database `id`'s index `loaded` (#272)
+    /// ([`MaskBuilds::lookup`]).
+    pub fn masks(&self, id: &str, loaded: &Arc<Loaded>) -> MaskLookup {
+        self.masks.lookup(id, loaded)
     }
 
     /// Keeps index files in `dir`.
@@ -328,6 +544,7 @@ impl Registry {
         let (db, generation, records) = (Arc::clone(&open.db), open.generation, open.db.records());
         let (machine, limits) = (self.builds.machine(), *lock(&self.limits));
         let (job_state, p, id) = (Arc::clone(state), Arc::clone(&progress), entry.id.clone());
+        let mask_builds = Arc::clone(&self.masks);
         let work = move |kind: Kind| {
             let _bug = Unwinding { state: &job_state, generation };
             // Asked at every turn, a stopped build's too. A background build
@@ -346,13 +563,24 @@ impl Registry {
                 *lock(&job_state) = State::Failed { at: Instant::now(), why, generation, busy: false };
                 return Ran::Done;
             }
+            // A database searched by fragments has its masks built again
+            // with its index (#272), whose build deletes the former ones.
+            let had_masks = mask_builds.known(&entry.id) || masks::path_of(&paths(&dir, &entry.id).0).exists();
             let result = index(&*db, generation, &dir, &entry.id, &p, &limits.unwrap_or_default());
             if result.is_err() && p.stopped() {
                 return Ran::Stopped;
             }
             let still = entry.generation() == Some(generation);
+            let result = result.map(Arc::new);
+            if let Ok(loaded) = &result
+                && still
+                && had_masks
+                && !mask_builds.off.load(Ordering::Relaxed)
+            {
+                mask_builds.lookup(&entry.id, loaded);
+            }
             *lock(&job_state) = match result {
-                Ok(loaded) if still => State::Ready(Arc::new(loaded)),
+                Ok(loaded) if still => State::Ready(loaded),
                 // The database changed meanwhile: the next request starts afresh.
                 Ok(_) => State::Idle,
                 Err(failure) => {
@@ -374,8 +602,8 @@ impl Registry {
     /// (#60): the index of a database that has been off the list for the
     /// grace ([`indexdir::SWEEP_GRACE`] unless the catalog sets another) or
     /// longer, and a build's work left by a build that no longer runs. The
-    /// files of a database being built are never touched, nor anything the
-    /// bridge did not write.
+    /// files of a database whose index or masks are being built are never
+    /// touched, nor anything the bridge did not write.
     pub fn sweep(&self, listed: &HashSet<String>) {
         let Some(dir) = self.dir() else { return };
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
@@ -387,14 +615,19 @@ impl Registry {
             // Held while the files go, so no build of `id` starts meanwhile.
             let state = self.state(id);
             let mut s = lock(&state);
-            if matches!(*s, State::Working(_)) {
+            if matches!(*s, State::Working(_)) || self.masks.building(id) {
                 continue;
             }
             let path = entry.path();
             match kind {
                 Kept::Index if listed.contains(id) => {}
                 Kept::Index => {
-                    if unlisted.due(id, now) && std::fs::remove_file(&path).is_ok() {
+                    let due = unlisted.due(id, now);
+                    if due {
+                        // Masks held in memory keep their file mapped.
+                        self.masks.forget(id);
+                    }
+                    if due && std::fs::remove_file(&path).is_ok() {
                         *s = State::Idle;
                     } else {
                         unlisted.still(id);
@@ -414,11 +647,13 @@ impl Registry {
     /// stream still mapped on Windows stays until the build replaces it; the
     /// index alone is gone, and without it the stream is never used.
     pub fn forget(&self, id: &str) {
+        self.masks.forget(id);
         let state = self.state(id);
         let mut s = lock(&state);
         if let State::Ready(l) = &*s {
             let _ = std::fs::remove_file(&l.base.path);
             let _ = std::fs::remove_file(&l.stream.path);
+            let _ = std::fs::remove_file(masks::path_of(&l.base.path));
         }
         *s = State::Idle;
     }
@@ -428,6 +663,7 @@ impl Registry {
     /// bridge's indexes before they change or remove the files, which a
     /// mapped move stream keeps from being replaced or removed on Windows.
     pub fn release(&self) {
+        lock(&self.masks.slots).retain(|_, slot| matches!(slot.state, MaskState::Building { .. }));
         let states: Vec<Arc<Mutex<State>>> = lock(&self.states).values().cloned().collect();
         for state in states {
             let mut s = lock(&state);
@@ -461,6 +697,12 @@ impl Registry {
                 _ => None,
             })
             .collect();
+        // The builds of masks (#272), a phase of their own.
+        for (id, slot) in lock(&self.masks.slots).iter() {
+            if let MaskState::Building { progress: p, .. } = &slot.state {
+                out.push((id.clone(), p.phase(), p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed)));
+            }
+        }
         out.sort();
         out
     }
@@ -557,6 +799,7 @@ fn index(
     // replaces it.
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&moves);
+    let _ = std::fs::remove_file(masks::path_of(&path));
     let plan = Plan { first: 1, last: count, generation };
     let header = build::build_with(db, &plan, &path, progress, limits).map_err(Failure::Build)?;
     let file = opened(progress, || IndexFile::open(&path)).map_err(Failure::Open)?;
@@ -754,6 +997,84 @@ mod tests {
         catalog.explorer.release();
         assert_eq!(Arc::strong_count(&loaded), 2, "held by the two requests alone");
         drop((loaded, again));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A build of masks (#272) stopped before its end leaves no file, and the
+    /// next builds them whole. The registry starts the build on the first
+    /// request, answers it pending meanwhile, then holds the masks, which the
+    /// catalog's settling waits for; a damaged index forgotten takes its masks
+    /// with it.
+    #[test]
+    fn a_build_of_masks_stops_when_told_and_is_built_again() {
+        let db = e4s("explorer-masks");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-masks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        catalog.explorer.set_dir(dir.clone());
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        let loaded =
+            prepare_with(&*open.db, open.generation, &dir, &entry.id, &Progress::default(), &patient()).unwrap();
+        let path = masks::path_of(&loaded.base.path);
+        let stopped = masks::build(&loaded.stream, &path, &Progress::default(), &Cancel::when(&Arc::new(true.into())));
+        assert!(stopped.is_err(), "a stopped build fails");
+        assert!(!path.exists() && !indexdir::partial(&path).exists(), "and leaves no file");
+        let built = masks::build(&loaded.stream, &path, &Progress::default(), &Cancel::never()).unwrap();
+        assert_eq!(built.build_id, loaded.stream.header.build_id);
+        assert!(masks::Masks::open(&path, &loaded.stream).is_some());
+        std::fs::remove_file(&path).unwrap();
+        drop(built);
+
+        // Through the registry, from the index held.
+        let Lookup::Ready(loaded) = catalog.explorer.index(Arc::clone(&entry), &open) else { panic!("no index") };
+        let MaskLookup::Pending(progress) = catalog.explorer.masks(&entry.id, &loaded) else { panic!("not built") };
+        assert_eq!(progress.phase(), "masks");
+        assert!(catalog.explorer.building().iter().any(|(id, phase, ..)| *id == entry.id && *phase == "masks"));
+        catalog.settle(workers::tests::PATIENCE).unwrap();
+        let MaskLookup::Ready(held) = catalog.explorer.masks(&entry.id, &loaded) else { panic!("not built") };
+        let MaskLookup::Ready(again) = catalog.explorer.masks(&entry.id, &loaded) else { panic!("not kept") };
+        assert!(Arc::ptr_eq(&held, &again) && path.exists());
+        drop((held, again));
+        catalog.explorer.forget(&entry.id);
+        assert!(!path.exists(), "the masks go with the index");
+        drop(loaded);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The database changed while its masks were built (#272): the build for
+    /// the former index is stopped and leaves no file, and the masks of the
+    /// new index are built once it has ended, with no other request.
+    #[test]
+    fn the_masks_of_a_new_index_follow_a_stopped_build() {
+        let db = e4s("explorer-masks-next");
+        let dir = std::env::temp_dir().join(format!("bridge-explorer-masks-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+        catalog.explorer.set_dir(dir.clone());
+        let entry = Arc::clone(&catalog.entries()[0]);
+        let Ok(open) = entry.open() else { panic!("the database does not open") };
+        let built = |sub: &str| {
+            let (dir, id) = (dir.join(sub), &entry.id);
+            Arc::new(prepare_with(&*open.db, open.generation, &dir, id, &Progress::default(), &patient()).unwrap())
+        };
+        let (old, new) = (built("old"), built("new"));
+        assert_ne!(old.stream.header.build_id, new.stream.header.build_id);
+        // The build of the former index's masks waits until released.
+        let (release, held) = mpsc::channel();
+        *lock(&catalog.explorer.masks.pause) = Some(held);
+        let MaskLookup::Pending(_) = catalog.explorer.masks(&entry.id, &old) else { panic!("not building") };
+        let MaskLookup::Pending(waiting) = catalog.explorer.masks(&entry.id, &new) else { panic!("not waiting") };
+        let MaskLookup::Pending(again) = catalog.explorer.masks(&entry.id, &new) else { panic!("not waiting") };
+        assert!(Arc::ptr_eq(&waiting, &again), "the new masks wait with one progress");
+        release.send(()).unwrap();
+        catalog.settle(workers::tests::PATIENCE).unwrap();
+        assert!(!masks::path_of(&old.base.path).exists(), "the stopped build left a file");
+        assert!(masks::Masks::open(&masks::path_of(&new.base.path), &new.stream).is_some(), "no new masks");
+        let MaskLookup::Ready(_) = catalog.explorer.masks(&entry.id, &new) else {
+            panic!("the new masks are not kept")
+        };
+        drop((old, new));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1020,17 +1341,23 @@ mod tests {
         let catalog = Catalog::new([missing.clone()]);
         catalog.explorer.set_dir(dir.clone());
         let listed = crate::catalog::id_of(&missing);
-        let (gone, building) = ("0123456789abcdef", "fedcba9876543210");
+        let (gone, building, masking) = ("0123456789abcdef", "fedcba9876543210", "00112233445566ff");
         let touch = |name: &str| std::fs::write(dir.join(name), b"x").unwrap();
         for name in [
             format!("{listed}.idx"),
             format!("{listed}.moves"),
+            format!("{listed}.masks"),
             format!("{listed}.idx.partial"),
             format!("{listed}.moves.partial"),
+            format!("{listed}.masks.partial"),
             format!("{gone}.idx"),
             format!("{gone}.moves"),
+            format!("{gone}.masks"),
             format!("{gone}.idx.partial"),
             format!("{gone}.moves.partial"),
+            format!("{gone}.masks.partial"),
+            format!("{masking}.masks"),
+            format!("{masking}.masks.partial"),
             format!("{building}.idx"),
             format!("{building}.moves"),
             format!("{building}.idx.partial"),
@@ -1045,6 +1372,13 @@ mod tests {
             touch(&name);
         }
         *lock(&catalog.explorer.state(building)) = State::Working(Arc::new(Progress::default()));
+        // A build of masks (#272) writes its file as an index build does.
+        let mask_build = MaskState::Building {
+            progress: Arc::new(Progress::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+            next: None,
+        };
+        lock(&catalog.explorer.masks.slots).insert(masking.into(), MaskSlot { build_id: 1, state: mask_build });
         let names = || {
             let mut n: Vec<String> =
                 std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
@@ -1054,9 +1388,13 @@ mod tests {
         let mut keep = vec![
             format!("{listed}.idx"),
             format!("{listed}.moves"),
+            format!("{listed}.masks"),
             format!("{listed}.moves.old"),
             format!("{gone}.idx"),
             format!("{gone}.moves"),
+            format!("{gone}.masks"),
+            format!("{masking}.masks"),
+            format!("{masking}.masks.partial"),
             format!("{building}.idx"),
             format!("{building}.moves"),
             format!("{building}.idx.partial"),
@@ -1074,15 +1412,16 @@ mod tests {
         // After it, the index and stream of the database off the list go too.
         catalog.set_sweep_grace(Duration::ZERO);
         catalog.sweep_indexes();
-        keep.retain(|n| n != &format!("{gone}.idx") && n != &format!("{gone}.moves"));
+        keep.retain(|n| !n.starts_with(gone));
         assert_eq!(names(), keep);
 
         // The build that ran ends: its leftovers go; its database, off the
         // list, keeps its index until the grace has passed since now.
         *lock(&catalog.explorer.state(building)) = State::Idle;
+        lock(&catalog.explorer.masks.slots).clear();
         catalog.set_sweep_grace(indexdir::SWEEP_GRACE);
         catalog.sweep_indexes();
-        keep.retain(|n| n != &format!("{building}.idx.partial") && n != &format!("{building}.moves.partial"));
+        keep.retain(|n| !n.ends_with(".partial"));
         assert_eq!(names(), keep);
         std::fs::remove_dir_all(&dir).unwrap();
     }

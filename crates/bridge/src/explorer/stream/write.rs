@@ -15,7 +15,8 @@ use crate::sync::lock;
 
 use super::{
     ALIGN, BATCH, CRC_AT, Departures, Entry, HEADER_LEN, Header, INDEXED, MAX_PLIES, PREFIX_AT, PREFIX_BYTES,
-    PREFIX_WORDS, SETUP, SETUP_BYTES, SLOT_BYTES, TABLE_ENTRY, TAIL_BUFFER, block_crc, record_crc, records,
+    PREFIX_WORDS, SETUP, SETUP_BYTES, SLOT_BYTES, START_MOVE_AT, TABLE_ENTRY, TAIL_BUFFER, block_crc, record_crc,
+    records,
 };
 
 /// The stream being written, `<id>.moves.partial`, from its start to its
@@ -190,6 +191,9 @@ impl Part<'_> {
         let entry = Entry { tail, plies: words.len() as u16, flags, departures };
         let slot = &mut self.slots[i * SLOT_BYTES..(i + 1) * SLOT_BYTES];
         slot[..PREFIX_AT].copy_from_slice(&entry.encode());
+        if setup.is_some() {
+            slot[START_MOVE_AT..START_MOVE_AT + 2].copy_from_slice(&line.start_move.to_le_bytes());
+        }
         for (to, w) in slot[PREFIX_AT..PREFIX_AT + PREFIX_BYTES].as_chunks_mut::<2>().0.iter_mut().zip(words) {
             *to = w.to_le_bytes();
         }

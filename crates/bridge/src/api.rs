@@ -17,6 +17,7 @@ use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
 use crate::engine::{self, Engine, Limit, Search};
 use crate::explorer;
+use crate::explorer::fragment::Filter;
 use crate::foreground;
 use crate::http::{IDLE_TIMEOUT, Request, Response};
 use crate::json::{self, Obj};
@@ -162,8 +163,9 @@ fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Respon
 
 /// The optional features of API version 1 this bridge has (#270), which a
 /// client offers only when it finds them named: `explorerSearch`, the
-/// explorer's `q` (#268).
-pub const FEATURES: [&str; 1] = ["explorerSearch"];
+/// explorer's `q` (#268), and `fragmentSearch`, the games of a position
+/// fragment and of material (#272).
+pub const FEATURES: [&str; 2] = ["explorerSearch", "fragmentSearch"];
 
 fn status(app: &App) -> Response {
     let entries = app.catalog.entries();
@@ -291,13 +293,14 @@ fn database_changing() -> Response {
 }
 
 fn games(app: &App, entry: &Entry, req: &Request) -> Response {
-    let GamesQuery { offset, limit, sort: sort_param, line, board, stream, q } = match GamesQuery::parse(req) {
+    let GamesQuery { offset, limit, sort: sort_param, line, board, fragment, stream, q } = match GamesQuery::parse(req)
+    {
         Ok(query) => query,
         Err(answer) => return answer,
     };
-    // The games of a position mark the database in use (#149); a list alone
-    // does not.
-    if board.is_some() {
+    // The games of a position or of a fragment mark the database in use
+    // (#149, #272); a list alone does not.
+    if board.is_some() || fragment.is_some() {
         app.catalog.explorer.mark_in_use(&entry.id);
     }
     let open = match entry.open_to_read() {
@@ -306,8 +309,10 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
     };
     app.catalog.attach_heads(entry, &open);
     let (db, idx) = (&open.db, &open.indexes);
-    let selected = match &board {
-        Some(board) => {
+    // The index a fragment's games were found in, which tells each row's ply.
+    let mut matched_in = None;
+    let selected = match (&board, &fragment) {
+        (Some(board), _) => {
             let loaded = match explorer::ready(app, entry, &open) {
                 Ok(loaded) => loaded,
                 Err(answer) => return answer,
@@ -315,7 +320,21 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
             let games = explorer::positions::Games { loaded: &loaded, board };
             search::select_position(db, idx, q, stream, sort_param, &games).map(|(s, sort, n)| (s, sort, Some(n)))
         }
-        None => search::select(db, idx, q, stream, sort_param).map(|(s, sort)| (s, sort, None)),
+        (None, Some(filter)) => {
+            let loaded = match explorer::ready(app, entry, &open) {
+                Ok(loaded) => loaded,
+                Err(answer) => return answer,
+            };
+            let masks = match explorer::ready_masks(app, entry, &loaded) {
+                Ok(masks) => masks,
+                Err(answer) => return answer,
+            };
+            let games = explorer::fragment::Games { loaded: &loaded, masks: masks.as_deref(), filter };
+            let found = search::select_position(db, idx, q, stream, sort_param, &games);
+            matched_in = Some(loaded);
+            found.map(|(s, sort, n)| (s, sort, Some(n)))
+        }
+        (None, None) => search::select(db, idx, q, stream, sort_param).map(|(s, sort)| (s, sort, None)),
     };
     let (selection, sort, games) = match selected {
         Ok(found) => found,
@@ -349,7 +368,20 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
         Selection::Numbers(numbers) => {
             let start = usize::try_from(offset).unwrap_or(usize::MAX).min(numbers.len());
             let end = start.saturating_add(limit as usize).min(numbers.len());
-            let rows = with_store!(&*open.db, db => rows_of(db, &numbers[start..end], &mut lines));
+            let window = &numbers[start..end];
+            // The ply each game of a fragment matched at, replayed again for
+            // the window's games alone.
+            let matched = match (&fragment, &matched_in) {
+                (Some(filter), Some(loaded)) => {
+                    match window.iter().map(|&n| filter.match_of(loaded, n)).collect::<Result<Vec<_>, _>>() {
+                        Ok(plies) => Some(plies),
+                        Err(explorer::file::Bad::Busy) => return busy(),
+                        Err(_) => return explorer::rebuilding(app, entry),
+                    }
+                }
+                _ => None,
+            };
+            let rows = with_store!(&*open.db, db => rows_of(db, window, matched.as_deref(), &mut lines));
             (numbers.len() as u64, rows)
         }
     };
@@ -377,6 +409,10 @@ fn games(app: &App, entry: &Entry, req: &Request) -> Response {
     // before `q`.
     if let (Some(board), Some(games)) = (&board, games) {
         body = body.raw("position", &Obj::new().str("fen", &board.fen()).num("games", games as i64).done());
+    }
+    // The fragment and the material acknowledged as `position` is (#272).
+    if let (Some(filter), Some(games)) = (&fragment, games) {
+        body = body.raw("fragment", &filter.acknowledged(games));
     }
     ok(body.raw("rows", &json::array(rows)).done()).holding(hold)
 }
@@ -447,13 +483,20 @@ fn window<S: Store>(db: &S, first: u32, count: u32, lines: &mut Option<Lines>) -
     // `first + count` itself may not fit when the window ends at `u32::MAX`.
     let records = db.records(first, first + (count - 1))?;
     let mut names = Names::new(db);
-    records.iter().map(|r| row(&mut names, lines, r)).collect()
+    records.iter().map(|r| row(&mut names, lines, r, None)).collect()
 }
 
-/// The rows of the records `numbers`, in that order.
-fn rows_of<S: Store>(db: &S, numbers: &[u32], lines: &mut Option<Lines>) -> cbformat::Result<Vec<String>> {
+/// The rows of the records `numbers`, in that order, each with the ply its
+/// game matched a fragment at when `matched` tells them, in the same order.
+fn rows_of<S: Store>(
+    db: &S,
+    numbers: &[u32],
+    matched: Option<&[Option<u32>]>,
+    lines: &mut Option<Lines>,
+) -> cbformat::Result<Vec<String>> {
     let mut names = Names::new(db);
-    numbers.iter().map(|&n| db.record(n).and_then(|r| row(&mut names, lines, &r))).collect()
+    let ply = |i: usize| matched.and_then(|m| m.get(i).copied().flatten());
+    numbers.iter().enumerate().map(|(i, &n)| db.record(n).and_then(|r| row(&mut names, lines, &r, ply(i)))).collect()
 }
 
 /// One reading of a game.
@@ -559,6 +602,9 @@ struct GamesQuery<'r> {
     line: Option<u8>,
     /// The position of `fen`, whose games alone are listed (#148).
     board: Option<Board>,
+    /// The position fragment and the material, whose games alone are listed
+    /// (#272).
+    fragment: Option<Filter>,
     stream: Option<&'r str>,
     q: Option<&'r str>,
 }
@@ -582,6 +628,18 @@ impl<'r> GamesQuery<'r> {
             Some(_) if req.param("variant").is_some_and(|v| v != "standard") => return Err(explorer::unsupported()),
             Some(fen) => Some(explorer::board(fen)?),
         };
+        // A fragment and the material (#272): standard chess alone, as with
+        // `fen`, and never together with `fen`.
+        let fragment =
+            Filter::parse(|name| req.param(name)).map_err(|(name, message)| bad_parameter(name, &message))?;
+        if fragment.is_some() {
+            if board.is_some() {
+                return Err(bad_parameter("fen", "fen cannot be combined with a fragment or material"));
+            }
+            if req.param("variant").is_some_and(|v| v != "standard") {
+                return Err(explorer::unsupported());
+            }
+        }
         let stream = match req.param("stream") {
             Some(s) if s.is_empty() || !stream_name(s) => {
                 return Err(bad_parameter("stream", "stream must be 1 to 64 characters of A-Z, a-z, 0-9, - and _"));
@@ -595,7 +653,7 @@ impl<'r> GamesQuery<'r> {
         if let Some(Err(Unsupported(qualifier))) = q.map(search::query::parse) {
             return Err(unsupported_qualifier(&qualifier));
         }
-        Ok(GamesQuery { offset, limit, sort, line, board, stream, q })
+        Ok(GamesQuery { offset, limit, sort, line, board, fragment, stream, q })
     }
 }
 

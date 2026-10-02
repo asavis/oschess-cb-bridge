@@ -47,6 +47,8 @@ pub struct Line {
     pub words: Vec<u16>,
     /// The start, when it is not the standard one ([`stream::setup_of`]).
     pub setup: Option<[u8; SETUP_BYTES]>,
+    /// The move number of a set-up start; 0 for the standard one.
+    pub start_move: u16,
     /// The home pawns in the order the line lost them.
     pub departures: Departures,
     /// The position the walk is at, noted before its move is played: its
@@ -72,6 +74,7 @@ impl Line {
             structures: Vec::new(),
             beyond: None,
             words,
+            start_move: setup.map_or(0, |_| 1),
             setup,
             departures: Departures::default(),
             here: 0,
@@ -97,7 +100,11 @@ impl Line {
     /// Notes the line's start, `board`: a set-up start is kept.
     fn start(&mut self, board: &Board) {
         let setup = stream::setup_of(board);
-        self.setup = (setup != *stream::standard_setup()).then_some(setup);
+        // A start at another move than the first is kept, whatever its
+        // pieces: its moves are numbered from it (#272).
+        let number = board.fullmove_number().max(1);
+        self.setup = (setup != *stream::standard_setup() || number != 1).then_some(setup);
+        self.start_move = self.setup.map_or(0, |_| number);
         self.home = stream::home_pawns(board);
     }
 
@@ -233,6 +240,7 @@ impl Workspace {
                 beyond: None,
                 words: Vec::new(),
                 setup: None,
+                start_move: 0,
                 departures: Departures::default(),
                 here: 0,
                 here_structure: 0,
@@ -695,6 +703,7 @@ fn begin(line: &mut Line, r: &impl Head) {
     line.beyond = None;
     line.words.clear();
     line.setup = None;
+    line.start_move = 0;
     line.departures = Departures::default();
     line.structure_of = None;
 }

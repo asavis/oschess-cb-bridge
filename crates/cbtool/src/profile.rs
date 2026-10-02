@@ -41,7 +41,9 @@ use std::time::{Duration, Instant};
 use bridge::access::{DEFAULT_ORIGINS, Policy};
 use bridge::catalog::id_of;
 use bridge::engine::{Engine, EngineConfig};
+use bridge::explorer::fragment::Filter;
 use bridge::explorer::runs::{PassTime, Timings};
+use bridge::explorer::{self, masks};
 use bridge::search::heads;
 use bridge::server;
 use bridge::sources::Sources;
@@ -94,6 +96,18 @@ const BARE_KINGS: &str = "7k/8/8/8/8/8/8/K7 w - - 0 1";
 const BACKGROUND_WAIT: Duration = Duration::from_secs(600);
 /// How long a bridge is given to finish writing its files before it ends.
 const WRITES_WAIT: Duration = Duration::from_secs(60);
+/// The searches by a position fragment and by material (#272), by name and
+/// parameters: a Carlsbad pawn skeleton, a knight on d5 against the pawn on
+/// d6, rook endgames, and a bishop on h7 with its mirrors.
+const FRAGMENTS: [(&str, &str); 4] = [
+    ("Carlsbad skeleton", "look=Pd4,Pe3,pc6,pd5&nowhite=c2,c4&noblack=e6,e5"),
+    ("Nd5 against d6", "look=Nd5,pd6"),
+    ("rook endgames", "material=Q0,q0,B0,b0,N0,n0,R1..2,r1..2"),
+    ("Bh7, mirrored", "look=Bh7&mirror=both"),
+];
+/// The rounds of the comparison of the searches with masks and without: in
+/// each, a new bridge of each kind, in turns, so that every search is cold.
+const FRAGMENT_ROUNDS: usize = 3;
 
 struct Options {
     db: PathBuf,
@@ -121,20 +135,28 @@ fn options(args: &[String]) -> AnyResult<Options> {
     Ok(Options { db, index, engine, background })
 }
 
-/// `cbtool profile-serve <db> <index> [--background] [<engine>]`: the bridge
-/// `profile` asks, in a process of its own. It prints `port <n>` and serves
-/// until killed, or until its input ends: when the `profile` that started it
-/// ends, however it ends. Once it has built the database's position index, it
-/// prints `built`, then where the build's time went ([`Timings::line`]). With
-/// `--background`, it keeps its indexes as a bridge that serves does (#149).
+/// `cbtool profile-serve <db> <index> [--background] [--no-masks] [<engine>]`:
+/// the bridge `profile` asks, in a process of its own. It prints `port <n>`
+/// and serves until killed, or until its input ends: when the `profile` that
+/// started it ends, however it ends. Once it has built the database's position
+/// index, it prints `built`, then where the build's time went
+/// ([`Timings::line`]). With `--background`, it keeps its indexes as a bridge
+/// that serves does (#149). With `--no-masks`, a search by a fragment or by
+/// material replays every game, without the masks that rule games out first
+/// (#272), so that the two can be compared.
 pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     let [db, index, rest @ ..] = args else {
-        return Err("profile-serve <db> <index> [--background] [<engine>]".into());
+        return Err("profile-serve <db> <index> [--background] [--no-masks] [<engine>]".into());
     };
-    let (background, rest) = match rest {
-        [flag, rest @ ..] if flag == "--background" => (true, rest),
-        _ => (false, rest),
-    };
+    let (mut background, mut no_masks, mut rest) = (false, false, rest);
+    while let [flag, after @ ..] = rest {
+        match flag.as_str() {
+            "--background" => background = true,
+            "--no-masks" => no_masks = true,
+            _ => break,
+        }
+        rest = after;
+    }
     let listeners = server::bind(0)?;
     let port = listeners[0].local_addr()?.port();
     let engine = match rest.first() {
@@ -148,6 +170,7 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
     // make the first answers warm.
     let sources = Sources { fixed: vec![PathBuf::from(db)], ..Sources::default() };
     let app = start::setup(Path::new(index), "profile", policy, sources, engine);
+    app.catalog.explorer.set_masks_off(no_masks);
     let mut out = std::io::stdout();
     writeln!(out, "port {port}")?;
     out.flush()?;
@@ -268,10 +291,19 @@ fn record(n: usize, event: &str) {
 /// exists, and its end once the process has been reaped, here when it does
 /// not start and else when it is dropped.
 fn spawn(o: &Options, n: usize, background: bool) -> AnyResult<Served> {
+    spawn_with(o, n, background, false)
+}
+
+/// [`spawn`], the bridge searching by fragments without masks when
+/// `no_masks` (#272).
+fn spawn_with(o: &Options, n: usize, background: bool, no_masks: bool) -> AnyResult<Served> {
     let mut command = Command::new(std::env::current_exe()?);
     command.arg("profile-serve").arg(&o.db).arg(&o.index);
     if background {
         command.arg("--background");
+    }
+    if no_masks {
+        command.arg("--no-masks");
     }
     if let Some(exe) = &o.engine {
         command.arg(exe);
@@ -651,6 +683,7 @@ pub(crate) fn run(args: &[String]) -> AnyResult<bool> {
     let searches = p.searches(&mut served, player);
     p.pgn(&mut served)?;
     p.index(&mut served, launched, records);
+    let served = p.fragments(served)?;
 
     // New bridges, their caches empty, on the files the ones before wrote:
     // each replaces the one before (#191).
@@ -897,6 +930,114 @@ impl Profile {
         self.crowded(served);
         list_positions(&mut self.table, &mut served.c, &self.base, &listed);
         self.notable_rows(served, &notable);
+    }
+
+    /// Searches by a position fragment and by material (#272): the build of
+    /// the masks the first one starts, until `/v1/status` no longer reports
+    /// it, and the file's size; how many games the masks leave each search
+    /// to replay; and each search's first window with the masks and without
+    /// them, on new bridges in turns ([`FRAGMENT_ROUNDS`]). Both must find
+    /// the same games. The last bridge is handed back.
+    fn fragments(&mut self, mut served: Served) -> AnyResult<Served> {
+        let base = self.base.clone();
+        let list = |params: &str| format!("{base}/games?limit=100&{params}");
+        let t = Instant::now();
+        let started = match served.c.get(&list(FRAGMENTS[0].1), true) {
+            Ok((409, body)) if Value::of(&body).get("error").get("state").str() == Some("indexing") => Ok(()),
+            Ok((status, body)) => Err(failure(status, &body)),
+            Err(_) => Err("no answer".to_string()),
+        };
+        let built = started.and_then(|()| {
+            loop {
+                match served.c.get("/v1/status", true) {
+                    Ok((200, body)) if phases(&Value::of(&body)).contains(&"masks") => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Ok((200, _)) => break Ok(()),
+                    Ok((status, body)) => break Err(failure(status, &body)),
+                    Err(_) => break Err("no answer".to_string()),
+                }
+            }
+        });
+        if let Err(why) = built {
+            self.table.failure("fragment", "masks build", &why);
+            return Ok(served);
+        }
+        let index = explorer::paths(&self.index_folder(), &self.id).0;
+        let path = masks::path_of(&index);
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+        self.table.once("fragment", "masks build", ms(t.elapsed()), &format!("{:.1} MB", size as f64 / 1e6));
+        self.survivors(&index);
+        let mut with: Vec<Samples> = FRAGMENTS.iter().map(|_| Samples::default()).collect();
+        let mut without: Vec<Samples> = FRAGMENTS.iter().map(|_| Samples::default()).collect();
+        let mut totals: Vec<Option<u64>> = vec![None; FRAGMENTS.len()];
+        let mut differ = Vec::new();
+        for round in 0..FRAGMENT_ROUNDS * 2 {
+            let no_masks = round % 2 == 1;
+            let n = served.n + 1;
+            self.end(served);
+            served = spawn_with(&self.o, n, false, no_masks)?;
+            // Its index, kept on disk, answers at once.
+            let mut open = Samples::default();
+            open.get(&mut served.c, &self.explorer(START_FEN), true);
+            for (i, (name, params)) in FRAGMENTS.iter().enumerate() {
+                let samples = if no_masks { &mut without[i] } else { &mut with[i] };
+                let total = samples.get(&mut served.c, &list(params), true).and_then(|body| count(&body, "total"));
+                if let Some(total) = total
+                    && *totals[i].get_or_insert(total) != total
+                {
+                    differ.push(*name);
+                }
+            }
+        }
+        for (i, (name, _)) in FRAGMENTS.iter().enumerate() {
+            let games = totals[i].map_or(String::new(), |n| format!("{n} games"));
+            self.table.row("fragment", &format!("{name}, masks"), &mut with[i], &games);
+            self.table.row("fragment", &format!("{name}, no masks"), &mut without[i], &games);
+        }
+        if !differ.is_empty() {
+            self.table.failure("fragment", "with masks and without", &format!("other games: {}", differ.join(", ")));
+        }
+        Ok(served)
+    }
+
+    /// For each search by a fragment, the games whose masks it may match,
+    /// which it replays, read from the files of the index at `index` in this
+    /// process.
+    fn survivors(&mut self, index: &Path) {
+        let stream = explorer::stream::Stream::open(&explorer::stream::path_of(index));
+        let opened = stream.ok().and_then(|s| masks::Masks::open(&masks::path_of(index), &s).map(|m| (s, m)));
+        let Some((stream, kept)) = opened else {
+            self.table.failure("fragment", "survivors", "the masks do not open");
+            return;
+        };
+        let header = stream.header;
+        let records = (header.last_record + 1).saturating_sub(header.first_record) as usize;
+        for (name, params) in FRAGMENTS {
+            let named: HashMap<&str, &str> = params.split('&').filter_map(|p| p.split_once('=')).collect();
+            let Ok(Some(filter)) = Filter::parse(|n| named.get(n).copied()) else {
+                self.table.failure("fragment", &format!("{name} survivors"), "refused");
+                continue;
+            };
+            let t = Instant::now();
+            let mut survivors = 0usize;
+            for block in 0..records.div_ceil(masks::BLOCK) {
+                let Ok(rows) = kept.block(block) else {
+                    self.table.failure("fragment", &format!("{name} survivors"), "a damaged block");
+                    return;
+                };
+                survivors += rows.chunks(masks::ROW).filter(|row| filter.may_match(&masks::Row::decode(row))).count();
+            }
+            self.table.once(
+                "fragment",
+                &format!("{name} survivors"),
+                ms(t.elapsed()),
+                &format!(
+                    "{survivors} of {records} records ({:.1}%) left to replay",
+                    survivors as f64 * 100.0 / records.max(1) as f64
+                ),
+            );
+        }
     }
 
     /// A lookup per move along the most played line: the positions of the

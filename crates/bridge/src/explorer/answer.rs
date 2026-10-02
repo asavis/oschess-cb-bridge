@@ -25,10 +25,11 @@ use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
 use super::format::{Counts, NO_MOVE, Stats, TOP_GAMES, order_moves, rank_top, structure, unpack_move};
+use super::masks::Masks;
 use super::runs::Progress;
 use super::source::average_elo;
 use super::stream::{Hit, Target};
-use super::{Loaded, Lookup};
+use super::{Loaded, Lookup, MaskLookup};
 
 pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
     if req.param("variant").is_some_and(|v| v != "standard") {
@@ -202,6 +203,24 @@ pub fn ready(app: &App, entry: &Entry, open: &Opened) -> Result<Arc<Loaded>, Res
     }
 }
 
+/// The masks a search by a fragment or by material of `entry`'s index
+/// `loaded` rules games out with (#272), the first such search starting their
+/// build; `None` while `cbtool profile-serve --no-masks` switches them off.
+/// The answer instead while they are built, or when they could not be.
+pub fn ready_masks(app: &App, entry: &Entry, loaded: &Arc<Loaded>) -> Result<Option<Arc<Masks>>, Response> {
+    let registry = &app.catalog.explorer;
+    if registry.masks_off() {
+        return Ok(None);
+    }
+    match registry.masks(&entry.id, loaded) {
+        MaskLookup::Ready(masks) => Ok(Some(masks)),
+        MaskLookup::Pending(progress) => Err(indexing_with(&progress, "The masks of the games are being built")),
+        MaskLookup::Failed(why) => {
+            Err(error(503, "index_unavailable", &format!("The masks of the games could not be built: {why}")))
+        }
+    }
+}
+
 /// Drops the index of `entry`, which a read found damaged, so that the next
 /// request builds it again; the answer meanwhile.
 pub fn rebuilding(app: &App, entry: &Entry) -> Response {
@@ -219,14 +238,16 @@ pub fn unsupported() -> Response {
 }
 
 fn indexing(p: &Progress) -> Response {
+    indexing_with(p, "The position index is being built")
+}
+
+fn indexing_with(p: &Progress, message: &str) -> Response {
     let progress = Obj::new()
         .str("phase", p.phase())
         .num("done", p.done.load(Ordering::Relaxed) as i64)
         .num("total", p.total.load(Ordering::Relaxed) as i64)
         .done();
-    error_with(409, "database_unavailable", "The position index is being built", |o| {
-        o.str("state", "indexing").raw("progress", &progress)
-    })
+    error_with(409, "database_unavailable", message, |o| o.str("state", "indexing").raw("progress", &progress))
 }
 
 fn counts(o: Obj, c: &Counts) -> Obj {
