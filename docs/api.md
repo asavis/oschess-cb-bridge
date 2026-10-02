@@ -783,11 +783,11 @@ With `q` the answer also acknowledges the search (#268):
   - A qualifier only the Library has is `400 unsupported_qualifier`, as in a
     list; the other refusals, `409` while the index is built and `503`, are
     those of the answer without `q`.
-  - The games `q` selects are those of a list of the position's games, kept
-    with the latest searches, so the next answer for the same position and
-    `q`, or a list of them, does not search again. Each of them is replayed
-    from the index's move stream to its first visit, on at most half of the
-    search workers.
+  - The records `q` selects are found by one pass over the database's
+    headers and kept as a set, a bit a record, with the latest four such
+    searches: the next positions narrowed by the same `q` need no pass. The
+    position's games among them are replayed from the index's move stream to
+    their first visit, on at most half of the search workers.
   - Searches by `timecontrol:`, `whiteelo:`, `blackelo:` and `date:` narrow
     the reference to the games a player prepares from: normal games of
     rated players in a span of years, for example.

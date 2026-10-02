@@ -74,6 +74,11 @@ impl Members {
         }
     }
 
+    /// The bits of word `word`, numbers `64 * word` on; 0 past the set's end.
+    pub fn word(&self, word: usize) -> u64 {
+        self.words.get(word).map_or(0, |w| w.load(Ordering::Relaxed))
+    }
+
     pub fn contains(&self, number: u32) -> bool {
         let n = number as usize;
         self.words.get(n / 64).is_some_and(|w| w.load(Ordering::Relaxed) & (1 << (n % 64)) != 0)

@@ -18,9 +18,9 @@ use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok, unavailable};
 use crate::rows::{Names, row_obj};
 use crate::search::memory::{Cancel, Hold};
-use crate::search::query::{self, MAX_QUERY_CHARS, Sort};
+use crate::search::query::{self, MAX_QUERY_CHARS};
 use crate::search::workers::{self, threads};
-use crate::search::{self, Numbers, SearchError, Selection};
+use crate::search::{self, Members, SearchError};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
@@ -83,11 +83,12 @@ enum Narrowing {
 }
 
 /// The answer for `board` among the games the search `q` selects (#268), and
-/// how many games reach the position before it: the games of the position
-/// that match `q`, as `GET /v1/databases/{id}/games?fen=&q=` lists them and
-/// keeps them with the latest searches, each replayed from the move stream
-/// to its first visit, where the move it played from there, its outcome and
-/// its rating are read. `None` when no game is selected.
+/// how many games reach the position before it: the games of the position,
+/// as `GET /v1/databases/{id}/games?fen=` lists them, that are among the
+/// records `q` selects, which one pass over the database finds and keeps for
+/// the next positions ([`search::matching`]). Each is replayed from the move
+/// stream to its first visit, where the move it played from there, its
+/// outcome and its rating are read. `None` when no game is selected.
 fn narrowed(
     app: &App,
     entry: &Entry,
@@ -98,51 +99,63 @@ fn narrowed(
 ) -> Result<(Option<Stats>, u64), Narrowing> {
     // Searches read the heads file when one is ready, as a list's do.
     app.catalog.attach_heads(entry, open);
-    let games = super::positions::Games { loaded, board };
-    let (selection, _, before) =
-        search::select_position(&open.db, &open.indexes, Some(q), None, Some(Sort::DEFAULT), &games)
-            .map_err(Narrowing::Search)?;
-    let Selection::Numbers(numbers) = selection else {
-        return Err(Narrowing::Search(SearchError::Bug("a position's games are numbered")));
+    let selected = match search::matching(&open.db, &open.indexes, q).map_err(Narrowing::Search)? {
+        Some(selected) => selected,
+        None => return Err(Narrowing::Search(SearchError::Bug("a search with terms selects a set"))),
     };
-    let found = walk(loaded, board, &numbers, &Cancel::never()).map_err(Narrowing::Index)?;
-    Ok((found.filter(|f| f.counts.games > 0).map(Found::into_stats), before))
+    let cancel = Cancel::never();
+    let games = super::positions::games(loaded, board, &cancel).map_err(Narrowing::Search)?;
+    let found = walk(loaded, board, &games, &selected, &cancel).map_err(Narrowing::Index)?;
+    Ok((found.filter(|f| f.counts.games > 0).map(Found::into_stats), games.count()))
 }
 
-/// The games `numbers` of `board`, each replayed to its first visit and
-/// counted there, as [`replay_with`] counts the games it finds: on the calling
-/// thread, taken as one of the shared workers, when one worker would take
-/// them all, else on at most half of them. Each is a game of the position, so
-/// a game that does not reach it is damage, `Corrupt`.
-fn walk(loaded: &Loaded, board: &Board, numbers: &Numbers, cancel: &Cancel) -> Result<Option<Found>, Bad> {
-    if numbers.is_empty() {
-        return Ok(None);
-    }
+/// The games of `board` in `games` that are in `selected`, each replayed to
+/// its first visit and counted there, as [`replay_with`] counts the games it
+/// finds: on the calling thread, taken as one of the shared workers, when one
+/// worker would take them all, else on at most half of them, each taking the
+/// games of [`WALK_WORDS_AT_ONCE`] words of the sets at a time. Each is a game
+/// of the position, so a game that does not reach it is damage, `Corrupt`.
+fn walk(
+    loaded: &Loaded,
+    board: &Board,
+    games: &Members,
+    selected: &Members,
+    cancel: &Cancel,
+) -> Result<Option<Found>, Bad> {
     let target = Target::of(board);
     let count = |game: u32, found: &mut Found| -> Result<(), Bad> {
         let hit = loaded.stream.find(game, &target)?.ok_or(Bad::Corrupt("a game of the position"))?;
         Counted.add(found, game, hit);
         Ok(())
     };
-    if numbers.len() <= DEEP_GAMES_PER_WORKER {
+    // The games of words `words` that are selected, in number order.
+    let each = |words: std::ops::Range<usize>, found: &mut Found| -> Result<(), Bad> {
+        for word in words {
+            let mut bits = games.word(word) & selected.word(word);
+            while bits != 0 {
+                count((word * 64) as u32 + bits.trailing_zeros(), found)?;
+                bits &= bits - 1;
+            }
+        }
+        Ok(())
+    };
+    let words = games.words();
+    let all = games.count();
+    if all <= DEEP_GAMES_PER_WORKER as u64 {
         let _worker = workers::one(cancel).map_err(|_| Bad::Busy)?;
         let _memory = Hold::reserve(Found::BYTES).map_err(|_| Bad::Busy)?;
         let mut found = Found::new().ok_or(Bad::Busy)?;
-        for &game in numbers.iter() {
-            count(game, &mut found)?;
-        }
+        each(0..words, &mut found)?;
         return Ok(Some(found));
     }
-    let want = numbers.len().div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
-    let chunks = numbers.len().div_ceil(WALK_GAMES_AT_ONCE);
-    let next = workers::Parts::new(chunks);
+    let want = (all as usize).div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
+    let next = workers::Parts::new(words.div_ceil(WALK_WORDS_AT_ONCE));
     let parts = workers::run(want, Found::BYTES, cancel, |w| {
         let mut found = Found::new().ok_or(SearchError::Busy)?;
         while let Some(taken) = next.take(w, cancel)? {
-            for &game in numbers.chunks(WALK_GAMES_AT_ONCE).nth(taken).unwrap_or_default() {
-                if let Err(damaged) = count(game, &mut found) {
-                    return Ok(Err(damaged));
-                }
+            let start = taken * WALK_WORDS_AT_ONCE;
+            if let Err(damaged) = each(start..(start + WALK_WORDS_AT_ONCE).min(words), &mut found) {
+                return Ok(Err(damaged));
             }
         }
         Ok(Ok(found))
@@ -281,8 +294,9 @@ const DEEP_GAMES_PER_WORKER: usize = 256;
 /// Candidates a worker takes at a time: the workers share a bucket as they
 /// go, so that one the machine runs less often takes fewer.
 const DEEP_GAMES_AT_ONCE: usize = 64;
-/// Games of a narrowed answer a worker takes at a time.
-const WALK_GAMES_AT_ONCE: usize = 256;
+/// Words of a narrowed position's games a worker takes at a time: 4,096
+/// records, a few of them selected.
+const WALK_WORDS_AT_ONCE: usize = 64;
 /// Room for the moves played from a position: it has 218 legal moves at most.
 const MAX_MOVES: usize = 256;
 
