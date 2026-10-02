@@ -25,6 +25,11 @@ const NOTE: &str = "updating-to";
 /// Store does not say which version it installs, so the start after it says
 /// the bridge was updated when it runs another version than this one.
 const FROM: &str = "updating-from";
+/// The file that names the version the bridge last started as (#265). The
+/// Store also installs an update by itself while the bridge is closed, after
+/// an exit or across a restart of Windows, and leaves no note; a start that
+/// runs a newer version than the last one says it was updated all the same.
+const LAST: &str = "last-run";
 
 /// How long the process must have run before Windows restarts it after a
 /// Store install: `RegisterApplicationRestart` restarts only a process that
@@ -250,17 +255,30 @@ pub fn forget(dir: &Path) {
 }
 
 /// The version this start was updated to: the one the direct installer's note
-/// names, when it is the version now `running`, or the one `running` after a
-/// Store install that started from another version. The notes are removed
-/// either way, so that an install that failed says nothing and a later start
-/// says nothing twice.
+/// names, when it is the version now `running`; the one `running` after a
+/// Store install that started from another version; or the one `running`
+/// when it is newer than the version of the last start, however it was
+/// installed (#265). The notes are removed and this start recorded either
+/// way, so that an install that failed says nothing and a later start says
+/// nothing twice.
 pub fn updated(dir: &Path, running: &str) -> Option<String> {
     let to = std::fs::read_to_string(dir.join(NOTE)).ok();
     let from = std::fs::read_to_string(dir.join(FROM)).ok();
+    let last = std::fs::read_to_string(dir.join(LAST)).ok();
     forget(dir);
+    // A start that cannot be recorded only costs the next update its notice.
+    let _ = std::fs::write(dir.join(LAST), running);
     let reached = to.is_some_and(|v| v.trim() == running);
     let moved = from.is_some_and(|v| !v.trim().is_empty() && v.trim() != running);
-    (reached || moved).then(|| running.to_string())
+    let newer = last.is_some_and(|v| newer_than(running, v.trim()));
+    (reached || moved || newer).then(|| running.to_string())
+}
+
+/// Whether version `a` is newer than `b`, both dotted numbers such as
+/// `1.10.0`; `false` when either is not one, as nothing is then said.
+fn newer_than(a: &str, b: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
+    matches!((parts(a), parts(b)), (Some(a), Some(b)) if a > b)
 }
 
 #[cfg(test)]
@@ -410,8 +428,43 @@ mod tests {
 
         note(&dir, "0.3.0").unwrap();
         forget(&dir);
+        // A first start, with no record of the last one: the forgotten note
+        // alone would say it.
+        std::fs::remove_file(dir.join(LAST)).unwrap();
         assert_eq!(updated(&dir, "0.3.0"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The start of a newer version says it was updated without any note, as
+    /// after an install the Store made while the bridge was closed (#265);
+    /// once, and never for the first start, an older version or a version
+    /// that is no dotted number.
+    #[test]
+    fn the_start_of_a_newer_version_says_so_once() {
+        let dir = std::env::temp_dir().join(format!("bridge-app-last-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(updated(&dir, "1.3.2"), None, "the first start");
+        assert_eq!(updated(&dir, "1.3.3").as_deref(), Some("1.3.3"));
+        assert_eq!(updated(&dir, "1.3.3"), None, "once");
+        assert_eq!(updated(&dir, "1.3.2"), None, "an older version");
+        assert_eq!(updated(&dir, "1.10.0").as_deref(), Some("1.10.0"), "compared as numbers, not text");
+        std::fs::write(dir.join(LAST), "garbled").unwrap();
+        assert_eq!(updated(&dir, "1.11.0"), None, "a record that is no version");
+        assert_eq!(updated(&dir, "1.12.0-rc.1"), None, "a version that is no dotted number");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn versions_compare_as_numbers() {
+        assert!(newer_than("1.3.3", "1.3.2"));
+        assert!(newer_than("1.10.0", "1.9.9"));
+        assert!(newer_than("2.0.0", "1.99.99"));
+        assert!(!newer_than("1.3.2", "1.3.2"));
+        assert!(!newer_than("1.3.1", "1.3.2"));
+        assert!(!newer_than("", "1.3.2"));
+        assert!(!newer_than("1.3.3", ""));
+        assert!(!newer_than("1.3.x", "1.3.2"));
     }
 
     /// A note that cannot be written fails with an error the updater logs as

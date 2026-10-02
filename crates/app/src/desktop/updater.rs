@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use tauri::plugin::TauriPlugin;
 use tauri::{AppHandle, Runtime};
-use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
+use super::notices::notify;
 use super::server::Shared;
 use super::shared;
 use crate::{prefs, updates};
@@ -55,6 +55,7 @@ pub fn start(app: &AppHandle) {
     STARTED.get_or_init(Instant::now);
     let shared = shared(app);
     if let Some(version) = shared.dir().ok().and_then(|dir| updates::updated(&dir, env!("CARGO_PKG_VERSION"))) {
+        bridge::log!("update: this start runs {version}, newly installed");
         let title = shared.strings.fill("toast.updated.title", &[("version", &version)]);
         notify(app, title, shared.strings.get("toast.updated.body"));
     }
@@ -144,14 +145,6 @@ pub(super) fn notify_latest(app: &AppHandle) {
     let strings = &shared(app).strings;
     let title = strings.get("toast.update.latest.title").to_string();
     notify(app, title, &strings.fill("toast.update.latest.body", &[("version", env!("CARGO_PKG_VERSION"))]));
-}
-
-pub(super) fn notify(app: &AppHandle, title: String, body: &str) {
-    let mut toast = app.notification().builder().title(title);
-    if !body.is_empty() {
-        toast = toast.body(body);
-    }
-    let _ = toast.show();
 }
 
 #[cfg(test)]

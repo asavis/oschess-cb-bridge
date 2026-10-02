@@ -3,6 +3,7 @@
 
 mod autostart;
 mod commands;
+mod notices;
 mod package;
 mod server;
 mod store_updates;
@@ -16,7 +17,6 @@ use std::time::Duration;
 
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
-use tauri_plugin_notification::NotificationExt;
 
 use crate::channel::Channel;
 use crate::i18n::{Lang, Strings};
@@ -163,7 +163,7 @@ fn notify_problem(app: &tauri::AppHandle, strings: &Strings, view: &View) {
         ),
         _ => (strings.get("toast.stopped.title").to_string(), strings.get("toast.stopped.body").to_string()),
     };
-    let _ = app.notification().builder().title(title).body(body).show();
+    notices::notify(app, title, &body);
 }
 
 /// The shared state, as the commands receive it.
