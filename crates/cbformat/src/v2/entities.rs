@@ -249,7 +249,10 @@ fn tournament_of(r: &[u8]) -> Option<Tournament> {
     let place = string(&mut c)?;
     let title = string(&mut c)?;
     let start = Date(c.le_i32()?);
-    Some(Tournament { title, place, start })
+    // The type byte follows the start date (#268); a record that ends before
+    // it has none.
+    let kind = c.u8().unwrap_or(0);
+    Some(Tournament { title, place, start, kind })
 }
 
 impl Entities {

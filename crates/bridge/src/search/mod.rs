@@ -39,6 +39,9 @@ use crate::sync::lock;
 
 /// Searches whose results are kept for paging.
 const KEPT_RESULTS: usize = 4;
+/// Searches kept as sets of records, for the explorer to narrow positions by
+/// (#268): a set takes a bit a record, 1.5 MB for the Mega Database.
+const KEPT_SETS: usize = 4;
 /// Record numbers kept over all those results: 128 MiB.
 const KEPT_NUMBERS: usize = 32 << 20;
 
@@ -55,6 +58,8 @@ pub struct Indexes {
     /// Where annotators are not players.
     annotators: Slot<NameTable>,
     titles: Slot<NameTable>,
+    /// Each tournament's type byte, by id, for `timecontrol:` (#268).
+    tournament_kinds: Slot<Held<Vec<u8>>>,
     player_ranks: Slot<Held<Vec<Vec<u32>>>>,
     annotator_ranks: Slot<Held<Vec<Vec<u32>>>>,
     /// Tournaments and titles in one name order: `[tournaments, titles]`.
@@ -66,6 +71,8 @@ pub struct Indexes {
     counts: Slot<Held<suggest::Counts>>,
     /// The latest searches, newest last.
     results: Mutex<VecDeque<Kept>>,
+    /// The latest searches as sets of records, by their text, newest last (#268).
+    sets: Mutex<VecDeque<(String, Arc<Members>)>>,
     /// Searches started on this database, per client stream: the latest in a
     /// stream supersedes the others there.
     streams: Streams,
@@ -257,6 +264,9 @@ impl Evict for Indexes {
         if let Ok(mut results) = self.results.try_lock() {
             results.clear();
         }
+        if let Ok(mut sets) = self.sets.try_lock() {
+            sets.clear();
+        }
         clear(&self.counts);
         clear(&self.player_ranks);
         clear(&self.annotator_ranks);
@@ -268,6 +278,7 @@ impl Evict for Indexes {
         clear(&self.tournaments);
         clear(&self.annotators);
         clear(&self.titles);
+        clear(&self.tournament_kinds);
     }
 }
 
@@ -588,16 +599,61 @@ fn push_u32(v: &mut Vec<u32>, x: u32, allow: &mut Allowance<'_>) -> Result<(), R
     Ok(())
 }
 
-/// The records `query` matches, among `members` when given, in `sort` order:
-/// the pass that evaluates the query tests the membership first.
-fn search<S: Store>(
+/// The records the search `q` selects, as a set, for the explorer to narrow
+/// each position's games by (#268); `None` for a search without terms. One
+/// pass over the database finds them, and the set is kept with the latest
+/// such searches under the search's text, so the next positions narrowed by
+/// it need no pass. A pass refused for memory or workers is `Busy`.
+pub fn matching(db: &Base, idx: &Indexes, q: &str) -> Result<Option<Arc<Members>>, SearchError> {
+    with_store!(db, db => matching_in(db, idx, q))
+}
+
+fn matching_in<S: Store>(db: &S, idx: &Indexes, q: &str) -> Result<Option<Arc<Members>>, SearchError> {
+    let query = query::parse(q).map_err(|u| SearchError::Unsupported(u.0))?;
+    if query.terms.is_empty() {
+        return Ok(None);
+    }
+    let key = q.trim();
+    if let Some(set) = lock(&idx.sets).iter().find(|kept| kept.0 == key).map(|kept| kept.1.clone()) {
+        return Ok(Some(set));
+    }
+    idx.gate.enter();
+    let cancel = Cancel::never();
+    let heads = idx.heads();
+    let ctl = Control { cancel: &cancel, scanned: &idx.scanned, heads: heads.as_deref() };
+    let set = Members::new(db.record_count() as usize + 1)?;
+    with_matcher(db, idx, &ctl, &query, |matcher| {
+        scan::scan(db, &ctl, |_| Ok(()), &Marking(matcher, &set), |_| {}).map(drop)
+    })?;
+    let set = Arc::new(set);
+    let mut sets = lock(&idx.sets);
+    sets.push_back((key.to_string(), Arc::clone(&set)));
+    while sets.len() > KEPT_SETS {
+        sets.pop_front();
+    }
+    Ok(Some(set))
+}
+
+/// Marks the records a query matches in a set.
+struct Marking<'m, 'a>(&'m scan::Matcher<'a>, &'m Members);
+
+impl scan::Visit<()> for Marking<'_, '_> {
+    fn visit(&self, _: &mut (), r: &impl Head) -> Result<(), SearchError> {
+        if self.0.matches(r) {
+            self.1.insert(r.id());
+        }
+        Ok(())
+    }
+}
+
+/// `query` compiled against the name tables it reads, and handed to `f`.
+fn with_matcher<S: Store, T>(
     db: &S,
     idx: &Indexes,
     ctl: &Control<'_>,
     query: &Query,
-    sort: Sort,
-    members: Option<&Members>,
-) -> Result<Held<Vec<u32>>, SearchError> {
+    f: impl FnOnce(&scan::Matcher<'_>) -> Result<T, SearchError>,
+) -> Result<T, SearchError> {
     let uses = |fields: &[Field]| query.terms.iter().any(|t| fields.contains(&t.field));
     let load = |used: bool, kind| if used { idx.names(db, kind, ctl.cancel).map(Some) } else { Ok(None) };
     let people = uses(&[Field::Text, Field::White, Field::Black, Field::Player]);
@@ -609,18 +665,37 @@ fn search<S: Store>(
     };
     let events = uses(&[Field::Text, Field::Event]);
     let (tournaments, titles) = (load(events, Kind::Tournaments)?, load(events, Kind::Titles)?);
+    let kinds = match uses(&[Field::TimeControl]) {
+        true => Some(cached(&idx.tournament_kinds, || names::tournament_kinds(db, ctl.cancel))?),
+        false => None,
+    };
     let tables = scan::Tables {
         players: players.as_deref(),
         annotators: annotators.as_deref(),
         annotators_are_players: S::ANNOTATORS_ARE_PLAYERS,
         tournaments: tournaments.as_deref(),
         titles: titles.as_deref(),
+        tournament_kinds: kinds.as_deref().map(|k| k.as_slice()),
     };
     let sets = Mutex::new(Hold::default());
     let matcher = scan::Matcher::new(query, &tables, &mut Allowance::new(&sets))?;
+    f(&matcher)
+}
+
+/// The records `query` matches, among `members` when given, in `sort` order:
+/// the pass that evaluates the query tests the membership first.
+fn search<S: Store>(
+    db: &S,
+    idx: &Indexes,
+    ctl: &Control<'_>,
+    query: &Query,
+    sort: Sort,
+    members: Option<&Members>,
+) -> Result<Held<Vec<u32>>, SearchError> {
     let found = Mutex::new(Hold::default());
-    let parts =
-        scan::scan(db, ctl, |_| Ok((Vec::new(), Allowance::new(&found))), &Matching(&matcher, members), |_| {})?;
+    let parts = with_matcher(db, idx, ctl, query, |matcher| {
+        scan::scan(db, ctl, |_| Ok((Vec::new(), Allowance::new(&found))), &Matching(matcher, members), |_| {})
+    })?;
     let parts: Vec<Vec<u32>> = parts.into_iter().map(|(numbers, _)| numbers).collect();
     let matches: usize = parts.iter().map(Vec::len).sum();
     let mut hold = Hold::reserve(matches * 4)?;

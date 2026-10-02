@@ -617,6 +617,12 @@ fn string(s: &str) -> Vec<u8> {
 /// A `.2lid` with the six entity types, holding players (type 0), tournaments
 /// (type 1) and the game tags that carry titles (type 5).
 pub fn lid(players: &[String], tournaments: &[String], titles: &[String]) -> Vec<u8> {
+    let tournaments: Vec<(String, u8)> = tournaments.iter().map(|t| (t.clone(), 0)).collect();
+    lid_of_kinds(players, &tournaments, titles)
+}
+
+/// [`lid`] with each tournament's type byte.
+pub fn lid_of_kinds(players: &[String], tournaments: &[(String, u8)], titles: &[String]) -> Vec<u8> {
     let tables: [Vec<Vec<u8>>; 6] = [
         players
             .iter()
@@ -625,7 +631,7 @@ pub fn lid(players: &[String], tournaments: &[String], titles: &[String]) -> Vec
                 [string(last), string(first)].concat()
             })
             .collect(),
-        tournaments.iter().map(|t| [string(""), string(t), vec![0; 4]].concat()).collect(),
+        tournaments.iter().map(|(t, kind)| [string(""), string(t), vec![0; 4], vec![*kind]].concat()).collect(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -700,12 +706,16 @@ pub struct FixtureRow<'a> {
     pub white_elo: u16,
     pub black_elo: u16,
     pub annotator: &'a str,
+    /// A game's tournament's time control: `normal`, `rapid`, `blitz` or
+    /// `corr`, the same for every game of an event; `-` for a guiding text or
+    /// an analysis.
+    pub time_control: &'a str,
 }
 
 impl<'a> FixtureRow<'a> {
     pub fn parse(line: &'a str) -> FixtureRow<'a> {
         let f: Vec<&str> = line.split('|').map(str::trim).collect();
-        assert_eq!(f.len(), 13, "a fixture row has 13 columns: {line}");
+        assert_eq!(f.len(), 14, "a fixture row has 14 columns: {line}");
         FixtureRow {
             number: f[0].parse().unwrap(),
             kind: f[1],
@@ -720,6 +730,32 @@ impl<'a> FixtureRow<'a> {
             white_elo: f[10].parse().unwrap(),
             black_elo: f[11].parse().unwrap(),
             annotator: f[12],
+            time_control: f[13],
+        }
+    }
+
+    /// The tournament's type byte both ChessBase formats store: its time
+    /// control's bit over the kind of event, a tournament (1).
+    pub fn tournament_kind(&self) -> u8 {
+        match self.time_control {
+            "rapid" => 0x41,
+            "blitz" => 0x21,
+            "corr" => 0x81,
+            "-" => 0,
+            _ => 0x01,
+        }
+    }
+
+    /// The `TimeControl` tag a PGN game of this time control has: FIDE's
+    /// normal, rapid and blitz games, and `-` for correspondence; `None` for a
+    /// row that has none.
+    pub fn pgn_time_control(&self) -> Option<&'static str> {
+        match self.time_control {
+            "normal" => Some("5400+30"),
+            "rapid" => Some("900+10"),
+            "blitz" => Some("180+2"),
+            "corr" => Some("-"),
+            _ => None,
         }
     }
 
@@ -767,7 +803,7 @@ impl std::fmt::Display for FixtureRow<'_> {
         let r = self;
         write!(
             f,
-            "{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}",
             r.number,
             r.kind,
             r.white,
@@ -780,7 +816,8 @@ impl std::fmt::Display for FixtureRow<'_> {
             r.moves,
             r.white_elo,
             r.black_elo,
-            r.annotator
+            r.annotator,
+            r.time_control
         )
     }
 }
@@ -798,6 +835,7 @@ fn numbered(rows: &[String]) -> Vec<FixtureRow<'_>> {
 /// [`fixture`] of `rows` in its form.
 pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
     let (mut players, mut tournaments, mut titles) = (Names::default(), Names::default(), Names::default());
+    let mut kinds: Vec<u8> = Vec::new();
     let mut b = Builder::new();
     let e4 = b.moves(1, &[MOVES, quiet(Color::White, Piece::Pawn, "e2", "e4"), END_OF_LINE]);
     for row in numbered(rows) {
@@ -816,7 +854,9 @@ pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
                 if kind == "deleted" {
                     rec[0] |= 0x80;
                 }
-                &[(0x18, white), (0x20, black), (0x28, tournaments.id(row.event)), (0x30, annotator)]
+                let tournament = tournaments.id(row.event);
+                kind_of(&mut kinds, tournament as usize, row.tournament_kind());
+                &[(0x18, white), (0x20, black), (0x28, tournament), (0x30, annotator)]
             }
         };
         for &(at, id) in ids {
@@ -835,8 +875,25 @@ pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
         put(rec, 0x60, &row.white_elo.to_le_bytes());
         put(rec, 0x70, &row.black_elo.to_le_bytes());
     }
-    b.lid(lid(&players.0, &tournaments.0, &titles.0));
+    let tournaments: Vec<(String, u8)> =
+        tournaments.0.iter().enumerate().map(|(i, t)| (t.clone(), kinds.get(i).copied().unwrap_or(0))).collect();
+    b.lid(lid_of_kinds(&players.0, &tournaments, &titles.0));
     b.write(name)
+}
+
+/// Notes `kind` as tournament `id`'s type byte: every game of an event gives
+/// the same one.
+fn kind_of(kinds: &mut Vec<u8>, id: usize, kind: u8) {
+    // Entity 0 is no event, which has no type.
+    if id == 0 {
+        return;
+    }
+    if kinds.len() <= id {
+        kinds.resize(id + 1, 0);
+    } else if kinds[id] != 0 {
+        assert_eq!(kinds[id], kind, "the games of one event share its time control");
+    }
+    kinds[id] = kind;
 }
 
 /// `rows` of the fixture's form as a PGN file, `db.pgn`: each a game with the
@@ -865,6 +922,10 @@ pub fn pgn_fixture(name: &str, rows: &[String]) -> TempDb {
             if value != "-" {
                 text.push_str(&format!("[{tag} \"{value}\"]\n"));
             }
+        }
+        // Correspondence is the tag's `-` itself.
+        if let Some(time_control) = row.pgn_time_control() {
+            text.push_str(&format!("[TimeControl \"{time_control}\"]\n"));
         }
         text.push('\n');
         let moves = usize::from(row.moves);
@@ -904,7 +965,7 @@ pub fn classic_fixture(name: &str, extra: &[&str]) -> TempDb {
         }
         assert_ne!(row.kind, "analysis", "the classic format has no analyses");
         let (white, black) = (ids.player(&mut b, row.white), ids.player(&mut b, row.black));
-        let event = ids.tournament(&mut b, row.event);
+        let event = ids.tournament(&mut b, row.event, row.tournament_kind());
         let rec = b.game(&e4);
         if row.kind == "deleted" {
             rec[0] |= 0x80;
@@ -957,8 +1018,8 @@ impl ClassicIds {
         })
     }
 
-    fn tournament(&mut self, b: &mut fixture_cbh::Builder, name: &str) -> u32 {
-        known(&mut self.tournaments, name, |n| b.tournament(n, ""))
+    fn tournament(&mut self, b: &mut fixture_cbh::Builder, name: &str, kind: u8) -> u32 {
+        known(&mut self.tournaments, name, |n| b.tournament_of_kind(n, "", kind))
     }
 
     fn annotator(&mut self, b: &mut fixture_cbh::Builder, name: &str) -> u32 {

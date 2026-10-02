@@ -95,6 +95,34 @@ fn the_conformance_corpus_holds_on_a_classic_copy() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The set the explorer narrows positions by (#268): the records a search
+/// selects, which one pass finds and the next positions reuse under the
+/// search's text, the latest four of them. A search without terms selects
+/// none, and a qualifier only the Library has is refused as in a list.
+#[test]
+fn a_search_set_is_found_once_and_kept_with_the_latest() {
+    let f = fixture("search-matching", &[]);
+    let db = Base::open(f.dir().join("db.2cbh")).unwrap();
+    let idx = Indexes::default();
+    let set = unbusy(|| search::matching(&db, &idx, "tc:blitz")).unwrap().unwrap();
+    assert_eq!(set.iter().collect::<Vec<_>>(), [7, 10]);
+    let scanned = idx.scanned();
+    assert!(scanned > 0);
+    let again = unbusy(|| search::matching(&db, &idx, "  tc:blitz ")).unwrap().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&set, &again));
+    assert_eq!(idx.scanned(), scanned, "a kept set needs no pass");
+    assert!(unbusy(|| search::matching(&db, &idx, "sort:date")).unwrap().is_none());
+    assert!(matches!(search::matching(&db, &idx, "tag:x"), Err(SearchError::Unsupported(q)) if q == "tag"));
+    for q in ["tc:normal", "tc:rapid", "tc:corr", "whiteelo:2500.."] {
+        unbusy(|| search::matching(&db, &idx, q)).unwrap();
+    }
+    let kept = idx.scanned();
+    let after = unbusy(|| search::matching(&db, &idx, "tc:blitz")).unwrap().unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&set, &after), "four later searches pushed it out");
+    assert!(idx.scanned() > kept);
+    assert_eq!(after.iter().collect::<Vec<_>>(), [7, 10]);
+}
+
 /// [`unbusy`] asks a call again while it answers `WorkersBusy`, returns the
 /// first answer that is not busy, and passes any other error through. A real
 /// busy answer comes only after the product's `workers::WAIT` (5 s): with the
@@ -163,8 +191,8 @@ fn suggestions_by_prefix_and_count() {
 #[test]
 fn texts_and_analyses_by_their_own_layout() {
     let extra = [
-        "11 | analysis | - | - | Morphy's openings | ????.??.?? | - | * | - | 0 | 0 | 0 | Tal, Mikhail",
-        "12 | text     | - | - | Aaa survey        | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm",
+        "11 | analysis | - | - | Morphy's openings | ????.??.?? | - | * | - | 0 | 0 | 0 | Tal, Mikhail | -",
+        "12 | text     | - | - | Aaa survey        | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm | -",
     ];
     let f = fixture("search-other", &extra);
     let db = Base::open(f.dir().join("db.2cbh")).unwrap();
@@ -415,9 +443,9 @@ fn only_the_same_stream_supersedes() {
 #[test]
 fn classic_and_2cbh_copies_agree() {
     let extra = [
-        "11 | text | - | - | Aaa survey | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm",
-        "12 | game | Tal, Mikhail | Morphy, Paul | Aaa survey | 1960.05.07 | 3 | 1-0 | A00 | 12 | 2700 | 0 | Tal, Mikhail",
-        "13 | text | - | - | Zugzwang | ????.??.?? | - | * | - | 0 | 0 | 0 | -",
+        "11 | text | - | - | Aaa survey | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm | -",
+        "12 | game | Tal, Mikhail | Morphy, Paul | Aaa survey | 1960.05.07 | 3 | 1-0 | A00 | 12 | 2700 | 0 | Tal, Mikhail | normal",
+        "13 | text | - | - | Zugzwang | ????.??.?? | - | * | - | 0 | 0 | 0 | - | -",
     ];
     let (f2, fc) = (fixture("search-pair-2cbh", &extra), classic_fixture("search-pair-cbh", &extra));
     let two = Base::open(f2.dir().join("db.2cbh")).unwrap();

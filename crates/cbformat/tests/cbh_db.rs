@@ -315,3 +315,35 @@ fn a_move_file_over_4_gib_is_read_through_cbj() {
     std::fs::write(path(".cbj"), short).unwrap();
     assert!(Database::open(f.base()).is_err());
 }
+
+/// A tournament's type byte, at 0x4a of its `.cbt` record (#268), keeps its
+/// time-control bits; a file whose records stop before it opens as before,
+/// its tournaments without a type.
+#[test]
+fn a_tournament_keeps_its_type_byte_where_its_record_holds_one() {
+    use cbformat::game::TimeControl;
+
+    let mut b = builder(1);
+    let blitz = b.tournament_of_kind("Blitz Open", "Riga", 0x21);
+    let f = b.write("cbt-kind");
+    let db = Database::open(f.dir().join("db.cbh")).unwrap();
+    let t = db.entities().tournament(blitz).unwrap().unwrap();
+    assert_eq!((t.title.as_str(), t.kind), ("Blitz Open", 0x21));
+    assert_eq!(TimeControl::of_kind(t.kind), TimeControl::BLITZ);
+    drop(db);
+
+    // The same file with records of 74 data bytes, the start date their last field.
+    let path = f.dir().join("db.cbt");
+    let bytes = std::fs::read(&path).unwrap();
+    let data = i32::from_le_bytes(bytes[0x0c..0x10].try_into().unwrap()) as usize;
+    let (header, record) = (28, 9 + data);
+    let mut short = bytes[..header].to_vec();
+    short[0x0c..0x10].copy_from_slice(&74i32.to_le_bytes());
+    for r in bytes[header..].chunks(record) {
+        short.extend_from_slice(&r[..9 + 74]);
+    }
+    std::fs::write(&path, short).unwrap();
+    let db = Database::open(f.dir().join("db.cbh")).unwrap();
+    let t = db.entities().tournament(blitz).unwrap().unwrap();
+    assert_eq!((t.title.as_str(), t.place.as_str(), t.kind), ("Blitz Open", "Riga", 0));
+}

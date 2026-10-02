@@ -415,7 +415,9 @@ of the same games answers, apart from what the format has otherwise:
   header index built for the file's current generation is used at once, also
   after the bridge restarts; a change to the file reads it again. A file whose
   header index cannot be built is `unreadable` for a minute, and the next
-  request tries again. A header index takes 48 bytes a game plus the names.
+  request tries again. A header index takes 48 bytes a game plus the names,
+  among them the game's time control, which its `TimeControl` tag gives
+  (#268, [search-grammar.md](search-grammar.md#time-control)).
   The `pgn` folder is swept as the `index` folder is (see "Storage" under
   `GET /v1/databases/{id}/explorer`): a build's `<id>.head.partial` goes at
   once unless that file is being read, and the header index of a database
@@ -741,6 +743,7 @@ the oschess analysis panel shows it like its Lichess tabs.
 |---|---|
 | `fen` | The position, in FEN; required |
 | `variant` | `standard` (the default); any other value is answered `422 unsupported` |
+| `q` | A search in the Library search grammar ([search-grammar.md](search-grammar.md)): the answer counts only the games it selects (below) |
 
 ```json
 {
@@ -761,6 +764,34 @@ the oschess analysis panel shows it like its Lichess tabs.
 }
 ```
 
+With `q` the answer also acknowledges the search (#268):
+
+    "filter": { "q": "tc:normal whiteelo:2200.. blackelo:2200..", "games": 5012345 }
+
+- **Narrowed by a search** (#268). With a `q` that has a term, `games`,
+  `white`, `draws`, `black`, `moves` and `topGames` count only the games of
+  the position that `q` selects, the games `GET /v1/databases/{id}/games?fen=&q=`
+  lists, by the rules below: each once, at the first ply its main line
+  reaches the position, with the move it played from there; the notable games
+  are the best rated of them. The answer acknowledges the search with
+  `filter`: `q` as read, its first 1,024 characters, and `games`, the games of
+  the position before it, the answer's `games` without `q`. A bridge older
+  than this parameter ignores it and sends no `filter`: a client that sent
+  `q` and finds none treats the answer as not narrowed.
+  - `sort:` tokens are ignored, and a `q` with no term left, empty or only a
+    sort, is the answer without it, with no `filter`.
+  - A qualifier only the Library has is `400 unsupported_qualifier`, as in a
+    list, before the database or its index is looked at: such a request
+    starts no build. The other refusals, `409` while the index is built and
+    `503`, are those of the answer without `q`.
+  - The records `q` selects are found by one pass over the database's
+    headers and kept as a set, a bit a record, with the latest four such
+    searches: the next positions narrowed by the same `q` need no pass. The
+    position's games among them are replayed from the index's move stream to
+    their first visit, on at most half of the search workers.
+  - Searches by `timecontrol:`, `whiteelo:`, `blackelo:` and `date:` narrow
+    the reference to the games a player prepares from: normal games of
+    rated players in a span of years, for example.
 - **Counts.** `games` counts the games that reached the position; `white`,
   `draws` and `black` count those that ended so. A game without a result
   counts in `games` only. A game is counted once however often it reaches the

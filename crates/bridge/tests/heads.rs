@@ -31,6 +31,7 @@ fn many(n: usize, kinds: &[&str]) -> Vec<String> {
     let base = out.len();
     let players = ["Kasparov, Garry", "Karpov, Anatoly", "Carlsen, Magnus", "Anand, Viswanathan", "Tal, Mikhail"];
     let events = ["Linares", "Wijk aan Zee", "Moscow ch", "Dortmund"];
+    let time_controls = ["normal", "rapid", "blitz", "corr"];
     let results = ["1-0", "0-1", "1/2-1/2", "*"];
     for i in 0..n {
         let number = base + i + 1;
@@ -49,7 +50,7 @@ fn many(n: usize, kinds: &[&str]) -> Vec<String> {
             k => format!("{}{:02}", ["A", "B", "C", "D", "E"][k % 5], i % 100),
         };
         out.push(format!(
-            "{number} | {kind} | {white} | {black} | {} | {}.{:02}.{:02} | {round} | {} | {eco} | {} | {} | {} | {}",
+            "{number} | {kind} | {white} | {black} | {} | {}.{:02}.{:02} | {round} | {} | {eco} | {} | {} | {} | {} | {}",
             events[i % 4],
             1950 + i % 70,
             i % 12 + 1,
@@ -59,6 +60,7 @@ fn many(n: usize, kinds: &[&str]) -> Vec<String> {
             if i % 5 == 0 { 0 } else { 2200 + i % 600 },
             if i % 6 == 0 { 0 } else { 2150 + i % 650 },
             if i % 9 == 0 { players[(i + 2) % 5] } else { "-" },
+            if kind == "text" || kind == "analysis" { "-" } else { time_controls[i % 4] },
         ));
     }
     out
@@ -98,7 +100,17 @@ fn answers(db: &Base, idx: &Indexes) -> Vec<String> {
         "moves",
         "result",
     ];
-    let extra = ["kasparov", "player:carlsen", "event:linares", "date:1960..1980", "result:1-0 tal", "-annotator:tal"];
+    let extra = [
+        "kasparov",
+        "player:carlsen",
+        "event:linares",
+        "date:1960..1980",
+        "result:1-0 tal",
+        "-annotator:tal",
+        "tc:blitz",
+        "-tc:normal whiteelo:>=2500",
+        "tc:rapid,corr blackelo:..2400",
+    ];
     let all = queries
         .chain(sorts.iter().map(|s| format!("sort:{s}")))
         .chain(extra.iter().map(|q| q.to_string()))

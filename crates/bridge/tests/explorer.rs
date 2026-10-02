@@ -441,7 +441,7 @@ fn number_of(object: &str) -> u32 {
 fn every_notable_game_is_its_games_row_and_its_year() {
     // A game dated without a year, beside the fixture's.
     let extra = [
-        "11 | game | Tal, Mikhail | Morphy, Paul | Riga Club Ch | ????.??.?? | 3 | 1-0 | B20 | 20 | 2400 | 0 | Nimzowitsch, Aron",
+        "11 | game | Tal, Mikhail | Morphy, Paul | Riga Club Ch | ????.??.?? | 3 | 1-0 | B20 | 20 | 2400 | 0 | Nimzowitsch, Aron | blitz",
     ];
     let two = common::fixture("explorer-rows-2cbh", &extra);
     let classic = common::classic_fixture("explorer-rows-cbh", &extra);

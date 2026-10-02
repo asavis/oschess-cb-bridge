@@ -1,5 +1,6 @@
 //! `GET /v1/databases/{id}/explorer?fen=`: the moves played from a position
-//! and its notable games, in the shape the oschess panel's explorer tabs use.
+//! and its notable games, in the shape the oschess panel's explorer tabs use,
+//! of all its games or of those a search `q` selects (#268).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -16,9 +17,10 @@ use crate::http::{Request, Response};
 use crate::json::{self, Obj};
 use crate::reply::{bad_parameter, error, error_with, ok, unavailable};
 use crate::rows::{Names, row_obj};
-use crate::search::SearchError;
 use crate::search::memory::{Cancel, Hold};
+use crate::search::query::{self, MAX_QUERY_CHARS};
 use crate::search::workers::{self, threads};
+use crate::search::{self, Members, SearchError};
 use crate::store::{Head, Store, with_store};
 
 use super::file::Bad;
@@ -37,6 +39,15 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(board) => board,
         Err(answer) => return answer,
     };
+    // A search is read before the database: a qualifier only the Library has
+    // is refused as a list refuses it, whatever state the database is in. A
+    // search with terms narrows the answer; one without, or none, does not.
+    let q = req.param("q").map(|q| q.chars().take(MAX_QUERY_CHARS).collect::<String>());
+    let narrowing = match q.as_deref().map(query::parse) {
+        Some(Err(unsupported)) => return crate::api::unsupported_qualifier(&unsupported.0),
+        Some(Ok(parsed)) => q.filter(|_| !parsed.terms.is_empty()),
+        None => None,
+    };
     // Asked for its explorer, the database is in use: the keeper rebuilds
     // its index when it changes (#149). A request refused for its
     // parameters does not ask for it.
@@ -49,11 +60,116 @@ pub fn route(app: &App, entry: &Entry, req: &Request) -> Response {
         Ok(loaded) => loaded,
         Err(answer) => return answer,
     };
+    if let Some(q) = narrowing {
+        return match narrowed(app, entry, &open, &loaded, &board, &q) {
+            Ok((stats, games)) => ok(render_with(&open.db, &board, stats, &loaded, Some(Filter { q: &q, games }))),
+            Err(Narrowing::Search(e)) => crate::api::search_error(app, entry, open.generation, e),
+            Err(Narrowing::Index(Bad::Busy)) => busy(),
+            Err(Narrowing::Index(_)) => rebuilding(app, entry),
+        };
+    }
     match stats(&loaded, &board, &Cancel::never()) {
         Ok(stats) => ok(render(&open.db, &board, stats, &loaded)),
         Err(Bad::Busy) => busy(),
         Err(_) => rebuilding(app, entry),
     }
+}
+
+/// What narrowing an answer by a search failed on: the search, as a list's
+/// search fails, or the walk of its games through the index.
+enum Narrowing {
+    Search(SearchError),
+    Index(Bad),
+}
+
+/// The answer for `board` among the games the search `q` selects (#268), and
+/// how many games reach the position before it: the games of the position,
+/// as `GET /v1/databases/{id}/games?fen=` lists them, that are among the
+/// records `q` selects, which one pass over the database finds and keeps for
+/// the next positions ([`search::matching`]). Each is replayed from the move
+/// stream to its first visit, where the move it played from there, its
+/// outcome and its rating are read. `None` when no game is selected.
+fn narrowed(
+    app: &App,
+    entry: &Entry,
+    open: &Opened,
+    loaded: &Loaded,
+    board: &Board,
+    q: &str,
+) -> Result<(Option<Stats>, u64), Narrowing> {
+    // Searches read the heads file when one is ready, as a list's do.
+    app.catalog.attach_heads(entry, open);
+    let selected = match search::matching(&open.db, &open.indexes, q).map_err(Narrowing::Search)? {
+        Some(selected) => selected,
+        None => return Err(Narrowing::Search(SearchError::Bug("a search with terms selects a set"))),
+    };
+    let cancel = Cancel::never();
+    let games = super::positions::games(loaded, board, &cancel).map_err(Narrowing::Search)?;
+    let found = walk(loaded, board, &games, &selected, &cancel).map_err(Narrowing::Index)?;
+    Ok((found.filter(|f| f.counts.games > 0).map(Found::into_stats), games.count()))
+}
+
+/// The games of `board` in `games` that are in `selected`, each replayed to
+/// its first visit and counted there, as [`replay_with`] counts the games it
+/// finds: on the calling thread, taken as one of the shared workers, when one
+/// worker would take them all, else on at most half of them, each taking the
+/// games of [`WALK_WORDS_AT_ONCE`] words of the sets at a time. Each is a game
+/// of the position, so a game that does not reach it is damage, `Corrupt`.
+fn walk(
+    loaded: &Loaded,
+    board: &Board,
+    games: &Members,
+    selected: &Members,
+    cancel: &Cancel,
+) -> Result<Option<Found>, Bad> {
+    let target = Target::of(board);
+    let count = |game: u32, found: &mut Found| -> Result<(), Bad> {
+        let hit = loaded.stream.find(game, &target)?.ok_or(Bad::Corrupt("a game of the position"))?;
+        Counted.add(found, game, hit);
+        Ok(())
+    };
+    // The games of words `words` that are selected, in number order.
+    let each = |words: std::ops::Range<usize>, found: &mut Found| -> Result<(), Bad> {
+        for word in words {
+            let mut bits = games.word(word) & selected.word(word);
+            while bits != 0 {
+                count((word * 64) as u32 + bits.trailing_zeros(), found)?;
+                bits &= bits - 1;
+            }
+        }
+        Ok(())
+    };
+    let words = games.words();
+    let all = games.count();
+    if all <= DEEP_GAMES_PER_WORKER as u64 {
+        let _worker = workers::one(cancel).map_err(|_| Bad::Busy)?;
+        let _memory = Hold::reserve(Found::BYTES).map_err(|_| Bad::Busy)?;
+        let mut found = Found::new().ok_or(Bad::Busy)?;
+        each(0..words, &mut found)?;
+        return Ok(Some(found));
+    }
+    let want = (all as usize).div_ceil(DEEP_GAMES_PER_WORKER).min((threads() / 2).max(1));
+    let next = workers::Parts::new(words.div_ceil(WALK_WORDS_AT_ONCE));
+    let parts = workers::run(want, Found::BYTES, cancel, |w| {
+        let mut found = Found::new().ok_or(SearchError::Busy)?;
+        while let Some(taken) = next.take(w, cancel)? {
+            let start = taken * WALK_WORDS_AT_ONCE;
+            if let Err(damaged) = each(start..(start + WALK_WORDS_AT_ONCE).min(words), &mut found) {
+                return Ok(Err(damaged));
+            }
+        }
+        Ok(Ok(found))
+    })
+    .map_err(|_| Bad::Busy)?;
+    let mut all: Option<Found> = None;
+    for part in parts {
+        let part = part?;
+        match &mut all {
+            Some(all) => all.merge(&part),
+            None => all = Some(part),
+        }
+    }
+    Ok(all)
 }
 
 /// The position `fen` names; else its answer: `400` naming `fen` for a FEN
@@ -120,9 +236,27 @@ fn counts(o: Obj, c: &Counts) -> Obj {
         .num("black", c.black as i64)
 }
 
+/// The search an answer was narrowed by, which it acknowledges: the text as
+/// read, and the games of the position before it.
+pub struct Filter<'q> {
+    pub q: &'q str,
+    pub games: u64,
+}
+
 /// The answer for `board`: its counts, its moves most played first, and its
 /// notable games, best rated first.
 pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -> String {
+    render_with(db, board, stats, loaded, None)
+}
+
+/// [`render`], acknowledging `filter` when the answer was narrowed by it.
+pub fn render_with(
+    db: &Base,
+    board: &Board,
+    stats: Option<Stats>,
+    loaded: &Loaded,
+    filter: Option<Filter<'_>>,
+) -> String {
     let stats = stats.unwrap_or_default();
     let moves = stats.moves.iter().filter_map(|(code, c)| {
         let mv = unpack_move(board, *code).filter(|&mv| board.is_legal(mv))?;
@@ -142,11 +276,14 @@ pub fn render(db: &Base, board: &Board, stats: Option<Stats>, loaded: &Loaded) -
     top.truncate(TOP_GAMES);
     let games = top.iter().map(|t| t.2.to_string());
     let index = Obj::new().num("records", i64::from(loaded.records())).num("games", loaded.games() as i64).done();
-    counts(Obj::new().str("generation", &format!("{:016x}", loaded.generation)), &stats.counts)
+    let answer = counts(Obj::new().str("generation", &format!("{:016x}", loaded.generation)), &stats.counts)
         .raw("moves", &json::array(moves))
         .raw("topGames", &json::array(games))
-        .raw("index", &index)
-        .done()
+        .raw("index", &index);
+    match filter {
+        Some(f) => answer.raw("filter", &Obj::new().str("q", f.q).num("games", f.games as i64).done()).done(),
+        None => answer.done(),
+    }
 }
 
 /// Candidates a worker replays at least, so that a small bucket takes one.
@@ -157,6 +294,9 @@ const DEEP_GAMES_PER_WORKER: usize = 256;
 /// Candidates a worker takes at a time: the workers share a bucket as they
 /// go, so that one the machine runs less often takes fewer.
 const DEEP_GAMES_AT_ONCE: usize = 64;
+/// Words of a narrowed position's games a worker takes at a time: 4,096
+/// records, a few of them selected.
+const WALK_WORDS_AT_ONCE: usize = 64;
 /// Room for the moves played from a position: it has 218 legal moves at most.
 const MAX_MOVES: usize = 256;
 

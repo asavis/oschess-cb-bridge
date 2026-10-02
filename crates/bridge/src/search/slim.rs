@@ -6,15 +6,19 @@
 //! played date `i32` at 16, ratings `i16` at 20 and 22, round and sub-round
 //! `i16` at 24 and 26, moves `i16` at 28, the ECO field `u16` at 30, the kind
 //! at 32 (bit 7 deleted, bit 6 a record with a layout of its own), a kind
-//! the formats do not name at 33, the result field at 34; 35 is zero.
+//! the formats do not name at 33, the result field at 34, and at 35 the game's
+//! own time control (#268): its bits with bit 0 set, 0 where the game's time
+//! control is its tournament's ([`Head::time_control`]).
 
-use cbformat::game::{Date, Eco, GameResult, Head, RecordKind};
+use cbformat::game::{Date, Eco, GameResult, Head, RecordKind, TimeControl};
 
 /// Bytes of one row.
 pub const ROW: usize = 36;
 
 const DELETED: u8 = 0x80;
 const OTHER: u8 = 0x40;
+/// Byte 35 holds the game's own time control.
+const OWN_TIME_CONTROL: u8 = 1;
 
 /// One record's row, with its number.
 #[derive(Clone, Copy)]
@@ -64,6 +68,7 @@ impl Slim {
                 put_i16(&mut b, 28, r.move_count())?;
                 b[30..32].copy_from_slice(&r.eco().field().to_le_bytes());
                 b[34] = r.result().field();
+                b[35] = r.time_control().map_or(0, |own| own.bits() | OWN_TIME_CONTROL);
             }
         }
         same(r, &Slim::new(r.id(), &b)).then_some(b)
@@ -104,7 +109,8 @@ pub fn same(a: &impl Head, b: &impl Head) -> bool {
             && a.round() == b.round()
             && a.move_count() == b.move_count()
             && a.eco() == b.eco()
-            && a.result() == b.result())
+            && a.result() == b.result()
+            && a.time_control() == b.time_control())
 }
 
 impl Head for Slim {
@@ -157,5 +163,8 @@ impl Head for Slim {
     }
     fn bytes(&self) -> &[u8] {
         &self.b
+    }
+    fn time_control(&self) -> Option<TimeControl> {
+        (self.b[35] & OWN_TIME_CONTROL != 0).then(|| TimeControl::of_kind(self.b[35]))
     }
 }

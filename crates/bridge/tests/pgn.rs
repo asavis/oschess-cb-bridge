@@ -48,13 +48,23 @@ fn wait_ready(catalog: &Catalog, path: &Path) {
 
 /// The fixture of `docs/search-grammar.md` with what PGN cannot hold made a
 /// game: the guiding text and the deleted game are games, and every game has
-/// at least one move, so that both copies play `1. e4` in each.
+/// at least one move, so that both copies play `1. e4` in each. The text made
+/// a game takes the time control of its event's games, which the 2CBH copy
+/// marks on the event.
 fn pgn_rows() -> Vec<String> {
-    rows(&[])
+    let rows = rows(&[]);
+    let parsed: Vec<FixtureRow> = rows.iter().map(|line| FixtureRow::parse(line)).collect();
+    parsed
         .iter()
-        .map(|line| {
-            let row = FixtureRow::parse(line);
-            FixtureRow { kind: "game", moves: row.moves.max(1), ..row }.to_string()
+        .map(|&row| {
+            let time_control = match row.time_control {
+                "-" => parsed
+                    .iter()
+                    .find(|r| r.event == row.event && r.time_control != "-")
+                    .map_or("normal", |r| r.time_control),
+                own => own,
+            };
+            FixtureRow { kind: "game", moves: row.moves.max(1), time_control, ..row }.to_string()
         })
         .collect()
 }
@@ -98,6 +108,10 @@ fn a_pgn_copy_answers_as_its_2cbh_copy() {
         "q=elo%3A%3E%3D2700",
         "q=date%3A1914&sort=black-desc",
         "q=result%3A1-0",
+        "q=whiteelo%3A%3E%3D2500%20blackelo%3A..2650",
+        "q=tc%3Anormal",
+        "q=tc%3Arapid,blitz",
+        "q=-timecontrol%3Acorr",
         "sort=tournament",
         "sort=annotator-desc",
         "sort=round",

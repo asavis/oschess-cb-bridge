@@ -33,6 +33,13 @@ pub enum Field {
     Moves,
     /// Either player's rating.
     Elo,
+    /// White's rating alone (#268).
+    WhiteElo,
+    /// Black's rating alone (#268).
+    BlackElo,
+    /// The game's time control, its tournament's (#268): its value is one of
+    /// `normal`, `rapid`, `blitz` and `correspondence`, in lower case.
+    TimeControl,
 }
 
 impl Field {
@@ -49,13 +56,16 @@ impl Field {
             "annotator" => Field::Annotator,
             "moves" => Field::Moves,
             "elo" => Field::Elo,
+            "whiteelo" => Field::WhiteElo,
+            "blackelo" => Field::BlackElo,
+            "timecontrol" | "tc" => Field::TimeControl,
             _ => return None,
         })
     }
 
     /// Fields that take `>`, `>=`, `<`, `<=` and `a..b`.
     pub fn is_comparable(self) -> bool {
-        matches!(self, Field::Eco | Field::Date | Field::Moves | Field::Elo)
+        matches!(self, Field::Eco | Field::Date | Field::Moves | Field::Elo | Field::WhiteElo | Field::BlackElo)
     }
 }
 
@@ -153,6 +163,10 @@ fn to_value(field: Field, raw: &str) -> Option<Value> {
             _ => value,
         };
         return Some(equal(canonical));
+    }
+    if field == Field::TimeControl {
+        let class = value.to_lowercase();
+        return Some(equal(if class == "corr" { "correspondence".to_string() } else { class }));
     }
     if !field.is_comparable() {
         return Some(equal(value));
@@ -306,6 +320,21 @@ mod tests {
         assert_eq!(v("white:>x").text, ">x");
         assert_eq!(v("result:Draw").text, "1/2-1/2");
         assert_eq!(v("result:unknown").text, "*");
+        assert_eq!(
+            v("whiteelo:2200..2700"),
+            Value { text: "2200".into(), cmp: Cmp::Range, upper: Some("2700".into()) }
+        );
+        assert_eq!((one("BlackElo:>=2600").field, v("blackelo:>=2600").cmp), (Field::BlackElo, Cmp::GreaterOrEqual));
+        assert_eq!(
+            (one("TimeControl:Rapid").field, v("timecontrol:Rapid").text.as_str()),
+            (Field::TimeControl, "rapid")
+        );
+        assert_eq!(v("tc:CORR").text, "correspondence");
+        // Time control is not comparable: an operator is part of the value.
+        assert_eq!(v("tc:>blitz").text, ">blitz");
+        let t = one("-tc:normal,blitz");
+        assert!(t.negated);
+        assert_eq!(t.values.iter().map(|v| v.text.as_str()).collect::<Vec<_>>(), ["normal", "blitz"]);
     }
 
     #[test]

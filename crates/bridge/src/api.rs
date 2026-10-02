@@ -399,7 +399,7 @@ fn suggest(app: &App, entry: &Entry, req: &Request) -> Response {
 }
 
 /// The answer to a search that could not finish.
-fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Response {
+pub(crate) fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Response {
     match e {
         SearchError::Unsupported(qualifier) => unsupported_qualifier(&qualifier),
         SearchError::Superseded => error(409, "superseded", "A newer search on this database replaced this one"),
@@ -421,7 +421,7 @@ fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchError) -> Re
 
 /// The answer to a search text that uses `qualifier`, which only the oschess
 /// Library has (`docs/search-grammar.md`).
-fn unsupported_qualifier(qualifier: &str) -> Response {
+pub(crate) fn unsupported_qualifier(qualifier: &str) -> Response {
     error_with(400, "unsupported_qualifier", "ChessBase databases do not have this qualifier", |o| {
         o.str("qualifier", qualifier)
     })

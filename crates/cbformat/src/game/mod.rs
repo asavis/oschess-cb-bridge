@@ -16,7 +16,7 @@ pub use annotations::{
     Unknown, language, timing,
 };
 pub(crate) use annotations::{QuoteDamage, quote_offsets};
-pub use entities::{Names, Player, Tournament};
+pub use entities::{Names, Player, TimeControl, Tournament};
 pub use fields::{Date, Eco, GameResult, ROUND_TEXT_BYTES, RecordKind, round_text};
 pub use head::Head;
 pub use start::{Setup, Start};
