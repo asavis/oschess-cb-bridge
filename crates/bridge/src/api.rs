@@ -160,6 +160,11 @@ fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Respon
     }
 }
 
+/// The optional features of API version 1 this bridge has (#270), which a
+/// client offers only when it finds them named: `explorerSearch`, the
+/// explorer's `q` (#268).
+pub const FEATURES: [&str; 1] = ["explorerSearch"];
+
 fn status(app: &App) -> Response {
     let entries = app.catalog.entries();
     let states: Vec<State> = entries.iter().map(|e| Database::of(e).state).collect();
@@ -173,7 +178,8 @@ fn status(app: &App) -> Response {
         .num("unsupported", count(State::Unsupported))
         .num("unreadable", count(State::Unreadable))
         .done();
-    let bridge = Obj::new().str("version", app.version).num("api", API_VERSION).done();
+    let features = json::array(FEATURES.iter().map(|f| format!("\"{f}\"")));
+    let bridge = Obj::new().str("version", app.version).num("api", API_VERSION).raw("features", &features).done();
     let engine = match (app.engine.name(), app.engine.defaults()) {
         (Some(name), Some((threads, hash_mb))) => {
             let limits = engine::limits();
