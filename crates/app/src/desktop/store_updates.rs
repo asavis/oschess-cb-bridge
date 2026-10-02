@@ -112,7 +112,10 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 };
                 let store = StoreCalls { download: || request(false), register_restart, install: || request(true) };
                 shared.dir().and_then(|dir| {
-                    updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || wait_ready(&shared))
+                    updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || {
+                        wait_ready(&shared);
+                        bridge::log!("update: installing over {} through Windows' dialog", env!("CARGO_PKG_VERSION"));
+                    })
                 })
             });
             // The Store page stays the way to update when Windows could not
@@ -130,7 +133,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 } else {
                     strings.get("toast.update.waiting.title")
                 };
-                super::updater::notify(app, title.to_string(), strings.get("toast.update.waiting.body"));
+                super::notices::notify(app, title.to_string(), strings.get("toast.update.waiting.body"));
                 *told = Some(mandatory);
             }
             Ok(())
@@ -166,8 +169,9 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
             };
             updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || {
                 wait_ready(&shared);
+                bridge::log!("update: installing over {} silently", env!("CARGO_PKG_VERSION"));
                 if asked {
-                    super::updater::notify(app, strings.get("toast.update.installing.store").to_string(), "");
+                    super::notices::notify(app, strings.get("toast.update.installing.store").to_string(), "");
                 }
             })
         }

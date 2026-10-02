@@ -39,9 +39,9 @@ tauri-plugin-updater = { version = "=2.12.0", default-features = false, features
 # The display language, the taskbar's theme and the package identity; already
 # in the tree.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_Packaging_Appx", "Win32_System_Registry"] }
-# The Store package's startup task (#112), a WinRT API; already in the tree
-# through Tauri.
-windows = { version = "0.61", features = ["ApplicationModel", "ApplicationModel_Core", "Foundation", "Foundation_Collections", "Services_Store", "Win32_System_Recovery", "Win32_UI_Shell"] }
+# The Store package's startup task (#112) and its toasts (#265), WinRT APIs;
+# already in the tree through Tauri.
+windows = { version = "0.61", features = ["ApplicationModel", "ApplicationModel_Core", "Data_Xml_Dom", "Foundation", "Foundation_Collections", "Services_Store", "UI_Notifications", "Win32_System_Recovery", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 cbformat = { version = "0.1.0", path = "../cbformat", features = ["fixture"] }
