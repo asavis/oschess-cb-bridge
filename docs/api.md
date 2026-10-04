@@ -873,9 +873,10 @@ entity tag (`"0123456789abcdef"`).
 - **Which databases.** Only a PGN file in state `ready` takes writes: one that
   is not ready answers `409 database_unavailable` with its `state`, as a read
   does. A `number` the file does not have is `404 not_found`.
-- **One at a time.** Writes into one file run one at a time: a write that
-  waits for another and names the generation before it is then
-  `409 generation_changed`.
+- **One at a time.** The bridge writes one write at a time, whatever
+  database or path it names, so that two listed paths of one file, as a link
+  and its target, are never written at once. A write that waits for another
+  and names the generation before it is then `409 generation_changed`.
 - **An append** writes after the file's last byte and leaves every earlier
   byte as it was. A file whose last line has no line end gets one, and then an
   empty line before the game unless the file ends with one already; the game
@@ -888,7 +889,9 @@ entity tag (`"0123456789abcdef"`).
   new one, never a mix. The temporary file is made new: when a file or a link
   already has its name, the write is `500 write_failed` and that file is left
   as it is. Before any game goes into it, it takes the PGN file's access: its
-  permissions and group on Unix, its access control list on Windows. So the
+  permissions and group on Unix, with its POSIX access control list on
+  Linux, and its access control list on Windows. A list that cannot be given
+  to it fails the write. So the
   new file is no more readable than the old one was. A temporary file a crash left is removed when the bridge next
   lists the file. A PGN path that is a link is written where it links to, and
   the link stays. A replace puts the game in the place of the old

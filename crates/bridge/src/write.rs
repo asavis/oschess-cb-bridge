@@ -39,6 +39,13 @@ use crate::catalog::{Entry, Format, State};
 use crate::http::{Request, Response};
 use crate::json::Obj;
 use crate::reply::{bad_parameter, error, error_with, not_found, unavailable};
+use crate::sync::lock;
+
+/// Held by every write, so that writes run one at a time. Two listed paths may
+/// name one file, as a link and its target or two hard links do; a lock of
+/// each database's own would let their writes overlap, and one would undo
+/// the other.
+static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What a temporary file beside a PGN file adds to its name.
 const TEMP_SUFFIX: &str = ".oschess-tmp";
@@ -142,6 +149,7 @@ fn write(entry: &Entry, req: &Request, op: Op) -> Response {
         },
         Op::Delete(_) => None,
     };
+    let _one_at_a_time = lock(&WRITES);
     let mut writing = entry.writing();
     // The file as it is now, told before anything waits for an index of it:
     // a file changed since the client read it is a conflict, not a file to
@@ -620,15 +628,60 @@ fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
     Ok(out)
 }
 
-/// Gives `out` the permissions of `source`, and its group where the user
-/// may: a group the user is not in keeps the user's own.
+/// Gives `out` the permissions of `source`, its group where the user may (a
+/// group the user is not in keeps the user's own), and on Linux its POSIX
+/// access control list.
 #[cfg(unix)]
 fn copy_access(source: &File, out: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = source.metadata()?;
     // The group first: a change of group may clear bits the mode sets again.
     let _ = std::os::unix::fs::fchown(out, None, Some(meta.gid()));
-    out.set_permissions(meta.permissions())
+    out.set_permissions(meta.permissions())?;
+    copy_acl(source, out)
+}
+
+/// The extended attribute that holds a file's POSIX access control list.
+#[cfg(target_os = "linux")]
+const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// Gives `out` the POSIX access control list of `source`, when it has one.
+/// With one, the mode's group bits are the list's mask, and the owning
+/// group's own access is in the list alone: the mode without the list could
+/// grant that group more. The list is set last, since setting it sets the
+/// mode to match. One that cannot be read whole or set fails the write.
+#[cfg(target_os = "linux")]
+fn copy_acl(source: &File, out: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    /// More than a file's list ever holds.
+    const MAX_ACL: usize = 64 << 10;
+    // SAFETY: a null buffer of size 0 asks for the value's size alone.
+    let size = unsafe { libc::fgetxattr(source.as_raw_fd(), ACL_ACCESS.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let e = io::Error::last_os_error();
+        // No list, or a file system without lists.
+        return if matches!(e.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) { Ok(()) } else { Err(e) };
+    }
+    let mut value = vec![0u8; (size as usize).min(MAX_ACL)];
+    // SAFETY: `value` is as long as the size given; a value grown since is
+    // refused with ERANGE.
+    let read =
+        unsafe { libc::fgetxattr(source.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the value is the first `read` bytes of `value`.
+    let set = unsafe { libc::fsetxattr(out.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_ptr().cast(), read as usize, 0) };
+    if set < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Elsewhere than on Linux, a file's mode is all the bridge keeps.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn copy_acl(_: &File, _: &File) -> io::Result<()> {
+    Ok(())
 }
 
 /// Gives `out` the discretionary access control list of `source`, protected
@@ -1081,6 +1134,71 @@ mod tests {
             drop(out);
             std::fs::remove_file(&temp).unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The value of `file`'s POSIX access control list; `None` without one.
+    #[cfg(target_os = "linux")]
+    fn acl_of(file: &File) -> Option<Vec<u8>> {
+        use std::os::fd::AsRawFd;
+        let mut value = vec![0u8; 4096];
+        // SAFETY: `value` is as long as the size given.
+        let n =
+            unsafe { libc::fgetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+        (n >= 0).then(|| value[..n as usize].to_vec())
+    }
+
+    /// Gives `file` a POSIX access control list that lets user 65534 read it
+    /// and its owning group nothing, its mask allowing reading: its mode is
+    /// then 0640, though its group may not read it. `false` where the file
+    /// system has no lists.
+    #[cfg(target_os = "linux")]
+    fn restrict(file: &File) -> bool {
+        use std::os::fd::AsRawFd;
+        // Version 2, then (tag, permissions, id) entries in tag order: the
+        // owner, user 65534, the owning group, the mask, others.
+        let mut value = 2u32.to_le_bytes().to_vec();
+        let none = u32::MAX;
+        for (tag, perm, id) in
+            [(0x01u16, 6u16, none), (0x02, 4, 65534), (0x04, 0, none), (0x10, 4, none), (0x20, 0, none)]
+        {
+            value.extend(tag.to_le_bytes());
+            value.extend(perm.to_le_bytes());
+            value.extend(id.to_le_bytes());
+        }
+        // SAFETY: `value` is as long as the size given.
+        let set =
+            unsafe { libc::fsetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        if set < 0 {
+            let e = io::Error::last_os_error();
+            assert_eq!(e.raw_os_error(), Some(libc::EOPNOTSUPP), "{e}");
+            return false;
+        }
+        true
+    }
+
+    /// The temporary file has the PGN file's POSIX access control list from
+    /// the start, and the mode it implies.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_temporary_file_has_the_files_posix_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-write-posix-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        let source = File::open(&path).unwrap();
+        if !restrict(&source) {
+            eprintln!("skipped: the file system of {} has no access control lists", dir.display());
+            return;
+        }
+        let acl = acl_of(&source).expect("a list");
+        let temp = temp_path(&path);
+        let out = create_temp_like(&source, &temp).unwrap();
+        assert_eq!(acl_of(&out).as_deref(), Some(&acl[..]));
+        assert_eq!(out.metadata().unwrap().permissions().mode() & 0o7777, 0o640);
+        drop(out);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

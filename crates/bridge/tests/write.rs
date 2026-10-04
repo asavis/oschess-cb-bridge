@@ -525,6 +525,95 @@ fn a_private_file_stays_private() {
     }
 }
 
+/// A file's POSIX access control list stays as it was through a replace and
+/// a removal: with one, the mode's group bits are its mask, and the owning
+/// group's own access is in the list alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_posix_acl_stays() {
+    use std::os::fd::AsRawFd;
+    let acl = |path: &Path| -> Option<Vec<u8>> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut value = vec![0u8; 4096];
+        // SAFETY: `value` is as long as the size given.
+        let n = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        (n >= 0).then(|| value[..n as usize].to_vec())
+    };
+    let scratch = Scratch::new("posix-acl");
+    let path = scratch.path("games.pgn");
+    std::fs::write(&path, format!("{GAME_1}\n\n{GAME_2}\n\n")).unwrap();
+    // User 65534 may read it, its owning group nothing; the mode is 0640.
+    let mut value = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in
+        [(0x01u16, 6u16, u32::MAX), (0x02, 4, 65534), (0x04, 0, u32::MAX), (0x10, 4, u32::MAX), (0x20, 0, u32::MAX)]
+    {
+        value.extend(tag.to_le_bytes());
+        value.extend(perm.to_le_bytes());
+        value.extend(id.to_le_bytes());
+    }
+    let file = std::fs::File::open(&path).unwrap();
+    // SAFETY: `value` is as long as the size given.
+    let set = unsafe {
+        libc::fsetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), value.as_ptr().cast(), value.len(), 0)
+    };
+    if set < 0 {
+        eprintln!("skipped: no access control lists here: {}", std::io::Error::last_os_error());
+        return;
+    }
+    drop(file);
+    let before = acl(&path).expect("a list");
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let id = id_of(&path);
+    let games = format!("/v1/databases/{id}/games");
+    for (method, at, body) in [("PUT", format!("{games}/1"), NEW), ("DELETE", format!("{games}/2"), "")] {
+        let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+        let r = write(bridge.port, method, &at, Some(&generation), body);
+        assert_eq!(r.status, 200, "{method}: {}", r.body);
+        assert_eq!(acl(&path).as_deref(), Some(&before[..]), "{method} changed the list");
+    }
+}
+
+/// Two listed paths that name one file, hard links of it, are written one
+/// at a time, as one database: of two appends naming the generation both
+/// read, one is written and the other is `409 generation_changed`, and no
+/// written game is lost. A long comment makes each write long enough for the
+/// two to meet.
+#[test]
+fn two_paths_of_one_file_write_one_at_a_time() {
+    let scratch = Scratch::new("aliases");
+    let (path, alias) = (scratch.path("games.pgn"), scratch.path("alias.pgn"));
+    let long = format!("[Event \"long\"]\n\n1. e4 {{{}}} *\n\n", "x".repeat(4 << 20));
+    std::fs::write(&path, &long).unwrap();
+    std::fs::hard_link(&path, &alias).unwrap();
+    let bridge = TestBridge::new(app_of([path.clone(), alias.clone()]));
+    let port = bridge.port;
+    let (id, alias_id) = (id_of(&path), id_of(&alias));
+    let generation = string_member(&ready_row(port, &id), "generation").to_string();
+    assert_eq!(string_member(&ready_row(port, &alias_id), "generation"), generation);
+    let send = |id: String, body: &'static str, generation: String| {
+        std::thread::spawn(move || write(port, "POST", &format!("/v1/databases/{id}/games"), Some(&generation), body))
+    };
+    let (a, b) = (send(id, NEW, generation.clone()), send(alias_id, GAME_3, generation));
+    let (a, b) = (a.join().unwrap(), b.join().unwrap());
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409], "{} / {}", a.body, b.body);
+    let refused = if a.status == 409 { &a } else { &b };
+    assert!(refused.body.contains(r#""code":"generation_changed""#), "{}", refused.body);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let written = [NEW, GAME_3].iter().filter(|g| text.contains(**g)).count();
+    assert_eq!(written, 1, "exactly the game answered 201 is in the file");
+    let saved = if a.status == 201 { NEW } else { GAME_3 };
+    assert!(text.contains(saved));
+}
+
 /// The temporary file a replace or a removal writes beside the PGN file, left
 /// by a bridge that stopped before it was renamed, goes when the file is next
 /// listed; the PGN file stays as it is.
