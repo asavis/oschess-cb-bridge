@@ -18,7 +18,7 @@
 //! reading depends on the whole file.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -172,12 +172,40 @@ fn write_update(old: &Database, pgn: &Path, out_path: &Path, stamp: u64, edit: &
 /// the same name twice in a table, and keeps no more bytes of names than
 /// its file's text gives (three bytes of UTF-8 for a byte of a code page at
 /// most): a name that breaks one of these is damage, and the file is read
-/// whole. So the maps hold no more names than the file holds bytes.
+/// whole. So the maps hold no more names than the file holds bytes. A name
+/// the new text gave the new index first, as a game a replace writes may, is
+/// one the old index's records share with it.
 #[derive(Default)]
 struct OldNames {
-    players: HashMap<i64, u32>,
-    tournaments: HashMap<i64, u32>,
-    annotators: HashMap<i64, u32>,
+    players: Remap,
+    tournaments: Remap,
+    annotators: Remap,
+}
+
+/// The new ids of one table's names, by their old ids.
+#[derive(Default)]
+struct Remap {
+    /// The new id, stored one higher, of each old id met.
+    ids: HashMap<i64, u32>,
+    /// The new ids old ids have taken: two old ids naming one name are two
+    /// entries of one text, which a build never writes.
+    taken: HashSet<u32>,
+}
+
+impl Remap {
+    fn get(&self, old: i64) -> Option<u32> {
+        self.ids.get(&old).copied()
+    }
+
+    /// Notes that old id `old` is new id `new`; `false` when another old id
+    /// took `new` already.
+    fn take(&mut self, old: i64, new: u32) -> bool {
+        if !self.taken.insert(new) {
+            return false;
+        }
+        self.ids.insert(old, new);
+        true
+    }
 }
 
 /// Name `id` of `kind` in `old`'s table, at most [`MAX_NAME`] bytes; `None`
@@ -257,7 +285,7 @@ impl Copy<'_> {
             return Ok(0);
         }
         let known = if annotator { &self.names.annotators } else { &self.names.players };
-        if let Some(&new) = known.get(&id) {
+        if let Some(new) = known.get(id) {
             return Ok(new);
         }
         let kind = if annotator { NameKind::Annotators } else { NameKind::Players };
@@ -265,13 +293,12 @@ impl Copy<'_> {
         let Some(text) = text else { return Ok(self.damage()) };
         let b = &mut self.building;
         let table = if annotator { &mut b.annotators } else { &mut b.players };
-        let (before, bytes) = (table.list.len(), text.len());
+        let bytes = text.len();
         let new = table.intern(text, bytes, &mut b.held).ok_or_else(too_many_names)?;
-        if table.list.len() == before || !self.within_text() {
+        let known = if annotator { &mut self.names.annotators } else { &mut self.names.players };
+        if !known.take(id, new) || !self.within_text() {
             return Ok(self.damage());
         }
-        let known = if annotator { &mut self.names.annotators } else { &mut self.names.players };
-        known.insert(id, new);
         Ok(new)
     }
 
@@ -281,7 +308,7 @@ impl Copy<'_> {
         if id < 0 {
             return Ok(0);
         }
-        if let Some(&new) = self.names.tournaments.get(&id) {
+        if let Some(new) = self.names.tournaments.get(id) {
             return Ok(new);
         }
         let event = old_name(self.old, NameKind::Tournaments, id, false)?;
@@ -291,12 +318,11 @@ impl Copy<'_> {
             return Ok(self.damage());
         }
         let b = &mut self.building;
-        let (before, bytes) = (b.tournaments.list.len(), event.len() + site.len());
+        let bytes = event.len() + site.len();
         let new = b.tournaments.intern((event, site), bytes, &mut b.held).ok_or_else(too_many_names)?;
-        if b.tournaments.list.len() == before || !self.within_text() {
+        if !self.names.tournaments.take(id, new) || !self.within_text() {
             return Ok(self.damage());
         }
-        self.names.tournaments.insert(id, new);
         Ok(new)
     }
 
@@ -435,8 +461,17 @@ mod tests {
 
     /// Edits `before` into `after`, replacing the bytes `span` of it, and
     /// checks that the index [`update`] writes from the index of `before` is
-    /// the one a build writes for `after`, as the edit names the games.
-    fn check(name: &str, before: &[u8], span: std::ops::Range<usize>, with: &[u8], first: u32, removed: u32) {
+    /// the one a build writes for `after`, as the edit names the games, and
+    /// that it read the file `whole`, or only around the edit. A whole read
+    /// gives the same bytes, so only this tells it apart.
+    fn check(
+        name: &str,
+        before: &[u8],
+        span: std::ops::Range<usize>,
+        with: &[u8],
+        (first, removed): (u32, u32),
+        whole: bool,
+    ) {
         let scratch = Scratch::new(name);
         let dir = &scratch.0;
         let (pgn, index) = (dir.join("db.pgn"), dir.join("db.head"));
@@ -451,7 +486,12 @@ mod tests {
         let edited = dir.join("db.pgn.new");
         std::fs::write(&edited, &after).unwrap();
         std::fs::rename(&edited, &pgn).unwrap();
-        let games = update(&old, &pgn, &index, 2, &Edit { first, removed, delta }).unwrap();
+        let edit = Edit { first, removed, delta };
+        let partial = partial_path(&index);
+        let around = write_update(&old, &pgn, &partial, 2, &edit).unwrap().is_some();
+        std::fs::remove_file(&partial).unwrap();
+        assert_eq!(around, !whole, "{name}: read around the edit");
+        let games = update(&old, &pgn, &index, 2, &edit).unwrap();
         let expected = built(dir, &after, 2);
         let text = String::from_utf8_lossy(&after);
         assert_eq!(std::fs::read(&index).unwrap(), expected, "{name}: {text}");
@@ -485,18 +525,37 @@ mod tests {
         let new = game("New", "Carlsen, Magnus", "1. e4 c5 2. Nf3 1-0");
         // An append, as the bridge writes it.
         let appended = format!("{new}\n\n");
-        check("append", file.as_bytes(), file.len()..file.len(), appended.as_bytes(), 5, 0);
+        check("append", file.as_bytes(), file.len()..file.len(), appended.as_bytes(), (5, 0), false);
         let empty = "";
-        check("append-to-nothing", empty.as_bytes(), 0..0, appended.as_bytes(), 1, 0);
+        check("append-to-nothing", empty.as_bytes(), 0..0, appended.as_bytes(), (1, 0), false);
         for (n, &start) in starts.iter().enumerate() {
             let span = start..start + games[n].len();
             let number = n as u32 + 1;
-            check(&format!("replace-{number}"), file.as_bytes(), span.clone(), new.as_bytes(), number, 1);
+            check(&format!("replace-{number}"), file.as_bytes(), span.clone(), new.as_bytes(), (number, 1), false);
             let shorter = game("One", "Morphy, Paul", "1. e4 1-0");
-            check(&format!("replace-short-{number}"), file.as_bytes(), span, shorter.as_bytes(), number, 1);
+            check(&format!("replace-short-{number}"), file.as_bytes(), span, shorter.as_bytes(), (number, 1), false);
             let removed = start..starts.get(n + 1).copied().unwrap_or(file.len());
-            check(&format!("remove-{number}"), file.as_bytes(), removed, b"", number, 1);
+            check(&format!("remove-{number}"), file.as_bytes(), removed, b"", (number, 1), false);
         }
+    }
+
+    /// A replacement that names a player, an event or an annotator a later
+    /// game names too shares the name with it: the file is read only around
+    /// the edit, whichever text met the name first.
+    #[test]
+    fn names_shared_with_the_new_text_stay_incremental() {
+        let named = |white: &str, event: &str, annotator: &str| {
+            format!("[Event \"{event}\"]\n[White \"{white}\"]\n[Annotator \"{annotator}\"]\n\n1. e4 *")
+        };
+        let games = [named("A", "One", "X"), named("A", "Two", "Y"), named("C", "Three", "Z"), named("D", "Four", "W")];
+        let file = games.join("\n\n") + "\n\n";
+        let first = 0..games[0].len();
+        // The reviewer's case: game 2's White is the replacement's.
+        check("shared-white", file.as_bytes(), first.clone(), named("A", "New", "V").as_bytes(), (1, 1), false);
+        // Each name of the replacement is a later game's.
+        check("shared-all", file.as_bytes(), first, named("C", "Three", "Z").as_bytes(), (1, 1), false);
+        let second = games[0].len() + 2..games[0].len() + 2 + games[1].len();
+        check("shared-later", file.as_bytes(), second, named("D", "Four", "W").as_bytes(), (2, 1), false);
     }
 
     /// Edits whose games read otherwise beside their neighbours: a game
@@ -509,11 +568,18 @@ mod tests {
         let file = "[Event \"a\"]\n1. e4\n\n[Event \"b\"]\n1. d4 1-0\n\n1. c4 0-1\n\n[Event \"d\"]\n1. f4 *\n";
         let b = file.find("[Event \"b\"]").unwrap();
         let c = file.find("1. c4").unwrap();
-        check("remove-joins", file.as_bytes(), b..c, b"", 2, 1);
-        check("replace-joins", file.as_bytes(), b..c - 2, b"1. g3", 2, 1);
+        check("remove-joins", file.as_bytes(), b..c, b"", (2, 1), false);
+        check("replace-joins", file.as_bytes(), b..c - 2, b"1. g3", (2, 1), false);
         let bom = format!("\u{feff}{file}");
-        check("bom-remove-first", bom.as_bytes(), 3..b + 3, b"", 1, 1);
-        check("bom-replace-first", bom.as_bytes(), 3..3 + "[Event \"a\"]\n1. e4".len(), b"[Event \"z\"] 1. h4 *", 1, 1);
+        check("bom-remove-first", bom.as_bytes(), 3..b + 3, b"", (1, 1), false);
+        check(
+            "bom-replace-first",
+            bom.as_bytes(),
+            3..3 + "[Event \"a\"]\n1. e4".len(),
+            b"[Event \"z\"] 1. h4 *",
+            (1, 1),
+            false,
+        );
     }
 
     /// A comment left open by the edit, which a build reads again from a game
@@ -524,7 +590,7 @@ mod tests {
         let file = "[Event \"a\"]\n1. e4 1-0\n\n[Event \"b\"]\n1. d4 1-0\n\n[Event \"c\"]\n1. c4 0-1\n";
         let b = file.find("[Event \"b\"]").unwrap();
         let end = b + "[Event \"b\"]\n1. d4 1-0".len();
-        check("open-comment", file.as_bytes(), b..end, b"[Event \"b\"]\n1. d4 {left open", 2, 1);
+        check("open-comment", file.as_bytes(), b..end, b"[Event \"b\"]\n1. d4 {left open", (2, 1), true);
     }
 
     /// Appends a game to the PGN file of `before`, whose index `doctor`
@@ -545,6 +611,9 @@ mod tests {
         std::fs::write(dir.join("new.pgn"), &after).unwrap();
         std::fs::rename(dir.join("new.pgn"), &pgn).unwrap();
         let edit = Edit { first: old.record_count() + 1, removed: 0, delta: (after.len() - before.len()) as i64 };
+        let partial = partial_path(&index);
+        assert!(write_update(&old, &pgn, &partial, 2, &edit).unwrap().is_none(), "{name}: damage reads the file whole");
+        let _ = std::fs::remove_file(&partial);
         update(&old, &pgn, &index, 2, &edit).unwrap();
         assert_eq!(std::fs::read(&index).unwrap(), built(dir, after.as_bytes(), 2), "{name}");
     }
