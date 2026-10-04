@@ -133,7 +133,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
             });
             // The Store page stays the way to update when Windows could not
             // ask the user itself.
-            requested.map(store_result).or_else(|e| {
+            requested.map(StoreOutcome::phase).or_else(|e| {
                 bridge::log!("update: {e}; opening the Store page");
                 app.opener().open_url(STORE_PAGE, None::<&str>).map(|()| Phase::StoreOpened).map_err(|e| e.to_string())
             })
@@ -189,15 +189,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
                     super::notices::notify(app, strings.get("toast.update.installing.store").to_string(), "");
                 }
             })
-            .map(store_result)
+            .map(StoreOutcome::phase)
         }
-    }
-}
-
-fn store_result(outcome: StoreOutcome) -> Phase {
-    match outcome {
-        StoreOutcome::Declined => Phase::Declined,
-        StoreOutcome::Completed => Phase::RestartRequired,
-        StoreOutcome::Incomplete => Phase::Failed,
     }
 }

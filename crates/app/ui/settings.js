@@ -107,8 +107,10 @@ async function checkUpdates() {
     renderUpdateProgress(await call('check_updates'));
   } catch (error) {
     notice(failure(error));
-    // A failed command never leaves a local "checking" state behind.
-    renderUpdateProgress({ revision: updateProgress?.revision ?? 0, phase: 'failed', busy: false });
+    // An IPC failure must not overwrite a job already confirmed by an event.
+    if (!updateProgress?.busy) {
+      renderUpdateProgress({ revision: updateProgress?.revision ?? 0, phase: 'failed', busy: false });
+    }
   } finally {
     checkPending = false;
     renderUpdateStatus();

@@ -137,6 +137,18 @@ impl Monitor {
         Some(progress.clone())
     }
 
+    /// Runs a reserved job and ends it even if an updater dependency panics.
+    /// The snapshot becomes terminal before another caller can begin a job.
+    pub fn finish(&self, job: impl FnOnce() -> Result<Phase, String>) -> (Progress, Option<String>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+            .unwrap_or_else(|_| Err("the update task stopped unexpectedly".into()));
+        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        progress.revision += 1;
+        progress.phase = outcome.as_ref().copied().unwrap_or(Phase::Failed);
+        progress.busy = progress.phase.busy();
+        (progress.clone(), outcome.err())
+    }
+
     pub fn report(&self, phase: Phase, version: Option<String>) -> Progress {
         let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
         *progress = Progress { revision: progress.revision + 1, phase, busy: phase.busy(), version };
@@ -195,6 +207,16 @@ pub enum StoreOutcome {
     Declined,
     /// It did not complete.
     Incomplete,
+}
+
+impl StoreOutcome {
+    pub fn phase(self) -> Phase {
+        match self {
+            Self::Declined => Phase::Declined,
+            Self::Completed => Phase::RestartRequired,
+            Self::Incomplete => Phase::Failed,
+        }
+    }
 }
 
 /// What installing a Store update needs from Windows, so that its order is
@@ -457,6 +479,41 @@ mod tests {
         assert!(retry.version.is_none());
         monitor.report(Phase::Current, None);
         assert!(monitor.begin().is_some());
+    }
+
+    #[test]
+    fn a_panicking_update_releases_the_job_and_retains_a_failure() {
+        let monitor = Monitor::new();
+        monitor.begin().unwrap();
+        let (failed, error) = monitor.finish(|| {
+            monitor.report(Phase::Downloading, Some("1.5.0".into()));
+            panic!("an updater dependency panicked");
+        });
+        assert_eq!(error.as_deref(), Some("the update task stopped unexpectedly"));
+        assert_eq!(failed.phase, Phase::Failed);
+        assert!(!failed.busy);
+        assert_eq!(failed.version.as_deref(), Some("1.5.0"));
+        assert_eq!(monitor.snapshot().revision, failed.revision);
+        assert_eq!(monitor.snapshot().phase, Phase::Failed);
+        // Both a manual retry and the next automatic check use this path.
+        monitor.begin().expect("the failed job no longer owns the updater");
+        let (current, error) = monitor.finish(|| Ok(Phase::Current));
+        assert_eq!(current.phase, Phase::Current);
+        assert!(!current.busy);
+        assert!(error.is_none());
+        monitor.begin().unwrap();
+        let (failed, error) = monitor.finish(|| Err("connection failed".into()));
+        assert_eq!(failed.phase, Phase::Failed);
+        assert!(!failed.busy);
+        assert_eq!(error.as_deref(), Some("connection failed"));
+        assert!(monitor.begin().is_some());
+    }
+
+    #[test]
+    fn store_results_distinguish_cancellation_from_a_completed_request() {
+        assert_eq!(StoreOutcome::Declined.phase(), Phase::Declined);
+        assert_eq!(StoreOutcome::Completed.phase(), Phase::RestartRequired);
+        assert_eq!(StoreOutcome::Incomplete.phase(), Phase::Failed);
     }
 
     #[test]

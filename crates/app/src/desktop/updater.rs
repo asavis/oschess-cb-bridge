@@ -109,19 +109,13 @@ pub fn look_now(app: &AppHandle) -> Progress {
 /// Completes the job already reserved by its caller. Every exit records a
 /// terminal result before another request can reserve a job.
 fn look(app: &AppHandle, asked: bool) {
-    match look_and_install(app, asked) {
-        Ok(phase) => report(app, phase, progress().version),
-        Err(e) => {
-            bridge::log!("update: {e}");
-            report(app, Phase::Failed, progress().version);
-            if asked {
-                let strings = &shared(app).strings;
-                notify(
-                    app,
-                    strings.get("toast.update.failed.title").to_string(),
-                    strings.get("toast.update.failed.body"),
-                );
-            }
+    let (progress, error) = PROGRESS.finish(|| look_and_install(app, asked));
+    let _ = app.emit("update-progress", progress);
+    if let Some(e) = error {
+        bridge::log!("update: {e}");
+        if asked {
+            let strings = &shared(app).strings;
+            notify(app, strings.get("toast.update.failed.title").to_string(), strings.get("toast.update.failed.body"));
         }
     }
 }
