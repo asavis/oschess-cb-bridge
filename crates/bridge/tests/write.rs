@@ -493,6 +493,38 @@ fn a_linked_pgn_file_is_written_where_it_links() {
     );
 }
 
+/// A file's permissions stay as they were through a replace and a removal,
+/// which write a new file and rename it over the old one, and an append: a
+/// file only its owner may read stays so, and one its group may read too.
+#[cfg(unix)]
+#[test]
+fn a_private_file_stays_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("private");
+    let modes = [0o600, 0o640];
+    let paths: Vec<PathBuf> = modes.iter().map(|m| scratch.path(&format!("games-{m:o}.pgn"))).collect();
+    for (path, &mode) in paths.iter().zip(&modes) {
+        std::fs::write(path, format!("{GAME_1}\n\n{GAME_2}\n\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let bridge = TestBridge::new(app_of(paths.clone()));
+    for (path, &mode) in paths.iter().zip(&modes) {
+        let id = id_of(path);
+        let games = format!("/v1/databases/{id}/games");
+        for (method, at, body, status) in [
+            ("PUT", format!("{games}/1"), NEW, 200),
+            ("DELETE", format!("{games}/2"), "", 200),
+            ("POST", games.clone(), GAME_3, 201),
+        ] {
+            let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+            let r = write(bridge.port, method, &at, Some(&generation), body);
+            assert_eq!(r.status, status, "{method}: {}", r.body);
+            let now = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(now, mode, "{method} left a {mode:o} file {now:o}");
+        }
+    }
+}
+
 /// The temporary file a replace or a removal writes beside the PGN file, left
 /// by a bridge that stopped before it was renamed, goes when the file is next
 /// listed; the PGN file stays as it is.

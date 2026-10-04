@@ -575,7 +575,7 @@ fn rewrite(
 ) -> Result<Layout, Failure> {
     let target = std::fs::canonicalize(&entry.path)?;
     let temp = temp_path(&target);
-    let out = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    let out = create_temp_like(&file, &temp)?;
     let written = write_temp(&file, len, &cut, insert, out);
     drop(file);
     let swapped = written.map_err(Failure::from).and_then(|layout| {
@@ -590,6 +590,111 @@ fn rewrite(
         let _ = std::fs::remove_file(&temp);
     }
     swapped
+}
+
+/// The temporary file `temp`, made new, with the access the PGN file
+/// `source` gives before any of the game's bytes go in, so that the file
+/// renamed over it keeps it: its permissions and group on Unix, its access
+/// control list on Windows. A file that fails to take them is removed.
+fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Its owner's alone until it has the source's permissions.
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC};
+        options.access_mode(FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+    }
+    let out = options.open(temp)?;
+    if let Err(e) = copy_access(source, &out) {
+        drop(out);
+        let _ = std::fs::remove_file(temp);
+        return Err(e);
+    }
+    Ok(out)
+}
+
+/// Gives `out` the permissions of `source`, and its group where the user
+/// may: a group the user is not in keeps the user's own.
+#[cfg(unix)]
+fn copy_access(source: &File, out: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = source.metadata()?;
+    // The group first: a change of group may clear bits the mode sets again.
+    let _ = std::os::unix::fs::fchown(out, None, Some(meta.gid()));
+    out.set_permissions(meta.permissions())
+}
+
+/// Gives `out` the discretionary access control list of `source`, protected
+/// from the folder's inherited entries when the source's is: the entries the
+/// source inherits, `out` inherits from the same folder. A file system
+/// without access control lists, whose source gives none to read, leaves
+/// `out` as it is.
+#[cfg(windows)]
+fn copy_access(source: &File, out: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `source` holds its handle, opened with read access, which
+    // includes READ_CONTROL, for the whole call; the call writes the two out
+    // pointers, and the descriptor it allocates holds the list.
+    let read = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if read != 0 {
+        return Ok(());
+    }
+    let (mut control, mut revision) = (0u16, 0u32);
+    // SAFETY: `descriptor` is the one GetSecurityInfo returned, alive until
+    // it is freed below.
+    let told = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+    let protection = if told != 0 && control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: `out` holds its handle, opened with WRITE_DAC, for the whole
+    // call, and `dacl` points into `descriptor`, still alive.
+    let written = unsafe {
+        SetSecurityInfo(
+            out.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    // SAFETY: GetSecurityInfo allocated `descriptor` for the caller to free
+    // with LocalFree, once.
+    unsafe { LocalFree(descriptor) };
+    match written {
+        0 => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e as i32)),
+    }
 }
 
 /// Writes to `out`, a temporary file made for it, the bytes of `file`, `len`
@@ -953,6 +1058,99 @@ mod tests {
         drop(file);
         assert_eq!(std::fs::read(&path).unwrap(), b"[Event \"a\"]\n1. e4 *\n\n1. d4 *\n\n");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The temporary file has the PGN file's permissions from the start,
+    /// before any of the game's bytes go in.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_file_has_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-write-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for mode in [0o600, 0o640, 0o644] {
+            let path = dir.join("games.pgn");
+            std::fs::write(&path, b"1. e4 *\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let source = File::open(&path).unwrap();
+            let temp = temp_path(&path);
+            let out = create_temp_like(&source, &temp).unwrap();
+            assert_eq!(out.metadata().unwrap().permissions().mode() & 0o7777, mode, "{mode:o}");
+            assert_eq!(std::fs::metadata(&temp).unwrap().len(), 0);
+            drop(out);
+            std::fs::remove_file(&temp).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temporary file has the PGN file's access control list from the
+    /// start: a list protected from the folder's stays protected, with its
+    /// entries.
+    #[cfg(windows)]
+    #[test]
+    fn the_temporary_file_has_the_files_access_control_list() {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        };
+        // Whether a file's list is protected, and its number of entries;
+        // with `protect`, it is made protected first, keeping its entries.
+        fn list(file: &File, protect: bool) -> (bool, u16) {
+            let (mut dacl, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut());
+            // SAFETY: as in `copy_access`.
+            unsafe {
+                let handle = file.as_raw_handle();
+                let info = DACL_SECURITY_INFORMATION;
+                assert_eq!(
+                    GetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        info,
+                        null_mut(),
+                        null_mut(),
+                        &mut dacl,
+                        null_mut(),
+                        &mut descriptor
+                    ),
+                    0
+                );
+                if protect {
+                    let info = info | PROTECTED_DACL_SECURITY_INFORMATION;
+                    assert_eq!(SetSecurityInfo(handle, SE_FILE_OBJECT, info, null_mut(), null_mut(), dacl, null()), 0);
+                }
+                let (mut control, mut revision) = (0u16, 0u32);
+                assert_ne!(GetSecurityDescriptorControl(descriptor, &mut control, &mut revision), 0);
+                let entries = if dacl.is_null() { 0 } else { (*dacl).AceCount };
+                LocalFree(descriptor);
+                (control & SE_DACL_PROTECTED != 0, entries)
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("bridge-write-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        // A handle that may change the list, which write access does not give.
+        let changing = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+            std::fs::OpenOptions::new().access_mode(READ_CONTROL | WRITE_DAC).open(&path).unwrap()
+        };
+        list(&changing, true);
+        drop(changing);
+        let source = File::open(&path).unwrap();
+        let (protected, entries) = list(&source, false);
+        assert!(protected && entries > 0);
+        let temp = temp_path(&path);
+        let out = create_temp_like(&source, &temp).unwrap();
+        assert_eq!(list(&out, false), (true, entries));
+        drop(out);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

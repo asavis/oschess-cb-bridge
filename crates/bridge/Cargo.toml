@@ -36,10 +36,13 @@ libc = "0.2"
 # `CreateFileMappingW` takes a security descriptor, hence `Win32_Security`.
 # The priority of index builds, the power status, a disk's free space and the
 # physical memory (machine.rs).
+# The access control list a rewritten PGN file keeps (write.rs):
+# `Win32_Security_Authorization`.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Memory",

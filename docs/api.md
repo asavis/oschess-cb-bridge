@@ -887,7 +887,9 @@ entity tag (`"0123456789abcdef"`).
   renames it over the old one in one step: a crash leaves the old file or the
   new one, never a mix. The temporary file is made new: when a file or a link
   already has its name, the write is `500 write_failed` and that file is left
-  as it is. A temporary file a crash left is removed when the bridge next
+  as it is. Before any game goes into it, it takes the PGN file's access: its
+  permissions and group on Unix, its access control list on Windows. So the
+  new file is no more readable than the old one was. A temporary file a crash left is removed when the bridge next
   lists the file. A PGN path that is a link is written where it links to, and
   the link stays. A replace puts the game in the place of the old
   one's text, from its first tag to its end, and keeps the empty lines around
