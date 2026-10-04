@@ -872,7 +872,10 @@ entity tag (`"0123456789abcdef"`).
   the database again; the bridge never merges.
 - **Which databases.** Only a PGN file in state `ready` takes writes: one that
   is not ready answers `409 database_unavailable` with its `state`, as a read
-  does. A `number` the file does not have is `404 not_found`.
+  does. A `number` the file does not have is `404 not_found`. A header index
+  that claims more games than its file has bytes, as only a damaged one does,
+  is removed and the file read again: the write answers
+  `409 database_unavailable` with `state: "opening"` and writes nothing.
 - **One at a time.** The bridge writes one write at a time, whatever
   database or path it names, so that two listed paths of one file, as a link
   and its target, are never written at once. A write that waits for another
@@ -890,8 +893,11 @@ entity tag (`"0123456789abcdef"`).
   already has its name, the write is `500 write_failed` and that file is left
   as it is. Before any game goes into it, it takes the PGN file's access: its
   permissions and group on Unix, with its POSIX access control list on
-  Linux, and its access control list on Windows. A list that cannot be given
-  to it fails the write. So the
+  Linux, or none when the file has none, whatever the folder's default would
+  give a new file. On Windows it takes the file's access control list. Kept
+  from the folder's entries when the file's is, its entries inherited are the
+  folder's, as the file's are. A list that cannot be given to it fails the
+  write. So the
   new file is no more readable than the old one was. A temporary file a crash left is removed when the bridge next
   lists the file. A PGN path that is a link is written where it links to, and
   the link stays. A replace puts the game in the place of the old

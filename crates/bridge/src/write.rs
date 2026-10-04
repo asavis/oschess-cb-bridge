@@ -102,6 +102,9 @@ enum Failure {
     Io(io::Error),
     /// The file was written, then was gone before its generation was read.
     Lost,
+    /// The header index claims what no file of its length holds, more games
+    /// than it has bytes: it is removed, and the file read again.
+    Damaged,
 }
 
 impl From<io::Error> for Failure {
@@ -187,6 +190,15 @@ fn write(entry: &Entry, req: &Request, op: Op) -> Response {
     });
     let written = match done {
         None => return unavailable(State::Opening),
+        Some(Err(Failure::Damaged)) => {
+            crate::log!("the header index of database {} claims more games than its file holds; read again", entry.id);
+            drop(writing);
+            // The next look opens the file again: its index is gone, so
+            // reading it starts now.
+            entry.forget(open.generation);
+            let _ = entry.open();
+            return unavailable(State::Opening);
+        }
         Some(Err(failure)) => return refused(entry, failure),
         Some(Ok(written)) => written,
     };
@@ -238,6 +250,7 @@ fn refused(entry: &Entry, failure: Failure) -> Response {
             crate::log!("writing the PGN file of database {} failed: {e}", entry.id);
             error(500, "write_failed", "The file system refused the write; the file is as it was")
         }
+        Failure::Damaged => unavailable(State::Opening),
         Failure::Lost => {
             crate::log!("the PGN file of database {} was gone right after a write", entry.id);
             error(500, "internal", "The file was written, then was gone")
@@ -331,9 +344,21 @@ fn edit_file(
         };
         let len = file.metadata()?.len();
         let count = db.record_count();
+        // Every game of a file read has a byte at least, and a database
+        // numbers fewer games than u32::MAX: an index claiming more is
+        // damaged, and goes, under the build, so that the file is read again.
+        if u64::from(count) > len || count == u32::MAX {
+            let _ = std::fs::remove_file(index);
+            return Err(Failure::Damaged);
+        }
         let eol = layout.eol.text().as_bytes();
         let (splice, first, removed) = match op {
-            Op::Append => (Splice { cut: len..len, ..layout.appended(&game) }, count + 1, 0),
+            Op::Append => {
+                let Some(number) = count.checked_add(1).filter(|&n| n < u32::MAX) else {
+                    return Err(Failure::Io(io::Error::other("the file holds as many games as a database numbers")));
+                };
+                (Splice { cut: len..len, ..layout.appended(&game) }, number, 0)
+            }
             Op::Replace(n) => {
                 let record = db.record(n).map_err(io_error)?;
                 let cut = record.offset()..record.offset().saturating_add(u64::from(record.len()));
@@ -453,7 +478,7 @@ fn check_neighbours(
     if let Some(game) = &splice.game {
         expected.push((splice.cut.start + game.start as u64, splice.cut.start + game.end as u64));
     }
-    let next = edit.first + edit.removed;
+    let next = edit.first.saturating_add(edit.removed);
     let to = if next <= count {
         let r = db.record(next).map_err(io_error)?;
         let start = r.offset().checked_add_signed(edit.delta).ok_or(Failure::Joins)?;
@@ -630,57 +655,106 @@ fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
 
 /// Gives `out` the permissions of `source`, its group where the user may (a
 /// group the user is not in keeps the user's own), and on Linux its POSIX
-/// access control list.
+/// access control list, or none when it has none: a list `out` took from
+/// its folder's default goes, since the source's mode would widen its mask
+/// and grant its entries.
 #[cfg(unix)]
 fn copy_access(source: &File, out: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = source.metadata()?;
     // The group first: a change of group may clear bits the mode sets again.
     let _ = std::os::unix::fs::fchown(out, None, Some(meta.gid()));
+    let acl = read_acl(source)?;
+    if acl.is_none() {
+        drop_acl(out)?;
+    }
     out.set_permissions(meta.permissions())?;
-    copy_acl(source, out)
+    // The list last, since setting it sets the mode to match.
+    match acl {
+        Some(acl) => set_acl(out, &acl),
+        None => Ok(()),
+    }
 }
 
 /// The extended attribute that holds a file's POSIX access control list.
 #[cfg(target_os = "linux")]
 const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
 
-/// Gives `out` the POSIX access control list of `source`, when it has one.
-/// With one, the mode's group bits are the list's mask, and the owning
-/// group's own access is in the list alone: the mode without the list could
-/// grant that group more. The list is set last, since setting it sets the
-/// mode to match. One that cannot be read whole or set fails the write.
+/// Whether an extended attribute's error means there is none to read or
+/// remove: no such attribute, or a file system without them.
 #[cfg(target_os = "linux")]
-fn copy_acl(source: &File, out: &File) -> io::Result<()> {
+fn no_attribute(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP))
+}
+
+/// The POSIX access control list of `file`, as its attribute holds it;
+/// `None` when it has none. With one, the mode's group bits are the list's
+/// mask, and the owning group's own access is in the list alone. One that
+/// cannot be read whole is an error.
+#[cfg(target_os = "linux")]
+fn read_acl(file: &File) -> io::Result<Option<Vec<u8>>> {
     use std::os::fd::AsRawFd;
     /// More than a file's list ever holds.
     const MAX_ACL: usize = 64 << 10;
     // SAFETY: a null buffer of size 0 asks for the value's size alone.
-    let size = unsafe { libc::fgetxattr(source.as_raw_fd(), ACL_ACCESS.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         let e = io::Error::last_os_error();
-        // No list, or a file system without lists.
-        return if matches!(e.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) { Ok(()) } else { Err(e) };
+        return if no_attribute(&e) { Ok(None) } else { Err(e) };
     }
     let mut value = vec![0u8; (size as usize).min(MAX_ACL)];
     // SAFETY: `value` is as long as the size given; a value grown since is
     // refused with ERANGE.
     let read =
-        unsafe { libc::fgetxattr(source.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+        unsafe { libc::fgetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
     if read < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the value is the first `read` bytes of `value`.
-    let set = unsafe { libc::fsetxattr(out.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_ptr().cast(), read as usize, 0) };
+    value.truncate(read as usize);
+    Ok(Some(value))
+}
+
+/// Gives `file` the POSIX access control list `value`.
+#[cfg(target_os = "linux")]
+fn set_acl(file: &File, value: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the value is all of `value`.
+    let set = unsafe { libc::fsetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
     if set < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-/// Elsewhere than on Linux, a file's mode is all the bridge keeps.
+/// Removes the POSIX access control list of `file`, if it has one.
+#[cfg(target_os = "linux")]
+fn drop_acl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the name is a valid C string; the call reads nothing else.
+    let removed = unsafe { libc::fremovexattr(file.as_raw_fd(), ACL_ACCESS.as_ptr()) };
+    if removed < 0 {
+        let e = io::Error::last_os_error();
+        if !no_attribute(&e) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Elsewhere than on Linux, a file's mode and group are all the bridge
+/// keeps.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn copy_acl(_: &File, _: &File) -> io::Result<()> {
+fn read_acl(_: &File) -> io::Result<Option<Vec<u8>>> {
+    Ok(None)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn set_acl(_: &File, _: &[u8]) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn drop_acl(_: &File) -> io::Result<()> {
     Ok(())
 }
 
@@ -1140,21 +1214,14 @@ mod tests {
     /// The value of `file`'s POSIX access control list; `None` without one.
     #[cfg(target_os = "linux")]
     fn acl_of(file: &File) -> Option<Vec<u8>> {
-        use std::os::fd::AsRawFd;
-        let mut value = vec![0u8; 4096];
-        // SAFETY: `value` is as long as the size given.
-        let n =
-            unsafe { libc::fgetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
-        (n >= 0).then(|| value[..n as usize].to_vec())
+        read_acl(file).unwrap()
     }
 
-    /// Gives `file` a POSIX access control list that lets user 65534 read it
-    /// and its owning group nothing, its mask allowing reading: its mode is
-    /// then 0640, though its group may not read it. `false` where the file
-    /// system has no lists.
+    /// The value of a POSIX access control list that lets user 65534 read
+    /// and the owning group nothing, its mask allowing reading: a file's mode
+    /// with it is 0640, though its group may not read it.
     #[cfg(target_os = "linux")]
-    fn restrict(file: &File) -> bool {
-        use std::os::fd::AsRawFd;
+    fn restrictive_acl() -> Vec<u8> {
         // Version 2, then (tag, permissions, id) entries in tag order: the
         // owner, user 65534, the owning group, the mask, others.
         let mut value = 2u32.to_le_bytes().to_vec();
@@ -1166,15 +1233,57 @@ mod tests {
             value.extend(perm.to_le_bytes());
             value.extend(id.to_le_bytes());
         }
-        // SAFETY: `value` is as long as the size given.
-        let set =
-            unsafe { libc::fsetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        value
+    }
+
+    /// Sets the extended attribute `name` of the file or folder `file` to
+    /// `value`; `false` where the file system has no access control lists.
+    #[cfg(target_os = "linux")]
+    fn set_attribute(file: &File, name: &std::ffi::CStr, value: &[u8]) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the value is all of `value`.
+        let set = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
         if set < 0 {
             let e = io::Error::last_os_error();
             assert_eq!(e.raw_os_error(), Some(libc::EOPNOTSUPP), "{e}");
             return false;
         }
         true
+    }
+
+    /// Gives `file` the list of [`restrictive_acl`]; `false` where the file
+    /// system has no lists.
+    #[cfg(target_os = "linux")]
+    fn restrict(file: &File) -> bool {
+        set_attribute(file, ACL_ACCESS, &restrictive_acl())
+    }
+
+    /// A file without a list keeps none: the list its temporary file takes
+    /// from the folder's default, which grants user 65534 reading, goes, and
+    /// the file's mode stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_temporary_file_drops_a_list_its_folder_gives() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-write-default-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        // The folder's default list comes after the file, which has none.
+        if !set_attribute(&File::open(&dir).unwrap(), c"system.posix_acl_default", &restrictive_acl()) {
+            eprintln!("skipped: the file system of {} has no access control lists", dir.display());
+            return;
+        }
+        let source = File::open(&path).unwrap();
+        assert_eq!(acl_of(&source), None);
+        let temp = temp_path(&path);
+        let out = create_temp_like(&source, &temp).unwrap();
+        assert_eq!(acl_of(&out), None, "the folder's list goes");
+        assert_eq!(out.metadata().unwrap().permissions().mode() & 0o7777, 0o640);
+        drop(out);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The temporary file has the PGN file's POSIX access control list from

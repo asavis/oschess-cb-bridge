@@ -11,8 +11,8 @@ use cbformat::pgnfile;
 
 mod common;
 use common::{
-    ORIGIN, Reply, TOKEN, TestBridge, WAIT_LIMIT, app_of, classic_fixture, fixture, get_reply, member, object_with,
-    objects, poll, send, string_member,
+    ORIGIN, Reply, TOKEN, TestBridge, WAIT_LIMIT, app_of, classic_fixture, fixture, get_reply, has_members, member,
+    object_with, objects, poll, send, string_member,
 };
 
 /// A folder of the test's own, removed with it.
@@ -525,31 +525,36 @@ fn a_private_file_stays_private() {
     }
 }
 
-/// A file's POSIX access control list stays as it was through a replace and
-/// a removal: with one, the mode's group bits are its mask, and the owning
-/// group's own access is in the list alone.
+/// The value of the extended attribute `name` of `path`; `None` without it.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_posix_acl_stays() {
+fn attribute(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     use std::os::fd::AsRawFd;
-    let acl = |path: &Path| -> Option<Vec<u8>> {
-        let file = std::fs::File::open(path).unwrap();
-        let mut value = vec![0u8; 4096];
-        // SAFETY: `value` is as long as the size given.
-        let n = unsafe {
-            libc::fgetxattr(
-                file.as_raw_fd(),
-                c"system.posix_acl_access".as_ptr(),
-                value.as_mut_ptr().cast(),
-                value.len(),
-            )
-        };
-        (n >= 0).then(|| value[..n as usize].to_vec())
-    };
-    let scratch = Scratch::new("posix-acl");
-    let path = scratch.path("games.pgn");
-    std::fs::write(&path, format!("{GAME_1}\n\n{GAME_2}\n\n")).unwrap();
-    // User 65534 may read it, its owning group nothing; the mode is 0640.
+    let file = std::fs::File::open(path).unwrap();
+    let mut value = vec![0u8; 4096];
+    // SAFETY: `value` is as long as the size given.
+    let n = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    (n >= 0).then(|| value[..n as usize].to_vec())
+}
+
+/// Sets the extended attribute `name` of the file or folder `path`; `false`
+/// where the file system has no access control lists.
+#[cfg(target_os = "linux")]
+fn set_attribute(path: &Path, name: &std::ffi::CStr, value: &[u8]) -> bool {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    // SAFETY: the value is all of `value`.
+    let set = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    if set < 0 {
+        eprintln!("skipped: no access control lists here: {}", std::io::Error::last_os_error());
+        return false;
+    }
+    true
+}
+
+/// A POSIX access control list that lets user 65534 read and the owning
+/// group nothing, its mask allowing reading.
+#[cfg(target_os = "linux")]
+fn restrictive_acl() -> Vec<u8> {
     let mut value = 2u32.to_le_bytes().to_vec();
     for (tag, perm, id) in
         [(0x01u16, 6u16, u32::MAX), (0x02, 4, 65534), (0x04, 0, u32::MAX), (0x10, 4, u32::MAX), (0x20, 0, u32::MAX)]
@@ -558,25 +563,46 @@ fn a_posix_acl_stays() {
         value.extend(perm.to_le_bytes());
         value.extend(id.to_le_bytes());
     }
-    let file = std::fs::File::open(&path).unwrap();
-    // SAFETY: `value` is as long as the size given.
-    let set = unsafe {
-        libc::fsetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), value.as_ptr().cast(), value.len(), 0)
-    };
-    if set < 0 {
-        eprintln!("skipped: no access control lists here: {}", std::io::Error::last_os_error());
+    value
+}
+
+/// A file's POSIX access control list stays as it was through a replace and
+/// a removal: with one, the mode's group bits are its mask, and the owning
+/// group's own access is in the list alone. A file without one keeps none,
+/// whatever list its folder's default would give a new file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_posix_acl_stays() {
+    use std::os::unix::fs::PermissionsExt;
+    let access = c"system.posix_acl_access";
+    let scratch = Scratch::new("posix-acl");
+    let (listed, plain) = (scratch.path("listed.pgn"), scratch.path("plain.pgn"));
+    for path in [&listed, &plain] {
+        std::fs::write(path, format!("{GAME_1}\n\n{GAME_2}\n\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    // `listed` lets user 65534 read it, its owning group nothing; `plain`
+    // has no list, and its folder then gets a default one, which would
+    // grant user 65534 reading.
+    if !set_attribute(&listed, access, &restrictive_acl())
+        || !set_attribute(&scratch.0, c"system.posix_acl_default", &restrictive_acl())
+    {
         return;
     }
-    drop(file);
-    let before = acl(&path).expect("a list");
-    let bridge = TestBridge::new(app_of([path.clone()]));
-    let id = id_of(&path);
-    let games = format!("/v1/databases/{id}/games");
-    for (method, at, body) in [("PUT", format!("{games}/1"), NEW), ("DELETE", format!("{games}/2"), "")] {
-        let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
-        let r = write(bridge.port, method, &at, Some(&generation), body);
-        assert_eq!(r.status, 200, "{method}: {}", r.body);
-        assert_eq!(acl(&path).as_deref(), Some(&before[..]), "{method} changed the list");
+    let before = attribute(&listed, access).expect("a list");
+    assert_eq!(attribute(&plain, access), None);
+    let bridge = TestBridge::new(app_of([listed.clone(), plain.clone()]));
+    for (path, list) in [(&listed, Some(before)), (&plain, None)] {
+        let id = id_of(path);
+        let games = format!("/v1/databases/{id}/games");
+        for (method, at, body) in [("PUT", format!("{games}/1"), NEW), ("DELETE", format!("{games}/2"), "")] {
+            let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+            let r = write(bridge.port, method, &at, Some(&generation), body);
+            assert_eq!(r.status, 200, "{method}: {}", r.body);
+            assert_eq!(attribute(path, access), list, "{method} changed the list of {}", path.display());
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640, "{method} left {} {mode:o}", path.display());
+        }
     }
 }
 
@@ -612,6 +638,58 @@ fn two_paths_of_one_file_write_one_at_a_time() {
     assert_eq!(written, 1, "exactly the game answered 201 is in the file");
     let saved = if a.status == 201 { NEW } else { GAME_3 };
     assert!(text.contains(saved));
+}
+
+/// A header index that claims more games than its file has bytes, as a
+/// damaged one may, is no ground for a write: the write answers
+/// `409 database_unavailable` with `opening`, writes nothing and has the file
+/// read again, after which the database has its real games and takes the
+/// write. On Unix also an index claiming the most games a count holds, kept
+/// sparse, which a game number one higher would overflow.
+#[test]
+fn a_damaged_header_index_is_read_again() {
+    let mut claims = vec![1000u32];
+    if cfg!(unix) {
+        claims.push(u32::MAX);
+    }
+    for games in claims {
+        let scratch = Scratch::new(&format!("damaged-{games}"));
+        let path = scratch.path("games.pgn");
+        let text = format!("{GAME_1}\n\n");
+        std::fs::write(&path, &text).unwrap();
+        let data = scratch.path("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let id = id_of(&path);
+        // A first bridge builds the header index, which then claims `games`.
+        let bridge = TestBridge::in_dir(app_of([path.clone()]), &data);
+        ready_row(bridge.port, &id);
+        drop(bridge);
+        let index = data.join("pgn").join(format!("{id}.head"));
+        let mut header = std::fs::read(&index).unwrap();
+        header.truncate(64);
+        header[32..36].copy_from_slice(&games.to_le_bytes());
+        header[36..48].fill(0);
+        let names_at = 64 + 48 * u64::from(games);
+        header[48..56].copy_from_slice(&names_at.to_le_bytes());
+        let file = std::fs::File::create(&index).unwrap();
+        std::io::Write::write_all(&mut &file, &header).unwrap();
+        file.set_len(names_at).unwrap();
+        drop(file);
+        let bridge = TestBridge::in_dir(app_of([path.clone()]), &data);
+        let row = ready_row(bridge.port, &id);
+        assert_eq!(member(&row, "records"), games.to_string(), "the second bridge reads the claim");
+        let generation = string_member(&row, "generation").to_string();
+        let games_path = format!("/v1/databases/{id}/games");
+        let r = write(bridge.port, "POST", &games_path, Some(&generation), NEW);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(has_members(&r.body, r#""error":{"code":"database_unavailable","state":"opening"}"#), "{}", r.body);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let row = ready_row(bridge.port, &id);
+        assert_eq!(member(&row, "records"), "1", "{row}");
+        let r = write(bridge.port, "POST", &games_path, Some(string_member(&row, "generation")), NEW);
+        assert_eq!(r.status, 201, "{}", r.body);
+        drop(bridge);
+    }
 }
 
 /// The temporary file a replace or a removal writes beside the PGN file, left

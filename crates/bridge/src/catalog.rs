@@ -277,6 +277,16 @@ impl Entry {
         }
     }
 
+    /// Forgets the database opened at `generation`, whose header index a
+    /// write found damaged and removed (`crate::write`): the next look opens
+    /// the file again, which builds its index.
+    pub(crate) fn forget(&self, generation: u64) {
+        let mut slot = lock(&self.held.open);
+        if slot.as_ref().is_some_and(|o| o.generation == generation) {
+            *slot = None;
+        }
+    }
+
     /// The write lock of the database (`crate::write`), with the layout of
     /// its file that the last write found.
     pub(crate) fn writing(&self) -> std::sync::MutexGuard<'_, Option<(u64, crate::write::Layout)>> {
