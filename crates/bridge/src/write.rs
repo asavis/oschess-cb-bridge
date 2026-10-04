@@ -281,7 +281,7 @@ fn edit_file(
             }
             Op::Replace(n) => {
                 let record = db.record(n).map_err(io_error)?;
-                let cut = record.offset()..record.offset() + u64::from(record.len());
+                let cut = record.offset()..record.offset().saturating_add(u64::from(record.len()));
                 let layout = rewrite(entry, generation, file, len, cut.clone(), &game)?;
                 (Edit { first: n, removed: 1, delta: game.len() as i64 - span(&cut) }, layout)
             }

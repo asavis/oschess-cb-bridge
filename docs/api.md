@@ -69,8 +69,9 @@ nothing about the databases.
 | No body (`Content-Length` absent or 0, no `Transfer-Encoding`), except on `POST` of `/v1/databases/{id}/games` and `PUT` of `/v1/databases/{id}/games/{number}`, whose body is sent with `Content-Length` | `413 body_not_allowed` |
 | Request line and headers within 16 KiB | `431 headers_too_large` |
 
-The checks run in this order, the size of the request line and headers first,
-as they arrive, and a body is read only after the others pass.
+The size of the request line and headers is checked first, as they arrive;
+then the others, in the table's order. A body is read only once all of them
+pass.
 
 The allowlist is `https://oschess.org`, `https://www.oschess.org` and
 `https://staging.oschess.org`, plus the origins listed under `origins` in
@@ -446,9 +447,10 @@ of the same games answers, apart from what the format has otherwise:
   header index cannot be built is `unreadable` for a minute, and the next
   request tries again. A write of the bridge's own does not read the file
   again: it makes the header index of the new file from the one before
-  ([Writing games](#writing-games)). A header index takes 48 bytes a game plus the names,
-  among them the game's time control, which its `TimeControl` tag gives
-  (#268, [search-grammar.md](search-grammar.md#time-control)).
+  ([Writing games](#writing-games)). A header index takes 48 bytes a game
+  plus the names, among them the game's time control, which its
+  `TimeControl` tag gives (#268,
+  [search-grammar.md](search-grammar.md#time-control)).
   The `pgn` folder is swept as the `index` folder is (see "Storage" under
   `GET /v1/databases/{id}/explorer`): a build's `<id>.head.partial` goes at
   once unless that file is being read, and the header index of a database
