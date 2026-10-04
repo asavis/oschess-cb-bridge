@@ -147,6 +147,7 @@ with them.
 | 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
 | 422 | `unsupported` | The position or variant of the explorer, of `fen` or of a fragment is Chess960, which the position index does not hold; `variant` names it |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
+| 422 | `games_would_join` | A write would join games: the new game to a neighbour, or the games on either side of one removed, because a game next to it lacks its result or holds tags alone. Nothing was written |
 | 422 | `unencodable` | The game of a write holds a character that the file's code page cannot store; `character` names the first. Nothing was written |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 428 | `precondition_required` | A write without `If-Match` |
@@ -855,9 +856,9 @@ entity tag (`"0123456789abcdef"`).
   and writes the game from its first tag (or move) to its end: blank lines and
   text outside the game are not the game's. A body is `400 bad_request` with
   `parameter: "body"` when it is not UTF-8, holds no game or more than one,
-  holds what the reader passes over (a move, number or result over 16
-  characters, or bytes that make no PGN element outside comments and tags),
-  or when its main line does not play. The main line plays when its `FEN`
+  leaves a `{` comment open, holds what the reader passes over (a move,
+  number or result over 16 characters, or bytes that make no PGN element
+  outside comments and tags), or when its main line does not play. The main line plays when its `FEN`
   tag, if it has one, names a position (an empty one does not) and each of
   its moves is legal from there or from the standard start; a null move ends
   it, as in the position index. `DELETE` carries no body.
@@ -890,8 +891,17 @@ entity tag (`"0123456789abcdef"`).
   lists the file. A PGN path that is a link is written where it links to, and
   the link stays. A replace puts the game in the place of the old
   one's text, from its first tag to its end, and keeps the empty lines around
-  it. A removal takes the game and the empty lines after it, to the next game
+  it; where a neighbour shares the game's line, a line end keeps them apart.
+  A removal takes the game and the empty lines after it, to the next game
   or the end of the file.
+- **The neighbours stay as they were.** Before anything is written, the text
+  from the start of the game before the edited one to the end of the game
+  after it is read as it would be. A write goes on only when those two games
+  read as they did and the new game reads as one game, exactly its text: the
+  reader would otherwise join it to a neighbour that lacks its result or holds
+  tags alone, or take the next game into it. A removal goes on only when the
+  games on either side stay apart. Otherwise the answer is
+  `422 games_would_join`, and nothing is written.
 - **A file held elsewhere.** On Windows the bridge holds the file while it
   reads and writes it, so that no other program writes it meanwhile. When
   Windows refuses to open, write or replace the file because another program

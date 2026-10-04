@@ -31,7 +31,7 @@ use cbformat::codepage::CodePage;
 use cbformat::pgnfile::edit::{self, Edit, Games};
 use cbformat::pgnfile::lex::{Lexer, MAX_SYMBOL, Sink, Token};
 use cbformat::pgnfile::line::{LineEnd, main_line};
-use cbformat::pgnfile::scan::Tag;
+use cbformat::pgnfile::scan::{Game, Splitter, Tag};
 use cbformat::pgnfile::{self, Record};
 use cbformat::view::Base;
 
@@ -88,6 +88,9 @@ enum Failure {
     Busy,
     /// The file's code page has no byte for this character of the game.
     Unencodable(char),
+    /// The edit would join games or end a neighbour elsewhere: a game next
+    /// to it lacks its result, or holds tags alone.
+    Joins,
     /// The file system refused the write otherwise, as a full disk does.
     Io(io::Error),
     /// The file was written, then was gone before its generation was read.
@@ -218,6 +221,11 @@ fn refused(entry: &Entry, failure: Failure) -> Response {
                 o.str("character", &c.to_string())
             })
         }
+        Failure::Joins => error(
+            422,
+            "games_would_join",
+            "The edit would join games: a game next to it in the file lacks its result or holds tags alone",
+        ),
         Failure::Io(e) => {
             crate::log!("writing the PGN file of database {} failed: {e}", entry.id);
             error(500, "write_failed", "The file system refused the write; the file is as it was")
@@ -231,9 +239,10 @@ fn refused(entry: &Entry, failure: Failure) -> Response {
 
 /// The text of the one game `body` holds, as the reader finds it in a file:
 /// from its first tag (or move) to its end. Refused when the body is not
-/// UTF-8 or holds no game or more than one; when the game holds what the
-/// reader would pass over, a move, number or result longer than any or bytes
-/// that make no PGN element; or when its main line does not play: a `FEN` tag
+/// UTF-8 or holds no game or more than one; when a `{` comment of the game is
+/// not closed; when the game holds what the reader would pass over, a move,
+/// number or result longer than any or bytes that make no PGN element; or
+/// when its main line does not play: a `FEN` tag
 /// that names no position, an empty one among them, or a move that names no
 /// legal move. A null move ends the main line, as it does in the reader.
 fn game_text(body: &[u8]) -> Result<String, &'static str> {
@@ -250,6 +259,10 @@ fn game_text(body: &[u8]) -> Result<String, &'static str> {
     let mut strict = Strict(None);
     let mut lexer = Lexer::new();
     lexer.feed(span.as_bytes(), &mut strict);
+    // What follows the game in the file would be the comment's.
+    if lexer.in_comment() {
+        return Err("A comment of the game is not closed");
+    }
     lexer.finish(&mut strict, false);
     if let Some(why) = strict.0 {
         return Err(why);
@@ -309,32 +322,44 @@ fn edit_file(
             None => Vec::new(),
         };
         let len = file.metadata()?.len();
-        match op {
-            Op::Append => {
-                let bytes = layout.appended(&game);
-                append_at_end(&file, len, &bytes, &mut &file)?;
-                let edit = Edit { first: db.record_count() + 1, removed: 0, delta: bytes.len() as i64 };
-                (edit, layout.after_append())
-            }
+        let count = db.record_count();
+        let eol = layout.eol.text().as_bytes();
+        let (splice, first, removed) = match op {
+            Op::Append => (Splice { cut: len..len, ..layout.appended(&game) }, count + 1, 0),
             Op::Replace(n) => {
                 let record = db.record(n).map_err(io_error)?;
                 let cut = record.offset()..record.offset().saturating_add(u64::from(record.len()));
-                let layout = rewrite(entry, generation, file, len, cut.clone(), &game)?;
-                (Edit { first: n, removed: 1, delta: game.len() as i64 - span(&cut) }, layout)
+                // A neighbour on the same line is kept apart by a line end.
+                let before = cut.start > 0 && !blank_before(&mut file, cut.start)?;
+                let after = cut.end < len && !byte_at(&mut file, cut.end)?.is_some_and(|b| b == b'\r' || b == b'\n');
+                let mut bytes = Vec::with_capacity(game.len() + 2 * eol.len());
+                if before {
+                    bytes.extend_from_slice(eol);
+                }
+                let at = bytes.len();
+                bytes.extend_from_slice(&game);
+                if after {
+                    bytes.extend_from_slice(eol);
+                }
+                (Splice { cut, bytes, game: Some(at..at + game.len()) }, n, 1)
             }
             Op::Delete(n) => {
                 let record = db.record(n).map_err(io_error)?;
                 // The game and the blank lines after it, to the next game.
-                let end = if n < db.record_count() {
-                    db.record(n + 1).map(|r: Record| r.offset()).map_err(io_error)?
-                } else {
-                    len
-                };
-                let cut = record.offset()..end.max(record.offset());
-                let layout = rewrite(entry, generation, file, len, cut.clone(), &[])?;
-                (Edit { first: n, removed: 1, delta: -span(&cut) }, layout)
+                let end = if n < count { db.record(n + 1).map(|r: Record| r.offset()).map_err(io_error)? } else { len };
+                (Splice { cut: record.offset()..end.max(record.offset()), bytes: Vec::new(), game: None }, n, 1)
             }
-        }
+        };
+        let edit = Edit { first, removed, delta: splice.bytes.len() as i64 - span(&splice.cut) };
+        check_neighbours(&mut file, db, &edit, &splice, len)?;
+        let layout = match op {
+            Op::Append => {
+                append_at_end(&file, len, &splice.bytes, &mut &file)?;
+                layout.after_append()
+            }
+            Op::Replace(_) | Op::Delete(_) => rewrite(entry, generation, file, len, splice.cut.clone(), &splice.bytes)?,
+        };
+        (edit, layout)
     };
     let generation = entry.generation().ok_or(Failure::Lost)?;
     let games = match edit::update(db, path, index, generation, &edit) {
@@ -350,6 +375,127 @@ fn edit_file(
 
 fn span(range: &std::ops::Range<u64>) -> i64 {
     (range.end - range.start) as i64
+}
+
+/// What an edit puts in the place of the bytes `cut` of the file: `bytes`,
+/// with the game, if there is one, at `game` among them.
+struct Splice {
+    cut: std::ops::Range<u64>,
+    bytes: Vec<u8>,
+    game: Option<std::ops::Range<usize>>,
+}
+
+/// The byte of `file` at `at`; `None` past its end.
+fn byte_at(file: &mut File, at: u64) -> io::Result<Option<u8>> {
+    file.seek(SeekFrom::Start(at))?;
+    let mut b = [0u8; 1];
+    loop {
+        match file.read(&mut b) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(b[0])),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether `file` starts with a byte-order mark.
+fn starts_with_bom(file: &mut File) -> io::Result<bool> {
+    let mut head = [0u8; 3];
+    file.seek(SeekFrom::Start(0))?;
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(head == BOM),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether what comes before byte `at` of `file` keeps a game starting
+/// there apart: a blank, or the byte-order mark the file starts with.
+fn blank_before(file: &mut File, at: u64) -> io::Result<bool> {
+    if at == BOM.len() as u64 && starts_with_bom(file)? {
+        return Ok(true);
+    }
+    Ok(byte_at(file, at - 1)?.is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0b' | b'\x0c')))
+}
+
+/// Refuses `splice`, the edit `edit` of `file`, `len` bytes long, unless the
+/// file after it reads as it must: the game before the edited span and the
+/// game after it as they were, moved, and the new game, if there is one, as
+/// one game of exactly its text. The reader would otherwise join a game to a
+/// neighbour that lacks its result or holds tags alone, or take a game after
+/// it into it. The text from the start of the game before to the end of the
+/// game after is read as it would be, nothing yet written.
+fn check_neighbours(
+    file: &mut File,
+    db: &pgnfile::Database,
+    edit: &Edit,
+    splice: &Splice,
+    len: u64,
+) -> Result<(), Failure> {
+    let count = db.record_count();
+    let mut expected = Vec::with_capacity(3);
+    let from = if edit.first >= 2 {
+        let r = db.record(edit.first - 1).map_err(io_error)?;
+        expected.push((r.offset(), r.offset().saturating_add(u64::from(r.len()))));
+        r.offset()
+    } else {
+        0
+    };
+    if let Some(game) = &splice.game {
+        expected.push((splice.cut.start + game.start as u64, splice.cut.start + game.end as u64));
+    }
+    let next = edit.first + edit.removed;
+    let to = if next <= count {
+        let r = db.record(next).map_err(io_error)?;
+        let start = r.offset().checked_add_signed(edit.delta).ok_or(Failure::Joins)?;
+        expected.push((start, start.saturating_add(u64::from(r.len()))));
+        r.offset().saturating_add(u64::from(r.len()))
+    } else {
+        len
+    };
+    let mut found = Vec::with_capacity(expected.len() + 1);
+    let mut splitter = Splitter::new(|g: &Game| {
+        if found.len() <= expected.len() {
+            found.push((g.start, g.end));
+        }
+    });
+    // A byte-order mark is no game's, as the reader reads the file.
+    let mut lexer = Lexer::at(from);
+    let mut at = from;
+    if from == 0 && splice.cut.start >= BOM.len() as u64 && starts_with_bom(file)? {
+        lexer.reset(BOM.len() as u64);
+        at = BOM.len() as u64;
+    }
+    feed_from(file, at, splice.cut.start, &mut lexer, &mut splitter)?;
+    lexer.feed(&splice.bytes, &mut splitter);
+    feed_from(file, splice.cut.end, to, &mut lexer, &mut splitter)?;
+    lexer.finish(&mut splitter, false);
+    splitter.finish();
+    drop(splitter);
+    if found != expected {
+        return Err(Failure::Joins);
+    }
+    Ok(())
+}
+
+/// Feeds `lexer` the bytes `from..to` of `file`.
+fn feed_from<S: Sink>(file: &mut File, from: u64, to: u64, lexer: &mut Lexer, sink: &mut S) -> io::Result<()> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut left = to.saturating_sub(from);
+    let mut buf = vec![0u8; CHUNK.min(usize::try_from(left).unwrap_or(CHUNK))];
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = match file.read(&mut buf[..want]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        lexer.feed(&buf[..n], sink);
+        left -= n as u64;
+    }
+    Ok(())
 }
 
 fn io_error(e: cbformat::Error) -> Failure {
@@ -569,7 +715,7 @@ impl Layout {
     /// line between the file's last game and the new one, the line before it
     /// ended first, then the game and an empty line, as PGN's export format
     /// ends each game.
-    fn appended(&self, game: &[u8]) -> Vec<u8> {
+    fn appended(&self, game: &[u8]) -> Splice {
         let eol = self.eol.text().as_bytes();
         let lead = match self.end {
             End::Empty | End::Blank => 0,
@@ -580,10 +726,11 @@ impl Layout {
         for _ in 0..lead {
             bytes.extend_from_slice(eol);
         }
+        let at = bytes.len();
         bytes.extend_from_slice(game);
         bytes.extend_from_slice(eol);
         bytes.extend_from_slice(eol);
-        bytes
+        Splice { cut: 0..0, bytes, game: Some(at..at + game.len()) }
     }
 
     /// The layout after an append: the text was written in the file's
@@ -736,7 +883,7 @@ mod tests {
             b"[White \"St\xe5hlberg\"]\n\n1. e4".to_vec()
         });
         assert_eq!(ansi.encode("[White \"Таль\"]", CodePage::WESTERN), Err('Т'));
-        let appended = |end| Layout { utf8: true, eol: Eol::Lf, end }.appended(b"G");
+        let appended = |end| Layout { utf8: true, eol: Eol::Lf, end }.appended(b"G").bytes;
         assert_eq!(appended(End::Empty), b"G\n\n");
         assert_eq!(appended(End::Blank), b"G\n\n");
         assert_eq!(appended(End::Line), b"\nG\n\n");

@@ -311,6 +311,102 @@ fn refusals_leave_the_file_as_it_was() {
     assert_eq!(r.status, 201, "{}", r.body);
 }
 
+/// The text of game `n` of database `id`, as `GET` serves it.
+fn served(port: u16, id: &str, n: u32) -> String {
+    let r = get_reply(port, &format!("/v1/databases/{id}/games/{n}"));
+    assert_eq!(r.status, 200, "{}", r.body);
+    member(&r.body, "pgn").to_string()
+}
+
+/// A save leaves the games next to it as they were, and adds or removes
+/// exactly one game. One the reader would join to a neighbour, because the
+/// neighbour or the game lacks its result or holds tags alone, is refused
+/// with `422 games_would_join`, and so is a removal that would join the games
+/// on either side; a game whose comment is not closed is `400`; a game on a
+/// line shared with the next is kept apart from it by a line end.
+#[test]
+fn neighbours_stay_as_they_were() {
+    let scratch = Scratch::new("neighbours");
+    let cases = [
+        // A game without tags would continue a last game without a result.
+        ("no-result", "1. e4\n"),
+        // A replacement without a result would take the next game, which has
+        // no tags.
+        ("tagless-next", "[Event \"first\"]\n1. e4 *\n\n1. d4 *\n\n"),
+        // Two games on one line.
+        ("one-line", "[Event \"a\"] 1. e4 * [Event \"b\"] 1. d4 *\n"),
+        // Removing the middle game would join the other two.
+        ("join-on-delete", "1. e4\n\n[Event \"b\"]\n1. d4 *\n\n1. c4 *\n"),
+        // A game of tags alone takes the next game's tags unless one repeats.
+        ("tags-alone", "[Event \"a\"]\n\n[Event \"b\"]\n1. e4 *\n"),
+    ];
+    let paths: Vec<PathBuf> = cases.iter().map(|(name, _)| scratch.path(&format!("{name}.pgn"))).collect();
+    for ((_, text), path) in cases.iter().zip(&paths) {
+        std::fs::write(path, text).unwrap();
+    }
+    let bridge = TestBridge::new(app_of(paths.clone()));
+    let port = bridge.port;
+    let code = |r: &Reply| string_member(member(&r.body, "error"), "code").to_string();
+    // Refused: the file stays as it was, and so does its list.
+    let refused = |path: &Path, method: &str, at: &str, body: &str, status: u16, expected: &str| {
+        let id = id_of(path);
+        let before = std::fs::read(path).unwrap();
+        let row = ready_row(port, &id);
+        let generation = string_member(&row, "generation").to_string();
+        let r = write(port, method, &format!("/v1/databases/{id}/games{at}"), Some(&generation), body);
+        assert_eq!((r.status, code(&r)), (status, expected.to_string()), "{method} {body:?}: {}", r.body);
+        assert_eq!(std::fs::read(path).unwrap(), before, "{method} {body:?}");
+        assert_eq!(row_now(port, &id), row);
+    };
+    // Written: the answer and the games then served.
+    let written = |path: &Path, method: &str, at: &str, body: &str, status: u16, games: &[&str]| {
+        let id = id_of(path);
+        let generation = string_member(&ready_row(port, &id), "generation").to_string();
+        let r = write(port, method, &format!("/v1/databases/{id}/games{at}"), Some(&generation), body);
+        assert_eq!(r.status, status, "{method} {body:?}: {}", r.body);
+        let row = row_now(port, &id);
+        assert_eq!(member(&row, "records"), games.len().to_string(), "{method} {body:?}: {row}");
+        for (n, game) in games.iter().enumerate() {
+            assert_eq!(
+                served(port, &id, n as u32 + 1),
+                bridge::json::string(&format!("{game}\n")),
+                "{method} {body:?}"
+            );
+        }
+    };
+    let joins = "games_would_join";
+
+    let path = &paths[0];
+    refused(path, "POST", "", "1. d4 *", 422, joins);
+    written(path, "POST", "", "[Event \"b\"]\n1. d4 *", 201, &["1. e4", "[Event \"b\"]\n1. d4 *"]);
+
+    let path = &paths[1];
+    refused(path, "PUT", "/1", "[Event \"x\"]\n1. c4", 422, joins);
+    refused(path, "PUT", "/1", "[Event \"new\"]\n1. c4 * {open", 400, "bad_request");
+    written(path, "PUT", "/1", "[Event \"x\"]\n1. c4 *", 200, &["[Event \"x\"]\n1. c4 *", "1. d4 *"]);
+
+    // A comment to the end of the line would take the next game: a line end
+    // is put after the replacement.
+    let path = &paths[2];
+    written(
+        path,
+        "PUT",
+        "/1",
+        "[Event \"x\"] 1. c4 * ; a note",
+        200,
+        &["[Event \"x\"] 1. c4 * ; a note", "[Event \"b\"] 1. d4 *"],
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "[Event \"x\"] 1. c4 * ; a note\n [Event \"b\"] 1. d4 *\n");
+
+    let path = &paths[3];
+    refused(path, "DELETE", "/2", "", 422, joins);
+    written(path, "DELETE", "/3", "", 200, &["1. e4", "[Event \"b\"]\n1. d4 *"]);
+
+    let path = &paths[4];
+    refused(path, "PUT", "/2", "[White \"x\"]\n1. d4 *", 422, joins);
+    written(path, "PUT", "/2", "[Event \"c\"]\n1. d4 *", 200, &["[Event \"a\"]", "[Event \"c\"]\n1. d4 *"]);
+}
+
 /// A file another program changed since the client read it is a conflict
 /// at once: the write answers `409 generation_changed` from the file's
 /// metadata, before the changed file is read for its index, and writes

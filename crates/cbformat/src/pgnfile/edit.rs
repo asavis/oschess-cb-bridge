@@ -130,20 +130,36 @@ fn write_update(old: &Database, pgn: &Path, out_path: &Path, stamp: u64, edit: &
     if edit.first == 0 || after.is_none_or(|after| after > count.saturating_add(1)) {
         return Err(Error::Format(format!("an edit of games {} to {count} games", edit.first)));
     }
+    // Every game of a file built has a byte of text at least: an index
+    // claiming more is damaged, and the file, however small, is read whole.
+    if u64::from(count) > old.text_len {
+        return Ok(None);
+    }
+    let total = std::fs::metadata(pgn).map_err(io(pgn))?.len();
     let mut out = start_index(out_path)?;
-    let names = OldNames::default();
-    let mut copy =
-        Copy { old, names, damaged: false, building: Building::new(old.page), games: 0, out: &mut out, out_path };
+    let mut copy = Copy {
+        old,
+        names: OldNames::default(),
+        damaged: false,
+        // The names of both files are in the new index.
+        name_bytes: old.text_len.max(total).saturating_mul(3),
+        building: Building::new(old.page),
+        games: 0,
+        out: &mut out,
+        out_path,
+    };
     // The games before the one ahead of the edited span, as they were.
     let kept = edit.first.saturating_sub(2);
     copy.records(old, 1, kept, 0)?;
+    if copy.damaged {
+        return Ok(None);
+    }
     let from = if edit.first >= 2 { old.record(edit.first - 1)?.offset() } else { 0 };
     let Some(next) = read_window(old, pgn, from, edit, &mut copy)? else { return Ok(None) };
     copy.records(old, next, count, edit.delta)?;
     if copy.damaged {
         return Ok(None);
     }
-    let total = std::fs::metadata(pgn).map_err(io(pgn))?.len();
     let Copy { building, games, .. } = copy;
     finish_index(&building, games, total, stamp, out, out_path)?;
     Ok(Some(games))
@@ -152,7 +168,11 @@ fn write_update(old: &Database, pgn: &Path, out_path: &Path, stamp: u64, edit: &
 /// The new ids, stored one higher, of the names of the old index met so far,
 /// by their old ids: each name is read from the old index once, when a
 /// record first names it, so that the names read are those the records use,
-/// whatever the index's tables claim.
+/// whatever the index's tables claim. A build never keeps an empty name or
+/// the same name twice in a table, and keeps no more bytes of names than
+/// its file's text gives (three bytes of UTF-8 for a byte of a code page at
+/// most): a name that breaks one of these is damage, and the file is read
+/// whole. So the maps hold no more names than the file holds bytes.
 #[derive(Default)]
 struct OldNames {
     players: HashMap<i64, u32>,
@@ -182,6 +202,8 @@ struct Copy<'a> {
     /// A record named a name the old index does not hold: the file is then
     /// read whole.
     damaged: bool,
+    /// The most bytes of names the files' texts can give.
+    name_bytes: u64,
     building: Building,
     games: u32,
     out: &'a mut BufWriter<File>,
@@ -198,6 +220,9 @@ impl Copy<'_> {
             let Some(end) = batch.last().map(Record::id) else { break };
             for record in &batch {
                 let b = self.moved(record, delta)?;
+                if self.damaged {
+                    return Ok(());
+                }
                 self.write(&b)?;
             }
             next = end + 1;
@@ -236,18 +261,15 @@ impl Copy<'_> {
             return Ok(new);
         }
         let kind = if annotator { NameKind::Annotators } else { NameKind::Players };
-        let Some(text) = old_name(self.old, kind, id, false)? else {
-            self.damaged = true;
-            return Ok(0);
-        };
-        let new = if text.is_empty() {
-            0
-        } else {
-            let b = &mut self.building;
-            let table = if annotator { &mut b.annotators } else { &mut b.players };
-            let bytes = text.len();
-            table.intern(text, bytes, &mut b.held).ok_or_else(too_many_names)?
-        };
+        let text = old_name(self.old, kind, id, false)?.filter(|t| !t.is_empty());
+        let Some(text) = text else { return Ok(self.damage()) };
+        let b = &mut self.building;
+        let table = if annotator { &mut b.annotators } else { &mut b.players };
+        let (before, bytes) = (table.list.len(), text.len());
+        let new = table.intern(text, bytes, &mut b.held).ok_or_else(too_many_names)?;
+        if table.list.len() == before || !self.within_text() {
+            return Ok(self.damage());
+        }
         let known = if annotator { &mut self.names.annotators } else { &mut self.names.players };
         known.insert(id, new);
         Ok(new)
@@ -264,19 +286,30 @@ impl Copy<'_> {
         }
         let event = old_name(self.old, NameKind::Tournaments, id, false)?;
         let site = old_name(self.old, NameKind::Tournaments, id, true)?;
-        let (Some(event), Some(site)) = (event, site) else {
-            self.damaged = true;
-            return Ok(0);
-        };
-        let new = if event.is_empty() && site.is_empty() {
-            0
-        } else {
-            let b = &mut self.building;
-            let bytes = event.len() + site.len();
-            b.tournaments.intern((event, site), bytes, &mut b.held).ok_or_else(too_many_names)?
-        };
+        let (Some(event), Some(site)) = (event, site) else { return Ok(self.damage()) };
+        if event.is_empty() && site.is_empty() {
+            return Ok(self.damage());
+        }
+        let b = &mut self.building;
+        let (before, bytes) = (b.tournaments.list.len(), event.len() + site.len());
+        let new = b.tournaments.intern((event, site), bytes, &mut b.held).ok_or_else(too_many_names)?;
+        if b.tournaments.list.len() == before || !self.within_text() {
+            return Ok(self.damage());
+        }
         self.names.tournaments.insert(id, new);
         Ok(new)
+    }
+
+    /// Notes damage in the old index, which has the file read whole; no id.
+    fn damage(&mut self) -> u32 {
+        self.damaged = true;
+        0
+    }
+
+    /// Whether the names kept so far are no more than the files' texts can
+    /// give.
+    fn within_text(&self) -> bool {
+        self.building.held as u64 <= self.name_bytes
     }
 
     /// The record of `game`, read from the new text, as a build makes it.
@@ -492,6 +525,64 @@ mod tests {
         let b = file.find("[Event \"b\"]").unwrap();
         let end = b + "[Event \"b\"]\n1. d4 1-0".len();
         check("open-comment", file.as_bytes(), b..end, b"[Event \"b\"]\n1. d4 {left open", 2, 1);
+    }
+
+    /// Appends a game to the PGN file of `before`, whose index `doctor`
+    /// changes first, and checks that the index [`update`] writes is the
+    /// one a build writes: a damaged index has the file read whole, and its
+    /// damage never reaches the new index.
+    fn append_to_doctored(name: &str, before: &str, doctor: impl FnOnce(&mut Vec<u8>)) {
+        let scratch = Scratch::new(name);
+        let dir = &scratch.0;
+        let (pgn, index) = (dir.join("db.pgn"), dir.join("db.head"));
+        std::fs::write(&pgn, before).unwrap();
+        build(&pgn, &index, 1, CodePage::WESTERN, &mut |_| true).unwrap();
+        let mut bytes = std::fs::read(&index).unwrap();
+        doctor(&mut bytes);
+        std::fs::write(&index, &bytes).unwrap();
+        let old = Database::open(&pgn, &index, 1, CodePage::WESTERN).unwrap();
+        let after = format!("{before}\n[Event \"c\"]\n1. c4 *\n\n");
+        std::fs::write(dir.join("new.pgn"), &after).unwrap();
+        std::fs::rename(dir.join("new.pgn"), &pgn).unwrap();
+        let edit = Edit { first: old.record_count() + 1, removed: 0, delta: (after.len() - before.len()) as i64 };
+        update(&old, &pgn, &index, 2, &edit).unwrap();
+        assert_eq!(std::fs::read(&index).unwrap(), built(dir, after.as_bytes(), 2), "{name}");
+    }
+
+    /// The name table's entry `n` in the index `bytes`: where its text starts
+    /// and its length.
+    fn entry(bytes: &mut [u8], n: usize) -> (&mut [u8], usize) {
+        let names_at = u64::from_le_bytes(bytes[48..56].try_into().unwrap()) as usize;
+        let at = names_at + n * ENTRY_SIZE as usize;
+        (&mut bytes[at..at + ENTRY_SIZE as usize], at)
+    }
+
+    /// Names a build never writes, an empty one or the same one twice, and
+    /// more games than the file has bytes, are damage: the file is read
+    /// whole, and the maps of names never grow with what the index claims.
+    #[test]
+    fn names_a_build_never_writes_are_damage() {
+        // Three games, so that an append copies the first one's record, and
+        // its names, from the index: the window starts at the last game.
+        let two = "[Event \"a\"]\n[White \"Morphy\"]\n[Black \"Tal\"]\n1. e4 1-0\n\n\
+                   [Event \"b\"]\n1. d4 *\n\n[Event \"c\"]\n1. c4 *\n\n";
+        // The second player, Tal, names Morphy's text.
+        append_to_doctored("duplicate", two, |bytes| {
+            let first = entry(bytes, 0).0.to_vec();
+            entry(bytes, 1).0.copy_from_slice(&first);
+        });
+        // Morphy's name is empty.
+        append_to_doctored("empty", two, |bytes| entry(bytes, 0).0[8..12].copy_from_slice(&0u32.to_le_bytes()));
+        // A thousand games, of zeros, in a file of 90 bytes.
+        append_to_doctored("too-many-games", two, |bytes| {
+            let games = 1000u32;
+            let names_at = 64 + games as usize * RECORD_SIZE;
+            bytes.truncate(64);
+            bytes[32..36].copy_from_slice(&games.to_le_bytes());
+            bytes[36..48].fill(0);
+            bytes[48..56].copy_from_slice(&(names_at as u64).to_le_bytes());
+            bytes.resize(names_at, 0);
+        });
     }
 
     #[test]

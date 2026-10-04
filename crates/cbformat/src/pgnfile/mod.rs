@@ -610,6 +610,8 @@ pub struct Database {
     /// The index: its records, and the name table after them.
     index: RecordFile<RECORD_SIZE>,
     index_len: u64,
+    /// The length of the PGN file the index was built from.
+    text_len: u64,
     /// Players, tournaments and annotators.
     counts: [u32; 3],
     names_at: u64,
@@ -661,7 +663,8 @@ impl Database {
             return Err(bad("sizes that do not fit the file"));
         }
         let index = RecordFile::new(index_file, HEADER_SIZE, games);
-        Ok(Database { path: pgn.to_path_buf(), text, index, index_len, counts, names_at, page })
+        let text_len = h.le_u64::<TEXT_LEN_AT>();
+        Ok(Database { path: pgn.to_path_buf(), text, index, index_len, text_len, counts, names_at, page })
     }
 
     pub fn path(&self) -> &Path {
