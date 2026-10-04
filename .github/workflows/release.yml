@@ -1,6 +1,6 @@
 name: release
 
-# The release of the Windows app, from a version tag: the bare
+# The release of the Windows app, from an owner-requested main dispatch: the bare
 # oschess-bridge.exe and its per-user NSIS installer, each signed by SignPath
 # once that is switched on, the updater's signature and latest.json once its key
 # exists, the Microsoft Store package once its identity exists (#112), their
@@ -9,16 +9,15 @@ name: release
 #
 # The one exception to our own-runners rule (owner decision on #23,
 # 2026-09-24): SignPath requires every job before a signing request to run on
-# GitHub's hosted runners. It starts only on a version tag, which only
-# collaborators can push; no pull request, issue, comment or fork can start it.
+# GitHub's hosted runners. Only collaborators can dispatch it on main;
+# no pull request, issue, comment or fork can start it.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: store-release-bridge
   cancel-in-progress: false
 
 defaults:
@@ -40,9 +39,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
-      # Lists the ci workflow's runs for the tagged commit.
+      # Lists the ci workflow's runs for the source commit.
       actions: read
-      contents: read
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
       exe: ${{ steps.exe.outputs.artifact-id }}
@@ -50,14 +49,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The tag is on main
+      - name: Release only reviewed main
         run: |
+          test "$GITHUB_REF" = refs/heads/main || { echo "::error::Dispatch releases from main"; exit 1; }
           git fetch --no-tags --quiet origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
             echo "::error::$GITHUB_REF_NAME is not on main: releases are made only from reviewed commits"
             exit 1
           fi
-      - name: CI passed for the tagged commit
+      - name: CI passed for the source commit
         # ci.yml's run after the merge, the newest if it ran more than once
         # (a re-run is the same run). A run that has not finished, or has not
         # started, fails here as a failed one does: once ci has passed,
@@ -100,15 +100,21 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
-      - name: The tag names the app's version
+      - name: Reserve the store version
         id: version
-        run: |
-          version=$(cargo pkgid -p app | sed 's/.*[#@]//')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::the tag $GITHUB_REF_NAME does not name the app's version $version (crates/app/Cargo.toml)"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/store_version.py --platform bridge
+      - name: Apply the reserved version to the build workspace
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python scripts/apply_release_version.py "$VERSION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          overwrite: true
+          name: store-release-identity
+          path: store-release.json
+          if-no-files-found: error
       - name: Tauri CLI
         run: cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked --root tools
       - name: Build
@@ -123,11 +129,13 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: exe
         with:
+          overwrite: true
           name: exe-unsigned
           path: dist/oschess-bridge.exe
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          overwrite: true
           name: tauri-cli
           path: tools/bin/cargo-tauri.exe
           if-no-files-found: error
@@ -161,6 +169,7 @@ jobs:
           output-artifact-directory: signed
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          overwrite: true
           name: exe-signed
           path: signed/oschess-bridge.exe
           if-no-files-found: error
@@ -183,6 +192,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Apply the executable's reserved version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: python scripts/apply_release_version.py "$VERSION"
       - name: Toolchain
         # The version, components and targets rust-toolchain.toml names.
         run: |
@@ -212,6 +225,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: installer
         with:
+          overwrite: true
           name: installer-unsigned
           path: dist/oschess-bridge-setup.exe
           if-no-files-found: error
@@ -239,6 +253,7 @@ jobs:
           output-artifact-directory: signed
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          overwrite: true
           name: installer-signed
           path: signed/oschess-bridge-setup.exe
           if-no-files-found: error
@@ -265,6 +280,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Apply the executable's reserved version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: python scripts/apply_release_version.py "$VERSION"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.sign-exe.result == 'success' && 'exe-signed' || 'exe-unsigned' }}
@@ -274,6 +293,7 @@ jobs:
         run: python scripts/msix.py --exe exe/oschess-bridge.exe --out dist/oschess-bridge.msix
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          overwrite: true
           name: msix
           path: dist/oschess-bridge.msix
           if-no-files-found: error
@@ -309,6 +329,10 @@ jobs:
         with:
           name: msix
           path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: store-release-identity
+          path: dist
       - name: Both files signed, or neither
         run: |
           if [ "$EXE_SIGNED" != "$INSTALLER_SIGNED" ]; then
@@ -339,10 +363,10 @@ jobs:
         # update only for the version it was signed as (requireSignedVersion).
         run: |
           tools/bin/cargo-tauri.exe signer sign --app-version "$VERSION" dist/oschess-bridge-setup.exe
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/oschess-bridge-setup.exe"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/oschess-bridge-setup.exe"
           jq -n \
             --arg version "$VERSION" \
-            --arg notes "https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" \
+            --arg notes "https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION" \
             --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --rawfile signature dist/oschess-bridge-setup.exe.sig \
             --arg url "$url" \
@@ -379,6 +403,7 @@ jobs:
           cat notes.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          overwrite: true
           name: release
           path: dist/
           if-no-files-found: error
@@ -387,7 +412,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --draft --verify-tag \
+          gh release create "v$VERSION" dist/* \
+            --draft --target "$GITHUB_SHA" \
             --title "oschess bridge $VERSION" \
             --notes-file notes.md --generate-notes

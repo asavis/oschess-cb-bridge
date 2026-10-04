@@ -52,11 +52,14 @@ The review gate follows the scheme of the `kidschessleague` project.
   head carries a `CB-REVIEW: CLEAN <sha>` verdict and the prose review naming
   that commit is reviewed, and an agent merges it into `main` without asking
   again.
-- That merge is where an agent's authority ends. The version number, a version
-  change in `crates/app/Cargo.toml`, a `v*` tag, publishing a draft release and
-  a Microsoft Store submission each need the owner's explicit order naming the
-  version. An agent never chooses a version, and a general request such as
-  "ship it" or "send it to the Store" is not that order.
+- A release still needs the owner's explicit release request. Its version is
+  assigned by the release workflow under `docs/release.md`, not chosen by the
+  owner or agent. Major stays 1 until the owner explicitly directs a change to
+  `store-version.json`; never raise it automatically. Do not request a version
+  or make a version-only Cargo commit. This supersedes the old requirement for
+  the owner to name an exact version (owner decision 2026-10-04). Publishing a
+  draft or submitting to Microsoft Store still needs the corresponding owner
+  authorization; implementing release tooling does not itself authorize a release.
 
 ## Checks
 
@@ -71,8 +74,8 @@ collaborators can make, and only on our own runners (`bridge-local` for Linux,
 workflow, trigger or job
 that a pull request, an issue, a comment or a fork can start, and never route a
 job to GitHub's hosted runners. The one exception (owner decision on #23,
-2026-09-24) is `.github/workflows/release.yml`: it runs only on a version tag
-that a collaborator pushes, on GitHub's hosted Windows runners, because SignPath
+2026-09-24) is `.github/workflows/release.yml`: it runs only on a collaborator
+dispatch on `main`, on GitHub's hosted Windows runners, because SignPath
 requires every job before a signing request to run there
 ([docs/release.md](docs/release.md)). Before a merge, every check runs on our
 own hosts, started by us: by the author before every push and by the reviewer

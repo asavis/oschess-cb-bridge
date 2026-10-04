@@ -258,8 +258,8 @@ The app builds on Windows only. On Linux, `scripts/clippy-windows.sh` checks
 it for `x86_64-pc-windows-gnu`, a target `rust-toolchain.toml` installs,
 without linking.
 
-A version tag builds the release: `oschess-bridge.exe`, its per-user NSIS
-installer and their SHA-256, as a draft for the owner to publish
+A collaborator dispatch on `main` assigns the version and builds the release:
+`oschess-bridge.exe`, its per-user NSIS installer and their SHA-256, as a draft for the owner to publish
 ([docs/release.md](docs/release.md)). The app's updater reads the newest
 release's `latest.json` and installs only an installer signed with the updater
 key, whose public half is in `crates/app/tauri.conf.json`.
@@ -278,8 +278,8 @@ whether a release is signed.
 
 What is signed: only this repository's own `oschess-bridge.exe` and its
 installer, as `.github/workflows/release.yml` builds them on GitHub's runners
-from a version tag on `main`. Every release is published by the owner after
-checking it ([docs/release.md](docs/release.md)).
+from an owner-requested dispatch on `main`, with an automatic version. Every
+release is published by the owner after checking it ([docs/release.md](docs/release.md)).
 
 Roles:
 

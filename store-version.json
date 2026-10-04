@@ -1,0 +1,10 @@
+{
+  "major": 1,
+  "platforms": {
+    "bridge": {
+      "minimum_version": "1.4.0",
+      "minimum_build": 0,
+      "legacy_tag_prefix": "v"
+    }
+  }
+}
