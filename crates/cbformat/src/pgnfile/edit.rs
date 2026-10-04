@@ -18,6 +18,7 @@
 //! reading depends on the whole file.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -26,10 +27,10 @@ use super::lex::Lexer;
 use super::scan::{Game, Splitter};
 use super::{
     ANNOTATOR_AT, BLACK_AT, Building, CHUNK, Database, ENTRY_LEN_AT, ENTRY_SIZE, ENTRY_TEXT_AT, MAX_NAME, MAX_RESUMES,
-    OFFSET_AT, RECORD_SIZE, Record, TOURNAMENT_AT, WHITE_AT, build, finish_index, io, partial_path, publish,
+    NameKind, OFFSET_AT, RECORD_SIZE, Record, TOURNAMENT_AT, WHITE_AT, build, finish_index, io, partial_path, publish,
     start_index, too_many_names,
 };
-use crate::bytes::{Fields, array};
+use crate::bytes::Fields;
 use crate::{Error, Result};
 
 const BOM: &[u8] = b"\xef\xbb\xbf";
@@ -47,30 +48,62 @@ pub struct Edit {
     pub delta: i64,
 }
 
-/// The games of `text`, read as a build reads a file: a byte-order mark
-/// first is no game's, and a comment left open is read again from a game
-/// header it holds.
-pub fn games(text: &[u8]) -> Vec<Game> {
-    let mut games = Vec::new();
-    let mut splitter = Splitter::new(|g: &Game| games.push(g.clone()));
+/// What a text holds, read as a build reads a file.
+#[derive(Debug)]
+pub enum Games {
+    None,
+    One(Box<Game>),
+    /// More than one game; the text was read only as far as the second.
+    Several,
+}
+
+/// Bytes of a text read at a time by [`one_game`], which stops once it has
+/// found a second game.
+const TEXT_STEP: usize = 64 << 10;
+
+/// Whether `text` holds no game, one or several, read as a build reads a
+/// file: a byte-order mark first is no game's, and a comment left open is
+/// read again from a game header it holds. Only the first game is kept, and
+/// the text is read no further than the second, so that a text of many games
+/// costs no more memory than one of two.
+pub fn one_game(text: &[u8]) -> Games {
+    let mut first = None;
+    let seen = Cell::new(0u32);
+    let mut splitter = Splitter::new(|g: &Game| {
+        if seen.get() == 0 {
+            first = Some(g.clone());
+        }
+        seen.set(seen.get().saturating_add(1));
+    });
     let from = if text.starts_with(BOM) { BOM.len() } else { 0 };
     let mut lexer = Lexer::at(from as u64);
     let mut rest = &text[from..];
     let mut resumes = 0;
-    loop {
-        lexer.feed(rest, &mut splitter);
+    let several = 'read: loop {
+        for chunk in rest.chunks(TEXT_STEP) {
+            lexer.feed(chunk, &mut splitter);
+            if seen.get() > 1 {
+                break 'read true;
+            }
+        }
         match lexer.finish(&mut splitter, resumes < MAX_RESUMES) {
             Some(at) => {
                 resumes += 1;
                 lexer.reset(at);
                 rest = text.get(at as usize..).unwrap_or_default();
             }
-            None => break,
+            None => break false,
         }
+    };
+    if !several {
+        splitter.finish();
     }
-    splitter.finish();
     drop(splitter);
-    games
+    match (several || seen.get() > 1, first) {
+        (true, _) => Games::Several,
+        (false, Some(game)) => Games::One(Box::new(game)),
+        (false, None) => Games::None,
+    }
 }
 
 /// Writes to `index` the index of the PGN file `pgn` after `edit`, stamped
@@ -97,63 +130,58 @@ fn write_update(old: &Database, pgn: &Path, out_path: &Path, stamp: u64, edit: &
     if edit.first == 0 || after.is_none_or(|after| after > count.saturating_add(1)) {
         return Err(Error::Format(format!("an edit of games {} to {count} games", edit.first)));
     }
-    let Some(names) = OldNames::read(old)? else { return Ok(None) };
     let mut out = start_index(out_path)?;
-    let mut copy = Copy { names: &names, building: Building::new(old.page), games: 0, out: &mut out, out_path };
+    let names = OldNames::default();
+    let mut copy =
+        Copy { old, names, damaged: false, building: Building::new(old.page), games: 0, out: &mut out, out_path };
     // The games before the one ahead of the edited span, as they were.
     let kept = edit.first.saturating_sub(2);
     copy.records(old, 1, kept, 0)?;
     let from = if edit.first >= 2 { old.record(edit.first - 1)?.offset() } else { 0 };
     let Some(next) = read_window(old, pgn, from, edit, &mut copy)? else { return Ok(None) };
     copy.records(old, next, count, edit.delta)?;
+    if copy.damaged {
+        return Ok(None);
+    }
     let total = std::fs::metadata(pgn).map_err(io(pgn))?.len();
     let Copy { building, games, .. } = copy;
     finish_index(&building, games, total, stamp, out, out_path)?;
     Ok(Some(games))
 }
 
-/// The name table of an index, read whole, by id.
+/// The new ids, stored one higher, of the names of the old index met so far,
+/// by their old ids: each name is read from the old index once, when a
+/// record first names it, so that the names read are those the records use,
+/// whatever the index's tables claim.
+#[derive(Default)]
 struct OldNames {
-    players: Vec<String>,
-    tournaments: Vec<(String, String)>,
-    annotators: Vec<String>,
+    players: HashMap<i64, u32>,
+    tournaments: HashMap<i64, u32>,
+    annotators: HashMap<i64, u32>,
 }
 
-impl OldNames {
-    /// The names of `old`; `None` when an entry points outside the index,
-    /// which only a damaged one does, so that the file is read whole.
-    fn read(old: &Database) -> Result<Option<OldNames>> {
-        let [players, tournaments, annotators] = old.counts.map(|c| c as usize);
-        let entries = players + 2 * tournaments + annotators;
-        let len = usize::try_from(old.index_len - old.names_at)
-            .map_err(|_| Error::Format("a PGN index's names are larger than memory".into()))?;
-        let table = old.index.file().read(old.names_at, len)?;
-        let mut texts = Vec::with_capacity(entries);
-        for n in 0..entries {
-            let Some(e) = array::<{ ENTRY_SIZE as usize }>(&table, n * ENTRY_SIZE as usize) else { return Ok(None) };
-            let (at, len) = (e.le_u64::<ENTRY_TEXT_AT>(), e.le_u32::<ENTRY_LEN_AT>() as usize);
-            let text = at
-                .checked_sub(old.names_at)
-                .and_then(|at| usize::try_from(at).ok())
-                .filter(|_| len <= MAX_NAME)
-                .and_then(|at| table.get(at..at.checked_add(len)?));
-            let Some(text) = text else { return Ok(None) };
-            texts.push(String::from_utf8_lossy(text).into_owned());
-        }
-        let mut texts = texts.into_iter();
-        let players = texts.by_ref().take(players).collect();
-        let mut tournaments = Vec::with_capacity(tournaments);
-        for _ in 0..tournaments.capacity() {
-            tournaments.push((texts.next().unwrap_or_default(), texts.next().unwrap_or_default()));
-        }
-        Ok(Some(OldNames { players, tournaments, annotators: texts.collect() }))
+/// Name `id` of `kind` in `old`'s table, at most [`MAX_NAME`] bytes; `None`
+/// when the table has no such name, or its entry points outside the index,
+/// which only a damaged index does.
+fn old_name(old: &Database, kind: NameKind, id: i64, second: bool) -> Result<Option<String>> {
+    let Some(slot) = old.slot(kind, id) else { return Ok(None) };
+    let mut e = [0u8; ENTRY_SIZE as usize];
+    old.index.file().read_into(old.names_at + (slot + u64::from(second)) * ENTRY_SIZE, &mut e)?;
+    let (at, len) = (e.le_u64::<ENTRY_TEXT_AT>(), e.le_u32::<ENTRY_LEN_AT>() as usize);
+    if len > MAX_NAME || at.checked_add(len as u64).is_none_or(|end| end > old.index_len) {
+        return Ok(None);
     }
+    Ok(Some(String::from_utf8_lossy(&old.index.file().read(at, len)?).into_owned()))
 }
 
 /// The new index as it is written: the records so far, with the names they
 /// use given their new ids.
 struct Copy<'a> {
-    names: &'a OldNames,
+    old: &'a Database,
+    names: OldNames,
+    /// A record named a name the old index does not hold: the file is then
+    /// read whole.
+    damaged: bool,
     building: Building,
     games: u32,
     out: &'a mut BufWriter<File>,
@@ -180,10 +208,10 @@ impl Copy<'_> {
     /// `record`'s bytes with the new ids of its names, its game moved by
     /// `delta` bytes. The names are met in the order a build meets them.
     fn moved(&mut self, record: &Record, delta: i64) -> Result<[u8; RECORD_SIZE]> {
-        let white = self.person(record, record.white(), false)?;
-        let black = self.person(record, record.black(), false)?;
+        let white = self.person(record.white(), false)?;
+        let black = self.person(record.black(), false)?;
         let tournament = self.tournament(record)?;
-        let annotator = self.person(record, record.annotator(), true)?;
+        let annotator = self.person(record.annotator(), true)?;
         let offset = record
             .offset()
             .checked_add_signed(delta)
@@ -198,19 +226,31 @@ impl Copy<'_> {
     }
 
     /// The new id, stored one higher, of player or annotator `id` of the old
-    /// index, which `record` names.
-    fn person(&mut self, record: &Record, id: i64, annotator: bool) -> Result<u32> {
+    /// index.
+    fn person(&mut self, id: i64, annotator: bool) -> Result<u32> {
         if id < 0 {
             return Ok(0);
         }
-        let old = if annotator { &self.names.annotators } else { &self.names.players };
-        let text = old.get(id as usize).ok_or_else(|| damaged(record))?;
-        if text.is_empty() {
-            return Ok(0);
+        let known = if annotator { &self.names.annotators } else { &self.names.players };
+        if let Some(&new) = known.get(&id) {
+            return Ok(new);
         }
-        let b = &mut self.building;
-        let table = if annotator { &mut b.annotators } else { &mut b.players };
-        table.intern(text.clone(), text.len(), &mut b.held).ok_or_else(too_many_names)
+        let kind = if annotator { NameKind::Annotators } else { NameKind::Players };
+        let Some(text) = old_name(self.old, kind, id, false)? else {
+            self.damaged = true;
+            return Ok(0);
+        };
+        let new = if text.is_empty() {
+            0
+        } else {
+            let b = &mut self.building;
+            let table = if annotator { &mut b.annotators } else { &mut b.players };
+            let bytes = text.len();
+            table.intern(text, bytes, &mut b.held).ok_or_else(too_many_names)?
+        };
+        let known = if annotator { &mut self.names.annotators } else { &mut self.names.players };
+        known.insert(id, new);
+        Ok(new)
     }
 
     /// The new id, stored one higher, of the tournament of `record`.
@@ -219,13 +259,24 @@ impl Copy<'_> {
         if id < 0 {
             return Ok(0);
         }
-        let (event, site) = self.names.tournaments.get(id as usize).ok_or_else(|| damaged(record))?;
-        if event.is_empty() && site.is_empty() {
-            return Ok(0);
+        if let Some(&new) = self.names.tournaments.get(&id) {
+            return Ok(new);
         }
-        let b = &mut self.building;
-        let bytes = event.len() + site.len();
-        b.tournaments.intern((event.clone(), site.clone()), bytes, &mut b.held).ok_or_else(too_many_names)
+        let event = old_name(self.old, NameKind::Tournaments, id, false)?;
+        let site = old_name(self.old, NameKind::Tournaments, id, true)?;
+        let (Some(event), Some(site)) = (event, site) else {
+            self.damaged = true;
+            return Ok(0);
+        };
+        let new = if event.is_empty() && site.is_empty() {
+            0
+        } else {
+            let b = &mut self.building;
+            let bytes = event.len() + site.len();
+            b.tournaments.intern((event, site), bytes, &mut b.held).ok_or_else(too_many_names)?
+        };
+        self.names.tournaments.insert(id, new);
+        Ok(new)
     }
 
     /// The record of `game`, read from the new text, as a build makes it.
@@ -242,10 +293,6 @@ impl Copy<'_> {
             .ok_or_else(|| Error::Format("the file holds more games than a database can number".into()))?;
         self.out.write_all(record).map_err(io(self.out_path))
     }
-}
-
-fn damaged(record: &Record) -> Error {
-    Error::Format(format!("PGN index record {} names a name its table lacks", record.id()))
 }
 
 /// Reads the edited file `pgn` from `from`, where the game ahead of the
@@ -448,12 +495,43 @@ mod tests {
     }
 
     #[test]
-    fn games_of_a_text() {
-        assert_eq!(games(b"").len(), 0);
-        assert_eq!(games(b"{just a comment}\n").len(), 0);
-        let one = games("\u{feff}[Event \"a\"]\n1. e4 *\n".as_bytes());
-        assert_eq!((one.len(), one[0].start, one[0].plies), (1, 3, 1));
-        assert_eq!(games(b"1. e4 1-0 1. d4 0-1").len(), 2);
-        assert_eq!(games(b"[Event \"a\"]\n[Event \"b\"]").len(), 2);
+    fn the_games_of_a_text() {
+        assert!(matches!(one_game(b""), Games::None));
+        assert!(matches!(one_game(b"{just a comment}\n"), Games::None));
+        let Games::One(one) = one_game("\u{feff}[Event \"a\"]\n1. e4 *\n".as_bytes()) else { panic!() };
+        assert_eq!((one.start, one.end, one.plies), (3, 22, 1));
+        assert!(matches!(one_game(b"1. e4 1-0 1. d4 0-1"), Games::Several));
+        assert!(matches!(one_game(b"[Event \"a\"]\n[Event \"b\"]"), Games::Several));
+        // A game that ends only with the text is one.
+        let Games::One(open) = one_game(b"[Event \"a\"]\n1. e4 {left open") else { panic!() };
+        assert_eq!(open.plies, 1);
+        // Two million games, the most a 4 MiB text holds, are told to be
+        // several from the first two.
+        assert!(matches!(one_game("* ".repeat(2 << 20).as_bytes()), Games::Several));
+    }
+
+    /// A damaged name entry, which points outside the index, has the file
+    /// read whole, and so does an index whose name table claims far more
+    /// names than it holds: what is read is what the records name.
+    #[test]
+    fn a_damaged_index_is_read_again_whole() {
+        let scratch = Scratch::new("damaged");
+        let dir = &scratch.0;
+        let (pgn, index) = (dir.join("db.pgn"), dir.join("db.head"));
+        let before = "[Event \"a\"]\n[White \"Morphy, Paul\"]\n1. e4 1-0\n\n[Event \"b\"]\n1. d4 0-1\n";
+        std::fs::write(&pgn, before).unwrap();
+        build(&pgn, &index, 1, CodePage::WESTERN, &mut |_| true).unwrap();
+        // The first name entry, Morphy's, points past the end of the index.
+        let mut bytes = std::fs::read(&index).unwrap();
+        let names_at = u64::from_le_bytes(bytes[48..56].try_into().unwrap()) as usize;
+        bytes[names_at..names_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&index, &bytes).unwrap();
+        let old = Database::open(&pgn, &index, 1, CodePage::WESTERN).unwrap();
+        let after = format!("{before}\n[Event \"c\"]\n1. c4 *\n\n");
+        std::fs::write(dir.join("new.pgn"), &after).unwrap();
+        std::fs::rename(dir.join("new.pgn"), &pgn).unwrap();
+        let delta = (after.len() - before.len()) as i64;
+        assert_eq!(update(&old, &pgn, &index, 2, &Edit { first: 3, removed: 0, delta }).unwrap(), 3);
+        assert_eq!(std::fs::read(&index).unwrap(), built(dir, after.as_bytes(), 2));
     }
 }

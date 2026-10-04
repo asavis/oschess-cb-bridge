@@ -28,9 +28,10 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cbformat::codepage::CodePage;
-use cbformat::pgnfile::edit::{self, Edit};
-use cbformat::pgnfile::lex::Lexer;
+use cbformat::pgnfile::edit::{self, Edit, Games};
+use cbformat::pgnfile::lex::{Lexer, MAX_SYMBOL, Sink, Token};
 use cbformat::pgnfile::line::{LineEnd, main_line};
+use cbformat::pgnfile::scan::Tag;
 use cbformat::pgnfile::{self, Record};
 use cbformat::view::Base;
 
@@ -139,6 +140,12 @@ fn write(entry: &Entry, req: &Request, op: Op) -> Response {
         Op::Delete(_) => None,
     };
     let mut writing = entry.writing();
+    // The file as it is now, told before anything waits for an index of it:
+    // a file changed since the client read it is a conflict, not a file to
+    // open first.
+    if entry.generation().is_some_and(|now| !names_generation(expected, now)) {
+        return generation_changed();
+    }
     let open = match entry.open() {
         Ok(open) => open,
         Err(state) => return unavailable(state),
@@ -224,21 +231,51 @@ fn refused(entry: &Entry, failure: Failure) -> Response {
 
 /// The text of the one game `body` holds, as the reader finds it in a file:
 /// from its first tag (or move) to its end. Refused when the body is not
-/// UTF-8, holds no game or more than one, or when the game's main line does
-/// not play: a move that names no legal move, or a `FEN` tag that names no
-/// position. A null move ends the main line, as it does in the reader.
+/// UTF-8 or holds no game or more than one; when the game holds what the
+/// reader would pass over, a move, number or result longer than any or bytes
+/// that make no PGN element; or when its main line does not play: a `FEN` tag
+/// that names no position, an empty one among them, or a move that names no
+/// legal move. A null move ends the main line, as it does in the reader.
 fn game_text(body: &[u8]) -> Result<String, &'static str> {
     let text = std::str::from_utf8(body).map_err(|_| "The body is not UTF-8")?;
-    let game = match &edit::games(text.as_bytes())[..] {
-        [] => return Err("The body holds no game"),
-        [game] => game.clone(),
-        _ => return Err("The body holds more than one game"),
+    let game = match edit::one_game(text.as_bytes()) {
+        Games::None => return Err("The body holds no game"),
+        Games::One(game) => game,
+        Games::Several => return Err("The body holds more than one game"),
     };
     let span = text.get(game.start as usize..game.end as usize).ok_or("The game does not end at a character")?;
-    match main_line(span.as_bytes(), &mut Lexer::new(), &mut |_, _| true) {
+    if game.tags.get(Tag::Fen).is_some_and(|fen| fen.trim_ascii().is_empty()) {
+        return Err("The game's FEN names no position");
+    }
+    let mut strict = Strict(None);
+    let mut lexer = Lexer::new();
+    lexer.feed(span.as_bytes(), &mut strict);
+    lexer.finish(&mut strict, false);
+    if let Some(why) = strict.0 {
+        return Err(why);
+    }
+    match main_line(span.as_bytes(), &mut lexer, &mut |_, _| true) {
         LineEnd::End | LineEnd::NullMove => Ok(span.to_string()),
         LineEnd::BadStart => Err("The game's FEN names no position"),
         LineEnd::Stopped | LineEnd::Unplayable(_) => Err("The game's main line does not play"),
+    }
+}
+
+/// Finds in a game's text what the reader passes over: a symbol longer than
+/// it keeps, which could hide anything after its first bytes, and bytes that
+/// make no PGN element.
+struct Strict(Option<&'static str>);
+
+impl Sink for Strict {
+    fn tag(&mut self, _: u64, _: u64, _: &[u8], _: &[u8], _: bool) {}
+
+    fn movetext(&mut self, start: u64, end: u64, _: u32, token: Token<'_>, _: bool) {
+        let why = match token {
+            Token::Symbol(_) if end - start > MAX_SYMBOL as u64 => "A move, number or result of the game is too long",
+            Token::Skipped => "The game holds bytes that make no PGN element",
+            _ => return,
+        };
+        self.0.get_or_insert(why);
     }
 }
 
@@ -363,9 +400,10 @@ fn temp_path(path: &Path) -> PathBuf {
 }
 
 /// Removes the temporary file a replace or a removal left beside the PGN file
-/// `path` when the bridge stopped before it was renamed.
+/// `path`, or the file it links to, when the bridge stopped before it was
+/// renamed. Only a file is removed: a link of that name is not the bridge's.
 pub fn remove_leftover(path: &Path) {
-    let temp = temp_path(path);
+    let temp = temp_path(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
     if std::fs::symlink_metadata(&temp).is_ok_and(|m| m.is_file()) {
         match std::fs::remove_file(&temp) {
             Ok(()) => crate::log!("removed {} left by a write that did not end", temp.display()),
@@ -374,10 +412,13 @@ pub fn remove_leftover(path: &Path) {
     }
 }
 
-/// Writes the PGN file at `path`, which `file` holds, `len` bytes long,
-/// with `insert` in the place of the bytes `cut`, beside it, then renames
-/// the new file over it: the layout of the new file. The file is let go
-/// before the rename, and its generation looked at again.
+/// Writes the PGN file of `entry`, which `file` holds, `len` bytes long,
+/// with `insert` in the place of the bytes `cut`, beside it, then renames the
+/// new file over it: the layout of the new file. A PGN path that is a link is
+/// written where it links to, so that the link stays. The temporary file is
+/// made new: a file or a link already of its name is no file of this write's,
+/// and is left as it is. The PGN file is let go before the rename, and its
+/// generation looked at again.
 fn rewrite(
     entry: &Entry,
     generation: u64,
@@ -386,15 +427,17 @@ fn rewrite(
     cut: std::ops::Range<u64>,
     insert: &[u8],
 ) -> Result<Layout, Failure> {
-    let temp = temp_path(&entry.path);
-    let written = write_temp(&file, len, &cut, insert, &temp);
+    let target = std::fs::canonicalize(&entry.path)?;
+    let temp = temp_path(&target);
+    let out = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    let written = write_temp(&file, len, &cut, insert, out);
     drop(file);
     let swapped = written.map_err(Failure::from).and_then(|layout| {
         if entry.generation() != Some(generation) {
             return Err(Failure::Changed);
         }
-        std::fs::rename(&temp, &entry.path)?;
-        sync_folder(&entry.path);
+        std::fs::rename(&temp, &target)?;
+        sync_folder(&target);
         Ok(layout)
     });
     if swapped.is_err() {
@@ -403,10 +446,11 @@ fn rewrite(
     swapped
 }
 
-/// Writes to `temp` the bytes of `file`, `len` long, with `insert` in the
-/// place of `cut`, and flushes them to the disk: their layout.
-fn write_temp(file: &File, len: u64, cut: &std::ops::Range<u64>, insert: &[u8], temp: &Path) -> io::Result<Layout> {
-    let mut out = BufWriter::with_capacity(CHUNK, File::create(temp)?);
+/// Writes to `out`, a temporary file made for it, the bytes of `file`, `len`
+/// long, with `insert` in the place of `cut`, and flushes them to the disk:
+/// their layout.
+fn write_temp(file: &File, len: u64, cut: &std::ops::Range<u64>, insert: &[u8], out: File) -> io::Result<Layout> {
+    let mut out = BufWriter::with_capacity(CHUNK, out);
     let mut scan = Scan::default();
     let mut source = file;
     let mut buf = vec![0u8; CHUNK];
@@ -714,6 +758,17 @@ mod tests {
         assert_eq!(game_text(b"1. e4 e5 2. Ke3 *").unwrap_err(), "The game's main line does not play");
         assert_eq!(game_text(b"[FEN \"8/8/8 w - - 0 1\"]\n1. e4 *").unwrap_err(), "The game's FEN names no position");
         assert_eq!(game_text(b"[Event \"\xff\"] *").unwrap_err(), "The body is not UTF-8");
+        // What the reader would pass over is refused, not written.
+        assert_eq!(game_text(b"[FEN \"\"]\n1. e4 *").unwrap_err(), "The game's FEN names no position");
+        assert_eq!(game_text(b"[FEN \" \"]\n1. e4 *").unwrap_err(), "The game's FEN names no position");
+        let long = "A move, number or result of the game is too long";
+        assert_eq!(game_text(b"[Event \"a\"]\n1. e4 0000000000000000GARBAGE *").unwrap_err(), long);
+        assert_eq!(game_text(b"1. e4 (1. d4 00000000000000001) *").unwrap_err(), long);
+        let bytes = "The game holds bytes that make no PGN element";
+        assert_eq!(game_text("1. e4 ½ *".as_bytes()).unwrap_err(), bytes);
+        assert_eq!(game_text(b"1. e4 [%clk 0:01:00] *").unwrap_err(), bytes);
+        // Text inside comments and tags is the game's own.
+        assert!(game_text("[White \"Ståhlberg\"] 1. e4 {½ [%clk 0:01:00]} 1-0".as_bytes()).is_ok());
     }
 
     /// An append that fails part-way leaves the file at its old length.

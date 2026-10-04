@@ -853,16 +853,21 @@ entity tag (`"0123456789abcdef"`).
   Library's bound for PGN; a larger one is `413 body_too_large`. The bridge
   reads it with its own PGN reader, as it reads a file ([PGN files](#pgn-files)),
   and writes the game from its first tag (or move) to its end: blank lines and
-  text outside the game are not the game's. A body that is not UTF-8, holds no
-  game or more than one, or whose main line does not play is `400 bad_request`
-  with `parameter: "body"`. The main line plays when each of its moves is
-  legal from its `FEN` tag or the standard start; a null move ends it, as in
-  the position index. `DELETE` carries no body.
+  text outside the game are not the game's. A body is `400 bad_request` with
+  `parameter: "body"` when it is not UTF-8, holds no game or more than one,
+  holds what the reader passes over (a move, number or result over 16
+  characters, or bytes that make no PGN element outside comments and tags),
+  or when its main line does not play. The main line plays when its `FEN`
+  tag, if it has one, names a position (an empty one does not) and each of
+  its moves is legal from there or from the standard start; a null move ends
+  it, as in the position index. `DELETE` carries no body.
 - **The precondition.** Every write names the generation its client read in
   `If-Match`, as the `ETag` gives it or bare. A write without one is
   `428 precondition_required`. When the file's generation is another, because
   ChessBase, another program, a sync client or another write changed it, the
-  answer is `409 generation_changed` and nothing is written. The client reads
+  answer is `409 generation_changed` and nothing is written. The generation
+  is told from the file's metadata, before the changed file is read: the
+  answer is the conflict, never `opening`. The client reads
   the database again; the bridge never merges.
 - **Which databases.** Only a PGN file in state `ready` takes writes: one that
   is not ready answers `409 database_unavailable` with its `state`, as a read
@@ -879,8 +884,11 @@ entity tag (`"0123456789abcdef"`).
 - **A replace or a removal** writes the whole new file beside the old one, as
   `<name>.pgn.oschess-tmp` in the same folder, flushes it to the disk, and
   renames it over the old one in one step: a crash leaves the old file or the
-  new one, never a mix. A temporary file a crash left is removed when the
-  bridge next lists the file. A replace puts the game in the place of the old
+  new one, never a mix. The temporary file is made new: when a file or a link
+  already has its name, the write is `500 write_failed` and that file is left
+  as it is. A temporary file a crash left is removed when the bridge next
+  lists the file. A PGN path that is a link is written where it links to, and
+  the link stays. A replace puts the game in the place of the old
   one's text, from its first tag to its end, and keeps the empty lines around
   it. A removal takes the game and the empty lines after it, to the next game
   or the end of the file.

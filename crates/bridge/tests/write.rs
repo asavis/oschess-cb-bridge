@@ -257,6 +257,11 @@ fn refusals_leave_the_file_as_it_was() {
         "1. e4 e5 1-0\n\n1. d4 d5 0-1",
         "[Event \"a\"]\n[Event \"b\"]",
         "1. e4 e5 2. Ke3 *",
+        // What the reader would pass over: an empty FEN, a token longer
+        // than it keeps, bytes that make no PGN element.
+        "[FEN \"\"]\n1. e4 *",
+        "[Event \"truncated\"]\n1. e4 0000000000000000GARBAGE *",
+        "1. e4 ½ *",
     ] {
         for (method, at) in [("POST", games(&utf8_id)), ("PUT", format!("{}/1", games(&utf8_id)))] {
             let r = write(port, method, &at, Some(&generation), body);
@@ -304,6 +309,92 @@ fn refusals_leave_the_file_as_it_was() {
     // Then a write with the generation read goes through.
     let r = write(port, "POST", &games(&utf8_id), Some(&generation), GAME_1);
     assert_eq!(r.status, 201, "{}", r.body);
+}
+
+/// A file another program changed since the client read it is a conflict
+/// at once: the write answers `409 generation_changed` from the file's
+/// metadata, before the changed file is read for its index, and writes
+/// nothing.
+#[test]
+fn a_file_changed_elsewhere_is_a_conflict() {
+    let scratch = Scratch::new("changed");
+    let path = scratch.path("games.pgn");
+    std::fs::write(&path, format!("{GAME_1}\n\n")).unwrap();
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let id = id_of(&path);
+    let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+    // ChessBase saves a game into the file.
+    let changed = format!("{GAME_1}\n\n{GAME_3}\n\n");
+    std::fs::write(&path, &changed).unwrap();
+    let games = format!("/v1/databases/{id}/games");
+    for (method, at, body) in
+        [("POST", games.clone(), NEW), ("PUT", format!("{games}/1"), NEW), ("DELETE", format!("{games}/1"), "")]
+    {
+        let r = write(bridge.port, method, &at, Some(&generation), body);
+        assert_eq!(r.status, 409, "{method}: {}", r.body);
+        assert!(r.body.contains(r#""code":"generation_changed""#), "{method}: {}", r.body);
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    // With the generation read again, the write goes through.
+    let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+    assert_eq!(write(bridge.port, "POST", &games, Some(&generation), NEW).status, 201);
+}
+
+/// A replace makes its temporary file new: a link already of that name,
+/// which the bridge did not make, is refused with `500 write_failed`, and
+/// neither the file it links to, nor the link, nor the PGN file changes.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_place_of_the_temporary_file_is_left_alone() {
+    let scratch = Scratch::new("temp-link");
+    let path = scratch.path("games.pgn");
+    let before = format!("{GAME_1}\n\n{GAME_2}\n\n");
+    std::fs::write(&path, &before).unwrap();
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let id = id_of(&path);
+    let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+    let other = scratch.path("unrelated.txt");
+    std::fs::write(&other, "not a PGN file").unwrap();
+    let temp = scratch.path("games.pgn.oschess-tmp");
+    std::os::unix::fs::symlink(&other, &temp).unwrap();
+    let r = write(bridge.port, "PUT", &format!("/v1/databases/{id}/games/1"), Some(&generation), NEW);
+    assert_eq!(r.status, 500, "{}", r.body);
+    assert!(r.body.contains(r#""code":"write_failed""#), "{}", r.body);
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "not a PGN file");
+    assert!(std::fs::symlink_metadata(&temp).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    // Nor does a start remove it: it is no file the bridge made.
+    drop(bridge);
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    assert!(std::fs::symlink_metadata(&temp).is_ok());
+    drop(bridge);
+}
+
+/// A PGN path that links to the file is written where it links: the link
+/// stays a link to the new file, and a temporary file left beside the file
+/// it links to goes at start.
+#[cfg(unix)]
+#[test]
+fn a_linked_pgn_file_is_written_where_it_links() {
+    let scratch = Scratch::new("pgn-link");
+    let real = scratch.path("real.pgn");
+    let link = scratch.path("link.pgn");
+    std::fs::write(&real, format!("{GAME_1}\n\n{GAME_2}\n\n")).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(scratch.path("real.pgn.oschess-tmp"), "a crash's leftover").unwrap();
+    let bridge = TestBridge::new(app_of([link.clone()]));
+    assert!(!scratch.path("real.pgn.oschess-tmp").exists(), "the leftover beside the linked file goes");
+    let id = id_of(&link);
+    let generation = string_member(&ready_row(bridge.port, &id), "generation").to_string();
+    let r = write(bridge.port, "PUT", &format!("/v1/databases/{id}/games/2"), Some(&generation), REPLACEMENT);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link stays");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), format!("{GAME_1}\n\n{REPLACEMENT}\n\n"));
+    let row = row_now(bridge.port, &id);
+    assert_eq!(
+        (string_member(&row, "state"), string_member(&row, "generation")),
+        ("ready", string_member(&r.body, "generation"))
+    );
 }
 
 /// The temporary file a replace or a removal writes beside the PGN file, left
