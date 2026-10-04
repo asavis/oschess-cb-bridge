@@ -134,6 +134,10 @@ struct Held {
     /// The last download read every file, yet a file kept its cloud-only mark.
     /// Only tests read it, through [`Entry::marks_kept`].
     kept: AtomicBool,
+    /// Held by a write into the file, so that writes run one at a time
+    /// (`crate::write`), with how the file is written at a generation, as
+    /// the last write found it.
+    writing: Mutex<Option<(u64, crate::write::Layout)>>,
 }
 
 /// What the metadata of a database's files tells, without reading them.
@@ -234,6 +238,15 @@ impl Entry {
             return Err(State::CloudOnly);
         }
         let mut slot = lock(&self.held.open);
+        // The files changed since the database was opened, or since they were
+        // looked at: a write of the bridge's own may have changed them and
+        // opened the new generation meanwhile (`crate::write`). They are
+        // looked at again under the slot, so that no index is built for a
+        // generation already gone.
+        let generation = match slot.as_ref() {
+            Some(open) if open.generation != generation => self.files().generation.ok_or(State::Missing)?,
+            _ => generation,
+        };
         if let Some(open) = slot.as_ref().filter(|o| o.generation == generation) {
             return Ok(open.clone());
         }
@@ -248,6 +261,38 @@ impl Entry {
         let open = Opened { db: Arc::new(db), generation, indexes: Indexes::counted(&self.shared.activity) };
         *slot = Some(open.clone());
         Ok(open)
+    }
+
+    /// Opens the PGN file at `generation` with the header index a write of
+    /// the bridge's own made for it (`crate::write`), unless the database is
+    /// already open at that generation. Held meanwhile, the slot keeps a
+    /// request from opening the file before its index is in place.
+    pub(crate) fn install(&self, generation: u64, open: impl FnOnce() -> Option<Base>) {
+        let mut slot = lock(&self.held.open);
+        if slot.as_ref().is_some_and(|o| o.generation == generation) {
+            return;
+        }
+        if let Some(db) = open() {
+            *slot = Some(Opened { db: Arc::new(db), generation, indexes: Indexes::counted(&self.shared.activity) });
+        }
+    }
+
+    /// The write lock of the database (`crate::write`), with the layout of
+    /// its file that the last write found.
+    pub(crate) fn writing(&self) -> std::sync::MutexGuard<'_, Option<(u64, crate::write::Layout)>> {
+        lock(&self.held.writing)
+    }
+
+    /// The header indexes of PGN files, this database's among them.
+    pub(crate) fn pgn(&self) -> &pgnindex::Registry {
+        &self.shared.pgn
+    }
+
+    /// Whether the database takes writes (`docs/api.md`, "Writing games"): a
+    /// PGN file without the read-only attribute. Whether it is ready is told
+    /// apart.
+    pub fn writable_file(&self) -> bool {
+        self.format == Format::Pgn && std::fs::metadata(&self.path).is_ok_and(|m| !m.permissions().readonly())
     }
 
     /// The build of a PGN file's index running or queued: the bytes of the
@@ -628,7 +673,13 @@ impl Catalog {
                 Some(e) if e.name == item.name => Arc::clone(e),
                 // Renamed in the window: the same database under its new name.
                 Some(e) => Arc::new(Entry::new(item, &self.shared, Arc::clone(&e.held))),
-                None => Arc::new(Entry::new(item, &self.shared, Arc::default())),
+                None => {
+                    let entry = Entry::new(item, &self.shared, Arc::default());
+                    if entry.format == Format::Pgn {
+                        crate::write::remove_leftover(&entry.path);
+                    }
+                    Arc::new(entry)
+                }
             };
             entry.held.removed.store(false, Ordering::Relaxed);
             entries.push(entry);

@@ -156,6 +156,29 @@ impl Registry {
         unlisted.retain();
     }
 
+    /// Where the header index of database `id` is kept, when there is a
+    /// data folder.
+    pub fn index_path(&self, id: &str) -> Option<PathBuf> {
+        self.dir().map(|dir| dir.join(format!("{id}.head")))
+    }
+
+    /// Runs `write`, a write of the bridge's own into the PGN file of
+    /// database `id` and the header index it makes for it, holding the
+    /// database's build: no build of its index starts meanwhile, a request
+    /// that opens the file waits for the index, and the folder's sweep leaves
+    /// its work alone. `None` when a build runs or waits: the database is
+    /// then `opening`.
+    pub fn while_idle<T>(&self, id: &str, write: impl FnOnce() -> T) -> Option<T> {
+        let build = self.build(id);
+        let mut b = lock(&build);
+        if matches!(*b, Build::Working(_)) {
+            return None;
+        }
+        let done = write();
+        *b = Build::Idle;
+        Some(done)
+    }
+
     /// The PGN file `path` of database `id` at `generation`: opened with the
     /// index built for that generation, else the build that makes it, which
     /// starts now if none runs. While another generation's build runs, the

@@ -14,7 +14,9 @@ with `404 not_found`.
 
 - `http://127.0.0.1:<port>`, and the same on `localhost` and `[::1]`. The
   default port is **39581**; `port` in `bridge.toml` overrides it.
-- HTTP/1.1. `GET` and `OPTIONS` only. Requests carry no body.
+- HTTP/1.1. `GET` and `OPTIONS`, and the writes of a PGN file's games:
+  `POST`, `PUT` and `DELETE` ([Writing games](#writing-games)). Only the
+  writes of a game carry a body, sent with `Content-Length`.
 - Every response body is JSON, UTF-8, `Content-Type: application/json;
   charset=utf-8`. Clients must ignore fields they do not know; see
   [Compatibility](#compatibility).
@@ -63,9 +65,12 @@ nothing about the databases.
 | `Host` is `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>` (guards against DNS rebinding) | `421 misdirected_host` |
 | `Origin`, when present, is on the allowlist | `403 forbidden_origin` |
 | `Authorization: Bearer <token>` carries the pairing token | `401 unauthorized` |
-| The method is `GET` | `405 method_not_allowed` |
-| No body (`Content-Length` absent or 0, no `Transfer-Encoding`) | `413 body_not_allowed` |
+| The method is served at the path: `GET` at every path, `POST` at `/v1/databases/{id}/games`, `PUT` and `DELETE` at `/v1/databases/{id}/games/{number}` | `405 method_not_allowed`, with `Allow` naming the methods served there |
+| No body (`Content-Length` absent or 0, no `Transfer-Encoding`), except on `POST` of `/v1/databases/{id}/games` and `PUT` of `/v1/databases/{id}/games/{number}`, whose body is sent with `Content-Length` | `413 body_not_allowed` |
 | Request line and headers within 16 KiB | `431 headers_too_large` |
+
+The checks run in this order, the size of the request line and headers first,
+as they arrive, and a body is read only after the others pass.
 
 The allowlist is `https://oschess.org`, `https://www.oschess.org` and
 `https://staging.oschess.org`, plus the origins listed under `origins` in
@@ -83,8 +88,8 @@ An `OPTIONS` preflight from an allowed origin is answered `204` with:
 
 ```
 Access-Control-Allow-Origin: <the request's Origin>
-Access-Control-Allow-Methods: GET
-Access-Control-Allow-Headers: Authorization
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+Access-Control-Allow-Headers: Authorization, Content-Type, If-Match
 Access-Control-Max-Age: 600
 Vary: Origin
 ```
@@ -96,11 +101,12 @@ response to an allowed origin, errors included, carries
 
 ```
 Access-Control-Allow-Origin: <the request's Origin>
-Access-Control-Expose-Headers: Retry-After
+Access-Control-Expose-Headers: Retry-After, ETag
 Vary: Origin
 ```
 
-so that the page can read the error body and the retry delay.
+so that the page can read the error body, the retry delay and the generation
+a write answers with.
 
 Chrome and Edge, from version 142, let a public site reach `127.0.0.1` only
 after the user grants the **Local Network Access** permission for that site. No
@@ -122,22 +128,29 @@ with them.
 
 | Status | Code | Meaning |
 |---|---|---|
-| 400 | `bad_request` | A parameter is missing or malformed; `parameter` names it |
+| 400 | `bad_request` | A parameter is missing or malformed; `parameter` names it. A write's body that is not one playable game is `parameter: "body"` ([Writing games](#writing-games)) |
 | 400 | `query_syntax` | Reserved: the search grammar is lenient and no text is a syntax error today |
 | 400 | `unsupported_qualifier` | `q` uses a qualifier ChessBase databases do not have; `qualifier` names it |
 | 401 | `unauthorized` | Token missing or wrong |
 | 403 | `forbidden_origin` | `Origin` not on the allowlist |
 | 404 | `not_found` | No such path, database or game number |
-| 405 | `method_not_allowed` | Not `GET` or `OPTIONS` |
+| 405 | `method_not_allowed` | The method is not served at the path; `Allow` names those that are |
 | 409 | `database_unavailable` | The database is not `ready`; `state` gives its state. A request for the games of a `cloudOnly` database starts its download and is answered with `downloading`. For the explorer and the games of a position or of a fragment, `state: "indexing"` with `progress` while the position index is built or waits to be built, or a fragment search's masks are built |
+| 409 | `generation_changed` | A write names a generation the file no longer has: it changed since the client read it, through ChessBase, another program, a sync client or another write. Nothing was written |
+| 409 | `read_only` | A write to a database that takes none: a 2CBH or classic database, or a PGN file with the read-only attribute |
+| 409 | `file_busy` | Windows refused the write because another program holds the file, as ChessBase holds a database it has open. Nothing was written; the bridge neither waits nor retries |
 | 409 | `superseded` | A newer search (`q`, `fen` or a fragment) on the same database replaced this one while it ran; the page shows the newer answer |
-| 413 | `body_not_allowed` | The request has a body |
+| 413 | `body_not_allowed` | The request has a body where none is taken, or sends one in chunks |
+| 413 | `body_too_large` | A write's body is over 4 MiB |
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
 | 422 | `unsupported` | The position or variant of the explorer, of `fen` or of a fragment is Chess960, which the position index does not hold; `variant` names it |
 | 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
+| 422 | `unencodable` | The game of a write holds a character that the file's code page cannot store; `character` names the first. Nothing was written |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
+| 428 | `precondition_required` | A write without `If-Match` |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
+| 500 | `write_failed` | The file system refused a write for another reason than another program holding the file, a full disk among them. The file is as it was; the bridge logs why |
 | 500 | `internal` | A bug; the bridge logs it with the database's `id`, in `bridge.log` in its data folder and, in a console, on standard error |
 | 503 | `database_changing` | ChessBase changed the database during the read; `Retry-After: 1` |
 | 503 | `index_unavailable` | The position index, or the masks of a fragment search, could not be built; the message says why, too little free disk space among the reasons, and the next request after a minute tries again |
@@ -159,6 +172,8 @@ with them.
   [Classic databases](#classic-databases)); a PGN file itself (see
   [PGN files](#pgn-files)). For a PGN file, a bridge whose reading of PGN
   files changed also reports a new generation.
+- A write into a PGN file names the generation its client read and answers
+  with the new one ([Writing games](#writing-games)).
 
 ## Consistency
 
@@ -323,6 +338,7 @@ adds, then those given with `--database`, each once:
       "name": "Mega Database 2026",
       "format": "2cbh",
       "state": "ready",
+      "writable": false,
       "records": 11966514,
       "generation": "g1b2c3d4"
     },
@@ -331,6 +347,7 @@ adds, then those given with `--database`, each once:
       "name": "Club 2025",
       "format": "2cbh",
       "state": "downloading",
+      "writable": false,
       "size": 734003200,
       "progress": { "present": 104857600, "total": 734003200 }
     },
@@ -339,6 +356,7 @@ adds, then those given with `--database`, each once:
       "name": "Openings",
       "format": "pgn",
       "state": "opening",
+      "writable": false,
       "progress": { "present": 52428800, "total": 157286400 }
     }
   ]
@@ -350,6 +368,7 @@ adds, then those given with `--database`, each once:
 | `name` | The name ChessBase's window shows: the title it keeps for the database, else the file name without extension. A database that is not in the window has its file name without extension |
 | `format` | `2cbh`, `cbh` or `pgn`; another value is possible later |
 | `state` | `ready`; `opening` (a PGN file being read for its header index, see [PGN files](#pgn-files); retry after a moment); `missing` (the file is gone, or the database left the list); `cloudOnly` (kept only in the cloud, not on this computer; see below); `downloading` (being brought to this computer; see below); `unsupported` (a format the bridge does not serve: any but `.2cbh`, `.cbh` and `.pgn`); `unreadable` (the files are present but cannot be opened: damaged, locked by another program, or not regular files, such as a folder or a pipe named like one; for a PGN file, its header index could not be built) |
+| `writable` | Whether the database takes writes now ([Writing games](#writing-games)): `true` for a `ready` PGN file without the read-only attribute, else `false`. A client offers writes only where it is `true`; a row without it comes from an older bridge, whose databases take none |
 | `records` | Games, guiding texts and analyses; present when `ready` |
 | `generation` | See above; present when `ready` |
 | `size` | The bytes of the database's files; present when `cloudOnly` or `downloading` |
@@ -425,7 +444,9 @@ of the same games answers, apart from what the format has otherwise:
   header index built for the file's current generation is used at once, also
   after the bridge restarts; a change to the file reads it again. A file whose
   header index cannot be built is `unreadable` for a minute, and the next
-  request tries again. A header index takes 48 bytes a game plus the names,
+  request tries again. A write of the bridge's own does not read the file
+  again: it makes the header index of the new file from the one before
+  ([Writing games](#writing-games)). A header index takes 48 bytes a game plus the names,
   among them the game's time control, which its `TimeControl` tag gives
   (#268, [search-grammar.md](search-grammar.md#time-control)).
   The `pgn` folder is swept as the `index` folder is (see "Storage" under
@@ -805,6 +826,93 @@ These types are `[%cbraw …]`, their data kept whole:
   whole, in hundredths of a second, not a clock per move. ChessBase's own
   export of them is not available to confirm what they mean, so they are not
   written as `[%clk]`.
+
+### Writing games
+
+A PGN file takes writes (#281): a game appended at its end, or one replaced
+or removed. Nothing else is ever written: ChessBase's own formats (`2cbh`,
+`cbh`) answer every write `409 read_only`, and so does a PGN file with the
+read-only attribute. A database row says whether it takes writes now with
+`writable` (see `GET /v1/databases`). The bridge writes only the file behind
+a listed `id`: it never takes a path from a request, and never makes, renames
+or removes a file of its own accord, but for its temporary file below.
+
+| Request | Does | Answer |
+|---|---|---|
+| `POST /v1/databases/{id}/games` | Appends the body's game at the end of the file | `201`, `{ "number": 13, "generation": "…" }`: the new game's number and the new generation |
+| `PUT /v1/databases/{id}/games/{number}` | Replaces game `number` with the body's game | `200`, `{ "number": 4, "generation": "…" }` |
+| `DELETE /v1/databases/{id}/games/{number}` | Removes game `number`; the games after it move up by one | `200`, `{ "generation": "…" }` |
+
+Every answer also carries the new generation as its `ETag`, quoted as an
+entity tag (`"0123456789abcdef"`).
+
+- **The body.** `POST` and `PUT` carry one game's PGN text, UTF-8, as
+  `Content-Type: application/x-chess-pgn`, at most 4 MiB, the oschess
+  Library's bound for PGN; a larger one is `413 body_too_large`. The bridge
+  reads it with its own PGN reader, as it reads a file ([PGN files](#pgn-files)),
+  and writes the game from its first tag (or move) to its end: blank lines and
+  text outside the game are not the game's. A body that is not UTF-8, holds no
+  game or more than one, or whose main line does not play is `400 bad_request`
+  with `parameter: "body"`. The main line plays when each of its moves is
+  legal from its `FEN` tag or the standard start; a null move ends it, as in
+  the position index. `DELETE` carries no body.
+- **The precondition.** Every write names the generation its client read in
+  `If-Match`, as the `ETag` gives it or bare. A write without one is
+  `428 precondition_required`. When the file's generation is another, because
+  ChessBase, another program, a sync client or another write changed it, the
+  answer is `409 generation_changed` and nothing is written. The client reads
+  the database again; the bridge never merges.
+- **Which databases.** Only a PGN file in state `ready` takes writes: one that
+  is not ready answers `409 database_unavailable` with its `state`, as a read
+  does. A `number` the file does not have is `404 not_found`.
+- **One at a time.** Writes into one file run one at a time: a write that
+  waits for another and names the generation before it is then
+  `409 generation_changed`.
+- **An append** writes after the file's last byte and leaves every earlier
+  byte as it was. A file whose last line has no line end gets one, and then an
+  empty line before the game unless the file ends with one already; the game
+  is followed by an empty line, as PGN's export format ends each game. An
+  empty file gets the game alone. When the write fails part-way, the file is
+  cut back to its former length.
+- **A replace or a removal** writes the whole new file beside the old one, as
+  `<name>.pgn.oschess-tmp` in the same folder, flushes it to the disk, and
+  renames it over the old one in one step: a crash leaves the old file or the
+  new one, never a mix. A temporary file a crash left is removed when the
+  bridge next lists the file. A replace puts the game in the place of the old
+  one's text, from its first tag to its end, and keeps the empty lines around
+  it. A removal takes the game and the empty lines after it, to the next game
+  or the end of the file.
+- **A file held elsewhere.** On Windows the bridge holds the file while it
+  reads and writes it, so that no other program writes it meanwhile. When
+  Windows refuses to open, write or replace the file because another program
+  holds it, as ChessBase holds a database it has open, the answer is
+  `409 file_busy` and nothing is written; the page then asks the user to close
+  the database in ChessBase. The bridge neither waits nor forces anything.
+  When the file system refuses for another reason, such as a full disk, the
+  answer is `500 write_failed`, and the file is as it was.
+- **Encoding and line ends follow the file.** The bridge writes in the
+  encoding it reads the file in: UTF-8 when all of the file is UTF-8, which a
+  file of pure ASCII is, otherwise the computer's ANSI code page, Windows-1252
+  where the bridge has no table for it ([PGN files](#pgn-files)). The rest of
+  the file is never encoded again. A game holding a character that the code
+  page cannot store is `422 unencodable`, with `character` naming the first,
+  and nothing is written. Line ends follow the file's first line end; a file
+  without one gets CRLF, as ChessBase writes on Windows.
+
+After a write:
+
+- **The generation** changes, and the answer carries the new one.
+- **The header index** of the new file is made from the one before: the
+  games ahead of the changed one keep their entries, the text is read again
+  from the game before it until the games are those of the old file again,
+  and the entries after it move. The database stays `ready` and is not read
+  again: the index is the one a reading of the whole file makes. A file whose
+  text a write leaves inside a comment that is never closed is read again
+  whole, within the write. A change made by another program still has the
+  file read again, in the background, as before.
+- **Sort orders, suggestions and the position index** follow the generation
+  ([Consistency](#consistency)): the position index is built again in the
+  background, as after any change.
 
 ### `GET /v1/databases/{id}/suggest`
 

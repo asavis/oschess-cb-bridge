@@ -64,6 +64,9 @@ pub struct Database {
     pub progress: Option<(u64, u64)>,
     /// Whether the database is on the list: one that left it is `missing`.
     pub listed: bool,
+    /// Whether it takes writes now: a ready PGN file without the read-only
+    /// attribute (`docs/api.md`, "Writing games").
+    pub writable: bool,
 }
 
 impl Database {
@@ -96,6 +99,7 @@ impl Database {
             size,
             progress,
             listed: entry.listed(),
+            writable: state == State::Ready && entry.writable_file(),
         }
     }
 }
@@ -286,6 +290,7 @@ mod tests {
             size: None,
             progress: None,
             listed: true,
+            writable: false,
         };
         assert_eq!(work_of(&[db(State::Ready), db(State::Missing)], false, false, false), []);
         assert_eq!(

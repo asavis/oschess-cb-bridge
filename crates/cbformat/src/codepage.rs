@@ -57,6 +57,21 @@ impl CodePage {
             Err(_) => self.decode(bytes),
         }
     }
+
+    /// `text` in this page, each character as the byte that
+    /// [`CodePage::char`] reads as it, so that [`CodePage::decode`] gives the
+    /// text back. The first character that no byte of the page reads as is
+    /// the error.
+    pub fn encode(self, text: &str) -> Result<Vec<u8>, char> {
+        let mut bytes: Vec<(char, u8)> = (0x80..=0xff).map(|b| (self.char(b), b)).collect();
+        bytes.sort_unstable();
+        text.chars()
+            .map(|c| match u8::try_from(c) {
+                Ok(b) if b < 0x80 => Ok(b),
+                _ => bytes.binary_search_by_key(&c, |&(c, _)| c).map(|i| bytes[i].1).map_err(|_| c),
+            })
+            .collect()
+    }
 }
 
 // The bytes 0x80-0xFF of each page, from the Unicode mapping tables of the
@@ -197,6 +212,21 @@ mod tests {
         assert_eq!(CodePage::new(1255).char(0xFF), '\u{ff}');
         // Above 0x9f, 1252 is Latin-1.
         assert!((0xA0..=0xFF).all(|b| CodePage::WESTERN.char(b) == char::from(b)));
+    }
+
+    /// Every byte of every page encodes back from the character it reads as,
+    /// and the first character that no byte reads as is named.
+    #[test]
+    fn text_encodes_to_the_bytes_it_reads_from() {
+        let all: Vec<u8> = (0..=0xff).collect();
+        for number in 1250..=1258 {
+            let page = CodePage::new(number);
+            assert_eq!(page.encode(&page.decode(&all)).as_deref(), Ok(&all[..]), "{number}");
+        }
+        assert_eq!(CodePage::new(1251).encode("Спасский"), Ok(vec![0xD1, 0xEF, 0xE0, 0xF1, 0xF1, 0xEA, 0xE8, 0xE9]));
+        assert_eq!(CodePage::WESTERN.encode("Ångström €"), Ok(b"\xc5ngstr\xf6m \x80".to_vec()));
+        assert_eq!(CodePage::WESTERN.encode("Tal, Михаил ♔"), Err('М'));
+        assert_eq!(CodePage::new(1251).encode("Таль ♔"), Err('♔'));
     }
 
     #[test]

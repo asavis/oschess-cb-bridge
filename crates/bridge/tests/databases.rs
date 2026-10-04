@@ -945,7 +945,7 @@ fn the_snapshot_shows_cloud_states() {
 /// The members of a database's row in `GET /v1/databases` past its id, name
 /// and format, as the contract writes them.
 fn row(d: &bridge::snapshot::Database) -> String {
-    let mut row = format!("\"state\":\"{}\"", d.state.name());
+    let mut row = format!("\"state\":\"{}\",\"writable\":{}", d.state.name(), d.writable);
     if let Some(records) = d.records {
         row += &format!(",\"records\":{records}");
     }

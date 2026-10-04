@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
-use crate::access::cors;
+use crate::access::{Verdict, cors, takes_body};
 use crate::api::{self, App};
-use crate::http::{Conn, LINGER, REQUEST_TIMEOUT, ReadError, Refusal, Response};
+use crate::http::{Conn, LINGER, MAX_BODY, REQUEST_TIMEOUT, ReadError, Refusal, Request, Response};
 use crate::reply::error;
 
 pub const MAX_CONNECTIONS: usize = 32;
@@ -155,12 +155,15 @@ fn handle_connection(stream: TcpStream, app: &App) -> Conn {
     let mut conn = Conn::new(stream).idle(app.idle_timeout);
     loop {
         let (mut response, keep_alive): (Response, bool) = match conn.read_request() {
-            Ok(req) => (api::handle(app, &req), req.keep_alive),
+            Ok(mut req) => match answer(app, &mut conn, &mut req) {
+                Some(answer) => answer,
+                None => return conn,
+            },
             Err(Refusal { error: ReadError::Closed | ReadError::Dropped, .. }) => return conn,
             Err(Refusal { error: refused, origin }) => {
                 let response = match refused {
                     ReadError::TooLarge => error(431, "headers_too_large", "Request line and headers exceed 16 KiB"),
-                    ReadError::Body => error(413, "body_not_allowed", "Requests carry no body"),
+                    ReadError::Body => error(413, "body_not_allowed", "A body is sent with Content-Length"),
                     ReadError::Malformed(what) => error(400, "bad_request", &format!("Malformed request: {what}")),
                     ReadError::Closed | ReadError::Dropped => return conn,
                 };
@@ -176,6 +179,32 @@ fn handle_connection(stream: TcpStream, app: &App) -> Conn {
             return conn;
         }
     }
+}
+
+/// The answer to `req`, and whether the connection may serve another
+/// request after it: the policy's verdict first, then the body, read when the
+/// request may carry one. `None` when the body did not arrive in time. A
+/// request refused with its body unread ends the connection, which reads and
+/// drops the body as it closes.
+fn answer(app: &App, conn: &mut Conn, req: &mut Request) -> Option<(Response, bool)> {
+    let origin = match api::admit(app, req) {
+        Verdict::Answer(response) => return Some((response, req.keep_alive && req.body_len == 0)),
+        Verdict::Serve { origin } => origin,
+    };
+    if req.body_len > 0 {
+        let refusal = if !takes_body(req) {
+            Some(error(413, "body_not_allowed", "This request carries no body"))
+        } else if req.body_len > MAX_BODY {
+            Some(error(413, "body_too_large", "The body is over 4 MiB"))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return Some((cors(refusal, origin.as_deref()), false));
+        }
+        req.body = conn.read_body(req.body_len as usize).ok()?;
+    }
+    Some((api::serve(app, req, origin.as_deref()), req.keep_alive))
 }
 
 #[cfg(test)]

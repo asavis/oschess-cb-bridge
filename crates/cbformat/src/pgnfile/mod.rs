@@ -28,6 +28,7 @@
 //! length (4) of its UTF-8 text in the index file: every player, then each
 //! tournament's title and place, then every annotator. The texts follow.
 
+pub mod edit;
 pub mod lex;
 pub mod line;
 pub mod scan;
@@ -303,6 +304,16 @@ struct Building {
 }
 
 impl Building {
+    fn new(page: CodePage) -> Building {
+        Building {
+            page,
+            players: Names::default(),
+            tournaments: Names::default(),
+            annotators: Names::default(),
+            held: 0,
+        }
+    }
+
     /// A tag's value as a name, in the game's encoding: UTF-8 when all of the
     /// game is, as [`Database::text`] reads it, else the code page.
     fn text(&self, game: &Game, tag: Tag) -> String {
@@ -393,14 +404,19 @@ pub fn partial_path(index: &Path) -> PathBuf {
 /// error when it answers `false`. Returns the number of games.
 pub fn build(pgn: &Path, index: &Path, stamp: u64, page: CodePage, read: &mut dyn FnMut(u64) -> bool) -> Result<u32> {
     let partial = partial_path(index);
-    let result = write_index(pgn, &partial, stamp, page, read);
-    match result {
-        Ok(games) => {
-            std::fs::rename(&partial, index).map_err(io(index))?;
-            Ok(games)
+    publish(&partial, index, write_index(pgn, &partial, stamp, page, read))
+}
+
+/// Puts the index `written` to `partial` in the place of `index`, or removes
+/// what was written when it failed.
+fn publish<T>(partial: &Path, index: &Path, written: Result<T>) -> Result<T> {
+    match written {
+        Ok(done) => {
+            std::fs::rename(partial, index).map_err(io(index))?;
+            Ok(done)
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&partial);
+            let _ = std::fs::remove_file(partial);
             Err(e)
         }
     }
@@ -417,29 +433,45 @@ fn write_index(
     read: &mut dyn FnMut(u64) -> bool,
 ) -> Result<u32> {
     let file = File::open(pgn).map_err(io(pgn))?;
+    let mut out = start_index(out_path)?;
+    let mut building = Building::new(page);
+    let (games, total) = read_games(pgn, file, &mut building, &mut out, out_path, read)?;
+    finish_index(&building, games, total, stamp, out, out_path)?;
+    Ok(games)
+}
+
+/// An index file begun at `out_path`: zeros in the place of its header.
+fn start_index(out_path: &Path) -> Result<BufWriter<File>> {
     let mut out = BufWriter::with_capacity(CHUNK, File::create(out_path).map_err(io(out_path))?);
     out.write_all(&[0; HEADER_SIZE as usize]).map_err(io(out_path))?;
-    let mut building = Building {
-        page,
-        players: Names::default(),
-        tournaments: Names::default(),
-        annotators: Names::default(),
-        held: 0,
-    };
-    let (games, total) = read_games(pgn, file, &mut building, &mut out, out_path, read)?;
+    Ok(out)
+}
+
+/// Ends the index `out`, the file `out_path`, whose `games` records are
+/// written: the name table of `building` after them, then the header, over
+/// the zeros written first in its place, for the PGN file of `total` bytes
+/// and `stamp`.
+fn finish_index(
+    building: &Building,
+    games: u32,
+    total: u64,
+    stamp: u64,
+    mut out: BufWriter<File>,
+    out_path: &Path,
+) -> Result<()> {
     let names_at = HEADER_SIZE + u64::from(games) * RECORD_SIZE as u64;
-    write_names(&building, names_at, &mut out, out_path)?;
+    write_names(building, names_at, &mut out, out_path)?;
     let counts = [
         building.players.list.len() as u32,
         building.tournaments.list.len() as u32,
         building.annotators.list.len() as u32,
     ];
-    let header = header(stamp, total, games, counts, names_at, page);
+    let header = header(stamp, total, games, counts, names_at, building.page);
     let mut file = out.into_inner().map_err(|e| Error::Io(out_path.to_path_buf(), e.into_error()))?;
     file.seek(SeekFrom::Start(0)).map_err(io(out_path))?;
     file.write_all(&header).map_err(io(out_path))?;
     file.sync_all().map_err(io(out_path))?;
-    Ok(games)
+    Ok(())
 }
 
 /// Reads the games of `file`, the PGN file `pgn`, keeping their names in

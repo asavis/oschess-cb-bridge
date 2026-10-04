@@ -343,6 +343,7 @@ mod tests {
                 size: None,
                 progress: None,
                 listed: true,
+                writable: false,
             }],
             served: true,
             ..testing::snapshot()
