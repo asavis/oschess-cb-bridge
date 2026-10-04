@@ -10,12 +10,13 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tauri::plugin::TauriPlugin;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_updater::UpdaterExt;
 
 use super::notices::notify;
 use super::server::Shared;
 use super::shared;
+use crate::updates::{Phase, Progress};
 use crate::{prefs, updates};
 
 const FIRST_LOOK: Duration = Duration::from_secs(60);
@@ -23,8 +24,16 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// How often a downloaded update asks again whether the bridge is idle.
 const IDLE_POLL: Duration = Duration::from_secs(30);
 
-/// One look or install at a time; a look on request waits for a running one.
-static GATE: updates::Gate = updates::Gate::new();
+/// The running job and its last result, also available to reopened windows.
+static PROGRESS: updates::Monitor = updates::Monitor::new();
+
+pub fn progress() -> Progress {
+    PROGRESS.snapshot()
+}
+
+pub(super) fn report(app: &AppHandle, phase: Phase, version: Option<String>) {
+    let _ = app.emit("update-progress", PROGRESS.report(phase, version));
+}
 
 /// When this process started looking for updates, at the app's start.
 static STARTED: OnceLock<Instant> = OnceLock::new();
@@ -56,6 +65,7 @@ pub fn start(app: &AppHandle) {
     let shared = shared(app);
     if let Some(version) = shared.dir().ok().and_then(|dir| updates::updated(&dir, env!("CARGO_PKG_VERSION"))) {
         bridge::log!("update: this start runs {version}, newly installed");
+        report(app, Phase::Updated, Some(version.clone()));
         let title = shared.strings.fill("toast.updated.title", &[("version", &version)]);
         notify(app, title, shared.strings.get("toast.updated.body"));
     }
@@ -66,7 +76,10 @@ pub fn start(app: &AppHandle) {
     let spawned = std::thread::Builder::new().name("updates".into()).spawn(move || {
         std::thread::sleep(FIRST_LOOK);
         loop {
-            if shared.dir().is_ok_and(|dir| prefs::load(&dir).auto_update) {
+            if shared.dir().is_ok_and(|dir| prefs::load(&dir).auto_update)
+                && let Some(progress) = PROGRESS.begin()
+            {
+                let _ = app.emit("update-progress", progress);
                 look(&app, false);
             }
             std::thread::sleep(EVERY);
@@ -79,26 +92,36 @@ pub fn start(app: &AppHandle) {
 
 /// Looks for an update on request, on a thread of its own: the menu and the
 /// commands run on the event loop's thread.
-pub fn look_now(app: &AppHandle) {
+pub fn look_now(app: &AppHandle) -> Progress {
     if !enabled(app) {
-        return;
+        return progress();
     }
-    let app = app.clone();
-    let _ = std::thread::Builder::new().name("update-now".into()).spawn(move || look(&app, true));
+    let Some(started) = PROGRESS.begin() else { return progress() };
+    let _ = app.emit("update-progress", &started);
+    let worker_app = app.clone();
+    if let Err(e) = std::thread::Builder::new().name("update-now".into()).spawn(move || look(&worker_app, true)) {
+        bridge::log!("update: no worker thread: {e}");
+        report(app, Phase::Failed, None);
+    }
+    progress()
 }
 
-/// Looks for a newer version and installs it. `asked`: the user asked, so the
-/// outcome is told whatever it is, after any look already running; otherwise
-/// only the new start speaks, and a look already running makes this one skip.
+/// Completes the job already reserved by its caller. Every exit records a
+/// terminal result before another request can reserve a job.
 fn look(app: &AppHandle, asked: bool) {
-    let Some(running) = GATE.enter(asked) else { return };
-    let outcome = look_and_install(app, asked);
-    drop(running);
-    if let Err(e) = outcome {
-        bridge::log!("update: {e}");
-        if asked {
-            let strings = &shared(app).strings;
-            notify(app, strings.get("toast.update.failed.title").to_string(), strings.get("toast.update.failed.body"));
+    match look_and_install(app, asked) {
+        Ok(phase) => report(app, phase, progress().version),
+        Err(e) => {
+            bridge::log!("update: {e}");
+            report(app, Phase::Failed, progress().version);
+            if asked {
+                let strings = &shared(app).strings;
+                notify(
+                    app,
+                    strings.get("toast.update.failed.title").to_string(),
+                    strings.get("toast.update.failed.body"),
+                );
+            }
         }
     }
 }
@@ -106,7 +129,7 @@ fn look(app: &AppHandle, asked: bool) {
 /// On success the installer runs and this process exits, so this returns
 /// only when there was nothing to install or something failed. [`look`] logs
 /// the error as it is, so no error of this crate's own names a path.
-fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
+fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
     if super::channel().is_store() {
         return super::store_updates::look_and_install(app, asked);
     }
@@ -117,12 +140,17 @@ fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
         if asked {
             notify_latest(app);
         }
-        return Ok(());
+        return Ok(Phase::Current);
     };
     // The download checks the signature; an installer the key did not sign
     // never runs.
+    report(app, Phase::Downloading, Some(update.version.clone()));
     let bytes = tauri::async_runtime::block_on(update.download(|_, _| {}, || {})).map_err(|e| e.to_string())?;
+    if !updates::idle(&shared.view(), super::commands::installing()) {
+        report(app, Phase::WaitingIdle, Some(update.version.clone()));
+    }
     wait_idle(&shared);
+    report(app, Phase::Installing, Some(update.version.clone()));
     if asked {
         notify(app, strings.fill("toast.update.installing", &[("version", &update.version)]), "");
     }
@@ -130,7 +158,7 @@ fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
     updates::note(&dir, &update.version)?;
     let installed = update.install(bytes);
     updates::forget(&dir);
-    installed.map_err(|e| e.to_string())
+    installed.map(|()| Phase::RestartRequired).map_err(|e| e.to_string())
 }
 
 /// Waits until an install would lose no work (`updates::idle`).

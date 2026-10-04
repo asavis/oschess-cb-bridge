@@ -82,6 +82,7 @@ pub fn run() {
             commands::set_port,
             commands::open_pairing,
             commands::check_updates,
+            commands::update_progress,
         ])
         // The plugins set up first, so a second start has handed over and
         // exited before this one touches the port.

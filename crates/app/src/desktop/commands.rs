@@ -260,10 +260,15 @@ pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     settings_view(&app)
 }
 
-/// Looks for an update now; the outcome comes as a notification.
+/// Starts a check or returns the existing job; its result stays available.
 #[tauri::command]
-pub fn check_updates(app: AppHandle) {
-    updater::look_now(&app);
+pub fn check_updates(app: AppHandle) -> crate::updates::Progress {
+    updater::look_now(&app)
+}
+
+#[tauri::command]
+pub fn update_progress() -> crate::updates::Progress {
+    updater::progress()
 }
 
 #[tauri::command]

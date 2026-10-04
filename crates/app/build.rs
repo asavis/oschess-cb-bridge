@@ -22,6 +22,7 @@ const COMMANDS: &[&str] = &[
     "set_autostart",
     "set_auto_update",
     "check_updates",
+    "update_progress",
     "pairing_code",
     "copy_code",
     "new_code",

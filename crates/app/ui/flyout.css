@@ -5,6 +5,7 @@ body { background: #f9f9f9; overflow: hidden; }
 .head { display: flex; align-items: center; gap: 12px; padding: 16px 12px 12px 16px; }
 .head .tile { width: 36px; height: 36px; }
 .title { font-size: 15px; font-weight: 600; }
+.version { font-weight: 400; white-space: nowrap; }
 .status { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
 .dot { width: 8px; height: 8px; border-radius: 4px; display: inline-block; background: var(--ok); }
 .dot.attention { background: var(--attention); }
