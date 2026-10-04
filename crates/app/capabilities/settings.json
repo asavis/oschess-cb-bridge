@@ -18,6 +18,7 @@
     "allow-set-autostart",
     "allow-set-auto-update",
     "allow-check-updates",
+    "allow-update-progress",
     "allow-pairing-code",
     "allow-copy-code",
     "allow-new-code",

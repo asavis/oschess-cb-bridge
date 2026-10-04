@@ -4,6 +4,8 @@
 
 let current = null;
 let engines = null;
+let updateProgress = null;
+let checkPending = false;
 
 async function main() {
   await loadWords();
@@ -20,7 +22,9 @@ async function main() {
   on('section', show);
   renderServed(await call('view'));
   on('view', renderServed);
+  await on('update-progress', renderUpdateProgress);
   renderSettings(await call('settings'));
+  renderUpdateProgress(await call('update_progress'));
   act(call('engines').then(renderEngines));
 }
 
@@ -54,7 +58,7 @@ function renderSettings(settings) {
   document.getElementById('version-hint').textContent = settings.store
     ? t('settings.versionRow.store')
     : settings.updates ? t('settings.versionRow.hint') : t('settings.versionRow.off');
-  document.getElementById('check-updates').disabled = !settings.updates;
+  renderUpdateStatus();
   document.getElementById('port-title').textContent = t('settings.port.title', { port: settings.port });
   toggle('autostart', settings.autostart);
   // Only Windows' Startup apps settings turn back on what the user turned off there.
@@ -67,6 +71,50 @@ function renderSettings(settings) {
   });
   if (!rows.length) rows.push(el('div', 'row empty-row', t('settings.folders.none')));
   document.getElementById('folders').replaceChildren(...rows);
+}
+
+// Keep events received during initialization or before a command's reply;
+// older snapshots must never replace a newer result.
+function renderUpdateProgress(progress) {
+  if (updateProgress && progress.revision < updateProgress.revision) return;
+  updateProgress = progress;
+  renderUpdateStatus();
+}
+
+function renderUpdateStatus() {
+  if (!current) return;
+  const progress = updateProgress;
+  const button = document.getElementById('check-updates');
+  button.disabled = !current.updates || checkPending || !!progress?.busy;
+  button.textContent = t(progress?.busy || checkPending ? 'updates.busy' : 'settings.versionRow.check');
+  const node = document.getElementById('update-status');
+  const phase = checkPending && !progress?.busy ? 'checking' : progress?.phase ?? 'idle';
+  node.hidden = phase === 'idle';
+  if (node.hidden) return;
+  const channel = current.store ? 'store' : 'direct';
+  const key = phase === 'checking' || phase === 'current' ? `updates.${phase}.${channel}` : `updates.${phase}`;
+  const text = t(key, { version: progress?.version ?? current.version });
+  node.className = phase === 'failed' ? 'failed' : '';
+  const busy = checkPending || !!progress?.busy;
+  node.replaceChildren(icon(busy ? 'spin' : phase === 'failed' ? 'alert' : 'info'), el('span', null, text));
+}
+
+async function checkUpdates() {
+  if (checkPending || updateProgress?.busy) return;
+  checkPending = true;
+  renderUpdateStatus();
+  try {
+    renderUpdateProgress(await call('check_updates'));
+  } catch (error) {
+    notice(failure(error));
+    // An IPC failure must not overwrite a job already confirmed by an event.
+    if (!updateProgress?.busy) {
+      renderUpdateProgress({ revision: updateProgress?.revision ?? 0, phase: 'failed', busy: false });
+    }
+  } finally {
+    checkPending = false;
+    renderUpdateStatus();
+  }
 }
 
 // The engines found, one of them chosen; an engine chosen by its file comes first.
@@ -205,9 +253,7 @@ function wire() {
     })));
   document.getElementById('auto-update').addEventListener('click', () =>
     act(call('set_auto_update', { on: !current.autoUpdate }).then(renderSettings)));
-  // The outcome comes as a Windows notification.
-  document.getElementById('check-updates').addEventListener('click', () =>
-    act(call('check_updates').then(() => notice(t('settings.versionRow.checking')))));
+  document.getElementById('check-updates').addEventListener('click', checkUpdates);
 
   document.getElementById('show-code').addEventListener('click', () =>
     revealCode(document.getElementById('code-line').hidden));

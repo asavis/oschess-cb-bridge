@@ -25,9 +25,10 @@ use windows::core::{AgileReference, Interface, PCWSTR};
 
 use super::server::Shared;
 use super::shared;
+use super::updater::report;
 use super::windows::FLYOUT;
 use crate::channel::STORE_PAGE;
-use crate::updates::{self, StoreCalls, StoreOutcome, StoreStep};
+use crate::updates::{self, Phase, StoreCalls, StoreOutcome, StoreStep};
 
 /// What automatic looks told this run: `Some(false)` that an update waits,
 /// `Some(true)` that one is required. A notice is repeated only when it says
@@ -48,8 +49,19 @@ fn register_restart() -> Result<(), String> {
 
 /// Waits until a Store install would lose no work and Windows would start the
 /// bridge again after it (`updates::store_ready`).
-fn wait_ready(shared: &Shared) {
-    while !updates::store_ready(&shared.view(), super::commands::installing(), super::updater::alive()) {
+fn wait_ready(app: &AppHandle, shared: &Shared) {
+    let mut shown = None;
+    loop {
+        let view = shared.view();
+        let installing = super::commands::installing();
+        if updates::store_ready(&view, installing, super::updater::alive()) {
+            break;
+        }
+        let phase = if updates::idle(&view, installing) { Phase::WaitingRestart } else { Phase::WaitingIdle };
+        if shown != Some(phase) {
+            report(app, phase, None);
+            shown = Some(phase);
+        }
         std::thread::sleep(READY_POLL);
     }
 }
@@ -58,7 +70,7 @@ fn wait_ready(shared: &Shared) {
 /// asked. An install closes the bridge, so this returns only when there was
 /// nothing to install, the user declined one of Windows' dialogs, the Store
 /// page opened, the user was told, or something failed.
-pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
+pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
     let context = StoreContext::GetDefault().map_err(text)?;
     // A desktop app's Store context needs a window to own anything it shows,
     // Windows' update dialog included; the flyout always exists, hidden until
@@ -78,7 +90,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
             if asked {
                 super::updater::notify_latest(app);
             }
-            Ok(())
+            Ok(Phase::Current)
         }
         StoreStep::RequestInstall => {
             // Microsoft requires the requests, which show Windows' dialogs, to
@@ -89,6 +101,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 // `install`: download if needed, then install; otherwise
                 // download only. Each asks the user first.
                 let request = |install: bool| {
+                    report(app, if install { Phase::Installing } else { Phase::AwaitingConsent }, None);
                     let (context, agile) = (context.clone(), agile.clone());
                     let operation = updates::run_on(
                         |job| app.run_on_main_thread(job).map_err(|e| e.to_string()),
@@ -113,16 +126,16 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 let store = StoreCalls { download: || request(false), register_restart, install: || request(true) };
                 shared.dir().and_then(|dir| {
                     updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || {
-                        wait_ready(&shared);
+                        wait_ready(app, &shared);
                         bridge::log!("update: installing over {} through Windows' dialog", env!("CARGO_PKG_VERSION"));
                     })
                 })
             });
             // The Store page stays the way to update when Windows could not
             // ask the user itself.
-            requested.or_else(|e| {
+            requested.map(StoreOutcome::phase).or_else(|e| {
                 bridge::log!("update: {e}; opening the Store page");
-                app.opener().open_url(STORE_PAGE, None::<&str>).map_err(|e| e.to_string())
+                app.opener().open_url(STORE_PAGE, None::<&str>).map(|()| Phase::StoreOpened).map_err(|e| e.to_string())
             })
         }
         StoreStep::Tell { mandatory } => {
@@ -136,7 +149,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 super::notices::notify(app, title.to_string(), strings.get("toast.update.waiting.body"));
                 *told = Some(mandatory);
             }
-            Ok(())
+            Ok(if mandatory { Phase::Required } else { Phase::Available })
         }
         StoreStep::InstallQuietly => {
             let dir = shared.dir()?;
@@ -150,6 +163,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
             };
             let store = StoreCalls {
                 download: || {
+                    report(app, Phase::Downloading, None);
                     completed(
                         context
                             .TrySilentDownloadStorePackageUpdatesAsync(&found)
@@ -159,6 +173,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 },
                 register_restart,
                 install: || {
+                    report(app, Phase::Installing, None);
                     completed(
                         context
                             .TrySilentDownloadAndInstallStorePackageUpdatesAsync(&found)
@@ -168,12 +183,13 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<(), String> {
                 },
             };
             updates::install_store_update(&store, &dir, env!("CARGO_PKG_VERSION"), || {
-                wait_ready(&shared);
+                wait_ready(app, &shared);
                 bridge::log!("update: installing over {} silently", env!("CARGO_PKG_VERSION"));
                 if asked {
                     super::notices::notify(app, strings.get("toast.update.installing.store").to_string(), "");
                 }
             })
+            .map(StoreOutcome::phase)
         }
     }
 }

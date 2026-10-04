@@ -128,7 +128,10 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
                 windows::open_settings(app, "general");
             }
         }
-        "update" => updater::look_now(app),
+        "update" => {
+            updater::look_now(app);
+            windows::open_settings(app, "general");
+        }
         "quit" => app.exit(0),
         _ => {}
     }

@@ -11,7 +11,9 @@
 //! [docs/release.md]: https://github.com/asavis/oschess-cb-bridge/blob/main/docs/release.md
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::Mutex;
+
+use serde::Serialize;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -59,33 +61,98 @@ fn is_public_key(key: &str) -> bool {
         && minisign_verify::PublicKey::decode(&text).is_ok()
 }
 
-/// One look for updates at a time. An automatic look skips while another
-/// runs; a look on request waits for the running one and then looks itself,
-/// so the user always hears the outcome of the look they asked for.
-pub struct Gate(Mutex<()>);
+/// Progress shared by manual and automatic checks, retained until the next
+/// check so a reopened window can show the result without a Windows toast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Phase {
+    Idle,
+    Checking,
+    Downloading,
+    AwaitingConsent,
+    WaitingIdle,
+    WaitingRestart,
+    Installing,
+    Current,
+    Available,
+    Required,
+    Declined,
+    StoreOpened,
+    RestartRequired,
+    Updated,
+    Failed,
+}
 
-impl Default for Gate {
-    fn default() -> Gate {
-        Gate::new()
+impl Phase {
+    pub fn busy(self) -> bool {
+        matches!(
+            self,
+            Self::Checking
+                | Self::Downloading
+                | Self::AwaitingConsent
+                | Self::WaitingIdle
+                | Self::WaitingRestart
+                | Self::Installing
+        )
     }
 }
 
-impl Gate {
-    pub const fn new() -> Gate {
-        Gate(Mutex::new(()))
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    /// Events and command replies can arrive out of order in a window.
+    pub revision: u64,
+    pub phase: Phase,
+    pub busy: bool,
+    /// Only the direct updater knows the offered version. Never mistake the
+    /// Store's installed-package version for the version being downloaded.
+    pub version: Option<String>,
+}
+
+/// Starting a job reserves it before its thread is spawned. Repeated clicks
+/// and automatic checks share that job instead of queuing more threads.
+pub struct Monitor(Mutex<Progress>);
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Monitor {
+    pub const fn new() -> Self {
+        Self(Mutex::new(Progress { revision: 0, phase: Phase::Idle, busy: false, version: None }))
     }
 
-    /// Enters the gate for a look, `asked` or automatic; `None` when an
-    /// automatic look should skip. The look runs while the guard lives.
-    pub fn enter(&self, asked: bool) -> Option<MutexGuard<'_, ()>> {
-        if asked {
-            return Some(self.0.lock().unwrap_or_else(PoisonError::into_inner));
+    pub fn snapshot(&self) -> Progress {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn begin(&self) -> Option<Progress> {
+        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if progress.busy {
+            return None;
         }
-        match self.0.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::WouldBlock) => None,
-            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
-        }
+        *progress = Progress { revision: progress.revision + 1, phase: Phase::Checking, busy: true, version: None };
+        Some(progress.clone())
+    }
+
+    /// Runs a reserved job and ends it even if an updater dependency panics.
+    /// The snapshot becomes terminal before another caller can begin a job.
+    pub fn finish(&self, job: impl FnOnce() -> Result<Phase, String>) -> (Progress, Option<String>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+            .unwrap_or_else(|_| Err("the update task stopped unexpectedly".into()));
+        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        progress.revision += 1;
+        progress.phase = outcome.as_ref().copied().unwrap_or(Phase::Failed);
+        progress.busy = progress.phase.busy();
+        (progress.clone(), outcome.err())
+    }
+
+    pub fn report(&self, phase: Phase, version: Option<String>) -> Progress {
+        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *progress = Progress { revision: progress.revision + 1, phase, busy: phase.busy(), version };
+        progress.clone()
     }
 }
 
@@ -142,6 +209,16 @@ pub enum StoreOutcome {
     Incomplete,
 }
 
+impl StoreOutcome {
+    pub fn phase(self) -> Phase {
+        match self {
+            Self::Declined => Phase::Declined,
+            Self::Completed => Phase::RestartRequired,
+            Self::Incomplete => Phase::Failed,
+        }
+    }
+}
+
 /// What installing a Store update needs from Windows, so that its order is
 /// tested without Windows (#153).
 pub trait StoreInstall {
@@ -186,16 +263,17 @@ where
 /// where it started from in `dir`, asks for the restart and installs. A
 /// process still running after the install forgets the note. `Ok` when the
 /// install reported completion or the user declined the download or the
-/// install; the error says why it did not take place otherwise.
+/// install, preserving which outcome occurred for the UI; an error says why
+/// it did not take place otherwise.
 pub fn install_store_update(
     store: &impl StoreInstall,
     dir: &Path,
     running: &str,
     wait_ready: impl FnOnce(),
-) -> Result<(), String> {
+) -> Result<StoreOutcome, String> {
     match store.download()? {
         StoreOutcome::Completed => {}
-        StoreOutcome::Declined => return Ok(()),
+        StoreOutcome::Declined => return Ok(StoreOutcome::Declined),
         StoreOutcome::Incomplete => return Err("the Store download did not complete".into()),
     }
     wait_ready();
@@ -204,7 +282,7 @@ pub fn install_store_update(
     let installed = store.install();
     forget(dir);
     match installed? {
-        StoreOutcome::Completed | StoreOutcome::Declined => Ok(()),
+        outcome @ (StoreOutcome::Completed | StoreOutcome::Declined) => Ok(outcome),
         StoreOutcome::Incomplete => Err("the Store install did not complete".into()),
     }
 }
@@ -374,22 +452,99 @@ mod tests {
     }
 
     #[test]
-    fn a_look_on_request_waits_and_an_automatic_one_skips() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-        static GATE: Gate = Gate::new();
-        let running = GATE.enter(false).expect("the first look enters");
-        assert!(GATE.enter(false).is_none(), "an automatic look skips while one runs");
-        let (tx, rx) = mpsc::channel();
-        let asked = std::thread::spawn(move || {
-            let _look = GATE.enter(true).expect("a look on request always runs");
-            tx.send(()).unwrap();
+    fn overlapping_requests_share_the_job_and_reopening_keeps_its_result() {
+        use std::sync::{Arc, Barrier};
+        let monitor = Arc::new(Monitor::new());
+        let barrier = Arc::new(Barrier::new(8));
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let (monitor, barrier) = (Arc::clone(&monitor), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    monitor.begin().is_some()
+                })
+            })
+            .collect();
+        assert_eq!(jobs.into_iter().filter_map(|j| j.join().unwrap().then_some(())).count(), 1);
+        assert_eq!(monitor.snapshot().phase, Phase::Checking);
+        let downloading = monitor.report(Phase::Downloading, Some("1.5.0".into()));
+        assert!(monitor.begin().is_none());
+        let failure = monitor.report(Phase::Failed, None);
+        assert!(failure.revision > downloading.revision);
+        assert!(!failure.busy);
+        assert_eq!(monitor.snapshot().phase, Phase::Failed);
+        assert_eq!(monitor.snapshot().revision, failure.revision);
+        let retry = monitor.begin().unwrap();
+        assert!(retry.revision > failure.revision);
+        assert!(retry.version.is_none());
+        monitor.report(Phase::Current, None);
+        assert!(monitor.begin().is_some());
+    }
+
+    #[test]
+    fn a_panicking_update_releases_the_job_and_retains_a_failure() {
+        let monitor = Monitor::new();
+        monitor.begin().unwrap();
+        let (failed, error) = monitor.finish(|| {
+            monitor.report(Phase::Downloading, Some("1.5.0".into()));
+            panic!("an updater dependency panicked");
         });
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "it waits for the running look");
-        drop(running);
-        rx.recv_timeout(crate::PATIENCE).expect("then it runs");
-        asked.join().unwrap();
-        assert!(GATE.enter(false).is_some(), "and the gate is free again");
+        assert_eq!(error.as_deref(), Some("the update task stopped unexpectedly"));
+        assert_eq!(failed.phase, Phase::Failed);
+        assert!(!failed.busy);
+        assert_eq!(failed.version.as_deref(), Some("1.5.0"));
+        assert_eq!(monitor.snapshot().revision, failed.revision);
+        assert_eq!(monitor.snapshot().phase, Phase::Failed);
+        // Both a manual retry and the next automatic check use this path.
+        monitor.begin().expect("the failed job no longer owns the updater");
+        let (current, error) = monitor.finish(|| Ok(Phase::Current));
+        assert_eq!(current.phase, Phase::Current);
+        assert!(!current.busy);
+        assert!(error.is_none());
+        monitor.begin().unwrap();
+        let (failed, error) = monitor.finish(|| Err("connection failed".into()));
+        assert_eq!(failed.phase, Phase::Failed);
+        assert!(!failed.busy);
+        assert_eq!(error.as_deref(), Some("connection failed"));
+        assert!(monitor.begin().is_some());
+    }
+
+    #[test]
+    fn store_results_distinguish_cancellation_from_a_completed_request() {
+        assert_eq!(StoreOutcome::Declined.phase(), Phase::Declined);
+        assert_eq!(StoreOutcome::Completed.phase(), Phase::RestartRequired);
+        assert_eq!(StoreOutcome::Incomplete.phase(), Phase::Failed);
+    }
+
+    #[test]
+    fn only_active_update_stages_block_another_check() {
+        for phase in [
+            Phase::Checking,
+            Phase::Downloading,
+            Phase::AwaitingConsent,
+            Phase::WaitingIdle,
+            Phase::WaitingRestart,
+            Phase::Installing,
+        ] {
+            let monitor = Monitor::new();
+            monitor.report(phase, None);
+            assert!(monitor.begin().is_none(), "{phase:?}");
+        }
+        for phase in [
+            Phase::Idle,
+            Phase::Current,
+            Phase::Available,
+            Phase::Required,
+            Phase::Declined,
+            Phase::StoreOpened,
+            Phase::RestartRequired,
+            Phase::Updated,
+            Phase::Failed,
+        ] {
+            let monitor = Monitor::new();
+            monitor.report(phase, None);
+            assert!(monitor.begin().is_some(), "{phase:?}");
+        }
     }
 
     #[test]
@@ -609,8 +764,8 @@ mod tests {
         let failed = "0x80070578".to_string();
 
         for (installed, result) in [
-            (Ok(Completed), Ok(())),
-            (Ok(Declined), Ok(())),
+            (Ok(Completed), Ok(Completed)),
+            (Ok(Declined), Ok(Declined)),
             (Ok(Incomplete), Err("the Store install did not complete".to_string())),
             (Err(failed.clone()), Err(failed.clone())),
         ] {
@@ -621,7 +776,7 @@ mod tests {
 
         note_from(&dir, "1.0.0").unwrap();
         for (downloaded, result) in [
-            (Ok(Declined), Ok(())),
+            (Ok(Declined), Ok(Declined)),
             (Ok(Incomplete), Err("the Store download did not complete".to_string())),
             (Err(failed.clone()), Err(failed.clone())),
         ] {

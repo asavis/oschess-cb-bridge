@@ -18,6 +18,7 @@ async function main() {
 }
 
 function render(view) {
+  document.getElementById('version').textContent = view.version;
   const downloading = view.databases.filter((d) => d.state === 'downloading').length;
   // The tray mark's colour, decided by the app.
   document.getElementById('dot').className = `dot${view.mark === 'ready' ? '' : ` ${view.mark}`}`;

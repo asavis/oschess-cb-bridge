@@ -246,11 +246,16 @@ oschess page on this computer.
 the colour of the bridge's state: the taskbar's own colour when the databases
 are ready; amber while one opens or downloads, or when one cannot be opened or
 is not found; red when the bridge cannot serve at all, such as with its port
-in use. The tooltip says which. A click opens a flyout with the state and the
-databases, and the right-click menu opens oschess, the settings (extra database
-folders, the port, the pairing code, starting with Windows, updates), checks
-for updates or quits. The
-windows are plain HTML, CSS and JavaScript in `crates/app/ui`, in Ukrainian or
+in use. The tooltip says which. A click opens a flyout with the running
+version, state and databases, and the right-click menu opens oschess, the
+settings (extra database folders, the port, the pairing code, starting with Windows, updates), checks
+for updates or quits. Checking from the menu opens General settings, where
+the progress and last result stay visible even when Windows notifications are
+off. Closing and reopening Settings keeps that result; repeated clicks share
+a check already in progress. The result distinguishes no update offered by the
+current channel, cancellation, failure and the Store fallback. Downloads and
+installs show their stage, including waiting for the bridge to be safe to restart.
+The windows are plain HTML, CSS and JavaScript in `crates/app/ui`, in Ukrainian or
 English after the Windows display language; `crates/app/icons/generate.py`
 draws the tray marks and the app icon from the logo.
 
