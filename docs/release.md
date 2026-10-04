@@ -2,8 +2,8 @@
 
 A release of the Windows app is made by
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) from a
-version tag. It leaves a **draft** release; nobody gets it until the owner
-publishes the draft.
+collaborator dispatch on `main`. It assigns the version automatically and
+leaves a **draft** release; nobody gets it until the owner publishes the draft.
 
 | File | What it is |
 |---|---|
@@ -15,13 +15,14 @@ publishes the draft.
 
 The workflow runs on GitHub's hosted Windows runners, the one exception to the
 own-runners rule in [CLAUDE.md](../CLAUDE.md), because SignPath requires every
-job before a signing request to run there. Only a version tag starts it. Its
-jobs, in order:
+job before a signing request to run there. Only a collaborator dispatch on
+`main` starts it. Its jobs, in order:
 
-1. **build**: checks that the tag is on `main`, that the `ci` workflow's run
-   for the tagged commit passed, that the tag names the version in
-   `crates/app/Cargo.toml`, and that the updater secret and the public key in
-   `crates/app/tauri.conf.json` agree. It then builds `oschess-bridge.exe`
+1. **build**: checks that the dispatch selected `main`, that its source commit
+   is in main history, that the newest `ci` run for that commit passed, and that
+   the updater secret and the public key in `crates/app/tauri.conf.json` agree.
+   It reserves a version, applies it to the disposable workspace
+   (`crates/app/Cargo.toml` and `Cargo.lock`), and then builds `oschess-bridge.exe`
    with the Tauri CLI named in the workflow (`TAURI_CLI_VERSION`, the CLI of the
    `tauri` crates in `Cargo.lock`: built with the same `tauri-utils`, which
    the `ci` workflow checks on every merge).
@@ -42,55 +43,79 @@ Control blocks the installed program if only its installer is signed, and an
 installer cannot be signed from the inside. The updater's signature is made
 last, over the installer as users download it.
 
+## Automatic version policy
+
+Owner decision (2026-10-04): use `major.yymm.ddnn`. Major is **1** until an
+explicit owner decision changes `store-version.json`. Month and daily sequence
+have two positions; the final integer is `day * 100 + sequence`. Components
+have no leading zeroes: the first build on 2027-01-01 is `1.2701.101`; its MSIX
+version is `1.2701.101.0`. The second is `1.2701.102`, and January 10 begins at
+`1.2701.1001`. Dates are UTC. There are 99 reservations per day.
+
+`scripts/store_version.py` allocates inside the build job. It uses existing
+release tags, the configured migration floor and the latest reservation to
+prevent a backwards version. The workflow run number is an additional technical
+counter floor. It atomically creates an annotated GitHub ref
+under `store-build/bridge/<technical-build>`. The annotation records the
+version, date, source SHA, run/attempt and a unique claim identity. A competing
+claimant must take the next number; an uncertain write is read back before the
+job can use it. Preserve these refs permanently, including failed builds.
+
+Every rebuilt job reserves a fresh version; failed builds leave harmless gaps.
+Later jobs reuse the build job's version for the executable, installer, MSIX,
+updater metadata and release tag. The `store-release.json` artifact records
+that identity and is included in the draft. A reservation alone is not proof
+of a successful build. Exhausting 99 daily numbers, a backwards clock/major,
+corrupt history, an exhausted technical counter or a year outside 2000–2099
+stops allocation; none automatically increments major. Ordinary development
+keeps the committed Cargo version: release-number commits are unnecessary.
+
 ## Cutting a release
 
-1. Raise `version` in `crates/app/Cargo.toml`, and in `Cargo.lock` with it, in
-   a pull request that is reviewed and merged like any other. That version is
-   the installer's, the one the updater compares, and the one the tag must
-   name.
-2. Wait until the `ci` run of the merged commit has passed (Actions → ci, or
-   `gh run list -w ci.yml -c <commit>`), then tag that commit on `main` and
-   push the tag:
+1. When the owner requests a release, wait for the latest `ci` run for the
+   intended main commit to pass. Do not ask the owner for a version.
+2. Dispatch the workflow on `main` (owner PowerShell command):
 
-   ```
-   git fetch origin main
-   git tag -a v0.2.0 -m "oschess bridge 0.2.0" origin/main
-   git push origin v0.2.0
+   ```powershell
+   gh workflow run release.yml --repo asavis/oschess-cb-bridge --ref main
    ```
 
-   The build job fails unless the tagged commit's newest `ci` run has
-   passed. Once that run passes, whether it had not started or finished yet,
-   or had failed or been cancelled and was re-run (a queued run is cancelled
-   when a later merge's run takes its place), re-run the release's failed
-   jobs. When `main` needs a fix, delete the tag and tag again as below.
-
-3. Follow the run under Actions → release. With signing on, approve both
-   signing requests in SignPath; each job waits an hour for its approval.
-4. Check the draft before publishing it:
-   - It has both `.exe` files and `SHA256SUMS.txt`, and while the updater
-     secret is set also `latest.json` naming the tag's version and
-     `oschess-bridge-setup.exe.sig`.
+   The workflow checks the exact source commit's CI again before reserving a
+   version. Agents execute GitHub operations under their fixed bot identity.
+   No version input, manifest edit or manually pushed tag is needed. Tags no
+   longer trigger builds. A release failure before reservation consumes no
+   number; retrying the build after reservation consumes a fresh number.
+3. Follow Actions → release. With signing on, approve both SignPath requests;
+   each job waits an hour. The installer is built around the signed executable.
+4. Check the draft before publishing:
+   - It has both `.exe` files, `SHA256SUMS.txt` and the matching identity in
+     `store-release.json`; with the updater secret configured, it also has
+     `latest.json` naming this version and `oschess-bridge-setup.exe.sig`.
+     With Store identity configured, it includes the MSIX.
    - The downloaded files match their SHA-256
-     (`Get-FileHash .\oschess-bridge-setup.exe`).
-   - When signed: both files' Properties → Digital Signatures show the
-     SignPath Foundation certificate.
+     (`Get-FileHash .\oschess-bridge-setup.exe` in PowerShell).
+   - When signed, both files' Properties → Digital Signatures show the
+     SignPath Foundation certificate. An unsigned result is not a signed release.
    - On a fresh Windows user account, every step of the README's
-     [Install](../README.md#install) section happens as written, labels
-     included.
-   - The manual acceptance of #23: with fresh Chrome and Edge profiles and
-     `web = "https://staging.oschess.org"` in `bridge.toml`, allowing the
-     local-network prompt connects; denying it shows the permission state with
-     the steps to allow it again, not «bridge not installed»; revoking it after
-     pairing shows the same, and allowing it again recovers without pairing
-     again. «Start with Windows» survives a restart, and a second start opens
-     oschess instead of a second bridge.
-5. Publish the draft as the latest release. From then on, installed apps with
-   updates on find it within six hours.
+     [Install](../README.md#install) section happens as written, labels included.
+   - With fresh Chrome and Edge profiles and `web = "https://staging.oschess.org"`
+     in `bridge.toml`, allowing local-network permission connects; denying it
+     shows the permission state and recovery steps, not "bridge not installed";
+     revoking it after pairing shows that state, and allowing it again recovers
+     without pairing again. "Start with Windows" survives a restart, and a
+     second start opens the web app instead of a second bridge.
+5. Publish the draft only under the owner's release authorization. Installed
+   direct-channel copies then find the update within six hours. Submit the
+   MSIX through the separate Microsoft Store procedure below.
 
-When something is wrong, delete the draft and the tag
-(`git push origin :refs/tags/v0.2.0`), fix it in a pull request, and tag again.
-Never move or reuse the tag of a published release: checksums, installed apps
-and links refer to it.
+The draft's `v<version>` tag points to the reviewed source SHA. The generated
+Cargo metadata is recorded by the reservation and identity artifact; it is not
+an unreviewed source-code change. To reproduce the version locally, apply
+`scripts/apply_release_version.py <version>` to a disposable checkout at that
+SHA before building. All source changes still require the normal reviewed PR.
+Never delete, move or reuse published tags or reservation refs. Fix code
+through a PR and dispatch a new build. A rerun of later packaging/release jobs
+keeps the already-built executable's identity and never allocates a new one.
 
 ## Pinned actions
 
@@ -266,9 +291,10 @@ are at most 65535 and whose fourth part is 0. The package version is the
 app's with a fourth part of 0, so the Store shows the version the app does:
 1.0.0 packs as 1.0.0.0. The app went from 0.1.0 straight to 1.0.0 for its
 first Store release, and `scripts/msix.py` refuses a 0.x version. The app's
-version is the one Cargo reads for `crates/app`, which the build job checks
-the tag against. `scripts/test_msix.py` pins that reading and the mapping, and
-CI runs it.
+version is the one Cargo reads for `crates/app` after
+`scripts/apply_release_version.py` applies the reserved identity in each build
+and packaging workspace. `scripts/test_msix.py` pins that reading and the
+mapping, and CI runs it.
 
 The identity comes from three repository variables, all public values from
 Partner Center's product identity page:
