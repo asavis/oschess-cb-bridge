@@ -892,7 +892,9 @@ entity tag (`"0123456789abcdef"`).
   new one, never a mix. The temporary file is made new: when a file or a link
   already has its name, the write is `500 write_failed` and that file is left
   as it is. Before any game goes into it, it takes the PGN file's access: its
-  permissions and group on Unix, with its POSIX access control list on
+  permissions and group on Unix (when the user may not give it the file's
+  group and the file's mode grants that group any access, the write is
+  `500 write_failed`), with its POSIX access control list on
   Linux, or none when the file has none, whatever the folder's default would
   give a new file. On Windows it takes the file's access control list. Kept
   from the folder's entries when the file's is, its entries inherited are the

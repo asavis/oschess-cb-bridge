@@ -630,6 +630,12 @@ fn rewrite(
 /// renamed over it keeps it: its permissions and group on Unix, its access
 /// control list on Windows. A file that fails to take them is removed.
 fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
+    create_temp(temp, |out| copy_access(source, out))
+}
+
+/// [`create_temp_like`], with `access` giving the new file the source's
+/// access.
+fn create_temp(temp: &Path, access: impl FnOnce(&File) -> io::Result<()>) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -645,7 +651,7 @@ fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
         options.access_mode(FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
     }
     let out = options.open(temp)?;
-    if let Err(e) = copy_access(source, &out) {
+    if let Err(e) = access(&out) {
         drop(out);
         let _ = std::fs::remove_file(temp);
         return Err(e);
@@ -653,17 +659,32 @@ fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
     Ok(out)
 }
 
-/// Gives `out` the permissions of `source`, its group where the user may (a
-/// group the user is not in keeps the user's own), and on Linux its POSIX
+/// Gives `out` the group of `source`, its permissions, and on Linux its POSIX
 /// access control list, or none when it has none: a list `out` took from
 /// its folder's default goes, since the source's mode would widen its mask
 /// and grant its entries.
 #[cfg(unix)]
 fn copy_access(source: &File, out: &File) -> io::Result<()> {
+    copy_access_with(source, out, |out, group| std::os::unix::fs::fchown(out, None, Some(group)))
+}
+
+/// [`copy_access`], with `chgrp` giving `out` a group. A group the user may
+/// not give, one the user is not in, leaves `out` in the user's own: the
+/// mode's group permissions would then be another group's, so a source mode
+/// that grants its group any access fails the write, and one that grants it
+/// none goes on.
+#[cfg(unix)]
+fn copy_access_with(source: &File, out: &File, chgrp: impl FnOnce(&File, u32) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = source.metadata()?;
     // The group first: a change of group may clear bits the mode sets again.
-    let _ = std::os::unix::fs::fchown(out, None, Some(meta.gid()));
+    let grouped = chgrp(out, meta.gid());
+    if out.metadata()?.gid() != meta.gid() && meta.mode() & 0o070 != 0 {
+        let why = grouped.err().map_or_else(|| "it stays in another".to_string(), |e| e.to_string());
+        return Err(io::Error::other(format!(
+            "the new file cannot take the file's group, whose mode grants that group access: {why}"
+        )));
+    }
     let acl = read_acl(source)?;
     if acl.is_none() {
         drop_acl(out)?;
@@ -1185,6 +1206,59 @@ mod tests {
         drop(file);
         assert_eq!(std::fs::read(&path).unwrap(), b"[Event \"a\"]\n1. e4 *\n\n1. d4 *\n\n");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A group of the user's own other than the one new files take, for a
+    /// file the user may move into it; `None` for a user in one group.
+    #[cfg(unix)]
+    fn other_group() -> Option<u32> {
+        // SAFETY: a null list of size 0 asks for the count alone.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0 as libc::gid_t; usize::try_from(count).ok()?];
+        // SAFETY: `groups` holds `count` entries.
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(count).ok()?);
+        // SAFETY: getegid takes nothing and cannot fail.
+        let own = unsafe { libc::getegid() };
+        groups.into_iter().find(|&g| g != own)
+    }
+
+    /// A file's group is kept: given to the temporary file when the user
+    /// may, and when the user may not, the write fails for a mode that grants
+    /// the group access, the temporary file gone, and goes on for one that
+    /// grants it none.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_cannot_be_kept_fails_a_mode_that_grants_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Some(group) = other_group() else {
+            eprintln!("skipped: the user is in one group only");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("bridge-write-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        let temp = temp_path(&path);
+        let refused = |_: &File, _: u32| -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::EPERM)) };
+        for (mode, kept) in [(0o640, false), (0o604, true), (0o600, true)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let source = File::open(&path).unwrap();
+            // The user may: the group goes with the mode.
+            let out = create_temp_like(&source, &temp).unwrap();
+            let meta = out.metadata().unwrap();
+            assert_eq!((meta.gid(), meta.permissions().mode() & 0o7777), (group, mode), "{mode:o}");
+            drop(out);
+            std::fs::remove_file(&temp).unwrap();
+            // The user may not.
+            let made = create_temp(&temp, |out| copy_access_with(&source, out, refused));
+            assert_eq!(made.is_ok(), kept, "{mode:o}: {made:?}");
+            assert_eq!(temp.exists(), kept, "{mode:o}: a refused file is gone");
+            let _ = std::fs::remove_file(&temp);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The temporary file has the PGN file's permissions from the start,
