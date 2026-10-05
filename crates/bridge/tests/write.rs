@@ -66,11 +66,26 @@ fn row_now(port: u16, id: &str) -> String {
     object_with(&list.body, &format!(r#""id":"{id}""#)).unwrap_or_else(|| panic!("{}", list.body)).to_string()
 }
 
-/// `text` as a file of `layout` holds it: its line ends `eol`, in UTF-8 or
-/// in Windows-1252.
+/// The code page the bridge reads and writes a file that is not UTF-8 in:
+/// this computer's, Windows-1251 on a Russian Windows, Windows-1252 outside
+/// Windows.
+fn page() -> CodePage {
+    bridge::pgnindex::system_code_page()
+}
+
+/// `text` with its `å` and `é` as the letters this computer's code page has
+/// at their Windows-1252 bytes, so that a file in that page holds it: the
+/// text itself on a Western European computer.
+fn in_page(text: &str) -> String {
+    let page = page();
+    text.replace('å', &page.char(0xe5).to_string()).replace('é', &page.char(0xe9).to_string())
+}
+
+/// `text` as a file holds it: its line ends `eol`, in UTF-8 or in this
+/// computer's code page.
 fn file_text(text: &str, eol: &str, utf8: bool) -> Vec<u8> {
     let text = text.replace('\n', eol);
-    if utf8 { text.into_bytes() } else { CodePage::WESTERN.encode(&text).unwrap() }
+    if utf8 { text.into_bytes() } else { page().encode(&text).unwrap() }
 }
 
 const GAME_1: &str = "[Event \"Club\"]\n[White \"Ståhlberg, Gideon\"]\n[Black \"Morphy, Paul\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 1-0";
@@ -107,14 +122,14 @@ fn check_written(
     assert_eq!(member(&row, "writable"), "true", "{row}");
     let stamp = u64::from_str_radix(&generation, 16).unwrap();
     let built = bridge.dir().join("built.head");
-    pgnfile::build(path, &built, stamp, CodePage::WESTERN, &mut |_| true).unwrap();
+    pgnfile::build(path, &built, stamp, page(), &mut |_| true).unwrap();
     let index = bridge.dir().join("pgn").join(format!("{id}.head"));
     assert_eq!(std::fs::read(&index).unwrap(), std::fs::read(&built).unwrap(), "the index of {}", path.display());
     std::fs::remove_file(&built).unwrap();
     generation
 }
 
-/// An append, a replace and a removal in UTF-8 and Windows-1252 files with LF
+/// An append, a replace and a removal in UTF-8 and code page files with LF
 /// and CRLF line ends: each written in the file's encoding and line ends, an
 /// append after every earlier byte, the others in the place of their game,
 /// and the database ready at the new generation at once.
@@ -126,8 +141,11 @@ fn writes_follow_the_file() {
         let scratch = Scratch::new(name);
         let path = scratch.path("games.pgn");
         let text = |t: &str| file_text(t, eol, utf8);
+        // The games, in letters a file of this computer's code page holds.
+        let g = |t: &str| if utf8 { t.to_string() } else { in_page(t) };
+        let (game_1, game_2, game_3, new, replacement) = (g(GAME_1), g(GAME_2), g(GAME_3), g(NEW), g(REPLACEMENT));
         // The file's last game ends its line, with no empty line after it.
-        let original = [text(GAME_1), text(&format!("\n\n{GAME_2}\n\n{GAME_3}\n"))].concat();
+        let original = [text(&game_1), text(&format!("\n\n{game_2}\n\n{game_3}\n"))].concat();
         std::fs::write(&path, &original).unwrap();
         let bridge = TestBridge::new(app_of([path.clone()]));
         let id = id_of(&path);
@@ -139,32 +157,32 @@ fn writes_follow_the_file() {
         // An append: an empty line after the file's last line, then the game
         // and an empty line. The body's blank lines around the game are not
         // the game's.
-        let answer = write(bridge.port, "POST", &games, Some(&generation), &format!("\n{NEW}\n\n"));
-        let appended = [original.clone(), text(&format!("\n{NEW}\n\n"))].concat();
+        let answer = write(bridge.port, "POST", &games, Some(&generation), &format!("\n{new}\n\n"));
+        let appended = [original.clone(), text(&format!("\n{new}\n\n"))].concat();
         let generation = check_written(&bridge, &path, &answer, 201, &appended, 4);
         assert_eq!(member(&answer.body, "number"), "4", "{}", answer.body);
         let served = get_reply(bridge.port, &format!("{games}/4"));
-        assert_eq!(member(&served.body, "pgn"), bridge::json::string(&format!("{NEW}\n")), "{name}");
+        assert_eq!(member(&served.body, "pgn"), bridge::json::string(&format!("{new}\n")), "{name}");
 
         // A replace: the game's own bytes, the empty lines around it kept.
-        let answer = write(bridge.port, "PUT", &format!("{games}/2"), Some(&generation), REPLACEMENT);
-        let replaced = [text(&format!("{GAME_1}\n\n{REPLACEMENT}\n\n{GAME_3}\n\n{NEW}\n\n"))].concat();
+        let answer = write(bridge.port, "PUT", &format!("{games}/2"), Some(&generation), &replacement);
+        let replaced = [text(&format!("{game_1}\n\n{replacement}\n\n{game_3}\n\n{new}\n\n"))].concat();
         let generation = check_written(&bridge, &path, &answer, 200, &replaced, 4);
         assert_eq!(member(&answer.body, "number"), "2", "{}", answer.body);
         let served = get_reply(bridge.port, &format!("{games}/2"));
-        assert_eq!(member(&served.body, "pgn"), bridge::json::string(&format!("{REPLACEMENT}\n")), "{name}");
+        assert_eq!(member(&served.body, "pgn"), bridge::json::string(&format!("{replacement}\n")), "{name}");
 
         // A removal: the game and the empty lines after it, to the next game;
         // the games after it move up.
         let answer = write(bridge.port, "DELETE", &format!("{games}/1"), Some(&generation), "");
-        let removed = text(&format!("{REPLACEMENT}\n\n{GAME_3}\n\n{NEW}\n\n"));
+        let removed = text(&format!("{replacement}\n\n{game_3}\n\n{new}\n\n"));
         let generation = check_written(&bridge, &path, &answer, 200, &removed, 3);
         assert!(!answer.body.contains("number"), "{}", answer.body);
         let answer = write(bridge.port, "DELETE", &format!("{games}/3"), Some(&generation), "");
-        let removed = text(&format!("{REPLACEMENT}\n\n{GAME_3}\n\n"));
+        let removed = text(&format!("{replacement}\n\n{game_3}\n\n"));
         check_written(&bridge, &path, &answer, 200, &removed, 2);
         let served = get_reply(bridge.port, &format!("{games}/1"));
-        assert_eq!(member(&served.body, "pgn"), bridge::json::string(&format!("{REPLACEMENT}\n")), "{name}");
+        assert_eq!(member(&served.body, "pgn"), bridge::json::string(&format!("{replacement}\n")), "{name}");
         drop(bridge);
     }
 }
@@ -208,7 +226,7 @@ fn an_append_ends_the_file_first() {
 fn refusals_leave_the_file_as_it_was() {
     let scratch = Scratch::new("refusals");
     let (utf8, ansi) = (scratch.path("utf8.pgn"), scratch.path("ansi.pgn"));
-    let (utf8_text, ansi_text) = (file_text(GAME_1, "\n", true), file_text(GAME_1, "\r\n", false));
+    let (utf8_text, ansi_text) = (file_text(GAME_1, "\n", true), file_text(&in_page(GAME_1), "\r\n", false));
     std::fs::write(&utf8, &utf8_text).unwrap();
     std::fs::write(&ansi, &ansi_text).unwrap();
     let (two_db, classic_db) = (fixture("write-refusals-2cbh", &[]), classic_fixture("write-refusals-cbh", &[]));
@@ -275,11 +293,12 @@ fn refusals_leave_the_file_as_it_was() {
         assert_eq!(write(port, "DELETE", &at, Some(&generation), "").status, 404, "{number}");
     }
 
-    // The ANSI file cannot hold Cyrillic; the UTF-8 file can.
-    let cyrillic = "[Event \"Club\"]\n[White \"Таль, Михаил\"]\n\n1. e4 *";
-    let r = write(port, "POST", &games(&ansi_id), Some(&ansi_generation), cyrillic);
+    // The code page file cannot hold the king; the UTF-8 file could.
+    // No Windows code page holds the chess king.
+    let king = "[Event \"Club\"]\n[White \"Tal ♔, Mikhail\"]\n\n1. e4 *";
+    let r = write(port, "POST", &games(&ansi_id), Some(&ansi_generation), king);
     assert_eq!((r.status, code(&r)), (422, "unencodable".into()), "{}", r.body);
-    assert_eq!(string_member(member(&r.body, "error"), "character"), "Т");
+    assert_eq!(string_member(member(&r.body, "error"), "character"), "♔");
 
     // A body only where a game is written, and at most 4 MiB.
     let r = write(port, "DELETE", &format!("{}/1", games(&utf8_id)), Some(&generation), GAME_1);

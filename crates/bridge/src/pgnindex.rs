@@ -234,13 +234,13 @@ impl Registry {
 /// The code page Windows reads text that is not Unicode in: the one ChessBase
 /// reads a legacy PGN file in. Elsewhere, Windows-1252.
 #[cfg(windows)]
-fn system_code_page() -> CodePage {
+pub fn system_code_page() -> CodePage {
     // SAFETY: GetACP takes no arguments and only reads the system's setting.
     CodePage::new(unsafe { windows_sys::Win32::Globalization::GetACP() })
 }
 
 #[cfg(not(windows))]
-fn system_code_page() -> CodePage {
+pub fn system_code_page() -> CodePage {
     CodePage::WESTERN
 }
 
