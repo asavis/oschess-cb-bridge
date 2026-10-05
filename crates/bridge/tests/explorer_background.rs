@@ -702,11 +702,11 @@ fn a_background_build_gives_way_to_a_search() {
     let search = bridge.search(&id);
     assert!(held.arrived(1, WAIT_LIMIT));
     bridge.keep(TICK, Duration::ZERO);
-    until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("reading"));
+    until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &id).as_deref() == Some("checking"));
     // Twenty games take milliseconds to build: a build that went on would be
     // over in ten times as long as they took alone, or a second.
     std::thread::sleep((alone * 10).max(Duration::from_secs(1)));
-    assert_eq!(bridge.building(), [(id.clone(), "reading", 0, 20)], "it went on while the search ran");
+    assert_eq!(bridge.building(), [(id.clone(), "checking", 0, 20)], "it went on while the search ran");
     assert!(built_for(&dir, &id).is_none());
     drop(held);
     let (status, body) = search.answer();
@@ -741,7 +741,7 @@ fn a_requested_build_does_not_give_way() {
     assert!(held.arrived(1, WAIT_LIMIT));
     // The largest database is in use from the start: its build gives way.
     bridge.keep(TICK, Duration::ZERO);
-    until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &a).as_deref() == Some("reading"));
+    until("the background build did not start", WAIT_LIMIT, || phase(bridge.port, &a).as_deref() == Some("checking"));
     until("the requested build did not answer", WAIT_LIMIT, || bridge.explorer(&b).0 == 200);
     assert!(built_for(&dir, &a).is_none(), "the background build went on");
     until("the promoted build did not answer", WAIT_LIMIT, || bridge.explorer(&a).0 == 200);

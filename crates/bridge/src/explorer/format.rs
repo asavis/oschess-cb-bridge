@@ -14,8 +14,9 @@ pub const MAGIC: [u8; 8] = *b"OSCBIDX\0";
 /// built with the index carries too (#145); 4 deep blocks of 256 buckets, and
 /// with each game its structure's print and whether it holds that structure
 /// beyond the tree's plies (#146); 5 the tree to ply 20 in full, its blocks
-/// ending where the build's parts of the keys end (#147).
-pub const VERSION: u32 = 5;
+/// ending where the build's parts of the keys end (#147); 6 adds a separate
+/// database-relative selection to every position, keeping the legacy list.
+pub const VERSION: u32 = 6;
 pub const HEADER_LEN: usize = 128;
 /// Keys per block. A lookup reads one block: its keys and its records.
 pub const BLOCK_KEYS: usize = 4096;
@@ -23,10 +24,10 @@ pub const BLOCK_KEYS: usize = 4096;
 /// whatever a position holds.
 pub const BLOCK_DATA: usize = 1 << 20;
 /// The most a block's records can take: [`BLOCK_DATA`], plus the record that
-/// passed it, which is at most 218 moves and 12 games of varints.
+/// passed it, which is at most 218 moves and two lists of 12 games of varints.
 pub const MAX_BLOCK_DATA: usize = BLOCK_DATA + (16 << 10);
 /// The fewest bytes a record takes: four counts, no moves, no games.
-pub const MIN_RECORD: usize = 6;
+pub const MIN_RECORD: usize = 7;
 /// A key and the offset of its record in the block's data.
 pub const KEY_ENTRY: usize = 12;
 /// A block in the table: first key, offset, key count, data length, CRC.
@@ -251,13 +252,14 @@ pub struct Stats {
     pub moves: Vec<(u16, Counts)>,
     /// The notable games, best first.
     pub top: Vec<u32>,
+    pub featured: Vec<u32>,
 }
 
 impl Stats {
     /// Appends the record: counts, moves (most played first), notable games,
     /// each number as an unsigned LEB128 varint.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        encode_record(out, &self.counts, &self.moves, self.top.iter().copied());
+        encode_record(out, &self.counts, &self.moves, self.top.iter().copied(), self.featured.iter().copied());
     }
 
     /// The record at the start of `b`, in an index of `games` games; `None`
@@ -290,7 +292,15 @@ impl Stats {
         for _ in 0..t {
             top.push(u32::try_from(read_varint(b, &mut at)?).ok()?);
         }
-        Some(Stats { counts: total, moves, top })
+        let n = read_varint(b, &mut at)?;
+        if n > TOP_GAMES as u64 {
+            return None;
+        }
+        let mut featured = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            featured.push(u32::try_from(read_varint(b, &mut at)?).ok()?);
+        }
+        Some(Stats { counts: total, moves, top, featured })
     }
 }
 
@@ -307,7 +317,12 @@ pub fn order_moves(moves: &mut [(u16, Counts)]) {
 /// first, and among equal ratings the later game. `top` has room for one
 /// more, which it takes while `game` is ranked.
 #[inline]
-pub fn rank_top(top: &mut Vec<(u16, u32)>, game: (u16, u32)) {
+pub fn rank_top<R: Ord + Copy>(top: &mut Vec<(R, u32)>, game: (R, u32)) {
+    // Nearly every candidate of a crowded position loses to the current
+    // tail. Reject it with one comparison, before searching the 12 slots.
+    if top.len() == TOP_GAMES && top[TOP_GAMES - 1] >= game {
+        return;
+    }
     let at = top.partition_point(|&t| t > game);
     if at < TOP_GAMES {
         top.insert(at, game);
@@ -322,6 +337,7 @@ pub fn encode_record(
     counts: &Counts,
     moves: &[(u16, Counts)],
     top: impl ExactSizeIterator<Item = u32>,
+    featured: impl ExactSizeIterator<Item = u32>,
 ) {
     let put = |out: &mut Vec<u8>, c: &Counts| {
         for v in [c.games, c.white, c.draws, c.black] {
@@ -336,6 +352,10 @@ pub fn encode_record(
     }
     varint(out, top.len() as u64);
     for g in top {
+        varint(out, u64::from(g));
+    }
+    varint(out, featured.len() as u64);
+    for g in featured {
         varint(out, u64::from(g));
     }
 }
@@ -700,6 +720,7 @@ mod tests {
             counts: Counts { games: 300, white: 120, draws: 100, black: 70 },
             moves: vec![(pack_move("e2e4".parse().unwrap()), Counts { games: 200, white: 90, draws: 60, black: 45 })],
             top: vec![7, 1_000_000, 3],
+            featured: vec![3, 7],
         };
         let mut b = Vec::new();
         s.encode(&mut b);
@@ -723,7 +744,7 @@ mod tests {
             ),
         ] {
             let mut b = Vec::new();
-            Stats { counts, moves: moves.clone(), top: vec![] }.encode(&mut b);
+            Stats { counts, moves: moves.clone(), top: vec![], featured: vec![] }.encode(&mut b);
             assert_eq!(Stats::decode(&b, 300), None, "{counts:?} {moves:?}");
         }
         let h = Header {

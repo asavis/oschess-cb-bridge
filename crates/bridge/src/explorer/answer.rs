@@ -302,10 +302,16 @@ pub fn render_with(
     top.dedup_by_key(|t| t.1);
     top.truncate(TOP_GAMES);
     let games = top.iter().map(|t| t.2.to_string());
+    let featured: Vec<String> = with_store!(db, db => {
+        let mut names = Names::new(db);
+        stats.featured.iter().filter_map(|&n| loaded.game(n, || top_game(db, &mut names, n))
+            .map(|(_, json)| json.to_string())).collect()
+    });
     let index = Obj::new().num("records", i64::from(loaded.records())).num("games", loaded.games() as i64).done();
     let answer = counts(Obj::new().str("generation", &format!("{:016x}", loaded.generation)), &stats.counts)
         .raw("moves", &json::array(moves))
         .raw("topGames", &json::array(games))
+        .raw("featuredGames", &json::array(featured))
         .raw("index", &index);
     match filter {
         Some(f) => answer.raw("filter", &Obj::new().str("q", f.q).num("games", f.games as i64).done()).done(),
@@ -343,19 +349,22 @@ struct Found {
     counts: Counts,
     moves: Vec<Played>,
     top: Vec<(u16, u32)>,
+    featured: Vec<(u32, u32)>,
 }
 
 impl Found {
     /// What one takes, all a worker reserves.
-    const BYTES: usize =
-        MAX_MOVES * std::mem::size_of::<Played>() + (TOP_GAMES + 1) * std::mem::size_of::<(u16, u32)>();
+    const BYTES: usize = MAX_MOVES * std::mem::size_of::<Played>()
+        + (TOP_GAMES + 1) * (std::mem::size_of::<(u16, u32)>() + std::mem::size_of::<(u32, u32)>());
 
     fn new() -> Option<Found> {
         let mut moves = Vec::new();
         moves.try_reserve_exact(MAX_MOVES).ok()?;
         let mut top = Vec::new();
         top.try_reserve_exact(TOP_GAMES + 1).ok()?;
-        Some(Found { counts: Counts::default(), moves, top })
+        let mut featured = Vec::new();
+        featured.try_reserve_exact(TOP_GAMES + 1).ok()?;
+        Some(Found { counts: Counts::default(), moves, top, featured })
     }
 
     /// Adds `counts` of games that played `mv` from the position (`NO_MOVE`
@@ -389,6 +398,9 @@ impl Found {
         for &best in &other.top {
             rank_top(&mut self.top, best);
         }
+        for &best in &other.featured {
+            rank_top(&mut self.featured, best);
+        }
     }
 
     /// The answer of these games alone: the moves played as often in the
@@ -396,7 +408,12 @@ impl Found {
     fn into_stats(mut self) -> Stats {
         self.moves.sort_unstable_by_key(|m| (std::cmp::Reverse(m.counts.games), m.first));
         let moves = self.moves.iter().map(|m| (m.mv, m.counts)).collect();
-        Stats { counts: self.counts, moves, top: self.top.iter().map(|b| b.1).collect() }
+        Stats {
+            counts: self.counts,
+            moves,
+            top: self.top.iter().map(|b| b.1).collect(),
+            featured: self.featured.iter().map(|b| b.1).collect(),
+        }
     }
 }
 
@@ -429,6 +446,11 @@ pub fn stats(loaded: &Loaded, board: &Board, cancel: &Cancel) -> Result<Option<S
         rank_top(&mut top, (loaded.stream.entry(game)?.elo(), game));
     }
     tree.top = top.iter().map(|b| b.1).collect();
+    let mut featured = found.featured;
+    for &game in &tree.featured {
+        rank_top(&mut featured, (loaded.stream.record(game)?.featured, game));
+    }
+    tree.featured = featured.iter().map(|b| b.1).collect();
     Ok(Some(tree))
 }
 
@@ -497,6 +519,7 @@ impl Keep for Counted {
         let mut counts = Counts::default();
         counts.add(hit.outcome);
         found.add(hit.mv, &counts, (hit.elo, game), game);
+        rank_top(&mut found.featured, (hit.featured, game));
     }
 }
 
@@ -635,7 +658,7 @@ mod tests {
     fn found_games_are_added_up_in_the_room_reserved() {
         let (a, b) = (Found::new().unwrap(), Found::new().unwrap());
         let (mut one, mut halves) = (Found::new().unwrap(), [a, b]);
-        let (moves, top) = (one.moves.capacity(), one.top.capacity());
+        let (moves, top, featured) = (one.moves.capacity(), one.top.capacity(), one.featured.capacity());
         for n in 1..=50_000u32 {
             let mut counts = Counts::default();
             counts.add([Outcome::White, Outcome::Draw, Outcome::Black][n as usize % 3]);
@@ -643,6 +666,11 @@ mod tests {
             let best = ((n * 7919 % 3000) as u16, n);
             one.add(mv, &counts, best, n);
             halves[n as usize % 2].add(mv, &counts, best, n);
+            let key = (n * 3571 % (1 << 19), n);
+            rank_top(&mut one.featured, key);
+            rank_top(&mut halves[n as usize % 2].featured, key);
+            assert!(one.featured.len() <= TOP_GAMES);
+            assert_eq!(one.featured.capacity(), featured, "selection capacity is independent of matches");
         }
         assert_eq!((one.moves.capacity(), one.top.capacity()), (moves, top), "nothing grew");
         assert_eq!(one.counts.games, 50_000);
@@ -662,9 +690,13 @@ mod tests {
         merged.merge(&other);
         assert_eq!(merged.counts, one.counts);
         assert_eq!(merged.top, one.top);
+        assert_eq!(merged.featured, one.featured);
         assert_eq!(firsts(&merged), firsts(&one));
         let mut expected: Vec<(u16, u32)> = (1..=50_000u32).map(|n| ((n * 7919 % 3000) as u16, n)).collect();
         expected.sort_unstable_by(|x, y| y.cmp(x));
         assert_eq!(one.top, expected[..TOP_GAMES]);
+        let mut selected: Vec<_> = (1..=50_000u32).map(|n| (n * 3571 % (1 << 19), n)).collect();
+        selected.sort_unstable_by(|x, y| y.cmp(x));
+        assert_eq!(one.featured, selected[..TOP_GAMES]);
     }
 }

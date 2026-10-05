@@ -1005,7 +1005,7 @@ With `q` the answer also acknowledges the search (#268):
     "filter": { "q": "tc:normal whiteelo:2200.. blackelo:2200..", "games": 5012345 }
 
 - **Narrowed by a search** (#268). With a `q` that has a term, `games`,
-  `white`, `draws`, `black`, `moves` and `topGames` count only the games of
+  `white`, `draws`, `black`, `moves`, `topGames` and `featuredGames` count only the games of
   the position that `q` selects, the games `GET /v1/databases/{id}/games?fen=&q=`
   lists, by the rules below: each once, at the first ply its main line
   reaches the position, with the move it played from there; the notable games
@@ -1042,10 +1042,42 @@ With `q` the answer also acknowledges the search (#268):
   that ended there played no move from it. `uci` writes castling the standard
   way, `e1g1` and `e1c1`; `san` is the move in SAN.
 - **`topGames`**: up to 12 games that reached the position, the highest
-  average rating first (the known rating when only one is), then the latest.
+  average rating first (the known rating when only one is), then descending
+  record number. This legacy field keeps its original meaning.
   Each is a row of `GET /v1/databases/{id}/games`, with every field a row
   has, and `year`: the year of its `date`, `null` when the date has none.
   `year` stays for clients written before rows; `date` is the field to read.
+- **`featuredGames`** (additive, API v1): up to 12 whole game rows, with
+  `year` as in `topGames`, for clients that support database-relative selection.
+  Use this list in its returned order when present, including an empty list;
+  fall back to `topGames` only on older bridges that omit it. The heading can
+  remain “Top games”; counts, moves and the All games list are unchanged.
+  - Compute the mean of both source ratings, replacing each missing rating
+    with 1500 for selection only. A half-point average stays exact. The rows
+    still contain the source ratings, including zeros for unknown ratings.
+  - Anchor the date windows to the newest valid game date in the database,
+    before any user filter, including games outside the position index but
+    excluding deleted records and non-game records. Unknown month/day means 1;
+    an unknown year or invalid calendar date has no date. No known dates means
+    every game enters the last tier.
+  - First matching tier: average at least 2700 in the last calendar year;
+    at least 2600 in the last three years; at least 2400 in the last five
+    years; then everything else. Boundaries are inclusive. Calendar-year
+    subtraction clamps February 29 to February 28 in a non-leap year.
+  - Within each tier, descending average, then descending record number for
+    equal averages. Date never breaks a tie. Take the first 12 of the combined
+    order, with no tier quotas or duplicates, or every match if fewer than 12.
+  - Indexing scans header batches once for the anchor, then writes each game's
+    selection key into the move stream and precomputes the opening lists.
+    Deep and filtered queries keep a bounded best-12 list using that key;
+    they read no extra candidate headers and perform no full-result sort.
+    Opening and deep selections merge under the same order. Only the selected
+    rows are read for display (at most 24 across both API lists, sharing the
+    existing rendered-row cache).
+  - A generation change rebuilds both selections. Filtered-answer cache keys
+    include build id, generation, position and search text, with at most 64
+    answers within the existing memory budget. No daily recalculation occurs.
+  Reproducible cost measurements: [selection-performance.md](selection-performance.md).
 - **What is indexed.** Every position of each game's main line, to its end
   (its 65,535th ply at most): standard chess only, from the standard start or
   a set-up position, without deleted games, guiding texts or analyses. A game whose move record is over
@@ -1168,7 +1200,7 @@ With `q` the answer also acknowledges the search (#268):
   stream of different builds, are rebuilt. A build needs no room but its
   files': it writes them as `<id>.moves.partial` and `<id>.idx.partial`,
   renamed at its end, and deletes the database's former files when it
-  starts. The move stream takes 64 bytes a game and 2 bytes for each ply
+  starts. The move stream takes 68 bytes a game and 2 bytes for each ply
   past the 21st, each game with a CRC checked whenever it is replayed; a list
   of a position's games reads every game's first plies, 4,096 games at a
   time with a CRC checked the first time a list reads them, and what it

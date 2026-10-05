@@ -27,6 +27,8 @@ pub struct Line {
     pub outcome: Outcome,
     /// The average rating of the two players, or the one known; 0 with none.
     pub elo: u16,
+    pub rating_sum: u32,
+    pub date: u32,
     /// Each position the main line reaches within the index's plies, once,
     /// with the move played from it (`NO_MOVE` at the end) and its ply: a
     /// build counts them, and replays them from the move stream (#147).
@@ -70,6 +72,8 @@ impl Line {
             number,
             outcome,
             elo: 2000,
+            rating_sum: 4000,
+            date: 0,
             positions: Vec::new(),
             structures: Vec::new(),
             beyond: None,
@@ -235,6 +239,8 @@ impl Workspace {
                 number: 0,
                 outcome: Outcome::Other,
                 elo: 0,
+                rating_sum: 3000,
+                date: 0,
                 positions,
                 structures,
                 beyond: None,
@@ -256,6 +262,11 @@ impl Workspace {
 /// A database the index can be built from.
 pub trait Source: Sync {
     fn records(&self) -> u32;
+    /// Newest non-deleted game date in a bounded header batch; synthetic
+    /// sources without headers have no dates. Never called by a query.
+    fn newest_date(&self, _first: u32, _last: u32, _work: &mut Workspace) -> Result<u32> {
+        Ok(0)
+    }
 
     /// Calls `each` for every game of records `first..=last` that the index
     /// holds, in order: standard chess, not deleted, and not a guiding text
@@ -271,6 +282,19 @@ pub trait Source: Sync {
         work: &mut Workspace,
         each: &mut dyn FnMut(&Line),
     ) -> Result<()>;
+}
+
+/// One bounded sequential header read, without names, moves or annotations.
+fn newest_date<S: Store>(db: &S, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
+    let count = last.min(db.record_count()).saturating_add(1).saturating_sub(first).min(RECORDS as u32) as usize;
+    work.headers.resize(count * S::HEAD_BYTES, 0);
+    let read = db.read_records(first, &mut work.headers)? as usize;
+    Ok((0..read)
+        .map(|i| S::head(first + i as u32, &work.headers[i * S::HEAD_BYTES..(i + 1) * S::HEAD_BYTES]))
+        .filter(|r| r.kind() == RecordKind::Game && !r.is_deleted())
+        .map(|r| super::ranking::date(r.played_date()))
+        .max()
+        .unwrap_or(0))
 }
 
 /// What reading games' main lines needs of a format, besides [`Store`].
@@ -343,6 +367,10 @@ impl Games for cbh::Database {
 }
 
 impl Source for v2::Database {
+    fn newest_date(&self, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
+        newest_date(self, first, last, work)
+    }
+
     fn records(&self) -> u32 {
         self.record_count()
     }
@@ -360,6 +388,10 @@ impl Source for v2::Database {
 }
 
 impl Source for cbh::Database {
+    fn newest_date(&self, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
+        newest_date(self, first, last, work)
+    }
+
     fn records(&self) -> u32 {
         self.record_count()
     }
@@ -377,6 +409,14 @@ impl Source for cbh::Database {
 }
 
 impl Source for Base {
+    fn newest_date(&self, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
+        match self {
+            Base::TwoCbh(db) => newest_date(db, first, last, work),
+            Base::Cbh(db) => newest_date(db, first, last, work),
+            Base::Pgn(db) => newest_date(db, first, last, work),
+        }
+    }
+
     fn records(&self) -> u32 {
         self.record_count()
     }
@@ -400,6 +440,10 @@ impl Source for Base {
 /// A PGN file's games are read from its text: the texts of consecutive games
 /// at once when the move buffer holds them, as a run's move records are.
 impl Source for pgnfile::Database {
+    fn newest_date(&self, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
+        newest_date(self, first, last, work)
+    }
+
     fn records(&self) -> u32 {
         self.record_count()
     }
@@ -698,6 +742,8 @@ fn begin(line: &mut Line, r: &impl Head) {
     line.number = r.id();
     line.outcome = outcome(r);
     line.elo = average_elo(r);
+    line.rating_sum = super::ranking::rating_sum(r);
+    line.date = super::ranking::date(r.played_date());
     line.positions.clear();
     line.structures.clear();
     line.beyond = None;

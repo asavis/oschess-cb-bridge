@@ -98,7 +98,9 @@ fn build_in(
     let moves_partial = indexdir::partial(&moves);
     let (part_bits, bits) = (part_bits(plan.last), deep_bits(plan.last));
     let started = Instant::now();
-    let writer = stream::Writer::create(&moves_partial, plan.first, plan.last)?;
+    let anchor = ranking_anchor(source, plan, progress)?;
+    let mut writer = stream::Writer::create(&moves_partial, plan.first, plan.last)?;
+    writer.anchor = anchor;
     let counted = read_games(source, plan, &writer, part_bits, bits, progress, limits)?;
     let build_id = stream::build_id();
     writer.finish(plan.generation, build_id)?;
@@ -142,6 +144,25 @@ fn build_in(
     indexdir::replace(&partial, target).map_err(|e| io(target, e))?;
     progress.time(|t| t.renaming = started.elapsed());
     Ok(header)
+}
+
+/// The ranking anchor is found once, before any shallow entries are folded.
+/// Batches reuse one budgeted workspace and observe build cancellation.
+fn ranking_anchor(source: &dyn Source, plan: &Plan, progress: &Progress) -> Result<u32, SearchError> {
+    let _memory = reserve(Workspace::BYTES, progress)?;
+    let mut work = Workspace::new().ok_or(Refused::Busy)?;
+    progress.start("checking", u64::from(plan.last));
+    let mut newest = 0;
+    for first in (plan.first..=plan.last).step_by(super::source::RECORDS) {
+        if progress.stopped() {
+            return Err(SearchError::Superseded);
+        }
+        progress.give_way();
+        let last = first.saturating_add(super::source::RECORDS as u32 - 1).min(plan.last);
+        newest = newest.max(source.newest_date(first, last, &mut work)?);
+        progress.done.store(u64::from(last), Ordering::Relaxed);
+    }
+    Ok(newest)
 }
 
 /// A failure of the file at `path`, which the build wrote, as a build's
@@ -348,7 +369,9 @@ impl StreamPass<'_> {
                 entries[at] += 1;
                 if standard && ply <= tree::SHALLOW_PLY && !unfolded.load(Ordering::Relaxed) {
                     shallow_entries[at] += 1;
-                    if !shallow.add(Entry::new(key, line.number, line.outcome, mv, line.elo)) {
+                    if !shallow
+                        .add(Entry::new(key, line.number, line.outcome, mv, line.elo).with_featured(writer.rank(line)))
+                    {
                         unfolded.store(true, Ordering::Relaxed);
                     }
                 }

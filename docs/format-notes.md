@@ -411,7 +411,7 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBIDX\0` |
-  | 8 | 4 | format version, 5 |
+  | 8 | 4 | format version, 6 |
   | 12 | 4 | header length, 128 |
   | 17 | 1 | depth in plies, 20 |
   | 18 | 1 | pruning ply, 20: none within the depth |
@@ -432,8 +432,9 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   | 116 | 8 | build id, which the move stream built with it carries too |
   | 124 | 4 | CRC-32 of bytes 0-123 |
 
-  The other bytes are zero. Version 4, a tree to ply 40 whose positions
-  reached by one game only beyond ply 20 were dropped, is rebuilt.
+  The other bytes are zero. Version 5, without the separate selection list,
+  and version 4, a tree to ply 40 whose positions
+  reached by one game only beyond ply 20 were dropped, are rebuilt.
 
 - **Blocks** follow the header back to back, positions in ascending key order,
   up to 4,096 a block, and a block ends once its records reach 1 MiB, or where
@@ -449,7 +450,9 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
     bishop or knight as 0-3, in bits 0-5, 6-11 and 12-13; castling is the king
     moving onto its rook) followed by its four counts;
   - the number of notable games, then their numbers, the highest average
-    rating first, then the latest.
+    rating first, then descending record number;
+  - the number of database-relative selected games, then their numbers in
+    selection order (`docs/api.md`, `featuredGames`), at most 12 in each list.
 - **The block table** follows the blocks: for each block its first key,
   offset (8 bytes each), number of keys, data length and the CRC-32 of its
   keys and data together (4 bytes each), 28 bytes a block.
@@ -474,7 +477,7 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   counts: the header's CRC, and counts that fit the file (the table between
   its offset and the deep section; the deep table between its offset and the
   end of the file; 1 to 4,096 keys a block; for every key 12 bytes and a
-  record of at least 6 before the table), and no more games indexed than
+  record of at least 7 before the table), and no more games indexed than
   records. Then the tables' CRCs, blocks that follow each other, in key
   order, with at most 4,096 keys and a little over 1 MiB of records each,
   and deep blocks that follow each other from the deep section's offset to
@@ -491,8 +494,11 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   rebuilds both. A crash between writing one and the other, or a file copied
   from another build, never pairs an index with a stream it was not built
   with.
-- **The build** (#147) runs three kinds of pass, on at most half the search
-  workers and within half the search memory budget, and writes nothing but
+- **The build** (#147) first scans game headers in bounded batches (phase
+  `checking`) to find the newest valid date before any search filter, without
+  reading names, moves or annotations. It observes cancellation and yields to
+  foreground searches between batches. It then runs three kinds of pass, on at
+  most half the search workers and within half the search memory budget, and writes nothing but
   `<id>.moves.partial` and `<id>.idx.partial`, renamed `<id>.moves` and
   `<id>.idx` at the end; the database's former files are deleted when it
   starts, so that the folder never holds more than the new files.
@@ -510,7 +516,7 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      standard start reaches first within ply 3, at most 9,323 whatever the
      database and the most crowded of all, a fifth of the tree's entries,
      are folded as they come, as a tree pass folds a full buffer (below):
-     each worker keeps their entries in a room of up to a million (16 MiB),
+     each worker keeps their entries in a room of up to a million (24 MiB),
      and of no more than four a game of the database, 16,384 at least,
      taken from what the share and the budget have free beside the pass's
      buffers, and folds it whenever it fills; at the end the workers' entries
@@ -526,7 +532,7 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      build holds a little of the budget, however large its share, and takes
      one pass. The room is reserved together with the
      workers' buffers for making blocks and the table of the tree's blocks,
-     so that the table never waits for memory the entries took. An entry is 16 bytes: the key, the game
+     so that the table never waits for memory the entries took. An entry is 24 bytes: the selection key and padding, the position key, the game
      number (30 bits) with its result (2), and the move (14 bits) and average
      rating (12). Each worker replays the first 21 positions of the games it
      takes, a few hundred at a time, from the stream just written, mapped,
@@ -540,10 +546,11 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
      twice what a chunk of games adds takes no more, unless it is the last
      one taking them, so that the buffers fill evenly whatever the workers'
      pace.
-     A full buffer is sorted by key, and each position of more than 24
-     entries in it folded: its 12 best games by rating kept whole, the others
-     counted by move and result into entries that count games and rank for
-     no notable game. A buffer still three quarters full ends the pass, for
+     A full buffer is sorted by key, and each position of more than 48
+     entries in it folded: the union of its 12 legacy leaders and 12 selected
+     games is kept whole (at most 24 distinct games), and every other game
+     is counted by move and result into weighted entries. Each game still
+     contributes once to the counts. A buffer still three quarters full ends the pass, for
      every worker, at the part that keeps about half of it, and the next pass
      starts there; a first part that alone fills it fails the build as too
      large. So that none does, a worker's buffer holds the pass's first part
@@ -650,7 +657,7 @@ it means the same in any position and needs no board to decode.
   | Offset | Size | Field |
   |---|---|---|
   | 0 | 8 | magic `OSCBMOV\0` |
-  | 8 | 4 | format version, 4 |
+  | 8 | 4 | format version, 5 |
   | 12 | 4 | header length, 128 |
   | 16 | 1 | prefix words per record, *W* = 21 |
   | 20 | 4 | first record, 1 |
@@ -668,7 +675,8 @@ it means the same in any position and needs no board to decode.
   The other bytes are zero. Version 1, whose directory, prefix and tail
   areas lay apart with a CRC for each MiB, version 2, whose block table
   held no CRCs of the blocks' slots, and version 3, whose slots kept no
-  set-up start's move number (#272), are rebuilt.
+  set-up start's move number (#272), and version 4 without selection keys,
+  are rebuilt.
 - **Body**, from 128 to the block table: the tails and the blocks of slots,
   each starting at a multiple of 64 bytes, in the order the build's workers
   appended them. A worker takes the records of one block at a time and
@@ -676,7 +684,7 @@ it means the same in any position and needs no board to decode.
   the block's end, then appends the block's slots, so the file is written
   from its start to its end: a game's tail is found only by its offset, and
   a block only by the table.
-- **Slot**, 64 bytes a record, *B* in a block, record *r* the
+- **Slot**, 68 bytes a record, *B* in a block, record *r* the
   ((*r* − 1) mod *B*)th slot of block ⌊(*r* − 1)/*B*⌋:
 
   | Offset | Size | Field |
@@ -687,7 +695,8 @@ it means the same in any position and needs no board to decode.
   | 8 | 8 | home-pawn departures: bits 0-59 the first 15 home pawns to leave home, in order, 4 bits each (white a-h 0-7, black a-h 8-15); bits 60-63 how many, 15 meaning 15 or 16 |
   | 16 | 42 | words 0 to *W* − 1 of its line, then `0xffff` after its end |
   | 58 | 2 | the move number of a set-up start, as the database stores it (the move its side to move plays next); 0 for the standard start |
-  | 60 | 4 | CRC-32 of the record's number (4 bytes), bytes 0-59 and its tail |
+  | 60 | 4 | selection key: twice the average in bits 0-16, tier priority in bits 17-18 (3 for first tier, 0 for last); higher is better |
+  | 64 | 4 | CRC-32 of the record's number (4 bytes), bytes 0-63 and its tail |
 
   A record the index does not hold has zeros for bytes 0-15 and no words.
 - **Tail**: for a set-up start, 18 words describing it (32 bytes of pieces
@@ -697,9 +706,10 @@ it means the same in any position and needs no board to decode.
   the set-up section above; the en passant file 0-7 when a capture is
   possible, else 8; a zero byte); then words *W* to plies − 1. A start equal
   to the standard one at move 1 is no set-up; at any other move it is one,
-  so that its moves keep their numbers. A file takes 64 bytes a record and 2
+  so that its moves keep their numbers. A file takes 68 bytes a record and 2
   bytes for each ply past the 21st, 36 more for a set-up start, up to 63
-  bytes of padding after each append of tails, and 12 bytes a block.
+  bytes of padding after each append of tails or slots, and 12 bytes a block.
+  The slots' block CRC excludes alignment padding.
 - **Block table**, at the end of the body: for each block the offset of its
   slots (8 bytes) and the CRC-32 of the block's number from 0 (4 bytes) and
   its slots (4 bytes), 12 bytes a block. The file must end with it, have a

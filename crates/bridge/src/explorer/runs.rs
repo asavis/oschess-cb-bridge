@@ -18,8 +18,8 @@ use crate::sync::lock;
 use super::file::Bad;
 use super::format::Outcome;
 
-/// One game passing through one position, in 16 bytes: the key, the game and
-/// its outcome, and the move and rating. A position that many games pass
+/// One game passing through one position, in 24 bytes: the position key,
+/// game and outcome, move, legacy rating and precomputed selection key. A position that many games pass
 /// through is folded, as a pass collects it, into weighted entries: the games
 /// that played one move with one outcome, counted, which rank for no notable
 /// game.
@@ -32,9 +32,10 @@ pub struct Entry {
     /// The move in the low 14 bits, whether the entry is weighted in bit 14,
     /// the rating in the top 12.
     pub meta: u32,
+    pub featured: u32,
 }
 
-pub const ENTRY_BYTES: usize = 16;
+pub const ENTRY_BYTES: usize = std::mem::size_of::<Entry>();
 /// The largest game number an entry holds, and the most games a weighted
 /// entry counts.
 pub const MAX_GAME: u32 = (1 << 30) - 1;
@@ -45,6 +46,7 @@ impl Entry {
         Entry {
             key,
             game_outcome: game << 2 | outcome as u32,
+            featured: 0,
             meta: u32::from(mv & 0x3fff) | u32::from(elo.min(4095)) << 20,
         }
     }
@@ -52,9 +54,18 @@ impl Entry {
     /// `games` games through position `key` that played `mv` and ended with
     /// `outcome`.
     pub fn weighted(key: u64, games: u32, outcome: Outcome, mv: u16) -> Entry {
-        Entry { key, game_outcome: games.min(MAX_GAME) << 2 | outcome as u32, meta: u32::from(mv & 0x3fff) | WEIGHTED }
+        Entry {
+            featured: 0,
+            key,
+            game_outcome: games.min(MAX_GAME) << 2 | outcome as u32,
+            meta: u32::from(mv & 0x3fff) | WEIGHTED,
+        }
     }
 
+    pub fn with_featured(mut self, rank: u32) -> Self {
+        self.featured = rank;
+        self
+    }
     pub fn game(&self) -> u32 {
         self.game_outcome >> 2
     }

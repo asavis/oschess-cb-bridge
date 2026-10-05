@@ -46,27 +46,28 @@ use super::format::{NO_MOVE, Outcome, pack_move};
 use super::map::Map;
 
 pub const MAGIC: [u8; 8] = *b"OSCBMOV\0";
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const HEADER_LEN: usize = 128;
 /// The words of a line kept in its record's slot: the tree's depth, 20 plies,
 /// and one more, the move from its last position.
 pub const PREFIX_WORDS: usize = 21;
 const PREFIX_BYTES: usize = 2 * PREFIX_WORDS;
-/// A record's slot: its directory entry, its prefix words, two zero bytes
-/// and its CRC, a cache line that no page boundary cuts.
-pub const SLOT_BYTES: usize = 64;
+/// A record's slot: directory, 21 prefix words, set-up move number,
+/// precomputed selection key and CRC. Blocks remain 64-byte aligned.
+pub const SLOT_BYTES: usize = 68;
 /// Where a slot's prefix words start, and where its CRC is.
 const PREFIX_AT: usize = 16;
 const CRC_AT: usize = SLOT_BYTES - 4;
 /// Where a slot keeps the move number of a set-up start (#272): the
 /// number the start's side to move plays next, 0 for the standard start.
-const START_MOVE_AT: usize = CRC_AT - 2;
+const START_MOVE_AT: usize = 58;
+const RANK_AT: usize = 60;
 /// A set-up start in a tail: 18 words.
 pub const SETUP_BYTES: usize = 36;
 /// The most plies of a line the stream keeps; the line ends there.
 pub const MAX_PLIES: usize = u16::MAX as usize;
 /// Everything appended to the file starts at a multiple of this.
-const ALIGN: u64 = SLOT_BYTES as u64;
+const ALIGN: u64 = 64;
 /// Records in a block: a worker writes the slots of one block at a time, as
 /// the build reads them, and the file's table gives where each block is.
 pub const BATCH: usize = 4096;
@@ -166,7 +167,7 @@ fn records(first: u32, last: u32) -> u64 {
     (u64::from(last) + 1).saturating_sub(u64::from(first))
 }
 
-/// The CRC of record `number` whose slot's first 60 bytes are `slot` and
+/// The CRC of record `number` whose slot before its CRC is `slot` and
 /// whose tail is `tail`: the number binds the record to its place.
 fn record_crc(number: u32, slot: &[u8], tail: &[u8]) -> u32 {
     let c = crc32_update(!0, &number.to_le_bytes());
@@ -417,6 +418,7 @@ fn counts(white: Bitboard, black: Bitboard, pawns: Bitboard) -> [u32; 4] {
 /// visit (`NO_MOVE` at the line's end), its outcome and rating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit {
+    pub featured: u32,
     pub mv: u16,
     pub outcome: Outcome,
     pub elo: u16,
@@ -693,7 +695,12 @@ impl Stream {
                 if ply < target.from {
                     return Ok(None);
                 }
-                return Ok(Some(Hit { mv: mv.map_or(NO_MOVE, pack_move), outcome: entry.outcome(), elo: entry.elo() }));
+                return Ok(Some(Hit {
+                    mv: mv.map_or(NO_MOVE, pack_move),
+                    outcome: entry.outcome(),
+                    elo: entry.elo(),
+                    featured: record.featured,
+                }));
             }
             let Some(mv) = mv else { return Ok(None) };
             // Only a capture or a pawn's move changes what `passed` counts:
@@ -732,6 +739,7 @@ impl<'a> Slot<'a> {
 /// A record of a stream: its entry, the words of its prefix, the words past
 /// it, and its set-up start.
 pub(super) struct Record<'a> {
+    pub featured: u32,
     pub entry: Entry,
     prefix: &'a [u8],
     past: &'a [u8],
@@ -747,6 +755,7 @@ impl<'a> Record<'a> {
         let plies = usize::from(entry.plies);
         let (start, past) = tail.split_at(setup);
         Record {
+            featured: u32_at(slot, RANK_AT),
             entry,
             prefix: &slot[PREFIX_AT..PREFIX_AT + 2 * plies.min(PREFIX_WORDS)],
             past,
