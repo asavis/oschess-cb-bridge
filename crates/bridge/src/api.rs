@@ -30,6 +30,7 @@ use crate::snapshot::Database;
 use crate::store::{Head, Store, with_store};
 use crate::sync::{lock, unpoisoned};
 use crate::token;
+use crate::write;
 
 pub const API_VERSION: i64 = 1;
 pub const MAX_LIMIT: u32 = 500;
@@ -122,20 +123,33 @@ impl App {
     }
 }
 
-pub fn handle(app: &App, req: &Request) -> Response {
-    match app.policy.check(req) {
-        Verdict::Answer(response) => response,
-        Verdict::Serve { origin } => {
-            app.served.store(true, Ordering::Relaxed);
-            cors(route(app, req), origin.as_deref())
-        }
+/// The policy's verdict on `req`, taken before its body is read. A request
+/// it serves tells that a paired browser reached the bridge.
+pub fn admit(app: &App, req: &Request) -> Verdict {
+    let verdict = app.policy.check(req);
+    if matches!(verdict, Verdict::Serve { .. }) {
+        app.served.store(true, Ordering::Relaxed);
     }
+    verdict
+}
+
+/// The answer to `req`, which the policy serves, with the CORS headers for
+/// `origin`.
+pub fn serve(app: &App, req: &Request, origin: Option<&str>) -> Response {
+    cors(route(app, req), origin)
 }
 
 fn route(app: &App, req: &Request) -> Response {
     let Some(segments) = req.segments() else { return bad_parameter("path", "The path is not UTF-8") };
     let s: Vec<&str> = segments.iter().map(String::as_str).collect();
     match s[..] {
+        ["v1", "databases", id, "games"] if req.method == "POST" => with_entry(app, id, |e| write::append(e, req)),
+        ["v1", "databases", id, "games", number] if req.method == "PUT" => {
+            with_entry(app, id, |e| write::replace(e, number, req))
+        }
+        ["v1", "databases", id, "games", number] if req.method == "DELETE" => {
+            with_entry(app, id, |e| write::delete(e, number, req))
+        }
         ["v1", "status"] => status(app),
         ["v1", "databases"] => databases(app),
         ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(app, e, req)),
@@ -262,7 +276,12 @@ fn databases(app: &App) -> Response {
 
 /// A database of `GET /v1/databases`, as the tray app shows it too.
 fn database(d: &Database) -> String {
-    let mut o = Obj::new().str("id", &d.id).str("name", &d.name).str("format", d.format).str("state", d.state.name());
+    let mut o = Obj::new()
+        .str("id", &d.id)
+        .str("name", &d.name)
+        .str("format", d.format)
+        .str("state", d.state.name())
+        .bool("writable", d.writable);
     if let Some(records) = d.records {
         o = o.num("records", records);
     }

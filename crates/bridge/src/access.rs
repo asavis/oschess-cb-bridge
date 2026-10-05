@@ -46,8 +46,12 @@ impl Policy {
         if !self.token_ok(req.header("authorization")) {
             return refuse(error(401, "unauthorized", "The pairing token is missing or wrong"));
         }
-        if req.method != "GET" {
-            return refuse(error(405, "method_not_allowed", "Only GET is served").header("Allow", "GET, OPTIONS"));
+        let methods = methods(req);
+        if !methods.contains(&req.method.as_str()) {
+            let allow = format!("{}, OPTIONS", methods.join(", "));
+            return refuse(
+                error(405, "method_not_allowed", "The method is not served at this path").header("Allow", allow),
+            );
         }
         Verdict::Serve { origin }
     }
@@ -71,6 +75,40 @@ impl Policy {
     }
 }
 
+/// The methods served at `req`'s path besides `OPTIONS`: `GET` everywhere,
+/// and the writes of the games of a PGN database (`docs/api.md`, "Writing
+/// games") at theirs.
+fn methods(req: &Request) -> &'static [&'static str] {
+    match path_kind(req) {
+        Some(Games::List) => &["GET", "POST"],
+        Some(Games::One) => &["GET", "PUT", "DELETE"],
+        None => &["GET"],
+    }
+}
+
+/// The paths that take writes.
+enum Games {
+    /// `/v1/databases/{id}/games`.
+    List,
+    /// `/v1/databases/{id}/games/{number}`.
+    One,
+}
+
+fn path_kind(req: &Request) -> Option<Games> {
+    let segments = req.segments()?;
+    match segments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["v1", "databases", _, "games"] => Some(Games::List),
+        ["v1", "databases", _, "games", _] => Some(Games::One),
+        _ => None,
+    }
+}
+
+/// Whether `req` may carry a body: `POST` of a database's games and `PUT` of
+/// one game, which carry the game's PGN.
+pub fn takes_body(req: &Request) -> bool {
+    matches!((req.method.as_str(), path_kind(req)), ("POST", Some(Games::List)) | ("PUT", Some(Games::One)))
+}
+
 /// Compares without an early exit, so the time taken tells nothing about how
 /// much of the token matched.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -80,8 +118,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn preflight(req: &Request, origin: &str) -> Response {
     let mut r = Response::empty(204)
         .header("Access-Control-Allow-Origin", origin)
-        .header("Access-Control-Allow-Methods", "GET")
-        .header("Access-Control-Allow-Headers", "Authorization")
+        .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+        .header("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
         .header("Access-Control-Max-Age", "600")
         .header("Vary", "Origin");
     if req.header("access-control-request-private-network").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
@@ -94,7 +132,9 @@ fn preflight(req: &Request, origin: &str) -> Response {
 pub fn cors(r: Response, origin: Option<&str>) -> Response {
     let r = r.header("Vary", "Origin");
     match origin {
-        Some(o) => r.header("Access-Control-Allow-Origin", o).header("Access-Control-Expose-Headers", "Retry-After"),
+        Some(o) => {
+            r.header("Access-Control-Allow-Origin", o).header("Access-Control-Expose-Headers", "Retry-After, ETag")
+        }
         None => r,
     }
 }
@@ -102,6 +142,28 @@ pub fn cors(r: Response, origin: Option<&str>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes are served at the paths of a database's games alone, and only
+    /// they take a body.
+    #[test]
+    fn methods_and_bodies_by_path() {
+        let request = |method: &str, path: &str| {
+            let mut r = Request::get(path);
+            r.method = method.into();
+            r
+        };
+        let list = "/v1/databases/0123456789abcdef/games";
+        let one = "/v1/databases/0123456789abcdef/games/7";
+        assert_eq!(methods(&request("GET", list)), ["GET", "POST"]);
+        assert_eq!(methods(&request("GET", one)), ["GET", "PUT", "DELETE"]);
+        for path in ["/v1/status", "/v1/databases", "/v1/databases/x/suggest", "/v1/databases/x/games/7/x"] {
+            assert_eq!(methods(&request("GET", path)), ["GET"], "{path}");
+        }
+        assert!(takes_body(&request("POST", list)) && takes_body(&request("PUT", one)));
+        for (method, path) in [("POST", one), ("PUT", list), ("DELETE", one), ("GET", list), ("POST", "/v1/status")] {
+            assert!(!takes_body(&request(method, path)), "{method} {path}");
+        }
+    }
 
     #[test]
     fn constant_time_comparison() {

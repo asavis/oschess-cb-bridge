@@ -28,7 +28,8 @@ Store's copy, which updates itself through the Store (#153).
 > oschess (https://oschess.org).
 >
 > • Бази ChessBase з вашого диска відкриваються в бібліотеці oschess: пошук
-> партій, перегляд і аналіз. Міст лише читає бази й нічого в них не змінює.
+> партій, перегляд і аналіз. Бази ChessBase міст лише читає; файл PGN
+> змінюється, лише коли ви зберігаєте в нього партію в oschess.
 > • Рушій для аналізу: міст знаходить рушії ChessBase і Fritz або однією
 > кнопкою встановлює офіційну збірку Stockfish з GitHub. Аналітична дошка
 > oschess рахує на вашому процесорі.
@@ -65,8 +66,8 @@ Store's copy, which updates itself through the Store (#153).
 > (https://oschess.org).
 >
 > • ChessBase databases on your disk open in the oschess Library: search,
-> browse and analyse games. The bridge only reads the databases and never
-> changes them.
+> browse and analyse games. The bridge only reads ChessBase databases; a PGN
+> file changes only when you save a game into it in oschess.
 > • An engine for analysis: the bridge finds the engines of ChessBase and
 > Fritz, or installs the official Stockfish build from GitHub with one button.
 > The oschess analysis board calculates on your own processor.
@@ -105,12 +106,12 @@ content question is answered «No».
 Partner Center takes at most 500 characters here.
 
 > oschess bridge is a packaged Win32 desktop app (Windows.FullTrustApplication)
-> in the notification area. It reads ChessBase database files from folders the
-> user picks, serves them read-only on a loopback port (127.0.0.1) to the
-> oschess web app the user paired it with, and runs the UCI engine the user
-> chose as a child process: one from ChessBase or Fritz, or the official
-> Stockfish it downloads on request and checks against a pinned SHA-256. This
-> needs full-trust desktop access.
+> in the notification area. It reads ChessBase databases from folders the user
+> picks, serves them on 127.0.0.1 to the oschess web app the user paired it
+> with, writes only PGN files the user saves games to, and runs the UCI engine
+> the user chose as a child process: one from ChessBase or Fritz, or the
+> official Stockfish it downloads on request and checks against a pinned
+> SHA-256. This needs full-trust desktop access.
 
 ## Notes for certification
 

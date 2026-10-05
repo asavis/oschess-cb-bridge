@@ -214,6 +214,13 @@ impl Lexer {
         self.pos
     }
 
+    /// Whether the text read so far ends inside a `{` comment, in the
+    /// movetext or between a tag's tokens: what follows would be the
+    /// comment's until its `}`.
+    pub fn in_comment(&self) -> bool {
+        matches!(self.state, State::Comment | State::TagComment)
+    }
+
     /// Reads `bytes`, the text after what was read before.
     pub fn feed(&mut self, bytes: &[u8], sink: &mut impl Sink) {
         for &b in bytes {

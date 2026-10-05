@@ -236,9 +236,11 @@ oschess downloads it first ([docs/api.md](docs/api.md#cloud-only-databases)).
 
 A database path may name the `.2cbh` or `.cbh` file, or the common stem of its
 files, which is read as 2CBH when a `.2cbh` file has it.
-Databases are opened read-only and read with positional reads; nothing is
-written, and nothing leaves the machine except what the bridge serves to the
-oschess page on this computer.
+ChessBase databases are opened read-only and read with positional reads. A
+PGN file is changed only when you save a game into it in oschess
+([docs/api.md](docs/api.md#writing-games)); nothing else on the computer is
+written apart from the bridge's own folders, and nothing leaves the machine
+except what the bridge serves to the oschess page on this computer.
 
 ## The Windows app
 
@@ -298,7 +300,8 @@ Roles:
   request.
 
 Privacy: the bridge collects no information about you, your computer or your
-databases. It opens your databases read-only and serves them only to the
+databases. It opens ChessBase databases read-only, changes a PGN file only
+when you save a game into it in oschess, and serves your databases only to the
 oschess page in a browser on the same computer, over the loopback address
 `127.0.0.1`, and only to a browser that holds the pairing code. Beyond this
 computer, what it connects to depends on where you got it:

@@ -105,7 +105,7 @@ fn status_and_databases() {
     assert!(has_object(&d.body, r#""name":"base","format":"2cbh","state":"missing""#), "{}", d.body);
     assert!(!d.body.contains(db.dir().to_str().unwrap()), "paths are never sent");
     assert_eq!(d.header("access-control-allow-origin"), Some(ORIGIN));
-    assert_eq!(d.header("access-control-expose-headers"), Some("Retry-After"));
+    assert_eq!(d.header("access-control-expose-headers"), Some("Retry-After, ETag"));
 }
 
 #[test]
@@ -131,6 +131,22 @@ fn access_checks() {
     assert_eq!((r.status, r.header("access-control-allow-origin")), (403, None));
     let r = plain(p, &format!("POST /v1/status HTTP/1.1\r\n{host}\r\n{auth}"));
     assert_eq!((r.status, r.header("allow")), (405, Some("GET, OPTIONS")));
+    // Writes are served at the paths of a database's games alone.
+    let games = format!("/v1/databases/{}/games", bridge.id);
+    for (method, path, allow) in [
+        ("PUT", games.clone(), "GET, POST, OPTIONS"),
+        ("DELETE", games.clone(), "GET, POST, OPTIONS"),
+        ("POST", format!("{games}/1"), "GET, PUT, DELETE, OPTIONS"),
+        ("PATCH", format!("{games}/1"), "GET, PUT, DELETE, OPTIONS"),
+        ("DELETE", "/v1/databases".into(), "GET, OPTIONS"),
+        ("PUT", format!("/v1/databases/{}/suggest", bridge.id), "GET, OPTIONS"),
+    ] {
+        let r = plain(p, &format!("{method} {path} HTTP/1.1\r\n{host}\r\n{auth}"));
+        assert_eq!((r.status, r.header("allow")), (405, Some(allow)), "{method} {path}");
+    }
+    // The token is checked before the method, and before a body is read.
+    let r = send(p, &format!("POST {games} HTTP/1.1\r\n{host}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"));
+    assert_eq!(r.status, 401);
     // No Origin: a program, not a page; the token is enough.
     assert_eq!(plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: localhost:{p}\r\n{auth}")).status, 200);
     let pre = plain(
@@ -141,7 +157,8 @@ fn access_checks() {
     );
     assert_eq!(pre.status, 204);
     assert_eq!(pre.header("access-control-allow-origin"), Some(ORIGIN));
-    assert_eq!(pre.header("access-control-allow-headers"), Some("Authorization"));
+    assert_eq!(pre.header("access-control-allow-methods"), Some("GET, POST, PUT, DELETE"));
+    assert_eq!(pre.header("access-control-allow-headers"), Some("Authorization, Content-Type, If-Match"));
     assert_eq!(pre.header("access-control-allow-private-network"), Some("true"));
     let pre = plain(p, &format!("OPTIONS /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}"));
     assert_eq!((pre.status, pre.header("access-control-allow-private-network")), (204, None));
@@ -154,7 +171,11 @@ fn malformed_requests_bodies_and_oversized_headers() {
     let db = database("api-malformed", 1, 0, 0);
     let bridge = start(&db, vec![], None);
     let p = bridge.port;
-    let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 5"));
+    let auth = format!("Authorization: Bearer {TOKEN}");
+    let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n{auth}\r\nContent-Length: 5"));
+    assert_eq!((r.status, r.body.contains("body_not_allowed")), (413, true));
+    let r =
+        plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n{auth}\r\nTransfer-Encoding: chunked"));
     assert_eq!((r.status, r.body.contains("body_not_allowed")), (413, true));
     let big = "x".repeat(17 << 10);
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}"));
@@ -176,7 +197,10 @@ fn a_refusal_is_read_to_its_end_while_the_request_goes_on() {
     let big = "x".repeat(MAX_HEAD * 4);
     let r = plain(p, &format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}"));
     assert_eq!((r.status, r.body.contains("headers_too_large")), (431, true));
-    let head = format!("GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: {}", big.len());
+    let head = format!(
+        "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {}",
+        big.len()
+    );
     let r = send(p, &format!("{head}\r\nConnection: close\r\n\r\n{big}"));
     assert_eq!((r.status, r.body.contains("body_not_allowed")), (413, true));
 }
@@ -284,7 +308,7 @@ fn a_database_that_keeps_changing_is_reported() {
     assert_eq!(g.status, 503, "{}", g.body);
     assert!(g.body.contains(r#""code":"database_changing""#));
     assert_eq!(g.header("retry-after"), Some("1"));
-    assert_eq!(g.header("access-control-expose-headers"), Some("Retry-After"));
+    assert_eq!(g.header("access-control-expose-headers"), Some("Retry-After, ETag"));
 }
 
 /// The documented limitation: a save paused between its move record and its
@@ -483,17 +507,33 @@ fn refusals_before_routing_are_readable_by_the_page() {
     let host = format!("Host: 127.0.0.1:{p}");
     let big = format!("GET /v1/status HTTP/1.1\r\nOrigin: {ORIGIN}\r\n{host}\r\nX-Big: ");
     let big = format!("{big}{}", "x".repeat(MAX_HEAD + 1 - big.len()));
+    let auth = format!("Authorization: Bearer {TOKEN}");
     for (r, status) in [
-        (plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}\r\nContent-Length: 1")), 413),
+        (
+            plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\n{auth}\r\nOrigin: {ORIGIN}\r\nContent-Length: 1")),
+            413,
+        ),
+        (
+            plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}\r\nTransfer-Encoding: chunked")),
+            413,
+        ),
         (plain(p, &format!("GET /v1/status?q=%zz HTTP/1.1\r\n{host}\r\nOrigin: {ORIGIN}")), 400),
         (send(p, &big), 431),
     ] {
         assert_eq!(r.status, status);
         assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN), "{status}");
-        assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After"), "{status}");
+        assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After, ETag"), "{status}");
     }
-    let r =
-        plain(p, &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: https://evil.example\r\nContent-Length: 1"));
+    // The origin is checked before a body is looked at.
+    let r = plain(
+        p,
+        &format!("GET /v1/status HTTP/1.1\r\n{host}\r\n{auth}\r\nOrigin: https://evil.example\r\nContent-Length: 1"),
+    );
+    assert_eq!((r.status, r.header("access-control-allow-origin")), (403, None));
+    let r = plain(
+        p,
+        &format!("GET /v1/status HTTP/1.1\r\n{host}\r\nOrigin: https://evil.example\r\nTransfer-Encoding: chunked"),
+    );
     assert_eq!((r.status, r.header("access-control-allow-origin")), (413, None));
 }
 
@@ -626,7 +666,7 @@ fn busy_and_misdirected_answers_carry_cors() {
     assert!(r.body.contains(r#""code":"busy""#));
     assert_eq!(r.header("retry-after"), Some("1"));
     assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
-    assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After"));
+    assert_eq!(r.header("access-control-expose-headers"), Some("Retry-After, ETag"));
     drop(idle);
 }
 

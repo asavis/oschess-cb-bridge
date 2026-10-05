@@ -1,0 +1,1470 @@
+//! Writes into PGN databases (`docs/api.md`, "Writing games"): a game
+//! appended at the end of the file, or one replaced or removed. ChessBase's
+//! own formats are never written.
+//!
+//! An append writes after the file's last byte and leaves every earlier byte
+//! as it was; when it fails part-way, the file is cut back to its old length.
+//! A replace or a removal writes the whole new file beside the old one, as
+//! `<name>.pgn.oschess-tmp`, flushes it, and renames it over the old one,
+//! which a file system does at once: a crash leaves the old file or the new
+//! one. (Windows' `ReplaceFileW` is not used: some of its failures leave
+//! neither file at the name.) A temporary file left by a crash is removed
+//! when the bridge next lists the file.
+//!
+//! Writes into one file run one at a time. Each names the generation its
+//! client read, and nothing is written once the file changed since then. On
+//! Windows the file is held while it is read and written so that no other
+//! program writes it meanwhile, and a file another program holds is
+//! reported, never waited for.
+//!
+//! The text is written as the file is written: in UTF-8 when all of the file
+//! is UTF-8, which pure ASCII is, else in the computer's code page, as the
+//! reader decodes such a file; with the file's line ends. The header index of
+//! the new file is made from the old one (`cbformat::pgnfile::edit`), so a
+//! write of the bridge's own never puts the database into `opening`.
+
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use cbformat::codepage::CodePage;
+use cbformat::pgnfile::edit::{self, Edit, Games};
+use cbformat::pgnfile::lex::{Lexer, MAX_SYMBOL, Sink, Token};
+use cbformat::pgnfile::line::{LineEnd, main_line};
+use cbformat::pgnfile::scan::{Game, Splitter, Tag};
+use cbformat::pgnfile::{self, Record};
+use cbformat::view::Base;
+
+use crate::catalog::{Entry, Format, State};
+use crate::http::{Request, Response};
+use crate::json::Obj;
+use crate::reply::{bad_parameter, error, error_with, not_found, unavailable};
+use crate::sync::lock;
+
+/// Held by every write, so that writes run one at a time. Two listed paths may
+/// name one file, as a link and its target or two hard links do; a lock of
+/// each database's own would let their writes overlap, and one would undo
+/// the other.
+static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What a temporary file beside a PGN file adds to its name.
+const TEMP_SUFFIX: &str = ".oschess-tmp";
+/// Bytes of a file read or copied at a time.
+const CHUNK: usize = 1 << 20;
+
+/// `POST /v1/databases/{id}/games`: appends the game of the body.
+pub fn append(entry: &Entry, req: &Request) -> Response {
+    write(entry, req, Op::Append)
+}
+
+/// `PUT /v1/databases/{id}/games/{number}`: replaces game `number` with the
+/// game of the body.
+pub fn replace(entry: &Entry, number: &str, req: &Request) -> Response {
+    match game_number(number) {
+        Some(n) => write(entry, req, Op::Replace(n)),
+        None => not_found(),
+    }
+}
+
+/// `DELETE /v1/databases/{id}/games/{number}`: removes game `number`.
+pub fn delete(entry: &Entry, number: &str, req: &Request) -> Response {
+    match game_number(number) {
+        Some(n) => write(entry, req, Op::Delete(n)),
+        None => not_found(),
+    }
+}
+
+fn game_number(number: &str) -> Option<u32> {
+    number.parse::<u32>().ok().filter(|&n| n > 0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Append,
+    Replace(u32),
+    Delete(u32),
+}
+
+/// Why a write wrote nothing.
+#[derive(Debug)]
+enum Failure {
+    /// The file changed since the generation the client read.
+    Changed,
+    /// Windows refused to open, write or replace the file: another program
+    /// holds it.
+    Busy,
+    /// The file's code page has no byte for this character of the game.
+    Unencodable(char),
+    /// The edit would join games or end a neighbour elsewhere: a game next
+    /// to it lacks its result, or holds tags alone.
+    Joins,
+    /// The file system refused the write otherwise, as a full disk does.
+    Io(io::Error),
+    /// The file was written, then was gone before its generation was read.
+    Lost,
+    /// The header index claims what no file of its length holds, more games
+    /// than it has bytes: it is removed, and the file read again.
+    Damaged,
+}
+
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Failure {
+        if held_elsewhere(&e) { Failure::Busy } else { Failure::Io(e) }
+    }
+}
+
+/// Whether Windows refused a file operation because another program holds
+/// the file: a sharing or lock violation, access denied to a file in use, or
+/// a file mapped into another program's memory.
+#[cfg(windows)]
+fn held_elsewhere(e: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, ERROR_USER_MAPPED_FILE,
+    };
+    let held = [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_USER_MAPPED_FILE];
+    e.raw_os_error().is_some_and(|code| held.contains(&(code as u32)))
+}
+
+/// Elsewhere no program holds a file against another.
+#[cfg(not(windows))]
+fn held_elsewhere(_: &io::Error) -> bool {
+    false
+}
+
+/// What a write did.
+struct Written {
+    generation: u64,
+    /// Games in the file after it, when its header index was made.
+    games: Option<u32>,
+}
+
+fn write(entry: &Entry, req: &Request, op: Op) -> Response {
+    if matches!(entry.format, Format::TwoCbh | Format::Cbh) {
+        return read_only();
+    }
+    let Some(expected) = req.header("if-match") else {
+        return error(428, "precondition_required", "A write names the generation it read in If-Match");
+    };
+    let text = match op {
+        Op::Append | Op::Replace(_) => match game_text(&req.body) {
+            Ok(text) => Some(text),
+            Err(why) => return bad_parameter("body", why),
+        },
+        Op::Delete(_) => None,
+    };
+    let _one_at_a_time = lock(&WRITES);
+    let mut writing = entry.writing();
+    // The file as it is now, told before anything waits for an index of it:
+    // a file changed since the client read it is a conflict, not a file to
+    // open first.
+    if entry.generation().is_some_and(|now| !names_generation(expected, now)) {
+        return generation_changed();
+    }
+    let open = match entry.open() {
+        Ok(open) => open,
+        Err(state) => return unavailable(state),
+    };
+    if !names_generation(expected, open.generation) {
+        return generation_changed();
+    }
+    let Base::Pgn(db) = &*open.db else { return read_only() };
+    if !entry.writable_file() {
+        return read_only();
+    }
+    let count = db.record_count();
+    if let Op::Replace(n) | Op::Delete(n) = op
+        && n > count
+    {
+        return not_found();
+    }
+    let Some(index) = entry.pgn().index_path(&entry.id) else {
+        return error(500, "internal", "The bridge has no data folder for the header index");
+    };
+    let done = entry.pgn().while_idle(&entry.id, || {
+        let cached = (*writing).filter(|(g, _)| *g == open.generation).map(|(_, layout)| layout);
+        let edited = edit_file(entry, db, open.generation, cached, op, text.as_deref(), &index);
+        edited.map(|(written, layout)| {
+            *writing = Some((written.generation, layout));
+            written
+        })
+    });
+    let written = match done {
+        None => return unavailable(State::Opening),
+        Some(Err(Failure::Damaged)) => {
+            crate::log!("the header index of database {} claims more games than its file holds; read again", entry.id);
+            drop(writing);
+            // The next look opens the file again: its index is gone, so
+            // reading it starts now.
+            entry.forget(open.generation);
+            let _ = entry.open();
+            return unavailable(State::Opening);
+        }
+        Some(Err(failure)) => return refused(entry, failure),
+        Some(Ok(written)) => written,
+    };
+    drop(writing);
+    let (generation, page, path) = (written.generation, db.code_page(), entry.path.clone());
+    if written.games.is_some() {
+        entry.install(generation, || pgnfile::Database::open(&path, &index, generation, page).ok().map(Base::Pgn));
+    }
+    let tag = format!("{generation:016x}");
+    let body = Obj::new().str("generation", &tag);
+    let (status, body) = match op {
+        Op::Append => (201, body.num("number", written.games.unwrap_or(count + 1))),
+        Op::Replace(n) => (200, body.num("number", n)),
+        Op::Delete(_) => (200, body),
+    };
+    Response::json(status, body.done()).header("ETag", format!("\"{tag}\""))
+}
+
+/// Whether an `If-Match` header names `generation`, as an entity tag or bare.
+fn names_generation(header: &str, generation: u64) -> bool {
+    let tag = header.trim();
+    let tag = tag.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(tag);
+    tag == format!("{generation:016x}")
+}
+
+fn read_only() -> Response {
+    error(409, "read_only", "The database is not a PGN file that takes writes")
+}
+
+fn generation_changed() -> Response {
+    error(409, "generation_changed", "The file changed since the generation the write names; read it again")
+}
+
+fn refused(entry: &Entry, failure: Failure) -> Response {
+    match failure {
+        Failure::Changed => generation_changed(),
+        Failure::Busy => error(409, "file_busy", "Another program holds the file; close it there and write again"),
+        Failure::Unencodable(c) => {
+            error_with(422, "unencodable", "The file's code page cannot hold a character of the game", |o| {
+                o.str("character", &c.to_string())
+            })
+        }
+        Failure::Joins => error(
+            422,
+            "games_would_join",
+            "The edit would join games: a game next to it in the file lacks its result or holds tags alone",
+        ),
+        Failure::Io(e) => {
+            crate::log!("writing the PGN file of database {} failed: {e}", entry.id);
+            error(500, "write_failed", "The file system refused the write; the file is as it was")
+        }
+        Failure::Damaged => unavailable(State::Opening),
+        Failure::Lost => {
+            crate::log!("the PGN file of database {} was gone right after a write", entry.id);
+            error(500, "internal", "The file was written, then was gone")
+        }
+    }
+}
+
+/// The text of the one game `body` holds, as the reader finds it in a file:
+/// from its first tag (or move) to its end. Refused when the body is not
+/// UTF-8 or holds no game or more than one; when a `{` comment of the game is
+/// not closed; when the game holds what the reader would pass over, a move,
+/// number or result longer than any or bytes that make no PGN element; or
+/// when its main line does not play: a `FEN` tag
+/// that names no position, an empty one among them, or a move that names no
+/// legal move. A null move ends the main line, as it does in the reader.
+fn game_text(body: &[u8]) -> Result<String, &'static str> {
+    let text = std::str::from_utf8(body).map_err(|_| "The body is not UTF-8")?;
+    let game = match edit::one_game(text.as_bytes()) {
+        Games::None => return Err("The body holds no game"),
+        Games::One(game) => game,
+        Games::Several => return Err("The body holds more than one game"),
+    };
+    let span = text.get(game.start as usize..game.end as usize).ok_or("The game does not end at a character")?;
+    if game.tags.get(Tag::Fen).is_some_and(|fen| fen.trim_ascii().is_empty()) {
+        return Err("The game's FEN names no position");
+    }
+    let mut strict = Strict(None);
+    let mut lexer = Lexer::new();
+    lexer.feed(span.as_bytes(), &mut strict);
+    // What follows the game in the file would be the comment's.
+    if lexer.in_comment() {
+        return Err("A comment of the game is not closed");
+    }
+    lexer.finish(&mut strict, false);
+    if let Some(why) = strict.0 {
+        return Err(why);
+    }
+    match main_line(span.as_bytes(), &mut lexer, &mut |_, _| true) {
+        LineEnd::End | LineEnd::NullMove => Ok(span.to_string()),
+        LineEnd::BadStart => Err("The game's FEN names no position"),
+        LineEnd::Stopped | LineEnd::Unplayable(_) => Err("The game's main line does not play"),
+    }
+}
+
+/// Finds in a game's text what the reader passes over: a symbol longer than
+/// it keeps, which could hide anything after its first bytes, and bytes that
+/// make no PGN element.
+struct Strict(Option<&'static str>);
+
+impl Sink for Strict {
+    fn tag(&mut self, _: u64, _: u64, _: &[u8], _: &[u8], _: bool) {}
+
+    fn movetext(&mut self, start: u64, end: u64, _: u32, token: Token<'_>, _: bool) {
+        let why = match token {
+            Token::Symbol(_) if end - start > MAX_SYMBOL as u64 => "A move, number or result of the game is too long",
+            Token::Skipped => "The game holds bytes that make no PGN element",
+            _ => return,
+        };
+        self.0.get_or_insert(why);
+    }
+}
+
+/// Does `op` to the PGN file of `entry`, which `db` read at `generation`, and
+/// makes the header index of the new file at `index`, holding the database's
+/// build: what it wrote, and the layout of the file after it. `layout` is the
+/// file's at `generation`, when a write found it. `text` is the game for an
+/// append or a replace.
+fn edit_file(
+    entry: &Entry,
+    db: &pgnfile::Database,
+    generation: u64,
+    layout: Option<Layout>,
+    op: Op,
+    text: Option<&str>,
+    index: &Path,
+) -> Result<(Written, Layout), Failure> {
+    let path = &entry.path;
+    let (edit, layout) = {
+        let mut file = open_held(path, op == Op::Append)?;
+        // The file as the client read it; held, no other program changes it.
+        if entry.generation() != Some(generation) {
+            return Err(Failure::Changed);
+        }
+        let layout = match layout {
+            Some(layout) => layout,
+            None => Layout::of(&mut file)?,
+        };
+        let game = match text {
+            Some(text) => layout.encode(text, db.code_page()).map_err(Failure::Unencodable)?,
+            None => Vec::new(),
+        };
+        let len = file.metadata()?.len();
+        let count = db.record_count();
+        // Every game of a file read has a byte at least, and a database
+        // numbers fewer games than u32::MAX: an index claiming more is
+        // damaged, and goes, under the build, so that the file is read again.
+        if u64::from(count) > len || count == u32::MAX {
+            let _ = std::fs::remove_file(index);
+            return Err(Failure::Damaged);
+        }
+        let eol = layout.eol.text().as_bytes();
+        let (splice, first, removed) = match op {
+            Op::Append => {
+                let Some(number) = count.checked_add(1).filter(|&n| n < u32::MAX) else {
+                    return Err(Failure::Io(io::Error::other("the file holds as many games as a database numbers")));
+                };
+                (Splice { cut: len..len, ..layout.appended(&game) }, number, 0)
+            }
+            Op::Replace(n) => {
+                let record = db.record(n).map_err(io_error)?;
+                let cut = record.offset()..record.offset().saturating_add(u64::from(record.len()));
+                // A neighbour on the same line is kept apart by a line end.
+                let before = cut.start > 0 && !blank_before(&mut file, cut.start)?;
+                let after = cut.end < len && !byte_at(&mut file, cut.end)?.is_some_and(|b| b == b'\r' || b == b'\n');
+                let mut bytes = Vec::with_capacity(game.len() + 2 * eol.len());
+                if before {
+                    bytes.extend_from_slice(eol);
+                }
+                let at = bytes.len();
+                bytes.extend_from_slice(&game);
+                if after {
+                    bytes.extend_from_slice(eol);
+                }
+                (Splice { cut, bytes, game: Some(at..at + game.len()) }, n, 1)
+            }
+            Op::Delete(n) => {
+                let record = db.record(n).map_err(io_error)?;
+                // The game and the blank lines after it, to the next game.
+                let end = if n < count { db.record(n + 1).map(|r: Record| r.offset()).map_err(io_error)? } else { len };
+                (Splice { cut: record.offset()..end.max(record.offset()), bytes: Vec::new(), game: None }, n, 1)
+            }
+        };
+        let edit = Edit { first, removed, delta: splice.bytes.len() as i64 - span(&splice.cut) };
+        check_neighbours(&mut file, db, &edit, &splice, len)?;
+        let layout = match op {
+            Op::Append => {
+                append_at_end(&file, len, &splice.bytes, &mut &file)?;
+                layout.after_append()
+            }
+            Op::Replace(_) | Op::Delete(_) => rewrite(entry, generation, file, len, splice.cut.clone(), &splice.bytes)?,
+        };
+        (edit, layout)
+    };
+    let generation = entry.generation().ok_or(Failure::Lost)?;
+    let games = match edit::update(db, path, index, generation, &edit) {
+        Ok(games) => Some(games),
+        Err(e) => {
+            // The file is written; the next request reads it whole instead.
+            crate::log!("the header index of database {} after a write: {}", entry.id, crate::log::error(&e));
+            None
+        }
+    };
+    Ok((Written { generation, games }, layout))
+}
+
+fn span(range: &std::ops::Range<u64>) -> i64 {
+    (range.end - range.start) as i64
+}
+
+/// What an edit puts in the place of the bytes `cut` of the file: `bytes`,
+/// with the game, if there is one, at `game` among them.
+struct Splice {
+    cut: std::ops::Range<u64>,
+    bytes: Vec<u8>,
+    game: Option<std::ops::Range<usize>>,
+}
+
+/// The byte of `file` at `at`; `None` past its end.
+fn byte_at(file: &mut File, at: u64) -> io::Result<Option<u8>> {
+    file.seek(SeekFrom::Start(at))?;
+    let mut b = [0u8; 1];
+    loop {
+        match file.read(&mut b) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(b[0])),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether `file` starts with a byte-order mark.
+fn starts_with_bom(file: &mut File) -> io::Result<bool> {
+    let mut head = [0u8; 3];
+    file.seek(SeekFrom::Start(0))?;
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(head == BOM),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether what comes before byte `at` of `file` keeps a game starting
+/// there apart: a blank, or the byte-order mark the file starts with.
+fn blank_before(file: &mut File, at: u64) -> io::Result<bool> {
+    if at == BOM.len() as u64 && starts_with_bom(file)? {
+        return Ok(true);
+    }
+    Ok(byte_at(file, at - 1)?.is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0b' | b'\x0c')))
+}
+
+/// Refuses `splice`, the edit `edit` of `file`, `len` bytes long, unless the
+/// file after it reads as it must: the game before the edited span and the
+/// game after it as they were, moved, and the new game, if there is one, as
+/// one game of exactly its text. The reader would otherwise join a game to a
+/// neighbour that lacks its result or holds tags alone, or take a game after
+/// it into it. The text from the start of the game before to the end of the
+/// game after is read as it would be, nothing yet written.
+fn check_neighbours(
+    file: &mut File,
+    db: &pgnfile::Database,
+    edit: &Edit,
+    splice: &Splice,
+    len: u64,
+) -> Result<(), Failure> {
+    let count = db.record_count();
+    let mut expected = Vec::with_capacity(3);
+    let from = if edit.first >= 2 {
+        let r = db.record(edit.first - 1).map_err(io_error)?;
+        expected.push((r.offset(), r.offset().saturating_add(u64::from(r.len()))));
+        r.offset()
+    } else {
+        0
+    };
+    if let Some(game) = &splice.game {
+        expected.push((splice.cut.start + game.start as u64, splice.cut.start + game.end as u64));
+    }
+    let next = edit.first.saturating_add(edit.removed);
+    let to = if next <= count {
+        let r = db.record(next).map_err(io_error)?;
+        let start = r.offset().checked_add_signed(edit.delta).ok_or(Failure::Joins)?;
+        expected.push((start, start.saturating_add(u64::from(r.len()))));
+        r.offset().saturating_add(u64::from(r.len()))
+    } else {
+        len
+    };
+    let mut found = Vec::with_capacity(expected.len() + 1);
+    let mut splitter = Splitter::new(|g: &Game| {
+        if found.len() <= expected.len() {
+            found.push((g.start, g.end));
+        }
+    });
+    // A byte-order mark is no game's, as the reader reads the file.
+    let mut lexer = Lexer::at(from);
+    let mut at = from;
+    if from == 0 && splice.cut.start >= BOM.len() as u64 && starts_with_bom(file)? {
+        lexer.reset(BOM.len() as u64);
+        at = BOM.len() as u64;
+    }
+    feed_from(file, at, splice.cut.start, &mut lexer, &mut splitter)?;
+    lexer.feed(&splice.bytes, &mut splitter);
+    feed_from(file, splice.cut.end, to, &mut lexer, &mut splitter)?;
+    lexer.finish(&mut splitter, false);
+    splitter.finish();
+    drop(splitter);
+    if found != expected {
+        return Err(Failure::Joins);
+    }
+    Ok(())
+}
+
+/// Feeds `lexer` the bytes `from..to` of `file`.
+fn feed_from<S: Sink>(file: &mut File, from: u64, to: u64, lexer: &mut Lexer, sink: &mut S) -> io::Result<()> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut left = to.saturating_sub(from);
+    let mut buf = vec![0u8; CHUNK.min(usize::try_from(left).unwrap_or(CHUNK))];
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = match file.read(&mut buf[..want]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        lexer.feed(&buf[..n], sink);
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+fn io_error(e: cbformat::Error) -> Failure {
+    match e {
+        cbformat::Error::Io(_, e) => Failure::from(e),
+        e => Failure::Io(io::Error::other(crate::log::error(&e))),
+    }
+}
+
+/// The PGN file at `path`, opened to read it, and to write it when `write`.
+/// On Windows, no other program may write it while it is open, and a file
+/// another program holds against that is refused at once.
+fn open_held(path: &Path, write: bool) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(write);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+    }
+    options.open(path)
+}
+
+/// Writes `bytes` through `out` at the end of `file`, `len` bytes long, and
+/// flushes it to the disk. When that fails part-way, the file is cut back to
+/// `len`.
+fn append_at_end(file: &File, len: u64, bytes: &[u8], out: &mut impl Write) -> io::Result<()> {
+    let mut at = file;
+    let written = at
+        .seek(SeekFrom::Start(len))
+        .and_then(|_| out.write_all(bytes))
+        .and_then(|()| out.flush())
+        .and_then(|()| file.sync_data());
+    if let Err(e) = written {
+        let _ = file.set_len(len).and_then(|()| file.sync_data());
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The temporary file beside the PGN file `path` that a replace or a removal
+/// writes the new file to.
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(TEMP_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Removes the temporary file a replace or a removal left beside the PGN file
+/// `path`, or the file it links to, when the bridge stopped before it was
+/// renamed. Only a file is removed: a link of that name is not the bridge's.
+pub fn remove_leftover(path: &Path) {
+    let temp = temp_path(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    if std::fs::symlink_metadata(&temp).is_ok_and(|m| m.is_file()) {
+        match std::fs::remove_file(&temp) {
+            Ok(()) => crate::log!("removed {} left by a write that did not end", temp.display()),
+            Err(e) => crate::log!("{} left by a write that did not end cannot be removed: {e}", temp.display()),
+        }
+    }
+}
+
+/// Writes the PGN file of `entry`, which `file` holds, `len` bytes long,
+/// with `insert` in the place of the bytes `cut`, beside it, then renames the
+/// new file over it: the layout of the new file. A PGN path that is a link is
+/// written where it links to, so that the link stays. The temporary file is
+/// made new: a file or a link already of its name is no file of this write's,
+/// and is left as it is. The PGN file is let go before the rename, and its
+/// generation looked at again.
+fn rewrite(
+    entry: &Entry,
+    generation: u64,
+    file: File,
+    len: u64,
+    cut: std::ops::Range<u64>,
+    insert: &[u8],
+) -> Result<Layout, Failure> {
+    let target = std::fs::canonicalize(&entry.path)?;
+    let temp = temp_path(&target);
+    let out = create_temp_like(&file, &temp)?;
+    let written = write_temp(&file, len, &cut, insert, out);
+    drop(file);
+    let swapped = written.map_err(Failure::from).and_then(|layout| {
+        if entry.generation() != Some(generation) {
+            return Err(Failure::Changed);
+        }
+        std::fs::rename(&temp, &target)?;
+        sync_folder(&target);
+        Ok(layout)
+    });
+    if swapped.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    swapped
+}
+
+/// The temporary file `temp`, made new, with the access the PGN file
+/// `source` gives before any of the game's bytes go in, so that the file
+/// renamed over it keeps it: its permissions and group on Unix, its access
+/// control list on Windows. A file that fails to take them is removed.
+fn create_temp_like(source: &File, temp: &Path) -> io::Result<File> {
+    create_temp(temp, |out| copy_access(source, out))
+}
+
+/// [`create_temp_like`], with `access` giving the new file the source's
+/// access.
+fn create_temp(temp: &Path, access: impl FnOnce(&File) -> io::Result<()>) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Its owner's alone until it has the source's permissions.
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC};
+        options.access_mode(FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+    }
+    let out = options.open(temp)?;
+    if let Err(e) = access(&out) {
+        drop(out);
+        let _ = std::fs::remove_file(temp);
+        return Err(e);
+    }
+    Ok(out)
+}
+
+/// Gives `out` the group of `source`, its permissions, and on Linux its POSIX
+/// access control list, or none when it has none: a list `out` took from
+/// its folder's default goes, since the source's mode would widen its mask
+/// and grant its entries.
+#[cfg(unix)]
+fn copy_access(source: &File, out: &File) -> io::Result<()> {
+    copy_access_with(source, out, |out, group| std::os::unix::fs::fchown(out, None, Some(group)))
+}
+
+/// [`copy_access`], with `chgrp` giving `out` a group. A group the user may
+/// not give, one the user is not in, leaves `out` in the user's own. That
+/// group would then take the mode's group permissions, and the source's
+/// group, its members no longer in the file's group, the permissions of
+/// others, which Unix gives them nowhere else: a member of a file's group
+/// gets the group's permissions, even none, and never those of others. So
+/// another group is taken only by a mode that grants neither its group nor
+/// others anything; any other fails the write.
+#[cfg(unix)]
+fn copy_access_with(source: &File, out: &File, chgrp: impl FnOnce(&File, u32) -> io::Result<()>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = source.metadata()?;
+    // The group first: a change of group may clear bits the mode sets again.
+    let grouped = chgrp(out, meta.gid());
+    if out.metadata()?.gid() != meta.gid() && meta.mode() & 0o077 != 0 {
+        let why = grouped.err().map_or_else(|| "it stays in another".to_string(), |e| e.to_string());
+        return Err(io::Error::other(format!(
+            "the new file cannot take the file's group, and the mode grants its group or others access: {why}"
+        )));
+    }
+    let acl = read_acl(source)?;
+    if acl.is_none() {
+        drop_acl(out)?;
+    }
+    out.set_permissions(meta.permissions())?;
+    // The list last, since setting it sets the mode to match.
+    match acl {
+        Some(acl) => set_acl(out, &acl),
+        None => Ok(()),
+    }
+}
+
+/// The extended attribute that holds a file's POSIX access control list.
+#[cfg(target_os = "linux")]
+const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// Whether an extended attribute's error means there is none to read or
+/// remove: no such attribute, or a file system without them.
+#[cfg(target_os = "linux")]
+fn no_attribute(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP))
+}
+
+/// The POSIX access control list of `file`, as its attribute holds it;
+/// `None` when it has none. With one, the mode's group bits are the list's
+/// mask, and the owning group's own access is in the list alone. One that
+/// cannot be read whole is an error.
+#[cfg(target_os = "linux")]
+fn read_acl(file: &File) -> io::Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+    /// More than a file's list ever holds.
+    const MAX_ACL: usize = 64 << 10;
+    // SAFETY: a null buffer of size 0 asks for the value's size alone.
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let e = io::Error::last_os_error();
+        return if no_attribute(&e) { Ok(None) } else { Err(e) };
+    }
+    let mut value = vec![0u8; (size as usize).min(MAX_ACL)];
+    // SAFETY: `value` is as long as the size given; a value grown since is
+    // refused with ERANGE.
+    let read =
+        unsafe { libc::fgetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    value.truncate(read as usize);
+    Ok(Some(value))
+}
+
+/// Gives `file` the POSIX access control list `value`.
+#[cfg(target_os = "linux")]
+fn set_acl(file: &File, value: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the value is all of `value`.
+    let set = unsafe { libc::fsetxattr(file.as_raw_fd(), ACL_ACCESS.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    if set < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Removes the POSIX access control list of `file`, if it has one.
+#[cfg(target_os = "linux")]
+fn drop_acl(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the name is a valid C string; the call reads nothing else.
+    let removed = unsafe { libc::fremovexattr(file.as_raw_fd(), ACL_ACCESS.as_ptr()) };
+    if removed < 0 {
+        let e = io::Error::last_os_error();
+        if !no_attribute(&e) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Elsewhere than on Linux, a file's mode and group are all the bridge
+/// keeps.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_acl(_: &File) -> io::Result<Option<Vec<u8>>> {
+    Ok(None)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn set_acl(_: &File, _: &[u8]) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn drop_acl(_: &File) -> io::Result<()> {
+    Ok(())
+}
+
+/// Gives `out` the discretionary access control list of `source`, protected
+/// from the folder's inherited entries when the source's is: the entries the
+/// source inherits, `out` inherits from the same folder. A file system
+/// without access control lists, whose source gives none to read, leaves
+/// `out` as it is.
+#[cfg(windows)]
+fn copy_access(source: &File, out: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `source` holds its handle, opened with read access, which
+    // includes READ_CONTROL, for the whole call; the call writes the two out
+    // pointers, and the descriptor it allocates holds the list.
+    let read = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if read != 0 {
+        return Ok(());
+    }
+    let (mut control, mut revision) = (0u16, 0u32);
+    // SAFETY: `descriptor` is the one GetSecurityInfo returned, alive until
+    // it is freed below.
+    let told = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+    let protection = if told != 0 && control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: `out` holds its handle, opened with WRITE_DAC, for the whole
+    // call, and `dacl` points into `descriptor`, still alive.
+    let written = unsafe {
+        SetSecurityInfo(
+            out.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    // SAFETY: GetSecurityInfo allocated `descriptor` for the caller to free
+    // with LocalFree, once.
+    unsafe { LocalFree(descriptor) };
+    match written {
+        0 => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e as i32)),
+    }
+}
+
+/// Writes to `out`, a temporary file made for it, the bytes of `file`, `len`
+/// long, with `insert` in the place of `cut`, and flushes them to the disk:
+/// their layout.
+fn write_temp(file: &File, len: u64, cut: &std::ops::Range<u64>, insert: &[u8], out: File) -> io::Result<Layout> {
+    let mut out = BufWriter::with_capacity(CHUNK, out);
+    let mut scan = Scan::default();
+    let mut source = file;
+    let mut buf = vec![0u8; CHUNK];
+    let mut copy = |from: u64, to: u64, out: &mut BufWriter<File>, scan: &mut Scan| -> io::Result<()> {
+        source.seek(SeekFrom::Start(from))?;
+        let mut left = to.saturating_sub(from);
+        while left > 0 {
+            let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            let n = source.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            out.write_all(&buf[..n])?;
+            scan.feed(&buf[..n]);
+            left -= n as u64;
+        }
+        Ok(())
+    };
+    copy(0, cut.start, &mut out, &mut scan)?;
+    out.write_all(insert)?;
+    scan.feed(insert);
+    copy(cut.end, len, &mut out, &mut scan)?;
+    out.into_inner().map_err(io::IntoInnerError::into_error)?.sync_all()?;
+    Ok(scan.finish())
+}
+
+/// Flushes the folder of `path` after a rename in it, where the system can,
+/// so that the rename outlasts a crash. Windows flushes a rename itself.
+fn sync_folder(path: &Path) {
+    #[cfg(unix)]
+    if let Some(folder) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = File::open(folder).and_then(|f| f.sync_all());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// A line end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Eol {
+    CrLf,
+    Lf,
+    Cr,
+}
+
+impl Eol {
+    fn text(self) -> &'static str {
+        match self {
+            Eol::CrLf => "\r\n",
+            Eol::Lf => "\n",
+            Eol::Cr => "\r",
+        }
+    }
+}
+
+/// How a PGN file ends, after its byte-order mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// Nothing: an empty file, or a byte-order mark alone.
+    Empty,
+    /// A line without its line end.
+    Open,
+    /// A line and its line end.
+    Line,
+    /// An empty line: two line ends, or a line end alone.
+    Blank,
+}
+
+/// How a PGN file is written, as far as a write follows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    /// Whether all of it is UTF-8, which pure ASCII is: text is then written
+    /// in UTF-8, else in the computer's code page.
+    pub utf8: bool,
+    /// Its first line end, else CRLF, as ChessBase writes on Windows.
+    pub eol: Eol,
+    pub end: End,
+}
+
+impl Layout {
+    /// The layout of `file`, read whole.
+    fn of(file: &mut File) -> io::Result<Layout> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut scan = Scan::default();
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => return Ok(scan.finish()),
+                Ok(n) => scan.feed(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// `text` as the file writes it: its line ends the file's, in UTF-8 or
+    /// in `page`. The first character `page` cannot hold is the error.
+    fn encode(&self, text: &str, page: CodePage) -> Result<Vec<u8>, char> {
+        let mut lines = String::with_capacity(text.len() + text.len() / 32);
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' | '\n' => {
+                    if c == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    lines.push_str(self.eol.text());
+                }
+                c => lines.push(c),
+            }
+        }
+        if self.utf8 { Ok(lines.into_bytes()) } else { page.encode(&lines) }
+    }
+
+    /// What an append of `game` writes after the file's last byte: an empty
+    /// line between the file's last game and the new one, the line before it
+    /// ended first, then the game and an empty line, as PGN's export format
+    /// ends each game.
+    fn appended(&self, game: &[u8]) -> Splice {
+        let eol = self.eol.text().as_bytes();
+        let lead = match self.end {
+            End::Empty | End::Blank => 0,
+            End::Line => 1,
+            End::Open => 2,
+        };
+        let mut bytes = Vec::with_capacity(game.len() + eol.len() * (lead + 2));
+        for _ in 0..lead {
+            bytes.extend_from_slice(eol);
+        }
+        let at = bytes.len();
+        bytes.extend_from_slice(game);
+        bytes.extend_from_slice(eol);
+        bytes.extend_from_slice(eol);
+        Splice { cut: 0..0, bytes, game: Some(at..at + game.len()) }
+    }
+
+    /// The layout after an append: the text was written in the file's
+    /// encoding and line ends, and ends with an empty line.
+    fn after_append(self) -> Layout {
+        Layout { end: End::Blank, ..self }
+    }
+}
+
+const BOM: &[u8] = b"\xef\xbb\xbf";
+
+/// A file's layout, found as its bytes are fed in order.
+#[derive(Default)]
+struct Scan {
+    len: u64,
+    /// Its first three bytes, which may be a byte-order mark.
+    head: Vec<u8>,
+    /// A UTF-8 sequence the bytes so far end inside.
+    carry: Vec<u8>,
+    not_utf8: bool,
+    eol: Option<Eol>,
+    /// The bytes so far end with the file's first line end, a CR, which the
+    /// next byte may make a CRLF.
+    cr_last: bool,
+    /// Its last four bytes, the oldest first.
+    tail: [u8; 4],
+}
+
+impl Scan {
+    fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.len += bytes.len() as u64;
+        let room = 3usize.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
+        self.check_utf8(bytes);
+        if self.cr_last {
+            self.eol = Some(if bytes[0] == b'\n' { Eol::CrLf } else { Eol::Cr });
+            self.cr_last = false;
+        }
+        if self.eol.is_none()
+            && let Some(at) = bytes.iter().position(|&b| b == b'\r' || b == b'\n')
+        {
+            self.eol = match (bytes[at], bytes.get(at + 1)) {
+                (b'\n', _) => Some(Eol::Lf),
+                (_, Some(b'\n')) => Some(Eol::CrLf),
+                (_, Some(_)) => Some(Eol::Cr),
+                (_, None) => {
+                    self.cr_last = true;
+                    None
+                }
+            };
+        }
+        for &b in &bytes[bytes.len().saturating_sub(4)..] {
+            self.tail.rotate_left(1);
+            self.tail[3] = b;
+        }
+    }
+
+    fn check_utf8(&mut self, bytes: &[u8]) {
+        if self.not_utf8 {
+            return;
+        }
+        let joined;
+        let text = if self.carry.is_empty() {
+            bytes
+        } else {
+            joined = [std::mem::take(&mut self.carry).as_slice(), bytes].concat();
+            &joined[..]
+        };
+        if let Err(e) = std::str::from_utf8(text) {
+            match e.error_len() {
+                None => self.carry = text[e.valid_up_to()..].to_vec(),
+                Some(_) => self.not_utf8 = true,
+            }
+        }
+    }
+
+    fn finish(self) -> Layout {
+        let utf8 = !self.not_utf8 && self.carry.is_empty();
+        let eol = match (self.eol, self.cr_last) {
+            (Some(eol), _) => eol,
+            (None, true) => Eol::Cr,
+            (None, false) => Eol::CrLf,
+        };
+        let bom = if self.head == BOM { BOM.len() as u64 } else { 0 };
+        let content = self.len - bom;
+        let tail = &self.tail[4 - content.min(4) as usize..];
+        let is_eol = |b: &u8| *b == b'\r' || *b == b'\n';
+        let end = match tail.last() {
+            None => End::Empty,
+            Some(b) if !is_eol(b) => End::Open,
+            Some(_) => {
+                let ended = if tail.ends_with(b"\r\n") { 2 } else { 1 };
+                // A line end alone is an empty line.
+                match tail[..tail.len() - ended].last() {
+                    Some(b) if !is_eol(b) => End::Line,
+                    _ => End::Blank,
+                }
+            }
+        };
+        Layout { utf8, eol, end }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(bytes: &[u8]) -> Layout {
+        // Fed a byte at a time, as chunk boundaries may fall anywhere, and
+        // whole.
+        let mut one = Scan::default();
+        bytes.iter().for_each(|b| one.feed(std::slice::from_ref(b)));
+        let mut whole = Scan::default();
+        whole.feed(bytes);
+        let (one, whole) = (one.finish(), whole.finish());
+        assert_eq!(one, whole, "{bytes:?}");
+        one
+    }
+
+    #[test]
+    fn the_layout_of_a_file() {
+        let l = |utf8, eol, end| Layout { utf8, eol, end };
+        assert_eq!(layout(b""), l(true, Eol::CrLf, End::Empty));
+        assert_eq!(layout(BOM), l(true, Eol::CrLf, End::Empty));
+        assert_eq!(layout(b"[Event \"a\"]"), l(true, Eol::CrLf, End::Open));
+        assert_eq!(layout(b"a\nb\r\n"), l(true, Eol::Lf, End::Line));
+        assert_eq!(layout(b"a\r\nb\n\n"), l(true, Eol::CrLf, End::Blank));
+        assert_eq!(layout(b"a\rb\r\r"), l(true, Eol::Cr, End::Blank));
+        assert_eq!(layout(b"a\r"), l(true, Eol::Cr, End::Line));
+        assert_eq!(layout(b"\n"), l(true, Eol::Lf, End::Blank));
+        assert_eq!(layout(b"\r\n"), l(true, Eol::CrLf, End::Blank));
+        assert_eq!(layout(b"ab\r\n"), l(true, Eol::CrLf, End::Line));
+        assert_eq!(layout("\u{feff}Ж\r\n\r\n".as_bytes()), l(true, Eol::CrLf, End::Blank));
+        assert_eq!(layout(b"\xc5ngstr\xf6m\n"), l(false, Eol::Lf, End::Line));
+        // A sequence cut off at the end is not UTF-8.
+        assert!(!layout(b"ab\xd0").utf8);
+    }
+
+    #[test]
+    fn text_is_written_as_the_file_is() {
+        let utf8 = Layout { utf8: true, eol: Eol::CrLf, end: End::Line };
+        assert_eq!(utf8.encode("[White \"Таль\"]\n\n1. e4\r\n*", CodePage::WESTERN).unwrap(), {
+            "[White \"Таль\"]\r\n\r\n1. e4\r\n*".as_bytes().to_vec()
+        });
+        let ansi = Layout { utf8: false, eol: Eol::Lf, end: End::Line };
+        assert_eq!(ansi.encode("[White \"Ståhlberg\"]\r\r1. e4", CodePage::WESTERN).unwrap(), {
+            b"[White \"St\xe5hlberg\"]\n\n1. e4".to_vec()
+        });
+        assert_eq!(ansi.encode("[White \"Таль\"]", CodePage::WESTERN), Err('Т'));
+        let appended = |end| Layout { utf8: true, eol: Eol::Lf, end }.appended(b"G").bytes;
+        assert_eq!(appended(End::Empty), b"G\n\n");
+        assert_eq!(appended(End::Blank), b"G\n\n");
+        assert_eq!(appended(End::Line), b"\nG\n\n");
+        assert_eq!(appended(End::Open), b"\n\nG\n\n");
+    }
+
+    #[test]
+    fn the_game_of_a_body() {
+        assert_eq!(
+            game_text(b"\n[Event \"a\"]\n\n1. e4 e5 1-0 {end}\n\n").as_deref(),
+            Ok("[Event \"a\"]\n\n1. e4 e5 1-0 {end}")
+        );
+        assert_eq!(game_text("\u{feff}1. d4 *".as_bytes()).as_deref(), Ok("1. d4 *"));
+        assert_eq!(game_text(b"[Event \"a\"] 1. e4 -- 2. Qxf7 *").as_deref(), Ok("[Event \"a\"] 1. e4 -- 2. Qxf7 *"));
+        assert_eq!(game_text(b"").unwrap_err(), "The body holds no game");
+        assert_eq!(game_text(b"  {a comment}\n").unwrap_err(), "The body holds no game");
+        assert_eq!(game_text(b"1. e4 1-0\n1. d4 0-1").unwrap_err(), "The body holds more than one game");
+        assert_eq!(game_text(b"[Event \"a\"]\n[Event \"b\"]").unwrap_err(), "The body holds more than one game");
+        assert_eq!(game_text(b"1. e4 e5 2. Ke3 *").unwrap_err(), "The game's main line does not play");
+        assert_eq!(game_text(b"[FEN \"8/8/8 w - - 0 1\"]\n1. e4 *").unwrap_err(), "The game's FEN names no position");
+        assert_eq!(game_text(b"[Event \"\xff\"] *").unwrap_err(), "The body is not UTF-8");
+        // What the reader would pass over is refused, not written.
+        assert_eq!(game_text(b"[FEN \"\"]\n1. e4 *").unwrap_err(), "The game's FEN names no position");
+        assert_eq!(game_text(b"[FEN \" \"]\n1. e4 *").unwrap_err(), "The game's FEN names no position");
+        let long = "A move, number or result of the game is too long";
+        assert_eq!(game_text(b"[Event \"a\"]\n1. e4 0000000000000000GARBAGE *").unwrap_err(), long);
+        assert_eq!(game_text(b"1. e4 (1. d4 00000000000000001) *").unwrap_err(), long);
+        let bytes = "The game holds bytes that make no PGN element";
+        assert_eq!(game_text("1. e4 ½ *".as_bytes()).unwrap_err(), bytes);
+        assert_eq!(game_text(b"1. e4 [%clk 0:01:00] *").unwrap_err(), bytes);
+        // Text inside comments and tags is the game's own.
+        assert!(game_text("[White \"Ståhlberg\"] 1. e4 {½ [%clk 0:01:00]} 1-0".as_bytes()).is_ok());
+    }
+
+    /// An append that fails part-way leaves the file at its old length.
+    #[test]
+    fn a_failed_append_is_cut_back() {
+        struct Failing<'a> {
+            file: &'a File,
+            left: usize,
+        }
+        impl Write for Failing<'_> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.left == 0 {
+                    return Err(io::Error::other("the disk is full"));
+                }
+                let n = buf.len().min(self.left);
+                self.left -= n;
+                let mut file = self.file;
+                file.write(&buf[..n])
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let path = std::env::temp_dir().join(format!("bridge-write-cut-{}.pgn", std::process::id()));
+        let before = b"[Event \"a\"]\n1. e4 *\n";
+        let len = before.len() as u64;
+        std::fs::write(&path, before).unwrap();
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let failed = append_at_end(&file, len, b"\n[Event \"b\"]\n1. d4 *\n\n", &mut Failing { file: &file, left: 7 });
+        assert!(failed.is_err());
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        append_at_end(&file, len, b"\n1. d4 *\n\n", &mut &file).unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"[Event \"a\"]\n1. e4 *\n\n1. d4 *\n\n");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A group of the user's own other than the one new files take, for a
+    /// file the user may move into it; `None` for a user in one group.
+    #[cfg(unix)]
+    fn other_group() -> Option<u32> {
+        // SAFETY: a null list of size 0 asks for the count alone.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0 as libc::gid_t; usize::try_from(count).ok()?];
+        // SAFETY: `groups` holds `count` entries.
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(count).ok()?);
+        // SAFETY: getegid takes nothing and cannot fail.
+        let own = unsafe { libc::getegid() };
+        groups.into_iter().find(|&g| g != own)
+    }
+
+    /// A file's group is kept: given to the temporary file when the user
+    /// may. When the user may not, the write fails, the temporary file gone,
+    /// for a mode that grants the group or others anything: under `0604` the
+    /// group's members may not read, and moved to another group they would
+    /// read as others. Only a mode granting both nothing goes on.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_cannot_be_kept_fails_a_mode_that_grants_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Some(group) = other_group() else {
+            eprintln!("skipped: the user is in one group only");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("bridge-write-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        let temp = temp_path(&path);
+        let refused = |_: &File, _: u32| -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::EPERM)) };
+        for (mode, kept) in [(0o640, false), (0o604, false), (0o600, true)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let source = File::open(&path).unwrap();
+            // The user may: the group goes with the mode.
+            let out = create_temp_like(&source, &temp).unwrap();
+            let meta = out.metadata().unwrap();
+            assert_eq!((meta.gid(), meta.permissions().mode() & 0o7777), (group, mode), "{mode:o}");
+            drop(out);
+            std::fs::remove_file(&temp).unwrap();
+            // The user may not.
+            let made = create_temp(&temp, |out| copy_access_with(&source, out, refused));
+            assert_eq!(made.is_ok(), kept, "{mode:o}: {made:?}");
+            assert_eq!(temp.exists(), kept, "{mode:o}: a refused file is gone");
+            let _ = std::fs::remove_file(&temp);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temporary file has the PGN file's permissions from the start,
+    /// before any of the game's bytes go in.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporary_file_has_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-write-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for mode in [0o600, 0o640, 0o644] {
+            let path = dir.join("games.pgn");
+            std::fs::write(&path, b"1. e4 *\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let source = File::open(&path).unwrap();
+            let temp = temp_path(&path);
+            let out = create_temp_like(&source, &temp).unwrap();
+            assert_eq!(out.metadata().unwrap().permissions().mode() & 0o7777, mode, "{mode:o}");
+            assert_eq!(std::fs::metadata(&temp).unwrap().len(), 0);
+            drop(out);
+            std::fs::remove_file(&temp).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The value of `file`'s POSIX access control list; `None` without one.
+    #[cfg(target_os = "linux")]
+    fn acl_of(file: &File) -> Option<Vec<u8>> {
+        read_acl(file).unwrap()
+    }
+
+    /// The value of a POSIX access control list that lets user 65534 read
+    /// and the owning group nothing, its mask allowing reading: a file's mode
+    /// with it is 0640, though its group may not read it.
+    #[cfg(target_os = "linux")]
+    fn restrictive_acl() -> Vec<u8> {
+        // Version 2, then (tag, permissions, id) entries in tag order: the
+        // owner, user 65534, the owning group, the mask, others.
+        let mut value = 2u32.to_le_bytes().to_vec();
+        let none = u32::MAX;
+        for (tag, perm, id) in
+            [(0x01u16, 6u16, none), (0x02, 4, 65534), (0x04, 0, none), (0x10, 4, none), (0x20, 0, none)]
+        {
+            value.extend(tag.to_le_bytes());
+            value.extend(perm.to_le_bytes());
+            value.extend(id.to_le_bytes());
+        }
+        value
+    }
+
+    /// Sets the extended attribute `name` of the file or folder `file` to
+    /// `value`; `false` where the file system has no access control lists.
+    #[cfg(target_os = "linux")]
+    fn set_attribute(file: &File, name: &std::ffi::CStr, value: &[u8]) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the value is all of `value`.
+        let set = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        if set < 0 {
+            let e = io::Error::last_os_error();
+            assert_eq!(e.raw_os_error(), Some(libc::EOPNOTSUPP), "{e}");
+            return false;
+        }
+        true
+    }
+
+    /// Gives `file` the list of [`restrictive_acl`]; `false` where the file
+    /// system has no lists.
+    #[cfg(target_os = "linux")]
+    fn restrict(file: &File) -> bool {
+        set_attribute(file, ACL_ACCESS, &restrictive_acl())
+    }
+
+    /// A file without a list keeps none: the list its temporary file takes
+    /// from the folder's default, which grants user 65534 reading, goes, and
+    /// the file's mode stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_temporary_file_drops_a_list_its_folder_gives() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-write-default-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        // The folder's default list comes after the file, which has none.
+        if !set_attribute(&File::open(&dir).unwrap(), c"system.posix_acl_default", &restrictive_acl()) {
+            eprintln!("skipped: the file system of {} has no access control lists", dir.display());
+            return;
+        }
+        let source = File::open(&path).unwrap();
+        assert_eq!(acl_of(&source), None);
+        let temp = temp_path(&path);
+        let out = create_temp_like(&source, &temp).unwrap();
+        assert_eq!(acl_of(&out), None, "the folder's list goes");
+        assert_eq!(out.metadata().unwrap().permissions().mode() & 0o7777, 0o640);
+        drop(out);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temporary file has the PGN file's POSIX access control list from
+    /// the start, and the mode it implies.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_temporary_file_has_the_files_posix_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bridge-write-posix-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        let source = File::open(&path).unwrap();
+        if !restrict(&source) {
+            eprintln!("skipped: the file system of {} has no access control lists", dir.display());
+            return;
+        }
+        let acl = acl_of(&source).expect("a list");
+        let temp = temp_path(&path);
+        let out = create_temp_like(&source, &temp).unwrap();
+        assert_eq!(acl_of(&out).as_deref(), Some(&acl[..]));
+        assert_eq!(out.metadata().unwrap().permissions().mode() & 0o7777, 0o640);
+        drop(out);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temporary file has the PGN file's access control list from the
+    /// start: a list protected from the folder's stays protected, with its
+    /// entries.
+    #[cfg(windows)]
+    #[test]
+    fn the_temporary_file_has_the_files_access_control_list() {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo};
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        };
+        // Whether a file's list is protected, and its number of entries;
+        // with `protect`, it is made protected first, keeping its entries.
+        fn list(file: &File, protect: bool) -> (bool, u16) {
+            let (mut dacl, mut descriptor): (*mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut());
+            // SAFETY: as in `copy_access`.
+            unsafe {
+                let handle = file.as_raw_handle();
+                let info = DACL_SECURITY_INFORMATION;
+                assert_eq!(
+                    GetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        info,
+                        null_mut(),
+                        null_mut(),
+                        &mut dacl,
+                        null_mut(),
+                        &mut descriptor
+                    ),
+                    0
+                );
+                if protect {
+                    let info = info | PROTECTED_DACL_SECURITY_INFORMATION;
+                    assert_eq!(SetSecurityInfo(handle, SE_FILE_OBJECT, info, null_mut(), null_mut(), dacl, null()), 0);
+                }
+                let (mut control, mut revision) = (0u16, 0u32);
+                assert_ne!(GetSecurityDescriptorControl(descriptor, &mut control, &mut revision), 0);
+                let entries = if dacl.is_null() { 0 } else { (*dacl).AceCount };
+                LocalFree(descriptor);
+                (control & SE_DACL_PROTECTED != 0, entries)
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("bridge-write-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("games.pgn");
+        std::fs::write(&path, b"1. e4 *\n").unwrap();
+        // A handle that may change the list, which write access does not give.
+        let changing = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+            std::fs::OpenOptions::new().access_mode(READ_CONTROL | WRITE_DAC).open(&path).unwrap()
+        };
+        list(&changing, true);
+        drop(changing);
+        let source = File::open(&path).unwrap();
+        let (protected, entries) = list(&source, false);
+        assert!(protected && entries > 0);
+        let temp = temp_path(&path);
+        let out = create_temp_like(&source, &temp).unwrap();
+        assert_eq!(list(&out, false), (true, entries));
+        drop(out);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn if_match_names_a_generation() {
+        let g = 0x0123_4567_89ab_cdef;
+        assert!(names_generation("\"0123456789abcdef\"", g));
+        assert!(names_generation(" 0123456789abcdef ", g));
+        assert!(!names_generation("W/\"0123456789abcdef\"", g));
+        assert!(!names_generation("*", g));
+        assert!(!names_generation("\"0123456789abcdee\"", g));
+    }
+}

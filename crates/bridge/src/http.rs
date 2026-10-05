@@ -1,6 +1,6 @@
-//! HTTP/1.1, as much of it as the bridge serves: requests without bodies, JSON
-//! responses, persistent connections, and bodies of JSON lines streamed as
-//! chunks.
+//! HTTP/1.1, as much of it as the bridge serves: requests whose bodies, if
+//! any, carry a `Content-Length`, JSON responses, persistent connections, and
+//! bodies of JSON lines streamed as chunks.
 
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 /// The request line and headers together may not exceed this.
 pub const MAX_HEAD: usize = 16 << 10;
+/// The largest request body: one game's PGN, as large as the oschess
+/// Library takes (`docs/api.md`, "Writing games").
+pub const MAX_BODY: u64 = 4 << 20;
 /// How long a connection may sit idle between requests.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request may take to arrive once it has begun.
@@ -27,6 +30,10 @@ pub struct Request {
     headers: Vec<(String, String)>,
     /// Whether the client may send another request on this connection.
     pub keep_alive: bool,
+    /// The bytes of the body its `Content-Length` announces: 0 without one.
+    pub body_len: u64,
+    /// The body, once [`Conn::read_body`] has read it.
+    pub body: Vec<u8>,
 }
 
 impl Request {
@@ -62,7 +69,7 @@ pub enum ReadError {
     Dropped,
     /// The request line and headers exceed [`MAX_HEAD`].
     TooLarge,
-    /// The request carries a body.
+    /// The request's body is sent in chunks, which the bridge does not read.
     Body,
     /// The request is not well-formed HTTP/1.1.
     Malformed(&'static str),
@@ -167,6 +174,30 @@ impl Conn {
                 Err(_) => return Err(lost.quiet()),
             }
         }
+    }
+
+    /// The `len` bytes of body that follow the request just read, within
+    /// [`REQUEST_TIMEOUT`] from now; [`ReadError::Dropped`] when they do not
+    /// arrive in time. Bytes after them stay for the next request.
+    pub fn read_body(&mut self, len: usize) -> Result<Vec<u8>, ReadError> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        while self.buf.len() < len {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return Err(ReadError::Dropped);
+            };
+            if self.stream.set_read_timeout(Some(left)).is_err() {
+                return Err(ReadError::Dropped);
+            }
+            let mut chunk = [0u8; 16 << 10];
+            let want = chunk.len().min(len - self.buf.len());
+            match self.stream.read(&mut chunk[..want]) {
+                Ok(0) => return Err(ReadError::Dropped),
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(ReadError::Dropped),
+            }
+        }
+        Ok(self.buf.drain(..len).collect())
     }
 
     /// Writes `response`'s head, then the lines `body` produces as chunks of
@@ -348,6 +379,7 @@ impl Response {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -358,6 +390,7 @@ fn reason(status: u16) -> &'static str {
         413 => "Content Too Large",
         421 => "Misdirected Request",
         422 => "Unprocessable Content",
+        428 => "Precondition Required",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -413,21 +446,26 @@ fn parse(head: &[u8]) -> Result<Request, ReadError> {
     if count("content-length") > 1 {
         return Err(bad("content-length"));
     }
-    let request =
-        Request { method: method.into(), path: path.into(), query: parse_query(query)?, headers, keep_alive: false };
+    let request = Request {
+        method: method.into(),
+        path: path.into(),
+        query: parse_query(query)?,
+        headers,
+        keep_alive: false,
+        body_len: 0,
+        body: Vec::new(),
+    };
     if request.header("transfer-encoding").is_some() {
         return Err(ReadError::Body);
     }
-    if let Some(n) = request.header("content-length") {
-        match n.parse::<u64>() {
-            Ok(0) => {}
-            Ok(_) => return Err(ReadError::Body),
-            Err(_) => return Err(bad("content-length")),
-        }
-    }
+    let body_len = match request.header("content-length") {
+        None => 0,
+        Some(n) if n.bytes().all(|b| b.is_ascii_digit()) => n.parse::<u64>().map_err(|_| bad("content-length"))?,
+        Some(_) => return Err(bad("content-length")),
+    };
     let connection = request.header("connection").unwrap_or_default().to_ascii_lowercase();
     let keep_alive = if http10 { connection == "keep-alive" } else { connection != "close" };
-    Ok(Request { keep_alive, ..request })
+    Ok(Request { keep_alive, body_len, ..request })
 }
 
 fn parse_query(query: &str) -> Result<Vec<(String, String)>, ReadError> {
@@ -546,9 +584,36 @@ mod tests {
         ] {
             assert!(matches!(req(head), Err(ReadError::Malformed(_))), "{head:?}");
         }
-        assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 3").err(), Some(ReadError::Body));
+        assert!(matches!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: +3"), Err(ReadError::Malformed(_))));
         assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked").err(), Some(ReadError::Body));
-        assert!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 0").is_ok());
+        assert_eq!(req("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 0").map(|r| r.body_len), Ok(0));
+        assert_eq!(req("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3").map(|r| r.body_len), Ok(3));
+        assert_eq!(req("POST / HTTP/1.1\r\nHost: h").map(|r| r.body_len), Ok(0));
+    }
+
+    /// A body is read to its announced length, from what came with the head
+    /// and what follows, and what comes after it is the next request's.
+    #[test]
+    fn a_body_is_read_to_its_length() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut conn = Conn::new(listener.accept().unwrap().0);
+        client.write_all(b"POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\n0123").unwrap();
+        let first = conn.read_request().unwrap();
+        assert_eq!(first.body_len, 10);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"456789GET /b HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+            client
+        });
+        assert_eq!(conn.read_body(10).unwrap(), b"0123456789");
+        assert_eq!(conn.read_request().unwrap().path, "/b");
+        // A body cut short by the client's leaving is dropped.
+        let mut client = sender.join().unwrap();
+        client.write_all(b"POST /c HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nab").unwrap();
+        assert_eq!(conn.read_request().unwrap().body_len, 5);
+        drop(client);
+        assert_eq!(conn.read_body(5).err(), Some(ReadError::Dropped));
     }
 
     /// How long a connection waits for a request to begin, told by the read
