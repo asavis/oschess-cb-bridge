@@ -15,8 +15,8 @@ use crate::sync::lock;
 
 use super::{
     ALIGN, BATCH, CRC_AT, Departures, Entry, HEADER_LEN, Header, INDEXED, MAX_PLIES, PREFIX_AT, PREFIX_BYTES,
-    PREFIX_WORDS, SETUP, SETUP_BYTES, SLOT_BYTES, START_MOVE_AT, TABLE_ENTRY, TAIL_BUFFER, block_crc, record_crc,
-    records,
+    PREFIX_WORDS, RANK_AT, SETUP, SETUP_BYTES, SLOT_BYTES, START_MOVE_AT, TABLE_ENTRY, TAIL_BUFFER, block_crc,
+    record_crc, records,
 };
 
 /// The stream being written, `<id>.moves.partial`, from its start to its
@@ -24,6 +24,7 @@ use super::{
 /// of each block it ends, so that a game's tail is found only by its offset
 /// and a block only by the table.
 pub struct Writer {
+    pub(crate) anchor: u32,
     file: File,
     path: PathBuf,
     first: u32,
@@ -37,6 +38,10 @@ pub struct Writer {
 }
 
 impl Writer {
+    pub(crate) fn rank(&self, line: &Line) -> u32 {
+        crate::explorer::ranking::key(line.rating_sum, line.date, self.anchor)
+    }
+
     /// A new stream at `path` for records `first..=last`.
     pub fn create(path: &Path, first: u32, last: u32) -> Result<Writer, SearchError> {
         let records = records(first, last);
@@ -47,6 +52,7 @@ impl Writer {
         let file =
             File::options().read(true).write(true).create(true).truncate(true).open(path).map_err(|e| io(path, e))?;
         Ok(Writer {
+            anchor: 0,
             file,
             path: path.to_path_buf(),
             first,
@@ -191,6 +197,7 @@ impl Part<'_> {
         let entry = Entry { tail, plies: words.len() as u16, flags, departures };
         let slot = &mut self.slots[i * SLOT_BYTES..(i + 1) * SLOT_BYTES];
         slot[..PREFIX_AT].copy_from_slice(&entry.encode());
+        slot[RANK_AT..RANK_AT + 4].copy_from_slice(&self.writer.rank(line).to_le_bytes());
         if setup.is_some() {
             slot[START_MOVE_AT..START_MOVE_AT + 2].copy_from_slice(&line.start_move.to_le_bytes());
         }
@@ -209,7 +216,7 @@ impl Part<'_> {
             return Ok(());
         }
         let len = self.tail.len();
-        self.tail.resize(len.next_multiple_of(SLOT_BYTES), 0);
+        self.tail.resize(len.next_multiple_of(ALIGN as usize), 0);
         let base = self.writer.append(&self.tail)? / 2;
         for &i in &self.pending {
             let slot = &mut self.slots[i as usize * SLOT_BYTES..(i as usize + 1) * SLOT_BYTES];
@@ -238,6 +245,7 @@ impl Part<'_> {
         }
         let w = self.writer;
         let crc = block_crc(self.block as u32, &self.slots);
+        self.slots.resize(self.slots.len().next_multiple_of(ALIGN as usize), 0);
         let at = w.append(&self.slots)?;
         if let Some((block, sum)) = w.blocks.get(self.block) {
             block.store(at, Ordering::Relaxed);

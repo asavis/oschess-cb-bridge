@@ -37,10 +37,10 @@ use super::stream::{self, Stream};
 
 /// A position's run of entries this long or shorter is left as it is when a
 /// buffer is folded.
-const FOLD_MIN: usize = 2 * TOP_GAMES;
+const FOLD_MIN: usize = 4 * TOP_GAMES;
 /// The most entries a position folds into: its notable games, and a
 /// weighted entry for each move, or none, and outcome.
-pub(super) const FOLD_ENTRIES: usize = TOP_GAMES + 219 * 4;
+pub(super) const FOLD_ENTRIES: usize = 2 * TOP_GAMES + 219 * 4;
 /// The positions a game from the standard start reaches first within this
 /// many plies: at most 9,323 whatever the database, and the most crowded of
 /// all. The stream pass folds their entries as it reads the games
@@ -326,7 +326,9 @@ impl Pass<'_> {
                 make_room(buf, cap, scratch, self.first, self.hi, self.part_bits)?;
             }
             if part < self.hi.load(Ordering::Relaxed) {
-                buf.push(Entry::new(key, game, entry.outcome(), moves[ply], entry.elo()));
+                buf.push(
+                    Entry::new(key, game, entry.outcome(), moves[ply], entry.elo()).with_featured(record.featured),
+                );
             }
         }
         Ok(())
@@ -372,8 +374,24 @@ fn make_room(
     Ok(())
 }
 
+/// Stack-bounded top selection used while folding a crowded position.
+fn keep(top: &mut [Entry; TOP_GAMES], len: &mut usize, entry: Entry, rank: impl Fn(&Entry) -> (u32, u32)) {
+    let key = rank(&entry);
+    if *len == TOP_GAMES && rank(&top[TOP_GAMES - 1]) >= key {
+        return;
+    }
+    let at = top[..*len].partition_point(|e| rank(e) > key);
+    if at >= TOP_GAMES {
+        return;
+    }
+    let end = (*len).min(TOP_GAMES - 1);
+    top.copy_within(at..end, at + 1);
+    top[at] = entry;
+    *len = (*len + 1).min(TOP_GAMES);
+}
+
 /// Folds each position whose run of entries in the sorted `buf` is longer
-/// than [`FOLD_MIN`]: its [`TOP_GAMES`] best games are kept whole, and every
+/// than [`FOLD_MIN`]: the union of both best-game lists is kept whole, and every
 /// other entry is counted into a weighted entry of its move and outcome, so
 /// that a position however crowded takes a few hundred entries at most. The
 /// position adds up to what it did. `scratch` holds [`FOLD_ENTRIES`].
@@ -392,34 +410,35 @@ fn fold(buf: &mut Vec<Entry>, scratch: &mut Vec<Entry>) {
             i = j;
             continue;
         }
-        // The best games whole, best first, then the weighted entries.
-        scratch.clear();
-        let mut best = 0;
-        let rank = |e: &Entry| (e.elo(), e.game());
+        // Preserve the union of the two exact selections before folding
+        // all other games into counts. Never duplicate their contribution.
+        let mut legacy = [Entry::default(); TOP_GAMES];
+        let mut selected = [Entry::default(); TOP_GAMES];
+        let (mut old_len, mut new_len) = (0, 0);
         for &e in &buf[i..j] {
-            let folded = if e.is_weighted() {
-                Some(e)
-            } else if best < TOP_GAMES {
-                let at = scratch[..best].partition_point(|b| rank(b) > rank(&e));
-                scratch.insert(at, e);
-                best += 1;
-                None
-            } else if rank(&e) > rank(&scratch[best - 1]) {
-                let worst = scratch.remove(best - 1);
-                let at = scratch[..best - 1].partition_point(|b| rank(b) > rank(&e));
-                scratch.insert(at, e);
-                Some(worst)
-            } else {
-                Some(e)
-            };
-            if let Some(f) = folded {
-                match scratch[best..].iter_mut().find(|w| w.mv() == f.mv() && w.outcome() == f.outcome()) {
-                    Some(w) => {
-                        let games = (w.games() + f.games()).min(u64::from(MAX_GAME)) as u32;
-                        *w = Entry::weighted(key, games, f.outcome(), f.mv());
-                    }
-                    None => scratch.push(Entry::weighted(key, f.games() as u32, f.outcome(), f.mv())),
+            if !e.is_weighted() {
+                keep(&mut legacy, &mut old_len, e, |e| (u32::from(e.elo()), e.game()));
+                keep(&mut selected, &mut new_len, e, |e| (e.featured, e.game()));
+            }
+        }
+        scratch.clear();
+        scratch.extend_from_slice(&legacy[..old_len]);
+        for &e in &selected[..new_len] {
+            if !scratch.iter().any(|b| b.game() == e.game()) {
+                scratch.push(e);
+            }
+        }
+        let best = scratch.len();
+        for &f in &buf[i..j] {
+            if !f.is_weighted() && scratch[..best].iter().any(|b| b.game() == f.game()) {
+                continue;
+            }
+            match scratch[best..].iter_mut().find(|w| w.mv() == f.mv() && w.outcome() == f.outcome()) {
+                Some(w) => {
+                    let games = (w.games() + f.games()).min(u64::from(MAX_GAME)) as u32;
+                    *w = Entry::weighted(key, games, f.outcome(), f.mv());
                 }
+                None => scratch.push(Entry::weighted(key, f.games() as u32, f.outcome(), f.mv())),
             }
         }
         // Never more than the run: each weighted entry folds one at least.
@@ -549,6 +568,7 @@ struct Aggregate {
     moves: Vec<(u16, Counts)>,
     /// The best games so far, best first: (rating, game).
     top: Vec<(u16, u32)>,
+    featured: Vec<(u32, u32)>,
 }
 
 impl Aggregate {
@@ -557,7 +577,9 @@ impl Aggregate {
         moves.try_reserve_exact(256).ok()?;
         let mut top = Vec::new();
         top.try_reserve_exact(TOP_GAMES + 1).ok()?;
-        Some(Aggregate { count: Counts::default(), moves, top })
+        let mut featured = Vec::new();
+        featured.try_reserve_exact(TOP_GAMES + 1).ok()?;
+        Some(Aggregate { count: Counts::default(), moves, top, featured })
     }
 
     fn add(&mut self, e: &Entry) {
@@ -577,17 +599,19 @@ impl Aggregate {
             return;
         }
         rank_top(&mut self.top, (e.elo(), e.game()));
+        rank_top(&mut self.featured, (e.featured, e.game()));
     }
 
     /// Writes the position `key` to `made`, its moves in a record's order,
     /// and starts afresh.
     fn emit(&mut self, key: u64, made: &mut Blocks) -> Result<(), SearchError> {
         order_moves(&mut self.moves);
-        made.push(key, &self.count, &self.moves, &self.top)?;
+        made.push(key, &self.count, &self.moves, &self.top, &self.featured)?;
         made.games += self.count.games;
         self.count = Counts::default();
         self.moves.clear();
         self.top.clear();
+        self.featured.clear();
         Ok(())
     }
 }
@@ -643,6 +667,7 @@ impl Blocks {
         counts: &Counts,
         moves: &[(u16, Counts)],
         top: &[(u16, u32)],
+        featured: &[(u32, u32)],
     ) -> Result<(), SearchError> {
         if self.in_block == 0 {
             self.first_key = key;
@@ -650,7 +675,7 @@ impl Blocks {
         let at = u32::try_from(self.data.len()).map_err(|_| SearchError::TooLarge)?;
         self.keys.extend(key.to_le_bytes());
         self.keys.extend(at.to_le_bytes());
-        encode_record(&mut self.data, counts, moves, top.iter().map(|t| t.1));
+        encode_record(&mut self.data, counts, moves, top.iter().map(|t| t.1), featured.iter().map(|t| t.1));
         self.in_block += 1;
         self.keys_made += 1;
         if self.in_block == BLOCK_KEYS || self.data.len() >= BLOCK_DATA {
@@ -686,7 +711,7 @@ mod tests {
     use crate::explorer::format::Outcome;
 
     /// A position's counts, its moves' counts, by move, and its best games.
-    type Added = (Counts, Vec<(u16, Counts)>, Vec<(u16, u32)>);
+    type Added = (Counts, Vec<(u16, Counts)>, Vec<(u16, u32)>, Vec<(u32, u32)>);
 
     /// What `entries` of one position add up to.
     fn added(entries: &[Entry]) -> Added {
@@ -695,7 +720,7 @@ mod tests {
             a.add(e);
         }
         a.moves.sort_unstable_by_key(|m| m.0);
-        (a.count, a.moves, a.top)
+        (a.count, a.moves, a.top, a.featured)
     }
 
     #[test]
@@ -711,7 +736,7 @@ mod tests {
         let mut buf: Vec<Entry> = all.iter().chain(&few).copied().collect();
         let mut scratch = Vec::with_capacity(FOLD_ENTRIES);
         fold(&mut buf, &mut scratch);
-        assert!(buf.len() <= TOP_GAMES + 8 * 4 + few.len(), "{} entries", buf.len());
+        assert!(buf.len() <= 2 * TOP_GAMES + 8 * 4 + few.len(), "{} entries", buf.len());
         assert_eq!(&buf[buf.len() - few.len()..], &few[..]);
         let folded: Vec<Entry> = buf.iter().filter(|e| e.key == 9).copied().collect();
         assert_eq!(added(&folded), added(&all));

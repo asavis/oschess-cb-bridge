@@ -61,7 +61,10 @@ impl Recent {
     /// Keeps `answer` under `key` when the budget has room without taking any
     /// from searches, the oldest answer dropped when [`ENTRIES`] are kept.
     pub fn put(&self, key: Key, answer: Arc<Narrowed>) {
-        let moves = answer.stats.as_ref().map_or(0, |s| s.moves.len() * size_of::<(u16, Counts)>() + s.top.len() * 4);
+        let moves = answer
+            .stats
+            .as_ref()
+            .map_or(0, |s| s.moves.len() * size_of::<(u16, Counts)>() + (s.top.len() + s.featured.len()) * 4);
         let Ok(hold) = Hold::reserve_quietly(ENTRY_OVERHEAD + key.3.len() + moves) else { return };
         let mut entries = lock(&self.entries);
         entries.retain(|(k, ..)| *k != key);

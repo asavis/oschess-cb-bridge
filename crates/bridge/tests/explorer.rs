@@ -1156,16 +1156,17 @@ fn a_stream_record_that_fails_its_crc_is_rebuilt() {
     // keep the next bridge from replacing it.
     drop(bridge);
     let path = dir.join("index").join(format!("{id}.moves"));
-    for part in ["slot", "tail"] {
+    for part in ["slot", "tail", "selection"] {
         let before = std::fs::read(&path).unwrap();
         let header = explorer::stream::Header::decode(&before).unwrap();
-        // Game 2's slot, 64 bytes into the only block, which the table at
+        // Game 2's slot, one slot into the only block, which the table at
         // the file's end places: a word of its prefix, or of its tail.
         let table = header.table_offset as usize;
         let block = u64::from_le_bytes(before[table..table + 8].try_into().unwrap()) as usize;
-        let slot = block + 64;
+        let slot = block + explorer::stream::SLOT_BYTES;
         let at = match part {
             "slot" => slot + 16 + 6,
+            "selection" => slot + 60,
             _ => 2 * u32::from_le_bytes(before[slot..slot + 4].try_into().unwrap()) as usize + 10,
         };
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -1592,7 +1593,11 @@ fn counts_that_no_sound_index_holds_are_rebuilt() {
         (c(3, 1, 1, 1), vec![(nf3, c(2, 1, 0, 1)), (bc4, c(1, 0, 1, 0))], true, "a sum beyond the index's games"),
     ] {
         std::fs::write(&path, &sound).unwrap();
-        replace_record(&path, board.hash(), &Stats { counts, moves, top: tree.top.clone() });
+        replace_record(
+            &path,
+            board.hash(),
+            &Stats { counts, moves, top: tree.top.clone(), featured: tree.featured.clone() },
+        );
         let idx = prepared(&db, &dir);
         assert_eq!(idx.base.header.build_id, build, "{why}: the file was kept");
         assert_eq!(idx.lookup(board.hash()).is_ok(), alone, "{why}");
@@ -1616,7 +1621,11 @@ fn counts_that_no_sound_index_holds_are_rebuilt() {
     drop(bridge);
     let path = dir.join("index").join(format!("{id}.idx"));
     let moves = vec![(nf3, c(1, 1, 0, 0)), (bc4, c(1, 0, 1, 0))];
-    replace_record(&path, board.hash(), &Stats { counts: max, moves, top: tree.top.clone() });
+    replace_record(
+        &path,
+        board.hash(),
+        &Stats { counts: max, moves, top: tree.top.clone(), featured: tree.featured.clone() },
+    );
     let (bridge, _) = TestBridge::database(&db, &dir);
     let (status, body) = get(bridge.port, &url);
     assert_eq!(status, 409, "{body}");
