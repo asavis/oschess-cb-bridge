@@ -669,20 +669,23 @@ fn copy_access(source: &File, out: &File) -> io::Result<()> {
 }
 
 /// [`copy_access`], with `chgrp` giving `out` a group. A group the user may
-/// not give, one the user is not in, leaves `out` in the user's own: the
-/// mode's group permissions would then be another group's, so a source mode
-/// that grants its group any access fails the write, and one that grants it
-/// none goes on.
+/// not give, one the user is not in, leaves `out` in the user's own. That
+/// group would then take the mode's group permissions, and the source's
+/// group, its members no longer in the file's group, the permissions of
+/// others, which Unix gives them nowhere else: a member of a file's group
+/// gets the group's permissions, even none, and never those of others. So
+/// another group is taken only by a mode that grants neither its group nor
+/// others anything; any other fails the write.
 #[cfg(unix)]
 fn copy_access_with(source: &File, out: &File, chgrp: impl FnOnce(&File, u32) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = source.metadata()?;
     // The group first: a change of group may clear bits the mode sets again.
     let grouped = chgrp(out, meta.gid());
-    if out.metadata()?.gid() != meta.gid() && meta.mode() & 0o070 != 0 {
+    if out.metadata()?.gid() != meta.gid() && meta.mode() & 0o077 != 0 {
         let why = grouped.err().map_or_else(|| "it stays in another".to_string(), |e| e.to_string());
         return Err(io::Error::other(format!(
-            "the new file cannot take the file's group, whose mode grants that group access: {why}"
+            "the new file cannot take the file's group, and the mode grants its group or others access: {why}"
         )));
     }
     let acl = read_acl(source)?;
@@ -1224,9 +1227,10 @@ mod tests {
     }
 
     /// A file's group is kept: given to the temporary file when the user
-    /// may, and when the user may not, the write fails for a mode that grants
-    /// the group access, the temporary file gone, and goes on for one that
-    /// grants it none.
+    /// may. When the user may not, the write fails, the temporary file gone,
+    /// for a mode that grants the group or others anything: under `0604` the
+    /// group's members may not read, and moved to another group they would
+    /// read as others. Only a mode granting both nothing goes on.
     #[cfg(unix)]
     #[test]
     fn a_group_that_cannot_be_kept_fails_a_mode_that_grants_it() {
@@ -1243,7 +1247,7 @@ mod tests {
         std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
         let temp = temp_path(&path);
         let refused = |_: &File, _: u32| -> io::Result<()> { Err(io::Error::from_raw_os_error(libc::EPERM)) };
-        for (mode, kept) in [(0o640, false), (0o604, true), (0o600, true)] {
+        for (mode, kept) in [(0o640, false), (0o604, false), (0o600, true)] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             let source = File::open(&path).unwrap();
             // The user may: the group goes with the mode.
