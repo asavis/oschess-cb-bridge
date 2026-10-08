@@ -261,13 +261,29 @@ fn download_with_progress(
 /// file, and its major version is below the pinned one. `None` otherwise.
 pub fn offer(current: Option<(&Path, &str)>) -> Option<&'static Build> {
     let build = Build::for_arch(machine_arch());
-    let pinned: u32 = build.version.split('.').next()?.parse().ok()?;
+    let pinned = pinned_major(build)?;
     let (path, name) = current?;
+    (major_of(path, name)? < pinned).then_some(build)
+}
+
+/// Whether the engine at `path`, named `name`, is a Stockfish of the pinned
+/// major version or a newer one, its version read as [`offer`] reads it. An
+/// engine whose version cannot be read is not.
+pub fn is_current(path: &Path, name: &str) -> bool {
+    let pinned = pinned_major(Build::for_arch(machine_arch()));
+    pinned.zip(major_of(path, name)).is_some_and(|(pinned, major)| major >= pinned)
+}
+
+fn pinned_major(build: &Build) -> Option<u32> {
+    build.version.split('.').next()?.parse().ok()
+}
+
+/// The Stockfish major version that an engine's name or its folder names.
+fn major_of(path: &Path, name: &str) -> Option<u32> {
     // The folder's name whichever separator the path uses.
     let text = path.to_string_lossy();
     let folder = text.rsplit(['\\', '/']).nth(1).unwrap_or_default();
-    let major = [name, folder].iter().find_map(|text| stockfish_major(text))?;
-    (major < pinned).then_some(build)
+    [name, folder].iter().find_map(|text| stockfish_major(text))
 }
 
 /// The major version in a name such as `Stockfish 17.1`, `stockfish-16` or
@@ -522,5 +538,27 @@ mod tests {
             assert!(offer(Some((Path::new(path), name))).is_none(), "{name}");
         }
         assert!(offer(None).is_none());
+    }
+
+    /// Only a Stockfish whose name or folder names the pinned major version or
+    /// a newer one is current; an older one, another engine and a Stockfish of
+    /// unknown version are not.
+    #[test]
+    fn a_stockfish_of_the_pinned_version_or_newer_is_current() {
+        for (path, name) in [
+            (r"C:\x\stockfish-19\stockfish.exe", "Stockfish 19"),
+            (r"C:\CB\Engines.x64\Stockfish 19.1\sf.exe", "sf"),
+            (r"C:\x\y\engine.exe", "Stockfish_20_x64"),
+        ] {
+            assert!(is_current(Path::new(path), name), "{name}");
+        }
+        for (path, name) in [
+            (r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe", "Stockfish 17.1"),
+            (r"C:\x\lc0\lc0.exe", "Lc0 v0.31"),
+            (r"C:\x\sf.exe", "Stockfish dev"),
+            (r"C:\CB\Engines\stockfish.exe", "stockfish"),
+        ] {
+            assert!(!is_current(Path::new(path), name), "{name}");
+        }
     }
 }

@@ -127,6 +127,16 @@ pub fn offer_for(data: &Path, chosen: Option<&Path>, found: &[Found], running: &
     (!stockfish::is_installed(data, build) && !dismissed).then_some(name)
 }
 
+/// Whether the first-run wizard recommends installing the pinned Stockfish
+/// build beside the engines `found` (#287): none of them, nor the `chosen`
+/// engine, is a Stockfish of the pinned version or newer
+/// ([`stockfish::is_current`]). A build the bridge installed is listed by its
+/// version, so an installed pinned build ends the recommendation.
+pub fn recommend_install(chosen: Option<&Path>, found: &[Found]) -> bool {
+    let chosen_current = chosen.is_some_and(|c| stockfish::is_current(c, &name_of(c, found)));
+    !chosen_current && !found.iter().any(|f| stockfish::is_current(&f.path, &f.name))
+}
+
 /// The name of the `chosen` engine: as `found` names it, else after its file
 /// without `.exe`, as the list names an engine by its file.
 fn name_of(chosen: &Path, found: &[Found]) -> String {
@@ -159,6 +169,9 @@ pub struct EnginesView {
     /// The chosen engine's name when it is an older Stockfish and the offer
     /// was not put off for this bridge version.
     offer_for: Option<String>,
+    /// Whether the first-run wizard recommends installing the pinned build
+    /// ([`recommend_install`]).
+    recommend_install: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -190,6 +203,7 @@ impl EnginesView {
             chosen: chosen.map(|p| p.to_string_lossy().into_owned()),
             chosen_name: chosen.map(|p| name_of(p, &found)),
             offer_for: offer_for(data, chosen, &found, running),
+            recommend_install: recommend_install(chosen, &found),
             install: Installable { version: build.version, megabytes: build.megabytes() },
             found: found
                 .into_iter()
@@ -463,6 +477,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The wizard recommends the pinned build beside older Stockfish builds and
+    /// other engines, found or chosen by file (#287), and not once an engine
+    /// found or chosen is that version or newer, as the build the bridge
+    /// installed is.
+    #[test]
+    fn recommends_the_pinned_build_until_a_current_stockfish_is_found_or_chosen() {
+        let older = [
+            listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"),
+            listed("Lc0 0.31", r"C:\lc0\lc0.exe"),
+        ];
+        assert!(recommend_install(None, &older));
+        assert!(recommend_install(None, &[]), "nothing found");
+        assert!(recommend_install(Some(Path::new(r"C:\lc0\lc0.exe")), &older));
+        assert!(recommend_install(Some(Path::new(r"C:\x\stockfish.exe")), &older), "a version nobody names");
+        assert!(!recommend_install(Some(Path::new(r"C:\x\stockfish_19_x64.exe")), &older), "chosen by its file");
+
+        let dir = folder("recommend");
+        let build = Build::for_arch(stockfish::machine_arch());
+        for file in [build.installed(&dir), build.dir(&dir).join(stockfish::LICENCE)] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"MZ").unwrap();
+        }
+        let roots = bridge::engines::Roots { bridge_data: Some(dir.clone()), ..Default::default() };
+        let mut with_installed = bridge::engines::find(&roots);
+        assert_eq!(with_installed.len(), 1, "the installed build is listed");
+        with_installed.extend(older);
+        assert!(!recommend_install(None, &with_installed));
+        let view = serde_json::to_value(EnginesView::new(&dir, None, with_installed, "1.2.1")).unwrap();
+        assert_eq!(view["recommendInstall"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// «Later» puts the offer off for this bridge version: it stays put off
     /// when the preferences are saved again or another older Stockfish is
     /// chosen, and the next bridge version offers again.
@@ -514,6 +560,7 @@ mod tests {
         }
         let build = Build::for_arch(stockfish::machine_arch());
         assert_eq!(none["install"], json!({ "version": build.version, "megabytes": build.megabytes() }));
+        assert_eq!(none["recommendInstall"], true, "only an older Stockfish found");
 
         let progress = |p: Progress| serde_json::to_value(InstallProgress::from(p)).unwrap();
         for build in &stockfish::PINNED {

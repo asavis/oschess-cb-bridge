@@ -208,9 +208,29 @@ function renderEngines(next) {
   }
   if (!listed.some((e) => e.path === picked)) picked = engines.chosen ?? (listed.length ? listed[0].path : null);
   document.getElementById('engines').replaceChildren(...listed.map(engineRow));
-  document.getElementById('engine-none').hidden = listed.length > 0;
+  renderInstall(listed.length === 0);
   document.getElementById('engine-found').hidden = listed.length === 0;
   if (step) footer();
+}
+
+// With no engine found, installing Stockfish is the step's main action. With
+// engines found but none of them the pinned Stockfish or newer, the step
+// recommends installing it above them, as the settings window's offer looks
+// (#287); the list keeps its own «Choose a file…».
+function renderInstall(none) {
+  const card = document.getElementById('engine-install');
+  const recommend = !none && engines.recommendInstall;
+  card.hidden = !none && !recommend;
+  card.classList.toggle('offer', recommend);
+  const row = card.querySelector('.row');
+  row.querySelector(':scope > svg')?.remove();
+  row.prepend(icon(recommend ? 'download' : 'cpu', 20));
+  const version = engines.install.version;
+  document.getElementById('install-title').textContent =
+    recommend ? t('wizard.engine.recommend.title', { version }) : t('settings.engine.none.title');
+  document.getElementById('install-lead').textContent =
+    recommend ? t('wizard.engine.recommend.hint', { version }) : t('settings.engine.none.hint');
+  document.getElementById('pick-other').hidden = recommend;
 }
 
 function engineRow(engine) {
