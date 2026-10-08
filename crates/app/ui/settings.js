@@ -6,6 +6,28 @@ let current = null;
 let engines = null;
 let updateProgress = null;
 let checkPending = false;
+let served = null;
+let installProgress = null;
+let portFailure = null;
+
+// Repaint words only: keep the active section, inputs, pairing disclosure and
+// controls locked by ongoing work.
+function retranslate() {
+  document.getElementById('language').value = LANG;
+  if (served) renderServed(served);
+  if (current) renderSettings(current);
+  if (engines) {
+    renderEngines(engines);
+    enginesBusy(choosing);
+  }
+  if (installProgress) showInstallProgress(installProgress);
+  document.getElementById('show-code').textContent =
+    document.getElementById('code-line').hidden ? t('settings.code.show') : t('settings.code.hide');
+  if (portFailure) document.getElementById('port-error').textContent = failure(portFailure);
+  if (notice.text && !document.getElementById('notice').hidden) {
+    document.getElementById('notice').textContent = notice.text();
+  }
+}
 
 async function main() {
   await loadWords();
@@ -40,6 +62,7 @@ function show(section) {
 }
 
 function renderServed(view) {
+  served = view;
   const rows = view.databases.map(databaseRow);
   if (view.problem) {
     rows.unshift(problemRow(view.problem));
@@ -106,7 +129,7 @@ async function checkUpdates() {
   try {
     renderUpdateProgress(await call('check_updates'));
   } catch (error) {
-    notice(failure(error));
+    notice(() => failure(error));
     // An IPC failure must not overwrite a job already confirmed by an event.
     if (!updateProgress?.busy) {
       renderUpdateProgress({ revision: updateProgress?.revision ?? 0, phase: 'failed', busy: false });
@@ -178,11 +201,11 @@ function choose(path) {
       // #73: starting an engine can take seconds; the section says so until it answers.
       line.hidden = false;
       return call('choose_engine', { path: chosen }).then(renderEngines, (error) => {
-        notice(failure(error));
+        notice(() => failure(error));
         return call('engines').then(renderEngines);
       });
     })
-    .catch((error) => notice(failure(error)))
+    .catch((error) => notice(() => failure(error)))
     .finally(() => {
       choosing = false;
       enginesBusy(false);
@@ -213,10 +236,10 @@ function installStockfish() {
   choosing = true;
   enginesBusy(true);
   const line = document.getElementById('install-progress');
-  line.textContent = t('settings.engine.progress.downloading', { done: 0, total: engines ? engines.install.megabytes : 0 });
+  showInstallProgress({ phase: 'downloading', doneMegabytes: 0, totalMegabytes: engines ? engines.install.megabytes : 0 });
   line.hidden = false;
   call('install_stockfish')
-    .then(renderEngines, (error) => notice(failure(error)))
+    .then(renderEngines, (error) => notice(() => failure(error)))
     .finally(() => {
       choosing = false;
       enginesBusy(false);
@@ -226,6 +249,7 @@ function installStockfish() {
 
 // The app counts the megabytes, rounded as the build's size is.
 function showInstallProgress(progress) {
+  installProgress = progress;
   const line = document.getElementById('install-progress');
   line.textContent = progress.phase === 'downloading'
     ? t('settings.engine.progress.downloading', { done: progress.doneMegabytes, total: progress.totalMegabytes })
@@ -238,6 +262,20 @@ function toggle(id, onNow) {
 }
 
 function wire() {
+  const language = document.getElementById('language');
+  language.addEventListener('change', async () => {
+    const chosen = language.value;
+    language.disabled = true;
+    try {
+      await call('set_language', { language: chosen });
+      applyLanguage(chosen);
+    } catch (error) {
+      language.value = LANG;
+      notice(() => failure(error));
+    } finally {
+      language.disabled = false;
+    }
+  });
   document.getElementById('engine-checking').prepend(icon('spin', 14, 2.4));
   document.getElementById('add-folder').addEventListener('click', () =>
     act(call('add_folder').then((settings) => settings && renderSettings(settings))));
@@ -249,7 +287,7 @@ function wire() {
   document.getElementById('autostart').addEventListener('click', () =>
     act(call('set_autostart', { on: !current.autostart }).then((settings) => {
       renderSettings(settings);
-      if (settings.autostartBlocked) notice(t('settings.autostart.blockedHint'));
+      if (settings.autostartBlocked) notice(() => t('settings.autostart.blockedHint'));
     })));
   document.getElementById('auto-update').addEventListener('click', () =>
     act(call('set_auto_update', { on: !current.autoUpdate }).then(renderSettings)));
@@ -287,6 +325,7 @@ function wire() {
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     call('set_port', { port: input.value }).then(restarting, (failed) => {
+      portFailure = failed;
       error.textContent = failure(failed);
       error.hidden = false;
     });
@@ -301,7 +340,7 @@ async function revealCode(shown) {
       const pairing = await call('pairing_code');
       document.getElementById('code').textContent = pairing.code;
     } catch (error) {
-      notice(failure(error));
+      notice(() => failure(error));
       return;
     }
   }
@@ -310,19 +349,20 @@ async function revealCode(shown) {
 }
 
 function restarting() {
-  notice(t('settings.restarting'));
+  notice(() => t('settings.restarting'));
 }
 
 function notice(text) {
   const node = document.getElementById('notice');
-  node.textContent = text;
+  notice.text = text;
+  node.textContent = text();
   node.hidden = false;
   clearTimeout(notice.timer);
   notice.timer = setTimeout(() => { node.hidden = true; }, 6000);
 }
 
 function act(promise) {
-  return promise.catch((error) => notice(failure(error)));
+  return promise.catch((error) => notice(() => failure(error)));
 }
 
 main();

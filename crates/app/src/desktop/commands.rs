@@ -17,6 +17,7 @@ use super::autostart::{self, State};
 use super::server::{self, Pairing};
 use super::{SharedState, channel, shared, tray, updater, windows};
 use crate::choices::{self, Choices, EnginesView, InstallProgress};
+use crate::i18n::Lang;
 use crate::prefs;
 use crate::settings::{self, Extra, Failure};
 use crate::status::View;
@@ -88,6 +89,27 @@ pub fn fit_flyout(app: AppHandle, height: f64) {
 #[tauri::command]
 pub fn settings(app: AppHandle) -> Answer<SettingsView> {
     settings_view(&app)
+}
+
+/// Reading after subscribing also catches a change during window creation.
+#[tauri::command]
+pub fn language(app: AppHandle, window: WebviewWindow) -> &'static str {
+    let shared = shared(&app);
+    windows::translate_window(&window, &shared.strings);
+    shared.strings.lang().code()
+}
+
+#[tauri::command]
+pub fn set_language(app: AppHandle, language: String) -> Answer<()> {
+    let lang = Lang::from_code(&language).ok_or_else(|| Failure::new("settings.language.invalid"))?;
+    let shared = shared(&app);
+    let dir = shared.dir()?;
+    prefs::update(&dir, |prefs| prefs.language = Some(lang))?;
+    shared.strings.set_lang(lang);
+    tray::translate(&app);
+    windows::translate(&app);
+    let _ = app.emit("language", lang.code());
+    Ok(())
 }
 
 fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
@@ -258,7 +280,7 @@ pub fn switch_autostart(app: &AppHandle, on: bool) -> Result<State, String> {
 #[tauri::command]
 pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
-    prefs::save(&dir, &prefs::Prefs { auto_update: on, ..prefs::load(&dir) })?;
+    prefs::update(&dir, |prefs| prefs.auto_update = on)?;
     settings_view(&app)
 }
 

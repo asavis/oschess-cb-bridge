@@ -19,7 +19,7 @@ use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 use crate::channel::Channel;
-use crate::i18n::{Lang, Strings};
+use crate::i18n::Strings;
 use crate::status::{Problem, View};
 use server::Shared;
 
@@ -38,7 +38,8 @@ pub(crate) fn channel() -> &'static Channel {
 }
 
 pub fn run() {
-    let strings = Strings::new(Lang::from_langid(system::display_language()));
+    let prefs = bridge::start::data_dir().ok().map(|dir| crate::prefs::load(&dir)).unwrap_or_default();
+    let strings = Strings::new(prefs.language(system::display_language()));
     let context = tauri::generate_context!();
     let mut builder = tauri::Builder::default()
         // First: a second start hands over to this one and exits.
@@ -66,6 +67,8 @@ pub fn run() {
             commands::hide_flyout,
             commands::fit_flyout,
             commands::settings,
+            commands::language,
+            commands::set_language,
             commands::add_folder,
             commands::remove_database,
             commands::engines,

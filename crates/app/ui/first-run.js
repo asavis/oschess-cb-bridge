@@ -29,6 +29,23 @@ let paired = false;
 // The engine folders' answer, which «Next» on the engine step and «Skip
 // setup» wait for: until then no engine is marked, found or not.
 let enginesRead = null;
+let installProgress = null;
+
+function retranslate() {
+  if (view) showView(view);
+  if (settings) renderSettings(settings);
+  if (engines) renderEngines(engines);
+  if (installProgress) showInstallProgress(installProgress);
+  if (step) {
+    renderStepText();
+    footer();
+    if (step === 'done') renderSummary();
+  }
+  renderEngineControls();
+  if (notice.text && !document.getElementById('notice').hidden) {
+    document.getElementById('notice').textContent = notice.text();
+  }
+}
 
 async function main() {
   await loadWords();
@@ -54,7 +71,7 @@ async function main() {
   show('databases');
   // The engine folders take a moment to read: ahead of the step. A failure
   // leaves no engine marked, and the wizard goes on without one.
-  enginesRead = call('engines').then(renderEngines, (error) => notice(failure(error)));
+  enginesRead = call('engines').then(renderEngines, (error) => notice(() => failure(error)));
   renderEngineControls();
   enginesRead.then(() => {
     enginesRead = null;
@@ -103,15 +120,20 @@ function show(name) {
     if (i === at) item.setAttribute('aria-current', 'step');
     else item.removeAttribute('aria-current');
   }
-  document.getElementById('title').textContent = t(last ? 'wizard.done.title' : 'wizard.title');
-  document.getElementById('subtitle').textContent = t(last ? 'wizard.done.subtitle' : 'wizard.subtitle');
-  document.getElementById('next').textContent = t(name === 'startup' ? 'wizard.finish' : 'wizard.next');
+  renderStepText();
   for (const id of ['skip', 'next']) document.getElementById(id).hidden = last;
   document.getElementById('back').hidden = last || at === 0;
   for (const id of ['close', 'open']) document.getElementById(id).hidden = !last;
   document.querySelector('.body').scrollTop = 0;
   footer();
   if (last) pair();
+}
+
+function renderStepText() {
+  const last = step === 'done';
+  document.getElementById('title').textContent = t(last ? 'wizard.done.title' : 'wizard.title');
+  document.getElementById('subtitle').textContent = t(last ? 'wizard.done.subtitle' : 'wizard.subtitle');
+  document.getElementById('next').textContent = t(step === 'startup' ? 'wizard.finish' : 'wizard.next');
 }
 
 // The footer's note and which buttons work.
@@ -259,7 +281,7 @@ function choose(path) {
       renderEngines(next);
       return true;
     }, (error) => {
-      notice(failure(error));
+      notice(() => failure(error));
       return false;
     })
     .finally(() => {
@@ -284,7 +306,7 @@ function installStockfish() {
       picked = next.chosen;
       renderEngines(next);
     },
-    (error) => notice(failure(error)),
+    (error) => notice(() => failure(error)),
   )).finally(() => {
     installing = false;
     document.getElementById('install-progress').hidden = true;
@@ -294,6 +316,7 @@ function installStockfish() {
 
 // The app counts the megabytes, rounded as the build's size is.
 function showInstallProgress(progress) {
+  installProgress = progress;
   const { doneMegabytes: done, totalMegabytes: total } = progress;
   document.getElementById('install-text').textContent = progress.phase === 'downloading'
     ? t('settings.engine.progress.downloading', { done, total })
@@ -372,8 +395,9 @@ function showConnected(next) {
   const opening = document.getElementById('opening');
   opening.classList.add('connected');
   opening.querySelector('svg').replaceWith(icon('check', 18, 2.4));
-  document.getElementById('opening-title').textContent = t('firstRun.connected.title');
-  document.getElementById('opening-hint').textContent = t('firstRun.connected.hint');
+  document.getElementById('opening-title').dataset.i18n = 'firstRun.connected.title';
+  document.getElementById('opening-hint').dataset.i18n = 'firstRun.connected.hint';
+  translate(opening);
   document.querySelector('details').open = false;
   // Nothing is left to do here: closing becomes the main action.
   document.getElementById('open').classList.remove('accent');
@@ -385,7 +409,7 @@ function showConnected(next) {
 function work(task) {
   if (busy) return Promise.resolve();
   setBusy(true);
-  return Promise.resolve().then(task).catch((error) => notice(failure(error))).finally(() => setBusy(false));
+  return Promise.resolve().then(task).catch((error) => notice(() => failure(error))).finally(() => setBusy(false));
 }
 
 function setBusy(now) {
@@ -407,14 +431,15 @@ function renderEngineControls() {
 
 function notice(text) {
   const node = document.getElementById('notice');
-  node.textContent = text;
+  notice.text = text;
+  node.textContent = text();
   node.hidden = false;
   clearTimeout(notice.timer);
   notice.timer = setTimeout(() => { node.hidden = true; }, 6000);
 }
 
 function act(promise) {
-  return promise.catch((error) => notice(failure(error)));
+  return promise.catch((error) => notice(() => failure(error)));
 }
 
 main();

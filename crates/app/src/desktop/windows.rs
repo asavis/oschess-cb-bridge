@@ -16,6 +16,25 @@ use tauri::{
 };
 
 use super::shared;
+use crate::i18n::Strings;
+
+/// Translate native titles as well as the documents inside their webviews.
+pub fn translate(app: &AppHandle) {
+    let shared = shared(app);
+    for window in app.webview_windows().values() {
+        translate_window(window, &shared.strings);
+    }
+}
+
+pub fn translate_window(window: &WebviewWindow, strings: &Strings) {
+    let title = match window.label() {
+        SETTINGS => strings.get("window.settings"),
+        FLYOUT => strings.get("window.flyout"),
+        FIRST_RUN => strings.get("window.firstRun"),
+        _ => return,
+    };
+    let _ = window.set_title(title);
+}
 
 pub const FLYOUT: &str = "flyout";
 pub const SETTINGS: &str = "settings";

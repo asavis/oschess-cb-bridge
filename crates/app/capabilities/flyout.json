@@ -6,6 +6,7 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-view",
+    "allow-language",
     "allow-open-oschess",
     "allow-open-settings",
     "allow-hide-flyout",

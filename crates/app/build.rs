@@ -11,6 +11,8 @@ const COMMANDS: &[&str] = &[
     "hide_flyout",
     "fit_flyout",
     "settings",
+    "language",
+    "set_language",
     "add_folder",
     "remove_database",
     "engines",
