@@ -236,7 +236,7 @@ fn repaired_title(title: &str, stem: &str) -> Option<String> {
 /// cut: each UTF-16 unit reduced to its low byte, so that `Ладья` reads
 /// `\u{1b}04LO`. The part is the whole name, or a start of it of two letters
 /// or more that the rest begins with something other than a letter (the
-/// title `завлечение` of `завлечение-1`). The whole title must be that image,
+/// title `Ладья` of `Ладья-1`). The whole title must be that image,
 /// as every cut title seen was: a title that only starts with it is a title of
 /// its own, such as `Queen endings` for `ё`, whose image is `Q`. Only an image
 /// of ASCII bytes is matched, since those read the same in UTF-8 and in every
@@ -266,8 +266,8 @@ fn cut_name<'a>(title: &str, stem: &'a str) -> Option<&'a str> {
 }
 
 /// `title` read where ChessBase stored it as the UTF-8 bytes of the title
-/// meant, each written `/` and two hex digits (`/D0/B5/D1/82/D1/8E/D0/B4/D0/B8`
-/// for `етюди`): only a title made of such escapes alone that read as UTF-8
+/// meant, each written `/` and two hex digits (`/D0/B7/D0/B0/D0/B4/D0/B0/D1/87/D0/B8`
+/// for `задачи`): only a title made of such escapes alone that read as UTF-8
 /// that is not ASCII.
 fn unescaped(title: &str) -> Option<String> {
     let b = title.as_bytes();

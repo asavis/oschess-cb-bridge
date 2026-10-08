@@ -169,7 +169,7 @@ impl Entities {
     /// Opens the entity files of a database read on a computer whose code
     /// page is `page`. Where it is one `text::single_byte` reads text by its
     /// words, the first [`SAMPLE`] bytes of each file give the page the
-    /// database's names show, for a text whose own words show none (`1.49а`,
+    /// database's names show, for a text whose own words show none (`3.7а`,
     /// `и т.д.`); the computer's page where they show none either.
     pub(super) fn open(with: impl Fn(&str) -> PathBuf, page: CodePage) -> Result<Self> {
         let players = EntityFile::open(with(".cbp"), PLAYER_DATA)?;
