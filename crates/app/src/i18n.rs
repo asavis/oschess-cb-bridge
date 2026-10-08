@@ -1,7 +1,7 @@
 //! The app's words in Ukrainian and English, one dictionary per language in
 //! `ui/i18n`, shared by the Rust side (tray, menu, notifications) and the
 //! windows. The language follows the Windows display language: Ukrainian for
-//! Ukrainian, English for any other.
+//! Ukrainian or Russian, English for any other.
 
 use std::collections::HashMap;
 
@@ -11,13 +11,17 @@ pub enum Lang {
     En,
 }
 
-/// The primary language of a Windows language identifier (LANGID) for Ukrainian.
+/// Primary language identifiers in a Windows language identifier (LANGID).
 const LANG_UKRAINIAN: u16 = 0x22;
+const LANG_RUSSIAN: u16 = 0x19;
 
 impl Lang {
     /// The language for a Windows display-language identifier.
     pub fn from_langid(langid: u16) -> Lang {
-        if langid & 0x3ff == LANG_UKRAINIAN { Lang::Uk } else { Lang::En }
+        match langid & 0x3ff {
+            LANG_UKRAINIAN | LANG_RUSSIAN => Lang::Uk,
+            _ => Lang::En,
+        }
     }
 
     /// The dictionary's file name in `ui/i18n`, and the windows' `lang` parameter.
@@ -246,10 +250,24 @@ mod tests {
 
     #[test]
     fn language_by_display_language() {
-        assert_eq!(Lang::from_langid(0x0422), Lang::Uk);
-        assert_eq!(Lang::from_langid(0x0409), Lang::En);
-        assert_eq!(Lang::from_langid(0x0419), Lang::En);
-        assert_eq!(Lang::from_langid(0x0415), Lang::En);
+        for langid in [0x0022, 0x0422, 0x0019, 0x0419, 0x0819] {
+            assert_eq!(Lang::from_langid(langid), Lang::Uk, "LANGID {langid:#06x}");
+        }
+        for langid in [0x0000, 0x0409, 0x0809, 0x0407, 0x040a, 0x040c, 0x0415, 0xffff] {
+            assert_eq!(Lang::from_langid(langid), Lang::En, "LANGID {langid:#06x}");
+        }
+    }
+
+    #[test]
+    fn russian_windows_use_ukrainian_strings() {
+        for langid in [0x0419, 0x0819] {
+            let strings = Strings::new(Lang::from_langid(langid));
+            assert_eq!(strings.lang().code(), "uk");
+            assert_eq!(strings.get("window.settings"), "Налаштування — oschess міст");
+            assert_eq!(strings.get("menu.quit"), "Вийти");
+            assert_eq!(strings.get("toast.stopped.title"), "Міст не працює");
+            assert_eq!(strings.plural("tray.ready", 22, &[]), "oschess міст — 22 бази готові");
+        }
     }
 
     #[test]
