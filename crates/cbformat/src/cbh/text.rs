@@ -19,14 +19,17 @@ const HEAD: usize = 8;
 /// `page`, in `fallback` where their own words show no page: a genuine
 /// single-byte name almost never forms valid multi-byte UTF-8. A UTF-8 text
 /// cut at the field's width may end in part of a character, which is dropped.
+/// UTF-8 that ChessBase converted from 2CBH keeps its signs as Private Use
+/// Area code points, which are read as a 2CBH name's are (`crate::signs`,
+/// #316), so that a name is searched for as it shows.
 pub(super) fn text(field: &[u8], page: CodePage, fallback: CodePage) -> String {
     let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
     match std::str::from_utf8(&field[..end]) {
-        Ok(s) => return s.to_owned(),
+        Ok(s) => return crate::signs::read(s).into_owned(),
         Err(e) if e.error_len().is_none() => {
             let valid = &field[..e.valid_up_to()];
             if valid.iter().any(|&b| b >= 0x80) {
-                return String::from_utf8_lossy(valid).into_owned();
+                return crate::signs::read(&String::from_utf8_lossy(valid)).into_owned();
             }
         }
         Err(_) => {}
@@ -269,6 +272,10 @@ mod tests {
         assert_eq!(text(&[0x4d, 0xc3, 0xbc, 0x6c, 0]), "Mül");
         // UTF-8 cut inside its last character: the part is dropped...
         assert_eq!(text(&[0xc3, 0xbc, 0x41, 0xc5]), "üA");
+        // ChessBase's signs in UTF-8 that it converted from 2CBH (#316),
+        // whole and cut. Made-up names.
+        assert_eq!(text("Odds \u{e028}g1\0".as_bytes()), "Odds ♘g1");
+        assert_eq!(text(b"5.\xee\x80\xa8f3 \xc3\xbc\xc5"), "5.♘f3 ü");
         // ...but a single-byte text is not taken for cut UTF-8.
         assert_eq!(text(&[0x41, 0xe2]), "Aâ");
     }
