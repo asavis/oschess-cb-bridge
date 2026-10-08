@@ -114,13 +114,15 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 /// the larger total decides:
 ///
 /// - Cyrillic: a word of these bytes alone, or one with three of them in a row
-///   (`Cлон`, typed with a Latin C), and Russian notation, a piece letter
-///   before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin K,
-///   `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`);
-///   a letter at 0xc0-0xff that ends a number, as Russian books number
+///   (`Cлон`, typed with a Latin C), and Russian notation, a Russian piece
+///   letter before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin
+///   K, `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`,
+///   `е5`); a letter at 0xc0-0xff that ends a number, as Russian books number
 ///   problems and variations (`1.49а`; Western text writes no `1.49à`, its
 ///   ordinals `1ª`, `2º` stand below 0xc0, and its `×` and `÷` stand between
-///   numbers, `2×2`); also `№` before a digit.
+///   numbers, `2×2`). Not `№` before a digit, nor any other letter before a
+///   square: in Western text ChessBase writes its signs ⌓ and × with those
+///   bytes, `¹8.¤c3` and `×b6` (#308).
 /// - Western: a word with no more of them than ASCII letters (`für`).
 /// - Neither: a word of one letter (French `à`, Russian `в`), a short word
 ///   with more of them than ASCII letters but no three in a row (`Süß`, `été`),
@@ -144,10 +146,6 @@ impl Evidence {
         let mut i = 0;
         while i < b.len() {
             if !letter(b[i]) {
-                // `№`, which Windows-1252 has as `¹`.
-                if b[i] == 0xb9 && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                    e.cyrillic += 1;
-                }
                 i += 1;
                 continue;
             }
@@ -214,20 +212,17 @@ fn is_typed_square(word: &[u8], next: Option<u8>) -> bool {
 }
 
 /// Whether `word`, followed by the byte `next`, is a move in Russian notation:
-/// a piece letter or two (`К`, `Кр`, `Ф`, `Л`, `С`, `П`; any letter at
-/// 0xc0-0xff is taken, and the K of Кр may be Latin), then up to three of
-/// `a`-`h` and `x` ending at a rank (`Фc2`, `Лbc2`, `Крxg1`, `Kрg1`), or
-/// nothing more before a `:` (`Л:f6`).
+/// a Russian piece letter (`К`, `Кр`, `Ф`, `Л`, `С`, `П`; the K of Кр may be
+/// Latin), then up to three of `a`-`h` and `x` ending at a rank (`Фc2`,
+/// `Лbc2`, `Крxg1`, `Kрg1`), or nothing more before a `:` (`Л:f6`).
 fn is_notation(word: &[u8], next: Option<u8>) -> bool {
-    let word = match word {
-        [b'K', c, ..] if *c >= 0xc0 => &word[1..],
-        _ => word,
+    let rest = match word {
+        // Кр, with a Cyrillic or a Latin K.
+        [0xca | b'K', 0xf0, rest @ ..] => rest,
+        // К, Ф, Л, С, П.
+        [0xca | 0xd4 | 0xcb | 0xd1 | 0xcf, rest @ ..] => rest,
+        _ => return false,
     };
-    let pieces = word.iter().take_while(|&&c| c >= 0xc0).count();
-    let rest = &word[pieces..];
-    if !(1..=2).contains(&pieces) {
-        return false;
-    }
     let square = !rest.is_empty()
         && rest.len() <= 3
         && rest.iter().all(|&c| matches!(c, b'a'..=b'h' | b'x'))
@@ -440,7 +435,11 @@ mod tests {
         assert_eq!(guess(b"\xd4c2"), cyrillic, "Фc2");
         assert_eq!(guess(b"\xca\xf0xg1"), cyrillic, "Крxg1");
         assert_eq!(guess(b"\xcb:f6"), cyrillic, "Л:f6");
-        assert_eq!(guess(b"\xb943"), cyrillic, "№43");
+        // ChessBase's signs in Western text: ⌓ at 0xb9 before a move, × before
+        // a square. Neither shows Cyrillic.
+        assert_eq!(guess(b"\xb943"), None, "¹43: № or ⌓");
+        assert_eq!(guess(b"[\xb98.\xa4c3;8.d4]"), None);
+        assert_eq!(guess(b"\x85Sa4, \xd7b6, c5"), western, "…Sa4, ×b6, c5");
         // The larger total decides: Позиция, then a German name.
         assert_eq!(guess(b"\xcf\xee\xe7\xe8\xf6\xe8\xff K\xf6nig"), cyrillic);
         // Nothing to go by: one-letter words, ASCII, symbols.
