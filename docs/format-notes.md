@@ -277,10 +277,13 @@ databases made on a Windows whose page is 1251 hold Russian in Windows-1251:
 4 comments, and 3 player names, which were read with replacement characters
 and so lost. The reader now reads a text or a name that is not UTF-8 in
 Windows-1251 when its own words show Cyrillic (`codepage::utf8_or_legacy`,
-the rule of the classic format's "Russian databases hold Windows-1251"), and
-in Windows-1252 otherwise, as before. Neither the computer's page nor the
-text around it decides, and no ChessBase sign is read, so the Mega's Western
-text reads as before on every computer.
+the rules of the classic format's "Russian databases hold Windows-1251" and
+"Signs in Western text"), and in Windows-1252 otherwise, as before. Neither
+the computer's page nor the text around it decides, and no ChessBase sign is
+read. In the Mega, 132 comments now read in Windows-1251, each with Russian
+words or with letters typed on a Russian keyboard, and nothing else changes:
+its Western text, with ChessBase's signs in it, reads as before on every
+computer.
 
 ## What `cbtool verify` checks
 
@@ -942,10 +945,10 @@ The reader was checked against:
   ANSI code page is 1251 or 1252, single-byte text is read in the page its words
   show (`codepage::Evidence`). A Russian or Ukrainian word is made of bytes
   0xc0-0xff alone, or has three of them in a row (`Cлон`, typed with a Latin C);
-  Russian notation (`Фc2`, `Kрg1`, `Л:f6`) and `№` count with them. A word with
+  Russian notation (`Фc2`, `Kрg1`, `Л:f6`) counts with them. A word with
   no more of those bytes than ASCII letters is Western (`für`). A word of one
   letter, and a short word with more of them but no three in a row (`Süß`,
-  `été`), shows neither. A text whose words show neither (`и т.д.`, `3.7а`,
+  `été`), shows neither. A text whose words show neither (`и т.д.`,
   `Cet été`) is read as its game's other texts show together, else as the names
   in the first 64 KiB of each entity file show, else in the computer's page.
   Read so, the 244 books show no mojibake on either computer, Western text in
@@ -987,8 +990,17 @@ The reader was checked against:
   look Latin into Latin words (`сorr.`, `Bа2`, `Rе8`). A word whose bytes
   above ASCII are all such letters shows neither page, since it reads alike
   either way, and so does not turn a database's names Western. A square whose
-  file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`), and a letter that ends a
-  number as the books number problems (`1.49а`), show Cyrillic.
+  file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`), one of а-е after a number
+  as the books number problems (`1.49а`), and a promotion or a mate after a
+  square (`h8Ф`, `Фb7х`), show Cyrillic.
+- **Signs in Western text** (#308). Western text holds ChessBase's signs in
+  bytes Windows-1251 reads as letters, and engines and French ordinals end
+  numbers with letters. Neither `№` before a digit, nor `¹` or `×` before a
+  move (`¹8.¤c3`, `×b6`), nor another letter after a number or a square
+  (`5.00ß`, French `2è`, `d4þ`, `2þ`), shows a page; nor does a word of one
+  byte repeated, nor one of only `×`, `÷` and the letters only Windows-1251
+  has (`þþ`, `××`, `÷³`). In the books, one comment of a German game changes
+  for it (`þþ`, which read as `юю`).
 - **UTF-8 inside Windows-1251.** Twelve comments hold a text in Windows-1251
   and then a copy in UTF-8. A run of three Cyrillic UTF-8 letters or more,
   with other UTF-8 and ASCII between, is read as UTF-8 (`cbh::text::utf8_runs`):
