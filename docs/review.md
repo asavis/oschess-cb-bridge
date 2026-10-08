@@ -23,10 +23,12 @@ env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL \
   GIT_COMMITTER_EMAIL=287075638+oschess-codex-bot@users.noreply.github.com \
   CODEX_HOME=/home/asavi/.codex-oschess-bot \
   codex exec --dangerously-bypass-approvals-and-sandbox \
-    -c model=gpt-6.1-sol -c model_reasoning_effort=medium \
+    -c model=<model> -c model_reasoning_effort=high \
     -C <worktree> - < prompt.txt
 ```
 
+`<model>` is the newest Codex model the account offers, resolved when the
+review starts (`gpt-6.1-sol` on 2026-10-08), and the prompt names it.
 `CODEX_HOME` selects the account that pays; when it is out of quota, rerun the
 identical command with `CODEX_HOME=/home/asavi/.codex`. The git identity
 prefix is kept even though a reviewer must not commit, so that the same prefix
@@ -41,7 +43,7 @@ The implementing session fills in the angle-bracketed values and adds nothing
 else: no crux, no focus, no summary of the change.
 
 ```
-You are <Codex gpt-6.1-sol | Claude sonnet>, performing the independent
+You are <Codex model | Claude sonnet>, performing the independent
 cross-model review required by CLAUDE.md in the oschess-cb-bridge repository.
 The change under review was implemented by <the other backend>, so you are the
 required independent reviewer. This is REVIEW WORK ONLY.

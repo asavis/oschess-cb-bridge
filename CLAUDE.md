@@ -29,8 +29,11 @@ The review gate follows the scheme of the `kidschessleague` project.
 
   | Author | Reviewer |
   |---|---|
-  | Claude | Codex `gpt-6.1-sol`, effort `medium` |
+  | Claude | Codex, its newest model, effort `high` |
   | Codex | Claude `sonnet`, effort `high` |
+
+  The newest Codex model is resolved when the review starts, and the prose
+  review names the model that ran it ([docs/review.md](docs/review.md)).
 
 - The implementing session is the delivery owner. It starts the review itself,
   never leaves that to the owner, and supplies only the fixed review contract in
