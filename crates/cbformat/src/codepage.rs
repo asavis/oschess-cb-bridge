@@ -83,6 +83,19 @@ impl CodePage {
 /// Windows-1252 has symbols there.
 const CYRILLIC_ONLY: [u8; 9] = [0xa8, 0xaa, 0xaf, 0xb2, 0xb3, 0xb4, 0xb8, 0xba, 0xbf];
 
+/// `bytes` as UTF-8 when they are valid UTF-8; else in Windows-1251 when their
+/// words show Cyrillic ([`cyrillic_or_western`]), and in Windows-1252
+/// otherwise. For text a format keeps as UTF-8, such as 2CBH's, which an
+/// older program sometimes wrote in a single-byte page: Russian text reads as
+/// Russian, and any other text as it did before, on every computer (#308).
+pub fn utf8_or_legacy(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) if cyrillic_or_western(bytes) == Some(CodePage::CYRILLIC) => CodePage::CYRILLIC.decode(bytes),
+        Err(_) => CodePage::WESTERN.decode(bytes),
+    }
+}
+
 /// Whether single-byte text reads as Cyrillic ([`CodePage::CYRILLIC`]) or as
 /// Western ([`CodePage::WESTERN`]) text, from its words; `None` when its
 /// words do not say ([`Evidence`]).
@@ -446,6 +459,18 @@ mod tests {
         assert_eq!(e.page(), None);
         e.add(Evidence::of(b"Br\xfccke"));
         assert_eq!(e.page(), western);
+    }
+
+    /// UTF-8 first; Windows-1251 only for text whose words show Cyrillic;
+    /// Windows-1252 for anything else, as before.
+    #[test]
+    fn utf8_or_legacy_reads_russian_and_leaves_the_rest() {
+        assert_eq!(utf8_or_legacy("Петров".as_bytes()), "Петров");
+        assert_eq!(utf8_or_legacy(b"\xcf\xe5\xf2\xf0\xee\xe2"), "Петров");
+        assert_eq!(utf8_or_legacy(b"M\xfcller"), "Müller");
+        assert_eq!(utf8_or_legacy(b"\xe0"), "à", "nothing to go by: Western, as before");
+        assert_eq!(utf8_or_legacy(b"Visit\xe9 \xa4d7"), "Visité ¤d7", "no signs");
+        assert_eq!(utf8_or_legacy(b"\x81"), "\u{81}");
     }
 
     #[test]

@@ -270,6 +270,18 @@ written.
 320,588 German, then French, Spanish, Portuguese, Dutch, Italian, Polish and
 Greek below 4,000 each.
 
+**Text that is not UTF-8** (#308). 2CBH keeps its texts and names as UTF-8,
+but some are single-byte. In 313 databases besides the Mega, 7,982 comments
+are Windows-1252 (Western text of the Mega updates), and a few lesson
+databases made on a Windows whose page is 1251 hold Russian in Windows-1251:
+4 comments, and 3 player names, which were read with replacement characters
+and so lost. The reader now reads a text or a name that is not UTF-8 in
+Windows-1251 when its own words show Cyrillic (`codepage::utf8_or_legacy`,
+the rule of the classic format's "Russian databases hold Windows-1251"), and
+in Windows-1252 otherwise, as before. Neither the computer's page nor the
+text around it decides, and no ChessBase sign is read, so the Mega's Western
+text reads as before on every computer.
+
 ## What `cbtool verify` checks
 
 For every game and analysis: the record framing (magic, sizes, trailing length
