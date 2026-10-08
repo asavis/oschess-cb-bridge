@@ -12,6 +12,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use crate::bytes::{self, Fields};
+use crate::codepage::CodePage;
 use crate::file::{self, DbFile};
 use crate::game::{GameAnnotations, Names, Source};
 use crate::recordfile::{RecordFile, Run, over_limit, span};
@@ -85,12 +86,24 @@ pub struct Database {
     wide: Option<wide::Wide>,
     entities: Entities,
     format_version: u8,
+    /// The code page of the computer the database is read on, which its
+    /// single-byte text is read by (`text::single_byte`).
+    page: CodePage,
 }
 
 impl Database {
     /// Opens the database whose files share `path`'s stem. `path` may name the
-    /// `.cbh` file or the bare stem. The record count is taken now.
+    /// `.cbh` file or the bare stem. The record count is taken now. Its text
+    /// is read as on a computer whose code page is Windows-1252
+    /// ([`Self::open_in`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in(path, CodePage::WESTERN)
+    }
+
+    /// [`Self::open`] on a computer whose ANSI code page is `page`: its
+    /// single-byte text, names and comments, is read as `text::single_byte`
+    /// says.
+    pub fn open_in(path: impl AsRef<Path>, page: CodePage) -> Result<Self> {
         let stem = file::stem(path.as_ref(), "cbh");
         let with = |ext: &str| {
             debug_assert!(READ.contains(&ext), "the classic reader opens {ext}, which cbh::READ does not list");
@@ -108,8 +121,8 @@ impl Database {
         let annotations_len = annotations.as_ref().map(DbFile::size).transpose()?;
         let wide =
             if needs_wide(moves.size()?, annotations_len) { Some(wide::Wide::open(with(".cbj"))?) } else { None };
-        let entities = Entities::open(with)?;
-        Ok(Database { stem, headers, moves, annotations, wide, entities, format_version: header[0x05] })
+        let entities = Entities::open(with, page)?;
+        Ok(Database { stem, headers, moves, annotations, wide, entities, format_version: header[0x05], page })
     }
 
     pub fn stem(&self) -> &Path {
@@ -234,7 +247,7 @@ impl Database {
         if size > limit {
             return Err(bad(&over_limit(size, limit)));
         }
-        annotations::parse(&file.read(at, size)?, record.id()).map(Some)
+        annotations::parse_in(&file.read(at, size)?, record.id(), self.page, self.entities.fallback()).map(Some)
     }
 
     /// Reads the header records from `first` into `buf`, as many as it holds

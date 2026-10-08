@@ -420,6 +420,12 @@ what the format stores otherwise:
   annotator at 45. A name longer in the 2CBH copy is cut in the classic one,
   and a character that no single-byte code page holds may be stored in
   another form.
+- **Text that is not UTF-8**, in names and comments, is read in
+  Windows-1251 or Windows-1252, as its words show, on a computer whose ANSI
+  code page is one of the two, and ChessBase's piece bytes in it are the
+  figurines ♔ ♕ ♘ ♗ ♖ ♙; on a computer of another page it is read in that
+  page ([format notes](format-notes.md), "Russian databases hold
+  Windows-1251").
 - **An annotator is one text**, kept in a table of its own rather than as a
   player, and often written `First Last`. Rows, `annotator:` searches, the
   `annotator` sort and annotator suggestions use it as stored; an annotator

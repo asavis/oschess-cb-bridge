@@ -28,7 +28,8 @@ fn refuse_database_file(out: &Path, db: &Base) -> AnyResult<()> {
 }
 
 pub(crate) fn pgn(path: &str, rest: &[String]) -> AnyResult<bool> {
-    let db = Base::open(path)?;
+    // A classic database's text as the bridge reads it on this computer.
+    let db = Base::open_in(path, bridge::pgnindex::system_code_page())?;
     let mut out_path = None;
     let mut options = Options::default();
     let mut ids = Vec::new();

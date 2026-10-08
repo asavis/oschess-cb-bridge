@@ -1,6 +1,9 @@
 //! Text in a Windows single-byte code page: what an older program wrote before
 //! it wrote UTF-8. A PGN file of such a program is read with the code page of
-//! the computer it is on, as ChessBase reads it (`crate::pgnfile`).
+//! the computer it is on, as ChessBase reads it (`crate::pgnfile`); the text of
+//! a classic database also by its own letters ([`cyrillic_or_western`]).
+
+use std::cmp::Ordering;
 
 /// A Windows ANSI code page. Pages 1250 to 1258 have tables of their own;
 /// any other page, such as a multi-byte one, reads as 1252.
@@ -10,6 +13,8 @@ pub struct CodePage(u16);
 impl CodePage {
     /// Western European, the default where no other page is known.
     pub const WESTERN: CodePage = CodePage(1252);
+    /// Cyrillic, the page of Russian and Ukrainian text.
+    pub const CYRILLIC: CodePage = CodePage(1251);
 
     /// Page `number`: 1250 to 1258, else [`CodePage::WESTERN`].
     pub fn new(number: u32) -> CodePage {
@@ -72,6 +77,102 @@ impl CodePage {
             })
             .collect()
     }
+}
+
+/// Letters of Windows-1251 outside 0xc0-0xff: Ё, Є, Ї, І, і, ґ, ё, є, ї.
+/// Windows-1252 has symbols there.
+const CYRILLIC_ONLY: [u8; 9] = [0xa8, 0xaa, 0xaf, 0xb2, 0xb3, 0xb4, 0xb8, 0xba, 0xbf];
+
+/// Whether single-byte text reads as Cyrillic ([`CodePage::CYRILLIC`]) or as
+/// Western ([`CodePage::WESTERN`]) text, from its words; `None` when its
+/// words do not say ([`Evidence`]).
+pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
+    Evidence::of(b).page()
+}
+
+/// What the words of single-byte text show of its page: Cyrillic or Western.
+///
+/// Windows-1251 has letters at 0xc0-0xff and Windows-1252 has them there but
+/// for `×` and `÷` (Ч and ч in Windows-1251, which never stand inside a
+/// Western word), so a word is a run of ASCII letters and those bytes, with
+/// the letters only Windows-1251 has. In Russian or Ukrainian text these bytes
+/// make most of each word; in Western text they stand among ASCII letters
+/// (`Hübner`). Each word adds its count of them to the reading it shows, and
+/// the larger total decides. A word of one letter, such as French `à` or
+/// Russian `в`, shows neither. Russian notation, one or two such letters
+/// before a square or a capture (`Фc2`, `Крg1`, `Л:f6`), and `№` before a
+/// digit show Cyrillic. Evidence adds up, so that texts that show nothing
+/// alone can be read as the texts beside them show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evidence {
+    cyrillic: usize,
+    western: usize,
+}
+
+impl Evidence {
+    pub fn of(b: &[u8]) -> Evidence {
+        let high = |c: u8| c >= 0xc0 || CYRILLIC_ONLY.contains(&c);
+        let letter = |c: u8| c.is_ascii_alphabetic() || high(c);
+        let mut e = Evidence::default();
+        let mut i = 0;
+        while i < b.len() {
+            if !letter(b[i]) {
+                // `№`, which Windows-1252 has as `¹`.
+                if b[i] == 0xb9 && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    e.cyrillic += 1;
+                }
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < b.len() && letter(b[i]) {
+                i += 1;
+            }
+            let word = &b[start..i];
+            let h = word.iter().filter(|&&c| high(c)).count();
+            if h == 0 {
+                continue;
+            }
+            if is_notation(word, b.get(i).copied()) {
+                e.cyrillic += h;
+            } else if word.len() > 1 {
+                *(if 2 * h > word.len() { &mut e.cyrillic } else { &mut e.western }) += h;
+            }
+        }
+        e
+    }
+
+    /// This evidence and `other`'s together.
+    pub fn add(&mut self, other: Evidence) {
+        self.cyrillic += other.cyrillic;
+        self.western += other.western;
+    }
+
+    /// The page the evidence shows; `None` when it shows neither more.
+    pub fn page(self) -> Option<CodePage> {
+        match self.cyrillic.cmp(&self.western) {
+            Ordering::Greater => Some(CodePage::CYRILLIC),
+            Ordering::Less => Some(CodePage::WESTERN),
+            Ordering::Equal => None,
+        }
+    }
+}
+
+/// Whether `word`, followed by the byte `next`, is a move in Russian notation:
+/// a piece letter or two (`К`, `Кр`, `Ф`, `Л`, `С`, `П`; any letter at
+/// 0xc0-0xff is taken), then up to three of `a`-`h` and `x` ending at a rank
+/// (`Фc2`, `Лbc2`, `Крxg1`), or nothing more before a `:` (`Л:f6`).
+fn is_notation(word: &[u8], next: Option<u8>) -> bool {
+    let pieces = word.iter().take_while(|&&c| c >= 0xc0).count();
+    let rest = &word[pieces..];
+    if !(1..=2).contains(&pieces) {
+        return false;
+    }
+    let square = !rest.is_empty()
+        && rest.len() <= 3
+        && rest.iter().all(|&c| matches!(c, b'a'..=b'h' | b'x'))
+        && next.is_some_and(|c| matches!(c, b'1'..=b'8'));
+    square || (rest.is_empty() && next == Some(b':'))
 }
 
 // The bytes 0x80-0xFF of each page, from the Unicode mapping tables of the
@@ -227,6 +328,46 @@ mod tests {
         assert_eq!(CodePage::WESTERN.encode("Ångström €"), Ok(b"\xc5ngstr\xf6m \x80".to_vec()));
         assert_eq!(CodePage::WESTERN.encode("Tal, Михаил ♔"), Err('М'));
         assert_eq!(CodePage::new(1251).encode("Таль ♔"), Err('♔'));
+    }
+
+    /// Words tell Cyrillic text from Western text whichever page reads them.
+    #[test]
+    fn words_tell_cyrillic_from_western_text() {
+        let guess = cyrillic_or_western;
+        let cyrillic = Some(CodePage::CYRILLIC);
+        let western = Some(CodePage::WESTERN);
+        assert_eq!(guess(b"\xcf\xe5\xf2\xf0\xee\xe2"), cyrillic, "Петров");
+        assert_eq!(guess(b"\xe1\xb3\xeb\xb3"), cyrillic, "білі: і is a letter only Windows-1251 has");
+        assert_eq!(guess(b"\xaf\xe6\xe0\xea"), cyrillic, "Їжак");
+        // `иначе 4...Kр:d4 5.Kр:f3 Kрd3`, a Latin K before Cyrillic р: `ч` is
+        // `÷` in Windows-1252, and still a letter of the word.
+        assert_eq!(guess(b"\xe8\xed\xe0\xf7\xe5 4...K\xf0:d4 5.K\xf0:f3 K\xf0d3"), cyrillic);
+        assert_eq!(guess(b"H\xfcbner, R"), western);
+        assert_eq!(guess(b"Copyright 1994 K\xf6nemann"), western);
+        assert_eq!(guess(b"Diese Partie ist ein Beispiel f\xfcr die Schw\xe4che"), western);
+        // Russian notation and `№`.
+        assert_eq!(guess(b"\xd4c2"), cyrillic, "Фc2");
+        assert_eq!(guess(b"\xca\xf0xg1"), cyrillic, "Крxg1");
+        assert_eq!(guess(b"\xcb:f6"), cyrillic, "Л:f6");
+        assert_eq!(guess(b"\xb943"), cyrillic, "№43");
+        // The larger total decides: Позиция, then a German name.
+        assert_eq!(guess(b"\xcf\xee\xe7\xe8\xf6\xe8\xff K\xf6nig"), cyrillic);
+        // Nothing to go by: one-letter words, ASCII, symbols.
+        assert_eq!(guess(b"\xe0"), None, "à or а");
+        assert_eq!(guess(b"\xe9 forte [Kasparov]"), None);
+        assert_eq!(guess(b"Kasparov"), None);
+        assert_eq!(guess(b"\x96 \xab\xbb"), None);
+        assert_eq!(guess(b""), None);
+        // Evidence adds up: `и т.д.` shows nothing alone, and Петров beside it does.
+        let mut e = Evidence::of(b"\xe8 \xf2.\xe4.");
+        assert_eq!(e.page(), None);
+        e.add(Evidence::of(b"\xcf\xe5\xf2\xf0\xee\xe2"));
+        assert_eq!(e.page(), cyrillic);
+        // Six Western letters against Петров's six: neither shows more.
+        e.add(Evidence::of(b"Sch\xf6n M\xfcller K\xf6nig H\xfcbner M\xe4rz T\xe4ter"));
+        assert_eq!(e.page(), None);
+        e.add(Evidence::of(b"Br\xfccke"));
+        assert_eq!(e.page(), western);
     }
 
     #[test]
