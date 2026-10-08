@@ -142,14 +142,19 @@ fn short_words_keep_their_context() {
     assert_eq!(read(&f, CodePage::CYRILLIC).1[1], ["1.Kрg1"]);
 }
 
-/// Ukrainian names keep their capital Ґ, which is ChessBase's bishop byte, on
-/// either computer.
+/// Cyrillic names keep their letters at ChessBase's piece bytes, Ukrainian Ґ
+/// and Serbian Ј, on either computer.
 #[test]
-fn ukrainian_names_keep_their_capital_ghe() {
+fn cyrillic_names_keep_their_letters_at_piece_bytes() {
     // `Ґалаґан` and `Ґаєвський` in Windows-1251; є is a letter below 0xc0.
     let names: [&[u8]; 2] = [b"\xa5\xe0\xeb\xe0\xb4\xe0\xed", b"\xa5\xe0\xba\xe2\xf1\xfc\xea\xe8\xe9"];
     let f = database("text-ghe", names, [&[], &[]]);
     for computer in COMPUTERS {
         assert_eq!(read(&f, computer).0, ["Ґалаґан", "Ґаєвський"], "{computer:?}");
+    }
+    // Serbian `Јасна`: Ј is ChessBase's queen byte, and а and с look like files.
+    let f = database("text-je", [b"\xa3\xe0\xf1\xed\xe0", b"Anderssen"], [&[], &[]]);
+    for computer in COMPUTERS {
+        assert_eq!(read(&f, computer).0, ["Јасна", "Anderssen"], "{computer:?}");
     }
 }
