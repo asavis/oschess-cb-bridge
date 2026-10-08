@@ -41,7 +41,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
       - name: Script tests
         # The Store package's version, the app's as Cargo reads it and its
         # mapping, and the packing steps (scripts/test_msix.py); the stress

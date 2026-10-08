@@ -130,7 +130,11 @@ fn seconds(time: SystemTime) -> i64 {
 /// (#298): `None` for a time outside the years 0000 to 9999, which RFC 3339's
 /// four-digit year cannot hold (a Windows file time reaches the year 30827).
 pub fn rfc3339(time: SystemTime) -> Option<String> {
-    let secs = seconds(time);
+    rfc3339_of(seconds(time))
+}
+
+/// [`rfc3339`] of the time `secs` seconds after 1970-01-01T00:00:00Z.
+fn rfc3339_of(secs: i64) -> Option<String> {
     let (year, _, _) = civil_from_days(secs.div_euclid(86_400));
     (0..=9999).contains(&year).then(|| timestamp(secs))
 }
@@ -213,15 +217,17 @@ mod tests {
         for secs in [0, -1, -86_401, 1_790_521_445] {
             assert_eq!(seconds(at(secs)), secs);
         }
-        // RFC 3339 holds the years 0000 to 9999 only.
+        assert_eq!(rfc3339(at(1_790_521_445)).as_deref(), Some("2026-09-27T15:04:05Z"));
+        // RFC 3339 holds the years 0000 to 9999 only. Their bounds are checked
+        // in seconds: a Windows `SystemTime` cannot hold a time before 1601
+        // (#302).
         for (secs, text) in [
-            (1_790_521_445, Some("2026-09-27T15:04:05Z")),
             (253_402_300_799, Some("9999-12-31T23:59:59Z")),
             (253_402_300_800, None),
             (-62_167_219_200, Some("0000-01-01T00:00:00Z")),
             (-62_167_219_201, None),
         ] {
-            assert_eq!(rfc3339(at(secs)).as_deref(), text, "{secs}");
+            assert_eq!(rfc3339_of(secs).as_deref(), text, "{secs}");
         }
     }
 
