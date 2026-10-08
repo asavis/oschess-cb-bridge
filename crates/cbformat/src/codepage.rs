@@ -95,14 +95,22 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 /// Windows-1251 has letters at 0xc0-0xff and Windows-1252 has them there but
 /// for `×` and `÷` (Ч and ч in Windows-1251, which never stand inside a
 /// Western word), so a word is a run of ASCII letters and those bytes, with
-/// the letters only Windows-1251 has. In Russian or Ukrainian text these bytes
-/// make most of each word; in Western text they stand among ASCII letters
-/// (`Hübner`). Each word adds its count of them to the reading it shows, and
-/// the larger total decides. A word of one letter, such as French `à` or
-/// Russian `в`, shows neither. Russian notation, one or two such letters
-/// before a square or a capture (`Фc2`, `Крg1`, `Л:f6`), and `№` before a
-/// digit show Cyrillic. Evidence adds up, so that texts that show nothing
-/// alone can be read as the texts beside them show.
+/// the letters only Windows-1251 has. A Russian or Ukrainian word is made of
+/// these bytes alone; in a Western word they stand among ASCII letters
+/// (`Hübner`). Each word that shows a reading adds its count of them to it, and
+/// the larger total decides:
+///
+/// - Cyrillic: a word of these bytes alone, or one with three of them in a row
+///   (`Cмыслов`, typed with a Latin C), and Russian notation, a piece letter
+///   before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin K,
+///   `Л:f6`); also `№` before a digit.
+/// - Western: a word with no more of them than ASCII letters (`für`).
+/// - Neither: a word of one letter (French `à`, Russian `в`), and a short word
+///   with more of them than ASCII letters but no three in a row (`Süß`, `été`),
+///   which could be either.
+///
+/// Evidence adds up, so that texts that show nothing alone can be read as the
+/// texts beside them show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Evidence {
     cyrillic: usize,
@@ -133,10 +141,12 @@ impl Evidence {
             if h == 0 {
                 continue;
             }
-            if is_notation(word, b.get(i).copied()) {
+            let ascii = word.len() - h;
+            let run = word.split(|&c| !high(c)).map(<[u8]>::len).max().unwrap_or(0);
+            if is_notation(word, b.get(i).copied()) || (word.len() > 1 && (ascii == 0 || run >= 3)) {
                 e.cyrillic += h;
-            } else if word.len() > 1 {
-                *(if 2 * h > word.len() { &mut e.cyrillic } else { &mut e.western }) += h;
+            } else if word.len() > 1 && h <= ascii {
+                e.western += h;
             }
         }
         e
@@ -160,9 +170,14 @@ impl Evidence {
 
 /// Whether `word`, followed by the byte `next`, is a move in Russian notation:
 /// a piece letter or two (`К`, `Кр`, `Ф`, `Л`, `С`, `П`; any letter at
-/// 0xc0-0xff is taken), then up to three of `a`-`h` and `x` ending at a rank
-/// (`Фc2`, `Лbc2`, `Крxg1`), or nothing more before a `:` (`Л:f6`).
+/// 0xc0-0xff is taken, and the K of Кр may be Latin), then up to three of
+/// `a`-`h` and `x` ending at a rank (`Фc2`, `Лbc2`, `Крxg1`, `Kрg1`), or
+/// nothing more before a `:` (`Л:f6`).
 fn is_notation(word: &[u8], next: Option<u8>) -> bool {
+    let word = match word {
+        [b'K', c, ..] if *c >= 0xc0 => &word[1..],
+        _ => word,
+    };
     let pieces = word.iter().take_while(|&&c| c >= 0xc0).count();
     let rest = &word[pieces..];
     if !(1..=2).contains(&pieces) {
@@ -339,12 +354,21 @@ mod tests {
         assert_eq!(guess(b"\xcf\xe5\xf2\xf0\xee\xe2"), cyrillic, "Петров");
         assert_eq!(guess(b"\xe1\xb3\xeb\xb3"), cyrillic, "білі: і is a letter only Windows-1251 has");
         assert_eq!(guess(b"\xaf\xe6\xe0\xea"), cyrillic, "Їжак");
-        // `иначе 4...Kр:d4 5.Kр:f3 Kрd3`, a Latin K before Cyrillic р: `ч` is
-        // `÷` in Windows-1252, and still a letter of the word.
-        assert_eq!(guess(b"\xe8\xed\xe0\xf7\xe5 4...K\xf0:d4 5.K\xf0:f3 K\xf0d3"), cyrillic);
+        // `иначе`: `ч` is `÷` in Windows-1252, and still a letter of the word.
+        assert_eq!(guess(b"\xe8\xed\xe0\xf7\xe5"), cyrillic);
+        // Кр with a Latin K, on its own.
+        assert_eq!(guess(b"1.K\xf0g1"), cyrillic, "1.Kрg1");
+        assert_eq!(guess(b"4...K\xf0:d4"), cyrillic, "4...Kр:d4");
+        assert_eq!(guess(b"C\xec\xfb\xf1\xeb\xee\xe2"), cyrillic, "Cмыслов, with a Latin C");
         assert_eq!(guess(b"H\xfcbner, R"), western);
         assert_eq!(guess(b"Copyright 1994 K\xf6nemann"), western);
         assert_eq!(guess(b"Diese Partie ist ein Beispiel f\xfcr die Schw\xe4che"), western);
+        assert_eq!(guess(b"K\xf6lner"), western, "Kölner: K before a high byte, but no move");
+        // Short words that could be either show neither.
+        assert_eq!(guess(b"S\xfc\xdf"), None, "Süß");
+        assert_eq!(guess(b"P\xe4\xe4"), None, "Pää");
+        assert_eq!(guess(b"Cet \xe9t\xe9"), None, "Cet été");
+        assert_eq!(guess(b"Cet \xe9t\xe9 \xe0 Z\xfcrich"), western, "beside a word that shows Western");
         // Russian notation and `№`.
         assert_eq!(guess(b"\xd4c2"), cyrillic, "Фc2");
         assert_eq!(guess(b"\xca\xf0xg1"), cyrillic, "Крxg1");

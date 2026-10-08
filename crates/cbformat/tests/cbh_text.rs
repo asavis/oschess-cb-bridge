@@ -99,9 +99,10 @@ fn a_western_database_reads_alike_on_either_computer() {
 #[test]
 fn the_computer_decides_what_nothing_shows() {
     let f = database("text-computer", [b"Anand", b"Kasparov"], [&[b"\xe8"], &[b"\xa3\xf3d\x9f"]]);
-    assert_eq!(read(&f, CodePage::WESTERN).1, [vec!["è"], vec!["♕ód\u{178}"]]);
-    // `ód` shows Western, whatever the computer.
-    assert_eq!(read(&f, CodePage::CYRILLIC).1, [vec!["и"], vec!["♕ód\u{178}"]]);
+    // `ód` shows Western, whatever the computer, and `£` before a letter
+    // is no piece.
+    assert_eq!(read(&f, CodePage::WESTERN).1, [vec!["è"], vec!["£ód\u{178}"]]);
+    assert_eq!(read(&f, CodePage::CYRILLIC).1, [vec!["и"], vec!["£ód\u{178}"]]);
     assert_eq!(read(&f, CodePage::new(1250)).1, [vec!["č"], vec!["Łódź"]]);
     // `open` reads as a Western computer.
     let db = Database::open(f.dir().join("db.cbh")).unwrap();
@@ -122,4 +123,32 @@ fn a_short_text_is_read_as_its_game_shows() {
     );
     assert_eq!(read(&f, CodePage::WESTERN).1, [vec!["Лучше 3...♘d7", "и т.д."], vec!["è ò.ä."]]);
     assert_eq!(read(&f, CodePage::CYRILLIC).1, [vec!["Лучше 3...♘d7", "и т.д."], vec!["и т.д."]]);
+}
+
+/// Words that could be either page leave the decision to their context: a
+/// Western name and a French comment stay Western on a Western computer, and
+/// a lone Russian move with a Latin K stays Cyrillic on a Cyrillic one.
+#[test]
+fn short_words_keep_their_context() {
+    let f = database(
+        "text-short",
+        [b"S\xfc\xdf", b"Anderssen"],
+        // `Cet été` (French), and `1.Kрg1` with a Latin K.
+        [&[b"Cet \xe9t\xe9"], &[b"1.K\xf0g1"]],
+    );
+    let (names, texts) = read(&f, CodePage::WESTERN);
+    assert_eq!(names, ["Süß", "Anderssen"]);
+    assert_eq!(texts[0], ["Cet été"]);
+    assert_eq!(read(&f, CodePage::CYRILLIC).1[1], ["1.Kрg1"]);
+}
+
+/// A Ukrainian name keeps its capital Ґ, which is ChessBase's bishop byte, on
+/// either computer.
+#[test]
+fn a_ukrainian_name_keeps_its_capital_ghe() {
+    // `Ґалаґан` in Windows-1251.
+    let f = database("text-ghe", [b"\xa5\xe0\xeb\xe0\xb4\xe0\xed", b"Anderssen"], [&[], &[]]);
+    for computer in COMPUTERS {
+        assert_eq!(read(&f, computer).0, ["Ґалаґан", "Anderssen"], "{computer:?}");
+    }
 }

@@ -915,22 +915,31 @@ The reader was checked against:
   Russian book). Nothing in a record names the page: the Russian comments'
   languages are "any" (280,184) and "English" (6,131). So, on a computer whose
   ANSI code page is 1251 or 1252, single-byte text is read in the page its
-  words show (`codepage::Evidence`): in Russian text the bytes 0xc0-0xff make
-  most of each word, in Western text they stand among ASCII letters. A text
-  whose words show neither (`и т.д.`, `1.49а`) is read as its game's other
-  texts show together, else as the names in the first 64 KiB of each entity
-  file show, else in the computer's page. Read so, the 244 books show no
-  mojibake on either computer, and the two read alike all but 48 of their
-  447,854 names and texts, each a lone `и …` in a game with no other text. On
+  words show (`codepage::Evidence`). A Russian or Ukrainian word is made of
+  bytes 0xc0-0xff alone, or has three of them in a row (`Cмыслов`, typed with a
+  Latin C); Russian notation (`Фc2`, `Kрg1`, `Л:f6`) and `№` count with them.
+  A word with no more of those bytes than ASCII letters is Western (`für`). A
+  word of one letter, and a short word with more of them but no three in a row
+  (`Süß`, `été`), shows neither. A text whose words show neither (`и т.д.`,
+  `1.49а`, `Cet été`) is read as its game's other texts show together, else as
+  the names in the first 64 KiB of each entity file show, else in the
+  computer's page. Read so, the 244 books show no mojibake on either computer,
+  Western text in them stays Western on a Cyrillic one (`Könemann` 4,731 times,
+  none read `Kцnemann`), and the two computers read alike all but 48 of their
+  447,853 names and texts, each a lone `и …` in a game with no other text. On
   a computer of another page, the text is read in that page as it stands.
 - **Piece bytes.** ChessBase's chess fonts draw 0xa2-0xa7 as king, queen,
   knight, bishop, rook and pawn, and the Russian books use them in comments
-  and some names (19,221 times: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`,
-  `£+¤`, `d8£`, `Позиция ¦¥1`); no other use was met. On a computer of either
-  page the reader serves them as the figurines ♔ ♕ ♘ ♗ ♖ ♙. Windows-1251 has
-  ў Ј ¤ Ґ ¦ § there, of which only Ґ, a capital, is Ukrainian. On a computer of
-  another page, such as Windows-1250 with Ł and Ą at 0xa3 and 0xa5, they are
-  read as that page reads them.
+  and some names: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`, `¦:f6`, `£+¤`,
+  `d8£`, and endgame classes such as `Позиция ¦¥1`. On a computer of either
+  page the reader serves such a byte as the figurine ♔ ♕ ♘ ♗ ♖ ♙ where it
+  stands as a piece (`cbh::text::is_piece`): before a file, a rank, a capture
+  or no letter, or after another piece. Elsewhere it is the page's character,
+  since Windows-1251 has ў Ј ¤ Ґ ¦ § there (Ukrainian `Ґалаґан`) and
+  Windows-1252 the signs ¢ £ ¤ ¥ ¦ § (`£100`). In the books 19,845 became
+  figurines and 30 stayed characters, all in typing slips such as `¤ld7` and
+  `¦el`. On a computer of another page, such as Windows-1250 with Ł and Ą at
+  0xa3 and 0xa5, they are read as that page reads them.
 - **Names that differ from the 2CBH copy** do so for two reasons only. Names
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut
