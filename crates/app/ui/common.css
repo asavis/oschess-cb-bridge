@@ -40,7 +40,7 @@ body {
   user-select: none;
   cursor: default;
 }
-button, input { font: inherit; color: inherit; }
+button, input, select { font: inherit; color: inherit; }
 svg { flex: none; display: block; }
 [hidden] { display: none !important; }
 

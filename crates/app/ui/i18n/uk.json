@@ -128,6 +128,8 @@
   "settings.engine.licence": "Ліцензія (GPL)",
 
   "settings.general.title": "Загальне",
+  "settings.language.title": "Мова",
+  "settings.language.invalid": "Виберіть українську або англійську мову.",
   "settings.autostart.title": "Запускати з Windows",
   "settings.autostart.hint": "Міст стартує у фоні, коли ви входите в систему",
   "settings.autostart.blocked": "Вимкнено в налаштуваннях Windows",

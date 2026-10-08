@@ -265,8 +265,10 @@ a check already in progress. The result distinguishes no update offered by the
 current channel, cancellation, failure and the Store fallback. Downloads and
 installs show their stage, including waiting for the bridge to be safe to restart.
 The app uses Ukrainian when the Windows display language is Ukrainian or
-Russian, and English for any other display language. This applies to its
-windows, tray menu and notifications. The windows are plain HTML, CSS and
+Russian, and English for any other display language until you choose one in
+Settings → General → Language. The choice is saved in `app.json` and applies
+to windows, the tray menu and subsequent notifications immediately, without
+restarting the bridge or interrupting its work. The windows are plain HTML, CSS and
 JavaScript in `crates/app/ui`; `crates/app/icons/generate.py` draws the tray
 marks and the app icon from the logo.
 

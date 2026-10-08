@@ -56,6 +56,9 @@ h1 { font-size: 28px; font-weight: 600; line-height: 36px; margin: 0 0 16px; }
 .port-form .field { width: 110px; }
 .error { margin-top: 6px; }
 
+#language { min-width: 150px; }
+#language:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; }
+
 .footer { margin-top: 18px; }
 .link { color: var(--accent-text); }
 .notice { position: fixed; right: 24px; bottom: 20px; margin: 0; padding: 10px 14px; border-radius: 6px; background: var(--card); border: 1px solid var(--stroke); box-shadow: 0 8px 16px rgba(0, 0, 0, .14); }

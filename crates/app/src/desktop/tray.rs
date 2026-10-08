@@ -91,7 +91,34 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(image);
     }
     builder.build(app)?;
+    app.manage(MenuLabels { open, settings, code, update, quit });
     Ok(())
+}
+
+struct MenuLabels {
+    open: MenuItem<Wry>,
+    settings: MenuItem<Wry>,
+    code: MenuItem<Wry>,
+    update: MenuItem<Wry>,
+    quit: MenuItem<Wry>,
+}
+
+pub fn translate(app: &AppHandle) {
+    let shared = shared(app);
+    let strings = &shared.strings;
+    if let Some(labels) = app.try_state::<MenuLabels>() {
+        let _ = labels.open.set_text(strings.get("menu.open"));
+        let _ = labels.settings.set_text(strings.get("menu.settings"));
+        let _ = labels.code.set_text(strings.get("menu.code"));
+        let _ = labels.update.set_text(strings.get("menu.update"));
+        let _ = labels.quit.set_text(strings.get("menu.quit"));
+    }
+    if let Some(tick) = app.try_state::<AutostartTick>() {
+        let _ = tick.0.set_text(strings.get("menu.autostart"));
+    }
+    if let Some(tray) = app.tray_by_id(TRAY) {
+        let _ = tray.set_tooltip(Some(shared.view().tooltip(strings)));
+    }
 }
 
 fn image(file: &str) -> Option<Image<'static>> {

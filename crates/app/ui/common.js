@@ -4,14 +4,34 @@
 // is always set as text, never as markup.
 'use strict';
 
-const LANG = new URLSearchParams(location.search).get('lang') === 'en' ? 'en' : 'uk';
+let LANG = null;
 let WORDS = {};
+const DICTIONARIES = {};
 
 async function loadWords() {
-  const response = await fetch(`i18n/${LANG}.json`);
-  WORDS = await response.json();
-  document.documentElement.lang = LANG;
+  // Load both once: an older fetch can never undo a later language choice.
+  await Promise.all(['uk', 'en'].map(async (lang) => {
+    const response = await fetch(`i18n/${lang}.json`);
+    if (!response.ok) throw new Error(`Language dictionary: ${response.status}`);
+    DICTIONARIES[lang] = await response.json();
+  }));
+  // Subscribe before reading. If a change arrives before the reply, keep it.
+  let changed = false;
+  await on('language', (lang) => {
+    changed = true;
+    applyLanguage(lang);
+  });
+  const lang = await call('language');
+  if (!changed) applyLanguage(lang);
+}
+
+function applyLanguage(lang) {
+  if (!Object.hasOwn(DICTIONARIES, lang) || LANG === lang) return;
+  LANG = lang;
+  WORDS = DICTIONARIES[lang];
+  document.documentElement.lang = lang;
   translate(document);
+  retranslate();
 }
 
 function t(key, values = {}) {

@@ -1,11 +1,16 @@
 //! The app's words in Ukrainian and English, one dictionary per language in
 //! `ui/i18n`, shared by the Rust side (tray, menu, notifications) and the
-//! windows. The language follows the Windows display language: Ukrainian for
-//! Ukrainian or Russian, English for any other.
+//! windows. A saved choice overrides the Windows display language: Ukrainian
+//! for Ukrainian or Russian, English for any other. Both dictionaries stay available so
+//! a change affects subsequent native text without restarting the bridge.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Lang {
     Uk,
     En,
@@ -16,6 +21,14 @@ const LANG_UKRAINIAN: u16 = 0x22;
 const LANG_RUSSIAN: u16 = 0x19;
 
 impl Lang {
+    pub fn from_code(code: &str) -> Option<Lang> {
+        match code {
+            "uk" => Some(Lang::Uk),
+            "en" => Some(Lang::En),
+            _ => None,
+        }
+    }
+
     /// The language for a Windows display-language identifier.
     pub fn from_langid(langid: u16) -> Lang {
         match langid & 0x3ff {
@@ -41,29 +54,48 @@ impl Lang {
 }
 
 pub struct Strings {
-    lang: Lang,
-    words: HashMap<String, String>,
+    english: AtomicBool,
+    uk: HashMap<String, String>,
+    en: HashMap<String, String>,
 }
 
 impl Strings {
     pub fn new(lang: Lang) -> Strings {
         // The dictionaries are part of the program and tested to parse.
-        let words = serde_json::from_str(lang.source()).unwrap_or_default();
-        Strings { lang, words }
+        Strings {
+            english: AtomicBool::new(lang == Lang::En),
+            uk: serde_json::from_str(Lang::Uk.source()).unwrap_or_default(),
+            en: serde_json::from_str(Lang::En.source()).unwrap_or_default(),
+        }
     }
 
     pub fn lang(&self) -> Lang {
-        self.lang
+        if self.english.load(Ordering::Relaxed) { Lang::En } else { Lang::Uk }
+    }
+
+    pub fn set_lang(&self, lang: Lang) {
+        self.english.store(lang == Lang::En, Ordering::Relaxed);
+    }
+
+    fn words(&self, lang: Lang) -> &HashMap<String, String> {
+        match lang {
+            Lang::Uk => &self.uk,
+            Lang::En => &self.en,
+        }
     }
 
     /// The text of `key`, or the key itself when it is missing.
     pub fn get<'a>(&'a self, key: &'a str) -> &'a str {
-        self.words.get(key).map_or(key, String::as_str)
+        self.words(self.lang()).get(key).map_or(key, String::as_str)
     }
 
     /// The text of `key` with each `{name}` replaced by its value.
     pub fn fill(&self, key: &str, values: &[(&str, &str)]) -> String {
-        let mut text = self.get(key).to_string();
+        self.fill_in(self.lang(), key, values)
+    }
+
+    fn fill_in(&self, lang: Lang, key: &str, values: &[(&str, &str)]) -> String {
+        let mut text = self.words(lang).get(key).map_or(key, String::as_str).to_string();
         for (name, value) in values {
             text = text.replace(&format!("{{{name}}}"), value);
         }
@@ -73,11 +105,12 @@ impl Strings {
     /// The form of `key` for the number `n` (`key.one`, `key.few` or
     /// `key.many`), with `{n}` and the other values filled in.
     pub fn plural(&self, key: &str, n: u64, values: &[(&str, &str)]) -> String {
-        let form = format!("{key}.{}", plural_form(self.lang, n));
+        let lang = self.lang();
+        let form = format!("{key}.{}", plural_form(lang, n));
         let n = n.to_string();
         let mut all = vec![("n", n.as_str())];
         all.extend_from_slice(values);
-        self.fill(&form, &all)
+        self.fill_in(lang, &form, &all)
     }
 }
 
@@ -267,6 +300,28 @@ mod tests {
             assert_eq!(strings.get("menu.quit"), "Вийти");
             assert_eq!(strings.get("toast.stopped.title"), "Міст не працює");
             assert_eq!(strings.plural("tray.ready", 22, &[]), "oschess міст — 22 бази готові");
+        }
+    }
+
+    #[test]
+    fn a_language_change_updates_native_words_and_plural_forms() {
+        let strings = Strings::new(Lang::Uk);
+        assert_eq!(strings.plural("db.records", 21, &[]), "21 партія");
+        for lang in [Lang::En, Lang::Uk, Lang::En] {
+            strings.set_lang(lang);
+            assert_eq!(strings.lang(), lang);
+            let expected = Strings::new(lang);
+            assert_eq!(strings.get("menu.settings"), expected.get("menu.settings"));
+            assert_eq!(strings.get("window.settings"), expected.get("window.settings"));
+            assert_eq!(strings.plural("db.records", 21, &[]), expected.plural("db.records", 21, &[]));
+            assert_eq!(
+                strings.fill("toast.updated.title", &[("version", "1.2.3")]),
+                expected.fill("toast.updated.title", &[("version", "1.2.3")])
+            );
+        }
+        assert_eq!(strings.plural("db.records", 21, &[]), "21 games");
+        for code in ["ru", "EN", "", "../en"] {
+            assert_eq!(Lang::from_code(code), None);
         }
     }
 

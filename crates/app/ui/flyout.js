@@ -1,6 +1,12 @@
 // The flyout by the tray mark: the bridge's state and its databases.
 'use strict';
 
+let currentView = null;
+
+function retranslate() {
+  if (currentView) render(currentView);
+}
+
 async function main() {
   await loadWords();
   document.getElementById('settings').append(icon('gear'));
@@ -18,6 +24,7 @@ async function main() {
 }
 
 function render(view) {
+  currentView = view;
   document.getElementById('version').textContent = view.version;
   const downloading = view.databases.filter((d) => d.state === 'downloading').length;
   // The tray mark's colour, decided by the app.

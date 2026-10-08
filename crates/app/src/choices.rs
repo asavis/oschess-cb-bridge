@@ -152,7 +152,7 @@ fn name_of(chosen: &Path, found: &[Found]) -> String {
 /// Puts off the Stockfish offer until the next bridge version: notes in the
 /// data folder `data` that the offer of the `running` version was dismissed.
 pub fn dismiss_offer(data: &Path, running: &str) -> Result<(), String> {
-    prefs::save(data, &prefs::Prefs { stockfish_offer_dismissed: Some(running.into()), ..prefs::load(data) })
+    prefs::update(data, |prefs| prefs.stockfish_offer_dismissed = Some(running.into()))
 }
 
 /// What the engine section shows: the engines found and the one chosen, the
