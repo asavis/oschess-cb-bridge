@@ -43,6 +43,14 @@ pub(crate) fn read(text: &str) -> Cow<'_, str> {
             i += n;
             continue;
         }
+        if chars[i] == MARK {
+            // Marks that hold no known word: as they stand, the run at once,
+            // so that a long run is read once.
+            let n = chars[i..].iter().take_while(|&&c| c == MARK).count();
+            out.extend(&chars[i..i + n]);
+            i += n;
+            continue;
+        }
         let c = chars[i];
         let at = |j: Option<usize>| j.and_then(|j| chars.get(j)).copied();
         match (letter(c, at(i.checked_sub(1)), at(Some(i + 1)), at(Some(i + 2))), sign(c)) {
@@ -54,6 +62,10 @@ pub(crate) fn read(text: &str) -> Cow<'_, str> {
     }
     Cow::Owned(out)
 }
+
+/// The code point a course's export writes around the words of its layout
+/// ([`markup`]).
+const MARK: char = '\u{e02d}';
 
 fn is_private(c: char) -> bool {
     ('\u{e000}'..='\u{f8ff}').contains(&c)
@@ -129,7 +141,6 @@ fn letter(c: char, prev: Option<char>, next: Option<char>, after: Option<char>) 
 /// bracket, a position's sets its FEN apart, and a link's leaves the address
 /// alone.
 fn markup(chars: &[char]) -> Option<(&'static str, usize)> {
-    const MARK: char = '\u{e02d}';
     let run = |from: usize| chars[from..].iter().take_while(|&&c| c == MARK).count();
     let open = run(0);
     if open == 0 {
@@ -216,6 +227,12 @@ mod tests {
         );
         assert_eq!(read(&format!("({m}LinkStart{m}https://example.org/{m}LinkEnd{m})")), "(https://example.org/)");
         assert_eq!(read(&format!("{m}Unknown{m}")), format!("{m}Unknown{m}"), "another word stays");
+        // A long run of marks, alone or around unknown words, is read in one
+        // pass and stays.
+        let long = "\u{e02d}".repeat(200_000);
+        assert_eq!(read(&long), long);
+        let words = format!("{m}Unknown").repeat(50_000);
+        assert_eq!(read(&words), words);
     }
 
     /// ChessBase's sign for ч in UTF-8 inside Windows-1251 text (#311) is

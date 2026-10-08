@@ -106,3 +106,14 @@ fn chessbase_signs_and_utf8_inside_single_bytes() {
         "a text without signs needs no original"
     );
 }
+
+/// A Ukrainian name in Windows-1251 whose first two bytes UTF-8 would read as
+/// a Latin letter stays Cyrillic (#311). A made-up name.
+#[test]
+fn a_ukrainian_name_in_windows_1251_is_no_utf8() {
+    // `Діденко`: Д and і are 0xc4 0xb3, UTF-8 for ĳ.
+    let f = database("ukrainian", &[b"\xc4\xb3\xe4\xe5\xed\xea\xee \xa4d4"], b"\xc4\xb3\xe4\xe5\xed\xea\xee");
+    let (texts, white) = read(&f);
+    assert_eq!(texts, ["Діденко ¤d4"]);
+    assert_eq!(white, "Діденко");
+}
