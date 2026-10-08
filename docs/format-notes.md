@@ -1045,9 +1045,14 @@ The reader was checked against:
   the page reads them: 0xb9 is `№` in the books' text (1,021 times, `№102`),
   0xb2 and 0xb3 are Ukrainian `І` and `і` in Windows-1251 (25 times as signs,
   which a reader cannot tell from the letters), and 0xa9 is `©` (13 times).
-  0x9e (2,465 times, after `Диаграмма` and at the end of comments) is drawn
-  as a ring with an arrow up; what ChessBase shows for it is not known, and it
-  reads as the page's character (`ћ`, `ž`).
+  0x9e (2,465 times, after `Диаграмма` and as comments of their own) is
+  ChessBase's diagram mark (#314): the Mega's Western text writes it after
+  "Diagram" in four languages, and 2CBH writes its counterpart U+E005 where
+  the older text has it (`cbformat::signs`). The books' font draws it as a
+  ring with an arrow up. Touching no letter, it is dropped
+  (`cbh::text::is_diagram_mark`), so `Диаграмма` keeps no `ћ` and a comment of
+  the mark alone is empty; between letters it is the page's letter (`ž` in
+  `Božidar`, Serbian `ћ`).
 - **Cyrillic look-alikes.** Typists of the books mixed Cyrillic letters that
   look Latin into Latin words (`сorr.`, `Bа2`, `Rе8`). A word whose bytes
   above ASCII are all such letters shows neither page, since it reads alike
