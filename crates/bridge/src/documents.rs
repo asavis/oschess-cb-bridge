@@ -2,7 +2,7 @@
 //! and the database window's list, and the folder names a database's place is
 //! told by.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent};
 
 /// Names the Documents folder instead of the system's answer, on every system:
 /// for tests, and for running the bridge outside Windows.
@@ -89,13 +89,27 @@ fn below(path: &Path, root: &Path) -> Option<Vec<String>> {
     Some(segments(rest))
 }
 
-/// Whether two path components name the same folder: on Windows, whose file
-/// systems ignore case, whatever the case they are written in.
+/// Whether two path components name the same folder: a drive or share
+/// however its prefix is written ([`prefix_name`]), and on Windows, whose
+/// file systems ignore case, whatever the case they are written in.
 fn same(a: Component<'_>, b: Component<'_>) -> bool {
-    if cfg!(windows) {
-        a.as_os_str().to_string_lossy().to_lowercase() == b.as_os_str().to_string_lossy().to_lowercase()
-    } else {
-        a == b
+    let name = |part: Component<'_>| match part {
+        Component::Prefix(prefix) => prefix_name(prefix),
+        other => other.as_os_str().to_string_lossy().into_owned(),
+    };
+    if cfg!(windows) { name(a).to_lowercase() == name(b).to_lowercase() } else { a == b }
+}
+
+/// A path's drive or share in its plain spelling: `\\?\C:` and `c:` are
+/// `C:`, `\\?\UNC\nas\share` is `\\nas\share`. Any other prefix, such as a
+/// device's, keeps its spelling.
+fn prefix_name(prefix: PrefixComponent<'_>) -> String {
+    match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => format!("{}:", char::from(letter).to_ascii_uppercase()),
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy())
+        }
+        _ => prefix.as_os_str().to_string_lossy().into_owned(),
     }
 }
 
@@ -108,7 +122,7 @@ fn segments<'a>(components: impl Iterator<Item = Component<'a>>) -> Vec<String> 
         match part {
             Component::Prefix(prefix) => {
                 drive = true;
-                out.push(prefix.as_os_str().to_string_lossy().into_owned());
+                out.push(prefix_name(prefix));
             }
             Component::RootDir if drive => {}
             Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR.to_owned()),
@@ -231,5 +245,18 @@ mod tests {
         assert_eq!(folder(r"C:\Users\Олена\Desktop\Games.pgn", cb, profile), ["~", "Desktop"]);
         assert_eq!(folder(r"D:\Chess\TWIC\twic.pgn", cb, profile), ["D:", "Chess", "TWIC"]);
         assert_eq!(folder(r"\\nas\share\Bases\x.2cbh", cb, profile), [r"\\nas\share", "Bases"]);
+        // A verbatim spelling of the database or of a root names the same folder.
+        assert_eq!(folder(r"\\?\C:\Users\Олена\OneDrive\Documents\ChessBase\Bases\x.2cbh", cb, profile), ["Bases"]);
+        assert_eq!(folder(r"\\?\c:\Users\Олена\Desktop\x.pgn", cb, profile), ["~", "Desktop"]);
+        let verbatim = (Some(r"\\?\C:\Users\Олена\OneDrive\Documents\ChessBase"), Some(r"\\?\C:\Users\Олена"));
+        assert_eq!(
+            folder(r"C:\Users\Олена\OneDrive\Documents\ChessBase\Bases\x.2cbh", verbatim.0, verbatim.1),
+            ["Bases"]
+        );
+        assert_eq!(folder(r"C:\Users\Олена\Desktop\x.pgn", verbatim.0, verbatim.1), ["~", "Desktop"]);
+        assert_eq!(folder(r"\\?\D:\Chess\x.pgn", cb, profile), ["D:", "Chess"]);
+        assert_eq!(folder(r"\\?\UNC\nas\share\Bases\x.2cbh", Some(r"\\nas\share"), None), ["Bases"]);
+        assert_eq!(folder(r"\\?\UNC\nas\share\Bases\x.2cbh", None, None), [r"\\nas\share", "Bases"]);
+        assert_eq!(folder(r"\\nas\share\Bases\x.2cbh", Some(r"\\?\UNC\NAS\Share"), None), ["Bases"]);
     }
 }
