@@ -290,13 +290,16 @@ with `á` and `í` in Windows-1252 and `ě` and `ř` in UTF-8, a UTF-8 `…` amo
 ChessBase's piece bytes, or one of ChessBase's signs below in UTF-8 inside
 Windows-1251. The reader reads as UTF-8 only what a single-byte page does not
 form by chance (`codepage::utf8_inside`): runs of Cyrillic UTF-8, as in the
-classic format, a letter of Latin-1 or Latin Extended (U+00C0-U+024F), and a
-sign of three bytes in U+2000-U+2BFF or ChessBase's Private Use Area. The
-rest is read as above. Other sequences stay single bytes: ChessBase's Western
-text writes `×»` (weak point, kingside) and `×§`, which UTF-8 reads as Hebrew
-letters, and `í…¤`, which it reads as a Hangul syllable. In the Mega, 41 of
-334,818 texts that are not UTF-8 hold such UTF-8. Text that is valid UTF-8 of
-text garbled before (`nÃ£o`) reads as the file holds it.
+classic format; a sign of three bytes, general punctuation (U+2000-U+206F) or
+ChessBase's range of the Private Use Area (U+E000-U+E02F); and a letter of
+Latin-1 or Latin Extended (U+00C0-U+024F), but only where the text outside the
+first two shows a Western page. The rest is read as above. Other sequences
+stay single bytes: Windows-1251 forms Latin letters of UTF-8 from a capital
+and a Ukrainian letter (`Ді` is 0xc4 0xb3, UTF-8 for `ĳ`), ChessBase's
+Western text writes `×»` (weak point, kingside) and `×§`, which UTF-8 reads as
+Hebrew letters, and `í…¤`, which it reads as a Hangul syllable. In the Mega,
+41 of 334,818 texts that are not UTF-8 hold such UTF-8. Text that is valid
+UTF-8 of text garbled before (`nÃ£o`) reads as the file holds it.
 
 **ChessBase's signs** (#309). Recent ChessBase writes the signs of its chess
 fonts as Private Use Area code points, which no other program draws: 26,904
