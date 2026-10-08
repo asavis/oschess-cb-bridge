@@ -307,11 +307,28 @@ Items carry no length, so a reader must know every tag. An unknown tag is an
 error.
 
 Strings are UTF-8 under tag `1e`, which ChessBase uses for text that is not
-ASCII, such as Cyrillic titles. Under `19` and `1a` only ASCII has been seen.
-Keys that are paths are UTF-8, Cyrillic ones included. The reader decodes
-anything that is not valid UTF-8 as Latin-1, so no byte is lost. What
-distinguishes `19` from `1a` is **unknown**: `1a` has held only the reference
-database's path.
+ASCII, such as Cyrillic titles. In the files written by ChessBase '26, only
+ASCII has been seen under `19` and `1a`, and keys that are paths are UTF-8,
+Cyrillic ones included. What distinguishes `19` from `1a` is **unknown**: `1a`
+has held only the reference database's path.
+
+**Older entries** (asavis/oschess-cb-bridge#288). A list kept by ChessBase 18
+on a Windows whose ANSI code page is 1251 showed two more encodings, seen in
+the user's screenshots rather than in the file:
+
+- **The ANSI code page.** Titles and paths in Windows-1251: read as Latin-1,
+  `Содержание` became `Ñîäåðæàíèå`, and the files of those entries, and of
+  entries with ASCII titles in folders named in Cyrillic, were not found. The
+  reader decodes anything that is not valid UTF-8 in the computer's ANSI code
+  page, as ChessBase does, so no byte is lost.
+- **Titles cut to one byte.** Titles of databases whose files were found
+  read as their Cyrillic file names with each UTF-16 unit cut to its low byte:
+  `Ладья` (U+041B U+0430 U+0434 U+044C U+044F) as `\x1b04LO`. The high bytes
+  are not in the file. When a title starts with this image of the database's
+  file name, the reader shows the file name in its place and keeps the rest of
+  the title. It matches only an image of ASCII bytes, which reads the same in
+  UTF-8 and in every code page; a title with a byte above ASCII stays as
+  stored.
 
 **Sections and items seen:**
 

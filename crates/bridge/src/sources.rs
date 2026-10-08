@@ -41,8 +41,10 @@ impl Listed {
 impl Sources {
     /// The databases ChessBase's window lists, in the order the window shows
     /// them where that is decoded and in the file's order otherwise
-    /// (`DbList::window_order`), named as the window names them. `Ok(empty)`
-    /// when there is no such list. The error, for the log, names no path.
+    /// (`DbList::window_order`), named as the window names them. Paths and
+    /// titles that are not UTF-8 are read in the computer's ANSI code page, as
+    /// ChessBase reads them. `Ok(empty)` when there is no such list. The
+    /// error, for the log, names no path.
     pub fn window(&self) -> Result<Vec<Listed>, String> {
         let Some(dir) = &self.chessbase else { return Ok(Vec::new()) };
         match std::fs::metadata(dir) {
@@ -60,7 +62,8 @@ impl Sources {
                 dbitems::FILE_NAME
             );
         }
-        let Some(list) = dbitems::read(dir).map_err(|e| crate::log::error(&e))? else { return Ok(Vec::new()) };
+        let page = crate::pgnindex::system_code_page();
+        let Some(list) = dbitems::read(dir, page).map_err(|e| crate::log::error(&e))? else { return Ok(Vec::new()) };
         Ok(list
             .into_window_order()
             .into_iter()

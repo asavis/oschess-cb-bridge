@@ -187,6 +187,45 @@ fn first_database(dir: &Path) -> Vec<String> {
     row.split_whitespace().map(str::to_owned).collect()
 }
 
+/// `cbtool databases --code-page N` reads the paths and titles of the list
+/// that are not UTF-8 in page N, as the bridge reads them in the computer's
+/// (#288).
+#[test]
+fn databases_reads_a_list_in_a_code_page() {
+    let f = fixture_with("databases-code-page", 3, None);
+    let folder = f.dir().join("Уроки");
+    std::fs::create_dir(&folder).unwrap();
+    for entry in std::fs::read_dir(f.dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::rename(&path, folder.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    let mut list = DbItems::new();
+    // `Уроки\db.2cbh`, titled `Эндшпиль`, in Windows-1251.
+    list.section("2cbg").text(
+        0x19,
+        b"\xd3\xf0\xee\xea\xe8\\db.2cbh",
+        b"\xdd\xed\xe4\xf8\xef\xe8\xeb\xfc,0,28,3,1,1037620,1037559",
+    );
+    std::fs::write(f.dir().join("DBItems.cbini"), list.bytes()).unwrap();
+    let row = |page: &str| {
+        let r = Command::new(env!("CARGO_BIN_EXE_cbtool"))
+            .arg("databases")
+            .arg(f.dir())
+            .args(["--code-page", page])
+            .output()
+            .unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let out = String::from_utf8(r.stdout).unwrap();
+        let row = out.lines().find(|l| l.trim_start().starts_with('1')).unwrap_or_else(|| panic!("{out}"));
+        row.split_whitespace().map(str::to_owned).collect::<Vec<_>>()
+    };
+    assert_eq!(row("1251"), ["1", "2cbh", "present", "3", "3", "Эндшпиль"]);
+    // Read in a Western page, the path names no file.
+    assert_eq!(row("1252")[2], "missing");
+}
+
 /// A two-game classic database, listed in the window of its own folder as
 /// `Old`, with 5 games when ChessBase last looked.
 fn listed_classic(name: &str) -> TempDb {
