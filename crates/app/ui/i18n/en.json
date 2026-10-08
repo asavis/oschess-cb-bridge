@@ -184,6 +184,8 @@
   "wizard.engine.later": "You can go on without an engine and add one later",
   "wizard.engine.installing": "«Next» becomes available once Stockfish is installed",
   "wizard.engine.verify": "After the download the bridge checks the build's checksum, unpacks it and chooses it.",
+  "wizard.engine.recommend.title": "We recommend installing Stockfish {version}",
+  "wizard.engine.recommend.hint": "None of the engines found is the latest Stockfish, {version}. Install it now: it is the strongest version, and its analysis is more accurate. The engines found stay in the list.",
   "wizard.startup.lead": "The bridge runs in the background, its mark is by the clock. oschess sees your databases only while the bridge runs.",
   "wizard.startup.autostartHint": "The bridge starts in the background when you sign in, so your databases are in oschess right away.",
   "wizard.done.title": "All set",

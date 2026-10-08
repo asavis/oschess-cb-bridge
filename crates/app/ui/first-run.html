@@ -54,11 +54,13 @@
     <section id="engine" hidden>
       <h2 data-i18n="settings.engine.title"></h2>
       <p class="intro" data-i18n="settings.engine.intro"></p>
-      <div class="cards" id="engine-none" hidden>
-        <div class="row top" data-icon="cpu">
+      <!-- With no engine found, the step's main action; with no current
+           Stockfish among those found, the warm recommendation above them. -->
+      <div class="cards" id="engine-install" hidden>
+        <div class="row top">
           <div class="text">
-            <div class="strong" data-i18n="settings.engine.none.title"></div>
-            <div class="cap12" data-i18n="settings.engine.none.hint"></div>
+            <div class="strong" id="install-title"></div>
+            <div class="cap12" id="install-lead"></div>
             <div class="actions">
               <button class="btn accent" id="install-stockfish"><span data-i18n="settings.engine.install"></span></button>
               <button class="btn" id="pick-other"><span data-i18n="settings.engine.pick"></span></button>
