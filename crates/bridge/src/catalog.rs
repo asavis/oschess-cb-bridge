@@ -303,7 +303,9 @@ impl Entry {
                 Opening::Pending(_) => return Err(State::Opening),
                 Opening::Failed => return Err(State::Unreadable),
             },
-            _ => Base::open(&self.path).map_err(|_| State::Unreadable)?,
+            // A classic database's single-byte text is read by this
+            // computer's code page, as a PGN file's is (#293).
+            _ => Base::open_in(&self.path, crate::pgnindex::system_code_page()).map_err(|_| State::Unreadable)?,
         };
         let open = Opened { db: Arc::new(db), generation, indexes: Indexes::counted(&self.shared.activity) };
         *slot = Some(open.clone());

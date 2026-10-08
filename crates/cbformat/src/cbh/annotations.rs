@@ -11,6 +11,7 @@
 //! say so by their [`Source`], which the PGN writer places them by.
 
 use crate::bytes::{self, Fields};
+use crate::codepage::{CodePage, Evidence};
 use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Source, Square, language};
 use crate::movetable::{Sq, from_cb_square};
 use crate::{Error, Result};
@@ -32,7 +33,17 @@ pub(super) fn record_size(head: &[u8; HEAD]) -> usize {
 /// runs past the record, a position below −1, a square out of range, a text
 /// without its language) is an error. Whether each position names a move of
 /// the game is checked against the game by [`GameAnnotations::check_positions`].
+/// Texts are read as on a computer whose code page is Windows-1252
+/// ([`parse_in`]).
 pub fn parse(record: &[u8], id: u32) -> Result<GameAnnotations> {
+    parse_in(record, id, CodePage::WESTERN, CodePage::WESTERN)
+}
+
+/// [`parse`] on a computer whose ANSI code page is `page`, which texts that
+/// are not UTF-8 are read by (`super::text::single_byte`). A text whose own
+/// words show no page is read in the one the game's other texts show
+/// together, else in `fallback`.
+pub fn parse_in(record: &[u8], id: u32, page: CodePage, fallback: CodePage) -> Result<GameAnnotations> {
     let bad = |at: usize, what: &str| Error::Format(format!("classic annotations of game {id} at byte {at}: {what}"));
     let Some(head) = record.first_chunk::<HEAD>() else { return Err(bad(0, "shorter than its head")) };
     if head.be_u24::<0>() != id {
@@ -46,6 +57,9 @@ pub fn parse(record: &[u8], id: u32) -> Result<GameAnnotations> {
     }
     let mut out = GameAnnotations { source: Source::Classic, ..GameAnnotations::default() };
     let mut count = 0u32;
+    // Texts that are not UTF-8, decoded once the whole record has been read:
+    // where each lies in `out` and its bytes.
+    let mut single_byte: Vec<((usize, usize), &[u8])> = Vec::new();
     let mut i = HEAD;
     while i < record.len() {
         let Some(item) = bytes::array::<ITEM_HEAD>(record, i) else {
@@ -61,16 +75,30 @@ pub fn parse(record: &[u8], id: u32) -> Result<GameAnnotations> {
             return Err(bad(i, &format!("position {position}")));
         }
         let data = &record[i + ITEM_HEAD..i + size];
-        let a = annotation(type_code, data).map_err(|what| bad(i + ITEM_HEAD, what))?;
+        let (a, pending) = annotation(type_code, data).map_err(|what| bad(i + ITEM_HEAD, what))?;
         match out.blocks.last_mut() {
             Some(b) if b.position == position => b.annotations.push(a),
             _ => out.blocks.push(Block { position, annotations: vec![a] }),
+        }
+        if let Some(text) = pending {
+            let block = out.blocks.len() - 1;
+            single_byte.push(((block, out.blocks[block].annotations.len() - 1), text));
         }
         count += 1;
         i += size;
     }
     if head.be_u24::<7>() != count + 1 {
         return Err(bad(7, "annotation count disagrees with the record"));
+    }
+    let mut game = Evidence::default();
+    for (_, text) in &single_byte {
+        game.add(Evidence::of(text));
+    }
+    let fallback = game.page().unwrap_or(fallback);
+    for ((block, at), bytes) in single_byte {
+        if let Annotation::Text { text, .. } = &mut out.blocks[block].annotations[at] {
+            *text = super::text::single_byte(bytes, page, fallback);
+        }
     }
     Ok(out)
 }
@@ -80,11 +108,19 @@ fn int24(v: u32) -> i32 {
     ((v << 8) as i32) >> 8
 }
 
-fn annotation(t: u8, d: &[u8]) -> std::result::Result<Annotation, &'static str> {
-    Ok(match t {
+/// An annotation of type `t` with data `d`, and for a text that is not
+/// UTF-8 its bytes, which [`parse_in`] decodes once it has seen the record's
+/// other texts: the text stays empty until then.
+fn annotation(t: u8, d: &[u8]) -> std::result::Result<(Annotation, Option<&[u8]>), &'static str> {
+    let a = match t {
         0x02 | 0x82 => {
             let [_, nation, text @ ..] = d else { return Err("text without its language") };
-            Annotation::Text { before: t == 0x82, language: language_of(*nation), text: decode_text(text) }
+            let (decoded, pending) = match std::str::from_utf8(text) {
+                Ok(s) => (s.to_owned(), None),
+                Err(_) => (String::new(), Some(text)),
+            };
+            let a = Annotation::Text { before: t == 0x82, language: language_of(*nation), text: decoded };
+            return Ok((a, pending));
         }
         0x03 => {
             if d.is_empty() || d.len() > 3 {
@@ -115,7 +151,8 @@ fn annotation(t: u8, d: &[u8]) -> std::result::Result<Annotation, &'static str> 
         }
         // Every other type has its size, so it is skipped whatever its layout.
         _ => Annotation::Other { code: u16::from(t), data: d.to_vec() },
-    })
+    };
+    Ok((a, None))
 }
 
 /// Squares here are numbered from 1, file by file.
@@ -144,9 +181,4 @@ pub fn language_of(nation: u8) -> u16 {
         55 => language::GREEK,
         n => 0x100 + u16::from(n),
     }
-}
-
-/// UTF-8 when the bytes are valid UTF-8, else Windows-1252, as in 2CBH.
-fn decode_text(b: &[u8]) -> String {
-    crate::game::annotations_text(b)
 }

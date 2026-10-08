@@ -11,6 +11,7 @@
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
+use crate::codepage::CodePage;
 use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Names, PositionOrder, RecordKind, Start};
 use crate::pgn::{self, Options, Rendered};
 use crate::replay::{self, TreeStats, TreeVisitor};
@@ -38,12 +39,21 @@ pub enum Base {
 impl Base {
     /// Opens the database `path` names: a `.2cbh` or `.cbh` file, or a stem
     /// shared by the files, which is read as 2CBH when a `.2cbh` file has it.
-    /// A PGN file is opened with its index, [`pgnfile::Database::open`].
+    /// A PGN file is opened with its index, [`pgnfile::Database::open`]. A
+    /// classic database's text is read as on a computer whose code page is
+    /// Windows-1252 ([`Self::open_in`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in(path, CodePage::WESTERN)
+    }
+
+    /// [`Self::open`] on a computer whose ANSI code page is `page`, which a
+    /// classic database's single-byte text is read by
+    /// ([`cbh::Database::open_in`]). 2CBH text is UTF-8.
+    pub fn open_in(path: impl AsRef<Path>, page: CodePage) -> Result<Self> {
         let path = path.as_ref();
         Ok(match format_of(path) {
             Format::TwoCbh => Base::TwoCbh(v2::Database::open(path)?),
-            Format::Cbh => Base::Cbh(cbh::Database::open(path)?),
+            Format::Cbh => Base::Cbh(cbh::Database::open_in(path, page)?),
             Format::Pgn => return Err(Error::Format("a PGN file is read through its index".into())),
         })
     }

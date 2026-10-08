@@ -274,7 +274,9 @@ impl NameTable {
 }
 
 const FILE_MAGIC: [u8; 8] = *b"OSCBNAM\0";
-const FILE_VERSION: u32 = 1;
+/// 2: a classic database's single-byte names are read in the page their
+/// words show (#293), so the names files written before are built again.
+const FILE_VERSION: u32 = 2;
 const FILE_HEADER: usize = 64;
 
 /// The buffer a names file is written through.

@@ -114,3 +114,33 @@ fn classic_games_are_rendered_within_the_limits() {
         assert!(body.contains(r#""code":"unreadable_game""#) && body.contains("-byte limit"), "{body}");
     }
 }
+
+/// A Russian classic database through the API: its Windows-1251 names and
+/// comments read as Cyrillic in rows, searches and games, and ChessBase's
+/// piece bytes as figurines (#293).
+#[test]
+fn a_russian_classic_database_is_served_in_cyrillic() {
+    let e4 = move_record(0, None, None, &encode(&Board::startpos(), &[Tok::Mv("e2e4"), Tok::End], 0, false));
+    let mut b = Builder::new();
+    // `Петров` and `Таль`.
+    b.player_name(0, b"\xcf\xe5\xf2\xf0\xee\xe2").player_name(1, b"\xd2\xe0\xeb\xfc");
+    b.game(&e4);
+    // `Лучше ¤f3`, in any language.
+    b.annotations(&annotation_record(1, &[(0, 0x02, b"\x00\x00\xcb\xf3\xf7\xf8\xe5 \xa4f3")]));
+    let f = b.write("classic-api-cyrillic");
+    let path = f.dir().join("db.cbh");
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let port = bridge.port;
+    let id = id_of(&path);
+
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games"));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""white":"Петров""#) && body.contains(r#""black":"Таль""#), "{body}");
+    // `q=петров`, through the names the bridge indexes.
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games?q=%D0%BF%D0%B5%D1%82%D1%80%D0%BE%D0%B2"));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""white":"Петров""#), "{body}");
+    let (status, body) = get(port, &format!("/v1/databases/{id}/games/1"));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("{Лучше ♘f3}"), "{body}");
+}

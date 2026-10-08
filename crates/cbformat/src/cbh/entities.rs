@@ -7,8 +7,9 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use super::text::text;
+use super::text::{detects, text};
 use crate::bytes::Fields;
+use crate::codepage::{CodePage, Evidence};
 use crate::file::DbFile;
 use crate::game::{Date, Player, Tournament};
 use crate::{Error, Result};
@@ -23,6 +24,9 @@ const MAX_DATA: i32 = 64 << 10;
 const DELETED: i32 = -999;
 /// Bytes of a record before its data: the tree's links and balance.
 const LINKS: usize = 9;
+/// Bytes read from the start of each entity file when the database is opened,
+/// for the page its names show (`Entities::fallback`): one read of each.
+const SAMPLE: u64 = 64 << 10;
 
 // Where the fields read lie in the data of each file's records. A file whose
 // records hold less data than the fields read from them, `*_DATA`, is
@@ -101,6 +105,31 @@ impl EntityFile {
         Ok(EntityFile { file, header, record, count })
     }
 
+    /// Adds to `evidence` what the `fields` of the records in the first
+    /// [`SAMPLE`] bytes of the file show of their page, read in one go. A
+    /// field that is UTF-8 shows nothing; deleted records are skipped.
+    fn sample(&self, fields: &[Range<usize>], evidence: &mut Evidence) -> Result<()> {
+        let count = self.count.min(SAMPLE / self.record);
+        if count == 0 {
+            return Ok(());
+        }
+        let bytes = self.file.read(self.header, (count * self.record) as usize)?;
+        for r in bytes.chunks_exact(self.record as usize) {
+            if r.first_chunk().map(|&left| i32::from_le_bytes(left)) == Some(DELETED) {
+                continue;
+            }
+            let data = &r[LINKS..];
+            for at in fields {
+                let f = field(data, at.clone());
+                let f = &f[..f.iter().position(|&b| b == 0).unwrap_or(f.len())];
+                if std::str::from_utf8(f).is_err() {
+                    evidence.add(Evidence::of(f));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The data of entity `id`, or `None` for an id past the file or a
     /// deleted record.
     fn data(&self, id: u32) -> Result<Option<Vec<u8>>> {
@@ -130,16 +159,39 @@ pub struct Entities {
     tournaments: EntityFile,
     annotators: EntityFile,
     sources: EntityFile,
+    /// The code page of the computer the names are read on.
+    page: CodePage,
+    /// The page a single-byte text whose own words show none is read in.
+    fallback: CodePage,
 }
 
 impl Entities {
-    pub(super) fn open(with: impl Fn(&str) -> PathBuf) -> Result<Self> {
-        Ok(Entities {
-            players: EntityFile::open(with(".cbp"), PLAYER_DATA)?,
-            tournaments: EntityFile::open(with(".cbt"), TOURNAMENT_DATA)?,
-            annotators: EntityFile::open(with(".cbc"), ANNOTATOR_DATA)?,
-            sources: EntityFile::open(with(".cbs"), SOURCE_DATA)?,
-        })
+    /// Opens the entity files of a database read on a computer whose code
+    /// page is `page`. Where it is one `text::single_byte` reads text by its
+    /// words, the first [`SAMPLE`] bytes of each file give the page the
+    /// database's names show, for a text whose own words show none (`1.49а`,
+    /// `и т.д.`); the computer's page where they show none either.
+    pub(super) fn open(with: impl Fn(&str) -> PathBuf, page: CodePage) -> Result<Self> {
+        let players = EntityFile::open(with(".cbp"), PLAYER_DATA)?;
+        let tournaments = EntityFile::open(with(".cbt"), TOURNAMENT_DATA)?;
+        let annotators = EntityFile::open(with(".cbc"), ANNOTATOR_DATA)?;
+        let sources = EntityFile::open(with(".cbs"), SOURCE_DATA)?;
+        let mut fallback = page;
+        if detects(page) {
+            let mut e = Evidence::default();
+            players.sample(&[PLAYER_LAST, PLAYER_FIRST], &mut e)?;
+            tournaments.sample(&[TOURNAMENT_TITLE, TOURNAMENT_PLACE], &mut e)?;
+            annotators.sample(&[ANNOTATOR_NAME], &mut e)?;
+            sources.sample(&[SOURCE_TITLE], &mut e)?;
+            fallback = e.page().unwrap_or(page);
+        }
+        Ok(Entities { players, tournaments, annotators, sources, page, fallback })
+    }
+
+    /// The page the database's single-byte text is read in where its own
+    /// words show none, before the computer's ([`Self::open`]).
+    pub(super) fn fallback(&self) -> CodePage {
+        self.fallback
     }
 
     /// Records in each file, deleted ones included: players, tournaments,
@@ -166,24 +218,29 @@ impl Entities {
         Ok(self
             .players
             .data(id)?
-            .map(|d| Player { last: text(field(&d, PLAYER_LAST)), first: text(field(&d, PLAYER_FIRST)) }))
+            .map(|d| Player { last: self.text(&d, PLAYER_LAST), first: self.text(&d, PLAYER_FIRST) }))
     }
 
     pub fn tournament(&self, id: u32) -> Result<Option<Tournament>> {
         Ok(self.tournaments.data(id)?.map(|d| Tournament {
-            title: text(field(&d, TOURNAMENT_TITLE)),
-            place: text(field(&d, TOURNAMENT_PLACE)),
+            title: self.text(&d, TOURNAMENT_TITLE),
+            place: self.text(&d, TOURNAMENT_PLACE),
             start: Date(field(&d, TOURNAMENT_START).try_into().map_or(0, i32::from_le_bytes)),
             kind: field(&d, TOURNAMENT_KIND).first().copied().unwrap_or(0),
         }))
     }
 
     pub fn annotator(&self, id: u32) -> Result<Option<String>> {
-        Ok(self.annotators.data(id)?.map(|d| text(field(&d, ANNOTATOR_NAME))))
+        Ok(self.annotators.data(id)?.map(|d| self.text(&d, ANNOTATOR_NAME)))
     }
 
     /// The source's title.
     pub fn source(&self, id: u32) -> Result<Option<String>> {
-        Ok(self.sources.data(id)?.map(|d| text(field(&d, SOURCE_TITLE))))
+        Ok(self.sources.data(id)?.map(|d| self.text(&d, SOURCE_TITLE)))
+    }
+
+    /// The text of the field `at` of a record's `data`.
+    fn text(&self, data: &[u8], at: Range<usize>) -> String {
+        text(field(data, at), self.page, self.fallback)
     }
 }
