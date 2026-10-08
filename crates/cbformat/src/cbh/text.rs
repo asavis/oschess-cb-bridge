@@ -43,7 +43,9 @@ pub(super) fn text(field: &[u8], page: CodePage, fallback: CodePage) -> String {
 /// around it shows, which the caller finds, or the computer's. A byte at
 /// 0xa2-0xa7, which ChessBase's chess fonts draw as a piece, is then the
 /// figurine ♔ ♕ ♘ ♗ ♖ ♙ where it stands as a piece ([`is_piece`]: `¤d7`),
-/// and the page's character elsewhere (Ukrainian `Ґалаґан`, `£100`). A run
+/// and the page's character elsewhere (Ukrainian `Ґалаґан`, `£100`).
+/// ChessBase's diagram mark, 0x9e touching no letter, is dropped
+/// ([`is_diagram_mark`]). A run
 /// of Cyrillic UTF-8 inside the text ([`cyrillic_utf8_runs`]) is read as UTF-8. Where
 /// the computer's page is another, such as Windows-1250, whose 0xa3 and 0xa5
 /// are the letters Ł and Ą, the text is read in it as it stands.
@@ -58,6 +60,10 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
     let mut i = 0;
     for run in runs.iter().chain([&(b.len()..b.len())]) {
         while i < run.start {
+            if is_diagram_mark(b, i, letter) {
+                i += 1;
+                continue;
+            }
             let sign = || sign(b[i], read).filter(|_| !b.get(i + 1).is_some_and(|&c| letter(c)));
             out.push(figurine(b[i]).filter(|_| is_piece(b, i)).or_else(sign).unwrap_or_else(|| read.char(b[i])));
             i += 1;
@@ -73,6 +79,16 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
 /// and a database's names give (#306).
 pub(super) fn evidence(b: &[u8]) -> Evidence {
     Evidence::outside(b, &cyrillic_utf8_runs(b))
+}
+
+/// Whether byte `i` of `b` is ChessBase's diagram mark (#314): 0x9e, which
+/// Windows-1251 reads as `ћ` and Windows-1252 as `ž`, with no letter on
+/// either side (`letter`). ChessBase's text writes it after the word for a
+/// diagram (`Diagram <mark>`) and as a comment of its own, where the reader
+/// of 2CBH drops its counterpart U+E005 (`crate::signs`); a letter beside it
+/// keeps the page's letter (`Božidar`, Serbian `ћ`).
+fn is_diagram_mark(b: &[u8], i: usize, letter: impl Fn(u8) -> bool) -> bool {
+    b[i] == 0x9e && !i.checked_sub(1).is_some_and(|j| letter(b[j])) && !b.get(i + 1).is_some_and(|&c| letter(c))
 }
 
 /// The chess sign ChessBase's fonts draw for byte `b` of text read in `read`,
@@ -261,6 +277,25 @@ mod tests {
         assert_eq!(single_byte(b"\xe8 \xf2.\xe4.", CYRILLIC, WESTERN), "è ò.ä.");
         assert_eq!(single_byte(b"\xe8 \xf2.\xe4.", WESTERN, CYRILLIC), "и т.д.");
         assert_eq!(text(b"\xcf\xe5\xf2\xf0\xee\xe2\0", WESTERN, WESTERN), "Петров");
+    }
+
+    /// ChessBase's diagram mark, 0x9e touching no letter, is dropped in both
+    /// pages' text; beside a letter it is the page's letter (#314). Made-up
+    /// texts.
+    #[test]
+    fn the_diagram_mark_is_dropped() {
+        for page in [WESTERN, CYRILLIC] {
+            // `Диаграмма` and the mark, in Windows-1251.
+            assert_eq!(single_byte(b"\xc4\xe8\xe0\xe3\xf0\xe0\xec\xec\xe0 \x9e", page, page), "Диаграмма ");
+            assert_eq!(single_byte(b"Diagram \x9e", page, page), "Diagram ");
+            assert_eq!(single_byte(b"\x9e", page, page), "");
+            assert_eq!(single_byte(b"\x9e\r\nWhite is better.", page, page), "\r\nWhite is better.");
+        }
+        // Between letters it stays the page's letter.
+        assert_eq!(single_byte(b"Bo\x9eidar", WESTERN, WESTERN), "Božidar");
+        assert_eq!(single_byte(b"Bo\x9eidar", CYRILLIC, CYRILLIC), "Boћidar", "a name that shows no page");
+        // Serbian `Ћирић`, in Windows-1251: its ћ ends a word.
+        assert_eq!(single_byte(b"\x8e\xe8\xf0\xe8\x9e", CYRILLIC, CYRILLIC), "Ћирић");
     }
 
     /// ChessBase's piece bytes are figurines where they stand as pieces in
