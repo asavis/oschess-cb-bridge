@@ -105,8 +105,9 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 ///   before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin K,
 ///   `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`);
 ///   a letter at 0xc0-0xff that ends a number, as Russian books number
-///   problems and variations (`1.49а`; Western text writes no `1.49à`, and
-///   its ordinals `1ª`, `2º` stand below 0xc0); also `№` before a digit.
+///   problems and variations (`1.49а`; Western text writes no `1.49à`, its
+///   ordinals `1ª`, `2º` stand below 0xc0, and its `×` and `÷` stand between
+///   numbers, `2×2`); also `№` before a digit.
 /// - Western: a word with no more of them than ASCII letters (`für`).
 /// - Neither: a word of one letter (French `à`, Russian `в`), a short word
 ///   with more of them than ASCII letters but no three in a row (`Süß`, `été`),
@@ -150,7 +151,10 @@ impl Evidence {
             let run = word.split(|&c| !high(c)).map(<[u8]>::len).max().unwrap_or(0);
             let next = b.get(i).copied();
             let lookalikes = ascii > 0 && word.iter().filter(|&&c| high(c)).all(|c| LOOKALIKES.contains(c));
-            let ends_number = matches!(word, [0xc0..=0xff]) && start > 0 && b[start - 1].is_ascii_digit();
+            let ends_number = matches!(word, [0xc0..=0xff] if word[0] != 0xd7 && word[0] != 0xf7)
+                && start > 0
+                && b[start - 1].is_ascii_digit()
+                && !next.is_some_and(|c| c.is_ascii_alphanumeric());
             if is_notation(word, next) || is_typed_square(word, next) || ends_number {
                 e.cyrillic += h;
             } else if lookalikes {
@@ -391,6 +395,10 @@ mod tests {
         assert_eq!(guess(b"3.7\xe0"), cyrillic, "3.7а");
         assert_eq!(guess(b"9.4\xf1"), cyrillic, "9.4с");
         assert_eq!(guess(b"3 \xe0"), None, "a word of its own");
+        // Western multiplication and division between numbers.
+        assert_eq!(guess(b"2\xd72 = 4"), None, "2×2 = 4");
+        assert_eq!(guess(b"10\xf75 = 2"), None, "10÷5 = 2");
+        assert_eq!(guess(b"3\xe22"), None, "a letter that does not end the number: 3в2");
         // Western ordinals stay Western.
         assert_eq!(guess(b"1\xaa Divisi\xf3n"), None, "1ª División: ó looks like у");
         assert_eq!(guess(b"1\xaa Divisi\xf3n, M\xfcller"), western);

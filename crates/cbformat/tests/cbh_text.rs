@@ -153,6 +153,14 @@ fn lookalike_names_do_not_turn_a_database_western() {
     assert_eq!(texts, [vec!["(сontinuation 1)"], vec!["и 6. Nb3"]]);
 }
 
+/// Western arithmetic shows no page, so it leaves its game's other texts as
+/// they are: `2×2 = 4` and `à` stay Western on a Western computer (#306).
+#[test]
+fn western_arithmetic_shows_its_game_no_page() {
+    let f = database("text-arithmetic", [b"Anand", b"Anderssen"], [&[b"2\xd72 = 4", b"\xe0"], &[b"10\xf75 = 2"]]);
+    assert_eq!(read(&f, CodePage::WESTERN).1, [vec!["2×2 = 4", "à"], vec!["10÷5 = 2"]]);
+}
+
 /// A UTF-8 run in one text shows its game no page: `à` beside `für` and a
 /// Cyrillic UTF-8 run stays Western on a Western computer (#306).
 #[test]
