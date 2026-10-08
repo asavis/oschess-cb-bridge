@@ -344,6 +344,9 @@ mod tests {
                 progress: None,
                 listed: true,
                 writable: false,
+                folder: Vec::new(),
+                created: None,
+                modified: None,
             }],
             served: true,
             ..testing::snapshot()

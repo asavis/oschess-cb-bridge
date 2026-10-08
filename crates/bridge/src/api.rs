@@ -294,6 +294,13 @@ fn database(d: &Database) -> String {
     if let Some((present, total)) = d.progress {
         o = o.raw("progress", &progress(present, total));
     }
+    o = o.raw("folder", &json::array(d.folder.iter().map(|s| json::string(s))));
+    if let Some(created) = d.created.and_then(crate::log::rfc3339) {
+        o = o.str("created", &created);
+    }
+    if let Some(modified) = d.modified.and_then(crate::log::rfc3339) {
+        o = o.str("modified", &modified);
+    }
     o.done()
 }
 

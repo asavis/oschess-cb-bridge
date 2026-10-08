@@ -342,7 +342,10 @@ adds, then those given with `--database`, each once:
       "state": "ready",
       "writable": false,
       "records": 11966514,
-      "generation": "g1b2c3d4"
+      "generation": "g1b2c3d4",
+      "folder": ["Bases", "Mega2026"],
+      "created": "2025-11-20T09:14:03Z",
+      "modified": "2025-11-20T09:31:47Z"
     },
     {
       "id": "5e4f30219a8b7c6d",
@@ -351,7 +354,10 @@ adds, then those given with `--database`, each once:
       "state": "downloading",
       "writable": false,
       "size": 734003200,
-      "progress": { "present": 104857600, "total": 734003200 }
+      "progress": { "present": 104857600, "total": 734003200 },
+      "folder": ["MyWork", "Club"],
+      "created": "2025-07-07T16:02:11Z",
+      "modified": "2025-08-29T19:45:00Z"
     },
     {
       "id": "9a8b7c6d5e4f3021",
@@ -359,7 +365,10 @@ adds, then those given with `--database`, each once:
       "format": "pgn",
       "state": "opening",
       "writable": false,
-      "progress": { "present": 52428800, "total": 157286400 }
+      "progress": { "present": 52428800, "total": 157286400 },
+      "folder": ["D:", "Chess", "TWIC"],
+      "created": "2026-09-29T07:30:12Z",
+      "modified": "2026-09-29T07:30:12Z"
     }
   ]
 }
@@ -375,6 +384,13 @@ adds, then those given with `--database`, each once:
 | `generation` | See above; present when `ready` |
 | `size` | The bytes of the database's files; present when `cloudOnly` or `downloading` |
 | `progress` | `present` bytes on this computer of `total`, when `downloading`; `present` bytes of the PGN file read of `total`, when `opening` |
+| `folder` | The folder holding the database, as an array of path segments, for a client to show and search (#298). Inside ChessBase's documents folder (`Documents\ChessBase`) it is relative to it: `["Bases", "Mega2026"]`, and `[]` for a database directly in it. Elsewhere under the user's profile folder it starts with the segment `"~"` for that folder: `["~", "Desktop", "Chess"]`. Elsewhere it is the whole path from its drive: `["D:", "Chess", "TWIC"]`, or `["\\\\nas\\share", "Bases"]` on a network share. The path is first made absolute and its `.` and `..` resolved, by its spelling alone, and a drive or share is named plainly however it is written (`\\?\C:\…` is `C:`, `\\?\UNC\nas\share` is `\\nas\share`), so every spelling of a folder names it alike; the user's name never appears. Always present |
+| `created` | When the database was created: the creation time of its main file (`.2cbh`, `.cbh` or `.pgn`; for another format, its file), in UTC, RFC 3339 to the second. Absent when `missing`, when the file system keeps no creation time, and for a time outside the years 0000 to 9999, which RFC 3339 cannot write |
+| `modified` | When the database last changed: the latest modification time of the files it is read through (for 2CBH `.2cbh`, `.2cbg`, `.2lid`, and `.2cba` when present, never its `.2lgd` and `.2lcd`; a game added in ChessBase writes `.2cbg` alone), in the form of `created`. Absent when `missing`, and outside the years 0000 to 9999 |
+
+`folder`, `created` and `modified` come from the files' metadata: a cloud-only
+database's times are read without opening its files, so listing still
+downloads nothing. A row without them comes from an older bridge.
 
 #### Cloud-only databases
 

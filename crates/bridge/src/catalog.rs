@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use cbformat::view::Base;
 
 use crate::activity::Activity;
+use crate::documents;
 use crate::fetch::{Cloud, Progress, System};
 use crate::pgnindex::{self, Opening};
 use crate::search::Indexes;
@@ -110,7 +111,8 @@ pub struct Entry {
 }
 
 /// What entries share: how cloud files are seen, the download queue, the
-/// index builds of PGN files, and the catalog's background work.
+/// index builds of PGN files, the catalog's background work, and the folders
+/// a database's folder is named from.
 struct Shared {
     cloud: Arc<dyn Cloud>,
     downloads: Arc<Serial>,
@@ -119,6 +121,26 @@ struct Shared {
     /// queues, its index builds, the writers of its names files and the
     /// keeper's looks ([`Catalog::settle`]).
     activity: Arc<Activity>,
+    roots: Roots,
+}
+
+/// The folders [`documents::folder_segments`] names a database's folder from.
+struct Roots {
+    chessbase: Option<PathBuf>,
+    profile: Option<PathBuf>,
+}
+
+/// What one look at a database's files tells, without reading them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Look {
+    /// The bytes of the files the database is read through.
+    pub size: u64,
+    /// When its main file (`.2cbh`, `.cbh`, `.pgn`) was created, when the
+    /// file system keeps that.
+    pub created: Option<SystemTime>,
+    /// When the file of them that changed last changed, by its modification
+    /// time: a game added to a 2CBH database changes `.2cbg` alone.
+    pub modified: Option<SystemTime>,
 }
 
 /// What stays with a database when the list is read again or the window
@@ -152,6 +174,11 @@ struct Files {
     /// When the file changed last that changed last, as its modification
     /// time says.
     modified: Option<SystemTime>,
+    /// When the main file was created, when the file system keeps that.
+    created: Option<SystemTime>,
+    /// [`Files::modified`] of the files the reader opens alone: a 2CBH
+    /// database's `.2lgd` and `.2lcd` are among its files but never read.
+    read_modified: Option<SystemTime>,
 }
 
 impl Files {
@@ -161,6 +188,10 @@ impl Files {
 
     fn cloud_only(&self) -> bool {
         self.present.iter().any(|f| f.2)
+    }
+
+    fn look(&self) -> Look {
+        Look { size: self.size(), created: self.created, modified: self.read_modified }
     }
 }
 
@@ -195,21 +226,37 @@ impl Entry {
     /// A database with any file marked cloud-only is never opened, since
     /// reading that file would download it: see [`Entry::open_to_read`].
     pub fn open(&self) -> Result<Opened, State> {
-        self.open_sized().0
+        self.open_looked().0
     }
 
-    /// [`Entry::open`], and the bytes of the database's files from the same
-    /// look at their metadata: `None` when the files were not looked at, for
-    /// a database that left the list or is of another format (#67).
-    pub fn open_sized(&self) -> (Result<Opened, State>, Option<u64>) {
+    /// [`Entry::open`], and the size and times of the database's files from
+    /// the same look at their metadata (#67, #298): `None` when the files were
+    /// not looked at or are gone, for a database that left the list or is
+    /// `missing`. A file of another format is looked at alone.
+    pub fn open_looked(&self) -> (Result<Opened, State>, Option<Look>) {
         if self.held.removed.load(Ordering::Relaxed) {
             return (Err(State::Missing), None);
         }
         if self.format == Format::Other {
-            return (Err(if self.path.exists() { State::Unsupported } else { State::Missing }), None);
+            return match std::fs::metadata(&self.path) {
+                Ok(m) => {
+                    let look = Look { size: m.len(), created: m.created().ok(), modified: m.modified().ok() };
+                    (Err(State::Unsupported), Some(look))
+                }
+                Err(_) => (Err(State::Missing), None),
+            };
         }
         let files = self.files();
-        (self.open_files(&files), Some(files.size()))
+        let open = self.open_files(&files);
+        let look = (open.as_ref().err() != Some(&State::Missing)).then(|| files.look());
+        (open, look)
+    }
+
+    /// The folder holding the database, as path segments
+    /// ([`documents::folder_segments`]).
+    pub fn folder(&self) -> Vec<String> {
+        let roots = &self.shared.roots;
+        documents::folder_segments(&self.path, roots.chessbase.as_deref(), roots.profile.as_deref())
     }
 
     /// [`Entry::open`], and when its files last changed, by their
@@ -404,6 +451,18 @@ impl Drop for Done {
     }
 }
 
+/// Whether the reader of a database of `format` opens `file`, one of its
+/// files ([`cbformat::view::Format::files`]): a 2CBH database's name files
+/// `.2lgd` and `.2lcd` are listed among its files but never read
+/// ([`cbformat::v2::READ`]).
+fn read_by_reader(format: cbformat::view::Format, file: &Path) -> bool {
+    if format != cbformat::view::Format::TwoCbh {
+        return true;
+    }
+    let ext = file.extension().map(|e| e.to_string_lossy()).unwrap_or_default();
+    cbformat::v2::READ.iter().any(|read| read[1..].eq_ignore_ascii_case(&ext))
+}
+
 /// The metadata of the database at `path`, of `format`: its generation and
 /// files, the ones its reader opens ([`cbformat::view::Format::files`]), so
 /// that the search boosters and other optional classic files are neither
@@ -415,7 +474,14 @@ impl Drop for Done {
 /// database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let mut hash = Hash::new();
-    let mut files = Files { generation: None, present: Vec::new(), irregular: false, modified: None };
+    let mut files = Files {
+        generation: None,
+        present: Vec::new(),
+        irregular: false,
+        modified: None,
+        created: None,
+        read_modified: None,
+    };
     let Some(format) = format.view() else { return files };
     // Every cache keyed on a PGN database's generation (the header index, the
     // heads and names files, the position index) is then built again once
@@ -433,6 +499,12 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
                 hash.write_meta(&m);
                 hash.write_id(cbformat::file::file_id(&path, &m));
                 files.modified = files.modified.max(m.modified().ok());
+                if read_by_reader(format, &path) {
+                    files.read_modified = files.read_modified.max(m.modified().ok());
+                }
+                if i == 0 {
+                    files.created = m.created().ok();
+                }
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
             }
@@ -490,12 +562,13 @@ impl Catalog {
         let activity = Arc::new(Activity::default());
         let downloads = Arc::new(Serial::counted("download", Arc::clone(&activity)));
         let pgn = pgnindex::Registry::counted(Arc::clone(&activity));
+        let roots = Roots { chessbase: sources.chessbase.clone(), profile: documents::profile() };
         let catalog = Catalog {
             explorer: crate::explorer::Registry::counted(Arc::clone(&activity)),
             heads: Arc::default(),
             heads_queue: Arc::new(Serial::counted("heads", Arc::clone(&activity))),
             sources,
-            shared: Arc::new(Shared { cloud, downloads, pgn, activity }),
+            shared: Arc::new(Shared { cloud, downloads, pgn, activity, roots }),
             read: Mutex::default(),
             entries: Mutex::default(),
             after_read: Mutex::new(None),

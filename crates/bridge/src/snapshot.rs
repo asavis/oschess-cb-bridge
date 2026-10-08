@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::api::App;
 use crate::catalog::{Entry, State};
@@ -67,13 +67,22 @@ pub struct Database {
     /// Whether it takes writes now: a ready PGN file without the read-only
     /// attribute (`docs/api.md`, "Writing games").
     pub writable: bool,
+    /// The folder holding it, as path segments
+    /// ([`crate::documents::folder_segments`]).
+    pub folder: Vec<String>,
+    /// When its main file was created, from its metadata: `None` when it is
+    /// missing, or when the file system keeps no such time.
+    pub created: Option<SystemTime>,
+    /// When the file it is read through that changed last changed, from
+    /// their metadata: `None` when it is missing.
+    pub modified: Option<SystemTime>,
 }
 
 impl Database {
     /// The database as `GET /v1/databases`, `/v1/status` and the tray app all
     /// show it (#67), from one look at its files: a ready one is opened once.
     pub fn of(entry: &Entry) -> Database {
-        let (open, files_size) = entry.open_sized();
+        let (open, look) = entry.open_looked();
         let (state, records, generation) = match open {
             Ok(open) => (State::Ready, Some(open.db.record_count()), Some(open.generation)),
             Err(state) => (state, None, None),
@@ -86,7 +95,7 @@ impl Database {
         .map(|p| (p.present(), p.total));
         let size = match (state, progress) {
             (State::Downloading, Some((_, total))) => Some(total),
-            (State::CloudOnly | State::Downloading, _) => files_size,
+            (State::CloudOnly | State::Downloading, _) => look.map(|l| l.size),
             _ => None,
         };
         Database {
@@ -100,6 +109,9 @@ impl Database {
             progress,
             listed: entry.listed(),
             writable: state == State::Ready && entry.writable_file(),
+            folder: entry.folder(),
+            created: look.and_then(|l| l.created),
+            modified: look.and_then(|l| l.modified),
         }
     }
 }
@@ -291,6 +303,9 @@ mod tests {
             progress: None,
             listed: true,
             writable: false,
+            folder: Vec::new(),
+            created: None,
+            modified: None,
         };
         assert_eq!(work_of(&[db(State::Ready), db(State::Missing)], false, false, false), []);
         assert_eq!(

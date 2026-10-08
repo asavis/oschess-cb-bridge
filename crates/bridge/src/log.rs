@@ -115,10 +115,24 @@ fn extension(path: &Path) -> Option<&str> {
 
 /// Seconds since 1970-01-01T00:00:00Z, negative for a clock set before it.
 fn now() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
+    seconds(SystemTime::now())
+}
+
+/// Seconds from 1970-01-01T00:00:00Z to `time`, negative before it.
+fn seconds(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
         Err(e) => i64::try_from(e.duration().as_secs()).map_or(i64::MIN, |s| -s),
     }
+}
+
+/// `time` in RFC 3339 to the second, as the database list writes file times
+/// (#298): `None` for a time outside the years 0000 to 9999, which RFC 3339's
+/// four-digit year cannot hold (a Windows file time reaches the year 30827).
+pub fn rfc3339(time: SystemTime) -> Option<String> {
+    let secs = seconds(time);
+    let (year, _, _) = civil_from_days(secs.div_euclid(86_400));
+    (0..=9999).contains(&year).then(|| timestamp(secs))
 }
 
 /// `secs` seconds after 1970-01-01T00:00:00Z, in ISO 8601 to the second:
@@ -192,6 +206,23 @@ mod tests {
         }
         let now = timestamp(now());
         assert_eq!((now.len(), &now[4..5], &now[10..11], &now[19..]), (20, "-", "T", "Z"), "{now}");
+        let at = |secs: i64| match u64::try_from(secs) {
+            Ok(s) => UNIX_EPOCH + std::time::Duration::from_secs(s),
+            Err(_) => UNIX_EPOCH - std::time::Duration::from_secs(secs.unsigned_abs()),
+        };
+        for secs in [0, -1, -86_401, 1_790_521_445] {
+            assert_eq!(seconds(at(secs)), secs);
+        }
+        // RFC 3339 holds the years 0000 to 9999 only.
+        for (secs, text) in [
+            (1_790_521_445, Some("2026-09-27T15:04:05Z")),
+            (253_402_300_799, Some("9999-12-31T23:59:59Z")),
+            (253_402_300_800, None),
+            (-62_167_219_200, Some("0000-01-01T00:00:00Z")),
+            (-62_167_219_201, None),
+        ] {
+            assert_eq!(rfc3339(at(secs)).as_deref(), text, "{secs}");
+        }
     }
 
     #[test]
