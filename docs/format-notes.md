@@ -312,9 +312,11 @@ ASCII has been seen under `19` and `1a`, and keys that are paths are UTF-8,
 Cyrillic ones included. What distinguishes `19` from `1a` is **unknown**: `1a`
 has held only the reference database's path.
 
-**Older entries** (asavis/oschess-cb-bridge#288). A list kept by ChessBase 18
-on a Windows whose ANSI code page is 1251 showed two more encodings, seen in
-the user's screenshots rather than in the file:
+**Older entries** (asavis/oschess-cb-bridge#288, #300). A list kept by
+ChessBase 18 on a Windows whose ANSI code page is 1251 showed more encodings,
+first in the user's screenshots and then in the file itself, 110 entries: 64
+paths in Windows-1251 (44 of them with Windows-1251 titles, 20 with ASCII
+ones), 15 titles cut to one byte and one title escaped:
 
 - **The ANSI code page.** Titles and paths in Windows-1251: read as Latin-1,
   `Содержание` became `Ñîäåðæàíèå`, and the files of those entries, and of
@@ -333,6 +335,16 @@ the user's screenshots rather than in the file:
   ASCII stays as stored. One ambiguity remains: a title chosen by the user
   that is exactly the image of its own file name (`012` for `абв.cbh`) is
   shown as the file name.
+- **Titles cut from a start of the file name.** One cut title is the image
+  of the start of its file name before a dash: `завлечение` of
+  `завлечение-1`. The reader also matches the image of a start of two letters
+  or more that the rest of the name begins with something other than a letter
+  (a dash, a space, a digit), and shows that start. A part of one letter is
+  not matched, since its image is one character (`Q` for `ё`).
+- **Titles escaped.** One title holds the UTF-8 bytes of its text, each
+  written `/` and two hex digits: `/D0/B5/D1/82/D1/8E/D0/B4/D0/B8` for
+  `етюди`, the database's file name. The reader reads a title made of such
+  escapes alone, whose bytes are UTF-8 that is not ASCII, as that text.
 
 **Sections and items seen:**
 
