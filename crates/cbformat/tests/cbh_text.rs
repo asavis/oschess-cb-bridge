@@ -153,6 +153,15 @@ fn lookalike_names_do_not_turn_a_database_western() {
     assert_eq!(texts, [vec!["(сontinuation 1)"], vec!["и 6. Nb3"]]);
 }
 
+/// A UTF-8 run in one text shows its game no page: `à` beside `für` and a
+/// Cyrillic UTF-8 run stays Western on a Western computer (#306).
+#[test]
+fn utf8_runs_show_their_game_no_page() {
+    let first = [&b"f\xfcr "[..], "Ход белых".as_bytes()].concat();
+    let f = database("text-utf8-game", [b"Anand", b"Anderssen"], [&[&first, b"\xe0"], &[]]);
+    assert_eq!(read(&f, CodePage::WESTERN).1[0], ["für Ход белых", "à"]);
+}
+
 /// Cyrillic names keep their letters at ChessBase's piece bytes, Ukrainian Ґ
 /// and Serbian Ј, on either computer.
 #[test]
