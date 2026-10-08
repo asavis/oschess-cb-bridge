@@ -3,7 +3,6 @@
 //! the reading form of the PGN leaves out. [`crate::v2`] decodes `.2cba`
 //! records into them, and [`crate::cbh`] classic `.cba` records.
 
-use crate::codepage::CodePage;
 use crate::movetable::Sq;
 use crate::{Error, Result};
 
@@ -174,8 +173,10 @@ impl GameAnnotations {
     }
 }
 
-/// UTF-8 when the bytes are valid UTF-8, else Windows-1252: nothing in the
-/// record says which.
+/// UTF-8 when the bytes are valid UTF-8, else Windows-1251 when their words
+/// show Cyrillic and Windows-1252 otherwise
+/// ([`crate::codepage::utf8_or_legacy`]): nothing in the record says which
+/// (#308).
 pub(crate) fn decode_text(b: &[u8]) -> String {
-    CodePage::WESTERN.utf8_or(b)
+    crate::codepage::utf8_or_legacy(b)
 }

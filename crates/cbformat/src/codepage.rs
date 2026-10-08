@@ -83,6 +83,19 @@ impl CodePage {
 /// Windows-1252 has symbols there.
 const CYRILLIC_ONLY: [u8; 9] = [0xa8, 0xaa, 0xaf, 0xb2, 0xb3, 0xb4, 0xb8, 0xba, 0xbf];
 
+/// `bytes` as UTF-8 when they are valid UTF-8; else in Windows-1251 when their
+/// words show Cyrillic ([`cyrillic_or_western`]), and in Windows-1252
+/// otherwise. For text a format keeps as UTF-8, such as 2CBH's, which an
+/// older program sometimes wrote in a single-byte page: Russian text reads as
+/// Russian, and any other text as it did before, on every computer (#308).
+pub fn utf8_or_legacy(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) if cyrillic_or_western(bytes) == Some(CodePage::CYRILLIC) => CodePage::CYRILLIC.decode(bytes),
+        Err(_) => CodePage::WESTERN.decode(bytes),
+    }
+}
+
 /// Whether single-byte text reads as Cyrillic ([`CodePage::CYRILLIC`]) or as
 /// Western ([`CodePage::WESTERN`]) text, from its words; `None` when its
 /// words do not say ([`Evidence`]).
@@ -101,19 +114,24 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 /// the larger total decides:
 ///
 /// - Cyrillic: a word of these bytes alone, or one with three of them in a row
-///   (`Cлон`, typed with a Latin C), and Russian notation, a piece letter
-///   before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin K,
-///   `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`);
-///   a letter at 0xc0-0xff that ends a number, as Russian books number
-///   problems and variations (`1.49а`; Western text writes no `1.49à`, its
-///   ordinals `1ª`, `2º` stand below 0xc0, and its `×` and `÷` stand between
-///   numbers, `2×2`); also `№` before a digit.
+///   (`Cлон`, typed with a Latin C), and Russian notation, a Russian piece
+///   letter before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin
+///   K, `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`,
+///   `е5`); one of а-е after a number, as Russian books number problems and
+///   variations (`1.49а`, `1851г.`), and a promotion or a mate after a square
+///   (`h8Ф`, `Фb7х`), each before a space, ASCII punctuation or the end. Not
+///   `№` before a digit, nor any other letter before a square or after a
+///   number: in Western text ChessBase writes its signs with those bytes,
+///   `¹8.¤c3`, `×b6`, `d4þ` and `2þ`, and engines and French ordinals end
+///   numbers with letters too, `5.00ß` and `2è` (#308).
 /// - Western: a word with no more of them than ASCII letters (`für`).
 /// - Neither: a word of one letter (French `à`, Russian `в`), a short word
 ///   with more of them than ASCII letters but no three in a row (`Süß`, `été`),
 ///   which could be either, and a word whose such letters are all Cyrillic
 ///   letters that look Latin among ASCII ones (`сorr.` typed with a Cyrillic
-///   с), which reads alike either way.
+///   с), which reads alike either way; nor one of these bytes alone that
+///   repeats one byte or holds only signs ([`is_sign`]): ChessBase's signs in
+///   Western text, `þþ`, `××` and `÷³`, not Russian words (#308).
 ///
 /// Evidence adds up, so that texts that show nothing alone can be read as the
 /// texts beside them show.
@@ -125,16 +143,11 @@ pub struct Evidence {
 
 impl Evidence {
     pub fn of(b: &[u8]) -> Evidence {
-        let high = |c: u8| c >= 0xc0 || CYRILLIC_ONLY.contains(&c);
-        let letter = |c: u8| c.is_ascii_alphabetic() || high(c);
+        let letter = |c: u8| c.is_ascii_alphabetic() || is_high_letter(c);
         let mut e = Evidence::default();
         let mut i = 0;
         while i < b.len() {
             if !letter(b[i]) {
-                // `№`, which Windows-1252 has as `¹`.
-                if b[i] == 0xb9 && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                    e.cyrillic += 1;
-                }
                 i += 1;
                 continue;
             }
@@ -143,22 +156,20 @@ impl Evidence {
                 i += 1;
             }
             let word = &b[start..i];
-            let h = word.iter().filter(|&&c| high(c)).count();
+            let h = word.iter().filter(|&&c| is_high_letter(c)).count();
             if h == 0 {
                 continue;
             }
             let ascii = word.len() - h;
-            let run = word.split(|&c| !high(c)).map(<[u8]>::len).max().unwrap_or(0);
+            let run = word.split(|&c| !is_high_letter(c)).map(<[u8]>::len).max().unwrap_or(0);
             let next = b.get(i).copied();
-            let lookalikes = ascii > 0 && word.iter().filter(|&&c| high(c)).all(|c| LOOKALIKES.contains(c));
-            let ends_number = matches!(word, [0xc0..=0xff] if word[0] != 0xd7 && word[0] != 0xf7)
-                && start > 0
-                && b[start - 1].is_ascii_digit()
-                && !next.is_some_and(|c| c.is_ascii_alphanumeric());
-            if is_notation(word, next) || is_typed_square(word, next) || ends_number {
+            let lookalikes = ascii > 0 && word.iter().filter(|&&c| is_high_letter(c)).all(|c| LOOKALIKES.contains(c));
+            if is_notation(word, next) || is_typed_square(word, next) || ends_number(b, start, word, next) {
                 e.cyrillic += h;
             } else if lookalikes {
                 // Reads alike either way: shows neither.
+            } else if ascii == 0 && (word.iter().all(|&c| c == word[0]) || word.iter().all(|&c| is_sign(c))) {
+                // ChessBase's signs, not a Russian word: shows neither.
             } else if word.len() > 1 && (ascii == 0 || run >= 3) {
                 e.cyrillic += h;
             } else if word.len() > 1 && h <= ascii {
@@ -184,6 +195,39 @@ impl Evidence {
     }
 }
 
+/// Whether Windows-1251 reads byte `c` as a letter: 0xc0-0xff, and the letters
+/// only it has ([`CYRILLIC_ONLY`]).
+fn is_high_letter(c: u8) -> bool {
+    c >= 0xc0 || CYRILLIC_ONLY.contains(&c)
+}
+
+/// Whether byte `c` is a letter in Windows-1251 that ChessBase's chess fonts
+/// draw as a sign in Western text: × and ÷ (Ч and ч), and the letters only
+/// Windows-1251 has ([`CYRILLIC_ONLY`]), among them ² and ³ for ⩲ and ⩱ (І and
+/// і).
+fn is_sign(c: u8) -> bool {
+    matches!(c, 0xd7 | 0xf7) || CYRILLIC_ONLY.contains(&c)
+}
+
+/// Whether `word`, a word of `b` from `start` followed by the byte `next`, is
+/// a letter that ends a number in Russian text: one of а-е after a number
+/// (`1.49а`, `1851г.`), or a promotion or a mate after a square (`h8Ф`,
+/// `Фb7х`), before a space, ASCII punctuation or the end ([`Evidence`]).
+fn ends_number(b: &[u8], start: usize, word: &[u8], next: Option<u8>) -> bool {
+    let digits = b[..start].iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 || next.is_some_and(|c| !c.is_ascii() || c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let after_letter = b[..start - digits].last().is_some_and(|&c| c.is_ascii_alphabetic() || is_high_letter(c));
+    match word {
+        // Ф, Л, С, К, х, Х.
+        [0xd4 | 0xcb | 0xd1 | 0xca | 0xf5 | 0xd5] => after_letter,
+        // а-е.
+        [0xe0..=0xe5] => !after_letter,
+        _ => false,
+    }
+}
+
 /// Windows-1251 letters that look like Latin ones (а с е о р х у, А В Е К М Н О
 /// Р С Т Х У), whose bytes Windows-1252 reads as Latin letters with marks.
 const LOOKALIKES: [u8; 19] =
@@ -201,20 +245,17 @@ fn is_typed_square(word: &[u8], next: Option<u8>) -> bool {
 }
 
 /// Whether `word`, followed by the byte `next`, is a move in Russian notation:
-/// a piece letter or two (`К`, `Кр`, `Ф`, `Л`, `С`, `П`; any letter at
-/// 0xc0-0xff is taken, and the K of Кр may be Latin), then up to three of
-/// `a`-`h` and `x` ending at a rank (`Фc2`, `Лbc2`, `Крxg1`, `Kрg1`), or
-/// nothing more before a `:` (`Л:f6`).
+/// a Russian piece letter (`К`, `Кр`, `Ф`, `Л`, `С`, `П`; the K of Кр may be
+/// Latin), then up to three of `a`-`h` and `x` ending at a rank (`Фc2`,
+/// `Лbc2`, `Крxg1`, `Kрg1`), or nothing more before a `:` (`Л:f6`).
 fn is_notation(word: &[u8], next: Option<u8>) -> bool {
-    let word = match word {
-        [b'K', c, ..] if *c >= 0xc0 => &word[1..],
-        _ => word,
+    let rest = match word {
+        // Кр, with a Cyrillic or a Latin K.
+        [0xca | b'K', 0xf0, rest @ ..] => rest,
+        // К, Ф, Л, С, П.
+        [0xca | 0xd4 | 0xcb | 0xd1 | 0xcf, rest @ ..] => rest,
+        _ => return false,
     };
-    let pieces = word.iter().take_while(|&&c| c >= 0xc0).count();
-    let rest = &word[pieces..];
-    if !(1..=2).contains(&pieces) {
-        return false;
-    }
     let square = !rest.is_empty()
         && rest.len() <= 3
         && rest.iter().all(|&c| matches!(c, b'a'..=b'h' | b'x'))
@@ -391,10 +432,20 @@ mod tests {
         assert_eq!(guess(b"\xe8 N:\xf12"), cyrillic, "и N:с2");
         assert_eq!(guess(b"11. \xe55"), cyrillic, "е5");
         assert_eq!(guess(b"R\xe5x"), None, "no rank after the file");
-        // A letter that ends a number.
+        // A letter that ends a number: а-е after a number, a promotion or a
+        // mate after a square.
         assert_eq!(guess(b"3.7\xe0"), cyrillic, "3.7а");
-        assert_eq!(guess(b"9.4\xf1"), cyrillic, "9.4с");
+        assert_eq!(guess(b"(1851\xe3.)"), cyrillic, "1851г.");
+        assert_eq!(guess(b"8.h8\xd4"), cyrillic, "8.h8Ф");
+        assert_eq!(guess(b"Rh8\xd5!"), cyrillic, "Rh8Х!");
         assert_eq!(guess(b"3 \xe0"), None, "a word of its own");
+        assert_eq!(guess(b"B1\xe0"), None, "а after a square");
+        assert_eq!(guess(b"8.h8\xe1"), None, "б after a square: one of ChessBase's signs");
+        assert_eq!(guess(b"10.d4\xfe"), None, "a sign after a move");
+        assert_eq!(guess(b"an extra pawn, 2\xfe"), None, "a sign after a number");
+        assert_eq!(guess(b"Engine 1.00\xdf (5s)"), None, "an engine's version");
+        assert_eq!(guess(b"2\xe8 ronde"), None, "a French ordinal");
+        assert_eq!(guess(b"8\xe2\x80\xa6d6"), None, "UTF-8 …, not а-е before punctuation");
         // Western multiplication and division between numbers.
         assert_eq!(guess(b"2\xd72 = 4"), None, "2×2 = 4");
         assert_eq!(guess(b"10\xf75 = 2"), None, "10÷5 = 2");
@@ -427,7 +478,17 @@ mod tests {
         assert_eq!(guess(b"\xd4c2"), cyrillic, "Фc2");
         assert_eq!(guess(b"\xca\xf0xg1"), cyrillic, "Крxg1");
         assert_eq!(guess(b"\xcb:f6"), cyrillic, "Л:f6");
-        assert_eq!(guess(b"\xb943"), cyrillic, "№43");
+        // ChessBase's signs in Western text: ⌓ at 0xb9 before a move, × before
+        // a square. Neither shows Cyrillic.
+        assert_eq!(guess(b"\xb943"), None, "¹43: № or ⌓");
+        assert_eq!(guess(b"[\xb98.\xa4c3;8.d4]"), None);
+        assert_eq!(guess(b"\x85Sa4, \xd7b6, c5"), western, "…Sa4, ×b6, c5");
+        // ChessBase's signs on their own: one byte repeated, × and ÷, ² and ³.
+        assert_eq!(guess(b"with the \xfe\xfe"), None, "þþ");
+        assert_eq!(guess(b"[\xd7\xd7 c6, c7]"), None, "××");
+        assert_eq!(guess(b"24.Qf3\xf7\xb3/="), None, "÷³");
+        assert_eq!(guess(b"\xe5\xe5"), None, "ее: alone, a Russian word too shows neither");
+        assert_eq!(guess(b"\xe2\xe8\xe4\xe8\xec\xee \xe5\xe5"), cyrillic, "видимо ее");
         // The larger total decides: Позиция, then a German name.
         assert_eq!(guess(b"\xcf\xee\xe7\xe8\xf6\xe8\xff K\xf6nig"), cyrillic);
         // Nothing to go by: one-letter words, ASCII, symbols.
@@ -446,6 +507,19 @@ mod tests {
         assert_eq!(e.page(), None);
         e.add(Evidence::of(b"Br\xfccke"));
         assert_eq!(e.page(), western);
+    }
+
+    /// UTF-8 first; Windows-1251 only for text whose words show Cyrillic;
+    /// Windows-1252 for anything else, as before.
+    #[test]
+    fn utf8_or_legacy_reads_russian_and_leaves_the_rest() {
+        assert_eq!(utf8_or_legacy("Петров".as_bytes()), "Петров");
+        assert_eq!(utf8_or_legacy(b"\xcf\xe5\xf2\xf0\xee\xe2"), "Петров");
+        assert_eq!(utf8_or_legacy(b"M\xfcller"), "Müller");
+        assert_eq!(utf8_or_legacy(b"\xe0"), "à", "nothing to go by: Western, as before");
+        assert_eq!(utf8_or_legacy(b"Visit\xe9 \xa4d7"), "Visité ¤d7", "no signs");
+        assert_eq!(utf8_or_legacy(b"one of the \xfe\xfe, his \xa2"), "one of the þþ, his ¢");
+        assert_eq!(utf8_or_legacy(b"\x81"), "\u{81}");
     }
 
     #[test]
