@@ -83,12 +83,12 @@ fn a_russian_database_reads_alike_on_either_computer() {
 fn a_western_database_reads_alike_on_either_computer() {
     let f = database(
         "text-western",
-        [b"M\xfcller", b"3.7\xe0"],
+        [b"M\xfcller", b"\xe0"],
         [&[b"Diese Partie ist ein Beispiel f\xfcr die Schw\xe4che, \xa5xf3", b"\xe0"], &[b"\xe0"]],
     );
     for computer in COMPUTERS {
         let (names, texts) = read(&f, computer);
-        assert_eq!(names, ["Müller", "3.7à"], "{computer:?}");
+        assert_eq!(names, ["Müller", "à"], "{computer:?}");
         assert_eq!(texts, [vec!["Diese Partie ist ein Beispiel für die Schwäche, ♗xf3", "à"], vec!["à"]]);
     }
 }
@@ -99,10 +99,10 @@ fn a_western_database_reads_alike_on_either_computer() {
 #[test]
 fn the_computer_decides_what_nothing_shows() {
     let f = database("text-computer", [b"Anand", b"Kasparov"], [&[b"\xe8"], &[b"\xa3\xf3d\x9f"]]);
-    // `ód` shows Western, whatever the computer, and `£` before a letter
-    // is no piece.
+    // `ód` (or `уd`) shows neither, its ó looking like у, so the computer
+    // decides; `£` before a letter is no piece.
     assert_eq!(read(&f, CodePage::WESTERN).1, [vec!["è"], vec!["£ód\u{178}"]]);
-    assert_eq!(read(&f, CodePage::CYRILLIC).1, [vec!["и"], vec!["£ód\u{178}"]]);
+    assert_eq!(read(&f, CodePage::CYRILLIC).1, [vec!["и"], vec!["Јуdџ"]]);
     assert_eq!(read(&f, CodePage::new(1250)).1, [vec!["č"], vec!["Łódź"]]);
     // `open` reads as a Western computer.
     let db = Database::open(f.dir().join("db.cbh")).unwrap();
@@ -140,6 +140,17 @@ fn short_words_keep_their_context() {
     assert_eq!(names, ["Süß", "Anderssen"]);
     assert_eq!(texts[0], ["Cet été"]);
     assert_eq!(read(&f, CodePage::CYRILLIC).1[1], ["1.Kрg1"]);
+}
+
+/// Names whose Cyrillic letters look Latin (`сorr.`, `(сontinuation)`) show
+/// no page, so they do not turn a Russian database's short texts Western on
+/// a Cyrillic computer (`и 6. Nb3`).
+#[test]
+fn lookalike_names_do_not_turn_a_database_western() {
+    let f = database("text-lookalike", [b"\xf1orr.", b"Anand"], [&[b"(\xf1ontinuation 1)"], &[b"\xe8 6. Nb3"]]);
+    let (names, texts) = read(&f, CodePage::CYRILLIC);
+    assert_eq!(names, ["сorr.", "Anand"]);
+    assert_eq!(texts, [vec!["(сontinuation 1)"], vec!["и 6. Nb3"]]);
 }
 
 /// Cyrillic names keep their letters at ChessBase's piece bytes, Ukrainian Ґ

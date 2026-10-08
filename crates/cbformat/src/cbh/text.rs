@@ -43,15 +43,93 @@ pub(super) fn text(field: &[u8], page: CodePage, fallback: CodePage) -> String {
 /// around it shows, which the caller finds, or the computer's. A byte at
 /// 0xa2-0xa7, which ChessBase's chess fonts draw as a piece, is then the
 /// figurine ♔ ♕ ♘ ♗ ♖ ♙ where it stands as a piece ([`is_piece`]: `¤d7`),
-/// and the page's character elsewhere (Ukrainian `Ґалаґан`, `£100`). Where
+/// and the page's character elsewhere (Ukrainian `Ґалаґан`, `£100`). A run
+/// of Cyrillic UTF-8 inside the text ([`utf8_runs`]) is read as UTF-8. Where
 /// the computer's page is another, such as Windows-1250, whose 0xa3 and 0xa5
 /// are the letters Ł and Ą, the text is read in it as it stands.
 pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> String {
     if !detects(page) {
         return page.decode(b);
     }
-    let read = codepage::cyrillic_or_western(b).unwrap_or(fallback);
-    (0..b.len()).map(|i| figurine(b[i]).filter(|_| is_piece(b, i)).unwrap_or_else(|| read.char(b[i]))).collect()
+    let runs = utf8_runs(b);
+    // The words outside the runs show the page.
+    let mut rest = b.to_vec();
+    for run in &runs {
+        rest[run.clone()].fill(b' ');
+    }
+    let read = codepage::cyrillic_or_western(&rest).unwrap_or(fallback);
+    let letter = |c: u8| c.is_ascii_alphabetic() || read.char(c).is_alphabetic();
+    let mut out = String::with_capacity(b.len());
+    let mut i = 0;
+    for run in runs.iter().chain([&(b.len()..b.len())]) {
+        while i < run.start {
+            let sign = || sign(b[i], read).filter(|_| !b.get(i + 1).is_some_and(|&c| letter(c)));
+            out.push(figurine(b[i]).filter(|_| is_piece(b, i)).or_else(sign).unwrap_or_else(|| read.char(b[i])));
+            i += 1;
+        }
+        out.push_str(std::str::from_utf8(&b[run.clone()]).unwrap_or_default());
+        i = run.end;
+    }
+    out
+}
+
+/// Runs of Cyrillic UTF-8 inside single-byte text, which some Russian books
+/// hold after a text in Windows-1251 (`docs/format-notes.md`, "UTF-8 inside
+/// Windows-1251"): from a two-byte sequence of a Cyrillic letter (0xd0 or
+/// 0xd1, then 0x80-0xbf) to the last, with other UTF-8 sequences and ASCII
+/// between, holding three such letters at least. Windows-1251 reads such a
+/// sequence as Р or С and a sign or a rare letter, which Russian text does not
+/// write three times in a row with nothing but ASCII between.
+fn utf8_runs(b: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let continuation = |i: usize| b.get(i).is_some_and(|c| (0x80..=0xbf).contains(c));
+    let cyrillic = |i: usize| matches!(b.get(i), Some(0xd0 | 0xd1)) && continuation(i + 1);
+    // The length of the UTF-8 sequence of two or three bytes at `i`.
+    let sequence = |i: usize| match b.get(i) {
+        Some(0xc2..=0xdf) if continuation(i + 1) => 2,
+        Some(0xe0..=0xef) if continuation(i + 1) && continuation(i + 2) => 3,
+        _ => 0,
+    };
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !cyrillic(i) {
+            i += 1;
+            continue;
+        }
+        let (start, mut end, mut letters, mut j) = (i, i, 0, i);
+        while j < b.len() {
+            if b[j].is_ascii() {
+                j += 1;
+                continue;
+            }
+            let n = sequence(j);
+            if n == 0 {
+                break;
+            }
+            letters += usize::from(cyrillic(j));
+            j += n;
+            end = j;
+        }
+        if letters >= 3 && std::str::from_utf8(&b[start..end]).is_ok() {
+            runs.push(start..end);
+        }
+        i = end.max(i + 1);
+    }
+    runs
+}
+
+/// The chess sign ChessBase's fonts draw for byte `b` of text read in `read`,
+/// where the page has a letter or another sign there that a chess text does
+/// not mean (`docs/format-notes.md`, "Signs"): ½ at 0xbd, which
+/// Windows-1251 reads as the Macedonian Ѕ (`Ѕ-Ѕ` for a draw), and ∓ at 0xb5,
+/// which both pages read as µ (`♕d8-b6µ`). [`single_byte`] takes it only
+/// where no letter follows, so a word keeps its letter.
+fn sign(b: u8, read: CodePage) -> Option<char> {
+    match b {
+        0xbd if read == CodePage::CYRILLIC => Some('½'),
+        0xb5 => Some('∓'),
+        _ => None,
+    }
 }
 
 /// Whether the piece byte `b[i]` of single-byte text stands as a piece, as
@@ -256,6 +334,22 @@ mod tests {
             assert_eq!(single_byte(b"\xa5\xe0\xba\xe2\xf1\xfc\xea\xe8\xe9", page, page), "Ґаєвський");
             assert_eq!(single_byte(b"\xa3\xe0\xf1\xed\xe0", page, page), "Јасна");
         }
+        // Cyrillic UTF-8 after Windows-1251: `Ход? Ход белых`, the second in
+        // UTF-8, and `СССР` in Windows-1251, which is no UTF-8.
+        let mixed = [&b"\xd5\xee\xe4? "[..], "Ход белых".as_bytes()].concat();
+        assert_eq!(single_byte(&mixed, WESTERN, CYRILLIC), "Ход? Ход белых");
+        assert_eq!(single_byte(&mixed, CYRILLIC, CYRILLIC), "Ход? Ход белых");
+        assert_eq!(utf8_runs(b"\xd1\xd1\xd1\xd0"), []);
+        let runs = utf8_runs("Ход".as_bytes());
+        assert_eq!((runs.len(), runs.first()), (1, Some(&(0..6))));
+        assert_eq!(utf8_runs("Хо".as_bytes()), [], "two letters are not enough");
+        // ½ and ∓ in either page, and not inside a word: Macedonian `Ѕвезда`,
+        // `5µm`.
+        for page in [WESTERN, CYRILLIC] {
+            assert_eq!(single_byte(b"\xbd-\xbd, 6\xbd \xa3d8-b6\xb5 \xb5/-+", page, page), "½-½, 6½ ♕d8-b6∓ ∓/-+");
+            assert_eq!(single_byte(b"5\xb5m", page, page), "5µm");
+        }
+        assert_eq!(single_byte(b"\xbd\xe2\xe5\xe7\xe4\xe0", CYRILLIC, CYRILLIC), "Ѕвезда");
         // Signs, not pieces.
         for (bytes, text) in [
             (&b"Prize \xa3100"[..], "Prize £100"),
