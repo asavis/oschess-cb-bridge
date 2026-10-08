@@ -312,15 +312,17 @@ ASCII has been seen under `19` and `1a`, and keys that are paths are UTF-8,
 Cyrillic ones included. What distinguishes `19` from `1a` is **unknown**: `1a`
 has held only the reference database's path.
 
-**Older entries** (asavis/oschess-cb-bridge#288). A list kept by ChessBase 18
-on a Windows whose ANSI code page is 1251 showed two more encodings, seen in
-the user's screenshots rather than in the file:
+**Older entries** (asavis/oschess-cb-bridge#288, #300). A list kept by
+ChessBase 18 on a Windows whose ANSI code page is 1251 showed more encodings,
+first in the user's screenshots and then in the file itself, 110 entries: 64
+paths in Windows-1251 (44 of them with Windows-1251 titles, 20 with ASCII
+ones), 15 titles cut to one byte and one title escaped:
 
 - **The ANSI code page.** Titles and paths in Windows-1251: read as Latin-1,
-  `Содержание` became `Ñîäåðæàíèå`, and the files of those entries, and of
-  entries with ASCII titles in folders named in Cyrillic, were not found. The
-  reader decodes anything that is not valid UTF-8 in the computer's ANSI code
-  page, as ChessBase does, so no byte is lost.
+  `Эндшпиль` would read `Ýíäøïèëü` (a made-up example), and the files of those
+  entries, and of entries with ASCII titles in folders named in Cyrillic, were
+  not found. The reader decodes anything that is not valid UTF-8 in the
+  computer's ANSI code page, as ChessBase does, so no byte is lost.
 - **Titles cut to one byte.** Titles of databases whose files were found
   read as their Cyrillic file names with each UTF-16 unit cut to its low byte:
   `Ладья` (U+041B U+0430 U+0434 U+044C U+044F) as `\x1b04LO`, with nothing
@@ -333,6 +335,17 @@ the user's screenshots rather than in the file:
   ASCII stays as stored. One ambiguity remains: a title chosen by the user
   that is exactly the image of its own file name (`012` for `абв.cbh`) is
   shown as the file name.
+- **Titles cut from a start of the file name.** One cut title is the image of
+  the start of its file name before a dash, as the image of `Ладья` would be for
+  `Ладья-1` (a made-up example). The reader also matches the image of a start of
+  two letters or more that the rest of the name begins with something other than
+  a letter (a dash, a space, a digit), and shows that start. A part of one
+  letter is not matched, since its image is one character (`Q` for `ё`).
+- **Titles escaped.** One title holds the UTF-8 bytes of its text, each written
+  `/` and two hex digits, the text being the database's file name, as
+  `/D0/B7/D0/B0/D0/B4/D0/B0/D1/87/D0/B8` would be for `задачи` (a made-up
+  example). The reader reads a title made of such escapes alone, whose bytes are
+  UTF-8 that is not ASCII, as that text.
 
 **Sections and items seen:**
 
@@ -914,37 +927,36 @@ The reader was checked against:
   Windows-1252 (a few Spanish and German databases, and German comments in one
   Russian book). Nothing in a record names the page: the Russian comments'
   languages are "any" (280,184) and "English" (6,131). So, on a computer whose
-  ANSI code page is 1251 or 1252, single-byte text is read in the page its
-  words show (`codepage::Evidence`). A Russian or Ukrainian word is made of
-  bytes 0xc0-0xff alone, or has three of them in a row (`Cмыслов`, typed with a
-  Latin C); Russian notation (`Фc2`, `Kрg1`, `Л:f6`) and `№` count with them.
-  A word with no more of those bytes than ASCII letters is Western (`für`). A
-  word of one letter, and a short word with more of them but no three in a row
-  (`Süß`, `été`), shows neither. A text whose words show neither (`и т.д.`,
-  `1.49а`, `Cet été`) is read as its game's other texts show together, else as
-  the names in the first 64 KiB of each entity file show, else in the
-  computer's page. Read so, the 244 books show no mojibake on either computer,
-  Western text in them stays Western on a Cyrillic one (`Könemann` 4,731 times,
-  none read `Kцnemann`), and the two computers read alike all but 51 of their
-  447,853 names and texts, nearly all a lone `и …` in a game with no other
-  text. On
-  a computer of another page, the text is read in that page as it stands.
+  ANSI code page is 1251 or 1252, single-byte text is read in the page its words
+  show (`codepage::Evidence`). A Russian or Ukrainian word is made of bytes
+  0xc0-0xff alone, or has three of them in a row (`Cлон`, typed with a Latin C);
+  Russian notation (`Фc2`, `Kрg1`, `Л:f6`) and `№` count with them. A word with
+  no more of those bytes than ASCII letters is Western (`für`). A word of one
+  letter, and a short word with more of them but no three in a row (`Süß`,
+  `été`), shows neither. A text whose words show neither (`и т.д.`, `3.7а`,
+  `Cet été`) is read as its game's other texts show together, else as the names
+  in the first 64 KiB of each entity file show, else in the computer's page.
+  Read so, the 244 books show no mojibake on either computer, Western text in
+  them stays Western on a Cyrillic one (no umlaut reads as a Cyrillic letter),
+  and the two computers read alike all but 51 of their 447,853 names and texts,
+  nearly all a lone `и …` in a game with no other text. On a computer of another
+  page, the text is read in that page as it stands.
 - **Piece bytes.** ChessBase's chess fonts draw 0xa2-0xa7 as king, queen,
-  knight, bishop, rook and pawn, and the Russian books use them in comments
-  and some names: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`, `¦:f6`,
-  `¤ : h3`, `£+¤`, `d8£`, and endgame classes such as `Позиция ¦¥1`. On a
-  computer of either page the reader serves such a byte as the figurine
-  ♔ ♕ ♘ ♗ ♖ ♙ only where a whole move follows it, ending before an ASCII
-  letter or digit (`cbh::text::is_piece`): a square, which a file, a rank or
-  a square and then a capture or a dash may come before. Without a move it is
-  a piece only as a promotion after a square, beside another piece, and
-  across a plus from one. Elsewhere it is the page's character, since
-  Windows-1251 has ў Ј ¤ Ґ ¦ § there (Ukrainian `Ґаєвський`, Serbian
-  `Јасна`) and Windows-1252 the signs ¢ £ ¤ ¥ ¦ § (`£5-£10`, `§4-6`). In the
-  books 19,792 became figurines and 83 stayed characters: typing slips such
-  as `¤i:f5` and `¦:al`, and pieces standing alone (`¥ (любой ход)`). On a
-  computer of another page, such as Windows-1250 with Ł and Ą at 0xa3 and
-  0xa5, they are read as that page reads them.
+  knight, bishop, rook and pawn, and the Russian books use them in comments and
+  some names: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`, `¦:f6`, `¤ : h3`, `£+¤`,
+  `d8£`, and endgame classes such as `¦¥1`. On a computer of either page the
+  reader serves such a byte as the figurine ♔ ♕ ♘ ♗ ♖ ♙ only where a whole move
+  follows it, ending before an ASCII letter or digit (`cbh::text::is_piece`): a
+  square, which a file, a rank or a square and then a capture or a dash may come
+  before. Without a move it is a piece only as a promotion after a square,
+  beside another piece, and across a plus from one. Elsewhere it is the page's
+  character, since Windows-1251 has ў Ј ¤ Ґ ¦ § there (Ukrainian `Ґаєвський`,
+  Serbian `Јасна`) and Windows-1252 the signs ¢ £ ¤ ¥ ¦ § (`£5-£10`, `§4-6`). In
+  the books 19,792 became figurines and 83 stayed characters: typing slips such
+  as a square typed with a wrong letter, and pieces standing alone (`¥ (any
+  move)`; the examples in this section are made up). On a computer of another
+  page, such as Windows-1250 with Ł and Ą at 0xa3 and 0xa5, they are read as
+  that page reads them.
 - **Names that differ from the 2CBH copy** do so for two reasons only. Names
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut

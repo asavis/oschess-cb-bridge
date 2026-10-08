@@ -200,6 +200,39 @@ fn a_title_cut_to_one_byte_reads_as_the_file_name() {
     );
 }
 
+/// The other two garbled titles of the same list (#300): a title cut from
+/// the start of the file name before a mark, which reads as that start, and a
+/// title stored as `/`-escaped UTF-8, which reads as the text it escapes.
+#[test]
+fn titles_cut_from_a_start_or_escaped_read_as_meant() {
+    let mut f = DbItems::new();
+    f.section("Databases")
+        .database(r"D:\Уроки\Ладья-1.cbh", "\u{1b}04LO", [0, 1, 10, 0, 0, 0])
+        .database(r"D:\Уроки\Ладья-2.cbh", "\u{1b}04LO-2", [0, 1, 10, 0, 0, 0])
+        .database(r"D:\Уроки\задачи.cbh", "/D0/B7/D0/B0/D0/B4/D0/B0/D1/87/D0/B8", [0, 1, 10, 0, 0, 0])
+        .database(r"D:\Уроки\ё-1.cbh", "Q", [0, 1, 10, 0, 0, 0])
+        .database(r"D:\Уроки\x.cbh", "/41/42", [0, 1, 10, 0, 0, 0]);
+    let list = dbitems::parse(&f.bytes(), PAGE).unwrap();
+    let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["Ладья", "Ладья-2", "задачи", "Q", "/41/42"]);
+}
+
+/// A name of 500,000 dashes beside an unrelated title, in a list below
+/// `MAX_FILE`, is read at once: matching a title against the starts of a
+/// name is one pass over the name.
+#[test]
+fn a_long_name_of_marks_is_read_in_linear_time() {
+    let mut f = DbItems::new();
+    let path = format!(r"C:\x\{}.cbh", "-".repeat(500_000));
+    f.section("Databases").database(&path, "X", [0, 1, 0, 0, 0, 0]);
+    let bytes = f.bytes();
+    assert!(bytes.len() as u64 <= dbitems::MAX_FILE);
+    let started = std::time::Instant::now();
+    let list = dbitems::parse(&bytes, PAGE).unwrap();
+    assert_eq!(list.entries[0].name, "X");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
 #[test]
 fn damaged_files_are_errors_never_panics() {
     let good = sample().bytes();

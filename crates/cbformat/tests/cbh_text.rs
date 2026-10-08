@@ -56,14 +56,14 @@ fn read(f: &TempDb, computer: CodePage) -> (Vec<String>, Vec<Vec<String>>) {
 }
 
 /// A Russian book reads alike on a Cyrillic and on a Western computer. A text
-/// whose own words show no page (`1.49а`, `и т.д.`, `и`) is read as the
+/// whose own words show no page (`3.7а`, `и т.д.`, `и`) is read as the
 /// game's other texts show, else as the database's names show.
 #[test]
 fn a_russian_database_reads_alike_on_either_computer() {
     let f = database(
         "text-russian",
-        // `Петров`, and `1.49а`, which shows nothing alone.
-        [b"\xcf\xe5\xf2\xf0\xee\xe2", b"1.49\xe0"],
+        // `Петров`, and `3.7а`, which shows nothing alone.
+        [b"\xcf\xe5\xf2\xf0\xee\xe2", b"3.7\xe0"],
         [
             // `Лучше 3...¤d7 и т.д.`, then `и т.д.` alone.
             &[b"\xcb\xf3\xf7\xf8\xe5 3...\xa4d7 \xe8 \xf2.\xe4.", b"\xe8 \xf2.\xe4."],
@@ -73,7 +73,7 @@ fn a_russian_database_reads_alike_on_either_computer() {
     );
     for computer in COMPUTERS {
         let (names, texts) = read(&f, computer);
-        assert_eq!(names, ["Петров", "1.49а"], "{computer:?}");
+        assert_eq!(names, ["Петров", "3.7а"], "{computer:?}");
         assert_eq!(texts, [vec!["Лучше 3...♘d7 и т.д.", "и т.д."], vec!["и"]], "{computer:?}");
     }
 }
@@ -83,12 +83,12 @@ fn a_russian_database_reads_alike_on_either_computer() {
 fn a_western_database_reads_alike_on_either_computer() {
     let f = database(
         "text-western",
-        [b"M\xfcller", b"1.49\xe0"],
+        [b"M\xfcller", b"3.7\xe0"],
         [&[b"Diese Partie ist ein Beispiel f\xfcr die Schw\xe4che, \xa5xf3", b"\xe0"], &[b"\xe0"]],
     );
     for computer in COMPUTERS {
         let (names, texts) = read(&f, computer);
-        assert_eq!(names, ["Müller", "1.49à"], "{computer:?}");
+        assert_eq!(names, ["Müller", "3.7à"], "{computer:?}");
         assert_eq!(texts, [vec!["Diese Partie ist ein Beispiel für die Schwäche, ♗xf3", "à"], vec!["à"]]);
     }
 }

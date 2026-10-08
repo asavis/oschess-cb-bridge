@@ -108,9 +108,9 @@ pub struct Entry {
     /// The path as stored: an absolute Windows path in the files examined.
     pub path: String,
     /// The title the window shows, or the file name without its extension
-    /// when the stored title is empty. A title that is exactly the file name
-    /// cut to one byte per UTF-16 unit is shown as the file name
-    /// (`docs/format-notes.md`, "Titles cut to one byte").
+    /// when the stored title is empty. A title ChessBase stored garbled, cut
+    /// to one byte per UTF-16 unit or escaped, is shown as the text it meant
+    /// (`docs/format-notes.md`, "Older entries").
     pub name: String,
     /// The format the path's extension names; `None` for any other file.
     pub format: Option<Format>,
@@ -183,7 +183,10 @@ pub fn parse(bytes: &[u8], page: CodePage) -> Result<DbList> {
             Value::Text { text, .. } => {
                 if let Some((title, numbers)) = title_and_numbers(&text) {
                     let stem = stem(&item.key);
-                    let name = if title.is_empty() || is_cut_name(title, stem) { stem } else { title }.to_owned();
+                    let name = match title {
+                        "" => stem.to_owned(),
+                        _ => repaired_title(title, stem).unwrap_or_else(|| title.to_owned()),
+                    };
                     let format = Format::of_extension(Path::new(&item.key));
                     list.entries.push(Entry { path: item.key, name, format, section, numbers });
                 } else if in_section("2cbh") && item.key == "RefDB" {
@@ -222,18 +225,66 @@ fn title_and_numbers(value: &str) -> Option<(&str, [i64; 6])> {
     Some((parts.next()?, numbers))
 }
 
-/// Whether `title` is the file name `stem` as ChessBase stored it cut: each
-/// UTF-16 unit of the name reduced to its low byte, so that `Ладья` reads
-/// `\u{1b}04LO` (`docs/format-notes.md`, "Titles cut to one byte"). The whole
-/// title must be that image, as every cut title seen was: a title that only
-/// starts with it is a title of its own, such as `Queen endings` for `ё`,
-/// whose image is `Q`. Only an image of ASCII bytes is matched, since those
-/// read the same in UTF-8 and in every code page, and a name the cut leaves
-/// as it was, such as an ASCII one, is never taken for cut.
-fn is_cut_name(title: &str, stem: &str) -> bool {
-    let image: Option<String> =
-        stem.encode_utf16().map(|u| Some(u.to_le_bytes()[0]).filter(u8::is_ascii).map(char::from)).collect();
-    image.is_some_and(|image| image != stem && image == title)
+/// The title ChessBase meant where it stored `title` garbled in one of the two
+/// ways seen (`docs/format-notes.md`, "Older entries"); `None` for any other
+/// title.
+fn repaired_title(title: &str, stem: &str) -> Option<String> {
+    cut_name(title, stem).map(str::to_owned).or_else(|| unescaped(title))
+}
+
+/// The part of the file name `stem` that `title` is as ChessBase stored it
+/// cut: each UTF-16 unit reduced to its low byte, so that `Ладья` reads
+/// `\u{1b}04LO`. The part is the whole name, or a start of it of two letters
+/// or more that the rest begins with something other than a letter (the
+/// title `Ладья` of `Ладья-1`). The whole title must be that image,
+/// as every cut title seen was: a title that only starts with it is a title of
+/// its own, such as `Queen endings` for `ё`, whose image is `Q`. Only an image
+/// of ASCII bytes is matched, since those read the same in UTF-8 and in every
+/// code page, and a name the cut leaves as it was, such as an ASCII one, is
+/// never taken for cut. One pass over the name compares the title with its
+/// image as it goes, so the work is linear in the name however long it is.
+fn cut_name<'a>(title: &str, stem: &'a str) -> Option<&'a str> {
+    let t = title.as_bytes();
+    // Read so far: title bytes, letters, and whether the cut changed a character.
+    let (mut at, mut letters, mut changed) = (0, 0, false);
+    for (i, c) in stem.char_indices() {
+        if at == t.len() {
+            // The title ends before `c`: a start of the name.
+            return (!c.is_alphabetic() && letters > 1 && changed).then(|| &stem[..i]);
+        }
+        for u in c.encode_utf16(&mut [0; 2]) {
+            let low = u.to_le_bytes()[0];
+            if !low.is_ascii() || t.get(at) != Some(&low) {
+                return None;
+            }
+            at += 1;
+        }
+        letters += usize::from(c.is_alphabetic());
+        changed |= !c.is_ascii();
+    }
+    (at == t.len() && changed).then_some(stem)
+}
+
+/// `title` read where ChessBase stored it as the UTF-8 bytes of the title
+/// meant, each written `/` and two hex digits (`/D0/B7/D0/B0/D0/B4/D0/B0/D1/87/D0/B8`
+/// for `задачи`): only a title made of such escapes alone that read as UTF-8
+/// that is not ASCII.
+fn unescaped(title: &str) -> Option<String> {
+    let b = title.as_bytes();
+    if b.is_empty() || !b.len().is_multiple_of(3) {
+        return None;
+    }
+    let hex = |c: u8| char::from(c).to_digit(16).map(|d| d as u8);
+    let bytes: Option<Vec<u8>> = b
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| match c {
+            [b'/', h, l] => Some(hex(*h)? << 4 | hex(*l)?),
+            _ => None,
+        })
+        .collect();
+    String::from_utf8(bytes?).ok().filter(|t| !t.is_ascii())
 }
 
 /// The file name of a stored Windows or Unix path, without its extension.
@@ -356,6 +407,7 @@ mod tests {
 
     #[test]
     fn titles_cut_to_one_byte_are_told_apart() {
+        let is_cut_name = |title: &str, stem: &str| cut_name(title, stem) == Some(stem);
         // `Ладья` and `Їжак`, each UTF-16 unit cut to its low byte.
         assert!(is_cut_name("\u{1b}04LO", "Ладья"));
         assert!(is_cut_name("\u{7}60:", "Їжак"));
@@ -372,5 +424,44 @@ mod tests {
         // another character: the image is not matched.
         assert!(!is_cut_name("\u{1b}\u{e9}", "Лé"));
         assert!(!is_cut_name("", ""));
+    }
+
+    /// A title cut from the start of its file name before a mark: `Ладья`
+    /// of `Ладья-1` or `Ладья 2`, but no part of one letter (`ё` of `ё-1`,
+    /// with a mark or a space or not) and no part that a letter follows
+    /// (`Лад` of `Ладья`).
+    #[test]
+    fn titles_cut_from_a_start_of_the_file_name() {
+        assert_eq!(cut_name("\u{1b}04LO", "Ладья-1"), Some("Ладья"));
+        assert_eq!(cut_name("\u{1b}04LO", "Ладья 2"), Some("Ладья"));
+        assert_eq!(cut_name("\u{1b}04LO-1", "Ладья-1"), Some("Ладья-1"));
+        assert_eq!(cut_name("Q", "ё-1"), None);
+        assert_eq!(cut_name("Q-", "ё-1"), None);
+        assert_eq!(cut_name("Q ", "ё 2"), None);
+        assert_eq!(cut_name("-Q", "-ё-1"), None);
+        assert_eq!(cut_name("Q", "ё"), Some("ё"));
+        assert_eq!(cut_name("\u{1b}04", "Ладья"), None);
+        assert_eq!(cut_name("\u{1b}04", "Лад-ья"), Some("Лад"));
+        assert_eq!(cut_name("Rook", "Rook-1"), None, "an ASCII start is not cut");
+        // `Ъа` cuts to `*0` (U+042A, U+0430), and `𝄞`, two UTF-16 units, to
+        // two bytes, `4` and 0x1e.
+        assert_eq!(cut_name("*0", "Ъа-1"), Some("Ъа"));
+        assert_eq!(cut_name("4\u{1e}", "𝄞"), Some("𝄞"));
+        assert_eq!(cut_name("4", "𝄞"), None);
+    }
+
+    /// Titles stored as `/`-escaped UTF-8: `задачи`, and what is not one.
+    #[test]
+    fn titles_stored_as_escaped_utf8() {
+        let title = "/D0/B7/D0/B0/D0/B4/D0/B0/D1/87/D0/B8";
+        assert_eq!(unescaped(title).as_deref(), Some("задачи"));
+        assert_eq!(unescaped(&title.to_lowercase()).as_deref(), Some("задачи"));
+        assert_eq!(repaired_title(title, "x").as_deref(), Some("задачи"));
+        assert_eq!(unescaped("/41/42"), None, "ASCII");
+        assert_eq!(unescaped("/D0"), None, "not UTF-8");
+        assert_eq!(unescaped("/D0/B7 x"), None, "more than escapes");
+        assert_eq!(unescaped("/+1/B7"), None, "not hex");
+        assert_eq!(unescaped("1/2"), None);
+        assert_eq!(unescaped(""), None);
     }
 }

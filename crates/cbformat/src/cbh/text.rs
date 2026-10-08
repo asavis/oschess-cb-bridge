@@ -66,7 +66,7 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
 ///
 /// Anywhere else it is the page's character: a letter of a word (`Ґалаґан`,
 /// `Ґаєвський`, `Јасна`) or a sign (`£5`, `£5-£10`, `£5bn`, `§4-6`). A piece
-/// standing alone (`¥ (любой ход)`) or in a broken move (`¤ld7`) is taken for
+/// standing alone (`¥ (any move)`) or in a broken move (`¤qd7`) is taken for
 /// a character too.
 fn is_piece(b: &[u8], i: usize) -> bool {
     let piece = |c: u8| figurine(c).is_some();
@@ -268,7 +268,7 @@ mod tests {
             (b"Prize \xa35bn", "Prize £5bn"),
             (b"See \xa74-6", "See §4-6"),
             // A broken move, and a piece standing alone.
-            (b"\xa4ld7, \xa5 (any)", "¤ld7, ¥ (any)"),
+            (b"\xa4qd7, \xa5 (any)", "¤qd7, ¥ (any)"),
         ] {
             assert_eq!(single_byte(bytes, WESTERN, WESTERN), text);
         }

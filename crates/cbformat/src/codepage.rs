@@ -101,7 +101,7 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 /// the larger total decides:
 ///
 /// - Cyrillic: a word of these bytes alone, or one with three of them in a row
-///   (`Cмыслов`, typed with a Latin C), and Russian notation, a piece letter
+///   (`Cлон`, typed with a Latin C), and Russian notation, a piece letter
 ///   before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin K,
 ///   `Л:f6`); also `№` before a digit.
 /// - Western: a word with no more of them than ASCII letters (`für`).
@@ -359,7 +359,7 @@ mod tests {
         // Кр with a Latin K, on its own.
         assert_eq!(guess(b"1.K\xf0g1"), cyrillic, "1.Kрg1");
         assert_eq!(guess(b"4...K\xf0:d4"), cyrillic, "4...Kр:d4");
-        assert_eq!(guess(b"C\xec\xfb\xf1\xeb\xee\xe2"), cyrillic, "Cмыслов, with a Latin C");
+        assert_eq!(guess(b"C\xeb\xee\xed"), cyrillic, "Cлон, with a Latin C");
         assert_eq!(guess(b"H\xfcbner, R"), western);
         assert_eq!(guess(b"Copyright 1994 K\xf6nemann"), western);
         assert_eq!(guess(b"Diese Partie ist ein Beispiel f\xfcr die Schw\xe4che"), western);
