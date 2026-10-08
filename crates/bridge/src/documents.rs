@@ -80,12 +80,16 @@ fn resolved(path: &Path) -> PathBuf {
 
 /// The segments of `path` past `root`, when `root` is `path` or holds it.
 fn below(path: &Path, root: &Path) -> Option<Vec<String>> {
-    let mut rest = path.components();
+    let mut rest = path.components().peekable();
     for part in root.components() {
         if !same(rest.next()?, part) {
             return None;
         }
     }
+    // A root that is a drive or a share alone, written without its separator
+    // (`\\?\UNC\nas\share`, which is not made absolute), holds the path's root
+    // folder too (#302).
+    rest.next_if_eq(&Component::RootDir);
     Some(segments(rest))
 }
 
