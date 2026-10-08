@@ -75,6 +75,13 @@ database by its id and never by its name or path, so you can attach it to an
 issue as it is; past 1 MiB, the bridge moves it to `bridge.log.1` when it
 starts.
 
+The copy from the Microsoft Store uses the same folders, but Windows keeps the
+ones it creates inside the package:
+`%LOCALAPPDATA%\Packages\<package>\LocalCache\Roaming\oschess-bridge` and
+`…\LocalCache\Local\oschess bridge`. Uninstalling it removes them. A folder
+that already existed before the Store copy, from an earlier installation of
+the bridge, stays where it is and is used there.
+
 The release also has `oschess-bridge.exe`, the same app without the installer.
 Updates come as the installer, so they install the bridge for your user as
 above.
