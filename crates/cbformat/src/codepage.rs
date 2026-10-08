@@ -4,6 +4,7 @@
 //! a classic database also by its own letters ([`cyrillic_or_western`]).
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 /// A Windows ANSI code page. Pages 1250 to 1258 have tables of their own;
 /// any other page, such as a multi-byte one, reads as 1252.
@@ -55,6 +56,19 @@ impl CodePage {
         bytes.iter().map(|&b| self.char(b)).collect()
     }
 
+    /// `bytes` in this page, but for the ranges `utf8`, in order, which are
+    /// read as UTF-8 ([`utf8_inside`]).
+    pub(crate) fn decode_around(self, bytes: &[u8], utf8: &[Range<usize>]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        let mut i = 0;
+        for run in utf8.iter().chain([&(bytes.len()..bytes.len())]) {
+            out.extend(bytes[i..run.start].iter().map(|&b| self.char(b)));
+            out.push_str(std::str::from_utf8(&bytes[run.clone()]).unwrap_or_default());
+            i = run.end;
+        }
+        out
+    }
+
     /// `bytes` as UTF-8 when they are valid UTF-8, else in this page.
     pub fn utf8_or(self, bytes: &[u8]) -> String {
         match std::str::from_utf8(bytes) {
@@ -83,17 +97,122 @@ impl CodePage {
 /// Windows-1252 has symbols there.
 const CYRILLIC_ONLY: [u8; 9] = [0xa8, 0xaa, 0xaf, 0xb2, 0xb3, 0xb4, 0xb8, 0xba, 0xbf];
 
-/// `bytes` as UTF-8 when they are valid UTF-8; else in Windows-1251 when their
-/// words show Cyrillic ([`cyrillic_or_western`]), and in Windows-1252
+/// `bytes` as UTF-8 when they are valid UTF-8. Else the UTF-8 a writer mixed
+/// into them ([`utf8_inside`]) is read as UTF-8, and the rest in
+/// Windows-1251 when its words show Cyrillic ([`Evidence`]), in Windows-1252
 /// otherwise. For text a format keeps as UTF-8, such as 2CBH's, which an
 /// older program sometimes wrote in a single-byte page: Russian text reads as
 /// Russian, and any other text as it did before, on every computer (#308).
 pub fn utf8_or_legacy(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_owned(),
-        Err(_) if cyrillic_or_western(bytes) == Some(CodePage::CYRILLIC) => CodePage::CYRILLIC.decode(bytes),
-        Err(_) => CodePage::WESTERN.decode(bytes),
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
     }
+    let page = match Evidence::outside(bytes, &utf8_inside(bytes, false)).page() {
+        Some(CodePage::CYRILLIC) => CodePage::CYRILLIC,
+        _ => CodePage::WESTERN,
+    };
+    page.decode_around(bytes, &utf8_inside(bytes, page != CodePage::CYRILLIC))
+}
+
+/// The length of the UTF-8 sequence at `i` of `b` that encodes a character,
+/// and 0 where none does: no overlong form (0xe0 needs 0xa0 or more next,
+/// 0xf0 0x90 or more), no surrogate (0xed needs 0x9f or less next), nothing
+/// above U+10FFFF (0xf4 needs 0x8f or less next).
+pub(crate) fn utf8_sequence(b: &[u8], i: usize) -> usize {
+    let within = |i: usize, range: std::ops::RangeInclusive<u8>| b.get(i).is_some_and(|c| range.contains(c));
+    let continuation = |i: usize| within(i, 0x80..=0xbf);
+    match b.get(i) {
+        Some(0xc2..=0xdf) if continuation(i + 1) => 2,
+        Some(0xe0) if within(i + 1, 0xa0..=0xbf) && continuation(i + 2) => 3,
+        Some(0xed) if within(i + 1, 0x80..=0x9f) && continuation(i + 2) => 3,
+        Some(0xe1..=0xec | 0xee..=0xef) if continuation(i + 1) && continuation(i + 2) => 3,
+        Some(0xf0) if within(i + 1, 0x90..=0xbf) && continuation(i + 2) && continuation(i + 3) => 4,
+        Some(0xf4) if within(i + 1, 0x80..=0x8f) && continuation(i + 2) && continuation(i + 3) => 4,
+        Some(0xf1..=0xf3) if continuation(i + 1) && continuation(i + 2) && continuation(i + 3) => 4,
+        _ => 0,
+    }
+}
+
+/// Runs of Cyrillic UTF-8 inside single-byte text, which some Russian books
+/// hold after a text in Windows-1251 (`docs/format-notes.md`, "UTF-8 inside
+/// Windows-1251"): from a two-byte sequence of a Cyrillic letter (0xd0 or
+/// 0xd1, then 0x80-0xbf) to the last, with other UTF-8 sequences
+/// ([`utf8_sequence`]) and ASCII between, holding three such letters at
+/// least. Windows-1251 reads such a sequence as Р or С and a sign or a rare
+/// letter, which Russian text does not write three times in a row with
+/// nothing but ASCII between.
+pub(crate) fn cyrillic_utf8_runs(b: &[u8]) -> Vec<Range<usize>> {
+    let cyrillic =
+        |i: usize| matches!(b.get(i), Some(0xd0 | 0xd1)) && b.get(i + 1).is_some_and(|c| (0x80..=0xbf).contains(c));
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !cyrillic(i) {
+            i += 1;
+            continue;
+        }
+        let (start, mut end, mut letters, mut j) = (i, i, 0, i);
+        while j < b.len() {
+            if b[j].is_ascii() {
+                j += 1;
+                continue;
+            }
+            let n = utf8_sequence(b, j);
+            if n == 0 {
+                break;
+            }
+            letters += usize::from(cyrillic(j));
+            j += n;
+            end = j;
+        }
+        if letters >= 3 && std::str::from_utf8(&b[start..end]).is_ok() {
+            runs.push(start..end);
+        }
+        i = end.max(i + 1);
+    }
+    runs
+}
+
+/// The UTF-8 a writer mixed into single-byte text of a format that keeps
+/// its text as UTF-8, such as 2CBH's (#311), in order: runs of Cyrillic
+/// UTF-8 ([`cyrillic_utf8_runs`]), and single sequences that a single-byte
+/// page does not form by chance. Those are a sign of three bytes, general
+/// punctuation (U+2000-U+206F: `…`) or ChessBase's Private Use Area signs
+/// (U+E000-U+E02F, `crate::signs`), and where `latin`, a letter of Latin-1
+/// or Latin Extended (U+00C0-U+024F: `ě`, `ř` in Czech text whose `á` and
+/// `í` are Windows-1252). `latin` is for Western text only: Windows-1251
+/// forms such letters from a capital and a Ukrainian letter (`Ді`, which
+/// UTF-8 reads as `ĳ`). Not another sequence of two bytes: Windows-1252 forms
+/// them from a capital and a sign, as ChessBase's text writes `×»` (weak
+/// point, kingside), which UTF-8 reads as a Hebrew letter; nor one of three
+/// bytes elsewhere, as `í…¤` (ChessBase's signs before a move), which it
+/// reads as a Hangul syllable, or `о…»` in Windows-1251.
+pub(crate) fn utf8_inside(b: &[u8], latin: bool) -> Vec<Range<usize>> {
+    let cyrillic = cyrillic_utf8_runs(b);
+    let mut runs = Vec::new();
+    let mut next = cyrillic.iter().peekable();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(run) = next.next_if(|r| r.start == i) {
+            runs.push(run.clone());
+            i = run.end;
+            continue;
+        }
+        let n = utf8_sequence(b, i);
+        let c = std::str::from_utf8(&b[i..i + n]).ok().and_then(|s| s.chars().next());
+        let taken = c.is_some_and(|c| match n {
+            2 => latin && ('\u{c0}'..='\u{24f}').contains(&c) && c.is_alphabetic(),
+            3 => ('\u{2000}'..='\u{206f}').contains(&c) || ('\u{e000}'..='\u{e02f}').contains(&c),
+            _ => false,
+        });
+        if taken {
+            runs.push(i..i + n);
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    runs
 }
 
 /// Whether single-byte text reads as Cyrillic ([`CodePage::CYRILLIC`]) or as
@@ -177,6 +296,18 @@ impl Evidence {
             }
         }
         e
+    }
+
+    /// What the words of `b` outside the ranges `runs` show of its page.
+    pub(crate) fn outside(b: &[u8], runs: &[Range<usize>]) -> Evidence {
+        if runs.is_empty() {
+            return Evidence::of(b);
+        }
+        let mut rest = b.to_vec();
+        for run in runs {
+            rest[run.clone()].fill(b' ');
+        }
+        Evidence::of(&rest)
     }
 
     /// This evidence and `other`'s together.
@@ -520,6 +651,43 @@ mod tests {
         assert_eq!(utf8_or_legacy(b"Visit\xe9 \xa4d7"), "Visité ¤d7", "no signs");
         assert_eq!(utf8_or_legacy(b"one of the \xfe\xfe, his \xa2"), "one of the þþ, his ¢");
         assert_eq!(utf8_or_legacy(b"\x81"), "\u{81}");
+    }
+
+    /// UTF-8 mixed into single-byte text reads as UTF-8 where a single-byte
+    /// page cannot form it by chance, and the rest in its page (#311). Made-up
+    /// examples.
+    #[test]
+    fn utf8_inside_single_byte_text() {
+        // Czech: Č in UTF-8, ý in Windows-1252.
+        assert_eq!(utf8_or_legacy(b"\xc4\x8cern\xfd tah"), "Černý tah");
+        // A UTF-8 … among ChessBase's piece bytes.
+        assert_eq!(utf8_or_legacy(b"8\xe2\x80\xa6d6 9.\xa4e2"), "8…d6 9.¤e2");
+        // ChessBase's sign for ч in UTF-8 inside Windows-1251: the sign stays
+        // for `crate::signs` to read.
+        assert_eq!(utf8_or_legacy(b"\xed\xe5\xf0\xe0\xe7\xe1\xee\xf0\xee\x80\x89\xe8\xe2\xee"), "неразбор\u{e009}иво");
+        // Cyrillic UTF-8 after Windows-1251, as in the classic books.
+        let mixed = [&b"\xd5\xee\xe4? "[..], "Ход белых".as_bytes()].concat();
+        assert_eq!(utf8_or_legacy(&mixed), "Ход? Ход белых");
+        // What Windows-1252 forms by chance stays Windows-1252: `×»` (UTF-8
+        // reads a Hebrew letter), `ß` and a no-break space (an NKo letter),
+        // `í…¤` (a Hangul syllable), `Ã©` without a third byte of UTF-8.
+        assert_eq!(utf8_or_legacy(b"\xd7\xbb, \xa4e5"), "×», ¤e5");
+        assert_eq!(utf8_or_legacy(b"da\xdf\xa0die \xe0"), "daß\u{a0}die à");
+        assert_eq!(utf8_or_legacy(b"[\xed\x85\xa4h8-f7\x84]"), "[í…¤h8-f7„]");
+        assert_eq!(utf8_or_legacy(b"\xc3\xa9t\xe9"), "été", "é in UTF-8, then in Windows-1252");
+        // Text whose words show Cyrillic takes no Latin letter of UTF-8: its
+        // bytes are Windows-1251 letters.
+        assert_eq!(utf8_or_legacy(b"\xc4\x8c \xcf\xe5\xf2\xf0\xee\xe2"), "ДЊ Петров");
+        assert_eq!(utf8_inside(b"\xd7\xbb\xd7\xa7d4", true), []);
+        // Windows-1251 forms Latin letters of UTF-8 from a capital and a
+        // Ukrainian letter: made-up names stay Cyrillic.
+        assert_eq!(utf8_or_legacy(b"\xc4\xb3\xe4\xe5\xed\xea\xee \xa4"), "Діденко ¤");
+        assert_eq!(utf8_or_legacy(b"\xc3\xb3\xf0\xed\xe8\xea \xa4"), "Гірник ¤");
+        assert_eq!(utf8_or_legacy(b"\xc4\xb3\xe0\xed\xe0 \x98"), "Діана \u{98}");
+        // A sign of three bytes beyond punctuation stays single bytes: `о…»`
+        // in Windows-1251, and a code point past ChessBase's.
+        assert_eq!(utf8_or_legacy(b"\xd5\xee\xf0\xee\xf8\xee\x85\xbb \x98"), "Хорошо…» \u{98}");
+        assert_eq!(utf8_or_legacy(b"\xee\x81\x80 \x98"), "î\u{81}€ ˜");
     }
 
     #[test]

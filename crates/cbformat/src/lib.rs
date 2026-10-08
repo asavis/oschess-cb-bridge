@@ -28,6 +28,7 @@ pub mod pgn;
 pub mod pgnfile;
 mod recordfile;
 pub mod replay;
+mod signs;
 pub mod v2;
 pub mod view;
 

@@ -285,6 +285,65 @@ words or with letters typed on a Russian keyboard, and nothing else changes:
 its Western text, with ChessBase's signs in it, reads as before on every
 computer.
 
+**UTF-8 inside single-byte text** (#311). Some texts mix the two: Czech text
+with `á` and `í` in Windows-1252 and `ě` and `ř` in UTF-8, a UTF-8 `…` among
+ChessBase's piece bytes, or one of ChessBase's signs below in UTF-8 inside
+Windows-1251. The reader reads as UTF-8 only what a single-byte page does not
+form by chance (`codepage::utf8_inside`): runs of Cyrillic UTF-8, as in the
+classic format, a letter of Latin-1 or Latin Extended (U+00C0-U+024F), and a
+sign of three bytes in U+2000-U+2BFF or ChessBase's Private Use Area. The
+rest is read as above. Other sequences stay single bytes: ChessBase's Western
+text writes `×»` (weak point, kingside) and `×§`, which UTF-8 reads as Hebrew
+letters, and `í…¤`, which it reads as a Hangul syllable. In the Mega, 41 of
+334,818 texts that are not UTF-8 hold such UTF-8. Text that is valid UTF-8 of
+text garbled before (`nÃ£o`) reads as the file holds it.
+
+**ChessBase's signs** (#309). Recent ChessBase writes the signs of its chess
+fonts as Private Use Area code points, which no other program draws: 26,904
+in the Mega, and names hold them too (a tournament named for knight odds). No
+public table names them. Each was read from the Mega's comments: the words
+beside it (a piece's before a square, a flank's before `attack`), the
+evaluation it follows set against ChessBase's older Windows-1252 text, whose
+signs ChessBase's help names (`⩲/<U+E00A>` where the older text writes
+`⩲/±`), and the bytes of older text it replaced (`n°5` became
+`n<U+E000>5`). They are served as the Unicode signs of the Informator
+symbols (Unicode 11, L2/17-033R2; `cbformat::signs`): in a name as it is read,
+so that it is searched for as it shows, and in a comment where PGN shows it.
+A comment keeps the record's text, and the full form keeps it in
+`[%cbtext]` beside the shown one:
+
+| Code point | Sign | | Code point | Sign |
+|---|---|---|---|---|
+| U+E000 | ⯹ with compensation | | U+E012 | ↑ initiative |
+| U+E001 | ⮺ pair of bishops | | U+E013 | → attack |
+| U+E002 | ⮻ opposite bishops | | U+E017 | ⇆ counterplay |
+| U+E004, U+E02E | ⩱ | | U+E018 | ⇔ file |
+| U+E005 | diagram mark, dropped | | U+E019 | ⇗ diagonal |
+| U+E007, U+E02F | ⩲ | | U+E01A | ∓ |
+| U+E008 | ⯽ passed pawn | | U+E01D | ⨀ zugzwang |
+| U+E009 | ∞ unclear | | U+E01E | ⊞ centre |
+| U+E00A | ± | | U+E01F | ⊥ endgame |
+| U+E00C | ⌓ better is | | U+E021 | □ only move |
+| U+E00D | △ with the idea | | U+E023 | ○ space |
+| U+E00E | ⟪ queenside | | U+E024-U+E029 | ♔ ♕ ♖ ♗ ♘ ♙ |
+| U+E00F | ⟫ kingside | | | |
+| U+E010 | × weak point | | | |
+
+That covers all but 35 of the Mega's 26,904. U+E00B, U+E01B, U+E020, U+E022
+and a lone U+E02D, whose uses do not tell their sign, stay as they are.
+
+ChessBase made the same conversion of text typed on a Windows whose page is
+1251, and took some letters' bytes for signs: і and І (0xb3 and 0xb2, the
+bytes of ⩱ and ⩲) became U+E004 or U+E02E and U+E007 or U+E02F, ю (0xfe,
+passed pawn) U+E008, ч (0xf7, unclear) U+E009, and Ч (0xd7) `×`. Such a code
+point that touches a Cyrillic letter is the letter again, and `×` where it
+starts a word of Cyrillic letters (`×ернов`; not `Л×c3`, a capture): 7
+player names of the lesson databases, and `ч` inside a Russian comment in
+Windows-1251. A course exported from Chessable writes its brackets, positions
+and links as words between runs of U+E02D (`StartBracket`, `EndBRacket`,
+`StartFEN`, `LinkStart`); they read as `(` `)`, `[` `]`, `[FEN …]` and the bare
+address. The examples in this section are made up or counts.
+
 ## What `cbtool verify` checks
 
 For every game and analysis: the record framing (magic, sizes, trailing length
@@ -1003,7 +1062,7 @@ The reader was checked against:
   for it (`þþ`, which read as `юю`).
 - **UTF-8 inside Windows-1251.** Twelve comments hold a text in Windows-1251
   and then a copy in UTF-8. A run of three Cyrillic UTF-8 letters or more,
-  with other UTF-8 and ASCII between, is read as UTF-8 (`cbh::text::utf8_runs`):
+  with other UTF-8 and ASCII between, is read as UTF-8 (`codepage::cyrillic_utf8_runs`):
   Windows-1251 reads such a letter as `Р` or `С` and a sign, which Russian text
   does not write three times in a row. Six of them start with a letter whose
   first byte the file already lost (`? Ў…`), which stays as it is.

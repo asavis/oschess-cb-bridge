@@ -176,7 +176,8 @@ impl GameAnnotations {
 /// UTF-8 when the bytes are valid UTF-8, else Windows-1251 when their words
 /// show Cyrillic and Windows-1252 otherwise
 /// ([`crate::codepage::utf8_or_legacy`]): nothing in the record says which
-/// (#308).
+/// (#308). ChessBase's signs in it stay as the record holds them, and are
+/// read where the text is shown (`pgn`, #309).
 pub(crate) fn decode_text(b: &[u8]) -> String {
     crate::codepage::utf8_or_legacy(b)
 }

@@ -1,9 +1,11 @@
 //! 2CBH text that is not UTF-8: Russian in Windows-1251 reads as Russian, and
-//! any other text as before (#308).
+//! any other text as before (#308); ChessBase's signs read as Unicode (#309);
+//! UTF-8 mixed into single-byte text reads as UTF-8 (#311).
 
-use cbformat::fixture::{Builder, TempDb, annotations, lid_header, quiet};
+use cbformat::fixture::{Builder, TempDb, annotations, lid_header, quiet, rendered};
 use cbformat::game::Annotation;
 use cbformat::movetable::{self, Color, Piece};
+use cbformat::pgn::Options;
 use cbformat::view::Base;
 
 /// A text annotation of any language holding `bytes` as they are.
@@ -74,4 +76,44 @@ fn other_text_reads_as_before() {
     let (texts, white) = read(&f);
     assert_eq!(texts, ["für die Schwäche", "à", "¥xf3"]);
     assert_eq!(white, "Müller", "no longer M�ller");
+}
+
+/// ChessBase's signs: a comment keeps them as the record holds them, PGN
+/// shows them as Unicode and its full form keeps the original, and a name's
+/// letters that ChessBase took for signs read as the letters (#309). UTF-8
+/// mixed into a single-byte comment reads as UTF-8 (#311). Made-up text.
+#[test]
+fn chessbase_signs_and_utf8_inside_single_bytes() {
+    let f = database(
+        "signs",
+        &["the \u{e028}d4 is strong /\u{e00a}".as_bytes(), b"8\xe2\x80\xa6d6 9.\xa4e2", b"\xc4\x8cern\xfd tah"],
+        "Кл\u{e008}\u{e009}ко".as_bytes(),
+    );
+    let (texts, white) = read(&f);
+    assert_eq!(texts, ["the \u{e028}d4 is strong /\u{e00a}", "8…d6 9.¤e2", "Černý tah"]);
+    assert_eq!(white, "Ключко");
+    let (reading, _) = rendered(&f, &Options::default());
+    assert!(reading.contains("{the ♘d4 is strong /± 8…d6 9.¤e2 Černý tah}"), "{reading}");
+    let (full, _) = rendered(&f, &Options { full: true, ..Options::default() });
+    assert!(
+        full.contains(
+            "{[%lang any] the ♘d4 is strong /±} {[%cbtext lang=any;value=the%20%EE%80%A8d4%20is%20strong%20%2F%EE%80%8A]}"
+        ),
+        "{full}"
+    );
+    assert!(
+        full.contains("{[%lang any] 8…d6 9.¤e2} {[%lang any] Černý tah}"),
+        "a text without signs needs no original"
+    );
+}
+
+/// A Ukrainian name in Windows-1251 whose first two bytes UTF-8 would read as
+/// a Latin letter stays Cyrillic (#311). A made-up name.
+#[test]
+fn a_ukrainian_name_in_windows_1251_is_no_utf8() {
+    // `Діденко`: Д and і are 0xc4 0xb3, UTF-8 for ĳ.
+    let f = database("ukrainian", &[b"\xc4\xb3\xe4\xe5\xed\xea\xee \xa4d4"], b"\xc4\xb3\xe4\xe5\xed\xea\xee");
+    let (texts, white) = read(&f);
+    assert_eq!(texts, ["Діденко ¤d4"]);
+    assert_eq!(white, "Діденко");
 }
