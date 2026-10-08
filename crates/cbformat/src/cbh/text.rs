@@ -51,38 +51,57 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
         return page.decode(b);
     }
     let read = codepage::cyrillic_or_western(b).unwrap_or(fallback);
-    (0..b.len())
-        .map(|i| {
-            let piece = |i: usize| figurine(b[i]).is_some() && is_piece(&b[i + 1..]);
-            // The second of two pieces is one too, whatever follows (`¥¤9`).
-            let second = i > 0 && piece(i - 1) && figurine(b[i]).is_some();
-            figurine(b[i]).filter(|_| second || piece(i)).unwrap_or_else(|| read.char(b[i]))
-        })
-        .collect()
+    (0..b.len()).map(|i| figurine(b[i]).filter(|_| is_piece(b, i, read)).unwrap_or_else(|| read.char(b[i]))).collect()
 }
 
-/// Whether a piece byte followed by `after` stands as a piece in a move, as
-/// ChessBase's comments write them: before a file that a square, a second
-/// file, a capture or no letter follows (`¤d7`, `¦fe1`, `¥b+`, `¦a-e8`, and a
-/// file typed in Cyrillic, `¤с3`), before a rank that no digit follows
-/// (`¦1d5`), before a capture (`¥xf3`, `¦:f6`), and before anything but a
-/// letter or a digit (`d8£`, `£+¤`, `¦¥1`); [`single_byte`] takes the second
-/// of two pieces for one too (`¥¤9`, `¦¥23`, endgame classes). Before other
-/// letters it is a letter of a word (`Ґалаґан`), and before a number a sign
-/// (`£100`).
-fn is_piece(after: &[u8]) -> bool {
+/// Whether the piece byte `b[i]` of text read in `read` stands as a piece in
+/// a move, as ChessBase's comments write them:
+///
+/// - before a capture (`¥xf3`, `¦:f6`, and х typed in Cyrillic), a check or
+///   mate sign (`£+¤`, `d8£#`), or another piece (`¦¥1`);
+/// - before a file that a rank, a file, a capture or no letter or digit
+///   follows, or that ends the text (`¤d7`, `¦fe1`, `¥b+`, `¦a-e8`, and а, с,
+///   е typed in Cyrillic, `¤с3`);
+/// - before a rank that a file, a capture or a dash follows (`¦1d5`,
+///   `¤3:h4`, `¤7-b6`);
+/// - before one of ` `, `.`, `,` or `-` and then a capture or a file as above
+///   (`¤ e5`, `¤ :d5`, `¥ xc6+`, `¤.f6`, `¢-b4`);
+/// - after a square, as a promotion (`d8£`), after another piece (`¥¤9`), and
+///   after a piece and a plus (`£+¤`).
+///
+/// Anywhere else it is the page's character: a letter of a word (`Ґалаґан`,
+/// `Ґаєвський`, whose є is a letter of Windows-1251 below 0xc0) or a sign
+/// (`£5`, `£1.50`, `§4`). A piece standing alone (`¥ (любой ход)`) is taken
+/// for a sign too.
+fn is_piece(b: &[u8], i: usize, read: CodePage) -> bool {
     // a-h, and а, с, е typed in Cyrillic for a, c, e.
     let file = |c: u8| matches!(c, b'a'..=b'h' | 0xe0 | 0xf1 | 0xe5);
     // x, х typed in Cyrillic, and the colon Russian notation writes.
     let capture = |c: u8| matches!(c, b'x' | 0xf5 | b':');
-    let letter = |c: u8| c.is_ascii_alphabetic() || c >= 0xc0;
-    match after {
-        [] => true,
+    let rank = |c: u8| matches!(c, b'1'..=b'8');
+    let piece = |c: u8| figurine(c).is_some();
+    let word = |c: u8| c.is_ascii_digit() || read.char(c).is_alphabetic();
+    // A capture, or a file that a rank, a file, a capture or no letter or
+    // digit follows.
+    let move_on = |rest: &[u8]| match rest {
         [c, ..] if capture(*c) => true,
-        [c, rest @ ..] if file(*c) => rest.first().is_none_or(|&d| !letter(d) || file(d) || capture(d)),
-        [b'1'..=b'8', rest @ ..] => rest.first().is_none_or(|d| !d.is_ascii_digit()),
-        [c, ..] => !letter(*c) && !c.is_ascii_digit(),
-    }
+        [c] => file(*c),
+        [c, d, ..] => file(*c) && (rank(*d) || file(*d) || capture(*d) || !word(*d)),
+        [] => false,
+    };
+    let follows = match &b[i + 1..] {
+        [c, ..] if piece(*c) || matches!(c, b'+' | b'#') => true,
+        [c, d, ..] if rank(*c) => file(*d) || capture(*d) || *d == b'-',
+        [b' ' | b'.' | b',' | b'-', rest @ ..] => move_on(rest),
+        rest => move_on(rest),
+    };
+    follows
+        || match &b[..i] {
+            [.., c] if piece(*c) => true,
+            [.., f, r] if file(*f) && rank(*r) => true,
+            [.., p, b'+'] => piece(*p),
+            _ => false,
+        }
 }
 
 /// Whether text read on a computer whose code page is `page` is read in the
@@ -196,21 +215,37 @@ mod tests {
     /// letters there are never figurines.
     #[test]
     fn piece_bytes_are_figurines() {
-        // `Ход 3...¤d7 4.¥xf3 £d2 ¦e1 ¢g2 §`, in Windows-1251.
-        let moves = b"\xd5\xee\xe4 3...\xa4d7 4.\xa5xf3 \xa3d2 \xa6e1 \xa2g2 \xa7";
+        // `Ход 3...¤d7 4.¥xf3 £d2 ¦e1 ¢g2 §e4`, in Windows-1251.
+        let moves = b"\xd5\xee\xe4 3...\xa4d7 4.\xa5xf3 \xa3d2 \xa6e1 \xa2g2 \xa7e4";
         for page in [WESTERN, CYRILLIC] {
-            assert_eq!(single_byte(moves, page, page), "Ход 3...♘d7 4.♗xf3 ♕d2 ♖e1 ♔g2 ♙");
+            assert_eq!(single_byte(moves, page, page), "Ход 3...♘d7 4.♗xf3 ♕d2 ♖e1 ♔g2 ♙e4");
             assert_eq!(single_byte(b"\xa3+\xa4", page, page), "♕+♘");
-            // `¦fe1 ¦1d5 ¦:f6 d8£ ¦¥1 ¥b+ ¦a-e8`, and `¤с3 ¥хf3` with Cyrillic с and х.
-            let more = b"\xa6fe1 \xa61d5 \xa6:f6 d8\xa3 \xa6\xa51 \xa5b+ \xa6a-e8 \xa4\xf13 \xa5\xf5f3";
-            assert_eq!(single_byte(more, page, CYRILLIC), "♖fe1 ♖1d5 ♖:f6 d8♕ ♖♗1 ♗b+ ♖a-e8 ♘с3 ♗хf3");
+            // `¦fe1 ¦1d5 ¤3:h4 ¤7-b6 ¦:f6 d8£ c8£# ¦¥1 ¥b+ ¦a-e8 ¥d`, `¤ e5 ¤ :d5
+            // ¥ xc6+ ¤.f6 ¢-b4`, and `¤с3 ¥хf3` with Cyrillic с and х.
+            let more = b"\xa6fe1 \xa61d5 \xa43:h4 \xa47-b6 \xa6:f6 d8\xa3 c8\xa3# \xa6\xa51 \xa5b+ \xa6a-e8 \xa5d \
+                \xa4 e5 \xa4 :d5 \xa5 xc6+ \xa4.f6 \xa2-b4 \xa4\xf13 \xa5\xf5f3";
+            assert_eq!(
+                single_byte(more, page, CYRILLIC),
+                "♖fe1 ♖1d5 ♘3:h4 ♘7-b6 ♖:f6 d8♕ c8♕# ♖♗1 ♗b+ ♖a-e8 ♗d ♘ e5 ♘ :d5 ♗ xc6+ ♘.f6 ♔-b4 ♘с3 ♗хf3"
+            );
             // Endgame classes: `¥¤9`, `¦¥23`.
             assert_eq!(single_byte(b"\xa5\xa49 \xa6\xa523", page, page), "♗♘9 ♖♗23");
-            // `Ґалаґан` in Windows-1251: a Ukrainian name, not a bishop.
+            // Ukrainian names in Windows-1251, not bishops: `Ґалаґан`, and
+            // `Ґаєвський`, whose є is a letter below 0xc0.
             assert_eq!(single_byte(b"\xa5\xe0\xeb\xe0\xb4\xe0\xed", page, page), "Ґалаґан");
+            assert_eq!(single_byte(b"\xa5\xe0\xba\xe2\xf1\xfc\xea\xe8\xe9", page, page), "Ґаєвський");
         }
-        assert_eq!(single_byte(b"Prize \xa3100", WESTERN, WESTERN), "Prize £100");
-        assert_eq!(single_byte(b"\xa2 and \xa5 signs", WESTERN, WESTERN), "♔ and ♗ signs");
+        // Signs, not pieces.
+        for (bytes, text) in [
+            (&b"Prize \xa3100"[..], "Prize £100"),
+            (b"Prize \xa35", "Prize £5"),
+            (b"Prize \xa31.50", "Prize £1.50"),
+            (b"See \xa74", "See §4"),
+            (b"\xa2 and \xa5 signs", "¢ and ¥ signs"),
+            (b"\xa3 50 or \xa7 4", "£ 50 or § 4"),
+        ] {
+            assert_eq!(single_byte(bytes, WESTERN, WESTERN), text);
+        }
         // Windows-1250: `Łódź`, whatever a fallback says.
         let central = CodePage::new(1250);
         assert_eq!(single_byte(b"\xa3\xf3d\x9f", central, CYRILLIC), "Łódź");

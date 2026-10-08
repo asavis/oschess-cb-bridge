@@ -142,13 +142,14 @@ fn short_words_keep_their_context() {
     assert_eq!(read(&f, CodePage::CYRILLIC).1[1], ["1.Kрg1"]);
 }
 
-/// A Ukrainian name keeps its capital Ґ, which is ChessBase's bishop byte, on
+/// Ukrainian names keep their capital Ґ, which is ChessBase's bishop byte, on
 /// either computer.
 #[test]
-fn a_ukrainian_name_keeps_its_capital_ghe() {
-    // `Ґалаґан` in Windows-1251.
-    let f = database("text-ghe", [b"\xa5\xe0\xeb\xe0\xb4\xe0\xed", b"Anderssen"], [&[], &[]]);
+fn ukrainian_names_keep_their_capital_ghe() {
+    // `Ґалаґан` and `Ґаєвський` in Windows-1251; є is a letter below 0xc0.
+    let names: [&[u8]; 2] = [b"\xa5\xe0\xeb\xe0\xb4\xe0\xed", b"\xa5\xe0\xba\xe2\xf1\xfc\xea\xe8\xe9"];
+    let f = database("text-ghe", names, [&[], &[]]);
     for computer in COMPUTERS {
-        assert_eq!(read(&f, computer).0, ["Ґалаґан", "Anderssen"], "{computer:?}");
+        assert_eq!(read(&f, computer).0, ["Ґалаґан", "Ґаєвський"], "{computer:?}");
     }
 }

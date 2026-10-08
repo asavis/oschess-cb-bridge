@@ -925,21 +925,25 @@ The reader was checked against:
   the names in the first 64 KiB of each entity file show, else in the
   computer's page. Read so, the 244 books show no mojibake on either computer,
   Western text in them stays Western on a Cyrillic one (`Könemann` 4,731 times,
-  none read `Kцnemann`), and the two computers read alike all but 48 of their
-  447,853 names and texts, each a lone `и …` in a game with no other text. On
+  none read `Kцnemann`), and the two computers read alike all but 51 of their
+  447,853 names and texts, nearly all a lone `и …` in a game with no other
+  text. On
   a computer of another page, the text is read in that page as it stands.
 - **Piece bytes.** ChessBase's chess fonts draw 0xa2-0xa7 as king, queen,
   knight, bishop, rook and pawn, and the Russian books use them in comments
-  and some names: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`, `¦:f6`, `£+¤`,
-  `d8£`, and endgame classes such as `Позиция ¦¥1`. On a computer of either
-  page the reader serves such a byte as the figurine ♔ ♕ ♘ ♗ ♖ ♙ where it
-  stands as a piece (`cbh::text::is_piece`): before a file, a rank, a capture
-  or no letter, or after another piece. Elsewhere it is the page's character,
-  since Windows-1251 has ў Ј ¤ Ґ ¦ § there (Ukrainian `Ґалаґан`) and
-  Windows-1252 the signs ¢ £ ¤ ¥ ¦ § (`£100`). In the books 19,845 became
-  figurines and 30 stayed characters, all in typing slips such as `¤ld7` and
-  `¦el`. On a computer of another page, such as Windows-1250 with Ł and Ą at
-  0xa3 and 0xa5, they are read as that page reads them.
+  and some names: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`, `¦:f6`, `¤ :d5`,
+  `£+¤`, `d8£`, and endgame classes such as `Позиция ¦¥1`. On a computer of
+  either page the reader serves such a byte as the figurine ♔ ♕ ♘ ♗ ♖ ♙ only
+  where a move shows it is a piece (`cbh::text::is_piece`): before a file, a
+  rank, a capture or a check, possibly after a space, a dot, a comma or a
+  dash, after a square as a promotion, or beside another piece. Elsewhere it
+  is the page's character, since Windows-1251 has ў Ј ¤ Ґ ¦ § there
+  (Ukrainian `Ґалаґан`, `Ґаєвський`) and Windows-1252 the signs ¢ £ ¤ ¥ ¦ §
+  (`£5`, `£1.50`, `§4`). In the books 19,825 became figurines and 50 stayed
+  characters: typing slips such as `¤ld7` and `¦el`, and pieces standing
+  alone (`¥ (любой ход)`). On a computer of another page, such as
+  Windows-1250 with Ł and Ą at 0xa3 and 0xa5, they are read as that page
+  reads them.
 - **Names that differ from the 2CBH copy** do so for two reasons only. Names
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut
