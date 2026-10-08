@@ -280,7 +280,8 @@ const FILE_MAGIC: [u8; 8] = *b"OSCBNAM\0";
 /// 4: a 2CBH name that is not UTF-8 is read, no longer lost (#308).
 /// 5: and ChessBase's signs in 2CBH names are read (#309, #311).
 /// 6: and a classic name drops ChessBase's diagram mark (#314).
-const FILE_VERSION: u32 = 6;
+/// 7: and a classic UTF-8 name reads ChessBase's signs (#316).
+const FILE_VERSION: u32 = 7;
 const FILE_HEADER: usize = 64;
 
 /// The buffer a names file is written through.
