@@ -36,6 +36,9 @@ pub const HEADER_RECORD_SIZE: usize = 192;
 
 /// The extensions of the files that make up a database.
 pub const EXTENSIONS: [&str; 6] = [".2cbh", ".2cbg", ".2cba", ".2lid", ".2lgd", ".2lcd"];
+/// The files [`Database::open`] opens, `.2cba` when it is there: the others
+/// of [`EXTENSIONS`] are part of the database but never read.
+pub const READ: [&str; 4] = [".2cbh", ".2cbg", ".2cba", ".2lid"];
 /// Files that sit beside a database under its name without being needed to
 /// read it: its settings and the opening key files. An export must not
 /// overwrite them either.

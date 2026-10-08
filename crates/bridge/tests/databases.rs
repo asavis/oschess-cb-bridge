@@ -185,8 +185,15 @@ fn a_database_names_its_folder_and_the_times_of_its_files() {
     // A game added in ChessBase writes the games file, not the header file.
     touch(&inside.with_extension("2cbg"), 2_000_000_000);
     let later = of(&inside);
-    assert_eq!(later.modified, Some(std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000)));
+    let added = Some(std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000));
+    assert_eq!(later.modified, added);
     assert_eq!(later.created, mega.created);
+    // The name files beside it are never read: a later one changes nothing.
+    for ext in ["2lgd", "2lcd"] {
+        std::fs::write(inside.with_extension(ext), b"names").unwrap();
+        touch(&inside.with_extension(ext), 2_000_000_300);
+        assert_eq!(of(&inside).modified, added, ".{ext}");
+    }
     settle(&catalog);
 }
 
@@ -1005,8 +1012,8 @@ fn row(d: &bridge::snapshot::Database) -> String {
     let folder: Vec<String> = d.folder.iter().map(|s| format!("\"{s}\"")).collect();
     row += &format!(",\"folder\":[{}]", folder.join(","));
     for (key, time) in [("created", d.created), ("modified", d.modified)] {
-        if let Some(time) = time {
-            row += &format!(",\"{key}\":\"{}\"", bridge::log::timestamp(bridge::log::seconds(time)));
+        if let Some(time) = time.and_then(bridge::log::rfc3339) {
+            row += &format!(",\"{key}\":\"{time}\"");
         }
     }
     row

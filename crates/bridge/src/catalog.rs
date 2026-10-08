@@ -176,6 +176,9 @@ struct Files {
     modified: Option<SystemTime>,
     /// When the main file was created, when the file system keeps that.
     created: Option<SystemTime>,
+    /// [`Files::modified`] of the files the reader opens alone: a 2CBH
+    /// database's `.2lgd` and `.2lcd` are among its files but never read.
+    read_modified: Option<SystemTime>,
 }
 
 impl Files {
@@ -188,7 +191,7 @@ impl Files {
     }
 
     fn look(&self) -> Look {
-        Look { size: self.size(), created: self.created, modified: self.modified }
+        Look { size: self.size(), created: self.created, modified: self.read_modified }
     }
 }
 
@@ -448,6 +451,18 @@ impl Drop for Done {
     }
 }
 
+/// Whether the reader of a database of `format` opens `file`, one of its
+/// files ([`cbformat::view::Format::files`]): a 2CBH database's name files
+/// `.2lgd` and `.2lcd` are listed among its files but never read
+/// ([`cbformat::v2::READ`]).
+fn read_by_reader(format: cbformat::view::Format, file: &Path) -> bool {
+    if format != cbformat::view::Format::TwoCbh {
+        return true;
+    }
+    let ext = file.extension().map(|e| e.to_string_lossy()).unwrap_or_default();
+    cbformat::v2::READ.iter().any(|read| read[1..].eq_ignore_ascii_case(&ext))
+}
+
 /// The metadata of the database at `path`, of `format`: its generation and
 /// files, the ones its reader opens ([`cbformat::view::Format::files`]), so
 /// that the search boosters and other optional classic files are neither
@@ -459,7 +474,14 @@ impl Drop for Done {
 /// database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     let mut hash = Hash::new();
-    let mut files = Files { generation: None, present: Vec::new(), irregular: false, modified: None, created: None };
+    let mut files = Files {
+        generation: None,
+        present: Vec::new(),
+        irregular: false,
+        modified: None,
+        created: None,
+        read_modified: None,
+    };
     let Some(format) = format.view() else { return files };
     // Every cache keyed on a PGN database's generation (the header index, the
     // heads and names files, the position index) is then built again once
@@ -477,6 +499,9 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
                 hash.write_meta(&m);
                 hash.write_id(cbformat::file::file_id(&path, &m));
                 files.modified = files.modified.max(m.modified().ok());
+                if read_by_reader(format, &path) {
+                    files.read_modified = files.read_modified.max(m.modified().ok());
+                }
                 if i == 0 {
                     files.created = m.created().ok();
                 }

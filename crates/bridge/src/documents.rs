@@ -42,16 +42,40 @@ pub fn profile() -> Option<PathBuf> {
 /// `chessbase` when the database is inside it, else, after a `~` segment,
 /// relative to the user's profile folder `profile` when inside that, else the
 /// whole path from its drive (from the root elsewhere). So the user's name,
-/// and a redirection of Documents to a cloud folder, never show.
+/// and a redirection of Documents to a cloud folder, never show. The paths
+/// are first made absolute and their `.` and `..` resolved
+/// ([`resolved`]), so every spelling of a folder names it alike.
 pub fn folder_segments(path: &Path, chessbase: Option<&Path>, profile: Option<&Path>) -> Vec<String> {
-    let folder = path.parent().unwrap_or(Path::new(""));
-    if let Some(rest) = chessbase.and_then(|root| below(folder, root)) {
+    let path = resolved(path);
+    let folder = path.parent().unwrap_or(&path);
+    if let Some(rest) = chessbase.and_then(|root| below(folder, &resolved(root))) {
         return rest;
     }
-    if let Some(rest) = profile.and_then(|root| below(folder, root)) {
+    if let Some(rest) = profile.and_then(|root| below(folder, &resolved(root))) {
         return std::iter::once("~".to_owned()).chain(rest).collect();
     }
     segments(folder.components())
+}
+
+/// `path` made absolute against the working folder, with `.` and `..`
+/// resolved by their spelling alone: no file is looked at, so a missing
+/// database or one kept in the cloud is named as any other, and nothing is
+/// downloaded. A `..` at the root stays there.
+fn resolved(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The segments of `path` past `root`, when `root` is `path` or holds it.
@@ -88,8 +112,8 @@ fn segments<'a>(components: impl Iterator<Item = Component<'a>>) -> Vec<String> 
             }
             Component::RootDir if drive => {}
             Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR.to_owned()),
-            Component::CurDir => {}
-            Component::ParentDir => out.push("..".to_owned()),
+            // Resolved away by `resolved`.
+            Component::CurDir | Component::ParentDir => {}
             Component::Normal(name) => out.push(name.to_string_lossy().into_owned()),
         }
     }
@@ -164,14 +188,39 @@ mod tests {
         // A folder whose name begins like the root's is not inside it.
         assert_eq!(folder("/home/user2/Games.pgn", cb, home), ["/", "home", "user2"]);
         // ChessBase's folder wins over the profile that holds it; without
-        // either, the whole path; a path relative to the working folder stays so.
+        // either, the whole path.
         assert_eq!(folder("/home/u/Documents/ChessBase/A/x.2cbh", cb, None), ["A"]);
         assert_eq!(
             folder("/home/u/Documents/ChessBase/A/x.2cbh", None, None),
             ["/", "home", "u", "Documents", "ChessBase", "A"]
         );
-        assert_eq!(folder("bases/../x.2cbh", None, None), ["bases", ".."]);
-        assert!(folder("x.2cbh", cb, home).is_empty());
+    }
+
+    /// Every spelling of a folder names it alike: `..` and `.` resolved, a
+    /// relative path taken from the working folder, so a path written through
+    /// ChessBase's folder or the profile's parent still hides the user's name.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_folder_is_named_by_where_it_is_not_how_it_is_spelt() {
+        let (cb, home) = (Some("/r/alice/Documents/ChessBase"), Some("/r/alice"));
+        let through = "/r/alice/Documents/ChessBase/../../../alice/Desktop/Chess/db.2cbh";
+        assert_eq!(folder(through, cb, home), ["~", "Desktop", "Chess"]);
+        assert_eq!(folder("/r/alice/./Desktop/../Games/db.pgn", cb, home), ["~", "Games"]);
+        assert_eq!(
+            folder(
+                "/r/alice/Documents/ChessBase/Bases/x.2cbh",
+                Some("/r/alice/Documents/../Documents/ChessBase"),
+                home
+            ),
+            ["Bases"]
+        );
+        assert_eq!(folder("/../../x.pgn", cb, home), ["/"]);
+        // From the working folder: as the bridge, started there, reads it.
+        let cwd = std::env::current_dir().unwrap();
+        let profile = cwd.parent().map(|p| p.to_string_lossy().into_owned());
+        let name = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(folder("Chess/db.2cbh", None, profile.as_deref()), ["~".to_owned(), name, "Chess".to_owned()]);
+        assert_eq!(folder("db.2cbh", Some(&cwd.to_string_lossy()), None), Vec::<String>::new());
     }
 
     #[cfg(windows)]
