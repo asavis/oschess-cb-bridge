@@ -10,6 +10,7 @@
 //! first at every position), not in the PGN order 2CBH uses; the annotations
 //! say so by their [`Source`], which the PGN writer places them by.
 
+use super::text::evidence;
 use crate::bytes::{self, Fields};
 use crate::codepage::{CodePage, Evidence};
 use crate::game::{Annotation, Arrow, Block, GAME_POSITION, GameAnnotations, Source, Square, language};
@@ -92,7 +93,7 @@ pub fn parse_in(record: &[u8], id: u32, page: CodePage, fallback: CodePage) -> R
     }
     let mut game = Evidence::default();
     for (_, text) in &single_byte {
-        game.add(Evidence::of(text));
+        game.add(evidence(text));
     }
     let fallback = game.page().unwrap_or(fallback);
     for ((block, at), bytes) in single_byte {

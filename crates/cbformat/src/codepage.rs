@@ -103,11 +103,17 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 /// - Cyrillic: a word of these bytes alone, or one with three of them in a row
 ///   (`Cлон`, typed with a Latin C), and Russian notation, a piece letter
 ///   before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin K,
-///   `Л:f6`); also `№` before a digit.
+///   `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`);
+///   a letter at 0xc0-0xff that ends a number, as Russian books number
+///   problems and variations (`1.49а`; Western text writes no `1.49à`, its
+///   ordinals `1ª`, `2º` stand below 0xc0, and its `×` and `÷` stand between
+///   numbers, `2×2`); also `№` before a digit.
 /// - Western: a word with no more of them than ASCII letters (`für`).
-/// - Neither: a word of one letter (French `à`, Russian `в`), and a short word
+/// - Neither: a word of one letter (French `à`, Russian `в`), a short word
 ///   with more of them than ASCII letters but no three in a row (`Süß`, `été`),
-///   which could be either.
+///   which could be either, and a word whose such letters are all Cyrillic
+///   letters that look Latin among ASCII ones (`сorr.` typed with a Cyrillic
+///   с), which reads alike either way.
 ///
 /// Evidence adds up, so that texts that show nothing alone can be read as the
 /// texts beside them show.
@@ -143,7 +149,17 @@ impl Evidence {
             }
             let ascii = word.len() - h;
             let run = word.split(|&c| !high(c)).map(<[u8]>::len).max().unwrap_or(0);
-            if is_notation(word, b.get(i).copied()) || (word.len() > 1 && (ascii == 0 || run >= 3)) {
+            let next = b.get(i).copied();
+            let lookalikes = ascii > 0 && word.iter().filter(|&&c| high(c)).all(|c| LOOKALIKES.contains(c));
+            let ends_number = matches!(word, [0xc0..=0xff] if word[0] != 0xd7 && word[0] != 0xf7)
+                && start > 0
+                && b[start - 1].is_ascii_digit()
+                && !next.is_some_and(|c| c.is_ascii_alphanumeric());
+            if is_notation(word, next) || is_typed_square(word, next) || ends_number {
+                e.cyrillic += h;
+            } else if lookalikes {
+                // Reads alike either way: shows neither.
+            } else if word.len() > 1 && (ascii == 0 || run >= 3) {
                 e.cyrillic += h;
             } else if word.len() > 1 && h <= ascii {
                 e.western += h;
@@ -166,6 +182,22 @@ impl Evidence {
             Ordering::Equal => None,
         }
     }
+}
+
+/// Windows-1251 letters that look like Latin ones (а с е о р х у, А В Е К М Н О
+/// Р С Т Х У), whose bytes Windows-1252 reads as Latin letters with marks.
+const LOOKALIKES: [u8; 19] =
+    [0xe0, 0xf1, 0xe5, 0xee, 0xf0, 0xf5, 0xf3, 0xc0, 0xc2, 0xc5, 0xca, 0xcc, 0xcd, 0xce, 0xd0, 0xd1, 0xd2, 0xd5, 0xd3];
+
+/// Whether `word`, followed by the byte `next`, is a square whose file is
+/// typed in Cyrillic, а, с or е for a, c or e, possibly after a piece's Latin
+/// letter: `е5`, `Rе8`, and `с2` of `N:с2`.
+fn is_typed_square(word: &[u8], next: Option<u8>) -> bool {
+    let file = match word {
+        [f] | [b'K' | b'Q' | b'R' | b'B' | b'N', f] => *f,
+        _ => return false,
+    };
+    matches!(file, 0xe0 | 0xf1 | 0xe5) && next.is_some_and(|c| matches!(c, b'1'..=b'8'))
 }
 
 /// Whether `word`, followed by the byte `next`, is a move in Russian notation:
@@ -354,6 +386,28 @@ mod tests {
         assert_eq!(guess(b"\xcf\xe5\xf2\xf0\xee\xe2"), cyrillic, "Петров");
         assert_eq!(guess(b"\xe1\xb3\xeb\xb3"), cyrillic, "білі: і is a letter only Windows-1251 has");
         assert_eq!(guess(b"\xaf\xe6\xe0\xea"), cyrillic, "Їжак");
+        // Squares with a file typed in Cyrillic.
+        assert_eq!(guess(b", R\xe58 \xe8 \xf2.\xe4."), cyrillic, "Rе8 и т.д.");
+        assert_eq!(guess(b"\xe8 N:\xf12"), cyrillic, "и N:с2");
+        assert_eq!(guess(b"11. \xe55"), cyrillic, "е5");
+        assert_eq!(guess(b"R\xe5x"), None, "no rank after the file");
+        // A letter that ends a number.
+        assert_eq!(guess(b"3.7\xe0"), cyrillic, "3.7а");
+        assert_eq!(guess(b"9.4\xf1"), cyrillic, "9.4с");
+        assert_eq!(guess(b"3 \xe0"), None, "a word of its own");
+        // Western multiplication and division between numbers.
+        assert_eq!(guess(b"2\xd72 = 4"), None, "2×2 = 4");
+        assert_eq!(guess(b"10\xf75 = 2"), None, "10÷5 = 2");
+        assert_eq!(guess(b"3\xe22"), None, "a letter that does not end the number: 3в2");
+        // Western ordinals stay Western.
+        assert_eq!(guess(b"1\xaa Divisi\xf3n"), None, "1ª División: ó looks like у");
+        assert_eq!(guess(b"1\xaa Divisi\xf3n, M\xfcller"), western);
+        assert_eq!(guess(b"2\xba Open"), None, "2º Open");
+        // Cyrillic letters that look Latin among ASCII ones read alike: neither.
+        assert_eq!(guess(b"\xf1orr."), None, "сorr.");
+        assert_eq!(guess(b"(\xf1ontinuation 1)"), None);
+        assert_eq!(guess(b"Mu\xf1oz"), None, "Muñoz too");
+        assert_eq!(guess(b"Mu\xf1oz G\xf3mez Mart\xedn"), western, "beside other Western letters");
         // `иначе`: `ч` is `÷` in Windows-1252, and still a letter of the word.
         assert_eq!(guess(b"\xe8\xed\xe0\xf7\xe5"), cyrillic);
         // Кр with a Latin K, on its own.

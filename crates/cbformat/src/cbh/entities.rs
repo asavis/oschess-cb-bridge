@@ -7,7 +7,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use super::text::{detects, text};
+use super::text::{detects, evidence as words, text};
 use crate::bytes::Fields;
 use crate::codepage::{CodePage, Evidence};
 use crate::file::DbFile;
@@ -123,7 +123,7 @@ impl EntityFile {
                 let f = field(data, at.clone());
                 let f = &f[..f.iter().position(|&b| b == 0).unwrap_or(f.len())];
                 if std::str::from_utf8(f).is_err() {
-                    evidence.add(Evidence::of(f));
+                    evidence.add(words(f));
                 }
             }
         }

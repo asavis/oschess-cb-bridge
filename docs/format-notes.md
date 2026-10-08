@@ -957,6 +957,41 @@ The reader was checked against:
   move)`; the examples in this section are made up). On a computer of another
   page, such as Windows-1250 with Ł and Ą at 0xa3 and 0xa5, they are read as
   that page reads them.
+- **Signs** (#306). The chess font the books ship draws ChessBase's signs in
+  0x80-0xbf: the pieces above, `+-` at 0x9d, `-+` at 0xb0, `±` `⩲` `⩱` at
+  0xb1-0xb3, `∓` at 0xb5, `⌓` at 0xb9, `=/∞` at 0xa9 and `½` at 0xbd, read
+  from the glyphs' outlines. The books' text uses two of them where the
+  pages have a letter or a sign no chess text means, and the reader serves
+  them as signs where no letter follows: `½` at 0xbd (204 times, `½-½`), which
+  Windows-1251 reads as the Macedonian `Ѕ`, and `∓` at 0xb5 (53 times, after a
+  move or before `/-+`), which both pages read as `µ`. The others are left as
+  the page reads them: 0xb9 is `№` in the books' text (1,021 times, `№102`),
+  0xb2 and 0xb3 are Ukrainian `І` and `і` in Windows-1251 (25 times as signs,
+  which a reader cannot tell from the letters), and 0xa9 is `©` (13 times).
+  0x9e (2,465 times, after `Диаграмма` and at the end of comments) is drawn
+  as a ring with an arrow up; what ChessBase shows for it is not known, and it
+  reads as the page's character (`ћ`, `ž`).
+- **Cyrillic look-alikes.** Typists of the books mixed Cyrillic letters that
+  look Latin into Latin words (`сorr.`, `Bа2`, `Rе8`). A word whose bytes
+  above ASCII are all such letters shows neither page, since it reads alike
+  either way, and so does not turn a database's names Western. A square whose
+  file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`), and a letter that ends a
+  number as the books number problems (`1.49а`), show Cyrillic.
+- **UTF-8 inside Windows-1251.** Twelve comments hold a text in Windows-1251
+  and then a copy in UTF-8. A run of three Cyrillic UTF-8 letters or more,
+  with other UTF-8 and ASCII between, is read as UTF-8 (`cbh::text::utf8_runs`):
+  Windows-1251 reads such a letter as `Р` or `С` and a sign, which Russian text
+  does not write three times in a row. Six of them start with a letter whose
+  first byte the file already lost (`? Ў…`), which stays as it is.
+- **Checked against the books** (#306): every name and text read on a 1251 and
+  on a 1252 computer is its bytes read in one page, with pieces, signs and
+  UTF-8 runs only where the rules above put them; a letter-bigram model built
+  from independent Ukrainian and English text agrees with the page chosen but
+  for strings it misjudges (`СССР`, `(Эммс)`) and four of mixed typing
+  (`Tenepü`, the Latin `Tenep` with a Cyrillic `ь`). Served by the bridge on a
+  1251 computer, all 40,618 readable games parse with python-chess, and the
+  figurines' squares are reached by a piece of their kind more often under
+  this mapping than under any of the 719 others.
 - **Names that differ from the 2CBH copy** do so for two reasons only. Names
   with characters that no single-byte code page holds are stored in some other
   form (25 in the user database). Names longer than their field are cut
