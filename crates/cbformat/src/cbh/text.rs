@@ -81,12 +81,17 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
 /// sequence as Р or С and a sign or a rare letter, which Russian text does not
 /// write three times in a row with nothing but ASCII between.
 fn utf8_runs(b: &[u8]) -> Vec<std::ops::Range<usize>> {
-    let continuation = |i: usize| b.get(i).is_some_and(|c| (0x80..=0xbf).contains(c));
+    let within = |i: usize, range: std::ops::RangeInclusive<u8>| b.get(i).is_some_and(|c| range.contains(c));
+    let continuation = |i: usize| within(i, 0x80..=0xbf);
     let cyrillic = |i: usize| matches!(b.get(i), Some(0xd0 | 0xd1)) && continuation(i + 1);
-    // The length of the UTF-8 sequence of two or three bytes at `i`.
+    // The length of the UTF-8 sequence of two or three bytes at `i` that
+    // encodes a character: no overlong form (0xe0 needs 0xa0 or more next) and
+    // no surrogate (0xed needs 0x9f or less next). Anything else ends a run.
     let sequence = |i: usize| match b.get(i) {
         Some(0xc2..=0xdf) if continuation(i + 1) => 2,
-        Some(0xe0..=0xef) if continuation(i + 1) && continuation(i + 2) => 3,
+        Some(0xe0) if within(i + 1, 0xa0..=0xbf) && continuation(i + 2) => 3,
+        Some(0xed) if within(i + 1, 0x80..=0x9f) && continuation(i + 2) => 3,
+        Some(0xe1..=0xec | 0xee..=0xef) if continuation(i + 1) && continuation(i + 2) => 3,
         _ => 0,
     };
     let mut runs = Vec::new();
@@ -340,6 +345,14 @@ mod tests {
         assert_eq!(single_byte(&mixed, WESTERN, CYRILLIC), "Ход? Ход белых");
         assert_eq!(single_byte(&mixed, CYRILLIC, CYRILLIC), "Ход? Ход белых");
         assert_eq!(utf8_runs(b"\xd1\xd1\xd1\xd0"), []);
+        // A sequence that encodes no character, a surrogate or an overlong
+        // form, ends a run and keeps the runs on either side.
+        let surrogate = [&mixed[..], b"\xed\xa0\x80"].concat();
+        // The surrogate's bytes read in Windows-1251: н, a no-break space, Ђ.
+        assert_eq!(single_byte(&surrogate, CYRILLIC, CYRILLIC), "Ход? Ход белыхн\u{a0}Ђ");
+        let overlong = ["Ход".as_bytes(), b"\xe0\x80\x80", "белых".as_bytes()].concat();
+        assert!(single_byte(&overlong, CYRILLIC, CYRILLIC).starts_with("Ход"));
+        assert!(single_byte(&overlong, CYRILLIC, CYRILLIC).ends_with("белых"));
         let runs = utf8_runs("Ход".as_bytes());
         assert_eq!((runs.len(), runs.first()), (1, Some(&(0..6))));
         assert_eq!(utf8_runs("Хо".as_bytes()), [], "two letters are not enough");
