@@ -66,9 +66,12 @@ impl Process {
     /// Starts the engine of `config`, which may take `handshake` to answer
     /// `uci` with `uciok`, and sets it up.
     pub(super) fn start(config: &EngineConfig, handshake: Duration) -> Result<Process, String> {
-        let mut command = Command::new(&config.program);
+        // The engine runs outside the Store package, so it is started from
+        // the folder where it finds itself (#289).
+        let program = crate::folders::outside(&config.program);
+        let mut command = Command::new(&program);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        if let Some(dir) = config.program.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Some(dir) = program.parent().filter(|d| !d.as_os_str().is_empty()) {
             command.current_dir(dir);
         }
         #[cfg(windows)]

@@ -38,12 +38,15 @@ libc = "0.2"
 # physical memory (machine.rs).
 # The access control list a rewritten PGN file keeps (write.rs):
 # `Win32_Security_Authorization`.
+# The Store package's family, whose folder keeps the application data it
+# creates (folders.rs): `Win32_Storage_Packaging_Appx`.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Memory",
     "Win32_System_Power",

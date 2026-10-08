@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::sha256;
+use crate::{folders, sha256};
 
 /// A processor architecture Stockfish publishes a Windows build for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,34 +283,54 @@ fn stockfish_major(text: &str) -> Option<u32> {
 /// called by their full paths so that no other program on the path answers.
 pub struct System;
 
+/// The tools run outside the Store package, so they are given the paths at
+/// which they find the bridge's files ([`folders::outside`], #289).
 impl Transport for System {
     fn download(&self, url: &str, to: &Path, max_filesize: u64) -> Result<(), String> {
-        let status = system_tool("curl.exe")?
-            .args(["--fail", "--location", "--silent", "--show-error", "--proto", "=https", "--proto-redir", "=https"])
+        let mut curl = system_tool("curl.exe")?;
+        curl.args(["--fail", "--location", "--silent", "--show-error", "--proto", "=https", "--proto-redir", "=https"])
             // Bounded: no more than the pinned size, and a transfer that
             // stalls below 1 kB/s for a minute, or runs over half an hour, ends.
             .args(["--max-filesize", &max_filesize.to_string()])
             .args(["--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60", "--max-time", "1800"])
             .arg("--output")
-            .arg(to)
-            .arg(url)
-            .status()
-            .map_err(|e| format!("curl.exe: {e}"))?;
-        if status.success() { Ok(()) } else { Err(format!("The download failed ({status})")) }
+            .arg(folders::outside(to))
+            .arg(url);
+        run(curl, "curl.exe", "The download failed")
     }
 
     fn extract(&self, zip: &Path, members: &[String], to: &Path) -> Result<(), String> {
-        let status = system_tool("tar.exe")?
-            .arg("-xf")
-            .arg(zip)
-            .arg("-C")
-            .arg(to)
-            .args(members)
-            .status()
-            .map_err(|e| format!("tar.exe: {e}"))?;
-        if status.success() { Ok(()) } else { Err(format!("Unpacking failed ({status})")) }
+        let mut tar = system_tool("tar.exe")?;
+        tar.arg("-xf").arg(folders::outside(zip)).arg("-C").arg(folders::outside(to)).args(members);
+        run(tar, "tar.exe", "Unpacking failed")
     }
 }
+
+/// Runs the tool `name` as `command`. A failure is `failed` with the tool's
+/// exit status and the reason it gave.
+fn run(mut command: std::process::Command, name: &str, failed: &str) -> Result<(), String> {
+    use std::process::Stdio;
+    let out = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("{name}: {e}"))?;
+    if out.status.success() { Ok(()) } else { Err(failure(failed, &out.status.to_string(), &out.stderr)) }
+}
+
+/// `failed` with the tool's exit status `status` and the last line of its
+/// error output `stderr`, such as curl's "(23) Failure writing output to
+/// destination", at most [`REASON`] characters of it.
+fn failure(failed: &str, status: &str, stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let reason = text.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
+    let reason: String = reason.chars().take(REASON).collect();
+    if reason.is_empty() { format!("{failed} ({status})") } else { format!("{failed} ({status}): {reason}") }
+}
+
+/// The most of a tool's reason a failure repeats.
+const REASON: usize = 300;
 
 #[cfg(windows)]
 fn system_tool(name: &str) -> Result<std::process::Command, String> {
@@ -502,6 +522,22 @@ mod tests {
         // 80,190,536 bytes are 76.48 MB: rounded up to 77, never down to 76.
         assert_eq!(Build::for_arch(Arch::Arm64).megabytes(), 77);
         assert_eq!([0, 1, 1 << 20, (1 << 20) + 1].map(megabytes), [0, 1, 1, 2]);
+    }
+
+    /// A failed tool's own reason reaches the message, not its exit code
+    /// alone (#289).
+    #[test]
+    fn a_failure_names_the_tools_reason() {
+        let curl = b"Warning: Failed to open the file C:\\x\\.download.zip: No such file or directory\r\n\
+                     curl: (23) client returned ERROR on write of 1369 bytes\r\n\r\n";
+        assert_eq!(
+            failure("The download failed", "exit code: 23", curl),
+            "The download failed (exit code: 23): curl: (23) client returned ERROR on write of 1369 bytes"
+        );
+        assert_eq!(failure("Unpacking failed", "exit code: 1", b" \n"), "Unpacking failed (exit code: 1)");
+        let long = failure("The download failed", "exit code: 6", "é".repeat(1000).as_bytes());
+        assert_eq!(long, format!("The download failed (exit code: 6): {}", "é".repeat(REASON)));
+        assert!(failure("x", "y", b"\xff\xfe broken").ends_with("broken"), "text that is not UTF-8 is kept readable");
     }
 
     #[test]

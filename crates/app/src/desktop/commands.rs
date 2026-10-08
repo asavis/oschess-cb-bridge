@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bridge::engines::{self, Roots};
 use bridge::stockfish::{self, Build};
-use bridge::{config, engine, token};
+use bridge::{config, engine, folders, token};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -192,7 +192,9 @@ pub fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
     if !licence.is_file() {
         return Err(format!("{} is missing", licence.display()).into());
     }
-    Ok(app.opener().open_path(licence.to_string_lossy(), None::<&str>).map_err(text)?)
+    // The program that shows it runs outside the Store package (#289).
+    let shown = folders::outside(&licence);
+    Ok(app.opener().open_path(shown.to_string_lossy(), None::<&str>).map_err(text)?)
 }
 
 /// Puts off the Stockfish offer until the next bridge version.
