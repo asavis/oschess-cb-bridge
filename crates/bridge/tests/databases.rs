@@ -146,6 +146,50 @@ fn the_window_comes_first_then_bridge_toml_then_the_command_line() {
     settle(&catalog);
 }
 
+/// A database names its folder, relative to ChessBase's documents folder when
+/// it is inside it and from the root otherwise, and the times of its files:
+/// when its main file was created, and when any file it is read through last
+/// changed, a game added to `.2cbg` alone included. A database that is gone
+/// keeps its folder and has no times (#298).
+#[test]
+fn a_database_names_its_folder_and_the_times_of_its_files() {
+    use bridge::snapshot::Database;
+    let root = Root::new("folders");
+    let inside = database_at(&root.chessbase().join("Bases").join("Mega2026"), "Mega");
+    let top = database_at(&root.chessbase(), "Top");
+    let outside = database_at(&root.path("elsewhere"), "Outside");
+    let gone = root.chessbase().join("Old").join("Gone.2cbh");
+    root.window(&[(&inside, ""), (&top, ""), (&outside, ""), (&gone, "")]);
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    catalog.use_data_dir(&root.path("data"));
+    let of = |path: &Path| Database::of(&catalog.get(&id_of(path)).unwrap());
+
+    assert_eq!(of(&inside).folder, ["Bases", "Mega2026"]);
+    assert!(of(&top).folder.is_empty());
+    let profile = bridge::documents::profile();
+    let elsewhere = bridge::documents::folder_segments(&outside, Some(&root.chessbase()), profile.as_deref());
+    assert_eq!(of(&outside).folder, elsewhere);
+    assert_eq!(elsewhere.last().map(String::as_str), Some("elsewhere"));
+    let missing = of(&gone);
+    assert_eq!(
+        (missing.state, missing.folder.as_slice(), missing.created, missing.modified),
+        (State::Missing, &["Old".to_owned()][..], None, None)
+    );
+
+    let mega = of(&inside);
+    assert_eq!(mega.state, State::Ready);
+    let main = std::fs::metadata(&inside).unwrap();
+    assert_eq!(mega.created, main.created().ok());
+    let newest = files_of(&inside).iter().map(|f| std::fs::metadata(f).unwrap().modified().unwrap()).max();
+    assert_eq!(mega.modified, newest);
+    // A game added in ChessBase writes the games file, not the header file.
+    touch(&inside.with_extension("2cbg"), 2_000_000_000);
+    let later = of(&inside);
+    assert_eq!(later.modified, Some(std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000)));
+    assert_eq!(later.created, mega.created);
+    settle(&catalog);
+}
+
 /// Changes to the window list and to `bridge.toml` show on the next listing.
 /// A database that leaves the list stays, reported missing, under its id.
 #[test]
@@ -367,7 +411,7 @@ fn a_classic_database_follows_the_files_it_reads() {
     assert_eq!(entry.format.name(), "cbh");
     assert_eq!(states(&catalog), ["cloudOnly"]);
     let files: Vec<PathBuf> = CLASSIC.iter().map(|ext| db.with_extension(ext)).collect();
-    assert_eq!(entry.open_sized().1, Some(size_of(&files)));
+    assert_eq!(entry.open_looked().1.map(|l| l.size), Some(size_of(&files)));
     assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
     wait_for(&entry, State::Ready);
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 1, "the annotators' file only");
@@ -411,7 +455,7 @@ fn a_cloud_only_database_downloads_when_opened() {
     let catalog = Catalog::with_sources(root.sources(), cloud.clone());
     let entry = catalog.get(&id_of(&db)).unwrap();
     assert_eq!(states(&catalog), ["cloudOnly"]);
-    assert_eq!(entry.open_sized().1, Some(size_of(&files)));
+    assert_eq!(entry.open_looked().1.map(|l| l.size), Some(size_of(&files)));
     assert_eq!(cloud.fetches.load(Ordering::SeqCst), 0, "listing fetched a file");
 
     cloud.hold(true);
@@ -957,6 +1001,13 @@ fn row(d: &bridge::snapshot::Database) -> String {
     }
     if let Some((present, total)) = d.progress {
         row += &format!(",\"progress\":{{\"present\":{present},\"total\":{total}}}");
+    }
+    let folder: Vec<String> = d.folder.iter().map(|s| format!("\"{s}\"")).collect();
+    row += &format!(",\"folder\":[{}]", folder.join(","));
+    for (key, time) in [("created", d.created), ("modified", d.modified)] {
+        if let Some(time) = time {
+            row += &format!(",\"{key}\":\"{}\"", bridge::log::timestamp(bridge::log::seconds(time)));
+        }
     }
     row
 }

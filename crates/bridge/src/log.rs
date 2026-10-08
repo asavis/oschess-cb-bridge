@@ -115,15 +115,21 @@ fn extension(path: &Path) -> Option<&str> {
 
 /// Seconds since 1970-01-01T00:00:00Z, negative for a clock set before it.
 fn now() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
+    seconds(SystemTime::now())
+}
+
+/// Seconds from 1970-01-01T00:00:00Z to `time`, negative before it: what
+/// [`timestamp`] writes, for the database list's file times as for the log.
+pub fn seconds(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
         Err(e) => i64::try_from(e.duration().as_secs()).map_or(i64::MIN, |s| -s),
     }
 }
 
-/// `secs` seconds after 1970-01-01T00:00:00Z, in ISO 8601 to the second:
-/// `2026-09-27T15:04:05Z`.
-fn timestamp(secs: i64) -> String {
+/// `secs` seconds after 1970-01-01T00:00:00Z, in ISO 8601 to the second, which
+/// RFC 3339 also is: `2026-09-27T15:04:05Z`.
+pub fn timestamp(secs: i64) -> String {
     let (days, time) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", time / 3600, time / 60 % 60, time % 60)
@@ -192,6 +198,13 @@ mod tests {
         }
         let now = timestamp(now());
         assert_eq!((now.len(), &now[4..5], &now[10..11], &now[19..]), (20, "-", "T", "Z"), "{now}");
+        let at = |secs: i64| match u64::try_from(secs) {
+            Ok(s) => UNIX_EPOCH + std::time::Duration::from_secs(s),
+            Err(_) => UNIX_EPOCH - std::time::Duration::from_secs(secs.unsigned_abs()),
+        };
+        for secs in [0, -1, -86_401, 1_790_521_445] {
+            assert_eq!(seconds(at(secs)), secs);
+        }
     }
 
     #[test]
