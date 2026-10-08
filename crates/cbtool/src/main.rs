@@ -22,7 +22,7 @@ const USAGE: &str = "usage:
                                            decode and replay every game and analysis
   cbtool pgn    <db> [--out FILE] [--lang LANGS] [ID...]
                                            export games as PGN (all games when no ids)
-  cbtool databases <dir>                   the databases ChessBase's database window lists
+  cbtool databases <dir> [--code-page N]  the databases ChessBase's database window lists
                                            (dir: the ChessBase documents folder)
   cbtool bridge [--database <path>]... [--show-token] [--new-token]
                                            run the oschess bridge in this console
@@ -33,7 +33,9 @@ const USAGE: &str = "usage:
 
 <db> is a 2CBH (.2cbh) or classic (.cbh) database. info and verify also read a
 PGN file (.pgn), as the bridge serves it; --code-page N reads its text that is
-not UTF-8 in Windows code page N (default: 1252).
+not UTF-8 in Windows code page N (default: 1252). databases reads the paths
+and titles of the list that are not UTF-8 in code page N (default: this
+computer's, as the bridge reads them; 1252 off Windows).
 
 --lang takes ISO 639-1 codes in order of preference, comma-separated, for the
 language of comments (default: English, else the first a game has).
@@ -52,7 +54,7 @@ fn main() -> ExitCode {
         Some("info") if args.len() >= 2 => info(&args[1], &args[2..]),
         Some("verify") if args.len() >= 2 => verify::verify(&args[1], &args[2..]),
         Some("pgn") if args.len() >= 2 => export::pgn(&args[1], &args[2..]),
-        Some("databases") if args.len() == 2 => databases::databases(&args[1]),
+        Some("databases") if args.len() >= 2 => list_databases(&args[1], &args[2..]),
         Some("profile") => profile::run(&args[1..]),
         // The bridge `profile` asks, in a process of its own; not in the usage.
         Some("profile-serve") => profile::serve(&args[1..]),
@@ -76,16 +78,16 @@ fn main() -> ExitCode {
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// The options `info` and `verify` take, each at most once: `--limit N`
-/// (`verify` only) and `--code-page N` (a PGN file only). Anything else is an
-/// error, before any database is read.
+/// The options `info`, `verify` and `databases` take, each at most once:
+/// `--limit N` (`verify` only) and `--code-page N` (a PGN file, or the list
+/// `databases` reads). Anything else is an error, before any database is read.
 #[derive(Debug, Default, PartialEq)]
 struct Opts {
     limit: Option<u32>,
     code_page: Option<u32>,
 }
 
-fn opts(rest: &[String], limit: bool, pgn: bool) -> AnyResult<Opts> {
+fn opts(rest: &[String], limit: bool, code_page: bool) -> AnyResult<Opts> {
     let mut o = Opts::default();
     let mut args = rest.iter();
     while let Some(flag) = args.next() {
@@ -93,7 +95,7 @@ fn opts(rest: &[String], limit: bool, pgn: bool) -> AnyResult<Opts> {
         let n: u32 = value.parse().map_err(|_| format!("{flag} takes a whole number, not {value:?}"))?;
         match flag.as_str() {
             "--limit" if limit && o.limit.is_none() => o.limit = Some(n),
-            "--code-page" if pgn && o.code_page.is_none() => o.code_page = Some(n),
+            "--code-page" if code_page && o.code_page.is_none() => o.code_page = Some(n),
             _ => return Err(USAGE.into()),
         }
     }
@@ -102,6 +104,12 @@ fn opts(rest: &[String], limit: bool, pgn: bool) -> AnyResult<Opts> {
 
 fn page(o: &Opts) -> cbformat::codepage::CodePage {
     o.code_page.map_or(cbformat::codepage::CodePage::WESTERN, cbformat::codepage::CodePage::new)
+}
+
+fn list_databases(dir: &str, rest: &[String]) -> AnyResult<bool> {
+    let o = opts(rest, false, true)?;
+    let page = o.code_page.map_or_else(bridge::pgnindex::system_code_page, cbformat::codepage::CodePage::new);
+    databases::databases(dir, page)
 }
 
 fn info(path: &str, rest: &[String]) -> AnyResult<bool> {

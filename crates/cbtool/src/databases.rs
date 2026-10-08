@@ -2,12 +2,14 @@
 
 use std::path::Path;
 
+use cbformat::codepage::CodePage;
 use cbformat::dbitems;
 use cbformat::view::{Base, Format};
 
 /// Lists the databases of a ChessBase documents folder with their state on
-/// this computer. The stored paths are not printed.
-pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
+/// this computer, reading paths and titles that are not UTF-8 in `page`. The
+/// stored paths are not printed.
+pub fn databases(dir: &str, page: CodePage) -> Result<bool, Box<dyn std::error::Error>> {
     let dir = Path::new(dir);
     let located = dbitems::locate(dir)?;
     if !located.conflict_copies.is_empty() {
@@ -18,7 +20,7 @@ pub fn databases(dir: &str) -> Result<bool, Box<dyn std::error::Error>> {
             dbitems::FILE_NAME
         );
     }
-    let Some(list) = dbitems::read(dir)? else {
+    let Some(list) = dbitems::read(dir, page)? else {
         println!("no {} in {}", dbitems::FILE_NAME, dir.display());
         return Ok(true);
     };
