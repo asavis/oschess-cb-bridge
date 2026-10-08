@@ -177,21 +177,27 @@ fn paths_and_titles_that_are_not_utf8_are_read_in_the_code_page() {
 }
 
 /// A title ChessBase stored as the database's file name with each UTF-16
-/// unit cut to its low byte reads as the file name (#288); a title of its
-/// own, and one that only looks cut, stay as stored.
+/// unit cut to its low byte reads as the file name (#288). A title of its
+/// own stays as stored, also one that starts with the image of its file name.
 #[test]
 fn a_title_cut_to_one_byte_reads_as_the_file_name() {
     let mut f = DbItems::new();
     f.section("Databases")
         // `Ладья`, cut: Л is U+041B, а U+0430, д U+0434, ь U+044C, я U+044F.
         .database(r"D:\Уроки\Ладья.cbh", "\u{1b}04LO", [0, 1, 66, 0, 0, 0])
-        .database(r"D:\Уроки\Ладья 2.cbh", "\u{1b}04LO 2 (cbh)", [0, 1, 66, 0, 0, 0])
-        .database(r"D:\Уроки\Ладья 3.cbh", "Rook endings", [0, 1, 66, 0, 0, 0])
+        .database(r"D:\Уроки\Ладья 2.cbh", "Rook endings", [0, 1, 66, 0, 0, 0])
         .database(r"D:\Уроки\Ферзь.cbh", "\u{1b}04LO", [0, 1, 66, 0, 0, 0])
-        .database(r"D:\Уроки\Rook.cbh", "Rook", [0, 1, 66, 0, 0, 0]);
+        .database(r"D:\Уроки\Rook.cbh", "Rook", [0, 1, 66, 0, 0, 0])
+        // `ё` cuts to `Q`, and `абв` to `012`.
+        .database(r"D:\ё.cbh", "Queen endings", [0, 1, 66, 0, 0, 0])
+        .database(r"D:\абв.cbh", "012345 games", [0, 1, 66, 0, 0, 0])
+        .database(r"D:\Ладья.cbh", "\u{1b}04LO (cbh)", [0, 1, 66, 0, 0, 0]);
     let list = dbitems::parse(&f.bytes(), PAGE).unwrap();
     let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, ["Ладья", "Ладья 2 (cbh)", "Rook endings", "\u{1b}04LO", "Rook"]);
+    assert_eq!(
+        names,
+        ["Ладья", "Rook endings", "\u{1b}04LO", "Rook", "Queen endings", "012345 games", "\u{1b}04LO (cbh)"]
+    );
 }
 
 #[test]

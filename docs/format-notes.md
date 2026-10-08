@@ -323,12 +323,16 @@ the user's screenshots rather than in the file:
   page, as ChessBase does, so no byte is lost.
 - **Titles cut to one byte.** Titles of databases whose files were found
   read as their Cyrillic file names with each UTF-16 unit cut to its low byte:
-  `Ладья` (U+041B U+0430 U+0434 U+044C U+044F) as `\x1b04LO`. The high bytes
-  are not in the file. When a title starts with this image of the database's
-  file name, the reader shows the file name in its place and keeps the rest of
-  the title. It matches only an image of ASCII bytes, which reads the same in
-  UTF-8 and in every code page; a title with a byte above ASCII stays as
-  stored.
+  `Ладья` (U+041B U+0430 U+0434 U+044C U+044F) as `\x1b04LO`, with nothing
+  before or after. The high bytes are not in the file. When a title is
+  exactly this image of the database's file name, the reader shows the file
+  name in its place. A title that only starts with the image is a title of its
+  own: the image of a short name collides with ordinary words (`ё` cuts to
+  `Q`, `абв` to `012`). The reader matches only an image of ASCII bytes, which
+  reads the same in UTF-8 and in every code page; a title with a byte above
+  ASCII stays as stored. One ambiguity remains: a title chosen by the user
+  that is exactly the image of its own file name (`012` for `абв.cbh`) is
+  shown as the file name.
 
 **Sections and items seen:**
 

@@ -26,8 +26,9 @@ const MAGIC: [u8; 4] = [0x0c, 0x0b, 0x0a, 0x0e];
 /// Largest file accepted. The lists examined are under 2 KB. Decoding is
 /// linear in the input: the decoded strings hold at most three times its
 /// bytes (a code page character takes up to three bytes of UTF-8, and a
-/// restored title as many as the file name it is restored from), and each
-/// section name is stored once however many entries it holds.
+/// name shown for a cut title is its file name, at most three bytes for each
+/// byte of the title), and each section name is stored once however many
+/// entries it holds.
 pub const MAX_FILE: u64 = 1 << 20;
 
 const TAG_SECTION: u8 = 0xff;
@@ -107,8 +108,8 @@ pub struct Entry {
     /// The path as stored: an absolute Windows path in the files examined.
     pub path: String,
     /// The title the window shows, or the file name without its extension
-    /// when the stored title is empty. A title stored as the file name cut
-    /// to one byte per UTF-16 unit is shown as the file name
+    /// when the stored title is empty. A title that is exactly the file name
+    /// cut to one byte per UTF-16 unit is shown as the file name
     /// (`docs/format-notes.md`, "Titles cut to one byte").
     pub name: String,
     /// The format the path's extension names; `None` for any other file.
@@ -182,10 +183,7 @@ pub fn parse(bytes: &[u8], page: CodePage) -> Result<DbList> {
             Value::Text { text, .. } => {
                 if let Some((title, numbers)) = title_and_numbers(&text) {
                     let stem = stem(&item.key);
-                    let name = match title {
-                        "" => stem.to_owned(),
-                        _ => restored_title(title, stem).unwrap_or_else(|| title.to_owned()),
-                    };
+                    let name = if title.is_empty() || is_cut_name(title, stem) { stem } else { title }.to_owned();
                     let format = Format::of_extension(Path::new(&item.key));
                     list.entries.push(Entry { path: item.key, name, format, section, numbers });
                 } else if in_section("2cbh") && item.key == "RefDB" {
@@ -224,22 +222,18 @@ fn title_and_numbers(value: &str) -> Option<(&str, [i64; 6])> {
     Some((parts.next()?, numbers))
 }
 
-/// `title` with the file name `stem` put back where ChessBase stored it cut:
-/// each UTF-16 unit of the name reduced to its low byte, so that `Ладья`
-/// reads `\u{1b}04LO` (`docs/format-notes.md`, "Titles cut to one byte"). The
-/// title must start with that image, and the rest of it is kept. Only an
-/// image of ASCII bytes is matched, since those read the same in UTF-8 and
-/// in every code page; `None` when the title does not start with it, or when
-/// the cut changed nothing, as for a name in ASCII.
-fn restored_title(title: &str, stem: &str) -> Option<String> {
-    let image: String = stem
-        .encode_utf16()
-        .map(|u| Some(u.to_le_bytes()[0]).filter(u8::is_ascii).map(char::from))
-        .collect::<Option<_>>()?;
-    if image == stem {
-        return None;
-    }
-    title.strip_prefix(image.as_str()).map(|rest| format!("{stem}{rest}"))
+/// Whether `title` is the file name `stem` as ChessBase stored it cut: each
+/// UTF-16 unit of the name reduced to its low byte, so that `Ладья` reads
+/// `\u{1b}04LO` (`docs/format-notes.md`, "Titles cut to one byte"). The whole
+/// title must be that image, as every cut title seen was: a title that only
+/// starts with it is a title of its own, such as `Queen endings` for `ё`,
+/// whose image is `Q`. Only an image of ASCII bytes is matched, since those
+/// read the same in UTF-8 and in every code page, and a name the cut leaves
+/// as it was, such as an ASCII one, is never taken for cut.
+fn is_cut_name(title: &str, stem: &str) -> bool {
+    let image: Option<String> =
+        stem.encode_utf16().map(|u| Some(u.to_le_bytes()[0]).filter(u8::is_ascii).map(char::from)).collect();
+    image.is_some_and(|image| image != stem && image == title)
 }
 
 /// The file name of a stored Windows or Unix path, without its extension.
@@ -361,18 +355,22 @@ mod tests {
     }
 
     #[test]
-    fn titles_cut_to_one_byte_get_their_file_name_back() {
+    fn titles_cut_to_one_byte_are_told_apart() {
         // `Ладья` and `Їжак`, each UTF-16 unit cut to its low byte.
-        assert_eq!(restored_title("\u{1b}04LO", "Ладья").as_deref(), Some("Ладья"));
-        assert_eq!(restored_title("\u{1b}04LO (cbh)", "Ладья").as_deref(), Some("Ладья (cbh)"));
-        assert_eq!(restored_title("\u{7}60:", "Їжак").as_deref(), Some("Їжак"));
-        assert_eq!(restored_title("Ладья", "Ладья"), None, "a title stored whole");
-        assert_eq!(restored_title("Rook", "Ладья"), None, "a title of its own");
-        assert_eq!(restored_title("\u{1b}04L", "Ладья"), None, "shorter than the image");
-        assert_eq!(restored_title("Rook", "Rook"), None, "an ASCII name is not cut");
+        assert!(is_cut_name("\u{1b}04LO", "Ладья"));
+        assert!(is_cut_name("\u{7}60:", "Їжак"));
+        assert!(!is_cut_name("Ладья", "Ладья"), "a title stored whole");
+        assert!(!is_cut_name("Rook", "Ладья"), "a title of its own");
+        assert!(!is_cut_name("\u{1b}04L", "Ладья"), "shorter than the image");
+        assert!(!is_cut_name("\u{1b}04LO (cbh)", "Ладья"), "longer than the image");
+        // Titles of their own that start with the image of a short name:
+        // `ё` cuts to `Q`, and `абв` to `012`.
+        assert!(!is_cut_name("Queen endings", "ё"));
+        assert!(!is_cut_name("012345 games", "абв"));
+        assert!(!is_cut_name("Rook", "Rook"), "an ASCII name is not cut");
         // `é` cuts to a byte above ASCII, which a code page may have read as
         // another character: the image is not matched.
-        assert_eq!(restored_title("\u{1b}é", "Лé"), None);
-        assert_eq!(restored_title("", ""), None);
+        assert!(!is_cut_name("\u{1b}\u{e9}", "Лé"));
+        assert!(!is_cut_name("", ""));
     }
 }
