@@ -56,16 +56,27 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
     let runs = cyrillic_utf8_runs(b);
     let read = Evidence::outside(b, &runs).page().unwrap_or(fallback);
     let letter = |c: u8| c.is_ascii_alphabetic() || read.char(c).is_alphabetic();
+    // The character byte `j` reads as: a figurine, a sign or the page's.
+    let char_at = |j: usize| {
+        let sign = || sign(b[j], read).filter(|_| !b.get(j + 1).is_some_and(|&c| letter(c)));
+        figurine(b[j]).filter(|_| is_piece(b, j)).or_else(sign).unwrap_or_else(|| read.char(b[j]))
+    };
     let mut out = String::with_capacity(b.len());
     let mut i = 0;
     for run in runs.iter().chain([&(b.len()..b.len())]) {
         while i < run.start {
-            if is_diagram_mark(b, i, letter) {
+            // The characters on either side as they read, a UTF-8 run's
+            // included.
+            let next = if i + 1 == run.start {
+                std::str::from_utf8(&b[run.clone()]).ok().and_then(|s| s.chars().next())
+            } else {
+                b.get(i + 1).map(|_| char_at(i + 1))
+            };
+            if b[i] == 0x9e && is_diagram_mark(out.chars().next_back(), next) {
                 i += 1;
                 continue;
             }
-            let sign = || sign(b[i], read).filter(|_| !b.get(i + 1).is_some_and(|&c| letter(c)));
-            out.push(figurine(b[i]).filter(|_| is_piece(b, i)).or_else(sign).unwrap_or_else(|| read.char(b[i])));
+            out.push(char_at(i));
             i += 1;
         }
         out.push_str(std::str::from_utf8(&b[run.clone()]).unwrap_or_default());
@@ -81,14 +92,15 @@ pub(super) fn evidence(b: &[u8]) -> Evidence {
     Evidence::outside(b, &cyrillic_utf8_runs(b))
 }
 
-/// Whether byte `i` of `b` is ChessBase's diagram mark (#314): 0x9e, which
-/// Windows-1251 reads as `ћ` and Windows-1252 as `ž`, with no letter on
-/// either side (`letter`). ChessBase's text writes it after the word for a
-/// diagram (`Diagram <mark>`) and as a comment of its own, where the reader
-/// of 2CBH drops its counterpart U+E005 (`crate::signs`); a letter beside it
-/// keeps the page's letter (`Božidar`, Serbian `ћ`).
-fn is_diagram_mark(b: &[u8], i: usize, letter: impl Fn(u8) -> bool) -> bool {
-    b[i] == 0x9e && !i.checked_sub(1).is_some_and(|j| letter(b[j])) && !b.get(i + 1).is_some_and(|&c| letter(c))
+/// Whether a byte 0x9e between the characters `prev` and `next`, as the text
+/// reads them, is ChessBase's diagram mark (#314): it is where neither is a
+/// letter. Windows-1251 reads the byte as `ћ` and Windows-1252 as `ž`.
+/// ChessBase's text writes the mark after the word for a diagram (`Diagram
+/// <mark>`) and as a comment of its own, where the reader of 2CBH drops its
+/// counterpart U+E005 (`crate::signs`); a letter beside it keeps the page's
+/// letter (`Božidar`, Serbian `ћ`).
+fn is_diagram_mark(prev: Option<char>, next: Option<char>) -> bool {
+    !prev.is_some_and(char::is_alphabetic) && !next.is_some_and(char::is_alphabetic)
 }
 
 /// The chess sign ChessBase's fonts draw for byte `b` of text read in `read`,
@@ -296,6 +308,16 @@ mod tests {
         assert_eq!(single_byte(b"Bo\x9eidar", CYRILLIC, CYRILLIC), "Boћidar", "a name that shows no page");
         // Serbian `Ћирић`, in Windows-1251: its ћ ends a word.
         assert_eq!(single_byte(b"\x8e\xe8\xf0\xe8\x9e", CYRILLIC, CYRILLIC), "Ћирић");
+        // Beside a UTF-8 run, the run's characters decide: a letter keeps the
+        // byte, a sign drops it.
+        let after_word = ["Работа".as_bytes(), b"\x9e"].concat();
+        assert_eq!(single_byte(&after_word, CYRILLIC, CYRILLIC), "Работаћ");
+        let before_word = [&b"\x9e"[..], "Ходы".as_bytes()].concat();
+        assert_eq!(single_byte(&before_word, CYRILLIC, CYRILLIC), "ћХоды");
+        let after_sign = ["Ход 😀".as_bytes(), b"\x9e"].concat();
+        assert_eq!(single_byte(&after_sign, CYRILLIC, CYRILLIC), "Ход 😀");
+        // A figurine beside it is no letter: `ў` reads as ♔ before a square.
+        assert_eq!(single_byte(b"\x9e\xa2g2", CYRILLIC, CYRILLIC), "♔g2");
     }
 
     /// ChessBase's piece bytes are figurines where they stand as pieces in
