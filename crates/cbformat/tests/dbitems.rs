@@ -217,6 +217,22 @@ fn titles_cut_from_a_start_or_escaped_read_as_meant() {
     assert_eq!(names, ["Ладья", "Ладья-2", "задачи", "Q", "/41/42"]);
 }
 
+/// A name of 500,000 dashes beside an unrelated title, in a list below
+/// `MAX_FILE`, is read at once: matching a title against the starts of a
+/// name is one pass over the name.
+#[test]
+fn a_long_name_of_marks_is_read_in_linear_time() {
+    let mut f = DbItems::new();
+    let path = format!(r"C:\x\{}.cbh", "-".repeat(500_000));
+    f.section("Databases").database(&path, "X", [0, 1, 0, 0, 0, 0]);
+    let bytes = f.bytes();
+    assert!(bytes.len() as u64 <= dbitems::MAX_FILE);
+    let started = std::time::Instant::now();
+    let list = dbitems::parse(&bytes, PAGE).unwrap();
+    assert_eq!(list.entries[0].name, "X");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
 #[test]
 fn damaged_files_are_errors_never_panics() {
     let good = sample().bytes();

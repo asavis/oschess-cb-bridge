@@ -241,15 +241,28 @@ fn repaired_title(title: &str, stem: &str) -> Option<String> {
 /// its own, such as `Queen endings` for `ё`, whose image is `Q`. Only an image
 /// of ASCII bytes is matched, since those read the same in UTF-8 and in every
 /// code page, and a name the cut leaves as it was, such as an ASCII one, is
-/// never taken for cut.
+/// never taken for cut. One pass over the name compares the title with its
+/// image as it goes, so the work is linear in the name however long it is.
 fn cut_name<'a>(title: &str, stem: &'a str) -> Option<&'a str> {
-    let starts = stem.char_indices().filter(|&(i, c)| i > 0 && !c.is_alphabetic()).map(|(i, _)| &stem[..i]);
-    let mut parts = std::iter::once(stem).chain(starts.filter(|part| part.chars().count() > 1));
-    parts.find(|part| {
-        let image: Option<String> =
-            part.encode_utf16().map(|u| Some(u.to_le_bytes()[0]).filter(u8::is_ascii).map(char::from)).collect();
-        image.is_some_and(|image| image != *part && image == title)
-    })
+    let t = title.as_bytes();
+    // Read so far: title bytes, letters, and whether the cut changed a character.
+    let (mut at, mut letters, mut changed) = (0, 0, false);
+    for (i, c) in stem.char_indices() {
+        if at == t.len() {
+            // The title ends before `c`: a start of the name.
+            return (!c.is_alphabetic() && letters > 1 && changed).then(|| &stem[..i]);
+        }
+        for u in c.encode_utf16(&mut [0; 2]) {
+            let low = u.to_le_bytes()[0];
+            if !low.is_ascii() || t.get(at) != Some(&low) {
+                return None;
+            }
+            at += 1;
+        }
+        letters += usize::from(c.is_alphabetic());
+        changed |= !c.is_ascii();
+    }
+    (at == t.len() && changed).then_some(stem)
 }
 
 /// `title` read where ChessBase stored it as the UTF-8 bytes of the title
@@ -414,17 +427,27 @@ mod tests {
     }
 
     /// A title cut from the start of its file name before a mark: `Ладья`
-    /// of `Ладья-1` or `Ладья 2`, but no part of one letter (`ё` of `ё-1`)
-    /// and no part that a letter follows (`Лад` of `Ладья`).
+    /// of `Ладья-1` or `Ладья 2`, but no part of one letter (`ё` of `ё-1`,
+    /// with a mark or a space or not) and no part that a letter follows
+    /// (`Лад` of `Ладья`).
     #[test]
     fn titles_cut_from_a_start_of_the_file_name() {
         assert_eq!(cut_name("\u{1b}04LO", "Ладья-1"), Some("Ладья"));
         assert_eq!(cut_name("\u{1b}04LO", "Ладья 2"), Some("Ладья"));
         assert_eq!(cut_name("\u{1b}04LO-1", "Ладья-1"), Some("Ладья-1"));
         assert_eq!(cut_name("Q", "ё-1"), None);
+        assert_eq!(cut_name("Q-", "ё-1"), None);
+        assert_eq!(cut_name("Q ", "ё 2"), None);
+        assert_eq!(cut_name("-Q", "-ё-1"), None);
         assert_eq!(cut_name("Q", "ё"), Some("ё"));
         assert_eq!(cut_name("\u{1b}04", "Ладья"), None);
         assert_eq!(cut_name("\u{1b}04", "Лад-ья"), Some("Лад"));
+        assert_eq!(cut_name("Rook", "Rook-1"), None, "an ASCII start is not cut");
+        // `Ъа` cuts to `*0` (U+042A, U+0430), and `𝄞`, two UTF-16 units, to
+        // two bytes, `4` and 0x1e.
+        assert_eq!(cut_name("*0", "Ъа-1"), Some("Ъа"));
+        assert_eq!(cut_name("4\u{1e}", "𝄞"), Some("𝄞"));
+        assert_eq!(cut_name("4", "𝄞"), None);
     }
 
     /// Titles stored as `/`-escaped UTF-8: `задачи`, and what is not one.
