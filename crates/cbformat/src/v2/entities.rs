@@ -283,8 +283,9 @@ impl Entities {
 
 /// A string: its byte length as an `int`, then the bytes, read as UTF-8, or
 /// where they are not UTF-8 as `codepage::utf8_or_legacy` says, so that no
-/// byte is lost (#308).
+/// byte is lost (#308), with ChessBase's signs read (`crate::signs::decode`,
+/// #309): a name is searched for as it reads.
 fn string(c: &mut Cursor<'_>) -> Option<String> {
     let n = usize::try_from(c.le_i32()?).ok()?;
-    c.take(n).map(crate::codepage::utf8_or_legacy)
+    c.take(n).map(crate::signs::decode)
 }

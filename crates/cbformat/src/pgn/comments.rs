@@ -315,9 +315,11 @@ fn name(sq: Sq) -> String {
     format!("{}{}", file_char(s), rank_char(s))
 }
 
-/// A text fit for a PGN comment: no braces, no line breaks.
+/// A text fit for a PGN comment: ChessBase's signs read (`crate::signs`, so
+/// that the full form keeps the original in `[%cbtext]`), no braces, no line
+/// breaks.
 fn clean(text: &str) -> String {
-    let t: String = text
+    let t: String = crate::signs::read(text)
         .chars()
         .map(|c| match c {
             '{' => '(',
