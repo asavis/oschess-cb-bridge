@@ -330,7 +330,10 @@ adds, then those given with `--database`, each once:
   reads at most 10,000 folders for one entry, those nearest the top first.
 - **The list is read again** on a request to `/v1/status` or `/v1/databases`
   after `DBItems.cbini`, `bridge.toml` or a listed folder or any folder below
-  it changed. Each of them
+  it changed. A listed folder whose search reads more than 64 folders is
+  searched again at most every 10 seconds, and less often when one search
+  takes longer than half a second, so that a large tree is not searched on
+  every request. Each of them
   that cannot be read keeps the databases last read from it, and is read again
   on the next such request until it can be, even if it has not changed since.
   A database that leaves the list
