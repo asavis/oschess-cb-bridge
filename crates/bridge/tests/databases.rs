@@ -251,6 +251,32 @@ fn a_configured_folder_is_read_again_when_it_changes() {
     assert_eq!(catalog.get(&id_of(&three)).unwrap().state(), State::Ready);
 }
 
+/// A database file in a subfolder that cannot be examined, here a link into a
+/// folder closed to this user, is listed, missing while it cannot be reached,
+/// and the other databases of its folder and below stay ready (#320). Unix
+/// only.
+#[cfg(unix)]
+#[test]
+fn a_database_that_cannot_be_examined_keeps_its_folder_listed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Root::new("unexamined");
+    let good = database_at(&root.path("folder/sub"), "Good");
+    let deeper = database_at(&root.path("folder/sub/deeper"), "Deeper");
+    let closed = root.path("closed");
+    database_at(&closed, "Hidden");
+    std::os::unix::fs::symlink(closed.join("Hidden.2cbh"), root.path("folder/sub/Blocked.2cbh")).unwrap();
+    std::fs::write(root.path("bridge.toml"), format!("databases = ['{}']\n", root.path("folder").display())).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    let listed: Vec<(String, &str)> = catalog.entries().iter().map(|e| (e.name.clone(), e.state().name())).collect();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(listed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["Blocked", "Good", "Deeper"]);
+    assert_eq!(catalog.get(&id_of(&good)).unwrap().state(), State::Ready);
+    assert_eq!(catalog.get(&id_of(&deeper)).unwrap().state(), State::Ready);
+    assert_eq!(listed[0].1, "missing", "while it cannot be reached");
+}
+
 /// A database added to a configured folder shows even when the folder's own
 /// size and time did not change, as happens within one tick of the kernel's
 /// coarse clock: the listing, not only the folder's time, decides, for a PGN

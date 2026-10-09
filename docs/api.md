@@ -326,8 +326,10 @@ adds, then those given with `--database`, each once:
   below it, at any depth, by path (#320); a folder or a pipe named like one is
   not a database. The search follows no link or junction to a folder, and
   skips hidden folders (the Windows hidden attribute, or a name starting with
-  a dot) and the folders below it that are gone or closed to the user. It
-  reads at most 10,000 folders for one entry, those nearest the top first.
+  a dot) and the folders below it that are gone or closed to the user. A
+  file named like a database that cannot be examined, such as a link into a
+  folder closed to the user, is listed, `missing` while it cannot be reached.
+  It reads at most 10,000 folders for one entry, those nearest the top first.
 - **The list is read again** on a request to `/v1/status` or `/v1/databases`
   after `DBItems.cbini`, `bridge.toml` or a listed folder or any folder below
   it changed. A listed folder whose search reads more than 64 folders is

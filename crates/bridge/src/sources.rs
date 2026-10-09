@@ -1,7 +1,7 @@
 //! Where the list of databases comes from: ChessBase's database window
 //! (`DBItems.cbini`), then `bridge.toml`, then the command line.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::Display;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -116,7 +116,7 @@ struct Walk {
     /// Folders below the configured one that were gone when read, or that
     /// may not be read; their databases are not listed.
     skipped: usize,
-    /// The walk read `max` folders and left the others unread.
+    /// The walk left folders unread to stay within `max`.
     cut: bool,
     /// The folders read, the configured one included.
     folders: usize,
@@ -155,14 +155,16 @@ impl Walk {
 
 /// [`expand`] reading at most `max` folders: breadth first, each folder's
 /// subfolders in path order, so that folders near the top are searched
-/// first and the same tree always gives the same databases. A link or
-/// junction to a folder is not followed, so the walk never loops and never
-/// leaves the folder the user chose; a hidden folder is not searched
-/// ([`hidden`]). The configured folder that cannot be read fails the walk,
-/// as does a folder below it for any reason but being gone or closed to
-/// this user: a failure keeps what was read before (`Kept`), so an error
-/// that passes loses no databases, while a folder that stays closed, such
-/// as another user's, never stops the others from being listed.
+/// first and the same tree always gives the same databases. The folders
+/// read and waiting stay within `max` together, so a tree of any width or
+/// depth holds at most `max` paths of folders. A link or junction to a
+/// folder is not followed, so the walk never loops and never leaves the
+/// folder the user chose; a hidden folder is not searched ([`hidden`]). The
+/// configured folder that cannot be read fails the walk, as does a folder
+/// below it for any reason but being gone or closed to this user: a failure
+/// keeps what was read before (`Kept`), so an error that passes loses no
+/// databases, while a folder that stays closed, such as another user's,
+/// never stops the others from being listed.
 fn walk(path: &Path, max: usize) -> Result<Walk, String> {
     let err = |e: std::io::Error| e.to_string();
     match std::fs::metadata(path) {
@@ -176,21 +178,16 @@ fn walk(path: &Path, max: usize) -> Result<Walk, String> {
     }
     let mut walk = Walk::default();
     let mut folders = VecDeque::from([path.to_owned()]);
-    let mut read = 0;
     while let Some(folder) = folders.pop_front() {
-        if read == max {
-            walk.cut = true;
-            break;
-        }
-        read += 1;
-        walk.folders = read;
-        match read_folder(&folder) {
-            Ok((databases, mut subfolders)) => {
+        walk.folders += 1;
+        let keep = max.saturating_sub(walk.folders + folders.len());
+        match read_folder(&folder, keep) {
+            Ok((databases, subfolders, left_out)) => {
                 walk.found.extend(databases);
-                subfolders.sort();
                 folders.extend(subfolders);
+                walk.cut |= left_out;
             }
-            Err(e) if read > 1 && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+            Err(e) if walk.folders > 1 && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
                 walk.skipped += 1;
             }
             Err(e) => return Err(err(e)),
@@ -200,23 +197,30 @@ fn walk(path: &Path, max: usize) -> Result<Walk, String> {
     Ok(walk)
 }
 
-/// The databases directly in `folder`, and the folders in it to search.
-fn read_folder(folder: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let (mut databases, mut subfolders) = (Vec::new(), Vec::new());
+/// The databases directly in `folder`, the first `keep` of the folders in it
+/// to search, in path order, and whether it left others out. Only reading
+/// the folder itself fails: an entry named like a database that cannot be
+/// examined, such as a link into a folder closed to this user, is listed,
+/// and the catalog shows it missing while it cannot be reached; one that
+/// cannot be told a folder or a file is not searched.
+fn read_folder(folder: &Path, keep: usize) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>, bool)> {
+    let mut databases = Vec::new();
+    // The `keep` least paths so far: the greatest is dropped as one more comes.
+    let mut subfolders = BinaryHeap::new();
+    let mut left_out = false;
     for entry in std::fs::read_dir(folder)? {
         let entry = entry?;
         let path = entry.path();
         // Not followed: a link, or on Windows a junction, is never a folder here.
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => {
-                if !hidden(&entry) {
-                    subfolders.push(path);
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if !hidden(&entry) {
+                subfolders.push(path);
+                if subfolders.len() > keep {
+                    subfolders.pop();
+                    left_out = true;
                 }
-                continue;
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            continue;
         }
         if Format::of(&path) == Format::Other {
             continue;
@@ -226,10 +230,10 @@ fn read_folder(folder: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
             Ok(_) => {}
             // Removed while the folder was read, or a link to nothing.
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(_) => databases.push(path),
         }
     }
-    Ok((databases, subfolders))
+    Ok((databases, subfolders.into_sorted_vec(), left_out))
 }
 
 /// Whether the folder `entry` is hidden, and so not searched: its name starts
@@ -576,6 +580,54 @@ mod tests {
         assert_ne!(signature_of(t.dir()), before);
         std::fs::remove_file(&two).unwrap();
         assert_eq!(signature_of(t.dir()), before);
+    }
+
+    /// A wide folder keeps no more than the walk's room for folders: its
+    /// first subfolders in path order are searched, and the walk says that
+    /// it left the others out.
+    #[test]
+    fn a_wide_folder_keeps_only_the_folders_the_walk_has_room_for() {
+        let many: Vec<String> = (0..40).map(|i| format!("w{i:02}/D{i:02}.pgn")).collect();
+        let t = tree("wide", &many.iter().map(String::as_str).collect::<Vec<_>>());
+        let (_, kept, left_out) = read_folder(t.dir(), 5).unwrap();
+        assert_eq!(relative(t.dir(), &kept), ["w00", "w01", "w02", "w03", "w04"]);
+        assert!(left_out);
+        let (_, kept, left_out) = read_folder(t.dir(), 40).unwrap();
+        assert_eq!((kept.len(), left_out), (40, false));
+
+        let walk = walk(t.dir(), 10).unwrap();
+        let first: Vec<String> = (0..9).map(|i| format!("w{i:02}/D{i:02}.pgn")).collect();
+        assert_eq!((relative(t.dir(), &walk.found), walk.folders, walk.cut), (first, 10, true));
+    }
+
+    /// A database file that cannot be examined, here a link into a folder
+    /// closed to this user, is listed and costs its folder nothing: the
+    /// other databases there and below are listed, and no folder counts as
+    /// skipped. Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_database_that_cannot_be_examined_leaves_its_folder_listed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tree("unexamined", &["sub/good.pgn", "sub/deeper/d.pgn", "sibling/other.pgn"]);
+        let closed = tree("unexamined-closed", &["x.pgn"]);
+        std::os::unix::fs::symlink(closed.dir().join("x.pgn"), t.dir().join("sub/blocked.pgn")).unwrap();
+        std::fs::set_permissions(closed.dir(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let walk = walk(t.dir(), MAX_FOLDERS);
+        std::fs::set_permissions(closed.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let walk = walk.unwrap();
+        assert_eq!(
+            (relative(t.dir(), &walk.found), walk.skipped),
+            (
+                vec![
+                    "sibling/other.pgn".to_string(),
+                    "sub/blocked.pgn".into(),
+                    "sub/deeper/d.pgn".into(),
+                    "sub/good.pgn".into()
+                ],
+                0
+            )
+        );
     }
 
     /// What a walk leaves out is logged when it changes, whether or not the
