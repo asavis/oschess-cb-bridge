@@ -134,49 +134,34 @@ fn letter(c: char, prev: Option<char>, next: Option<char>, after: Option<char>) 
     }
 }
 
-/// A PGN game's text with the layout marks of a Chessable course read in its
-/// comments (#318): the course's export writes them between runs of `@`
-/// (`@@StartBracket@@`), where ChessBase's 2CBH copy has U+E02D. Only inside
-/// a `{}` comment, and only between runs of two `@` or more; a tag's value,
-/// even one holding a brace, is left alone.
-pub(crate) fn read_course_marks(pgn: &str) -> Cow<'_, str> {
-    if !pgn.contains("@@") {
-        return Cow::Borrowed(pgn);
+/// A PGN comment with the layout marks of a Chessable course read (#318):
+/// the course's export writes them between runs of `@`
+/// (`@@StartBracket@@`), where ChessBase's 2CBH copy has U+E02D. Only
+/// between runs of two `@` or more. The caller finds the comments
+/// (`crate::pgnfile`), so that a tag, a `;` comment or a `%` escape line is
+/// left alone.
+pub(crate) fn read_course_marks(comment: &str) -> Cow<'_, str> {
+    if !comment.contains("@@") {
+        return Cow::Borrowed(comment);
     }
-    let chars: Vec<char> = pgn.chars().collect();
-    let mut out = String::with_capacity(pgn.len());
-    let (mut comment, mut quoted, mut i) = (false, false, 0);
+    let chars: Vec<char> = comment.chars().collect();
+    let mut out = String::with_capacity(comment.len());
+    let mut i = 0;
     while i < chars.len() {
-        let c = chars[i];
-        if comment && c == '@' {
-            if let Some((s, n)) = markup(&chars[i..], '@', 2) {
-                out.push_str(s);
-                i += n;
-                continue;
-            }
-            // A run that holds no known word: as it stands, in one pass.
-            let n = chars[i..].iter().take_while(|&&c| c == '@').count();
-            out.extend(&chars[i..i + n]);
+        if chars[i] != '@' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if let Some((s, n)) = markup(&chars[i..], '@', 2) {
+            out.push_str(s);
             i += n;
             continue;
         }
-        match c {
-            '\\' if quoted => {
-                out.push(c);
-                i += 1;
-                if let Some(&next) = chars.get(i) {
-                    out.push(next);
-                    i += 1;
-                }
-                continue;
-            }
-            '"' if !comment => quoted = !quoted,
-            '{' if !comment && !quoted => comment = true,
-            '}' if comment => comment = false,
-            _ => {}
-        }
-        out.push(c);
-        i += 1;
+        // A run that holds no known word: as it stands, in one pass.
+        let n = chars[i..].iter().take_while(|&&c| c == '@').count();
+        out.extend(&chars[i..i + n]);
+        i += n;
     }
     Cow::Owned(out)
 }
@@ -289,22 +274,19 @@ mod tests {
         assert_eq!(decode(b"\xed\xe5\xf0\xe0\xe7\xe1\xee\xf0\xee\x80\x89\xe8\xe2\xee"), "неразборчиво");
     }
 
-    /// A Chessable course's marks in a PGN game's comments (#318). Made-up
-    /// text.
+    /// A Chessable course's marks in a PGN comment (#318). Made-up text.
     #[test]
-    fn a_course_layout_in_pgn_comments_reads_as_brackets() {
+    fn a_course_layout_in_a_pgn_comment_reads_as_brackets() {
         let read = |s: &str| read_course_marks(s).into_owned();
-        assert_eq!(read("1. e4 {1-0 @@StartBracket@@39@@EndBracket@@ Smith,J} *"), "1. e4 {1-0 (39) Smith,J} *");
+        assert_eq!(read("{1-0 @@StartBracket@@39@@EndBracket@@ Smith,J}"), "{1-0 (39) Smith,J}");
         assert_eq!(read("{@@@StartBracket@@x@@EndBRacket@@ @@StartSquare@@a@@EndSquare@@}"), "{(x) [a]}");
         assert_eq!(
             read("{If @@StartFEN@@8/8/8/8/8/8/8/K1k5 w - - 0 1@@EndFEN@@}"),
             "{If [FEN 8/8/8/8/8/8/8/K1k5 w - - 0 1]}"
         );
         assert_eq!(read("{(@@LinkStart@@https://example.org/@@LinkEnd@@)}"), "{(https://example.org/)}");
-        // Not outside a comment, not in a tag's value, not with one `@`, not
-        // another word.
-        let kept = "[Event \"@@StartBracket@@ {x}\"]\n\n1. e4 @@StartBracket@@ {a@StartBracket@b @@Other@@} *";
-        assert_eq!(read(kept), kept);
+        // Not with one `@`, not another word.
+        assert_eq!(read("{a@StartBracket@b @@Other@@}"), "{a@StartBracket@b @@Other@@}");
         // A long run of `@` is read in one pass and stays.
         let long = format!("{{{}}}", "@".repeat(200_000));
         assert_eq!(read(&long), long);

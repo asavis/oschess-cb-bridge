@@ -141,6 +141,27 @@ fn a_course_layout_reads_as_brackets_where_shown() {
         db.text(&r, 1 << 20).unwrap(),
         "[White \"Smith, J\"]\n\n1. e4 {1-0 @@StartBracket@@39@@EndBracket@@ Smith,J} *\n"
     );
+    // Only `{}` comments as the reader finds them: not a tag's value, even
+    // after a `%` escape line holding a brace, nor a `;` comment, even one
+    // holding a quote, nor after a tag's value left open.
+    let read = |name: &str, pgn: &[u8]| {
+        let f = pgn_file(name, pgn);
+        let db = built(&f, 1, CodePage::WESTERN);
+        db.reading(&db.record(1).unwrap(), 1 << 20).unwrap()
+    };
+    let m = "@@StartBracket@@x@@EndBracket@@";
+    let escape = format!("[Event \"Probe\"]\n% {{ ignored\n[Site \"{m}\"]\n\n1. e4 {{{m}}} *\n");
+    assert_eq!(
+        read("course-escape", escape.as_bytes()),
+        format!("[Event \"Probe\"]\n% {{ ignored\n[Site \"{m}\"]\n\n1. e4 {{(x)}} *\n")
+    );
+    let line = format!("[Event \"Probe\"]\n\n1. e4 ; he says \"hello {m}\n{{{m}}} *\n");
+    assert_eq!(
+        read("course-line", line.as_bytes()),
+        format!("[Event \"Probe\"]\n\n1. e4 ; he says \"hello {m}\n{{(x)}} *\n")
+    );
+    let open = format!("[Event \"Probe\n\n1. e4 {{{m}}} *\n");
+    assert_eq!(read("course-open", open.as_bytes()), "[Event \"Probe\n\n1. e4 {(x)} *\n");
 }
 
 #[test]
