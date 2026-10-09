@@ -234,7 +234,8 @@ fn the_list_is_read_again_when_its_sources_change() {
     assert_eq!(states(&catalog), ["missing", "ready", "ready"]);
 }
 
-/// A new database in a configured folder shows on the next listing.
+/// A new database in a configured folder, or in any folder below it (#320),
+/// shows on the next listing.
 #[test]
 fn a_configured_folder_is_read_again_when_it_changes() {
     let root = Root::new("folder");
@@ -244,6 +245,10 @@ fn a_configured_folder_is_read_again_when_it_changes() {
     assert_eq!(names(&catalog), ["One"]);
     database_at(&root.path("folder"), "Two");
     assert_eq!(names(&catalog), ["One", "Two"]);
+    // In path order: `Bases/2026/Three.2cbh` comes before `One.2cbh`.
+    let three = database_at(&root.path("folder/Bases/2026"), "Three");
+    assert_eq!(names(&catalog), ["Three", "One", "Two"]);
+    assert_eq!(catalog.get(&id_of(&three)).unwrap().state(), State::Ready);
 }
 
 /// A database added to a configured folder shows even when the folder's own

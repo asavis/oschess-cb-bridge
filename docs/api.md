@@ -322,10 +322,15 @@ adds, then those given with `--database`, each once:
   other setting they come in the order the file stores them: 2CBH databases
   first, then the others.
 - **`bridge.toml`'s** follow in the order written. A folder gives the `.2cbh`
-  and `.cbh` database files and the `.pgn` files directly in it, by file name;
-  a folder or a pipe named like one is not a database.
+  and `.cbh` database files and the `.pgn` files in it and in every folder
+  below it, at any depth, by path (#320); a folder or a pipe named like one is
+  not a database. The search follows no link or junction to a folder, and
+  skips hidden folders (the Windows hidden attribute, or a name starting with
+  a dot) and the folders below it that are gone or closed to the user. It
+  reads at most 10,000 folders for one entry, those nearest the top first.
 - **The list is read again** on a request to `/v1/status` or `/v1/databases`
-  after `DBItems.cbini`, `bridge.toml` or a listed folder changed. Each of them
+  after `DBItems.cbini`, `bridge.toml` or a listed folder or any folder below
+  it changed. Each of them
   that cannot be read keeps the databases last read from it, and is read again
   on the next such request until it can be, even if it has not changed since.
   A database that leaves the list

@@ -1,8 +1,9 @@
 //! Where the list of databases comes from: ChessBase's database window
 //! (`DBItems.cbini`), then `bridge.toml`, then the command line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,35 +80,145 @@ impl Sources {
     }
 }
 
+/// The most folders [`expand`] reads for one configured path, the configured
+/// folder included (#320). A folder as large as a whole drive is searched no
+/// further: it is walked again on every request that looks for changes, and
+/// the cap bounds the time each one takes.
+pub const MAX_FOLDERS: usize = 10_000;
+
 /// The databases a configured path names: the path itself, or for a folder
-/// the ChessBase databases and PGN files directly in it, by file name. In a
-/// folder only regular files (or links to them) count: a pipe or a folder
-/// named like a database is none. The error, for the log, names no path.
+/// the ChessBase databases and PGN files in it and in every folder below it
+/// (#320), by path ([`walk`]). In a folder only regular files (or links to
+/// them) count: a pipe or a folder named like a database is none. The error,
+/// for the log, names no path.
 pub fn expand(path: &Path) -> Result<Vec<Listed>, String> {
+    walk(path, MAX_FOLDERS).map(Walk::listed)
+}
+
+/// What [`walk`] found for a configured path.
+#[derive(Debug, Default)]
+struct Walk {
+    /// The databases, sorted by path.
+    found: Vec<PathBuf>,
+    /// Folders below the configured one that were gone when read, or that
+    /// may not be read; their databases are not listed.
+    skipped: usize,
+    /// The walk read `max` folders and left the others unread.
+    cut: bool,
+}
+
+impl Walk {
+    fn listed(self) -> Vec<Listed> {
+        self.found.into_iter().map(Listed::at).collect()
+    }
+
+    /// Logs what the walk left out, for the source `what`.
+    fn log(&self, what: &dyn Display) {
+        if self.skipped > 0 {
+            let s = if self.skipped == 1 { "" } else { "s" };
+            crate::log!("{what}: skipped {} folder{s} that could not be read", self.skipped);
+        }
+        if self.cut {
+            crate::log!("{what}: more than {MAX_FOLDERS} folders, the rest is not searched");
+        }
+    }
+}
+
+/// [`expand`] reading at most `max` folders: breadth first, each folder's
+/// subfolders in path order, so that folders near the top are searched
+/// first and the same tree always gives the same databases. A link or
+/// junction to a folder is not followed, so the walk never loops and never
+/// leaves the folder the user chose; a hidden folder is not searched
+/// ([`hidden`]). The configured folder that cannot be read fails the walk,
+/// as does a folder below it for any reason but being gone or closed to
+/// this user: a failure keeps what was read before (`Kept`), so an error
+/// that passes loses no databases, while a folder that stays closed, such
+/// as another user's, never stops the others from being listed.
+fn walk(path: &Path, max: usize) -> Result<Walk, String> {
     let err = |e: std::io::Error| e.to_string();
     match std::fs::metadata(path) {
         Ok(m) if m.is_dir() => {}
         // A database, or a path that names nothing and is then reported missing.
-        Ok(_) => return Ok(vec![Listed::at(path.to_owned())]),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![Listed::at(path.to_owned())]),
+        Ok(_) => return Ok(Walk { found: vec![path.to_owned()], ..Walk::default() }),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(Walk { found: vec![path.to_owned()], ..Walk::default() });
+        }
         Err(e) => return Err(err(e)),
     }
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(err)? {
-        let file = entry.map_err(err)?.path();
-        if Format::of(&file) == Format::Other {
-            continue;
+    let mut walk = Walk::default();
+    let mut folders = VecDeque::from([path.to_owned()]);
+    let mut read = 0;
+    while let Some(folder) = folders.pop_front() {
+        if read == max {
+            walk.cut = true;
+            break;
         }
-        match std::fs::metadata(&file) {
-            Ok(m) if m.is_file() => found.push(file),
-            Ok(_) => {}
-            // Removed while the folder was read, or a link to nothing.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        read += 1;
+        match read_folder(&folder) {
+            Ok((databases, mut subfolders)) => {
+                walk.found.extend(databases);
+                subfolders.sort();
+                folders.extend(subfolders);
+            }
+            Err(e) if read > 1 && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                walk.skipped += 1;
+            }
             Err(e) => return Err(err(e)),
         }
     }
-    found.sort();
-    Ok(found.into_iter().map(Listed::at).collect())
+    walk.found.sort();
+    Ok(walk)
+}
+
+/// The databases directly in `folder`, and the folders in it to search.
+fn read_folder(folder: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let (mut databases, mut subfolders) = (Vec::new(), Vec::new());
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        // Not followed: a link, or on Windows a junction, is never a folder here.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if !hidden(&entry) {
+                    subfolders.push(path);
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+        if Format::of(&path) == Format::Other {
+            continue;
+        }
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => databases.push(path),
+            Ok(_) => {}
+            // Removed while the folder was read, or a link to nothing.
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((databases, subfolders))
+}
+
+/// Whether the folder `entry` is hidden, and so not searched: its name starts
+/// with a dot (`.git`), or on Windows it has the hidden attribute, as the
+/// recycle bin, `System Volume Information` and `AppData`, which holds the
+/// bridge's own indexes, have.
+fn hidden(entry: &std::fs::DirEntry) -> bool {
+    if entry.file_name().as_encoded_bytes().starts_with(b".") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+        if entry.metadata().is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0) {
+            return true;
+        }
+    }
+    false
 }
 
 /// What was last read from each source. A source is read again when its
@@ -151,7 +262,11 @@ impl Read {
             // Named by its place: the path would name the user and the database.
             let place = i + 1;
             let what = format!("databases entry {place} of bridge.toml");
-            changed |= kept.update(folder_signature(path), &what, || expand(path));
+            changed |= kept.update(folder_signature(path), &what, || {
+                let walk = walk(path, MAX_FOLDERS)?;
+                walk.log(&what);
+                Ok(walk.listed())
+            });
         }
         self.configured = configured;
         changed
@@ -213,15 +328,16 @@ pub(crate) fn signature(path: Option<&Path>) -> u64 {
 }
 
 /// [`signature`] of a configured path, and the paths [`expand`] lists for it:
-/// for a folder, its database files of every format. A folder's own time moves
-/// with the kernel's coarse clock, a few milliseconds a step, and its size
-/// rarely changes, so a database added right after a listing could leave both
-/// as they were and stay unseen until the folder changed again. Taken from
-/// `expand` itself, the signature changes whenever the list does. The files'
-/// sizes and times are left out: they never decide whether a file is listed,
-/// and a PGN file that grows, or a database being saved, would otherwise have
-/// the folder read again and the list rebuilt on every request while it is
-/// written.
+/// for a folder, its database files of every format, at every depth. A
+/// folder's own time moves with the kernel's coarse clock, a few milliseconds
+/// a step, and its size rarely changes, so a database added right after a
+/// listing could leave both as they were and stay unseen until the folder
+/// changed again; a database added in a subfolder changes neither at all.
+/// Taken from `expand` itself, the signature changes whenever the list does.
+/// The files' sizes and times are left out: they never decide whether a file
+/// is listed, and a PGN file that grows, or a database being saved, would
+/// otherwise have the folder read again and the list rebuilt on every request
+/// while it is written.
 fn folder_signature(path: &Path) -> u64 {
     let mut hash = Hash::new();
     hash.write_file(path);
@@ -260,5 +376,136 @@ mod tests {
         append(&pgn, b"\n[White \"B\"]\n\n1. d4 *\n");
         append(&twocbh, &[0u8; 32]);
         assert_eq!(folder_signature(f.dir()), before);
+    }
+
+    /// A temporary folder, removed on drop, with `files` written in it as
+    /// empty files, their folders made.
+    fn tree(name: &str, files: &[&str]) -> cbformat::fixture::TempDb {
+        let dir = std::env::temp_dir().join(format!("bridge-sources-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for file in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        cbformat::fixture::TempDb::at(dir)
+    }
+
+    /// The databases `found` names, by their paths from `dir` with `/`.
+    fn relative(dir: &Path, found: &[PathBuf]) -> Vec<String> {
+        found.iter().map(|p| p.strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/")).collect()
+    }
+
+    fn expanded(dir: &Path) -> Vec<String> {
+        let paths: Vec<PathBuf> = expand(dir).unwrap().into_iter().map(|l| l.path).collect();
+        relative(dir, &paths)
+    }
+
+    /// A folder gives the databases of every folder below it, at any depth
+    /// and in path order (#320); a folder named like a database is searched
+    /// like any other, and a dot folder is not searched.
+    #[test]
+    fn a_folder_gives_the_databases_of_every_folder_below_it() {
+        let t = tree(
+            "depth",
+            &[
+                "A.pgn",
+                "notes.txt",
+                "sub/B.2cbh",
+                "sub/B.2cbg",
+                "sub/deeper/C.CBH",
+                "sub/deeper/deepest/D.pgn",
+                "z.2cbh/E.pgn",
+                ".git/F.pgn",
+            ],
+        );
+        assert_eq!(
+            expanded(t.dir()),
+            ["A.pgn", "sub/B.2cbh", "sub/deeper/C.CBH", "sub/deeper/deepest/D.pgn", "z.2cbh/E.pgn"]
+        );
+    }
+
+    /// A link to a folder is not followed, not even one to a folder above it,
+    /// which would loop; a link to a database file is a database.
+    #[cfg(unix)]
+    #[test]
+    fn links_to_folders_are_not_followed() {
+        let t = tree("links", &["inner/G.pgn"]);
+        let other = tree("links-other", &["H.pgn"]);
+        std::os::unix::fs::symlink(t.dir(), t.dir().join("inner/loop")).unwrap();
+        std::os::unix::fs::symlink(other.dir(), t.dir().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(other.dir().join("H.pgn"), t.dir().join("I.pgn")).unwrap();
+        assert_eq!(expanded(t.dir()), ["I.pgn", "inner/G.pgn"]);
+    }
+
+    /// A folder with the hidden attribute is not searched.
+    #[cfg(windows)]
+    #[test]
+    fn hidden_folders_are_not_searched() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+
+        let t = tree("hidden", &["shown/L.pgn", "hidden/M.pgn"]);
+        let wide: Vec<u16> = t.dir().join("hidden").as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call.
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) }, 0);
+        assert_eq!(expanded(t.dir()), ["shown/L.pgn"]);
+    }
+
+    /// The walk reads folders breadth first, so that the folders near the top
+    /// are the ones searched when it stops at its cap, and says that it
+    /// stopped.
+    #[test]
+    fn the_walk_stops_at_its_cap_with_the_folders_near_the_top_read() {
+        let t = tree("cap", &["Z.pgn", "a/Y.pgn", "a/b/c/X.pgn", "m/W.pgn"]);
+        let read = |max: usize| {
+            let walk = walk(t.dir(), max).unwrap();
+            (relative(t.dir(), &walk.found), walk.cut)
+        };
+        assert_eq!(read(3), (vec!["Z.pgn".to_string(), "a/Y.pgn".into(), "m/W.pgn".into()], true));
+        assert_eq!(read(4), (vec!["Z.pgn".to_string(), "a/Y.pgn".into(), "m/W.pgn".into()], true));
+        let all = vec!["Z.pgn".to_string(), "a/Y.pgn".into(), "a/b/c/X.pgn".into(), "m/W.pgn".into()];
+        assert_eq!(read(5), (all.clone(), false), "five folders, all read");
+        assert_eq!(read(MAX_FOLDERS), (all, false));
+    }
+
+    /// A folder below the configured one that may not be read is skipped and
+    /// counted, and the others are listed; the configured folder that may not
+    /// be read fails the walk, which keeps what was read before. Unix only,
+    /// and skipped when the tests run with the rights to read any folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_may_not_be_read_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tree("closed", &["open/K.pgn", "closed/J.pgn"]);
+        let set =
+            |path: &Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let closed = t.dir().join("closed");
+        set(&closed, 0o000);
+        if std::fs::read_dir(&closed).is_ok() {
+            set(&closed, 0o755);
+            return;
+        }
+        let walk = walk(t.dir(), MAX_FOLDERS).unwrap();
+        assert_eq!((relative(t.dir(), &walk.found), walk.skipped), (vec!["open/K.pgn".to_string()], 1));
+        set(&closed, 0o755);
+        set(t.dir(), 0o000);
+        assert!(expand(t.dir()).is_err());
+        set(t.dir(), 0o755);
+    }
+
+    /// A database added or removed deep in a configured folder changes the
+    /// folder's signature, although no time of the configured folder moves.
+    #[test]
+    fn a_database_added_in_a_subfolder_changes_the_folder_signature() {
+        let t = tree("deep-signature", &["sub/deeper/One.pgn"]);
+        let before = folder_signature(t.dir());
+        let two = t.dir().join("sub/deeper/Two.pgn");
+        std::fs::write(&two, b"").unwrap();
+        assert_ne!(folder_signature(t.dir()), before);
+        std::fs::remove_file(&two).unwrap();
+        assert_eq!(folder_signature(t.dir()), before);
     }
 }

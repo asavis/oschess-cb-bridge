@@ -43,7 +43,8 @@ impl From<String> for Failure {
 pub struct Extra {
     pub path: String,
     pub folder: bool,
-    /// The folder's databases, directly in it; `None` for a file.
+    /// The folder's databases, in it and in the folders below it; `None` for
+    /// a file.
     pub databases: Option<usize>,
     /// Whether the folder or file is there.
     pub present: bool,
@@ -65,8 +66,9 @@ fn extra(path: &Path) -> Extra {
     }
 }
 
-/// The databases directly in `folder`, by the bridge's own rule for a folder
-/// it serves ([`sources::expand`], #185); none when it cannot be read.
+/// The databases in `folder` and in the folders below it, by the bridge's own
+/// rule for a folder it serves ([`sources::expand`], #185, #320); none when it
+/// cannot be read.
 pub fn databases_in(folder: &Path) -> usize {
     sources::expand(folder).map_or(0, |listed| listed.len())
 }
@@ -157,15 +159,15 @@ mod tests {
     fn folders_count_their_databases() {
         let dir = std::env::temp_dir().join(format!("bridge-app-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("sub.2cbh")).unwrap();
-        for f in ["A.2cbh", "A.2cbg", "B.CBH", "C.pgn", "notes.txt"] {
+        std::fs::create_dir_all(dir.join("sub.2cbh/deeper")).unwrap();
+        for f in ["A.2cbh", "A.2cbg", "B.CBH", "C.pgn", "notes.txt", "sub.2cbh/deeper/D.pgn"] {
             std::fs::write(dir.join(f), b"").unwrap();
         }
         let config = Config { databases: vec![dir.clone(), dir.join("A.2cbh"), dir.join("gone")], ..Config::default() };
         let list = extras(&config);
         assert_eq!(
             list.iter().map(|e| (e.folder, e.databases, e.present)).collect::<Vec<_>>(),
-            [(true, Some(3), true), (false, None, true), (false, None, false)]
+            [(true, Some(4), true), (false, None, true), (false, None, false)]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

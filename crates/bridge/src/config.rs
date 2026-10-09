@@ -22,7 +22,7 @@ pub struct Config {
     /// Allowed origins in addition to the oschess ones.
     pub origins: Vec<String>,
     /// Databases in addition to those ChessBase lists: database files, or
-    /// folders of databases.
+    /// folders of databases, searched at every depth.
     pub databases: Vec<PathBuf>,
     /// The oschess site the pairing link opens.
     pub web: String,
@@ -59,7 +59,8 @@ port = 39581
 origins = []
 
 # Databases in addition to those ChessBase shows: paths to .2cbh, .cbh or .pgn
-# files, or to folders whose databases are all served,
+# files, or to folders whose databases are all served, in every folder below
+# them too,
 # for example ['C:\\Users\\me\\Documents\\ChessBase\\MyWork\\Games.2cbh'].
 databases = []
 
