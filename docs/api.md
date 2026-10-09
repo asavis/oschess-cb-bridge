@@ -505,8 +505,14 @@ of the same games answers, apart from what the format has otherwise:
   in `\n`: decoded as UTF-8, or, when the game is not valid UTF-8, in the
   computer's ANSI code page (Windows-1252 where the page has no table). Its
   row's names are read in the same encoding.
-  `lang` and `annotations` change nothing, and `annotations` is `complete`:
-  a PGN game's comments are all it has.
+  `lang` changes nothing, and `annotations` is `complete`: a PGN game's
+  comments are all it has. The reading form reads the layout marks that a
+  Chessable course's export writes in comments, words between runs of two
+  `@` or more, as a 2CBH copy of the course shows them (#318):
+  `@@StartBracket@@39@@EndBracket@@` is `(39)`, `StartSquare`/`EndSquare`
+  are `[` `]`, `StartFEN`/`EndFEN` set the FEN apart as `[FEN …]`, and
+  `LinkStart`/`LinkEnd` leave the address alone. The full form serves the
+  text as the file writes it, and a write keeps the file's text.
 - **Position index.** Each game's main line is played as written, from its
   `FEN` tag or the standard start, and ends at the first move that names no
   legal move, a null move among them. Games of Chess960 and of other variants

@@ -367,9 +367,12 @@ impl Store for pgnfile::Database {
         Ok(None)
     }
     /// The game as the file writes it: its comments are all it has, so the
-    /// preferred languages and the full form change nothing.
-    fn render(&self, r: &pgnfile::Record, _: &Options) -> Result<Rendered> {
-        Ok(Rendered { pgn: self.text(r, LIMITS.game_bytes)?, annotations: pgn::AnnotationStatus::Complete })
+    /// preferred languages change nothing. The reading form reads a Chessable
+    /// course's layout marks in them (#318); the full form is the text as
+    /// written.
+    fn render(&self, r: &pgnfile::Record, options: &Options) -> Result<Rendered> {
+        let pgn = if options.full { self.text(r, LIMITS.game_bytes)? } else { self.reading(r, LIMITS.game_bytes)? };
+        Ok(Rendered { pgn, annotations: pgn::AnnotationStatus::Complete })
     }
     /// The main line as the text writes it, played from the standard
     /// position ([`pgnfile::line`]), and read only until the prefix is

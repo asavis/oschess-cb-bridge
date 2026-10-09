@@ -128,6 +128,42 @@ fn text_in_the_code_page() {
     assert!(Database::open(&pgn, &index, 1, CodePage::WESTERN).is_err());
 }
 
+/// A Chessable course's layout marks in a game's comments read as brackets
+/// where the game is shown, and stay as written in its text (#318). Made-up
+/// text.
+#[test]
+fn a_course_layout_reads_as_brackets_where_shown() {
+    let f = pgn_file("course", b"[White \"Smith, J\"]\n\n1. e4 {1-0 @@StartBracket@@39@@EndBracket@@ Smith,J} *\n");
+    let db = built(&f, 1, CodePage::WESTERN);
+    let r = db.record(1).unwrap();
+    assert_eq!(db.reading(&r, 1 << 20).unwrap(), "[White \"Smith, J\"]\n\n1. e4 {1-0 (39) Smith,J} *\n");
+    assert_eq!(
+        db.text(&r, 1 << 20).unwrap(),
+        "[White \"Smith, J\"]\n\n1. e4 {1-0 @@StartBracket@@39@@EndBracket@@ Smith,J} *\n"
+    );
+    // Only `{}` comments as the reader finds them: not a tag's value, even
+    // after a `%` escape line holding a brace, nor a `;` comment, even one
+    // holding a quote, nor after a tag's value left open.
+    let read = |name: &str, pgn: &[u8]| {
+        let f = pgn_file(name, pgn);
+        let db = built(&f, 1, CodePage::WESTERN);
+        db.reading(&db.record(1).unwrap(), 1 << 20).unwrap()
+    };
+    let m = "@@StartBracket@@x@@EndBracket@@";
+    let escape = format!("[Event \"Probe\"]\n% {{ ignored\n[Site \"{m}\"]\n\n1. e4 {{{m}}} *\n");
+    assert_eq!(
+        read("course-escape", escape.as_bytes()),
+        format!("[Event \"Probe\"]\n% {{ ignored\n[Site \"{m}\"]\n\n1. e4 {{(x)}} *\n")
+    );
+    let line = format!("[Event \"Probe\"]\n\n1. e4 ; he says \"hello {m}\n{{{m}}} *\n");
+    assert_eq!(
+        read("course-line", line.as_bytes()),
+        format!("[Event \"Probe\"]\n\n1. e4 ; he says \"hello {m}\n{{(x)}} *\n")
+    );
+    let open = format!("[Event \"Probe\n\n1. e4 {{{m}}} *\n");
+    assert_eq!(read("course-open", open.as_bytes()), "[Event \"Probe\n\n1. e4 {(x)} *\n");
+}
+
 #[test]
 fn an_index_of_another_state_is_refused() {
     let f = pgn_file("stale", GAMES.as_bytes());

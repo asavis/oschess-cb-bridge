@@ -33,6 +33,7 @@ pub mod lex;
 pub mod line;
 pub mod scan;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
@@ -810,6 +811,18 @@ impl Database {
         self.text.read_into(r.offset(), buf)
     }
 
+    /// The game's text as a reader is shown it: [`Database::text`], with the
+    /// layout marks of a Chessable course in its comments read as brackets
+    /// (`@@StartBracket@@39@@EndBracket@@` is `(39)`, #318). A write keeps
+    /// the text as written.
+    pub fn reading(&self, r: &Record, limit: usize) -> Result<String> {
+        let text = self.text(r, limit)?;
+        Ok(match read_course_marks(&text) {
+            Cow::Borrowed(_) => text,
+            Cow::Owned(read) => read,
+        })
+    }
+
     /// The game's text as written, refused before it is read when longer
     /// than `limit` bytes: UTF-8 when it is valid UTF-8, else in the code
     /// page, with every line ending in `\n`, and a final one.
@@ -833,4 +846,39 @@ impl Database {
         }
         Ok(out)
     }
+}
+
+/// A game's `text` with the layout marks of a Chessable course read in its
+/// `{}` comments ([`crate::signs::read_course_marks`], #318), the comments
+/// found as the reader finds them ([`lex::Lexer`]): a tag's value, a `;`
+/// comment and a `%` escape line are left as written, whatever they hold.
+fn read_course_marks(text: &str) -> Cow<'_, str> {
+    if !text.contains("@@") {
+        return Cow::Borrowed(text);
+    }
+    /// The `{}` comments' spans.
+    struct Comments<'t>(&'t [u8], Vec<(usize, usize)>);
+    impl lex::Sink for Comments<'_> {
+        fn tag(&mut self, _: u64, _: u64, _: &[u8], _: &[u8], _: bool) {}
+        fn movetext(&mut self, start: u64, end: u64, _: u32, token: lex::Token<'_>, _: bool) {
+            let (start, end) = (start as usize, end as usize);
+            if token == lex::Token::Comment && self.0.get(start) == Some(&b'{') {
+                self.1.push((start, end));
+            }
+        }
+    }
+    let mut comments = Comments(text.as_bytes(), Vec::new());
+    let mut lexer = lex::Lexer::new();
+    lexer.feed(text.as_bytes(), &mut comments);
+    lexer.finish(&mut comments, false);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end) in comments.1 {
+        let Some(comment) = text.get(start..end) else { continue };
+        out.push_str(&text[at..start]);
+        out.push_str(&crate::signs::read_course_marks(comment));
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Cow::Owned(out)
 }
