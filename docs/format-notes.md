@@ -345,7 +345,10 @@ player names of the lesson databases, and `ч` inside a Russian comment in
 Windows-1251. A course exported from Chessable writes its brackets, positions
 and links as words between runs of U+E02D (`StartBracket`, `EndBRacket`,
 `StartFEN`, `LinkStart`); they read as `(` `)`, `[` `]`, `[FEN …]` and the bare
-address. The examples in this section are made up or counts.
+address. The course's own PGN export writes the same words between runs of
+`@` (`@@StartBracket@@`), which ChessBase turned into U+E02D; a PGN
+database's reading form reads them so too (#318, `docs/api.md`, "PGN
+files"). The examples in this section are made up or counts.
 
 ## What `cbtool verify` checks
 

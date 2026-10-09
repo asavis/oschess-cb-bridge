@@ -38,7 +38,7 @@ pub(crate) fn read(text: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        if let Some((s, n)) = markup(&chars[i..]) {
+        if let Some((s, n)) = markup(&chars[i..], MARK, 1) {
             out.push_str(s);
             i += n;
             continue;
@@ -134,21 +134,68 @@ fn letter(c: char, prev: Option<char>, next: Option<char>, after: Option<char>) 
     }
 }
 
+/// A PGN game's text with the layout marks of a Chessable course read in its
+/// comments (#318): the course's export writes them between runs of `@`
+/// (`@@StartBracket@@`), where ChessBase's 2CBH copy has U+E02D. Only inside
+/// a `{}` comment, and only between runs of two `@` or more; a tag's value,
+/// even one holding a brace, is left alone.
+pub(crate) fn read_course_marks(pgn: &str) -> Cow<'_, str> {
+    if !pgn.contains("@@") {
+        return Cow::Borrowed(pgn);
+    }
+    let chars: Vec<char> = pgn.chars().collect();
+    let mut out = String::with_capacity(pgn.len());
+    let (mut comment, mut quoted, mut i) = (false, false, 0);
+    while i < chars.len() {
+        let c = chars[i];
+        if comment && c == '@' {
+            if let Some((s, n)) = markup(&chars[i..], '@', 2) {
+                out.push_str(s);
+                i += n;
+                continue;
+            }
+            // A run that holds no known word: as it stands, in one pass.
+            let n = chars[i..].iter().take_while(|&&c| c == '@').count();
+            out.extend(&chars[i..i + n]);
+            i += n;
+            continue;
+        }
+        match c {
+            '\\' if quoted => {
+                out.push(c);
+                i += 1;
+                if let Some(&next) = chars.get(i) {
+                    out.push(next);
+                    i += 1;
+                }
+                continue;
+            }
+            '"' if !comment => quoted = !quoted,
+            '{' if !comment && !quoted => comment = true,
+            '}' if comment => comment = false,
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    Cow::Owned(out)
+}
+
 /// A mark of a course's layout at the start of `chars`, with how many
-/// characters it takes: a word between runs of U+E02D, which a course's
-/// export writes for its brackets, positions and links
-/// (`<U+E02D><U+E02D>StartBracket<U+E02D><U+E02D>`). A bracket's mark is the
-/// bracket, a position's sets its FEN apart, and a link's leaves the address
-/// alone.
-fn markup(chars: &[char]) -> Option<(&'static str, usize)> {
-    let run = |from: usize| chars[from..].iter().take_while(|&&c| c == MARK).count();
+/// characters it takes: a word between runs of `mark`, at least `min` on
+/// either side, which a course's export writes for its brackets, positions
+/// and links (`<U+E02D><U+E02D>StartBracket<U+E02D><U+E02D>` in 2CBH,
+/// `@@StartBracket@@` in PGN). A bracket's mark is the bracket, a position's
+/// sets its FEN apart, and a link's leaves the address alone.
+fn markup(chars: &[char], mark: char, min: usize) -> Option<(&'static str, usize)> {
+    let run = |from: usize| chars[from..].iter().take_while(|&&c| c == mark).count();
     let open = run(0);
-    if open == 0 {
+    if open < min {
         return None;
     }
     let word: String = chars[open..].iter().take(16).take_while(|c| c.is_ascii_alphabetic()).collect();
     let close = run(open + word.len());
-    if close == 0 {
+    if close < min {
         return None;
     }
     let s = match word.to_ascii_lowercase().as_str() {
@@ -240,6 +287,27 @@ mod tests {
     #[test]
     fn a_sign_in_utf8_inside_windows_1251_is_its_letter() {
         assert_eq!(decode(b"\xed\xe5\xf0\xe0\xe7\xe1\xee\xf0\xee\x80\x89\xe8\xe2\xee"), "неразборчиво");
+    }
+
+    /// A Chessable course's marks in a PGN game's comments (#318). Made-up
+    /// text.
+    #[test]
+    fn a_course_layout_in_pgn_comments_reads_as_brackets() {
+        let read = |s: &str| read_course_marks(s).into_owned();
+        assert_eq!(read("1. e4 {1-0 @@StartBracket@@39@@EndBracket@@ Smith,J} *"), "1. e4 {1-0 (39) Smith,J} *");
+        assert_eq!(read("{@@@StartBracket@@x@@EndBRacket@@ @@StartSquare@@a@@EndSquare@@}"), "{(x) [a]}");
+        assert_eq!(
+            read("{If @@StartFEN@@8/8/8/8/8/8/8/K1k5 w - - 0 1@@EndFEN@@}"),
+            "{If [FEN 8/8/8/8/8/8/8/K1k5 w - - 0 1]}"
+        );
+        assert_eq!(read("{(@@LinkStart@@https://example.org/@@LinkEnd@@)}"), "{(https://example.org/)}");
+        // Not outside a comment, not in a tag's value, not with one `@`, not
+        // another word.
+        let kept = "[Event \"@@StartBracket@@ {x}\"]\n\n1. e4 @@StartBracket@@ {a@StartBracket@b @@Other@@} *";
+        assert_eq!(read(kept), kept);
+        // A long run of `@` is read in one pass and stays.
+        let long = format!("{{{}}}", "@".repeat(200_000));
+        assert_eq!(read(&long), long);
     }
 
     #[test]
