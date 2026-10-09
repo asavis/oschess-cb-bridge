@@ -237,7 +237,8 @@ It serves the databases ChessBase's database window shows, read from
 Windows reports, wherever it has been moved; `OSCHESS_BRIDGE_DOCUMENTS` names
 another one, and outside Windows only that variable gives one. Databases or
 folders of databases listed under `databases` in `bridge.toml`, and
-`--database`, add more. The list is read again when those files change. A
+`--database`, add more; a folder gives the databases in every folder below it
+too. The list is read again when those files change. A
 database kept only in the cloud is not read while it is listed; opening it in
 oschess downloads it first ([docs/api.md](docs/api.md#cloud-only-databases)).
 

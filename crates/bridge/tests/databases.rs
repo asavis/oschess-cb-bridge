@@ -234,7 +234,8 @@ fn the_list_is_read_again_when_its_sources_change() {
     assert_eq!(states(&catalog), ["missing", "ready", "ready"]);
 }
 
-/// A new database in a configured folder shows on the next listing.
+/// A new database in a configured folder, or in any folder below it (#320),
+/// shows on the next listing.
 #[test]
 fn a_configured_folder_is_read_again_when_it_changes() {
     let root = Root::new("folder");
@@ -244,6 +245,36 @@ fn a_configured_folder_is_read_again_when_it_changes() {
     assert_eq!(names(&catalog), ["One"]);
     database_at(&root.path("folder"), "Two");
     assert_eq!(names(&catalog), ["One", "Two"]);
+    // In path order: `Bases/2026/Three.2cbh` comes before `One.2cbh`.
+    let three = database_at(&root.path("folder/Bases/2026"), "Three");
+    assert_eq!(names(&catalog), ["Three", "One", "Two"]);
+    assert_eq!(catalog.get(&id_of(&three)).unwrap().state(), State::Ready);
+}
+
+/// A database file in a subfolder that cannot be examined, here a link into a
+/// folder closed to this user, is listed, missing while it cannot be reached,
+/// and the other databases of its folder and below stay ready (#320). Unix
+/// only.
+#[cfg(unix)]
+#[test]
+fn a_database_that_cannot_be_examined_keeps_its_folder_listed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Root::new("unexamined");
+    let good = database_at(&root.path("folder/sub"), "Good");
+    let deeper = database_at(&root.path("folder/sub/deeper"), "Deeper");
+    let closed = root.path("closed");
+    database_at(&closed, "Hidden");
+    std::os::unix::fs::symlink(closed.join("Hidden.2cbh"), root.path("folder/sub/Blocked.2cbh")).unwrap();
+    std::fs::write(root.path("bridge.toml"), format!("databases = ['{}']\n", root.path("folder").display())).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let catalog = Catalog::with_sources(root.sources(), Arc::new(bridge::fetch::System));
+    let listed: Vec<(String, &str)> = catalog.entries().iter().map(|e| (e.name.clone(), e.state().name())).collect();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(listed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["Blocked", "Good", "Deeper"]);
+    assert_eq!(catalog.get(&id_of(&good)).unwrap().state(), State::Ready);
+    assert_eq!(catalog.get(&id_of(&deeper)).unwrap().state(), State::Ready);
+    assert_eq!(listed[0].1, "missing", "while it cannot be reached");
 }
 
 /// A database added to a configured folder shows even when the folder's own
