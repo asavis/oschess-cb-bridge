@@ -11,7 +11,9 @@ use bridge::api::App;
 use bridge::catalog::id_of;
 use bridge::http::MAX_HEAD;
 use bridge::server;
-use cbformat::fixture::{Builder, TempDb, annotations, arrows, lid_header, quiet, squares, symbols, text};
+use cbformat::fixture::{
+    Builder, TempDb, annotations, arrows, lid_header, lid_with, quiet, squares, strings, symbols, text, titles,
+};
 use cbformat::game::language;
 use cbformat::movetable::{ALTERNATIVE, Color, END_OF_LINE, MOVES, NULL_MOVE, Piece};
 
@@ -83,7 +85,10 @@ fn status_and_databases() {
     let s = get_reply(r.port, "/v1/status");
     assert_eq!(s.status, 200, "{}", s.body);
     assert!(
-        has_members(&s.body, r#""bridge":{"version":"test","api":1,"features":["explorerSearch","fragmentSearch"]}"#),
+        has_members(
+            &s.body,
+            r#""bridge":{"version":"test","api":1,"features":["explorerSearch","fragmentSearch","analysisGames"]}"#
+        ),
         "{}",
         s.body
     );
@@ -357,43 +362,6 @@ fn a_connection_serves_several_requests() {
     assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
 }
 
-/// A `.2lid` with six entity types (players, tournaments, sources, the unused
-/// type 3, teams, game tags), `count` entities each in containers of `size`
-/// bytes, holding `entities` as (type, id, record after its length field).
-fn lid_with(size: usize, count: usize, entities: &[(usize, usize, Vec<u8>)]) -> Vec<u8> {
-    const TYPES: usize = 6;
-    const HEADER: usize = 184;
-    let mut d = Vec::new();
-    d.extend((HEADER as i32).to_be_bytes());
-    d.extend((TYPES as i32).to_be_bytes());
-    for _ in 0..TYPES {
-        d.extend((size as i32).to_be_bytes());
-        d.extend((count as i64).to_be_bytes());
-        d.extend((-1i64).to_be_bytes());
-    }
-    d.resize(HEADER + size * TYPES * count, 0);
-    for (typ, id, record) in entities {
-        let o = HEADER + id * size * TYPES + typ * size;
-        d[o..o + 4].copy_from_slice(&(record.len() as i32).to_le_bytes());
-        d[o + 4..o + 4 + record.len()].copy_from_slice(record);
-    }
-    d
-}
-
-fn strings(parts: &[&str]) -> Vec<u8> {
-    parts.iter().flat_map(|s| (s.len() as i32).to_le_bytes().into_iter().chain(s.bytes())).collect()
-}
-
-/// A game tag: one title in language 0, one empty one in language 1.
-fn titles(title: &str) -> Vec<u8> {
-    let mut r = 2i32.to_le_bytes().to_vec();
-    r.extend(0i32.to_le_bytes());
-    r.extend(strings(&[title]));
-    r.extend(1i32.to_le_bytes());
-    r.extend(strings(&[""]));
-    r
-}
-
 /// Guiding texts and analyses have header layouts of their own; their rows
 /// carry their title and author, never fields read through the game layout.
 #[test]
@@ -434,6 +402,18 @@ fn texts_and_analyses_are_read_with_their_own_layouts() {
     assert!(has_members(rows[1], r#""annotator":"Author, Text""#), "{}", rows[1]);
     assert!(has_members(rows[2], r#""kind":"analysis","white":"""#), "{}", rows[2]);
     assert!(has_members(rows[2], r#""event":"1.d4 d5 2.c4","annotator":"Author, Text""#), "{}", rows[2]);
+    // An analysis is served as PGN with the tags its header holds (#323); a
+    // guiding text is not.
+    let game = |n: u32| get_reply(r.port, &format!("/v1/databases/{}/games/{n}", r.id));
+    let a = game(3);
+    assert_eq!(a.status, 200, "{}", a.body);
+    let pgn = member(&a.body, "pgn");
+    assert!(pgn.starts_with(r#""[Event \"1.d4 d5 2.c4\"]\n[Site \"?\"]"#), "{pgn}");
+    assert!(pgn.contains(r#"[White \"?\"]\n[Black \"?\"]\n[Result \"*\"]"#), "{pgn}");
+    assert!(pgn.ends_with(r#"1. e4 *\n""#), "{pgn}");
+    assert!(has_members(&a.body, r#""number":3"#) && has_members(&a.body, r#""annotations":"none""#), "{}", a.body);
+    let t = game(2);
+    assert_eq!((t.status, t.body.contains(r#""code":"not_a_game""#)), (422, true), "{}", t.body);
 }
 
 /// 500 rows sharing two players: one whose name fills a 1 MiB container and

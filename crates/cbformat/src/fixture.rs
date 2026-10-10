@@ -95,6 +95,44 @@ pub fn lid_header(container: i32, count: i64) -> Vec<u8> {
     d
 }
 
+/// A `.2lid` with six entity types (players, tournaments, sources, the unused
+/// type 3, teams, game tags), `count` entities each in containers of `size`
+/// bytes, holding `entities` as (type, id, record after its length field).
+pub fn lid_with(size: usize, count: usize, entities: &[(usize, usize, Vec<u8>)]) -> Vec<u8> {
+    const TYPES: usize = 6;
+    const HEADER: usize = 184;
+    let mut d = Vec::new();
+    d.extend((HEADER as i32).to_be_bytes());
+    d.extend((TYPES as i32).to_be_bytes());
+    for _ in 0..TYPES {
+        d.extend((size as i32).to_be_bytes());
+        d.extend((count as i64).to_be_bytes());
+        d.extend((-1i64).to_be_bytes());
+    }
+    d.resize(HEADER + size * TYPES * count, 0);
+    for (typ, id, record) in entities {
+        let o = HEADER + id * size * TYPES + typ * size;
+        d[o..o + 4].copy_from_slice(&(record.len() as i32).to_le_bytes());
+        d[o + 4..o + 4 + record.len()].copy_from_slice(record);
+    }
+    d
+}
+
+/// Each of `parts` as its byte length (an `int`) and its bytes, back to back.
+pub fn strings(parts: &[&str]) -> Vec<u8> {
+    parts.iter().flat_map(|s| (s.len() as i32).to_le_bytes().into_iter().chain(s.bytes())).collect()
+}
+
+/// A game tag: one title in language 0, one empty one in language 1.
+pub fn titles(title: &str) -> Vec<u8> {
+    let mut r = 2i32.to_le_bytes().to_vec();
+    r.extend(0i32.to_le_bytes());
+    r.extend(strings(&[title]));
+    r.extend(1i32.to_le_bytes());
+    r.extend(strings(&[""]));
+    r
+}
+
 /// A database in a temporary directory, removed on drop.
 pub struct TempDb {
     dir: PathBuf,
