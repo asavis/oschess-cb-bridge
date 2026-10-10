@@ -87,6 +87,7 @@ function renderSettings(settings) {
   // Only Windows' Startup apps settings turn back on what the user turned off there.
   if (settings.autostartBlocked) document.getElementById('autostart-state').textContent = t('settings.autostart.blocked');
   toggle('auto-update', settings.autoUpdate);
+  toggle('stockfish-update', settings.stockfishAutoUpdate);
   const rows = settings.extras.map((extra) => {
     const remove = el('button', 'btn', t('settings.folders.remove'));
     remove.addEventListener('click', () => act(call('remove_database', { path: extra.path }).then(renderSettings)));
@@ -229,7 +230,7 @@ function enginesBusy(busy) {
   }
 }
 
-// Installs the pinned Stockfish, showing its progress, then chooses it. A
+// Installs the newest Stockfish, showing its progress, then chooses it. A
 // failure shows why; the choice stays as it was.
 function installStockfish() {
   if (choosing) return;
@@ -284,6 +285,11 @@ function wire() {
   document.getElementById('offer-update').addEventListener('click', installStockfish);
   document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
   on('stockfish-progress', showInstallProgress);
+  // An automatic Stockfish update chose a new build (#322); a choice in
+  // progress reads the list itself when it ends.
+  on('engines-changed', () => {
+    if (!choosing) act(call('engines').then(renderEngines));
+  });
   document.getElementById('autostart').addEventListener('click', () =>
     act(call('set_autostart', { on: !current.autostart }).then((settings) => {
       renderSettings(settings);
@@ -291,6 +297,8 @@ function wire() {
     })));
   document.getElementById('auto-update').addEventListener('click', () =>
     act(call('set_auto_update', { on: !current.autoUpdate }).then(renderSettings)));
+  document.getElementById('stockfish-update').addEventListener('click', () =>
+    act(call('set_stockfish_auto_update', { on: !current.stockfishAutoUpdate }).then(renderSettings)));
   document.getElementById('check-updates').addEventListener('click', checkUpdates);
 
   document.getElementById('show-code').addEventListener('click', () =>

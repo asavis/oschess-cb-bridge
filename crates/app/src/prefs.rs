@@ -18,6 +18,9 @@ pub struct Prefs {
     pub language: Option<Lang>,
     /// Install new versions of the bridge by themselves.
     pub auto_update: bool,
+    /// Install new Stockfish releases in place of the build the bridge
+    /// installed (#322).
+    pub stockfish_auto_update: bool,
     /// The bridge version whose Stockfish offer the user put off with
     /// «Пізніше»; the next bridge version offers again.
     pub stockfish_offer_dismissed: Option<String>,
@@ -25,7 +28,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { language: None, auto_update: true, stockfish_offer_dismissed: None }
+        Prefs { language: None, auto_update: true, stockfish_auto_update: true, stockfish_offer_dismissed: None }
     }
 }
 
@@ -77,6 +80,7 @@ mod tests {
             ))
             .unwrap();
             assert!(!prefs.auto_update);
+            assert!(prefs.stockfish_auto_update, "a file from before #322 keeps Stockfish up to date");
             assert_eq!(prefs.stockfish_offer_dismissed.as_deref(), Some("1.2.3"));
             assert_eq!(prefs.language(0x0422), Lang::Uk);
             assert_eq!(prefs.language(0x0419), Lang::Uk);
@@ -93,7 +97,7 @@ mod tests {
     fn concurrent_preference_changes_keep_each_others_choices() {
         let dir = std::env::temp_dir().join(format!("bridge-app-language-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let start = &std::sync::Barrier::new(3);
+        let start = &std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
             let dir = &dir;
             scope.spawn(move || {
@@ -104,12 +108,17 @@ mod tests {
                 start.wait();
                 update(dir, |p| p.auto_update = false).unwrap();
             });
+            scope.spawn(move || {
+                start.wait();
+                update(dir, |p| p.stockfish_auto_update = false).unwrap();
+            });
             start.wait();
             update(dir, |p| p.stockfish_offer_dismissed = Some("1.2.3".into())).unwrap();
         });
         let saved = load(&dir);
         assert_eq!(saved.language, Some(Lang::En));
         assert!(!saved.auto_update);
+        assert!(!saved.stockfish_auto_update);
         assert_eq!(saved.stockfish_offer_dismissed.as_deref(), Some("1.2.3"));
         update(&dir, |p| p.language = Some(Lang::Uk)).unwrap();
         assert_eq!(load(&dir), Prefs { language: Some(Lang::Uk), ..saved });
@@ -124,8 +133,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bridge-app-prefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(load(&dir), Prefs::default());
-        let saved =
-            Prefs { language: Some(Lang::Uk), auto_update: false, stockfish_offer_dismissed: Some("0.2.0".into()) };
+        let saved = Prefs {
+            language: Some(Lang::Uk),
+            auto_update: false,
+            stockfish_auto_update: false,
+            stockfish_offer_dismissed: Some("0.2.0".into()),
+        };
         save(&dir, &saved).unwrap();
         assert_eq!(load(&dir), saved);
         // Replaced whole, with nothing left beside it (#62).

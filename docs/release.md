@@ -259,7 +259,9 @@ as the installer, and the app tells where it came from by its package identity
 
 Everything else is the installed app's, the engine included: the package
 carries no Stockfish, as #13 decided, and «Install Stockfish» downloads the
-pinned build into the data folder on the user's request.
+newest official build (the pinned one when GitHub's API does not answer)
+into the data folder on the user's request; «Update Stockfish automatically»
+keeps it up to date (#322).
 
 The package is x64 only; ARM64 Windows runs it emulated. It uses the system's
 WebView2, which Windows 11 has, since a package cannot run the WebView2
@@ -338,7 +340,7 @@ remove it with `Get-AppxPackage oschess.bridge.test | Remove-AppxPackage`:
   «Check for updates», and a look answers «No updates» (a package registered
   by hand has no Store listing to update from, so the silent install itself
   is tried with the Store build, below);
-- «Install Stockfish» downloads, checks and chooses the pinned build, and
+- «Install Stockfish» downloads, checks and chooses the newest build, and
   analysis works with it;
 - «Start with Windows» turns the task on and off (Settings → Apps → Startup
   shows it), and survives a sign-out;

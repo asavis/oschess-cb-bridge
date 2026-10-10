@@ -23,6 +23,7 @@ const COMMANDS: &[&str] = &[
     "open_stockfish_licence",
     "set_autostart",
     "set_auto_update",
+    "set_stockfish_auto_update",
     "check_updates",
     "update_progress",
     "pairing_code",

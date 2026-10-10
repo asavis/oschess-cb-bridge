@@ -17,6 +17,7 @@
     "allow-install-stockfish",
     "allow-set-autostart",
     "allow-set-auto-update",
+    "allow-set-stockfish-auto-update",
     "allow-pairing-code",
     "allow-copy-code",
     "allow-open-pairing"

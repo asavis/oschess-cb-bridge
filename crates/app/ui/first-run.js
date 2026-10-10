@@ -22,6 +22,7 @@ let picked = null;
 // Windows is on unless Windows' own settings turned it off.
 let autostartOn = true;
 let autoUpdateOn = true;
+let stockfishUpdateOn = true;
 // An engine check, a Stockfish install or a saved choice is running.
 let busy = false;
 let installing = false;
@@ -96,6 +97,10 @@ function wire() {
   });
   document.getElementById('auto-update').addEventListener('click', () => {
     autoUpdateOn = !autoUpdateOn;
+    renderStartup();
+  });
+  document.getElementById('stockfish-update').addEventListener('click', () => {
+    stockfishUpdateOn = !stockfishUpdateOn;
     renderStartup();
   });
   document.getElementById('open').addEventListener('click', () => act(call('open_pairing')));
@@ -201,6 +206,7 @@ function renderSettings(next) {
   if (!settings) {
     autostartOn = !next.autostartBlocked;
     autoUpdateOn = next.autoUpdate;
+    stockfishUpdateOn = next.stockfishAutoUpdate;
   }
   settings = next;
   const rows = settings.extras.map((extra) => {
@@ -294,7 +300,7 @@ function pickEngine() {
   work(() => call('pick_engine').then((path) => path && choose(path)));
 }
 
-// Installs the pinned Stockfish with its progress in place, and the bridge
+// Installs the newest Stockfish with its progress in place, and the bridge
 // chooses it. «Next» waits for it.
 function installStockfish() {
   if (busy) return;
@@ -333,6 +339,8 @@ function renderStartup() {
   document.getElementById('autostart-blocked').hidden = !blocked;
   toggle('auto-update', autoUpdateOn);
   document.getElementById('auto-update').disabled = busy;
+  toggle('stockfish-update', stockfishUpdateOn);
+  document.getElementById('stockfish-update').disabled = busy;
 }
 
 function toggle(id, onNow) {
@@ -346,6 +354,9 @@ async function applyStartup() {
     renderSettings(await call('set_autostart', { on: autostartOn }));
   }
   if (autoUpdateOn !== settings.autoUpdate) renderSettings(await call('set_auto_update', { on: autoUpdateOn }));
+  if (stockfishUpdateOn !== settings.stockfishAutoUpdate) {
+    renderSettings(await call('set_stockfish_auto_update', { on: stockfishUpdateOn }));
+  }
 }
 
 // The last screen opens oschess with the pairing link once, and shows the

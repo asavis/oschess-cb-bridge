@@ -10,6 +10,7 @@ pub mod i18n;
 pub mod prefs;
 pub mod settings;
 pub mod status;
+pub mod stockfish_updates;
 pub mod toast;
 pub mod updates;
 

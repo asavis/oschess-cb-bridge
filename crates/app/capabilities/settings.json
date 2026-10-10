@@ -19,6 +19,7 @@
     "allow-open-stockfish-licence",
     "allow-set-autostart",
     "allow-set-auto-update",
+    "allow-set-stockfish-auto-update",
     "allow-check-updates",
     "allow-update-progress",
     "allow-pairing-code",
