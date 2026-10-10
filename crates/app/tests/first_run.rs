@@ -87,29 +87,52 @@ fn skipping_applies_the_defaults() {
 
 /// A Stockfish build installed, or a newer release learned of, makes both
 /// windows read the engines again (#322): the engine page shows the newest
-/// build known. The wizard does not while the engine folders' first answer
-/// is awaited or anything runs, nor the settings window during a choice: an
-/// answer landing after a choice made meanwhile would replace it.
+/// build known. An event that arrives while a choice or an installation runs,
+/// or before the wizard's engine folders answered, is kept and read once that
+/// ends, whichever way it ended: a failed installation may have learned of a
+/// newer release, and an answer landing after a choice made meanwhile would
+/// replace it.
 #[test]
 fn the_windows_read_the_engines_again_when_they_change() {
     let wizard = source("ui/first-run.js");
-    let at = position(&wizard, "on('engines-changed', () => {");
-    let handler = &wizard[at..at + wizard[at..].find("});").expect("the handler's end")];
-    assert!(handler.contains("if (!busy && !enginesRead) act(call('engines').then(renderEngines));"));
+    let handler = function(&wizard, "  on('engines-changed', () => {");
+    assert!(handler.contains("enginesChanged = true;") && handler.contains("readChangedEngines();"));
+    let read = function(&wizard, "function readChangedEngines() {");
+    assert!(read.contains("if (!enginesChanged || busy || enginesRead) return;"));
+    assert!(read.contains("enginesChanged = false;") && read.contains("const asked = begun;"));
+    assert!(read.contains("if (asked === begun) {\n      renderEngines(next);"), "not over what began since");
+    assert!(function(&wizard, "function setBusy(now) {").contains("if (now) begun += 1;"));
+    // Read once nothing runs any more, and once the first answer is in.
+    assert!(function(&wizard, "function setBusy(now) {").ends_with("readChangedEngines();"));
+    let main = function(&wizard, "async function main() {");
+    let settled = main.find("enginesRead = null;").expect("the answer settles");
+    assert!(main[settled..].contains("readChangedEngines();"));
+
     let settings = source("ui/settings.js");
-    let at = position(&settings, "on('engines-changed', () => {");
-    let handler = &settings[at..at + settings[at..].find("});").expect("the handler's end")];
-    assert!(handler.contains("if (!choosing) act(call('engines').then(renderEngines));"));
+    position(&settings, "on('engines-changed', onEnginesChanged);");
+    let changed = function(&settings, "function onEnginesChanged() {");
+    assert!(changed.contains("enginesChanged = true;") && changed.contains("if (!choosing) readChangedEngines();"));
+    let read = function(&settings, "function readChangedEngines() {");
+    assert!(read.contains("if (!enginesChanged) return;") && read.contains("enginesChanged = false;"));
+    assert!(read.contains("const asked = begun;") && read.contains("if (asked === begun) renderEngines(view);"));
+    // Both a choice and an installation, succeeded or failed, read it when they end.
+    for start in ["function choose(path) {", "function installStockfish() {"] {
+        let body = function(&settings, start);
+        let end = body.find(".finally(() => {").unwrap_or_else(|| panic!("{start} ends in finally"));
+        let finally = &body[end..];
+        assert!(finally.find("choosing = false;") < finally.find("readChangedEngines();"), "{start}");
+        assert!(body.find("choosing = true;") < body.find("begun += 1;"), "{start} counts as begun");
+    }
+
     // The automatic look announces any change it made or learned of, and an
-    // installation a newer release it learned of.
+    // installation a newer release it learned of, also when it then failed.
     let looks = source("src/desktop/engine_updates.rs");
     assert!(
         position(&looks, "if KNOWN.newest(arch) != known_before || outcome.as_ref().is_ok_and(Outcome::installed) {")
             < position(&looks, "let _ = app.emit(\"engines-changed\", ());")
     );
     let commands = source("src/desktop/commands.rs");
-    assert!(
-        position(&commands, "if KNOWN.newest(arch) != known_before {")
-            < position(&commands, "let _ = app.emit(\"engines-changed\", ());")
-    );
+    let changed = position(&commands, "if KNOWN.newest(arch) != known_before {");
+    assert!(changed < position(&commands, "let _ = app.emit(\"engines-changed\", ());"));
+    assert!(changed < position(&commands, "installed.map_err(failed)?;"), "before a failure is answered");
 }

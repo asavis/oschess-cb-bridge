@@ -189,10 +189,35 @@ function engineRow(name, detail, path, chosen, version) {
 // a refused engine the list is read again.
 let choosing = false;
 
+// A Stockfish build was installed or a newer release became known (#322).
+// The list is read at once, or, during a choice or an installation, once it
+// ends, whichever way it ended: a failed installation may have learned of a
+// newer release too. A list read before a choice or an installation began is
+// not shown: it would replace what that one answered.
+let enginesChanged = false;
+let begun = 0;
+
+function onEnginesChanged() {
+  enginesChanged = true;
+  if (!choosing) readChangedEngines();
+}
+
+function readChangedEngines() {
+  if (!enginesChanged) return;
+  enginesChanged = false;
+  const asked = begun;
+  act(call('engines').then((view) => {
+    // Read again for what began meanwhile: now, or once it ends.
+    if (asked === begun) renderEngines(view);
+    else onEnginesChanged();
+  }));
+}
+
 // `path` gives the engine to check, or nothing (a closed file dialog).
 function choose(path) {
   if (choosing) return;
   choosing = true;
+  begun += 1;
   enginesBusy(true);
   const line = document.getElementById('engine-checking');
   Promise.resolve()
@@ -211,6 +236,7 @@ function choose(path) {
       choosing = false;
       enginesBusy(false);
       line.hidden = true;
+      readChangedEngines();
     });
 }
 
@@ -235,6 +261,7 @@ function enginesBusy(busy) {
 function installStockfish() {
   if (choosing) return;
   choosing = true;
+  begun += 1;
   enginesBusy(true);
   const line = document.getElementById('install-progress');
   showInstallProgress({ phase: 'downloading', doneMegabytes: 0, totalMegabytes: engines ? engines.install.megabytes : 0 });
@@ -245,6 +272,7 @@ function installStockfish() {
       choosing = false;
       enginesBusy(false);
       line.hidden = true;
+      readChangedEngines();
     });
 }
 
@@ -285,11 +313,7 @@ function wire() {
   document.getElementById('offer-update').addEventListener('click', installStockfish);
   document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
   on('stockfish-progress', showInstallProgress);
-  // A Stockfish build was installed or a newer release became known (#322);
-  // a choice in progress reads the list itself when it ends.
-  on('engines-changed', () => {
-    if (!choosing) act(call('engines').then(renderEngines));
-  });
+  on('engines-changed', onEnginesChanged);
   document.getElementById('autostart').addEventListener('click', () =>
     act(call('set_autostart', { on: !current.autostart }).then((settings) => {
       renderSettings(settings);

@@ -31,6 +31,14 @@ let paired = false;
 // setup» wait for: until then no engine is marked, found or not.
 let enginesRead = null;
 let installProgress = null;
+// A Stockfish build was installed or a newer release became known (#322).
+// The list is read again once nothing runs and the engine folders' first
+// answer is in, whichever way what ran ended: a failed installation may have
+// learned of a newer release too, and an answer landing after a choice made
+// meanwhile would replace it: a list read before something began is not
+// shown.
+let enginesChanged = false;
+let begun = 0;
 
 function retranslate() {
   if (view) showView(view);
@@ -78,17 +86,30 @@ async function main() {
     enginesRead = null;
     renderEngineControls();
     footer();
+    readChangedEngines();
   });
+}
+
+function readChangedEngines() {
+  if (!enginesChanged || busy || enginesRead) return;
+  enginesChanged = false;
+  const asked = begun;
+  act(call('engines').then((next) => {
+    if (asked === begun) {
+      renderEngines(next);
+    } else {
+      // Read again for what began meanwhile: now, or once it ends.
+      enginesChanged = true;
+      readChangedEngines();
+    }
+  }));
 }
 
 function wire() {
   on('stockfish-progress', showInstallProgress);
-  // A Stockfish build was installed or a newer release became known (#322).
-  // Not while the engine folders' first answer is awaited or anything runs:
-  // those read the list themselves, and an answer landing after a choice
-  // made meanwhile would replace it.
   on('engines-changed', () => {
-    if (!busy && !enginesRead) act(call('engines').then(renderEngines));
+    enginesChanged = true;
+    readChangedEngines();
   });
   document.getElementById('next').addEventListener('click', next);
   document.getElementById('back').addEventListener('click', () => show(STEPS[STEPS.indexOf(step) - 1]));
@@ -432,10 +453,12 @@ function work(task) {
 
 function setBusy(now) {
   busy = now;
+  if (now) begun += 1;
   document.getElementById('add-folder').disabled = now;
   renderEngineControls();
   renderStartup();
   footer();
+  readChangedEngines();
 }
 
 // The controls that change the engine wait for the engine folders' first
