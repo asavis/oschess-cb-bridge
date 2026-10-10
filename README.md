@@ -64,8 +64,10 @@ downloading or opening, no position index is being built, no Stockfish is
 being installed, and no analysis began less than five minutes ago; an
 analysis left running longer does not hold an update back. The Stockfish the
 bridge installed is kept up to date as well, from Stockfish's GitHub
-releases, unless «Update Stockfish automatically» is off in the settings: the
-new build downloads at once and replaces the old one when the bridge is idle.
+releases, unless «Update Stockfish automatically» is off in the settings: a
+release is taken once it is a week old, so that a build put in its place on
+GitHub would likely be found first; its build downloads at once and replaces
+the old one when the bridge is idle.
 An engine from ChessBase or Fritz is never replaced; the engine page offers
 the new Stockfish instead. A version whose settings say
 «This build does not check for updates» is replaced by running the next
@@ -335,7 +337,8 @@ computer, what it connects to depends on where you got it:
 - Either copy downloads the official Stockfish build from Stockfish's GitHub
   releases when you ask for it in the settings or the first-run wizard: it
   asks GitHub's API which release is the newest, and downloads that one's
-  build. While «Update Stockfish automatically» is on, it also asks a minute
+  build once the release is a week old, else the build pinned in the bridge's
+  own release. While «Update Stockfish automatically» is on, it also asks a minute
   after it starts and every six hours after that, and downloads the newest
   build when the Stockfish the bridge installed is older. These requests carry
   nothing about you or your databases.

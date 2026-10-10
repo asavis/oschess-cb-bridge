@@ -4,9 +4,9 @@
 //! official build from Stockfish's GitHub releases, over HTTPS only, checks
 //! its size and SHA-256, and unpacks the executable and its licence into
 //! `engines\stockfish-<version>` in the data folder. The build is the newest
-//! release GitHub's API names ([`LATEST`], [`Build::released`]), with the size
-//! and SHA-256 GitHub gives for its asset, or the build pinned in this release
-//! when that lookup fails. The app keeps a build it installed up to date the
+//! release GitHub's API names ([`LATEST`], [`Build::released`]) once it is a
+//! week old, with the size and SHA-256 GitHub gives for its asset, or the
+//! build pinned in this release when that lookup fails. The app keeps a build it installed up to date the
 //! same way, while the user lets it.
 
 use std::borrow::Cow;

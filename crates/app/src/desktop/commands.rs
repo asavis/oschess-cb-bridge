@@ -2,7 +2,7 @@
 //! the ones it needs.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bridge::engines::{self, Roots};
 use bridge::stockfish;
@@ -187,8 +187,8 @@ pub(super) fn installing() -> bool {
     CHOICES.installing()
 }
 
-/// Installs the newest official Stockfish, as GitHub's API names it, else the
-/// build pinned in this release, then chooses it unless another engine was
+/// Installs the newest official Stockfish a week old, as GitHub's API names
+/// it, else the build pinned in this release, then chooses it unless another engine was
 /// chosen meanwhile ([`Choices::install`]). The
 /// progress goes to the window that asked, the settings or the first-run
 /// wizard, as `stockfish-progress` events. A failed installation answers why,
@@ -202,7 +202,7 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let install = || {
             let arch = stockfish::machine_arch();
-            let build = KNOWN.look_up(&stockfish::System, arch).unwrap_or_else(|e| {
+            let build = KNOWN.look_up(&stockfish::System, arch, SystemTime::now()).unwrap_or_else(|e| {
                 bridge::log!("Stockfish lookup: {e}");
                 KNOWN.newest(arch)
             });

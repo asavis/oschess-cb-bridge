@@ -139,7 +139,7 @@
   "settings.autoUpdate.title": "Оновлювати автоматично",
   "settings.autoUpdate.hint": "Нові версії мосту встановлюються самі, коли він нічим не зайнятий",
   "settings.stockfishUpdate.title": "Оновлювати Stockfish автоматично",
-  "settings.stockfishUpdate.hint": "Нові версії Stockfish, який встановив міст, завантажуються з GitHub самі",
+  "settings.stockfishUpdate.hint": "Нові версії Stockfish, який встановив міст, завантажуються з GitHub самі, через тиждень після виходу",
   "settings.on": "Увімкнено",
   "settings.off": "Вимкнено",
   "settings.versionRow.title": "Версія {version}",

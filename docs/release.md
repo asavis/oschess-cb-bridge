@@ -259,7 +259,8 @@ as the installer, and the app tells where it came from by its package identity
 
 Everything else is the installed app's, the engine included: the package
 carries no Stockfish, as #13 decided, and «Install Stockfish» downloads the
-newest official build (the pinned one when GitHub's API does not answer)
+newest official build a week old (the pinned one when GitHub's API does not
+answer)
 into the data folder on the user's request; «Update Stockfish automatically»
 keeps it up to date (#322).
 

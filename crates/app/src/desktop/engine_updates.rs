@@ -4,7 +4,7 @@
 //! `stockfish_updates::Look`; this runs it on a thread and says what it did.
 
 use std::sync::{Mutex, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bridge::{engine, stockfish};
 use tauri::{AppHandle, Emitter};
@@ -65,6 +65,7 @@ fn look(app: &AppHandle) {
         known: &KNOWN,
         transport: &stockfish::System,
         arch: stockfish::machine_arch(),
+        now: SystemTime::now(),
     };
     match look.run(|| updater::wait_idle(&shared), |exe| engine::probe(exe).map(drop)) {
         Ok(Outcome::Updated(version)) => {

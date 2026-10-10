@@ -139,7 +139,7 @@
   "settings.autoUpdate.title": "Update automatically",
   "settings.autoUpdate.hint": "New versions of the bridge install themselves while it is idle",
   "settings.stockfishUpdate.title": "Update Stockfish automatically",
-  "settings.stockfishUpdate.hint": "New releases of the Stockfish the bridge installed download from GitHub by themselves",
+  "settings.stockfishUpdate.hint": "New releases of the Stockfish the bridge installed download from GitHub by themselves, a week after they come out",
   "settings.on": "On",
   "settings.off": "Off",
   "settings.versionRow.title": "Version {version}",

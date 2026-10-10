@@ -3,6 +3,9 @@
 //! While «Update Stockfish automatically» is on, the app asks GitHub's API for
 //! Stockfish's newest release ([`stockfish::LATEST`]) a minute after it
 //! starts, every six hours after that, and when the user turns the option on.
+//! A release counts only once it is a week old ([`SETTLE`]): a build put in
+//! place of the real one, should Stockfish's account on GitHub ever be taken
+//! over, is then likely to be found and removed before any bridge installs it.
 //! When the chosen engine is a build the bridge installed and the release is
 //! newer, it installs the release's build, checked against the size and
 //! SHA-256 GitHub gives for it, chooses it once the bridge is idle, and
@@ -16,6 +19,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use bridge::config;
 use bridge::stockfish::{self, Arch, Build, Transport};
@@ -23,6 +27,9 @@ use bridge::sync::lock;
 use serde::Deserialize;
 
 use crate::choices::Choices;
+
+/// How old a release must be before the bridge installs it: a week.
+pub const SETTLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The newest build this run knows of: the pinned one, until a lookup names a
 /// newer release.
@@ -50,10 +57,11 @@ impl Known {
     }
 
     /// Asks GitHub's API for Stockfish's newest release, keeps its build for
-    /// `arch`, and answers the newest build ([`Known::newest`]).
-    pub fn look_up(&self, transport: &dyn Transport, arch: Arch) -> Result<Build, String> {
+    /// `arch` when it is old enough at `now` ([`release`]), and answers the
+    /// newest build ([`Known::newest`]).
+    pub fn look_up(&self, transport: &dyn Transport, arch: Arch, now: SystemTime) -> Result<Build, String> {
         let answer = transport.fetch(stockfish::LATEST, stockfish::MAX_ANSWER)?;
-        *lock(&self.0) = Some(release(&answer, arch)?);
+        *lock(&self.0) = Some(release(&answer, arch, now)?);
         Ok(self.newest(arch))
     }
 }
@@ -66,6 +74,8 @@ struct Release {
     draft: bool,
     #[serde(default)]
     prerelease: bool,
+    /// When it was published, as `2026-09-05T08:33:17Z`.
+    published_at: Option<String>,
     #[serde(default)]
     assets: Vec<Asset>,
 }
@@ -79,20 +89,55 @@ struct Asset {
 }
 
 /// The build for `arch` that GitHub's `answer` about a release names: the
-/// release is tagged `sf_<version>`, and its asset named as the pinned one is
-/// carries a size and a SHA-256 ([`Build::released`]). The download address
-/// is the bridge's own ([`Build::url`]), never one from the answer.
-pub fn release(answer: &[u8], arch: Arch) -> Result<Build, String> {
+/// release is tagged `sf_<version>`, was published at least [`SETTLE`] before
+/// `now`, and its asset named as the pinned one is carries a size and a
+/// SHA-256 ([`Build::released`]). The download address is the bridge's own
+/// ([`Build::url`]), never one from the answer.
+pub fn release(answer: &[u8], arch: Arch, now: SystemTime) -> Result<Build, String> {
     let release: Release = serde_json::from_slice(answer).map_err(|e| format!("GitHub's answer: {e}"))?;
     let tag: String = release.tag_name.chars().take(40).collect();
     let version = tag.strip_prefix("sf_").filter(|_| !release.draft && !release.prerelease);
     let version = version.ok_or_else(|| format!("{tag:?} is not a Stockfish release"))?;
+    let published = release.published_at.as_deref().and_then(unix_seconds);
+    let published = published.ok_or_else(|| format!("Stockfish {version} names no publication time"))?;
+    let now = now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if now < published.saturating_add(SETTLE.as_secs()) {
+        return Err(format!("Stockfish {version} is less than {} days old", SETTLE.as_secs() / 86_400));
+    }
     let name = Build::for_arch(arch).asset;
     let asset = release.assets.iter().find(|a| a.name == name);
     let asset = asset.ok_or_else(|| format!("Stockfish {version} has no {name}"))?;
     let sha256 = asset.digest.as_deref().and_then(|d| d.strip_prefix("sha256:"));
     let sha256 = sha256.ok_or_else(|| format!("Stockfish {version} names no SHA-256 for {name}"))?;
     Build::released(arch, version, asset.size, sha256)
+}
+
+/// The seconds since 1970 of a UTC time written as GitHub writes it,
+/// `2026-09-05T08:33:17Z`; `None` for any other text.
+fn unix_seconds(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    let marks = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')];
+    if b.len() != 20 || marks.iter().any(|&(at, mark)| b[at] != mark) {
+        return None;
+    }
+    let number = |from: usize, to: usize| -> Option<i64> {
+        let digits = text.get(from..to)?;
+        digits.bytes().all(|d| d.is_ascii_digit()).then(|| digits.parse().ok())?
+    };
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+    // Days from 1970-01-01 to the date, counting years from March so that a
+    // leap day ends its year (Howard Hinnant's days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let (era, of_era) = (y.div_euclid(400), y.rem_euclid(400));
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let of_era = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    let days = era * 146_097 + of_era - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
 }
 
 /// What a look did.
@@ -110,7 +155,8 @@ pub enum Outcome {
 }
 
 /// What a look works with: the data folder, its `bridge.toml`, the app's
-/// engine choices and the newest build known, and how files arrive.
+/// engine choices and the newest build known, how files arrive, and the
+/// time a release's age is measured at.
 pub struct Look<'a> {
     pub data: &'a Path,
     pub config_path: &'a Path,
@@ -118,6 +164,7 @@ pub struct Look<'a> {
     pub known: &'a Known,
     pub transport: &'a dyn Transport,
     pub arch: Arch,
+    pub now: SystemTime,
 }
 
 impl Look<'_> {
@@ -129,7 +176,7 @@ impl Look<'_> {
     /// builds the bridge installed go. A failed lookup or installation
     /// changes nothing.
     pub fn run(&self, wait: impl FnOnce(), probe: impl FnOnce(&Path) -> Result<(), String>) -> Result<Outcome, String> {
-        let newest = self.known.look_up(self.transport, self.arch)?;
+        let newest = self.known.look_up(self.transport, self.arch, self.now)?;
         let chosen = config::load_or_create(self.config_path)?.engine;
         let Some(current) = chosen.as_deref().and_then(|c| stockfish::installed_version(self.data, c)) else {
             return Ok(Outcome::NotOurs);
@@ -167,6 +214,14 @@ mod tests {
     // SHA-256 of "hello world".
     const HELLO: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
+    /// When the releases of these tests were published: 2026-09-05T08:33:17Z.
+    const PUBLISHED: u64 = 1_788_597_197;
+
+    /// The tests' time: a day after the release settled.
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(PUBLISHED) + SETTLE + Duration::from_secs(86_400)
+    }
+
     /// GitHub's answer about a release, trimmed to what is read and some of
     /// what is not.
     fn answer(tag: &str, assets: &[(&str, u64, Option<&str>)]) -> Vec<u8> {
@@ -182,9 +237,16 @@ mod tests {
                 })
             })
             .collect();
-        serde_json::json!({ "tag_name": tag, "name": "Stockfish", "draft": false, "prerelease": false, "assets": assets })
-            .to_string()
-            .into_bytes()
+        serde_json::json!({
+            "tag_name": tag,
+            "name": "Stockfish",
+            "draft": false,
+            "prerelease": false,
+            "published_at": "2026-09-05T08:33:17Z",
+            "assets": assets,
+        })
+        .to_string()
+        .into_bytes()
     }
 
     /// Stockfish `version`'s answer, whose x86-64 build is "hello world".
@@ -272,7 +334,8 @@ mod tests {
     /// answering.
     fn look(dir: &Path, choices: &Choices, known: &Known, transport: &Fake) -> Result<Outcome, String> {
         let config_path = dir.join("bridge.toml");
-        let look = Look { data: dir, config_path: &config_path, choices, known, transport, arch: Arch::X86_64 };
+        let look =
+            Look { data: dir, config_path: &config_path, choices, known, transport, arch: Arch::X86_64, now: now() };
         look.run(|| {}, |_| Ok(()))
     }
 
@@ -291,9 +354,9 @@ mod tests {
             ],
         );
         for arch in [Arch::X86_64, Arch::Arm64] {
-            assert_eq!(&release(&stockfish_19, arch).unwrap(), Build::for_arch(arch), "{arch:?}");
+            assert_eq!(&release(&stockfish_19, arch, now()).unwrap(), Build::for_arch(arch), "{arch:?}");
         }
-        let build = release(&hello("20.1"), Arch::X86_64).unwrap();
+        let build = release(&hello("20.1"), Arch::X86_64, now()).unwrap();
         assert_eq!((&*build.version, build.size, &*build.sha256), ("20.1", 11, HELLO));
         assert!(build.url().ends_with("/sf_20.1/stockfish-windows-x86-64-universal.zip"), "the bridge's own address");
     }
@@ -319,7 +382,71 @@ mod tests {
             b"not json".to_vec(),
         ];
         for answer in refused {
-            assert!(release(&answer, Arch::X86_64).is_err(), "{}", String::from_utf8_lossy(&answer));
+            assert!(release(&answer, Arch::X86_64, now()).is_err(), "{}", String::from_utf8_lossy(&answer));
+        }
+    }
+
+    /// A release counts once it is a week old, and not a second before; one
+    /// with no readable publication time never does.
+    #[test]
+    fn a_release_counts_once_it_is_a_week_old() {
+        let published = SystemTime::UNIX_EPOCH + Duration::from_secs(PUBLISHED);
+        let error = release(&hello("20"), Arch::X86_64, published + SETTLE - Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error, "Stockfish 20 is less than 7 days old");
+        assert!(release(&hello("20"), Arch::X86_64, published).is_err(), "just published");
+        assert!(release(&hello("20"), Arch::X86_64, SystemTime::UNIX_EPOCH).is_err(), "a clock before it");
+        assert_eq!(release(&hello("20"), Arch::X86_64, published + SETTLE).unwrap().version, "20");
+
+        let mut undated: serde_json::Value = serde_json::from_slice(&hello("20")).unwrap();
+        for when in [serde_json::Value::Null, "2026-09-05 08:33:17".into(), "yesterday".into(), 1_788_597_197.into()] {
+            undated["published_at"] = when.clone();
+            let answer = undated.to_string().into_bytes();
+            assert!(release(&answer, Arch::X86_64, now()).is_err(), "{when}");
+        }
+
+        // A young release leaves the newest build known as it was, and
+        // replaces nothing.
+        let dir = folder("young");
+        let exe = installed(&dir, "19");
+        choose(&dir, &exe);
+        let (choices, known, transport) = (Choices::new(), Known::new(), fake(Ok(hello("20"))));
+        let config_path = dir.join("bridge.toml");
+        let young = Look {
+            data: &dir,
+            config_path: &config_path,
+            choices: &choices,
+            known: &known,
+            transport: &transport,
+            arch: Arch::X86_64,
+            now: published + Duration::from_secs(3_600),
+        };
+        assert_eq!(young.run(|| {}, |_| Ok(())), Err("Stockfish 20 is less than 7 days old".into()));
+        assert_eq!(&known.newest(Arch::X86_64), Build::for_arch(Arch::X86_64));
+        assert_eq!(chosen(&dir), Some(exe));
+        assert!(lock(&transport.downloads).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_githubs_times() {
+        assert_eq!(unix_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_seconds("2026-09-05T08:33:17Z"), Some(PUBLISHED));
+        assert_eq!(unix_seconds("2000-02-29T23:59:59Z"), Some(951_868_799));
+        assert_eq!(unix_seconds("2024-03-01T00:00:00Z"), Some(1_709_251_200));
+        for bad in [
+            "",
+            "2026-09-05T08:33:17",
+            "2026-09-05 08:33:17Z",
+            "2026-09-05T08:33:17.5Z",
+            "1969-12-31T23:59:59Z",
+            "2026-13-05T08:33:17Z",
+            "2026-09-00T08:33:17Z",
+            "2026-09-05T24:00:00Z",
+            "2026-09-05T08:60:00Z",
+            "+026-09-05T08:33:17Z",
+            "2026-09-05T08:33:1éZ",
+        ] {
+            assert_eq!(unix_seconds(bad), None, "{bad:?}");
         }
     }
 
@@ -329,10 +456,10 @@ mod tests {
     fn the_newest_build_known_is_the_pinned_one_until_a_lookup_names_a_newer() {
         let known = Known::new();
         assert_eq!(&known.newest(Arch::X86_64), Build::for_arch(Arch::X86_64));
-        assert!(known.look_up(&fake(Err("offline".into())), Arch::X86_64).is_err());
+        assert!(known.look_up(&fake(Err("offline".into())), Arch::X86_64, now()).is_err());
         assert_eq!(&known.newest(Arch::X86_64), Build::for_arch(Arch::X86_64));
-        assert_eq!(&known.look_up(&fake(Ok(hello("18"))), Arch::X86_64).unwrap(), Build::for_arch(Arch::X86_64));
-        assert_eq!(known.look_up(&fake(Ok(hello("20"))), Arch::X86_64).unwrap().version, "20");
+        assert_eq!(&known.look_up(&fake(Ok(hello("18"))), Arch::X86_64, now()).unwrap(), Build::for_arch(Arch::X86_64));
+        assert_eq!(known.look_up(&fake(Ok(hello("20"))), Arch::X86_64, now()).unwrap().version, "20");
         assert_eq!(known.newest(Arch::X86_64).version, "20");
         assert_eq!(&known.newest(Arch::Arm64), Build::for_arch(Arch::Arm64), "another architecture's build");
     }
@@ -410,6 +537,7 @@ mod tests {
             known: &known,
             transport: &transport,
             arch: Arch::X86_64,
+            now: now(),
         };
         let wait = || {
             assert_eq!(chosen(&dir), Some(exe.clone()), "nothing is chosen before the bridge is idle");

@@ -43,8 +43,8 @@ Store's copy, which updates itself through the Store (#153).
 > в налаштуваннях вимикає ці перевірки. Коли ви просите встановити
 > Stockfish, міст завантажує його офіційну збірку з GitHub. А Stockfish, який
 > він установив, міст тримає свіжим: у ті самі години питає GitHub, чи вийшов
-> новий Stockfish, і встановлює його; «Оновлювати Stockfish автоматично» в
-> налаштуваннях вимикає це.
+> новий Stockfish, і встановлює його через тиждень після виходу; «Оновлювати
+> Stockfish автоматично» в налаштуваннях вимикає це.
 >
 > Відкритий код, ліцензія AGPL-3.0: https://github.com/asavis/oschess-cb-bridge
 
@@ -84,8 +84,8 @@ Store's copy, which updates itself through the Store (#153).
 > automatically» in the settings turns these checks off. When you ask it to
 > install Stockfish, it downloads the official build from GitHub. And it keeps
 > the Stockfish it installed up to date: at the same times it asks GitHub
-> whether a new Stockfish is out, and installs it; «Update Stockfish
-> automatically» in the settings turns this off.
+> whether a new Stockfish is out, and installs it once it is a week old;
+> «Update Stockfish automatically» in the settings turns this off.
 >
 > Open source under the AGPL-3.0 licence: https://github.com/asavis/oschess-cb-bridge
 
@@ -142,8 +142,8 @@ listing, the justification above and these notes all say that the bridge
 downloads the official Stockfish build from Stockfish's GitHub releases when
 the user asks, and keeps a build it installed up to date while «Update
 Stockfish automatically» is on (the default, which the first-run wizard
-shows), checking every download against the SHA-256 GitHub publishes for it
-(#322).
+shows), a release only once it is a week old, checking every download against
+the SHA-256 GitHub publishes for it (#322).
 
 Submit only once the ChessBase section is open to everyone on oschess.org
 (asavis/oschess#13368): until then the pairing link shows the testers no
