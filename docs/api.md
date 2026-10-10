@@ -923,10 +923,10 @@ A span is one of:
 
 | Span | Meaning |
 |---|---|
-| `text` | Text in one style: `font` (empty when the style names none), `size` as stored (its unit is not known; compare the sizes of one text), `bold`, `italic` and `underline`. A list label such as `1.` is a text span |
+| `text` | Text in one style, neighbouring text of the same style joined: `font` (empty when the style names none; cut at 64 characters), `size` as stored (its unit is not known; compare the sizes of one text), `bold`, `italic` and `underline`. A list label such as `1.` is a text span |
 | `diagram` | A position: `board` is the piece placement field of a FEN. The side to move is not stored where the bridge reads it |
-| `game` | A link to a game of the same database. ChessBase stores a search, not a record: `white`, `black` (`Last, First`; empty when the search names none) and `event`, with the `label` the text shows. `number` is the first game in record order, among the first 100,000 records, whose white, black and tournament are the link's (names compared word by word, a field the link leaves empty matching any), or `null` |
-| `textLink` | A link to another guiding text of the same database by its `title`; `number` is the first text with that title among the first 100,000 records, or `null` |
+| `game` | A link to a game of the same database. ChessBase stores a search, not a record: `white`, `black` (`Last, First`; empty when the search names none) and `event`, with the `label` the text shows. `number` is the first game in record order, among the first 100,000 records, whose white, black and tournament are the link's (names compared word by word and as stored, a field the link leaves empty matching any; a link that names none of the three names no game), or `null` |
+| `textLink` | A link to another guiding text of the same database by its `title`; `number` is the first text with that title as stored among the first 100,000 records, or `null` |
 
 Pictures, links to other databases and the objects the bridge does not read
 are left out. The text is read as a classic comment's single-byte text is
@@ -934,7 +934,11 @@ are left out. The text is read as a classic comment's single-byte text is
 decided once for each language's text.
 
 A record that is not a guiding text is `422 not_a_text`, and a damaged one
-`422 unreadable_text`. The answer is held to a game's answer limit.
+`422 unreadable_text`: one whose titles and contents do not fill it exactly,
+of a format version not known, or, in 2CBH, whose size field is not its
+content's. Formatting data that does not read leaves the text unstyled. The
+answer is held to a game's answer limit, which is checked, and its memory
+reserved, before the answer is built.
 
 ### Writing games
 

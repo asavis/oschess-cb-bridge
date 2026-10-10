@@ -76,8 +76,8 @@ fn a_version_1_text_reads_its_styles_diagrams_and_links() {
             },
             Paragraph {
                 spans: vec![
-                    text("1.", &body_style),
-                    text(" See ", &body_style),
+                    // The list label and the text after it share a style: one span.
+                    text("1. See ", &body_style),
                     Span::Game(GameLink {
                         label: "1.5".into(),
                         white: "Doe,Jane".into(),
@@ -93,15 +93,16 @@ fn a_version_1_text_reads_its_styles_diagrams_and_links() {
 }
 
 /// Version 2 places an object past 65,535 bytes with a `u32` position, and
-/// splits a long text into runs of at most 65,535 bytes.
+/// splits a long text into runs of fewer than 65,535 bytes, a length that
+/// would end the runs.
 #[test]
 fn a_version_2_text_places_objects_past_a_u16() {
     let mut t = vec![b'a'; 70_000];
     t[69_999] = 4;
     let f = formatting(
         &[(0x09, 70_000, diagram(&[("a1", 1), ("h8", 9)], 0))],
-        &[(0, style("Arial", 18, false, false))],
-        &[(65_535, 0), (4_465, 0)],
+        &[(0, style("Arial", 18, true, false))],
+        &[(60_000, 0), (10_000, 0)],
         true,
     );
     let mut content = language::ENGLISH.to_le_bytes().to_vec();
@@ -115,7 +116,8 @@ fn a_version_2_text_places_objects_past_a_u16() {
     let read = read_classic(&db, CodePage::WESTERN, 1).unwrap();
     let spans = &paragraphs(&read)[0].spans;
     assert_eq!(spans.len(), 2, "{spans:?}");
-    assert!(matches!(&spans[0], Span::Text { text, .. } if text.len() == 69_999));
+    // Both runs are of one style: one span, bold.
+    assert!(matches!(&spans[0], Span::Text { text, style } if text.len() == 69_999 && style.bold));
     assert_eq!(spans[1], Span::Diagram { board: "7k/8/8/8/8/8/8/K7".into() });
 }
 
@@ -165,21 +167,17 @@ fn damaged_formatting_leaves_plain_text() {
     let plain = Style::default();
     let bold = Style { font: "Arial".into(), size: 18, bold: true, ..Style::default() };
     let cases: [(&str, Vec<u8>, Vec<Span>); 4] = [
-        ("cut in an object", good[..20].to_vec(), vec![text("One ", &plain), text("two", &plain)]),
-        (
-            "cut before the end of the runs",
-            good[..good.len() - 8].to_vec(),
-            vec![text("One ", &plain), text("two", &plain)],
-        ),
+        ("cut in an object", good[..20].to_vec(), vec![text("One two", &plain)]),
+        ("cut before the end of the runs", good[..good.len() - 8].to_vec(), vec![text("One two", &plain)]),
         (
             "runs that end early",
             formatting(&[], &[(0, style("Arial", 18, true, false))], &[(2, 0)], false),
-            vec![text("On", &bold), text("e ", &plain), text("two", &plain)],
+            vec![text("On", &bold), text("e two", &plain)],
         ),
         (
             "a run of a style not defined",
             formatting(&[], &[(0, style("Arial", 18, true, false))], &[(t.len(), 4)], false),
-            vec![text("One ", &plain), text("two", &plain)],
+            vec![text("One two", &plain)],
         ),
     ];
     for (i, (what, f, spans)) in cases.into_iter().enumerate() {
@@ -237,4 +235,94 @@ fn a_2cbh_text_is_html_per_language() {
         ]
     );
     assert!(db.guiding_text(&db.record(2).unwrap(), LIMIT).is_err(), "a game is not a text");
+}
+
+/// What a run case names: the case, the text, its runs and the spans expected.
+type Case<'a> = (&'a str, &'a [u8], &'a [(usize, u16)], Vec<Span>);
+
+/// Runs cut the text only where its styles change: each character reads as it
+/// does in the whole text, whichever run it falls in, and neighbouring runs of
+/// one style make one span.
+#[test]
+fn a_run_boundary_does_not_change_how_the_text_reads() {
+    let plain = Style { font: "Arial".into(), size: 18, ..Style::default() };
+    let bold = Style { bold: true, ..plain.clone() };
+    let styles = [
+        (0, style("Arial", 18, false, false)),
+        (1, style("Arial", 18, true, false)),
+        (2, style("Arial", 18, false, false)),
+    ];
+    let cases: [Case<'_>; 4] = [
+        // A knight and its move, in two styles.
+        ("a figurine", b"\xa4f3", &[(1, 1), (2, 0)], vec![text("♘", &bold), text("f3", &plain)]),
+        // `Božidar`, the 0x9e between letters in a run of its own.
+        (
+            "a diagram mark's byte",
+            b"Bo\x9eidar",
+            &[(2, 0), (1, 1), (4, 0)],
+            vec![text("Bo", &plain), text("ž", &bold), text("idar", &plain)],
+        ),
+        // `Ход` in UTF-8, a run ending inside its first character.
+        ("a UTF-8 character", "Ход".as_bytes(), &[(1, 1), (5, 0)], vec![text("Х", &bold), text("од", &plain)]),
+        // Two runs of styles that read the same are one span.
+        ("one style twice", b"one two", &[(4, 0), (3, 2)], vec![text("one two", &plain)]),
+    ];
+    for (i, (what, t, runs, spans)) in cases.into_iter().enumerate() {
+        let f = formatting(&[], &styles, runs, false);
+        let mut b = fixture_cbh::Builder::new();
+        b.text_body(&body(1, b"Chapter", 1, &content_v1(language::ENGLISH, t, &f)));
+        let db = b.write(&format!("guide-runs-{i}"));
+        let read = read_classic(&db, CodePage::WESTERN, 1).unwrap();
+        assert_eq!(paragraphs(&read), [Paragraph { spans }], "{what}");
+    }
+}
+
+/// A font name longer than any real one is cut, so that a style's spans do
+/// not each carry a copy of a stored name of any length.
+#[test]
+fn a_long_font_name_is_cut() {
+    let long = "F".repeat(1_000);
+    let t = b"one\rtwo";
+    let f = formatting(&[], &[(0, style(&long, 18, false, false))], &[(t.len(), 0)], false);
+    let mut b = fixture_cbh::Builder::new();
+    b.text_body(&body(1, b"Chapter", 1, &content_v1(language::ENGLISH, t, &f)));
+    let db = b.write("guide-long-font");
+    let read = read_classic(&db, CodePage::WESTERN, 1).unwrap();
+    for p in paragraphs(&read) {
+        assert!(matches!(&p.spans[0], Span::Text { style, .. } if style.font.chars().count() == cbh::MAX_FONT_CHARS));
+    }
+}
+
+/// Contents that do not fill the record exactly are an error: a count of none
+/// over a body, and bytes after the last content.
+#[test]
+fn contents_must_fill_the_record() {
+    let content = content_v1(language::ENGLISH, b"text", &[]);
+    let mut b = fixture_cbh::Builder::new();
+    b.text_body(&[&body(1, b"Chapter", 0, &[])[..], &content].concat());
+    b.text_body(&[&body(1, b"Chapter", 1, &content)[..], &[0]].concat());
+    let db = b.write("guide-extent");
+    for id in 1..=2 {
+        assert!(read_classic(&db, CodePage::WESTERN, id).is_err(), "record {id}");
+    }
+}
+
+/// A 2CBH text whose size field is not its content's, or whose entries do not
+/// fill it, is an error.
+#[test]
+fn a_2cbh_text_must_fill_its_record() {
+    let entry = [&42i32.to_le_bytes()[..], &u32s(9), b"<p>x</p>!"].concat();
+    let content = |size: usize, count: usize| [&5u16.to_le_bytes()[..], &u32s(size), &u32s(count), &entry].concat();
+    let fits = 4 + entry.len();
+    let mut b = fixture::Builder::new();
+    for c in [content(fits, 1), content(0, 1), content(0xffff_ffff, 1), content(fits, 0)] {
+        let at = b.move_bytes(v2::TEXT_TAG, &c);
+        b.game(at)[0] |= 2;
+    }
+    let tmp = b.write("guide-2cbh-extent");
+    let db = v2::Database::open(tmp.base()).unwrap();
+    assert!(db.guiding_text(&db.record(1).unwrap(), LIMIT).is_ok());
+    for id in 2..=4 {
+        assert!(db.guiding_text(&db.record(id).unwrap(), LIMIT).is_err(), "record {id}");
+    }
 }

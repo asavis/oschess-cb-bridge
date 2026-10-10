@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::text::{page_of, single_byte_in, text};
+use super::text::{page_of, single_byte_pieces, text};
 use super::{Database, Record};
 use crate::bytes::Cursor;
 use crate::codepage::{CodePage, utf8_or_legacy};
@@ -19,6 +19,10 @@ const MARKER: u8 = 0x04;
 const LINE: u8 = b'\r';
 /// The end of the runs.
 const END_OF_RUNS: u16 = 0xffff;
+/// The longest font name kept, in characters. Real ones are short (`FigurineCB
+/// AriesSP`); every span of a style carries its font, so a longer stored name
+/// is cut rather than copied into each of them.
+pub const MAX_FONT_CHARS: usize = 64;
 
 /// The objects read; each comes as a pair at one place, and either of a pair
 /// gives what is read of it. The other types are left out.
@@ -80,6 +84,11 @@ pub(super) fn read(b: &[u8], page: CodePage, fallback: CodePage) -> std::result:
             }
         };
         contents.push(Content { language, body });
+    }
+    // In all 1,635 real texts the contents end the record exactly; bytes past
+    // them mean the counts or lengths do not describe it.
+    if c.left() != 0 {
+        return Err("bytes after the contents");
     }
     Ok(GuidingText { contents })
 }
@@ -152,7 +161,7 @@ fn style(c: &mut Cursor<'_>, field: &impl Fn(&[u8]) -> String) -> Option<Style> 
         let v = c.take(usize::from(n))?;
         let on = v.first().is_some_and(|&b| b != 0);
         match key {
-            0 => s.font = counted(v).map(field).unwrap_or_default(),
+            0 => s.font = counted(v).map(|name| field(name).chars().take(MAX_FONT_CHARS).collect()).unwrap_or_default(),
             1 => s.bold = on,
             2 => s.italic = on,
             3 => s.underline = on,
@@ -171,8 +180,10 @@ fn counted(b: &[u8]) -> Option<&[u8]> {
 }
 
 /// The paragraphs of text `b` with its formatting data `fmt`. The text is read
-/// in the page its whole words show ([`page_of`]); names, titles and labels
-/// in the objects are read as the format's string fields are ([`text`]).
+/// once, whole, in the page its words show ([`page_of`]), and cut where a run,
+/// a line or an object begins or ends ([`single_byte_pieces`]); names, titles
+/// and labels in the objects are read as the format's string fields are
+/// ([`text`]). Neighbouring text of one style is one span.
 fn paragraphs(b: &[u8], fmt: &[u8], wide: bool, page: CodePage, fallback: CodePage) -> Vec<Paragraph> {
     let read = page_of(b, page, fallback);
     let field = |s: &[u8]| text(s, page, fallback);
@@ -183,61 +194,67 @@ fn paragraphs(b: &[u8], fmt: &[u8], wide: bool, page: CodePage, fallback: CodePa
             at_marker.entry(at).or_default().push(o);
         }
     }
-    let style_of = |id: u16| f.styles.get(&id).cloned().unwrap_or_default();
-    let mut runs = f.runs.iter();
-    let mut run_end = 0;
-    let mut style = Style::default();
-    let mut out = vec![Paragraph::default()];
-    let mut start = 0;
-    let flush = |out: &mut Vec<Paragraph>, piece: &[u8], style: &Style| {
-        let text = single_byte_in(piece, page, read);
-        if !text.is_empty() {
-            push(out, Span::Text { text, style: style.clone() });
+    // Each run's start and style, in order; past the last run, no style.
+    let mut starts = Vec::with_capacity(f.runs.len());
+    let mut end = 0usize;
+    for &(len, id) in &f.runs {
+        if len > 0 && end < b.len() {
+            starts.push((end, id));
         }
+        end = end.saturating_add(len);
+    }
+    if end < b.len() {
+        starts.push((end, u16::MAX));
+    }
+    let style_at = |at: usize| {
+        let run = starts.partition_point(|&(start, _)| start <= at);
+        run.checked_sub(1).and_then(|r| f.styles.get(&starts[r].1)).cloned().unwrap_or_default()
     };
+    // Cut at every run's start, and around every line end and marker.
+    let mut cuts: Vec<usize> = starts.iter().map(|&(start, _)| start).filter(|&start| start > 0).collect();
     for (i, &byte) in b.iter().enumerate() {
-        if i >= run_end {
-            flush(&mut out, &b[start..i], &style);
-            start = i;
-            // The run that holds byte `i`; past the last run, no style.
-            style = Style::default();
-            run_end = usize::MAX;
-            let mut end = i;
-            for &(len, id) in runs.by_ref() {
-                end += len;
-                if end > i {
-                    style = style_of(id);
-                    run_end = end;
-                    break;
-                }
-            }
+        if matches!(byte, LINE | b'\n' | MARKER) {
+            cuts.extend([i, i + 1]);
         }
-        match byte {
-            LINE | b'\n' | MARKER => {
-                flush(&mut out, &b[start..i], &style);
-                start = i + 1;
-                if byte == LINE {
-                    out.push(Paragraph::default());
-                } else if byte == MARKER {
-                    for span in objects(at_marker.get(&i).map_or(&[][..], Vec::as_slice), &style, &field) {
-                        push(&mut out, span);
-                    }
+    }
+    cuts.retain(|&cut| cut > 0 && cut < b.len());
+    cuts.sort_unstable();
+    cuts.dedup();
+    let pieces = single_byte_pieces(b, page, read, &cuts);
+
+    let mut out = vec![Paragraph::default()];
+    for (k, piece) in pieces.into_iter().enumerate() {
+        let start = if k == 0 { 0 } else { cuts[k - 1] };
+        match b.get(start) {
+            Some(&LINE) => out.push(Paragraph::default()),
+            Some(&b'\n') => {}
+            Some(&MARKER) => {
+                let style = style_at(start);
+                for span in objects(at_marker.get(&start).map_or(&[][..], Vec::as_slice), &style, &field) {
+                    push(&mut out, span);
                 }
             }
+            Some(_) if !piece.is_empty() => push(&mut out, Span::Text { text: piece, style: style_at(start) }),
             _ => {}
         }
     }
-    flush(&mut out, &b[start..], &style);
     if out.len() > 1 && out.last().is_some_and(|p| p.spans.is_empty()) {
         out.pop();
     }
     out
 }
 
+/// Adds `span` to the last paragraph, joining text to text of the same style.
 fn push(out: &mut [Paragraph], span: Span) {
-    if let Some(p) = out.last_mut() {
-        p.spans.push(span);
+    let Some(p) = out.last_mut() else { return };
+    if let (Some(Span::Text { text: last, style: last_style }), Span::Text { text, style }) =
+        (p.spans.last_mut(), &span)
+        && last_style == style
+    {
+        last.push_str(text);
+        return;
     }
+    p.spans.push(span);
 }
 
 /// The spans of the objects at one marker, in stored order: one diagram, one

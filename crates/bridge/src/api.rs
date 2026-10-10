@@ -686,14 +686,22 @@ impl<'r> GamesQuery<'r> {
     }
 }
 
-/// One reading of a guiding text: its body with its links resolved, as the
-/// answer's `contents`, and its title and author.
+/// A guiding text read: its body, the records its links name, its title and
+/// its author.
+struct TextRead {
+    text: cbformat::game::guide::GuidingText,
+    resolved: crate::texts::Resolved,
+    title: String,
+    author: String,
+}
+
+/// One reading of a guiding text.
 enum TextAttempt {
     NotFound,
     NotAText,
     /// The header changed while the text was read, or could not be read.
     Changed,
-    Read(cbformat::Result<(String, String, String)>),
+    Read(cbformat::Result<TextRead>),
 }
 
 /// Reads guiding text `number` of `db` between two reads of its header, as
@@ -712,7 +720,7 @@ fn text_attempt<S: Store>(app: &App, db: &S, number: u32) -> TextAttempt {
             let resolved = crate::texts::resolve(db, &text)?;
             let mut names = Names::new(db);
             let (title, author) = before.other().unwrap_or((-1, -1));
-            Ok((crate::texts::contents(&text, &resolved), names.title(title)?, names.annotator(author)?))
+            Ok(TextRead { text, resolved, title: names.title(title)?, author: names.annotator(author)? })
         })
     };
     if let Some(hook) = &app.between_reads {
@@ -741,10 +749,12 @@ fn text(app: &App, entry: &Entry, number: &str) -> Response {
             continue;
         }
         return match read {
-            Ok((contents, title, author)) => {
-                // The contents, the title and author, and at most 192 bytes of
-                // keys and numbers.
-                let size = contents.len() + json::string_len(&title) + json::string_len(&author) + 192;
+            Ok(TextRead { text, resolved, title, author }) => {
+                // The contents' bound, the title and author, and at most 192
+                // bytes of keys and numbers, refused or reserved before the
+                // answer is built.
+                let size =
+                    crate::texts::contents_len(&text) + json::string_len(&title) + json::string_len(&author) + 192;
                 if size > MAX_GAME_RESPONSE {
                     let reason =
                         format!("the text's answer would be {size} bytes, over the {MAX_GAME_RESPONSE}-byte limit");
@@ -758,7 +768,7 @@ fn text(app: &App, entry: &Entry, number: &str) -> Response {
                     .num("number", number)
                     .str("title", &title)
                     .str("author", &author)
-                    .raw("contents", &contents);
+                    .raw("contents", &crate::texts::contents(&text, &resolved));
                 ok(body.done()).holding(hold)
             }
             Err(Error::Io(..)) => database_changing(),

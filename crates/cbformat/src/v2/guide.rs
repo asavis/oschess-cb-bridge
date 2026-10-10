@@ -35,11 +35,15 @@ impl Database {
 /// the `u32` number of entries, and each entry a nation (as a text annotation
 /// names its language), the `u32` size of the HTML and the HTML. ChessBase
 /// writes an entry for each of its languages, empty where the text has none;
-/// those are left out.
+/// those are left out. The size and the entries fill the content exactly, as
+/// in all 1,823 real texts; anything else is an error.
 pub(crate) fn read(b: &[u8]) -> std::result::Result<GuidingText, &'static str> {
     let mut c = Cursor::new(b);
     c.le_u16().ok_or("no version")?;
-    c.le_u32().ok_or("no size")?;
+    let size = c.le_u32().ok_or("no size")?;
+    if usize::try_from(size).ok() != Some(c.left()) {
+        return Err("a size that is not the content's");
+    }
     let count = c.le_u32().ok_or("no entries")?;
     let mut contents = Vec::new();
     for _ in 0..count {
@@ -53,6 +57,9 @@ pub(crate) fn read(b: &[u8]) -> std::result::Result<GuidingText, &'static str> {
         // above every language, as `language_of` gives other nations.
         let language = u8::try_from(nation).map_or(0x100 + 0xff, language_of);
         contents.push(Content { language, body: Body::Html(utf8_or_legacy(html)) });
+    }
+    if c.left() != 0 {
+        return Err("bytes after the entries");
     }
     Ok(GuidingText { contents })
 }

@@ -97,3 +97,53 @@ fn a_damaged_text_is_unreadable() {
     assert_eq!((status, body.contains(r#""code":"unreadable_text""#)), (422, true), "{body}");
     assert!(body.contains("reason"), "{body}");
 }
+
+/// Links compare names and titles as stored, never cut for display: a title
+/// of 210 characters finds its text. A game link that leaves white empty
+/// matches any white; one that names nothing names no game.
+#[test]
+fn links_match_stored_names_and_empty_fields_match_anything() {
+    let mut b = Builder::new();
+    let (white, black) = (b.player("Doe", "Jane"), b.player("Roe", "Richard"));
+    let g = b.game(&e4());
+    g[0x09..0x0c].copy_from_slice(&white.to_be_bytes()[1..]);
+    g[0x0c..0x0f].copy_from_slice(&black.to_be_bytes()[1..]);
+    let long = "T".repeat(210);
+    let f = formatting(&[], &[(0, style("Arial", 18, false, false))], &[(4, 0)], false);
+    b.text_body(&body(1, long.as_bytes(), 1, &content_v1(language::ENGLISH, b"Long", &f)));
+    let t = b"\x04 \x04 \x04";
+    let objects = [
+        (0x05, 1, counted(long.as_bytes())),
+        (0x1a, 3, game_link("", "Roe,Richard", "", Some("2.1"))),
+        (0x1a, 5, game_link("", "", "", Some("2.2"))),
+    ];
+    let f = formatting(&objects, &[(0, style("Arial", 18, false, false))], &[(t.len(), 0)], false);
+    b.text_body(&body(1, b"Links", 1, &content_v1(language::ANY, t, &f)));
+    let db = b.write("texts-stored-names");
+    let path = db.dir().join("db.cbh");
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let (status, body) = get(bridge.port, &format!("/v1/databases/{}/texts/3", id_of(&path)));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(&format!(r#"{{"textLink":{{"title":"{long}","number":2}}}}"#)), "{body}");
+    assert!(body.contains(r#""label":"2.1","white":"","black":"Roe, Richard","event":"","number":1"#), "{body}");
+    assert!(body.contains(r#""label":"2.2","white":"","black":"","event":"","number":null"#), "{body}");
+}
+
+/// An answer over the limit is refused, before it is built: an HTML text of
+/// control characters, which JSON writes six bytes each.
+#[test]
+fn a_text_too_large_to_serve_is_unreadable() {
+    let html = vec![1u8; 1_500_000];
+    let mut content = language::ENGLISH.to_le_bytes().to_vec();
+    content.extend((html.len() as u32).to_le_bytes());
+    content.extend(&html);
+    content.extend([0; 4]);
+    let mut b = Builder::new();
+    b.text_body(&body(3, b"Big", 1, &content));
+    let db = b.write("texts-too-large");
+    let path = db.dir().join("db.cbh");
+    let bridge = TestBridge::new(app_of([path.clone()]));
+    let (status, body) = get(bridge.port, &format!("/v1/databases/{}/texts/1", id_of(&path)));
+    assert_eq!((status, body.contains(r#""code":"unreadable_text""#)), (422, true), "{}", &body[..body.len().min(300)]);
+    assert!(body.contains("over the"), "{body}");
+}

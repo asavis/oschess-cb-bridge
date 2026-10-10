@@ -1153,8 +1153,10 @@ number for the text's language.
 `\r` ends a paragraph; the text holds no `\n`, and no `0x9e` diagram mark.
 The byte `0x04` stands where an object of the formatting data is placed
 (30,755 in all). Piece bytes (`0xa2`-`0xa7`) appear in 451 texts and read as a
-comment's do. The bridge decides the code page once from the whole text and
-reads each run of it in that page.
+comment's do. The bridge decides the code page once from the whole text,
+reads the whole text once, and cuts it where runs, lines and objects begin, so
+a figurine, a diagram mark or a UTF-8 character reads the same whichever run
+it falls in.
 
 ### Formatting data
 
@@ -1201,7 +1203,8 @@ and without objects.
 
 **What the bridge reads** (`examples/guide_census.rs` over the same
 databases and the 2CBH ones, counts only): all 3,458 texts read, none failed.
-Their 1,631 contents of versions 1 and 2 give 99,723 text spans, 9,028
+Their 1,631 contents of versions 1 and 2 give 92,514 text spans (neighbouring
+runs of one style joined), 9,028
 diagrams (two diagrams hold a square code no piece has), 12,695 game links
 and 4,459 text links. Resolved as `docs/api.md` describes, 12,491 game links
 and 4,392 text links name a record of their database.
