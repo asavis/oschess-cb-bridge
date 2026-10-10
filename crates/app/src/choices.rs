@@ -77,7 +77,10 @@ impl Choices {
         install: impl FnOnce() -> Result<PathBuf, String>,
         probe: impl FnOnce(&Path) -> Result<(), String>,
     ) -> Result<bool, String> {
-        self.update(config_path, install, || {}, probe)
+        let _installing = self.begin_installing()?;
+        let ticket = self.ticket();
+        let exe = install()?;
+        self.choose_installed(ticket, config_path, exe, probe)
     }
 
     /// Installs as [`Choices::install`] does, then waits with `wait` before
@@ -85,23 +88,48 @@ impl Choices {
     /// bridge is idle, as choosing another engine stops a running analysis
     /// (#322). The installation no longer counts as running while it waits,
     /// so neither an update of the bridge nor the user's own installation
-    /// waits for that; a choice made meanwhile stands.
+    /// waits for that; a choice made meanwhile stands. `wait` answering false
+    /// gives the choice up: nothing is chosen, and the build stays listed.
     pub fn update(
         &self,
         config_path: &Path,
         install: impl FnOnce() -> Result<PathBuf, String>,
-        wait: impl FnOnce(),
+        wait: impl FnOnce() -> bool,
         probe: impl FnOnce(&Path) -> Result<(), String>,
     ) -> Result<bool, String> {
         let (ticket, exe) = {
             let _installing = self.begin_installing()?;
             (self.ticket(), install()?)
         };
-        wait();
+        if !wait() {
+            return Ok(false);
+        }
+        self.choose_installed(ticket, config_path, exe, probe)
+    }
+
+    /// Chooses the build `exe` an installation that began at `ticket`
+    /// installed, once `probe` accepts it, unless an engine was chosen since.
+    fn choose_installed(
+        &self,
+        ticket: Ticket,
+        config_path: &Path,
+        exe: PathBuf,
+        probe: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<bool, String> {
         let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
         probe(&exe)?;
         // A choice made while the download ran stands; the build stays listed.
         self.save_if_current(ticket, config_path, exe)
+    }
+
+    /// Runs `settled` while no installation runs and no engine is being
+    /// chosen, and holds both off until it ends: the removal of older builds
+    /// reads the choice and removes folders while neither can change (#322).
+    /// `None`, with `settled` not run, while an installation runs.
+    pub fn while_settled<R>(&self, settled: impl FnOnce() -> R) -> Option<R> {
+        let _installing = self.begin_installing().ok()?;
+        let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(settled())
     }
 
     /// Holds the one installation, or refuses a second.
@@ -368,7 +396,10 @@ mod tests {
                 events.borrow_mut().push(format!("install, installing {}", choices.installing()));
                 Ok(PathBuf::from("stockfish-20.exe"))
             },
-            || events.borrow_mut().push(format!("wait, installing {}", choices.installing())),
+            || {
+                events.borrow_mut().push(format!("wait, installing {}", choices.installing()));
+                true
+            },
             |exe| {
                 events.borrow_mut().push(format!("probe {}", exe.display()));
                 Ok(())
@@ -382,10 +413,94 @@ mod tests {
         let chosen = choices.update(
             &toml,
             || Ok(PathBuf::from("stockfish-21.exe")),
-            || choices.choose(&toml, PathBuf::from("lc0.exe"), accept).unwrap(),
+            || {
+                choices.choose(&toml, PathBuf::from("lc0.exe"), accept).unwrap();
+                true
+            },
             accept,
         );
         assert_eq!(chosen, Ok(false));
+        assert_eq!(engine_in(&toml), Some(PathBuf::from("lc0.exe")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wait that gives the update up chooses nothing; the installation
+    /// still happened, and the next one starts.
+    #[test]
+    fn an_update_given_up_while_it_waits_chooses_nothing() {
+        let dir = folder("given-up");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let probed = RefCell::new(false);
+        let chosen = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-20.exe")),
+            || false,
+            |_| {
+                *probed.borrow_mut() = true;
+                Ok(())
+            },
+        );
+        assert_eq!(chosen, Ok(false));
+        assert!(!*probed.borrow(), "nothing is probed either");
+        assert_eq!(engine_in(&toml), None);
+        assert_eq!(choices.install(&toml, || Ok(PathBuf::from("stockfish.exe")), accept), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manual installation counts as running until its build is chosen:
+    /// an update of the bridge waits through the probe too (#61).
+    #[test]
+    fn an_installation_runs_until_its_build_is_chosen() {
+        let dir = folder("runs");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let during_probe = RefCell::new(None);
+        let chosen = choices.install(
+            &toml,
+            || Ok(PathBuf::from("stockfish.exe")),
+            |_| {
+                *during_probe.borrow_mut() = Some(choices.installing());
+                Ok(())
+            },
+        );
+        assert_eq!(chosen, Ok(true));
+        assert_eq!(*during_probe.borrow(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settled work runs only with no installation running, and holds off
+    /// installations and choices until it ends (#322).
+    #[test]
+    fn settled_work_holds_off_installations_and_choices() {
+        static CHOICES: Choices = Choices::new();
+        let dir = folder("settled");
+        let toml = dir.join("bridge.toml");
+        // Not while an installation runs.
+        let inside = CHOICES.install(
+            &toml,
+            || {
+                assert_eq!(CHOICES.while_settled(|| panic!("settled work runs during an installation")), None);
+                Ok(PathBuf::from("stockfish.exe"))
+            },
+            accept,
+        );
+        assert_eq!(inside, Ok(true));
+        // A choice made while it runs waits for it; an installation is refused.
+        let (done_tx, done) = mpsc::channel();
+        let settled = CHOICES.while_settled(|| {
+            let path = toml.clone();
+            std::thread::spawn(move || done_tx.send(CHOICES.choose(&path, PathBuf::from("lc0.exe"), accept)));
+            assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "the choice waits");
+            assert_eq!(engine_in(&toml), Some(PathBuf::from("stockfish.exe")));
+            assert_eq!(
+                CHOICES.install(&toml, || panic!("an installation runs"), accept),
+                Err("Stockfish is being installed already".into())
+            );
+            "settled"
+        });
+        assert_eq!(settled, Some("settled"));
+        assert_eq!(done.recv_timeout(crate::PATIENCE).expect("then it is saved"), Ok(()));
         assert_eq!(engine_in(&toml), Some(PathBuf::from("lc0.exe")));
         let _ = std::fs::remove_dir_all(&dir);
     }

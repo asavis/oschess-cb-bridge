@@ -27,6 +27,7 @@ use bridge::sync::lock;
 use serde::Deserialize;
 
 use crate::choices::Choices;
+use crate::prefs;
 
 /// How old a release must be before the bridge installs it: a week.
 pub const SETTLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -143,6 +144,8 @@ fn unix_seconds(text: &str) -> Option<u64> {
 /// What a look did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
+    /// «Update Stockfish automatically» is off: nothing was looked up.
+    Off,
     /// The chosen engine is none the bridge installed: nothing is replaced.
     NotOurs,
     /// The chosen build is the newest release's.
@@ -152,6 +155,9 @@ pub enum Outcome {
     /// The newest release's build was installed, but the user chose another
     /// engine meanwhile; it stays listed.
     Kept(String),
+    /// The newest release's build was installed, but the user turned the
+    /// option off while it waited; nothing was chosen, and it stays listed.
+    Withdrawn(String),
 }
 
 /// What a look works with: the data folder, its `bridge.toml`, the app's
@@ -168,34 +174,59 @@ pub struct Look<'a> {
 }
 
 impl Look<'_> {
-    /// Looks up the newest release and, when the chosen engine is an older
-    /// build the bridge installed, installs the release's build, waits with
-    /// `wait` until the bridge is idle, and chooses the build once `probe`
-    /// accepts it, unless the user chose another engine meanwhile
-    /// ([`Choices::update`]). Once the chosen build is the newest, the older
-    /// builds the bridge installed go. A failed lookup or installation
-    /// changes nothing.
-    pub fn run(&self, wait: impl FnOnce(), probe: impl FnOnce(&Path) -> Result<(), String>) -> Result<Outcome, String> {
+    /// While «Update Stockfish automatically» is on, looks up the newest
+    /// release and, when the chosen engine is an older build the bridge
+    /// installed, installs the release's build, waits with `wait` until the
+    /// bridge is idle, and chooses the build once `probe` accepts it, unless
+    /// the user chose another engine meanwhile ([`Choices::update`]). `wait`
+    /// answers false when it gave up, as when the option was turned off; the
+    /// option is read again after it. Once the chosen build is the newest,
+    /// the older builds the bridge installed go ([`Look::remove_older`]). A
+    /// failed lookup or installation changes nothing.
+    pub fn run(
+        &self,
+        wait: impl FnOnce() -> bool,
+        probe: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<Outcome, String> {
+        if !self.wanted() {
+            return Ok(Outcome::Off);
+        }
         let newest = self.known.look_up(self.transport, self.arch, self.now)?;
         let chosen = config::load_or_create(self.config_path)?.engine;
         let Some(current) = chosen.as_deref().and_then(|c| stockfish::installed_version(self.data, c)) else {
             return Ok(Outcome::NotOurs);
         };
         if !stockfish::is_newer(&newest.version, &current) {
-            self.remove_older(&current);
+            self.remove_older();
             return Ok(Outcome::Current);
         }
         let version = newest.version.to_string();
         let install = || stockfish::install(self.data, &newest, self.transport, &mut |_| {});
-        if !self.choices.update(self.config_path, install, wait, probe)? {
-            return Ok(Outcome::Kept(version));
+        if !self.choices.update(self.config_path, install, || wait() && self.wanted(), probe)? {
+            return Ok(if self.wanted() { Outcome::Kept(version) } else { Outcome::Withdrawn(version) });
         }
-        self.remove_older(&version);
+        self.remove_older();
         Ok(Outcome::Updated(version))
     }
 
-    fn remove_older(&self, kept: &str) {
-        let (removed, failed) = stockfish::remove_older(self.data, kept);
+    /// Whether «Update Stockfish automatically» is on now.
+    fn wanted(&self) -> bool {
+        prefs::load(self.data).stockfish_auto_update
+    }
+
+    /// Removes the builds the bridge installed that are older than the
+    /// chosen one, while the option is on and the chosen engine is a build
+    /// the bridge installed. The choice is read when no engine can be chosen
+    /// and no build installed ([`Choices::while_settled`]), so that the build
+    /// chosen then is never removed; while an installation runs, a later look
+    /// removes them.
+    fn remove_older(&self) {
+        let removal = self.choices.while_settled(|| {
+            let chosen = config::load_or_create(self.config_path).ok()?.engine?;
+            let kept = stockfish::installed_version(self.data, &chosen)?;
+            self.wanted().then(|| stockfish::remove_older(self.data, &kept))
+        });
+        let Some(Some((removed, failed))) = removal else { return };
         for version in removed {
             bridge::log!("Stockfish update: Stockfish {version} removed");
         }
@@ -336,7 +367,7 @@ mod tests {
         let config_path = dir.join("bridge.toml");
         let look =
             Look { data: dir, config_path: &config_path, choices, known, transport, arch: Arch::X86_64, now: now() };
-        look.run(|| {}, |_| Ok(()))
+        look.run(|| true, |_| Ok(()))
     }
 
     #[test]
@@ -420,7 +451,7 @@ mod tests {
             arch: Arch::X86_64,
             now: published + Duration::from_secs(3_600),
         };
-        assert_eq!(young.run(|| {}, |_| Ok(())), Err("Stockfish 20 is less than 7 days old".into()));
+        assert_eq!(young.run(|| true, |_| Ok(())), Err("Stockfish 20 is less than 7 days old".into()));
         assert_eq!(&known.newest(Arch::X86_64), Build::for_arch(Arch::X86_64));
         assert_eq!(chosen(&dir), Some(exe));
         assert!(lock(&transport.downloads).is_empty());
@@ -521,6 +552,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With the option off, nothing is looked up; turned off while an update
+    /// waits, the update chooses nothing and removes nothing (#322 review).
+    #[test]
+    fn the_option_turned_off_stops_a_look_and_a_waiting_update() {
+        let dir = folder("off");
+        let exe = installed(&dir, "19");
+        choose(&dir, &exe);
+        let config_path = dir.join("bridge.toml");
+        let (choices, known) = (Choices::new(), Known::new());
+        prefs::update(&dir, |p| p.stockfish_auto_update = false).unwrap();
+        let offline = fake(Err("no lookup may run".into()));
+        assert_eq!(look(&dir, &choices, &known, &offline), Ok(Outcome::Off));
+
+        prefs::update(&dir, |p| p.stockfish_auto_update = true).unwrap();
+        installed(&dir, "18");
+        let transport = fake(Ok(hello("20")));
+        let look = Look {
+            data: &dir,
+            config_path: &config_path,
+            choices: &choices,
+            known: &known,
+            transport: &transport,
+            arch: Arch::X86_64,
+            now: now(),
+        };
+        let off_while_waiting = || {
+            prefs::update(&dir, |p| p.stockfish_auto_update = false).unwrap();
+            true
+        };
+        assert_eq!(look.run(off_while_waiting, |_| Ok(())), Ok(Outcome::Withdrawn("20".into())));
+        assert_eq!(chosen(&dir), Some(exe.clone()));
+        assert_eq!(builds(&dir), ["stockfish-18", "stockfish-19", "stockfish-20"]);
+        // A wait that gives up by itself chooses nothing either.
+        prefs::update(&dir, |p| p.stockfish_auto_update = true).unwrap();
+        assert_eq!(look.run(|| false, |_| Ok(())), Ok(Outcome::Kept("20".into())));
+        assert_eq!(chosen(&dir), Some(exe));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The removal reads the choice it keeps when it runs: an older build
+    /// the user chose after the update stays, with every newer one, and a
+    /// choice of another engine removes nothing (#322 review).
+    #[test]
+    fn the_removal_keeps_the_build_chosen_when_it_runs() {
+        let dir = folder("removal");
+        let config_path = dir.join("bridge.toml");
+        let older = installed(&dir, "18");
+        installed(&dir, "17");
+        installed(&dir, "19");
+        installed(&dir, "20");
+        let (choices, known, transport) = (Choices::new(), Known::new(), fake(Ok(hello("20"))));
+        let look = Look {
+            data: &dir,
+            config_path: &config_path,
+            choices: &choices,
+            known: &known,
+            transport: &transport,
+            arch: Arch::X86_64,
+            now: now(),
+        };
+        choose(&dir, Path::new(r"C:\lc0\lc0.exe"));
+        look.remove_older();
+        assert_eq!(builds(&dir), ["stockfish-17", "stockfish-18", "stockfish-19", "stockfish-20"], "another engine");
+        choices.choose(&config_path, older.clone(), |_| Ok::<(), String>(())).unwrap();
+        look.remove_older();
+        assert_eq!(builds(&dir), ["stockfish-18", "stockfish-19", "stockfish-20"]);
+        assert!(older.is_file(), "the chosen build stays");
+        // Not while an installation runs; the option off removes nothing.
+        let during = choices.install(
+            &config_path,
+            || {
+                choose(&dir, &installed(&dir, "20"));
+                look.remove_older();
+                assert_eq!(builds(&dir), ["stockfish-18", "stockfish-19", "stockfish-20"]);
+                Ok(older.clone())
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(during, Ok(true));
+        choose(&dir, &installed(&dir, "20"));
+        prefs::update(&dir, |p| p.stockfish_auto_update = false).unwrap();
+        look.remove_older();
+        assert_eq!(builds(&dir), ["stockfish-18", "stockfish-19", "stockfish-20"]);
+        prefs::update(&dir, |p| p.stockfish_auto_update = true).unwrap();
+        look.remove_older();
+        assert_eq!(builds(&dir), ["stockfish-20"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The choice waits until the bridge is idle, and one the user makes
     /// meanwhile stands; the new build stays listed, and the older one too.
     #[test]
@@ -542,13 +662,14 @@ mod tests {
         let wait = || {
             assert_eq!(chosen(&dir), Some(exe.clone()), "nothing is chosen before the bridge is idle");
             choices.choose(&config_path, PathBuf::from(r"C:\lc0\lc0.exe"), |_| Ok::<(), String>(())).unwrap();
+            true
         };
         assert_eq!(look.run(wait, |_| Ok(())), Ok(Outcome::Kept("20".into())));
         assert_eq!(chosen(&dir), Some(PathBuf::from(r"C:\lc0\lc0.exe")));
         assert_eq!(builds(&dir), ["stockfish-19", "stockfish-20"]);
         // A build that does not answer is not chosen either.
         choose(&dir, &exe);
-        let refused = look.run(|| {}, |_| Err("no uciok".into()));
+        let refused = look.run(|| true, |_| Err("no uciok".into()));
         assert_eq!(refused, Err("no uciok".into()));
         assert_eq!(chosen(&dir), Some(exe));
         let _ = std::fs::remove_dir_all(&dir);

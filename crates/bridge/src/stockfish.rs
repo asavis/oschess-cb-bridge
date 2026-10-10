@@ -223,11 +223,12 @@ pub fn installed_version(data: &Path, exe: &Path) -> Option<String> {
     is_version(version).then(|| version.to_string())
 }
 
-/// The prefix of a folder being removed, beside the builds.
-const REMOVING: &str = ".remove-";
+/// The prefix of a build's folder being removed, beside the builds.
+const REMOVING: &str = ".remove-stockfish-";
 
 /// Removes the builds the bridge installed in the data folder `data` whose
-/// version is older than `kept` (#322), and what an earlier removal left.
+/// version is older than `kept` (#322), and what an earlier removal of a
+/// build left (`.remove-stockfish-<version>`); no other folder is touched.
 /// Each build's folder is renamed aside first: Windows refuses that while its
 /// engine runs, and the build then stays whole until a later call. Answers
 /// the versions removed and the reasons of those that stayed, which name no
@@ -243,7 +244,7 @@ pub fn remove_older(data: &Path, kept: &str) -> (Vec<String>, Vec<String>) {
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     for name in folders {
-        if name.starts_with(REMOVING) {
+        if name.strip_prefix(REMOVING).is_some_and(is_version) {
             if let Err(e) = std::fs::remove_dir_all(engines.join(&name)) {
                 failed.push(format!("{name}: {e}"));
             }
@@ -253,7 +254,7 @@ pub fn remove_older(data: &Path, kept: &str) -> (Vec<String>, Vec<String>) {
         if !is_newer(kept, version) {
             continue;
         }
-        let aside = engines.join(format!("{REMOVING}{name}"));
+        let aside = engines.join(format!("{REMOVING}{version}"));
         let _ = std::fs::remove_dir_all(&aside);
         match std::fs::rename(engines.join(&name), &aside) {
             Ok(()) => {
@@ -429,13 +430,13 @@ impl Transport for System {
             .arg("--output")
             .arg(folders::outside(to))
             .arg(url);
-        run(curl, "curl.exe", "The download failed").map(drop)
+        run(curl, "curl.exe", "The download failed", QUIET).map(drop)
     }
 
     fn extract(&self, zip: &Path, members: &[String], to: &Path) -> Result<(), String> {
         let mut tar = system_tool("tar.exe")?;
         tar.arg("-xf").arg(folders::outside(zip)).arg("-C").arg(folders::outside(to)).args(members);
-        run(tar, "tar.exe", "Unpacking failed").map(drop)
+        run(tar, "tar.exe", "Unpacking failed", QUIET).map(drop)
     }
 
     fn fetch(&self, url: &str, max_size: u64) -> Result<Vec<u8>, String> {
@@ -445,27 +446,62 @@ impl Transport for System {
             .args(["--max-filesize", &max_size.to_string()])
             .args(["--connect-timeout", "15", "--max-time", "60"])
             .arg(url);
-        let answer = run(curl, "curl.exe", "The lookup failed")?;
-        // A server that names no length is cut off by the length read.
-        if answer.len() as u64 > max_size {
-            return Err(format!("The lookup failed: an answer of more than {max_size} bytes"));
-        }
-        Ok(answer)
+        // Before 8.4, curl bounds only an answer whose length the server
+        // names; `run` bounds what it reads all the same.
+        run(curl, "curl.exe", "The lookup failed", max_size)
     }
 }
 
-/// Runs the tool `name` as `command` and answers what it wrote. A failure is
-/// `failed` with the tool's exit status and the reason it gave.
-fn run(mut command: std::process::Command, name: &str, failed: &str) -> Result<Vec<u8>, String> {
+/// Runs the tool `name` as `command` and answers what it wrote, at most
+/// `limit` bytes: a tool that writes more is stopped, so that nothing it
+/// writes is held beyond that. A failure is `failed` with the tool's exit
+/// status and the reason it gave.
+fn run(mut command: std::process::Command, name: &str, failed: &str, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     use std::process::Stdio;
-    let out = command
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| format!("{name}: {e}"))?;
-    if out.status.success() { Ok(out.stdout) } else { Err(failure(failed, &out.status.to_string(), &out.stderr)) }
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{name}: no output"));
+    };
+    // The error output is read beside the output, so that neither pipe
+    // stalls the tool, and only its end is kept.
+    let errors = std::thread::spawn(move || {
+        let (mut tail, mut chunk) = (Vec::new(), [0u8; 8192]);
+        while let Ok(n @ 1..) = stderr.read(&mut chunk) {
+            tail.extend_from_slice(&chunk[..n]);
+            if tail.len() > ERRORS {
+                tail.drain(..tail.len() - ERRORS);
+            }
+        }
+        tail
+    });
+    let mut out = Vec::new();
+    let read = stdout.take(limit.saturating_add(1)).read_to_end(&mut out);
+    if out.len() as u64 > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = errors.join();
+        return Err(format!("{failed}: more than {limit} bytes"));
+    }
+    let status = child.wait().map_err(|e| format!("{name}: {e}"))?;
+    let stderr = errors.join().unwrap_or_default();
+    read.map_err(|e| format!("{name}: {e}"))?;
+    if status.success() { Ok(out) } else { Err(failure(failed, &status.to_string(), &stderr)) }
 }
+
+/// The most a tool that should write nothing, `curl.exe` writing to a file
+/// or `tar.exe` unpacking, may write before it is stopped.
+const QUIET: u64 = 1 << 20;
+
+/// The most of a tool's error output kept: its end, where the reason is.
+const ERRORS: usize = 64 << 10;
 
 /// `failed` with the tool's exit status `status` and the last line of its
 /// error output `stderr`, such as curl's "(23) Failure writing output to
@@ -676,6 +712,37 @@ mod tests {
         assert_eq!([0, 1, 1 << 20, (1 << 20) + 1].map(megabytes), [0, 1, 1, 2]);
     }
 
+    /// A tool's output is read up to the limit and no further: one that
+    /// writes more, without end here, is stopped and refused (#322). Its
+    /// error output's last line is the reason, however long that output is.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_is_read_up_to_its_limit_and_stopped_beyond_it() {
+        let sh = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        assert_eq!(run(sh("printf hello"), "sh", "The lookup failed", 5), Ok(b"hello".to_vec()));
+        assert_eq!(
+            run(sh("printf hello"), "sh", "The lookup failed", 4),
+            Err("The lookup failed: more than 4 bytes".into())
+        );
+        let endless = run(sh("yes"), "sh", "The lookup failed", 1 << 20);
+        assert_eq!(endless, Err(format!("The lookup failed: more than {} bytes", 1 << 20)));
+        // Endless error output stalls nothing, and is cut to its end.
+        let noisy = run(
+            sh("head -c 300000 /dev/zero | tr '\\0' x >&2; echo >&2; echo 'curl: (6) no host' >&2; exit 6"),
+            "sh",
+            "The lookup failed",
+            16,
+        );
+        assert_eq!(noisy, Err("The lookup failed (exit status: 6): curl: (6) no host".into()));
+        assert!(
+            run(std::process::Command::new("/nonexistent/tool"), "tool", "x", 1).unwrap_err().starts_with("tool: ")
+        );
+    }
+
     /// A failed tool's own reason reaches the message, not its exit code
     /// alone (#289).
     #[test]
@@ -811,6 +878,11 @@ mod tests {
             std::fs::write(engines.join(name).join(LICENCE), b"GPL").unwrap();
         }
         std::fs::write(engines.join(".download-stockfish.zip"), b"partial").unwrap();
+        // Folders of the same prefix that no removal of a build left stay.
+        for other in [".remove-lc0", ".remove-stockfish-dev", ".remove-", ".unpack-stockfish-20"] {
+            std::fs::create_dir_all(engines.join(other)).unwrap();
+            std::fs::write(engines.join(other).join("marker"), b"mine").unwrap();
+        }
         let (mut removed, failed) = remove_older(&dir, "19");
         removed.sort();
         assert_eq!(removed, ["17.1", "18"]);
@@ -818,7 +890,20 @@ mod tests {
         let mut left: Vec<String> =
             std::fs::read_dir(&engines).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
-        assert_eq!(left, [".download-stockfish.zip", "lc0", "stockfish-19", "stockfish-20"]);
+        assert_eq!(
+            left,
+            [
+                ".download-stockfish.zip",
+                ".remove-",
+                ".remove-lc0",
+                ".remove-stockfish-dev",
+                ".unpack-stockfish-20",
+                "lc0",
+                "stockfish-19",
+                "stockfish-20"
+            ]
+        );
+        assert_eq!(std::fs::read(engines.join(".remove-lc0").join("marker")).unwrap(), b"mine");
         assert_eq!(remove_older(&dir, "19"), (vec![], vec![]), "nothing more to remove");
         assert_eq!(remove_older(&dir.join("none"), "19"), (vec![], vec![]), "no engines folder");
         let _ = std::fs::remove_dir_all(&dir);

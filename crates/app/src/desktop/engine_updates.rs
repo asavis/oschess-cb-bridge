@@ -45,7 +45,8 @@ pub fn look_now(app: &AppHandle) {
     }
 }
 
-/// Looks while the option is on. A new build chosen is announced, and the
+/// Looks while the option is on; an update waiting for the bridge to be idle
+/// ends when it is turned off. A new build chosen is announced, and the
 /// windows read the engines again.
 fn look(app: &AppHandle) {
     let _one = match LOOKING.try_lock() {
@@ -55,9 +56,6 @@ fn look(app: &AppHandle) {
     };
     let shared = shared(app);
     let (Ok(data), Ok(config_path)) = (shared.dir(), shared.config_path()) else { return };
-    if !prefs::load(&data).stockfish_auto_update {
-        return;
-    }
     let look = Look {
         data: &data,
         config_path: &config_path,
@@ -67,7 +65,8 @@ fn look(app: &AppHandle) {
         arch: stockfish::machine_arch(),
         now: SystemTime::now(),
     };
-    match look.run(|| updater::wait_idle(&shared), |exe| engine::probe(exe).map(drop)) {
+    let wanted = || prefs::load(&data).stockfish_auto_update;
+    match look.run(|| updater::wait_idle_while(&shared, wanted), |exe| engine::probe(exe).map(drop)) {
         Ok(Outcome::Updated(version)) => {
             bridge::log!("Stockfish update: Stockfish {version} installed and chosen");
             let strings = &shared.strings;
@@ -82,7 +81,13 @@ fn look(app: &AppHandle) {
             bridge::log!("Stockfish update: Stockfish {version} installed; another engine was chosen meanwhile");
             let _ = app.emit("engines-changed", ());
         }
-        Ok(Outcome::Current | Outcome::NotOurs) => {}
+        Ok(Outcome::Withdrawn(version)) => {
+            bridge::log!(
+                "Stockfish update: Stockfish {version} installed; the update was turned off before the switch"
+            );
+            let _ = app.emit("engines-changed", ());
+        }
+        Ok(Outcome::Off | Outcome::Current | Outcome::NotOurs) => {}
         Err(e) => bridge::log!("Stockfish update: {e}"),
     }
 }
