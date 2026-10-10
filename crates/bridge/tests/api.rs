@@ -87,7 +87,7 @@ fn status_and_databases() {
     assert!(
         has_members(
             &s.body,
-            r#""bridge":{"version":"test","api":1,"features":["explorerSearch","fragmentSearch","analysisGames"]}"#
+            r#""bridge":{"version":"test","api":1,"features":["explorerSearch","fragmentSearch","analysisGames","guidingTexts"]}"#
         ),
         "{}",
         s.body

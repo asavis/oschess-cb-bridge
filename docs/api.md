@@ -150,6 +150,8 @@ with them.
 | 422 | `games_would_join` | A write would join games: the new game to a neighbour, or the games on either side of one removed, because a game next to it lacks its result or holds tags alone. Nothing was written |
 | 422 | `unencodable` | The game of a write holds a character that the file's code page cannot store; `character` names the first. Nothing was written |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
+| 422 | `not_a_text` | `GET /v1/databases/{id}/texts/{number}` names a record that is not a guiding text |
+| 422 | `unreadable_text` | The guiding text's record is damaged and stays so between reads, or it is too large to serve (a record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
 | 428 | `precondition_required` | A write without `If-Match` |
 | 431 | `headers_too_large` | Request line and headers over 16 KiB |
 | 500 | `write_failed` | The file system refused a write for another reason than another program holding the file, a full disk among them. The file is as it was; the bridge logs why |
@@ -287,7 +289,8 @@ names the optional features of version 1 this bridge has, each once (#270):
 `fragmentSearch`, the games of a position fragment and of material, with
 their `fragment` acknowledgement (#272, [Games of a fragment](#games-of-a-fragment));
 `analysisGames`, analyses served as PGN by `GET /v1/databases/{id}/games/{number}`
-(#323), which an older bridge answers `422 not_a_game`.
+(#323), which an older bridge answers `422 not_a_game`; `guidingTexts`,
+[`GET /v1/databases/{id}/texts/{number}`](#get-v1databasesidtextsnumber) (#324).
 A client offers a feature only when it finds it named. A bridge older than
 the list sends no `features`, which a client reads as an empty list, and a
 client ignores names it does not know (Compatibility, rule 2: a field only
@@ -461,6 +464,8 @@ what the format stores otherwise:
   does.
 - **A guiding text** keeps its titles, one per language, in its own record:
   its row shows the first that is not blank, and its author is its annotator.
+  Its body is served by `GET /v1/databases/{id}/texts/{number}`, with its
+  formatting, diagrams and links where its format version is 1 or 2.
   The format has no analyses.
 - **`moves`** is at most 255, as the header stores it; the game's PGN has
   every move.
@@ -877,6 +882,59 @@ These types are `[%cbraw …]`, their data kept whole:
   whole, in hundredths of a second, not a clock per move. ChessBase's own
   export of them is not available to confirm what they mean, so they are not
   written as `[%clk]`.
+
+### `GET /v1/databases/{id}/texts/{number}`
+
+One guiding text: a piece of writing filed among the games, such as a
+book's chapter or a tournament report (#324). `/v1/status` names this endpoint
+as the feature `guidingTexts`; an older bridge answers `404`.
+
+```json
+{
+  "generation": "g1b2c3d4",
+  "number": 3,
+  "title": "Round 1",
+  "author": "",
+  "contents": [
+    {
+      "lang": "any",
+      "paragraphs": [
+        { "spans": [ { "text": "Round 1", "font": "Arial", "size": 24, "bold": true, "italic": false, "underline": false } ] },
+        { "spans": [
+          { "text": "After ", "font": "Arial", "size": 18, "bold": false, "italic": false, "underline": false },
+          { "diagram": { "board": "4k3/8/8/8/8/8/4P3/4K3" } },
+          { "game": { "label": "1.5", "white": "Doe, Jane", "black": "Roe, Richard", "event": "Testville op", "number": 12 } },
+          { "textLink": { "title": "Contents", "number": 2 } }
+        ] }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `title`, `author` | The row's `event` and `annotator` |
+| `contents` | The text in every language stored, in stored order. Each has `lang`, coded as the full form codes a comment's language (below), and either `html` or `paragraphs` |
+| `html` | A complete HTML document, as stored: a 2CBH text, or a classic text of format version 3. Its links (ChessBase's `javascript:CBLink(…)`) and pictures (files of a media folder) are as ChessBase wrote them; the bridge serves neither |
+| `paragraphs` | A classic text of format version 1 or 2 (`docs/format-notes.md`, "Guiding texts"), one entry per paragraph, each a list of `spans` in text order |
+
+A span is one of:
+
+| Span | Meaning |
+|---|---|
+| `text` | Text in one style: `font` (empty when the style names none), `size` as stored (its unit is not known; compare the sizes of one text), `bold`, `italic` and `underline`. A list label such as `1.` is a text span |
+| `diagram` | A position: `board` is the piece placement field of a FEN. The side to move is not stored where the bridge reads it |
+| `game` | A link to a game of the same database. ChessBase stores a search, not a record: `white`, `black` (`Last, First`; empty when the search names none) and `event`, with the `label` the text shows. `number` is the first game in record order, among the first 100,000 records, whose white, black and tournament are the link's (names compared word by word, a field the link leaves empty matching any), or `null` |
+| `textLink` | A link to another guiding text of the same database by its `title`; `number` is the first text with that title among the first 100,000 records, or `null` |
+
+Pictures, links to other databases and the objects the bridge does not read
+are left out. The text is read as a classic comment's single-byte text is
+(see "Text that is not UTF-8" under the classic format above), the code page
+decided once for each language's text.
+
+A record that is not a guiding text is `422 not_a_text`, and a damaged one
+`422 unreadable_text`. The answer is held to a game's answer limit.
 
 ### Writing games
 

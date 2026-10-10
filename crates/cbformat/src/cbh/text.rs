@@ -58,6 +58,32 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
     }
     let runs = cyrillic_utf8_runs(b);
     let read = Evidence::outside(b, &runs).page().unwrap_or(fallback);
+    read_in(b, &runs, read)
+}
+
+/// The page [`single_byte`] reads text `b` in on a computer whose code page
+/// is `page`: the one its words show, else `fallback`; `page` itself where
+/// it is neither of the two ([`detects`]). A guiding text decides its page
+/// once from its whole text (asavis/oschess-cb-bridge#324).
+pub(super) fn page_of(b: &[u8], page: CodePage, fallback: CodePage) -> CodePage {
+    if !detects(page) {
+        return page;
+    }
+    Evidence::outside(b, &cyrillic_utf8_runs(b)).page().unwrap_or(fallback)
+}
+
+/// [`single_byte`] in page `read`, which [`page_of`] decided for a whole text
+/// that `b` is a piece of, on a computer whose code page is `page`.
+pub(super) fn single_byte_in(b: &[u8], page: CodePage, read: CodePage) -> String {
+    if !detects(page) {
+        return page.decode(b);
+    }
+    read_in(b, &cyrillic_utf8_runs(b), read)
+}
+
+/// Single-byte text `b`, whose Cyrillic UTF-8 runs are `runs`, read in page
+/// `read` as [`single_byte`] describes.
+fn read_in(b: &[u8], runs: &[std::ops::Range<usize>], read: CodePage) -> String {
     let letter = |c: u8| c.is_ascii_alphabetic() || read.char(c).is_alphabetic();
     // The character byte `j` reads as: a figurine, a sign or the page's.
     let char_at = |j: usize| {

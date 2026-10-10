@@ -11,6 +11,7 @@ use crate::cbh::tables;
 use crate::movetable::{from_cb_square, to_cb_square};
 
 mod builder;
+pub mod guide;
 pub use builder::Builder;
 
 /// One item of a move tree in stored order: a move in UCI (`e2e4`, `e7e8q`),

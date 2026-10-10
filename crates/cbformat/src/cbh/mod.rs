@@ -21,6 +21,7 @@ use crate::{Error, Result};
 pub mod annotations;
 mod decode;
 mod entities;
+mod guide;
 mod moves;
 mod pieces;
 mod record;

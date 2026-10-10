@@ -69,7 +69,7 @@ impl<'a, S: Store> Names<'a, S> {
         }
     }
 
-    fn player(&mut self, id: i64) -> cbformat::Result<String> {
+    pub(crate) fn player(&mut self, id: i64) -> cbformat::Result<String> {
         if let Some(name) = self.players.get(&id) {
             return Ok(name.clone());
         }
@@ -79,7 +79,7 @@ impl<'a, S: Store> Names<'a, S> {
     }
 
     /// An annotator or author: a player where annotators are players.
-    fn annotator(&mut self, id: i64) -> cbformat::Result<String> {
+    pub(crate) fn annotator(&mut self, id: i64) -> cbformat::Result<String> {
         if S::ANNOTATORS_ARE_PLAYERS {
             return self.player(id);
         }
@@ -92,7 +92,7 @@ impl<'a, S: Store> Names<'a, S> {
     }
 
     /// The tournament's title and place.
-    fn tournament(&mut self, id: i64) -> cbformat::Result<(String, String)> {
+    pub(crate) fn tournament(&mut self, id: i64) -> cbformat::Result<(String, String)> {
         if let Some(t) = self.tournaments.get(&id) {
             return Ok(t.clone());
         }
@@ -102,7 +102,7 @@ impl<'a, S: Store> Names<'a, S> {
     }
 
     /// A guiding text's or an analysis's title, by its key ([`Head::other`]).
-    fn title(&mut self, key: i64) -> cbformat::Result<String> {
+    pub(crate) fn title(&mut self, key: i64) -> cbformat::Result<String> {
         if let Some(t) = self.titles.get(&key) {
             return Ok(t.clone());
         }

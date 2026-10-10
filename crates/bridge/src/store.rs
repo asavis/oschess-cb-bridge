@@ -12,6 +12,7 @@
 use std::ops::Range;
 
 pub use cbformat::game::Head;
+use cbformat::game::guide::GuidingText;
 use cbformat::game::{Player, Start, Tournament};
 use cbformat::pgn::{self, Options, Rendered};
 use cbformat::pgnfile::lex::Lexer;
@@ -111,6 +112,9 @@ pub trait Store: Sync {
     /// standard position or its moves cannot be decoded; the line ends at a
     /// null move and before damage. Only a failed read is an error.
     fn main_line(&self, r: &Self::Head, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>>;
+    /// The body of guiding text `r`, its record read within [`LIMITS`]
+    /// (asavis/oschess-cb-bridge#324).
+    fn guiding_text(&self, r: &Self::Head) -> Result<GuidingText>;
 }
 
 impl Store for v2::Database {
@@ -172,6 +176,9 @@ impl Store for v2::Database {
     }
     fn render(&self, r: &v2::Record, options: &Options) -> Result<Rendered> {
         pgn::game_with(self, r.id(), options, LIMITS)
+    }
+    fn guiding_text(&self, r: &v2::Record) -> Result<GuidingText> {
+        v2::Database::guiding_text(self, r, LIMITS.game_bytes)
     }
     fn main_line(&self, r: &v2::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
         let data = match self.read_moves_into(r, LIMITS.game_bytes, buf) {
@@ -240,6 +247,9 @@ impl Store for cbh::Database {
     }
     fn render(&self, r: &cbh::Record, options: &Options) -> Result<Rendered> {
         pgn::classic_game_with(self, r.id(), options, LIMITS)
+    }
+    fn guiding_text(&self, r: &cbh::Record) -> Result<GuidingText> {
+        cbh::Database::guiding_text(self, r, LIMITS.game_bytes)
     }
     fn main_line(&self, r: &cbh::Record, plies: u8, buf: &mut Vec<u8>) -> Result<Option<String>> {
         let data = match self.read_moves_into(r, LIMITS.game_bytes, buf) {
@@ -373,6 +383,10 @@ impl Store for pgnfile::Database {
     fn render(&self, r: &pgnfile::Record, options: &Options) -> Result<Rendered> {
         let pgn = if options.full { self.text(r, LIMITS.game_bytes)? } else { self.reading(r, LIMITS.game_bytes)? };
         Ok(Rendered { pgn, annotations: pgn::AnnotationStatus::Complete })
+    }
+    /// A PGN file holds games only.
+    fn guiding_text(&self, r: &pgnfile::Record) -> Result<GuidingText> {
+        Err(Error::Format(format!("record {} of a PGN file is not a guiding text", r.id())))
     }
     /// The main line as the text writes it, played from the standard
     /// position ([`pgnfile::line`]), and read only until the prefix is

@@ -130,6 +130,10 @@ impl<'a> Cursor<'a> {
         self.array().map(|b| i32::from_le_bytes(*b))
     }
 
+    pub(crate) fn le_u32(&mut self) -> Option<u32> {
+        self.array().map(|b| u32::from_le_bytes(*b))
+    }
+
     pub(crate) fn be_i32(&mut self) -> Option<i32> {
         self.array().map(|b| i32::from_be_bytes(*b))
     }

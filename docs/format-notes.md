@@ -1108,7 +1108,8 @@ The reader was checked against:
   1,628 texts in the classic-only databases, none names a tournament in its
   header; 297 name an annotator and 339 a source. The bridge shows a text's
   first title that is not blank, whatever its language, and its annotator as
-  its author (`cbh::Database::text_title`).
+  its author (`cbh::Database::text_title`). Their bodies are described under
+  "Guiding texts" below.
 - **Annotators** are a table of their own (`.cbc`), one text each, where 2CBH
   names a player and shows it as `Last, First`. In the user database, 290 of
   the 291 games the 2CBH copy annotates carry the same words in another order
@@ -1127,6 +1128,92 @@ The reader was checked against:
   to hold both (38 bytes, version 6 on), and the low 32 bits of each must
   equal the `.cbh` offset, or the game is an error. In the six paired
   databases, every game's `.cbj` offsets equal its `.cbh` offsets.
+
+## Guiding texts
+
+A text's `.cbg` record holds its titles, an unknown byte (0 or 1), and its
+contents, one per language, as the description gives
+(`cbh::Database::guiding_text`, #324). Measured over every classic database
+available, counts only: 85 databases hold 1,635 texts, and every record reads
+to its last byte by that layout.
+
+| Format version | Texts | Content |
+|---|---|---|
+| 1 | 1,599 | single-byte text with `u16` lengths, then formatting data |
+| 2 | 28 | the same with `u32` lengths |
+| 3 | 8 | an HTML document, then 4 zero bytes |
+
+The language numbers of a content are ChessBase's text annotation languages
+(0 English … 6 Portuguese, 7 any). 1,595 of the 1,627 contents of versions 1
+and 2 say English (0), Russian books among them, so a reader cannot take the
+number for the text's language.
+
+### The text of versions 1 and 2
+
+`\r` ends a paragraph; the text holds no `\n`, and no `0x9e` diagram mark.
+The byte `0x04` stands where an object of the formatting data is placed
+(30,755 in all). Piece bytes (`0xa2`-`0xa7`) appear in 451 texts and read as a
+comment's do. The bridge decides the code page once from the whole text and
+reads each run of it in that page.
+
+### Formatting data
+
+The description calls it unknown. It reads as follows in all 1,631 contents
+of versions 1 and 2; integers are little-endian.
+
+| Part | Layout |
+|---|---|
+| Header | `u16` format (200 or 300 in version 1, 310 in version 2), `u16` number of objects, `u16` unknown (0 in 1,394 contents, else an even number up to 10) |
+| Objects | each a `u16` type, its position (`u16`; `u32` in version 2), a `u16` length and that many bytes |
+| Styles | a `u16` count, then each a `u16` id, a `u16` number of properties, and each property a `u16` key, a `u16` length and the value |
+| Runs | each a `u16` length of text, a `u16` style id and a `u16` flag (0 in 74,044 runs, 1 in 630, 2 in 82, 3 in 6), until `0xffff` |
+| Property lists | three, each a `u16` number of properties as above, with no id, to the end |
+
+In every content the runs' lengths sum to the text's length, and every run
+names a style the content defines; a version 2 text over 65,535 bytes has
+runs of at most 65,535. An object's position is one past the index of a
+`0x04` in the text: the objects' positions are exactly the markers' in 1,623
+of the 1,631 contents, and the others hold objects at position 0.
+
+**Style properties.** Weighted by the characters each style covers:
+
+| Key | Value | Reading |
+|---|---|---|
+| 0 | a `u16` length and a single-byte name | the font: Arial for 6.7 million characters, a chess figurine font made with Font Creator Program for 3.5 million, Times New Roman for 1.4 million, and figurine fonts named `FigurineCB`/`CA Chess` |
+| 1, 2, 3 | one byte, 0 or 1 | bold (541,123 characters), italic (613,942), underline (6,741) |
+| 4 | `u32` | the size: 18 for 10.2 million characters, 24 for 1.3 million, then 16, 20, 14 and others; its unit is not known |
+| 5, 6, 7, 8, 9, 256 | | not read: 5 is 0, 1 or 2; 6 takes 0-50 in steps of 5; 9 is six bytes |
+
+**Objects.**
+
+| Types | Count | Data |
+|---|---|---|
+| `0x09`, `0x11` | 9,030 pairs | a diagram. A `u16`, then 32 bytes of 4-bit square codes in the order a1, a2 … a8, b1 … h8, high nibble first: 0 empty, 1-6 a white king, queen, knight, bishop, rook and pawn, 9-14 the black ones. Then 70 bytes not read; `0x11` adds 3 more. No pawn stands on the first or last rank in any of the 9,030, and 8,999 have one king of each colour; read rank by rank or low nibble first, 24,179 and 39,100 pawns would. The side to move has not been found |
+| `0x02`, `0x1a` | 12,705 pairs | a game link. A `u16` length and the search: a byte, its length again, a `u16` 1, a byte, white (a byte length and its text), a byte, black, 7 bytes not read, the tournament, and fields not read that end in `b5 af`. `0x1a` adds a `u16` length and the label the text shows (`1.5`). No field read holds a game number. Among the games of their own database, matching white and black finds one game for 8,952 links and several for 1,472; white alone finds one for 1,797 and several for 338; 146 find none |
+| `0x05`, `0x19` | 4,464 | a link to another text, by title: a `u16` length and the title (`0x19` with 8 more bytes, `0x05` with 6). 4,398 of the titles are a text's of the same database |
+| `0x0c` | 2,004 | a list label such as `1.`: a `u16` length and the text |
+| `0x17`, `0x06` | 338 | a picture, by the name of a `.bmp` file in the folder beside the database (Morphy's `6-multimedia.md`); not served |
+| `0x1c` | 274 | a link to another database by its path; not served |
+| `0x0f`, `0x01`, `0x14`, `0x0a`, `0x10` | 1,198, 53, 7, 5, 5 | not read |
+
+A reader that meets formatting data it cannot read keeps the text, unstyled
+and without objects.
+
+**What the bridge reads** (`examples/guide_census.rs` over the same
+databases and the 2CBH ones, counts only): all 3,458 texts read, none failed.
+Their 1,631 contents of versions 1 and 2 give 99,723 text spans, 9,028
+diagrams (two diagrams hold a square code no piece has), 12,695 game links
+and 4,459 text links. Resolved as `docs/api.md` describes, 12,491 game links
+and 4,392 text links name a record of their database.
+
+### HTML texts
+
+The 1,823 2CBH texts, all in the Mega, read by Morphy's `format/v2/2-moves.md`
+to their last byte, each entry's language a nation as a text annotation's is;
+with the 8 classic texts of version 3 they hold 9,622 HTML documents that are
+not empty, the largest answer of them 1.2 MB.
+Their HTML links with `javascript:CBLink(tag_table, …)` (tournament tables)
+and `CBLink(tag_game_set, …)`, and shows pictures from a media folder.
 
 ## Annotations (`.cba`)
 

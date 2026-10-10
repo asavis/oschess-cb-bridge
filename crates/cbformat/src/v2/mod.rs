@@ -15,6 +15,7 @@ use crate::{Error, Result};
 mod annotations;
 mod entities;
 mod frame;
+mod guide;
 mod moves;
 mod record;
 mod window;
@@ -23,6 +24,7 @@ pub use annotations::ANNOTATION_TAG;
 pub use entities::{Entities, GAME_TAG, PLAYER, SOURCE, TEAM, TOURNAMENT};
 pub use frame::checksum;
 use frame::{MAX_FRAME_PART, frame_at, read_frame_into};
+pub use guide::TEXT_TAG;
 pub use moves::{GameMoves, Token};
 pub use record::Record;
 pub use window::MoveWindow;
@@ -308,6 +310,11 @@ pub struct MoveData<'a> {
 impl MoveData<'_> {
     pub fn tag(&self) -> u16 {
         self.tag
+    }
+
+    /// The record's content, after its framing.
+    pub fn content(&self) -> &[u8] {
+        &self.content
     }
 
     pub fn moves(&self) -> Result<GameMoves<'_>> {

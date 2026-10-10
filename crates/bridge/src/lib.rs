@@ -42,5 +42,6 @@ pub mod start;
 pub mod stockfish;
 pub mod store;
 pub mod sync;
+pub mod texts;
 pub mod token;
 pub mod write;

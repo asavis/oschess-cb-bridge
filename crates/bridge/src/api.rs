@@ -154,6 +154,7 @@ fn route(app: &App, req: &Request) -> Response {
         ["v1", "databases"] => databases(app),
         ["v1", "databases", id, "games"] => with_entry(app, id, |e| games(app, e, req)),
         ["v1", "databases", id, "games", number] => with_entry(app, id, |e| game(app, e, number, req)),
+        ["v1", "databases", id, "texts", number] => with_entry(app, id, |e| text(app, e, number)),
         ["v1", "databases", id, "suggest"] => with_entry(app, id, |e| suggest(app, e, req)),
         ["v1", "databases", id, "explorer"] => with_entry(app, id, |e| crate::explorer::route(app, e, req)),
         ["v1", "engine", "analyze"] => analyze(app, req),
@@ -178,8 +179,9 @@ fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Respon
 /// The optional features of API version 1 this bridge has (#270), which a
 /// client offers only when it finds them named: `explorerSearch`, the
 /// explorer's `q` (#268), `fragmentSearch`, the games of a position fragment
-/// and of material (#272), and `analysisGames`, analyses served as PGN (#323).
-pub const FEATURES: [&str; 3] = ["explorerSearch", "fragmentSearch", "analysisGames"];
+/// and of material (#272), `analysisGames`, analyses served as PGN (#323),
+/// and `guidingTexts`, `GET /v1/databases/{id}/texts/{number}` (#324).
+pub const FEATURES: [&str; 4] = ["explorerSearch", "fragmentSearch", "analysisGames", "guidingTexts"];
 
 fn status(app: &App) -> Response {
     let entries = app.catalog.entries();
@@ -682,6 +684,90 @@ impl<'r> GamesQuery<'r> {
         }
         Ok(GamesQuery { offset, limit, sort, line, board, fragment, stream, q })
     }
+}
+
+/// One reading of a guiding text: its body with its links resolved, as the
+/// answer's `contents`, and its title and author.
+enum TextAttempt {
+    NotFound,
+    NotAText,
+    /// The header changed while the text was read, or could not be read.
+    Changed,
+    Read(cbformat::Result<(String, String, String)>),
+}
+
+/// Reads guiding text `number` of `db` between two reads of its header, as
+/// [`attempt`] reads a game. The links are resolved within the same reads.
+fn text_attempt<S: Store>(app: &App, db: &S, number: u32) -> TextAttempt {
+    if number > db.record_count() {
+        return TextAttempt::NotFound;
+    }
+    let Ok(before) = db.record(number) else { return TextAttempt::Changed };
+    if !matches!(before.kind(), RecordKind::Text) {
+        return TextAttempt::NotAText;
+    }
+    let read = {
+        let _render = RENDERS.enter();
+        db.guiding_text(&before).and_then(|text| {
+            let resolved = crate::texts::resolve(db, &text)?;
+            let mut names = Names::new(db);
+            let (title, author) = before.other().unwrap_or((-1, -1));
+            Ok((crate::texts::contents(&text, &resolved), names.title(title)?, names.annotator(author)?))
+        })
+    };
+    if let Some(hook) = &app.between_reads {
+        hook();
+    }
+    match db.record(number).is_ok_and(|after| after.bytes() == before.bytes()) {
+        true => TextAttempt::Read(read),
+        false => TextAttempt::Changed,
+    }
+}
+
+fn text(app: &App, entry: &Entry, number: &str) -> Response {
+    let Some(number) = number.parse::<u32>().ok().filter(|&n| n > 0) else { return not_found() };
+    for _ in 0..GAME_ATTEMPTS {
+        let open = match entry.open_to_read() {
+            Ok(open) => open,
+            Err(state) => return unavailable(state),
+        };
+        let read = match with_store!(&*open.db, db => text_attempt(app, db, number)) {
+            TextAttempt::NotFound => return not_found(),
+            TextAttempt::NotAText => return error(422, "not_a_text", "The record is not a guiding text"),
+            TextAttempt::Changed => continue,
+            TextAttempt::Read(read) => read,
+        };
+        if entry.generation() != Some(open.generation) {
+            continue;
+        }
+        return match read {
+            Ok((contents, title, author)) => {
+                // The contents, the title and author, and at most 192 bytes of
+                // keys and numbers.
+                let size = contents.len() + json::string_len(&title) + json::string_len(&author) + 192;
+                if size > MAX_GAME_RESPONSE {
+                    let reason =
+                        format!("the text's answer would be {size} bytes, over the {MAX_GAME_RESPONSE}-byte limit");
+                    return error_with(422, "unreadable_text", "The text is too large to serve", |o| {
+                        o.str("reason", &reason)
+                    });
+                }
+                let Some(hold) = budget::reserve(size) else { return busy() };
+                let body = Obj::new()
+                    .str("generation", &format!("{:016x}", open.generation))
+                    .num("number", number)
+                    .str("title", &title)
+                    .str("author", &author)
+                    .raw("contents", &contents);
+                ok(body.done()).holding(hold)
+            }
+            Err(Error::Io(..)) => database_changing(),
+            Err(e) => error_with(422, "unreadable_text", "The text's records are damaged", |o| {
+                o.str("reason", &crate::log::error(&e))
+            }),
+        };
+    }
+    database_changing()
 }
 
 /// The parameters of `GET /v1/databases/{id}/games/{number}`, with the

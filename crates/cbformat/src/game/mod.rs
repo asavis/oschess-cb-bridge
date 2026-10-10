@@ -7,6 +7,7 @@
 mod annotations;
 mod entities;
 mod fields;
+pub mod guide;
 mod head;
 mod start;
 
