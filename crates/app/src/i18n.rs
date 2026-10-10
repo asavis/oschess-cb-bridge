@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn a_language_change_updates_native_words_and_plural_forms() {
         let strings = Strings::new(Lang::Uk);
-        assert_eq!(strings.plural("db.records", 21, &[]), "21 партія");
+        assert_eq!(strings.plural("db.records", 21, &[]), "21 запис");
         for lang in [Lang::En, Lang::Uk, Lang::En] {
             strings.set_lang(lang);
             assert_eq!(strings.lang(), lang);
@@ -319,7 +319,7 @@ mod tests {
                 expected.fill("toast.updated.title", &[("version", "1.2.3")])
             );
         }
-        assert_eq!(strings.plural("db.records", 21, &[]), "21 games");
+        assert_eq!(strings.plural("db.records", 21, &[]), "21 entries");
         for code in ["ru", "EN", "", "../en"] {
             assert_eq!(Lang::from_code(code), None);
         }
@@ -328,11 +328,15 @@ mod tests {
     #[test]
     fn filling() {
         let s = Strings::new(Lang::Uk);
-        assert_eq!(s.plural("db.records", 3, &[]), "3 партії");
+        assert_eq!(s.plural("db.records", 3, &[]), "3 записи");
+        // A base's count is its records, games, texts and analyses alike (#329).
+        assert_eq!(s.plural("db.records", 243, &[]), "243 записи");
+        assert_eq!(s.plural("db.records", 25, &[]), "25 записів");
         assert_eq!(s.fill("tray.portBusy", &[("port", "39581")]), "oschess міст — порт 39581 зайнятий");
         assert_eq!(s.get("no.such.key"), "no.such.key");
         let e = Strings::new(Lang::En);
-        assert_eq!(e.plural("db.records", 1, &[]), "1 game");
-        assert_eq!(e.plural("db.records", 12, &[]), "12 games");
+        assert_eq!(e.plural("db.records", 1, &[]), "1 entry");
+        assert_eq!(e.plural("db.records", 12, &[]), "12 entries");
+        assert_eq!(e.plural("db.records", 243, &[]), "243 entries");
     }
 }

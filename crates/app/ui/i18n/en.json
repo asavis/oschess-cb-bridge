@@ -62,9 +62,9 @@
   "flyout.open": "Open oschess",
   "flyout.settings": "Settings",
 
-  "db.records.one": "{n} game",
-  "db.records.few": "{n} games",
-  "db.records.many": "{n} games",
+  "db.records.one": "{n} entry",
+  "db.records.few": "{n} entries",
+  "db.records.many": "{n} entries",
   "db.chip.ready": "ready",
   "db.chip.missing": "missing",
   "db.chip.cloudOnly": "in the cloud",
