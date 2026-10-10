@@ -3,6 +3,7 @@
 
 mod autostart;
 mod commands;
+mod engine_updates;
 mod notices;
 mod package;
 mod server;
@@ -79,6 +80,7 @@ pub fn run() {
             commands::open_stockfish_licence,
             commands::set_autostart,
             commands::set_auto_update,
+            commands::set_stockfish_auto_update,
             commands::pairing_code,
             commands::copy_code,
             commands::new_code,
@@ -103,6 +105,7 @@ pub fn run() {
             }
             watch(app.handle().clone(), shared);
             updater::start(app.handle());
+            engine_updates::start(app.handle());
             Ok(())
         })
         .on_window_event(windows::on_event)

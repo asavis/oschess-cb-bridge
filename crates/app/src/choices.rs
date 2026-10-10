@@ -3,7 +3,7 @@
 //! it installed only if the user chose nothing else while it ran. The build
 //! stays in the engine list either way.
 //!
-//! Also the offer of the pinned Stockfish build in place of an older chosen
+//! Also the offer of the newest Stockfish build in place of an older chosen
 //! one, putting it off until the next bridge version, and the engine
 //! section's view, whose names and numbers are made here so that the window
 //! only shows them. The settings window's commands hand in what needs
@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, TryLockError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use bridge::config;
 use bridge::engines::Found;
@@ -77,17 +77,76 @@ impl Choices {
         install: impl FnOnce() -> Result<PathBuf, String>,
         probe: impl FnOnce(&Path) -> Result<(), String>,
     ) -> Result<bool, String> {
-        let _installing = match self.installing.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(TryLockError::WouldBlock) => return Err("Stockfish is being installed already".into()),
-        };
+        let _installing = self.begin_installing()?;
         let ticket = self.ticket();
         let exe = install()?;
+        self.choose_installed(ticket, config_path, exe, probe, || Some(()))
+    }
+
+    /// Installs as [`Choices::install`] does, then waits with `wait` before
+    /// the probe and the choice: an automatic update waits there until the
+    /// bridge is idle, as choosing another engine stops a running analysis
+    /// (#322). The installation no longer counts as running while it waits,
+    /// so neither an update of the bridge nor the user's own installation
+    /// waits for that; a choice made meanwhile stands. `wait` answering false
+    /// gives the choice up: nothing is chosen, and the build stays listed.
+    /// After the probe, `confirm` gives the choice up the same way by
+    /// answering `None`; what it answers otherwise is held while the choice
+    /// is saved, such as the preferences' lock ([`crate::prefs::hold_if`]),
+    /// so that a probe of seconds cannot outlast a reason to give up.
+    pub fn update<G>(
+        &self,
+        config_path: &Path,
+        install: impl FnOnce() -> Result<PathBuf, String>,
+        wait: impl FnOnce() -> bool,
+        probe: impl FnOnce(&Path) -> Result<(), String>,
+        confirm: impl FnOnce() -> Option<G>,
+    ) -> Result<bool, String> {
+        let (ticket, exe) = {
+            let _installing = self.begin_installing()?;
+            (self.ticket(), install()?)
+        };
+        if !wait() {
+            return Ok(false);
+        }
+        self.choose_installed(ticket, config_path, exe, probe, confirm)
+    }
+
+    /// Chooses the build `exe` an installation that began at `ticket`
+    /// installed, once `probe` accepts it and `confirm` answers, unless an
+    /// engine was chosen since.
+    fn choose_installed<G>(
+        &self,
+        ticket: Ticket,
+        config_path: &Path,
+        exe: PathBuf,
+        probe: impl FnOnce(&Path) -> Result<(), String>,
+        confirm: impl FnOnce() -> Option<G>,
+    ) -> Result<bool, String> {
         let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
         probe(&exe)?;
+        let Some(_confirmed) = confirm() else { return Ok(false) };
         // A choice made while the download ran stands; the build stays listed.
         self.save_if_current(ticket, config_path, exe)
+    }
+
+    /// Runs `settled` while no installation runs and no engine is being
+    /// chosen, and holds both off until it ends: the removal of older builds
+    /// reads the choice and removes folders while neither can change (#322).
+    /// `None`, with `settled` not run, while an installation runs.
+    pub fn while_settled<R>(&self, settled: impl FnOnce() -> R) -> Option<R> {
+        let _installing = self.begin_installing().ok()?;
+        let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(settled())
+    }
+
+    /// Holds the one installation, or refuses a second.
+    fn begin_installing(&self) -> Result<MutexGuard<'_, ()>, String> {
+        match self.installing.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+            Err(TryLockError::WouldBlock) => Err("Stockfish is being installed already".into()),
+        }
     }
 
     /// Taken when an operation that may choose later begins.
@@ -113,28 +172,30 @@ impl Choices {
     }
 }
 
-/// The name of the `chosen` engine when the engine section offers the pinned
-/// Stockfish build in its place: the chosen engine is an older Stockfish
-/// ([`stockfish::offer`]), the pinned build is not installed in the data
+/// The name of the `chosen` engine when the engine section offers the
+/// `newest` Stockfish build in its place: the chosen engine is an older
+/// Stockfish ([`stockfish::offer`]), that build is not installed in the data
 /// folder `data` (it would be in the list already), and the offer was not put
 /// off for the `running` bridge version. The chosen engine is named as
 /// `name_of` names it.
-pub fn offer_for(data: &Path, chosen: Option<&Path>, found: &[Found], running: &str) -> Option<String> {
+pub fn offer_for(data: &Path, chosen: Option<&Path>, found: &[Found], running: &str, newest: &Build) -> Option<String> {
     let chosen = chosen?;
     let name = name_of(chosen, found);
-    let build = stockfish::offer(Some((chosen, &name)))?;
+    if !stockfish::offer(newest, Some((chosen, &name))) {
+        return None;
+    }
     let dismissed = prefs::load(data).stockfish_offer_dismissed.as_deref() == Some(running);
-    (!stockfish::is_installed(data, build) && !dismissed).then_some(name)
+    (!stockfish::is_installed(data, newest) && !dismissed).then_some(name)
 }
 
-/// Whether the first-run wizard recommends installing the pinned Stockfish
+/// Whether the first-run wizard recommends installing the `newest` Stockfish
 /// build beside the engines `found` (#287): none of them, nor the `chosen`
-/// engine, is a Stockfish of the pinned version or newer
+/// engine, is a Stockfish of that major version or newer
 /// ([`stockfish::is_current`]). A build the bridge installed is listed by its
-/// version, so an installed pinned build ends the recommendation.
-pub fn recommend_install(chosen: Option<&Path>, found: &[Found]) -> bool {
-    let chosen_current = chosen.is_some_and(|c| stockfish::is_current(c, &name_of(c, found)));
-    !chosen_current && !found.iter().any(|f| stockfish::is_current(&f.path, &f.name))
+/// version, so an installed newest build ends the recommendation.
+pub fn recommend_install(chosen: Option<&Path>, found: &[Found], newest: &Build) -> bool {
+    let chosen_current = chosen.is_some_and(|c| stockfish::is_current(newest, c, &name_of(c, found)));
+    !chosen_current && !found.iter().any(|f| stockfish::is_current(newest, &f.path, &f.name))
 }
 
 /// The name of the `chosen` engine: as `found` names it, else after its file
@@ -156,7 +217,8 @@ pub fn dismiss_offer(data: &Path, running: &str) -> Result<(), String> {
 }
 
 /// What the engine section shows: the engines found and the one chosen, the
-/// official build the bridge can install, and whether to offer it instead.
+/// newest official build the bridge knows of and can install, and whether to
+/// offer it instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnginesView {
@@ -177,7 +239,7 @@ pub struct EnginesView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Installable {
-    version: &'static str,
+    version: String,
     /// Its size in whole megabytes ([`stockfish::megabytes`]).
     megabytes: u64,
 }
@@ -195,16 +257,15 @@ struct FoundEngine {
 
 impl EnginesView {
     /// The engine section for the engines `found` and the `chosen` one, with
-    /// the offer as [`offer_for`] makes it for the data folder `data` and the
-    /// `running` bridge version.
-    pub fn new(data: &Path, chosen: Option<&Path>, found: Vec<Found>, running: &str) -> EnginesView {
-        let build = Build::for_arch(stockfish::machine_arch());
+    /// the `newest` build the bridge knows of and the offer as [`offer_for`]
+    /// makes it for the data folder `data` and the `running` bridge version.
+    pub fn new(data: &Path, chosen: Option<&Path>, found: Vec<Found>, running: &str, newest: &Build) -> EnginesView {
         EnginesView {
             chosen: chosen.map(|p| p.to_string_lossy().into_owned()),
             chosen_name: chosen.map(|p| name_of(p, &found)),
-            offer_for: offer_for(data, chosen, &found, running),
-            recommend_install: recommend_install(chosen, &found),
-            install: Installable { version: build.version, megabytes: build.megabytes() },
+            offer_for: offer_for(data, chosen, &found, running, newest),
+            recommend_install: recommend_install(chosen, &found, newest),
+            install: Installable { version: newest.version.to_string(), megabytes: newest.megabytes() },
             found: found
                 .into_iter()
                 .map(|f| FoundEngine {
@@ -269,6 +330,12 @@ mod tests {
         Ok(())
     }
 
+    /// The pinned build for this computer: the newest the bridge knows of
+    /// before a lookup.
+    fn pinned() -> &'static Build {
+        Build::for_arch(stockfish::machine_arch())
+    }
+
     #[test]
     fn an_installation_does_not_replace_a_choice_made_while_it_ran() {
         let dir = folder("tickets");
@@ -319,6 +386,176 @@ mod tests {
         assert_eq!(*events.borrow(), ["install, installing true", "probe stockfish.exe"]);
         assert_eq!(engine_in(&toml), Some(PathBuf::from("stockfish.exe")));
         assert!(!choices.installing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An update waits after the installation, which no longer counts as
+    /// running then, and before the probe and the choice (#322); a choice the
+    /// user makes while it waits stands.
+    #[test]
+    fn an_update_waits_between_the_installation_and_the_choice() {
+        let dir = folder("update");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let events = RefCell::new(Vec::new());
+        let chosen = choices.update(
+            &toml,
+            || {
+                events.borrow_mut().push(format!("install, installing {}", choices.installing()));
+                Ok(PathBuf::from("stockfish-20.exe"))
+            },
+            || {
+                events.borrow_mut().push(format!("wait, installing {}", choices.installing()));
+                true
+            },
+            |exe| {
+                events.borrow_mut().push(format!("probe {}", exe.display()));
+                Ok(())
+            },
+            || Some(()),
+        );
+        assert_eq!(chosen, Ok(true));
+        assert_eq!(*events.borrow(), ["install, installing true", "wait, installing false", "probe stockfish-20.exe"]);
+        assert_eq!(engine_in(&toml), Some(PathBuf::from("stockfish-20.exe")));
+
+        // The user chooses Lc0 while the update waits for the bridge to be idle.
+        let chosen = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-21.exe")),
+            || {
+                choices.choose(&toml, PathBuf::from("lc0.exe"), accept).unwrap();
+                true
+            },
+            accept,
+            || Some(()),
+        );
+        assert_eq!(chosen, Ok(false));
+        assert_eq!(engine_in(&toml), Some(PathBuf::from("lc0.exe")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wait that gives the update up chooses nothing; the installation
+    /// still happened, and the next one starts.
+    #[test]
+    fn an_update_given_up_while_it_waits_chooses_nothing() {
+        let dir = folder("given-up");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let probed = RefCell::new(false);
+        let chosen = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-20.exe")),
+            || false,
+            |_| {
+                *probed.borrow_mut() = true;
+                Ok(())
+            },
+            || Some(()),
+        );
+        assert_eq!(chosen, Ok(false));
+        assert!(!*probed.borrow(), "nothing is probed either");
+        assert_eq!(engine_in(&toml), None);
+        assert_eq!(choices.install(&toml, || Ok(PathBuf::from("stockfish.exe")), accept), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the probe, a refused confirmation chooses nothing; a granted one
+    /// is held while the choice is saved (#322 review).
+    #[test]
+    fn an_update_confirms_after_the_probe() {
+        let dir = folder("confirm");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let events = RefCell::new(Vec::new());
+        let refused = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-20.exe")),
+            || true,
+            |_| {
+                events.borrow_mut().push("probe");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("confirm");
+                None::<()>
+            },
+        );
+        assert_eq!(refused, Ok(false));
+        assert_eq!(*events.borrow(), ["probe", "confirm"]);
+        assert_eq!(engine_in(&toml), None);
+        struct Saved<'a>(&'a Path, &'a RefCell<Vec<&'static str>>);
+        impl Drop for Saved<'_> {
+            fn drop(&mut self) {
+                assert!(engine_in(self.0).is_some(), "held until the choice is saved");
+                self.1.borrow_mut().push("released");
+            }
+        }
+        let granted = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-20.exe")),
+            || true,
+            accept,
+            || Some(Saved(&toml, &events)),
+        );
+        assert_eq!(granted, Ok(true));
+        assert_eq!(events.borrow().last(), Some(&"released"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manual installation counts as running until its build is chosen:
+    /// an update of the bridge waits through the probe too (#61).
+    #[test]
+    fn an_installation_runs_until_its_build_is_chosen() {
+        let dir = folder("runs");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let during_probe = RefCell::new(None);
+        let chosen = choices.install(
+            &toml,
+            || Ok(PathBuf::from("stockfish.exe")),
+            |_| {
+                *during_probe.borrow_mut() = Some(choices.installing());
+                Ok(())
+            },
+        );
+        assert_eq!(chosen, Ok(true));
+        assert_eq!(*during_probe.borrow(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settled work runs only with no installation running, and holds off
+    /// installations and choices until it ends (#322).
+    #[test]
+    fn settled_work_holds_off_installations_and_choices() {
+        static CHOICES: Choices = Choices::new();
+        let dir = folder("settled");
+        let toml = dir.join("bridge.toml");
+        // Not while an installation runs.
+        let inside = CHOICES.install(
+            &toml,
+            || {
+                assert_eq!(CHOICES.while_settled(|| panic!("settled work runs during an installation")), None);
+                Ok(PathBuf::from("stockfish.exe"))
+            },
+            accept,
+        );
+        assert_eq!(inside, Ok(true));
+        // A choice made while it runs waits for it; an installation is refused.
+        let (done_tx, done) = mpsc::channel();
+        let settled = CHOICES.while_settled(|| {
+            let path = toml.clone();
+            std::thread::spawn(move || done_tx.send(CHOICES.choose(&path, PathBuf::from("lc0.exe"), accept)));
+            assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "the choice waits");
+            assert_eq!(engine_in(&toml), Some(PathBuf::from("stockfish.exe")));
+            assert_eq!(
+                CHOICES.install(&toml, || panic!("an installation runs"), accept),
+                Err("Stockfish is being installed already".into())
+            );
+            "settled"
+        });
+        assert_eq!(settled, Some("settled"));
+        assert_eq!(done.recv_timeout(crate::PATIENCE).expect("then it is saved"), Ok(()));
+        assert_eq!(engine_in(&toml), Some(PathBuf::from("lc0.exe")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -461,7 +698,7 @@ mod tests {
             listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"),
             listed("Lc0 0.31", r"C:\lc0\lc0.exe"),
         ];
-        let offer = |chosen: Option<&str>| offer_for(&dir, chosen.map(Path::new), &found, "1.2.1");
+        let offer = |chosen: Option<&str>| offer_for(&dir, chosen.map(Path::new), &found, "1.2.1", pinned());
         assert_eq!(offer(Some(r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe")).as_deref(), Some("Stockfish 17.1"));
         assert_eq!(offer(Some(r"C:\x\stockfish_16_x64.exe")).as_deref(), Some("stockfish_16_x64"), "not listed");
         assert_eq!(offer(Some(r"C:\lc0\lc0.exe")), None);
@@ -474,6 +711,15 @@ mod tests {
             std::fs::write(&file, b"MZ").unwrap();
         }
         assert_eq!(offer(Some(r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe")), None, "installed, it is listed");
+        // A newer release that a lookup named is offered in place of the pinned build (#322).
+        let newer = Build::released(stockfish::machine_arch(), "20", 1, &"a".repeat(64)).unwrap();
+        let chosen = Some(Path::new(r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"));
+        assert_eq!(offer_for(&dir, chosen, &found, "1.2.1", &newer).as_deref(), Some("Stockfish 17.1"));
+        let installed_19 = build.installed(&dir);
+        assert_eq!(
+            offer_for(&dir, Some(&installed_19), &found, "1.2.1", &newer).as_deref(),
+            Some(build.exe.trim_end_matches(".exe"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -487,11 +733,14 @@ mod tests {
             listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"),
             listed("Lc0 0.31", r"C:\lc0\lc0.exe"),
         ];
-        assert!(recommend_install(None, &older));
-        assert!(recommend_install(None, &[]), "nothing found");
-        assert!(recommend_install(Some(Path::new(r"C:\lc0\lc0.exe")), &older));
-        assert!(recommend_install(Some(Path::new(r"C:\x\stockfish.exe")), &older), "a version nobody names");
-        assert!(!recommend_install(Some(Path::new(r"C:\x\stockfish_19_x64.exe")), &older), "chosen by its file");
+        assert!(recommend_install(None, &older, pinned()));
+        assert!(recommend_install(None, &[], pinned()), "nothing found");
+        assert!(recommend_install(Some(Path::new(r"C:\lc0\lc0.exe")), &older, pinned()));
+        assert!(recommend_install(Some(Path::new(r"C:\x\stockfish.exe")), &older, pinned()), "a version nobody names");
+        assert!(
+            !recommend_install(Some(Path::new(r"C:\x\stockfish_19_x64.exe")), &older, pinned()),
+            "chosen by its file"
+        );
 
         let dir = folder("recommend");
         let build = Build::for_arch(stockfish::machine_arch());
@@ -503,8 +752,8 @@ mod tests {
         let mut with_installed = bridge::engines::find(&roots);
         assert_eq!(with_installed.len(), 1, "the installed build is listed");
         with_installed.extend(older);
-        assert!(!recommend_install(None, &with_installed));
-        let view = serde_json::to_value(EnginesView::new(&dir, None, with_installed, "1.2.1")).unwrap();
+        assert!(!recommend_install(None, &with_installed, pinned()));
+        let view = serde_json::to_value(EnginesView::new(&dir, None, with_installed, "1.2.1", pinned())).unwrap();
         assert_eq!(view["recommendInstall"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -517,14 +766,18 @@ mod tests {
         let dir = folder("dismissed");
         let found = [listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe")];
         let chosen = Some(Path::new(r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"));
-        assert!(offer_for(&dir, chosen, &found, "1.2.1").is_some());
+        assert!(offer_for(&dir, chosen, &found, "1.2.1", pinned()).is_some());
         dismiss_offer(&dir, "1.2.1").unwrap();
-        assert_eq!(offer_for(&dir, chosen, &found, "1.2.1"), None);
+        assert_eq!(offer_for(&dir, chosen, &found, "1.2.1", pinned()), None);
         // «Update automatically» turned off saves the preferences again.
         prefs::save(&dir, &prefs::Prefs { auto_update: false, ..prefs::load(&dir) }).unwrap();
-        assert_eq!(offer_for(&dir, chosen, &found, "1.2.1"), None);
-        assert_eq!(offer_for(&dir, Some(Path::new(r"C:\x\stockfish_16_x64.exe")), &found, "1.2.1"), None);
-        assert_eq!(offer_for(&dir, chosen, &found, "1.3.0").as_deref(), Some("Stockfish 17.1"), "the next version");
+        assert_eq!(offer_for(&dir, chosen, &found, "1.2.1", pinned()), None);
+        assert_eq!(offer_for(&dir, Some(Path::new(r"C:\x\stockfish_16_x64.exe")), &found, "1.2.1", pinned()), None);
+        assert_eq!(
+            offer_for(&dir, chosen, &found, "1.3.0", pinned()).as_deref(),
+            Some("Stockfish 17.1"),
+            "the next version"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -537,7 +790,8 @@ mod tests {
         let dir = folder("view");
         let found = vec![listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe")];
         let view = |chosen: Option<&str>| {
-            serde_json::to_value(EnginesView::new(&dir, chosen.map(Path::new), found.clone(), "1.2.1")).unwrap()
+            serde_json::to_value(EnginesView::new(&dir, chosen.map(Path::new), found.clone(), "1.2.1", pinned()))
+                .unwrap()
         };
         let unlisted = view(Some(r"C:\x\stockfish_16_x64.exe"));
         assert_eq!(unlisted["chosen"], r"C:\x\stockfish_16_x64.exe");

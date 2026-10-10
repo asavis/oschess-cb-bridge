@@ -37,11 +37,14 @@ Store's copy, which updates itself through the Store (#153).
 > Windows.
 >
 > Міст відповідає лише браузеру, який ви з ним з’єднали, і лише на адресі
-> цього комп’ютера. В інтернет він звертається лише в двох випадках. Через
+> цього комп’ютера. В інтернет він звертається лише в трьох випадках. Через
 > хвилину після запуску й далі кожні шість годин він питає Microsoft Store,
 > чи вийшла нова версія, і оновлюється через Store; «Оновлювати автоматично»
-> в налаштуваннях вимикає ці перевірки. А коли ви просите встановити
-> Stockfish, міст завантажує його офіційну збірку з GitHub.
+> в налаштуваннях вимикає ці перевірки. Коли ви просите встановити
+> Stockfish, міст завантажує його офіційну збірку з GitHub. А Stockfish, який
+> він установив, міст тримає свіжим: у ті самі години питає GitHub, чи вийшов
+> новий Stockfish, і встановлює його через тиждень після виходу; «Оновлювати
+> Stockfish автоматично» в налаштуваннях вимикає це.
 >
 > Відкритий код, ліцензія AGPL-3.0: https://github.com/asavis/oschess-cb-bridge
 
@@ -75,11 +78,14 @@ Store's copy, which updates itself through the Store (#153).
 > start with Windows.
 >
 > The bridge answers only the browser you paired it with, and only on this
-> computer's own address. It goes online in two cases only. A minute after it
-> starts, and every six hours after that, it asks the Microsoft Store whether
-> a new version is out, and updates through the Store; «Update automatically»
-> in the settings turns these checks off. And when you ask it to install
-> Stockfish, it downloads the official build from GitHub.
+> computer's own address. It goes online in three cases only. A minute after
+> it starts, and every six hours after that, it asks the Microsoft Store
+> whether a new version is out, and updates through the Store; «Update
+> automatically» in the settings turns these checks off. When you ask it to
+> install Stockfish, it downloads the official build from GitHub. And it keeps
+> the Stockfish it installed up to date: at the same times it asks GitHub
+> whether a new Stockfish is out, and installs it once it is a week old;
+> «Update Stockfish automatically» in the settings turns this off.
 >
 > Open source under the AGPL-3.0 licence: https://github.com/asavis/oschess-cb-bridge
 
@@ -110,8 +116,8 @@ Partner Center takes at most 500 characters here.
 > picks, serves them on 127.0.0.1 to the oschess web app the user paired it
 > with, writes only PGN files the user saves games to, and runs the UCI engine
 > the user chose as a child process: one from ChessBase or Fritz, or the
-> official Stockfish it downloads on request and checks against a pinned
-> SHA-256. This needs full-trust desktop access.
+> official Stockfish it downloads from GitHub and checks by SHA-256. This
+> needs full-trust desktop access.
 
 ## Notes for certification
 
@@ -133,8 +139,11 @@ Information page, never in these notes or in this repository.
 
 Certification may ask about an app that downloads an executable. The
 listing, the justification above and these notes all say that the bridge
-downloads the official Stockfish build only on the user's request and checks
-it against a SHA-256 pinned in the release.
+downloads the official Stockfish build from Stockfish's GitHub releases when
+the user asks, and keeps a build it installed up to date while «Update
+Stockfish automatically» is on (the default, which the first-run wizard
+shows), a release only once it is a week old, checking every download against
+the SHA-256 GitHub publishes for it (#322).
 
 Submit only once the ChessBase section is open to everyone on oschess.org
 (asavis/oschess#13368): until then the pairing link shows the testers no

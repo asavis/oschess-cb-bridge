@@ -22,6 +22,7 @@ let picked = null;
 // Windows is on unless Windows' own settings turned it off.
 let autostartOn = true;
 let autoUpdateOn = true;
+let stockfishUpdateOn = true;
 // An engine check, a Stockfish install or a saved choice is running.
 let busy = false;
 let installing = false;
@@ -30,6 +31,14 @@ let paired = false;
 // setup» wait for: until then no engine is marked, found or not.
 let enginesRead = null;
 let installProgress = null;
+// A Stockfish build was installed or a newer release became known (#322).
+// The list is read again once nothing runs and the engine folders' first
+// answer is in, whichever way what ran ended: a failed installation may have
+// learned of a newer release too, and an answer landing after a choice made
+// meanwhile would replace it: a list read before something began is not
+// shown.
+let enginesChanged = false;
+let begun = 0;
 
 function retranslate() {
   if (view) showView(view);
@@ -77,11 +86,31 @@ async function main() {
     enginesRead = null;
     renderEngineControls();
     footer();
+    readChangedEngines();
   });
+}
+
+function readChangedEngines() {
+  if (!enginesChanged || busy || enginesRead) return;
+  enginesChanged = false;
+  const asked = begun;
+  act(call('engines').then((next) => {
+    if (asked === begun) {
+      renderEngines(next);
+    } else {
+      // Read again for what began meanwhile: now, or once it ends.
+      enginesChanged = true;
+      readChangedEngines();
+    }
+  }));
 }
 
 function wire() {
   on('stockfish-progress', showInstallProgress);
+  on('engines-changed', () => {
+    enginesChanged = true;
+    readChangedEngines();
+  });
   document.getElementById('next').addEventListener('click', next);
   document.getElementById('back').addEventListener('click', () => show(STEPS[STEPS.indexOf(step) - 1]));
   document.getElementById('skip').addEventListener('click', () => work(complete));
@@ -96,6 +125,10 @@ function wire() {
   });
   document.getElementById('auto-update').addEventListener('click', () => {
     autoUpdateOn = !autoUpdateOn;
+    renderStartup();
+  });
+  document.getElementById('stockfish-update').addEventListener('click', () => {
+    stockfishUpdateOn = !stockfishUpdateOn;
     renderStartup();
   });
   document.getElementById('open').addEventListener('click', () => act(call('open_pairing')));
@@ -201,6 +234,7 @@ function renderSettings(next) {
   if (!settings) {
     autostartOn = !next.autostartBlocked;
     autoUpdateOn = next.autoUpdate;
+    stockfishUpdateOn = next.stockfishAutoUpdate;
   }
   settings = next;
   const rows = settings.extras.map((extra) => {
@@ -294,7 +328,7 @@ function pickEngine() {
   work(() => call('pick_engine').then((path) => path && choose(path)));
 }
 
-// Installs the pinned Stockfish with its progress in place, and the bridge
+// Installs the newest Stockfish with its progress in place, and the bridge
 // chooses it. «Next» waits for it.
 function installStockfish() {
   if (busy) return;
@@ -333,6 +367,8 @@ function renderStartup() {
   document.getElementById('autostart-blocked').hidden = !blocked;
   toggle('auto-update', autoUpdateOn);
   document.getElementById('auto-update').disabled = busy;
+  toggle('stockfish-update', stockfishUpdateOn);
+  document.getElementById('stockfish-update').disabled = busy;
 }
 
 function toggle(id, onNow) {
@@ -346,6 +382,9 @@ async function applyStartup() {
     renderSettings(await call('set_autostart', { on: autostartOn }));
   }
   if (autoUpdateOn !== settings.autoUpdate) renderSettings(await call('set_auto_update', { on: autoUpdateOn }));
+  if (stockfishUpdateOn !== settings.stockfishAutoUpdate) {
+    renderSettings(await call('set_stockfish_auto_update', { on: stockfishUpdateOn }));
+  }
 }
 
 // The last screen opens oschess with the pairing link once, and shows the
@@ -414,10 +453,12 @@ function work(task) {
 
 function setBusy(now) {
   busy = now;
+  if (now) begun += 1;
   document.getElementById('add-folder').disabled = now;
   renderEngineControls();
   renderStartup();
   footer();
+  readChangedEngines();
 }
 
 // The controls that change the engine wait for the engine folders' first

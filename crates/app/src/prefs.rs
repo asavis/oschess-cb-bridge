@@ -2,7 +2,7 @@
 //! the bridge server does not read.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -18,6 +18,9 @@ pub struct Prefs {
     pub language: Option<Lang>,
     /// Install new versions of the bridge by themselves.
     pub auto_update: bool,
+    /// Install new Stockfish releases in place of the build the bridge
+    /// installed (#322).
+    pub stockfish_auto_update: bool,
     /// The bridge version whose Stockfish offer the user put off with
     /// «Пізніше»; the next bridge version offers again.
     pub stockfish_offer_dismissed: Option<String>,
@@ -25,7 +28,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { language: None, auto_update: true, stockfish_offer_dismissed: None }
+        Prefs { language: None, auto_update: true, stockfish_auto_update: true, stockfish_offer_dismissed: None }
     }
 }
 
@@ -46,14 +49,29 @@ pub fn load(dir: &Path) -> Prefs {
     std::fs::read_to_string(dir.join(FILE)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
+/// The lock every writer of the preferences takes.
+static CHANGING: Mutex<()> = Mutex::new(());
+
 /// Each writer reads the latest preferences under the same lock, so a
 /// concurrent Stockfish dismissal cannot overwrite a language choice.
 pub fn update(dir: &Path, change: impl FnOnce(&mut Prefs)) -> Result<(), String> {
-    static CHANGING: Mutex<()> = Mutex::new(());
     let _guard = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
     let mut prefs = load(dir);
     change(&mut prefs);
     save(dir, &prefs)
+}
+
+/// No change of the preferences while it is held.
+pub struct Held {
+    _changing: MutexGuard<'static, ()>,
+}
+
+/// Holds off every change of the preferences in `dir` when they meet `keep`
+/// now, so that what the caller does next follows them as they are (#322);
+/// `None` when they do not.
+pub fn hold_if(dir: &Path, keep: impl FnOnce(&Prefs) -> bool) -> Option<Held> {
+    let guard = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
+    keep(&load(dir)).then_some(Held { _changing: guard })
 }
 
 pub fn save(dir: &Path, prefs: &Prefs) -> Result<(), String> {
@@ -77,6 +95,7 @@ mod tests {
             ))
             .unwrap();
             assert!(!prefs.auto_update);
+            assert!(prefs.stockfish_auto_update, "a file from before #322 keeps Stockfish up to date");
             assert_eq!(prefs.stockfish_offer_dismissed.as_deref(), Some("1.2.3"));
             assert_eq!(prefs.language(0x0422), Lang::Uk);
             assert_eq!(prefs.language(0x0419), Lang::Uk);
@@ -93,7 +112,7 @@ mod tests {
     fn concurrent_preference_changes_keep_each_others_choices() {
         let dir = std::env::temp_dir().join(format!("bridge-app-language-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let start = &std::sync::Barrier::new(3);
+        let start = &std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
             let dir = &dir;
             scope.spawn(move || {
@@ -104,12 +123,17 @@ mod tests {
                 start.wait();
                 update(dir, |p| p.auto_update = false).unwrap();
             });
+            scope.spawn(move || {
+                start.wait();
+                update(dir, |p| p.stockfish_auto_update = false).unwrap();
+            });
             start.wait();
             update(dir, |p| p.stockfish_offer_dismissed = Some("1.2.3".into())).unwrap();
         });
         let saved = load(&dir);
         assert_eq!(saved.language, Some(Lang::En));
         assert!(!saved.auto_update);
+        assert!(!saved.stockfish_auto_update);
         assert_eq!(saved.stockfish_offer_dismissed.as_deref(), Some("1.2.3"));
         update(&dir, |p| p.language = Some(Lang::Uk)).unwrap();
         assert_eq!(load(&dir), Prefs { language: Some(Lang::Uk), ..saved });
@@ -119,13 +143,39 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// While held, every change waits; held only while the preferences meet
+    /// the condition (#322).
+    #[test]
+    fn a_hold_keeps_the_preferences_unchanged_until_it_ends() {
+        let dir = std::env::temp_dir().join(format!("bridge-app-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(hold_if(&dir, |p| !p.stockfish_auto_update).is_none(), "on by default");
+        let held = hold_if(&dir, |p| p.stockfish_auto_update).expect("on");
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let writer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || done_tx.send(update(&dir, |p| p.stockfish_auto_update = false)))
+        };
+        assert!(done.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "the change waits");
+        assert!(load(&dir).stockfish_auto_update);
+        drop(held);
+        assert_eq!(done.recv_timeout(crate::PATIENCE).expect("then it is saved"), Ok(()));
+        writer.join().unwrap().unwrap();
+        assert!(!load(&dir).stockfish_auto_update);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn defaults_then_what_was_saved() {
         let dir = std::env::temp_dir().join(format!("bridge-app-prefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(load(&dir), Prefs::default());
-        let saved =
-            Prefs { language: Some(Lang::Uk), auto_update: false, stockfish_offer_dismissed: Some("0.2.0".into()) };
+        let saved = Prefs {
+            language: Some(Lang::Uk),
+            auto_update: false,
+            stockfish_auto_update: false,
+            stockfish_offer_dismissed: Some("0.2.0".into()),
+        };
         save(&dir, &saved).unwrap();
         assert_eq!(load(&dir), saved);
         // Replaced whole, with nothing left beside it (#62).

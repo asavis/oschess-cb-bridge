@@ -157,7 +157,19 @@ fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
 
 /// Waits until an install would lose no work (`updates::idle`).
 pub(super) fn wait_idle(shared: &Shared) {
-    while !updates::idle(&shared.view(), super::commands::installing()) {
+    wait_idle_while(shared, || true);
+}
+
+/// Waits as [`wait_idle`] does while `wanted` holds; whether the bridge
+/// became idle before `wanted` stopped holding.
+pub(super) fn wait_idle_while(shared: &Shared, wanted: impl Fn() -> bool) -> bool {
+    loop {
+        if !wanted() {
+            return false;
+        }
+        if updates::idle(&shared.view(), super::commands::installing()) {
+            return true;
+        }
         std::thread::sleep(IDLE_POLL);
     }
 }

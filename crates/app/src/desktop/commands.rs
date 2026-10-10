@@ -2,10 +2,10 @@
 //! the ones it needs.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bridge::engines::{self, Roots};
-use bridge::stockfish::{self, Build};
+use bridge::stockfish;
 use bridge::{config, engine, folders, token};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, WebviewWindow};
@@ -15,12 +15,13 @@ use tauri_plugin_opener::OpenerExt;
 
 use super::autostart::{self, State};
 use super::server::{self, Pairing};
-use super::{SharedState, channel, shared, tray, updater, windows};
+use super::{SharedState, channel, engine_updates, shared, tray, updater, windows};
 use crate::choices::{self, Choices, EnginesView, InstallProgress};
 use crate::i18n::Lang;
 use crate::prefs;
 use crate::settings::{self, Extra, Failure};
 use crate::status::View;
+use crate::stockfish_updates::Known;
 
 /// What the settings window shows beside the databases.
 #[derive(Clone, Debug, Serialize)]
@@ -34,6 +35,8 @@ pub struct SettingsView {
     /// turn it on again.
     autostart_blocked: bool,
     auto_update: bool,
+    /// Whether new Stockfish releases replace the build the bridge installed (#322).
+    stockfish_auto_update: bool,
     /// Whether this build looks for updates at all.
     updates: bool,
     /// Whether the Microsoft Store installed this copy and updates it (#112).
@@ -117,13 +120,15 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
     let dir = shared.dir()?;
     let config = config::load_or_create(&shared.config_path()?)?;
     let autostart = autostart::state(app);
+    let prefs = prefs::load(&dir);
     Ok(SettingsView {
         version: env!("CARGO_PKG_VERSION"),
         port: config.port,
         extras: settings::extras(&config),
         autostart: autostart == State::On,
         autostart_blocked: autostart == State::Blocked,
-        auto_update: prefs::load(&dir).auto_update,
+        auto_update: prefs.auto_update,
+        stockfish_auto_update: prefs.stockfish_auto_update,
         updates: updater::enabled(app),
         store: channel().is_store(),
     })
@@ -166,20 +171,25 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     let data = shared.dir()?;
     let roots = Roots { bridge_data: Some(data.clone()), ..Roots::system() };
     let found = engines::find(&roots);
-    Ok(EnginesView::new(&data, config.engine.as_deref(), found, env!("CARGO_PKG_VERSION")))
+    let newest = KNOWN.newest(stockfish::machine_arch());
+    Ok(EnginesView::new(&data, config.engine.as_deref(), found, env!("CARGO_PKG_VERSION"), &newest))
 }
 
 /// The engine choices and Stockfish installations, in the order
 /// [`Choices`] keeps.
-static CHOICES: Choices = Choices::new();
+pub(super) static CHOICES: Choices = Choices::new();
+
+/// The newest Stockfish release this run knows of (#322).
+pub(super) static KNOWN: Known = Known::new();
 
 /// Whether Stockfish is being installed now (#61): an update waits for it.
 pub(super) fn installing() -> bool {
     CHOICES.installing()
 }
 
-/// Installs the official Stockfish pinned in this release, then chooses it
-/// unless another engine was chosen meanwhile ([`Choices::install`]). The
+/// Installs the newest official Stockfish a week old, as GitHub's API names
+/// it, else the build pinned in this release, then chooses it unless another engine was
+/// chosen meanwhile ([`Choices::install`]). The
 /// progress goes to the window that asked, the settings or the first-run
 /// wizard, as `stockfish-progress` events. A failed installation answers why,
 /// in English, inside the message that Stockfish was not installed.
@@ -189,10 +199,15 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
     let data = shared(&app).dir().map_err(failed)?;
     let config_path = shared(&app).config_path().map_err(failed)?;
     let label = window.label().to_string();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let arch = stockfish::machine_arch();
+    let known_before = KNOWN.newest(arch);
+    let installed = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let install = || {
-            let build = Build::for_arch(stockfish::machine_arch());
-            stockfish::install(&data, build, &stockfish::System, &mut |progress| {
+            let build = KNOWN.look_up(&stockfish::System, arch, SystemTime::now()).unwrap_or_else(|e| {
+                bridge::log!("Stockfish lookup: {e}");
+                KNOWN.newest(arch)
+            });
+            stockfish::install(&data, &build, &stockfish::System, &mut |progress| {
                 let _ = window.emit_to(label.as_str(), "stockfish-progress", InstallProgress::from(progress));
             })
         };
@@ -200,8 +215,12 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
     })
     .await
     .map_err(text)
-    .and_then(|installed| installed)
-    .map_err(failed)?;
+    .and_then(|installed| installed);
+    // A newer release learned of changes what every open window shows.
+    if KNOWN.newest(arch) != known_before {
+        let _ = app.emit("engines-changed", ());
+    }
+    installed.map_err(failed)?;
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
@@ -281,6 +300,17 @@ pub fn switch_autostart(app: &AppHandle, on: bool) -> Result<State, String> {
 pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
     prefs::update(&dir, |prefs| prefs.auto_update = on)?;
+    settings_view(&app)
+}
+
+/// Turned on, it looks for a newer Stockfish at once.
+#[tauri::command]
+pub fn set_stockfish_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
+    let dir = shared(&app).dir()?;
+    prefs::update(&dir, |prefs| prefs.stockfish_auto_update = on)?;
+    if on {
+        engine_updates::look_now(&app);
+    }
     settings_view(&app)
 }
 
