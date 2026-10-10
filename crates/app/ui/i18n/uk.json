@@ -62,9 +62,9 @@
   "flyout.open": "Відкрити oschess",
   "flyout.settings": "Налаштування",
 
-  "db.records.one": "{n} партія",
-  "db.records.few": "{n} партії",
-  "db.records.many": "{n} партій",
+  "db.records.one": "{n} запис",
+  "db.records.few": "{n} записи",
+  "db.records.many": "{n} записів",
   "db.chip.ready": "готова",
   "db.chip.missing": "немає на місці",
   "db.chip.cloudOnly": "у хмарі",
