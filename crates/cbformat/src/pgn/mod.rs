@@ -14,7 +14,9 @@ pub use san::{parse as parse_san, san};
 
 use chesscore::Board;
 
-use crate::game::{Date, Eco, GameAnnotations, GameResult, Head, Names, Player, RecordKind, Start, language};
+use crate::game::{
+    Date, Eco, GameAnnotations, GameResult, Head, Names, Player, RecordKind, Start, Tournament, language,
+};
 use crate::replay::{self, TreeStats, start_board};
 use crate::v2::{Database, GameMoves, Record};
 use crate::{Error, Limits, Result};
@@ -136,10 +138,10 @@ pub fn game(db: &Database, id: u32) -> Result<String> {
 
 /// [`game`] with `options`, and how much of the annotations it holds. A move
 /// or annotation record over [`Limits::game_bytes`] is refused before it is
-/// read.
+/// read. An analysis is written as a game is (asavis/oschess-cb-bridge#323).
 pub fn game_with(db: &Database, id: u32, options: &Options, limits: Limits) -> Result<Rendered> {
     let r = db.record(id)?;
-    if r.kind() != RecordKind::Game {
+    if !has_moves(&r) {
         return Err(Error::Format(format!("record {id} is not a game")));
     }
     let data = db.moves_of_within(&r, limits.game_bytes)?;
@@ -158,12 +160,21 @@ pub fn game_from(
     annotations: Option<&GameAnnotations>,
     options: &Options,
 ) -> Result<Rendered> {
-    if r.kind() != RecordKind::Game {
-        return Err(Error::Format(format!("record {} is not a game", r.id())));
-    }
-    let tags = Tags::new(r, db.tag_names(r)?, &moves.start()?, moves.is_chess960())?;
+    let start = moves.start()?;
+    let tags = match r.kind() {
+        RecordKind::Game => Tags::new(r, db.tag_names(r)?, &start, moves.is_chess960())?,
+        RecordKind::Analysis => Tags::analysis(db.entities().title(r.analysis_title())?, &start, moves.is_chess960())?,
+        _ => return Err(Error::Format(format!("record {} is not a game", r.id()))),
+    };
     let text = write_movetext(moves, annotations, options)?;
     Ok(finish(&tags, &text, annotations))
+}
+
+/// Whether record `r` holds moves to write: a game or an analysis. An
+/// analysis has moves and annotations as a game has, under a header of its
+/// own (Morphy's `format/v2/1-game-headers.md`, "Analyses").
+fn has_moves(r: &Record) -> bool {
+    matches!(r.kind(), RecordKind::Game | RecordKind::Analysis)
 }
 
 /// The tag roster of a game, from either format.
@@ -194,6 +205,24 @@ impl Tags {
             result: head.result(),
             elo: head.elo(),
             eco: head.eco(),
+            start: (*start != Start::Standard).then(|| start_board(start)).transpose()?,
+            chess960,
+        })
+    }
+
+    /// The tags of an analysis titled `title`, played from `start`. Its header
+    /// has no players, tournament, date, round, result, ratings or ECO, so
+    /// only `Event` (the title) and a start position other than the usual one
+    /// are written; the rest are PGN's unknowns.
+    fn analysis(title: Option<String>, start: &Start, chess960: bool) -> Result<Tags> {
+        let tournament = title.map(|title| Tournament { title, place: String::new(), start: Date::default(), kind: 0 });
+        Ok(Tags {
+            names: Names { tournament, ..Names::default() },
+            date: Date::default(),
+            round: (0, 0),
+            result: GameResult::Line,
+            elo: (0, 0),
+            eco: Eco::default(),
             start: (*start != Start::Standard).then(|| start_board(start)).transpose()?,
             chess960,
         })

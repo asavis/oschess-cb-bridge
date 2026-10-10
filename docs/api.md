@@ -146,7 +146,7 @@ with them.
 | 421 | `misdirected_host` | `Host` is not a loopback name |
 | 422 | `database_too_large` | Searching or sorting this database needs more than the whole search memory budget; number order still works |
 | 422 | `unsupported` | The position or variant of the explorer, of `fen` or of a fragment is Chess960, which the position index does not hold; `variant` names it |
-| 422 | `not_a_game` | The record is a guiding text or an analysis, which the bridge does not serve as PGN |
+| 422 | `not_a_game` | The record is a guiding text, which the bridge does not serve as PGN; a bridge without the `analysisGames` feature answers an analysis so too |
 | 422 | `games_would_join` | A write would join games: the new game to a neighbour, or the games on either side of one removed, because a game next to it lacks its result or holds tags alone. Nothing was written |
 | 422 | `unencodable` | The game of a write holds a character that the file's code page cannot store; `character` names the first. Nothing was written |
 | 422 | `unreadable_game` | The game's records are damaged and stay so between reads, or it is too large to serve (a move or annotation record over 2 MiB, or an answer over 8 MiB); `reason` says which, in English |
@@ -285,7 +285,9 @@ the bridge is too old; the app then offers the download link. `features`
 names the optional features of version 1 this bridge has, each once (#270):
 `explorerSearch`, the explorer's `q` and its `filter` acknowledgement (#268);
 `fragmentSearch`, the games of a position fragment and of material, with
-their `fragment` acknowledgement (#272, [Games of a fragment](#games-of-a-fragment)).
+their `fragment` acknowledgement (#272, [Games of a fragment](#games-of-a-fragment));
+`analysisGames`, analyses served as PGN by `GET /v1/databases/{id}/games/{number}`
+(#323), which an older bridge answers `422 not_a_game`.
 A client offers a feature only when it finds it named. A bridge older than
 the list sends no `features`, which a client reads as an empty list, and a
 client ignores names it does not know (Compatibility, rule 2: a field only
@@ -768,9 +770,17 @@ One game as PGN.
 | `annotations` | `none` when the game has no annotations or the database no annotation file; `complete` when every annotation was read; `incomplete` when an annotation of unknown layout stopped decoding, and the PGN then has the annotations before it |
 | `unreadableAnnotation` | With `incomplete`: the annotation type code, a number |
 
-A guiding text or an analysis is answered `422 not_a_game`, and a game whose
-records are damaged `422 unreadable_game`. Deleted games are served. Both forms
-are held to the same answer limit.
+A guiding text is answered `422 not_a_game`, and a game whose records are
+damaged `422 unreadable_game`. Deleted games are served. Both forms are held
+to the same answer limit.
+
+An analysis (a 2CBH record of its own kind, `kind: "analysis"` in its row) is
+served as a game is (#323): its moves and annotations are written in either
+form exactly as a game's. Its header holds only a title and an author, so its
+tags are `Event` (the title, `?` when it has none), `Site`, `Round`, `White`
+and `Black` as `?`, `Date` as `????.??.??` and `Result` as `*`, with no Elo or
+ECO tag, and `SetUp`/`FEN` when it starts from another position. As for a
+game, no tag names the annotator; the row's `annotator` holds the author.
 
 #### Both forms
 

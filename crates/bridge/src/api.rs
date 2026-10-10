@@ -177,9 +177,9 @@ fn with_entry(app: &App, id: &str, f: impl FnOnce(&Entry) -> Response) -> Respon
 
 /// The optional features of API version 1 this bridge has (#270), which a
 /// client offers only when it finds them named: `explorerSearch`, the
-/// explorer's `q` (#268), and `fragmentSearch`, the games of a position
-/// fragment and of material (#272).
-pub const FEATURES: [&str; 2] = ["explorerSearch", "fragmentSearch"];
+/// explorer's `q` (#268), `fragmentSearch`, the games of a position fragment
+/// and of material (#272), and `analysisGames`, analyses served as PGN (#323).
+pub const FEATURES: [&str; 3] = ["explorerSearch", "fragmentSearch", "analysisGames"];
 
 fn status(app: &App) -> Response {
     let entries = app.catalog.entries();
@@ -542,7 +542,8 @@ fn attempt<S: Store>(app: &App, db: &S, number: u32, options: &pgn::Options) -> 
         return Attempt::NotFound;
     }
     let Ok(before) = db.record(number) else { return Attempt::Changed };
-    if !matches!(before.kind(), RecordKind::Game) {
+    // An analysis has moves and annotations as a game has (#323).
+    if !matches!(before.kind(), RecordKind::Game | RecordKind::Analysis) {
         return Attempt::NotAGame;
     }
     let rendered = {
@@ -571,7 +572,7 @@ fn game(app: &App, entry: &Entry, number: &str, req: &Request) -> Response {
         let rendered = match with_store!(&*open.db, db => attempt(app, db, number, &options)) {
             Attempt::NotFound => return not_found(),
             Attempt::NotAGame => {
-                return error(422, "not_a_game", "Guiding texts and analyses are not served as PGN");
+                return error(422, "not_a_game", "Guiding texts are not served as PGN");
             }
             Attempt::Changed => continue,
             Attempt::Rendered(rendered) => rendered,
