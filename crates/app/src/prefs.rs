@@ -2,7 +2,7 @@
 //! the bridge server does not read.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -49,14 +49,29 @@ pub fn load(dir: &Path) -> Prefs {
     std::fs::read_to_string(dir.join(FILE)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }
 
+/// The lock every writer of the preferences takes.
+static CHANGING: Mutex<()> = Mutex::new(());
+
 /// Each writer reads the latest preferences under the same lock, so a
 /// concurrent Stockfish dismissal cannot overwrite a language choice.
 pub fn update(dir: &Path, change: impl FnOnce(&mut Prefs)) -> Result<(), String> {
-    static CHANGING: Mutex<()> = Mutex::new(());
     let _guard = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
     let mut prefs = load(dir);
     change(&mut prefs);
     save(dir, &prefs)
+}
+
+/// No change of the preferences while it is held.
+pub struct Held {
+    _changing: MutexGuard<'static, ()>,
+}
+
+/// Holds off every change of the preferences in `dir` when they meet `keep`
+/// now, so that what the caller does next follows them as they are (#322);
+/// `None` when they do not.
+pub fn hold_if(dir: &Path, keep: impl FnOnce(&Prefs) -> bool) -> Option<Held> {
+    let guard = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
+    keep(&load(dir)).then_some(Held { _changing: guard })
 }
 
 pub fn save(dir: &Path, prefs: &Prefs) -> Result<(), String> {
@@ -126,6 +141,28 @@ mod tests {
         assert!(update(&dir.join(FILE), |p| p.language = Some(Lang::En)).is_err());
         assert_eq!(load(&dir).language, Some(Lang::Uk));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// While held, every change waits; held only while the preferences meet
+    /// the condition (#322).
+    #[test]
+    fn a_hold_keeps_the_preferences_unchanged_until_it_ends() {
+        let dir = std::env::temp_dir().join(format!("bridge-app-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(hold_if(&dir, |p| !p.stockfish_auto_update).is_none(), "on by default");
+        let held = hold_if(&dir, |p| p.stockfish_auto_update).expect("on");
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let writer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || done_tx.send(update(&dir, |p| p.stockfish_auto_update = false)))
+        };
+        assert!(done.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "the change waits");
+        assert!(load(&dir).stockfish_auto_update);
+        drop(held);
+        assert_eq!(done.recv_timeout(crate::PATIENCE).expect("then it is saved"), Ok(()));
+        writer.join().unwrap().unwrap();
+        assert!(!load(&dir).stockfish_auto_update);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

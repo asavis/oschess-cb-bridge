@@ -180,7 +180,8 @@ impl Look<'_> {
     /// bridge is idle, and chooses the build once `probe` accepts it, unless
     /// the user chose another engine meanwhile ([`Choices::update`]). `wait`
     /// answers false when it gave up, as when the option was turned off; the
-    /// option is read again after it. Once the chosen build is the newest,
+    /// option is read again after it and after the probe, and is not changed
+    /// while the choice is saved. Once the chosen build is the newest,
     /// the older builds the bridge installed go ([`Look::remove_older`]). A
     /// failed lookup or installation changes nothing.
     pub fn run(
@@ -202,7 +203,10 @@ impl Look<'_> {
         }
         let version = newest.version.to_string();
         let install = || stockfish::install(self.data, &newest, self.transport, &mut |_| {});
-        if !self.choices.update(self.config_path, install, || wait() && self.wanted(), probe)? {
+        // The option is read again after the wait and, under the preferences'
+        // lock held while the choice is saved, after the probe.
+        let confirm = || prefs::hold_if(self.data, |p| p.stockfish_auto_update);
+        if !self.choices.update(self.config_path, install, || wait() && self.wanted(), probe, confirm)? {
             return Ok(if self.wanted() { Outcome::Kept(version) } else { Outcome::Withdrawn(version) });
         }
         self.remove_older();
@@ -218,13 +222,14 @@ impl Look<'_> {
     /// chosen one, while the option is on and the chosen engine is a build
     /// the bridge installed. The choice is read when no engine can be chosen
     /// and no build installed ([`Choices::while_settled`]), so that the build
-    /// chosen then is never removed; while an installation runs, a later look
-    /// removes them.
+    /// chosen then is never removed, and the option is held on until the
+    /// removal ends; while an installation runs, a later look removes them.
     fn remove_older(&self) {
         let removal = self.choices.while_settled(|| {
             let chosen = config::load_or_create(self.config_path).ok()?.engine?;
             let kept = stockfish::installed_version(self.data, &chosen)?;
-            self.wanted().then(|| stockfish::remove_older(self.data, &kept))
+            let _on = prefs::hold_if(self.data, |p| p.stockfish_auto_update)?;
+            Some(stockfish::remove_older(self.data, &kept))
         });
         let Some(Some((removed, failed))) = removal else { return };
         for version in removed {
@@ -582,6 +587,16 @@ mod tests {
             true
         };
         assert_eq!(look.run(off_while_waiting, |_| Ok(())), Ok(Outcome::Withdrawn("20".into())));
+        assert_eq!(chosen(&dir), Some(exe.clone()));
+        assert_eq!(builds(&dir), ["stockfish-18", "stockfish-19", "stockfish-20"]);
+        // Turned off while the new build is probed: nothing is chosen either
+        // (#322 review, round 2).
+        prefs::update(&dir, |p| p.stockfish_auto_update = true).unwrap();
+        let off_while_probing = |_: &Path| {
+            prefs::update(&dir, |p| p.stockfish_auto_update = false).unwrap();
+            Ok(())
+        };
+        assert_eq!(look.run(|| true, off_while_probing), Ok(Outcome::Withdrawn("20".into())));
         assert_eq!(chosen(&dir), Some(exe.clone()));
         assert_eq!(builds(&dir), ["stockfish-18", "stockfish-19", "stockfish-20"]);
         // A wait that gives up by itself chooses nothing either.

@@ -80,7 +80,7 @@ impl Choices {
         let _installing = self.begin_installing()?;
         let ticket = self.ticket();
         let exe = install()?;
-        self.choose_installed(ticket, config_path, exe, probe)
+        self.choose_installed(ticket, config_path, exe, probe, || Some(()))
     }
 
     /// Installs as [`Choices::install`] does, then waits with `wait` before
@@ -90,12 +90,17 @@ impl Choices {
     /// so neither an update of the bridge nor the user's own installation
     /// waits for that; a choice made meanwhile stands. `wait` answering false
     /// gives the choice up: nothing is chosen, and the build stays listed.
-    pub fn update(
+    /// After the probe, `confirm` gives the choice up the same way by
+    /// answering `None`; what it answers otherwise is held while the choice
+    /// is saved, such as the preferences' lock ([`crate::prefs::hold_if`]),
+    /// so that a probe of seconds cannot outlast a reason to give up.
+    pub fn update<G>(
         &self,
         config_path: &Path,
         install: impl FnOnce() -> Result<PathBuf, String>,
         wait: impl FnOnce() -> bool,
         probe: impl FnOnce(&Path) -> Result<(), String>,
+        confirm: impl FnOnce() -> Option<G>,
     ) -> Result<bool, String> {
         let (ticket, exe) = {
             let _installing = self.begin_installing()?;
@@ -104,20 +109,23 @@ impl Choices {
         if !wait() {
             return Ok(false);
         }
-        self.choose_installed(ticket, config_path, exe, probe)
+        self.choose_installed(ticket, config_path, exe, probe, confirm)
     }
 
     /// Chooses the build `exe` an installation that began at `ticket`
-    /// installed, once `probe` accepts it, unless an engine was chosen since.
-    fn choose_installed(
+    /// installed, once `probe` accepts it and `confirm` answers, unless an
+    /// engine was chosen since.
+    fn choose_installed<G>(
         &self,
         ticket: Ticket,
         config_path: &Path,
         exe: PathBuf,
         probe: impl FnOnce(&Path) -> Result<(), String>,
+        confirm: impl FnOnce() -> Option<G>,
     ) -> Result<bool, String> {
         let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
         probe(&exe)?;
+        let Some(_confirmed) = confirm() else { return Ok(false) };
         // A choice made while the download ran stands; the build stays listed.
         self.save_if_current(ticket, config_path, exe)
     }
@@ -404,6 +412,7 @@ mod tests {
                 events.borrow_mut().push(format!("probe {}", exe.display()));
                 Ok(())
             },
+            || Some(()),
         );
         assert_eq!(chosen, Ok(true));
         assert_eq!(*events.borrow(), ["install, installing true", "wait, installing false", "probe stockfish-20.exe"]);
@@ -418,6 +427,7 @@ mod tests {
                 true
             },
             accept,
+            || Some(()),
         );
         assert_eq!(chosen, Ok(false));
         assert_eq!(engine_in(&toml), Some(PathBuf::from("lc0.exe")));
@@ -440,11 +450,55 @@ mod tests {
                 *probed.borrow_mut() = true;
                 Ok(())
             },
+            || Some(()),
         );
         assert_eq!(chosen, Ok(false));
         assert!(!*probed.borrow(), "nothing is probed either");
         assert_eq!(engine_in(&toml), None);
         assert_eq!(choices.install(&toml, || Ok(PathBuf::from("stockfish.exe")), accept), Ok(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the probe, a refused confirmation chooses nothing; a granted one
+    /// is held while the choice is saved (#322 review).
+    #[test]
+    fn an_update_confirms_after_the_probe() {
+        let dir = folder("confirm");
+        let toml = dir.join("bridge.toml");
+        let choices = Choices::new();
+        let events = RefCell::new(Vec::new());
+        let refused = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-20.exe")),
+            || true,
+            |_| {
+                events.borrow_mut().push("probe");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("confirm");
+                None::<()>
+            },
+        );
+        assert_eq!(refused, Ok(false));
+        assert_eq!(*events.borrow(), ["probe", "confirm"]);
+        assert_eq!(engine_in(&toml), None);
+        struct Saved<'a>(&'a Path, &'a RefCell<Vec<&'static str>>);
+        impl Drop for Saved<'_> {
+            fn drop(&mut self) {
+                assert!(engine_in(self.0).is_some(), "held until the choice is saved");
+                self.1.borrow_mut().push("released");
+            }
+        }
+        let granted = choices.update(
+            &toml,
+            || Ok(PathBuf::from("stockfish-20.exe")),
+            || true,
+            accept,
+            || Some(Saved(&toml, &events)),
+        );
+        assert_eq!(granted, Ok(true));
+        assert_eq!(events.borrow().last(), Some(&"released"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
