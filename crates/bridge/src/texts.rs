@@ -230,37 +230,87 @@ pub fn resolve<S: Store>(db: &S, text: &GuidingText) -> cbformat::Result<Resolve
     Ok(out)
 }
 
-/// An upper bound of the length of [`contents`]: the escaped text of every
-/// field and room for the keys and numbers of each span, so that an answer
-/// over the limit is refused, and its budget reserved, before it is built.
-pub fn contents_len(text: &GuidingText) -> usize {
-    let mut len = 16;
-    for content in &text.contents {
-        len += 64;
-        match &content.body {
-            Body::Html(html) => len += string_len(html),
-            Body::Paragraphs(paragraphs) => {
-                for paragraph in paragraphs {
-                    len += 16;
-                    for span in &paragraph.spans {
-                        len += 128
-                            + match span {
-                                Span::Text { text, style } => string_len(text) + string_len(&style.font),
-                                Span::Diagram { board } => string_len(board),
-                                Span::Game(link) => {
-                                    string_len(&link.label)
-                                        + string_len(&link.white)
-                                        + string_len(&link.black)
-                                        + string_len(&link.event)
-                                }
-                                Span::TextLink { title } => string_len(title),
-                            };
-                    }
-                }
-            }
+/// The length of [`contents`] for `text` and `resolved`, counted without
+/// writing it, so that an answer over the limit is refused, and its budget
+/// reserved, before it is built. It is exact: the test below holds it to the
+/// written answer.
+pub fn contents_len(text: &GuidingText, resolved: &Resolved) -> usize {
+    let mut games = resolved.games.iter().copied();
+    let mut texts = resolved.texts.iter().copied();
+    list(text.contents.iter().map(|c| {
+        let lang = field("lang", string_len(&language_code(c.language)));
+        let body = match &c.body {
+            Body::Html(html) => field("html", string_len(html)),
+            Body::Paragraphs(paragraphs) => field(
+                "paragraphs",
+                list(paragraphs.iter().map(|p| {
+                    object(&[field("spans", list(p.spans.iter().map(|s| span_len(s, &mut games, &mut texts))))])
+                })),
+            ),
+        };
+        object(&[lang, body])
+    }))
+}
+
+fn span_len(
+    s: &Span,
+    games: &mut dyn Iterator<Item = Option<u32>>,
+    texts: &mut dyn Iterator<Item = Option<u32>>,
+) -> usize {
+    let flag = |on: bool| if on { 4 } else { 5 };
+    match s {
+        Span::Text { text, style } => object(&[
+            field("text", string_len(text)),
+            field("font", string_len(&style.font)),
+            field("size", digits(style.size)),
+            field("bold", flag(style.bold)),
+            field("italic", flag(style.italic)),
+            field("underline", flag(style.underline)),
+        ]),
+        Span::Diagram { board } => object(&[field("diagram", object(&[field("board", string_len(board))]))]),
+        Span::Game(link) => {
+            let game = object(&[
+                field("label", string_len(&link.label)),
+                field("white", string_len(&display_name(&link.white))),
+                field("black", string_len(&display_name(&link.black))),
+                field("event", string_len(link.event.trim())),
+                field("number", games.next().flatten().map_or(4, digits)),
+            ]);
+            object(&[field("game", game)])
+        }
+        Span::TextLink { title } => {
+            let link = object(&[
+                field("title", string_len(title.trim())),
+                field("number", texts.next().flatten().map_or(4, digits)),
+            ]);
+            object(&[field("textLink", link)])
         }
     }
-    len
+}
+
+/// A field `"key":value` whose value is `value` bytes; keys need no escapes.
+fn field(key: &str, value: usize) -> usize {
+    key.len() + 3 + value
+}
+
+/// An object of fields of these lengths.
+fn object(fields: &[usize]) -> usize {
+    2 + fields.iter().sum::<usize>() + fields.len().saturating_sub(1)
+}
+
+/// An array of values of these lengths.
+fn list(items: impl Iterator<Item = usize>) -> usize {
+    let (mut len, mut count) = (2usize, 0usize);
+    for item in items {
+        len += item;
+        count += 1;
+    }
+    len + count.saturating_sub(1)
+}
+
+/// The decimal digits of `n`.
+fn digits(n: u32) -> usize {
+    n.checked_ilog10().map_or(1, |d| d as usize + 1)
 }
 
 /// The `contents` of the answer: each language's text, its links numbered as
@@ -343,5 +393,51 @@ mod tests {
         assert_eq!(display_name("Coull,Alison"), "Coull, Alison");
         assert_eq!(display_name("Moravec,"), "Moravec");
         assert_eq!(display_name("1.1"), "1.1");
+    }
+
+    /// The counted length is the written one, whatever the text holds:
+    /// escapes, characters of several bytes, numbers of any width and none.
+    #[test]
+    fn the_counted_length_is_the_written_one() {
+        use cbformat::game::guide::Content;
+        let style = |size: u32, bold: bool| Style {
+            font: "Fig\u{2028}ure \"CB\"".into(),
+            size,
+            bold,
+            italic: !bold,
+            underline: bold,
+        };
+        let spans = vec![
+            Span::Text { text: "Ход \u{1}\n\t♘f3 \\ \"".into(), style: style(0, true) },
+            Span::Text { text: String::new(), style: style(4_294_967_295, false) },
+            Span::Diagram { board: "8/8/8/8/8/8/8/K6k".into() },
+            Span::Game(GameLink {
+                label: "1.5".into(),
+                white: "Doe,Jane".into(),
+                black: "".into(),
+                event: " Op ".into(),
+            }),
+            Span::Game(GameLink { label: "".into(), white: "Roe,".into(), black: "Ün,Ö".into(), event: "".into() }),
+            Span::TextLink { title: " Index ".into() },
+            Span::TextLink { title: "\u{7f}".into() },
+        ];
+        let text = GuidingText {
+            contents: vec![
+                Content { language: 7, body: Body::Paragraphs(vec![Paragraph { spans }, Paragraph::default()]) },
+                Content { language: 300, body: Body::Html("<p>\u{0}é</p>".into()) },
+                Content { language: 0, body: Body::Paragraphs(Vec::new()) },
+            ],
+        };
+        for resolved in [
+            Resolved { games: vec![Some(1), None], texts: vec![Some(4_000_000_000), None] },
+            Resolved { games: vec![None, Some(99)], texts: vec![None, Some(7)] },
+            Resolved::default(),
+        ] {
+            assert_eq!(contents_len(&text, &resolved), contents(&text, &resolved).len(), "{resolved:?}");
+        }
+        assert_eq!(
+            contents_len(&GuidingText::default(), &Resolved::default()),
+            contents(&GuidingText::default(), &Resolved::default()).len()
+        );
     }
 }

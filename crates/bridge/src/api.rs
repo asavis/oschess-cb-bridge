@@ -750,11 +750,13 @@ fn text(app: &App, entry: &Entry, number: &str) -> Response {
         }
         return match read {
             Ok(TextRead { text, resolved, title, author }) => {
-                // The contents' bound, the title and author, and at most 192
-                // bytes of keys and numbers, refused or reserved before the
-                // answer is built.
-                let size =
-                    crate::texts::contents_len(&text) + json::string_len(&title) + json::string_len(&author) + 192;
+                // The contents' length, counted without writing them, the
+                // title and author, and at most 192 bytes of keys and numbers,
+                // refused or reserved before the answer is built.
+                let size = crate::texts::contents_len(&text, &resolved)
+                    + json::string_len(&title)
+                    + json::string_len(&author)
+                    + 192;
                 if size > MAX_GAME_RESPONSE {
                     let reason =
                         format!("the text's answer would be {size} bytes, over the {MAX_GAME_RESPONSE}-byte limit");

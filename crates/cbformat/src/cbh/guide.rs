@@ -259,25 +259,34 @@ fn push(out: &mut [Paragraph], span: Span) {
 
 /// The spans of the objects at one marker, in stored order: one diagram, one
 /// game link, one text link and one list label at most, each from the first
-/// object of its kind that reads. A list label takes `style`, the style of
-/// its marker.
+/// object of its kind that reads. A game link takes its labelled form
+/// ([`LABELLED_GAME`]) wherever the pair puts it. A list label takes `style`,
+/// the style of its marker.
 fn objects(at: &[&Object<'_>], style: &Style, field: &impl Fn(&[u8]) -> String) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let mut done = [false; 4];
-    for o in at {
+    // Per kind: where its first object stands, its span, and whether that is a labelled game link.
+    let mut slots: [Option<(usize, Span, bool)>; 4] = Default::default();
+    for (order, o) in at.iter().enumerate() {
+        let labelled = o.kind == LABELLED_GAME;
         let (slot, span) = match o.kind {
             k if DIAGRAMS.contains(&k) => (0, diagram(o.data)),
-            GAME | LABELLED_GAME => (1, game_link(o.data, o.kind == LABELLED_GAME, field).map(Span::Game)),
+            GAME | LABELLED_GAME => (1, game_link(o.data, labelled, field).map(Span::Game)),
             k if TEXT_LINKS.contains(&k) => (2, counted(o.data).map(|t| Span::TextLink { title: field(t) })),
             LIST_LABEL => (3, counted(o.data).map(|t| Span::Text { text: field(t), style: style.clone() })),
             _ => continue,
         };
-        if let Some(span) = span.filter(|_| !done[slot]) {
-            done[slot] = true;
-            spans.push(span);
+        let Some(span) = span else { continue };
+        match &mut slots[slot] {
+            None => slots[slot] = Some((order, span, labelled)),
+            Some((_, kept, kept_labelled)) if labelled && !*kept_labelled => {
+                *kept = span;
+                *kept_labelled = true;
+            }
+            Some(_) => {}
         }
     }
-    spans
+    let mut spans: Vec<(usize, Span)> = slots.into_iter().flatten().map(|(order, span, _)| (order, span)).collect();
+    spans.sort_by_key(|&(order, _)| order);
+    spans.into_iter().map(|(_, span)| span).collect()
 }
 
 /// A diagram's data: a `u16`, then the 32 bytes of its squares

@@ -326,3 +326,32 @@ fn a_2cbh_text_must_fill_its_record() {
         assert!(db.guiding_text(&db.record(id).unwrap(), LIMIT).is_err(), "record {id}");
     }
 }
+
+/// A game link's pair gives its label whichever of the two comes first.
+#[test]
+fn a_game_link_keeps_its_label_in_either_order() {
+    let t = b"See \x04.";
+    let labelled = game_link("Doe,Jane", "Roe,Richard", "Testville op", Some("1.5"));
+    let plain = game_link("Doe,Jane", "Roe,Richard", "Testville op", None);
+    for (i, objects) in
+        [[(0x1a, 5, labelled.clone()), (0x02, 5, plain.clone())], [(0x02, 5, plain), (0x1a, 5, labelled)]]
+            .into_iter()
+            .enumerate()
+    {
+        let f = formatting(&objects, &[(0, style("Arial", 18, false, false))], &[(t.len(), 0)], false);
+        let mut b = fixture_cbh::Builder::new();
+        b.text_body(&body(1, b"Chapter", 1, &content_v1(language::ENGLISH, t, &f)));
+        let db = b.write(&format!("guide-pair-{i}"));
+        let read = read_classic(&db, CodePage::WESTERN, 1).unwrap();
+        let games: Vec<&GameLink> = paragraphs(&read)[0]
+            .spans
+            .iter()
+            .filter_map(|span| match span {
+                Span::Game(link) => Some(link),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(games.len(), 1, "order {i}");
+        assert_eq!(games[0].label, "1.5", "order {i}");
+    }
+}
