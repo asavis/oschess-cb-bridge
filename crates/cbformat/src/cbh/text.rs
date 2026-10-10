@@ -58,13 +58,64 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
     }
     let runs = cyrillic_utf8_runs(b);
     let read = Evidence::outside(b, &runs).page().unwrap_or(fallback);
+    read_in(b, &runs, read)
+}
+
+/// The page [`single_byte`] reads text `b` in on a computer whose code page
+/// is `page`: the one its words show, else `fallback`; `page` itself where
+/// it is neither of the two ([`detects`]). A guiding text decides its page
+/// once from its whole text (asavis/oschess-cb-bridge#324).
+pub(super) fn page_of(b: &[u8], page: CodePage, fallback: CodePage) -> CodePage {
+    if !detects(page) {
+        return page;
+    }
+    Evidence::outside(b, &cyrillic_utf8_runs(b)).page().unwrap_or(fallback)
+}
+
+/// Single-byte text `b`, whose Cyrillic UTF-8 runs are `runs`, read in page
+/// `read` as [`single_byte`] describes.
+fn read_in(b: &[u8], runs: &[std::ops::Range<usize>], read: CodePage) -> String {
+    let mut out = String::with_capacity(b.len());
+    read_each(b, runs, read, |_, c| out.push(c));
+    out
+}
+
+/// [`single_byte`] in page `read`, which [`page_of`] decided, for a whole
+/// text cut into the pieces between `cuts`, ascending byte offsets:
+/// `cuts.len() + 1` pieces. Each character goes to
+/// the piece holding the byte it starts at, and is read in the context of the
+/// whole text, so a cut between a figurine and its move, beside a diagram mark
+/// or inside a UTF-8 character reads as the whole text does (#324).
+pub(super) fn single_byte_pieces(b: &[u8], page: CodePage, read: CodePage, cuts: &[usize]) -> Vec<String> {
+    let mut pieces = vec![String::new(); cuts.len() + 1];
+    let mut piece = 0;
+    let mut put = |at: usize, c: char| {
+        while piece < cuts.len() && at >= cuts[piece] {
+            piece += 1;
+        }
+        pieces[piece].push(c);
+    };
+    if detects(page) {
+        read_each(b, &cyrillic_utf8_runs(b), read, put);
+    } else {
+        for (at, &byte) in b.iter().enumerate() {
+            put(at, page.char(byte));
+        }
+    }
+    pieces
+}
+
+/// Each character single-byte text `b`, whose Cyrillic UTF-8 runs are `runs`,
+/// reads as in page `read` ([`single_byte`]), with the index of the byte it
+/// starts at, in order.
+fn read_each(b: &[u8], runs: &[std::ops::Range<usize>], read: CodePage, mut each: impl FnMut(usize, char)) {
     let letter = |c: u8| c.is_ascii_alphabetic() || read.char(c).is_alphabetic();
     // The character byte `j` reads as: a figurine, a sign or the page's.
     let char_at = |j: usize| {
         let sign = || sign(b[j], read).filter(|_| !b.get(j + 1).is_some_and(|&c| letter(c)));
         figurine(b[j]).filter(|_| is_piece(b, j)).or_else(sign).unwrap_or_else(|| read.char(b[j]))
     };
-    let mut out = String::with_capacity(b.len());
+    let mut last = None;
     let mut i = 0;
     for run in runs.iter().chain([&(b.len()..b.len())]) {
         while i < run.start {
@@ -75,17 +126,21 @@ pub(super) fn single_byte(b: &[u8], page: CodePage, fallback: CodePage) -> Strin
             } else {
                 b.get(i + 1).map(|_| char_at(i + 1))
             };
-            if b[i] == 0x9e && is_diagram_mark(out.chars().next_back(), next) {
+            if b[i] == 0x9e && is_diagram_mark(last, next) {
                 i += 1;
                 continue;
             }
-            out.push(char_at(i));
+            let c = char_at(i);
+            each(i, c);
+            last = Some(c);
             i += 1;
         }
-        out.push_str(std::str::from_utf8(&b[run.clone()]).unwrap_or_default());
+        for (k, c) in std::str::from_utf8(&b[run.clone()]).unwrap_or_default().char_indices() {
+            each(run.start + k, c);
+            last = Some(c);
+        }
         i = run.end;
     }
-    out
 }
 
 /// What the words of single-byte text `b` show of its page, the words of its

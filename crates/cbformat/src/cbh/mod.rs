@@ -21,6 +21,8 @@ use crate::{Error, Result};
 pub mod annotations;
 mod decode;
 mod entities;
+mod guide;
+pub use guide::MAX_FONT_CHARS;
 mod moves;
 mod pieces;
 mod record;

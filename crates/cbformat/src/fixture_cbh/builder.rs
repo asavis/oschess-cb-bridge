@@ -85,6 +85,22 @@ impl Builder {
         self.records.last_mut().unwrap()
     }
 
+    /// Appends a guiding text whose `.cbg` record holds `body` after its
+    /// flags and size (version, titles, contents), and returns its header
+    /// record for further changes.
+    pub fn text_body(&mut self, body: &[u8]) -> &mut [u8; 46] {
+        let mut r = vec![0x80, 0, 0, 0];
+        r.extend(body);
+        let size = (r.len() as u32).to_be_bytes();
+        r[1..4].copy_from_slice(&size[1..]);
+        let mut h = [0u8; 46];
+        h[0] = 3;
+        h[1..5].copy_from_slice(&(self.cbg.len() as u32).to_be_bytes());
+        self.cbg.extend(r);
+        self.records.push(h);
+        self.records.last_mut().unwrap()
+    }
+
     /// Gives the last game added the annotation record `rec`.
     pub fn annotations(&mut self, rec: &[u8]) -> &mut Self {
         let at = (self.cba.len() as u32).to_be_bytes();
