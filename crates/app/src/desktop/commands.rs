@@ -199,9 +199,10 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
     let data = shared(&app).dir().map_err(failed)?;
     let config_path = shared(&app).config_path().map_err(failed)?;
     let label = window.label().to_string();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let arch = stockfish::machine_arch();
+    let known_before = KNOWN.newest(arch);
+    let installed = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let install = || {
-            let arch = stockfish::machine_arch();
             let build = KNOWN.look_up(&stockfish::System, arch, SystemTime::now()).unwrap_or_else(|e| {
                 bridge::log!("Stockfish lookup: {e}");
                 KNOWN.newest(arch)
@@ -214,8 +215,12 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
     })
     .await
     .map_err(text)
-    .and_then(|installed| installed)
-    .map_err(failed)?;
+    .and_then(|installed| installed);
+    // A newer release learned of changes what every open window shows.
+    if KNOWN.newest(arch) != known_before {
+        let _ = app.emit("engines-changed", ());
+    }
+    installed.map_err(failed)?;
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 

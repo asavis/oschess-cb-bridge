@@ -160,6 +160,14 @@ pub enum Outcome {
     Withdrawn(String),
 }
 
+impl Outcome {
+    /// Whether a build was installed, chosen or not: the engines listed
+    /// changed.
+    pub fn installed(&self) -> bool {
+        matches!(self, Outcome::Updated(_) | Outcome::Kept(_) | Outcome::Withdrawn(_))
+    }
+}
+
 /// What a look works with: the data folder, its `bridge.toml`, the app's
 /// engine choices and the newest build known, how files arrive, and the
 /// time a release's age is measured at.
@@ -461,6 +469,16 @@ mod tests {
         assert_eq!(chosen(&dir), Some(exe));
         assert!(lock(&transport.downloads).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_installed_build_changes_the_engines_listed() {
+        for installed in [Outcome::Updated("20".into()), Outcome::Kept("20".into()), Outcome::Withdrawn("20".into())] {
+            assert!(installed.installed(), "{installed:?}");
+        }
+        for nothing in [Outcome::Off, Outcome::NotOurs, Outcome::Current] {
+            assert!(!nothing.installed(), "{nothing:?}");
+        }
     }
 
     #[test]

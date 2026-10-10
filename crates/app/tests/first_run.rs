@@ -84,3 +84,32 @@ fn skipping_applies_the_defaults() {
     assert!(waits < complete.find("await chooseMarked();").expect("then saves the marked engine"));
     assert!(complete.contains("await applyStartup();") && complete.ends_with("show('done');"));
 }
+
+/// A Stockfish build installed, or a newer release learned of, makes both
+/// windows read the engines again (#322): the engine page shows the newest
+/// build known. The wizard does not while the engine folders' first answer
+/// is awaited or anything runs, nor the settings window during a choice: an
+/// answer landing after a choice made meanwhile would replace it.
+#[test]
+fn the_windows_read_the_engines_again_when_they_change() {
+    let wizard = source("ui/first-run.js");
+    let at = position(&wizard, "on('engines-changed', () => {");
+    let handler = &wizard[at..at + wizard[at..].find("});").expect("the handler's end")];
+    assert!(handler.contains("if (!busy && !enginesRead) act(call('engines').then(renderEngines));"));
+    let settings = source("ui/settings.js");
+    let at = position(&settings, "on('engines-changed', () => {");
+    let handler = &settings[at..at + settings[at..].find("});").expect("the handler's end")];
+    assert!(handler.contains("if (!choosing) act(call('engines').then(renderEngines));"));
+    // The automatic look announces any change it made or learned of, and an
+    // installation a newer release it learned of.
+    let looks = source("src/desktop/engine_updates.rs");
+    assert!(
+        position(&looks, "if KNOWN.newest(arch) != known_before || outcome.as_ref().is_ok_and(Outcome::installed) {")
+            < position(&looks, "let _ = app.emit(\"engines-changed\", ());")
+    );
+    let commands = source("src/desktop/commands.rs");
+    assert!(
+        position(&commands, "if KNOWN.newest(arch) != known_before {")
+            < position(&commands, "let _ = app.emit(\"engines-changed\", ());")
+    );
+}

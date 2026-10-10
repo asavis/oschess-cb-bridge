@@ -285,8 +285,8 @@ function wire() {
   document.getElementById('offer-update').addEventListener('click', installStockfish);
   document.getElementById('offer-later').addEventListener('click', () => act(call('dismiss_stockfish_offer').then(renderEngines)));
   on('stockfish-progress', showInstallProgress);
-  // An automatic Stockfish update chose a new build (#322); a choice in
-  // progress reads the list itself when it ends.
+  // A Stockfish build was installed or a newer release became known (#322);
+  // a choice in progress reads the list itself when it ends.
   on('engines-changed', () => {
     if (!choosing) act(call('engines').then(renderEngines));
   });

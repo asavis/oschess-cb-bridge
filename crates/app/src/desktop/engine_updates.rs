@@ -46,8 +46,9 @@ pub fn look_now(app: &AppHandle) {
 }
 
 /// Looks while the option is on; an update waiting for the bridge to be idle
-/// ends when it is turned off. A new build chosen is announced, and the
-/// windows read the engines again.
+/// ends when it is turned off. A new build chosen is announced. The windows
+/// read the engines again when a build was installed or a newer release
+/// became known, also when nothing was replaced.
 fn look(app: &AppHandle) {
     let _one = match LOOKING.try_lock() {
         Ok(guard) => guard,
@@ -56,17 +57,23 @@ fn look(app: &AppHandle) {
     };
     let shared = shared(app);
     let (Ok(data), Ok(config_path)) = (shared.dir(), shared.config_path()) else { return };
+    let arch = stockfish::machine_arch();
+    let known_before = KNOWN.newest(arch);
     let look = Look {
         data: &data,
         config_path: &config_path,
         choices: &CHOICES,
         known: &KNOWN,
         transport: &stockfish::System,
-        arch: stockfish::machine_arch(),
+        arch,
         now: SystemTime::now(),
     };
     let wanted = || prefs::load(&data).stockfish_auto_update;
-    match look.run(|| updater::wait_idle_while(&shared, wanted), |exe| engine::probe(exe).map(drop)) {
+    let outcome = look.run(|| updater::wait_idle_while(&shared, wanted), |exe| engine::probe(exe).map(drop));
+    if KNOWN.newest(arch) != known_before || outcome.as_ref().is_ok_and(Outcome::installed) {
+        let _ = app.emit("engines-changed", ());
+    }
+    match outcome {
         Ok(Outcome::Updated(version)) => {
             bridge::log!("Stockfish update: Stockfish {version} installed and chosen");
             let strings = &shared.strings;
@@ -75,17 +82,14 @@ fn look(app: &AppHandle) {
                 strings.fill("toast.stockfishUpdated.title", &[("version", &version)]),
                 strings.get("toast.stockfishUpdated.body"),
             );
-            let _ = app.emit("engines-changed", ());
         }
         Ok(Outcome::Kept(version)) => {
             bridge::log!("Stockfish update: Stockfish {version} installed; another engine was chosen meanwhile");
-            let _ = app.emit("engines-changed", ());
         }
         Ok(Outcome::Withdrawn(version)) => {
             bridge::log!(
                 "Stockfish update: Stockfish {version} installed; the update was turned off before the switch"
             );
-            let _ = app.emit("engines-changed", ());
         }
         Ok(Outcome::Off | Outcome::Current | Outcome::NotOurs) => {}
         Err(e) => bridge::log!("Stockfish update: {e}"),

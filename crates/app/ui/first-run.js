@@ -83,6 +83,13 @@ async function main() {
 
 function wire() {
   on('stockfish-progress', showInstallProgress);
+  // A Stockfish build was installed or a newer release became known (#322).
+  // Not while the engine folders' first answer is awaited or anything runs:
+  // those read the list themselves, and an answer landing after a choice
+  // made meanwhile would replace it.
+  on('engines-changed', () => {
+    if (!busy && !enginesRead) act(call('engines').then(renderEngines));
+  });
   document.getElementById('next').addEventListener('click', next);
   document.getElementById('back').addEventListener('click', () => show(STEPS[STEPS.indexOf(step) - 1]));
   document.getElementById('skip').addEventListener('click', () => work(complete));
