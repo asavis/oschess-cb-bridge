@@ -85,6 +85,17 @@ inputs by hand. Local databases hold personal data: you may run
 print, export or read the games, names or other contents of a local database,
 and never copy anything from one into a comment or a file.
 
+Look for local databases only in the folders the bridge reads them from: the
+`ChessBase` folder of the user's Documents folder, as Windows names it
+(`powershell.exe -NoProfile -Command "[Environment]::GetFolderPath('MyDocuments')"`),
+and the folders listed under `databases` in the bridge's `bridge.toml`
+(`%APPDATA%\oschess-bridge`), each with the folders below it. Never list,
+search or read any other directory of the user's, not even a parent of those
+folders such as Documents itself. The names of files and folders inside them
+name people and private databases too, so never print a directory listing or
+the output of `cbtool databases`: pick the databases within a script and print
+only counts.
+
 ## Rules
 
 Do not edit files, commit, push, change branches, merge, or mutate any issue or
