@@ -339,6 +339,9 @@ pub async fn set_stockfish_auto_update(app: AppHandle, on: bool) -> Answer<Setti
 pub async fn set_send_reports(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
     prefs::update(&dir, |prefs| prefs.send_reports = on)?;
+    if !on {
+        reporting::turned_off(&app);
+    }
     settings_view(&app)
 }
 

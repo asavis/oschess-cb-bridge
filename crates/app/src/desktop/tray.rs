@@ -69,8 +69,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         item("open", strings.get("menu.open"))?,
         item("settings", strings.get("menu.settings"))?,
         item("code", strings.get("menu.code"))?,
-        // A report by hand (#333) works when no window of the bridge opens.
-        item("report", strings.get("menu.report"))?,
+        // A report by hand (#333) works when no window of the bridge opens;
+        // greyed in a build that sends no reports.
+        MenuItem::with_id(app, "report", strings.get("menu.report"), reporting::available(), None::<&str>)?,
         item("quit", strings.get("menu.quit"))?,
     );
     let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);

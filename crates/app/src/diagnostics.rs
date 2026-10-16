@@ -71,6 +71,52 @@ fn path_ends(chars: &[char], start: usize, at: usize) -> bool {
     }
 }
 
+/// `text` with what it quotes replaced by `<text>` (#333): a panic's message
+/// quotes the value it failed on, `` `Петренко` `` or the `Debug` of an
+/// error, and a script's error the text it could not parse, and either may be
+/// a name from a database. Double quotes and backticks always quote; a single
+/// quote only when it opens a word, so that the apostrophe of `can't` stays.
+/// A quote with no end quotes the rest of its line.
+pub fn without_quotes(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let opens = match c {
+            '"' | '`' => true,
+            '\'' => i == 0 || matches!(chars[i - 1], ' ' | '(' | '[' | '{' | '=' | ':' | ','),
+            _ => false,
+        };
+        if !opens {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        out.push_str("<text>");
+        let mut j = i + 1;
+        while j < chars.len() && chars[j] != '\n' {
+            if chars[j] == '\\' {
+                j += 2;
+                continue;
+            }
+            // A single quote closes before what is no letter: `'x' is`, `'x')`.
+            let closes = chars[j] == c && (c != '\'' || chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric()));
+            if closes {
+                break;
+            }
+            j += 1;
+        }
+        if j < chars.len() && chars[j] == c {
+            out.push(c);
+            j += 1;
+        }
+        i = j.min(chars.len());
+    }
+    out
+}
+
 /// A source file as a panic names it, short enough to name no folder of the
 /// machine that built it: a dependency's from its crate's folder on, this
 /// workspace's as it is (relative), any other by its last two parts.
@@ -98,13 +144,13 @@ pub fn panic_line(thread: Option<&str>, location: Option<(&str, u32)>, message: 
     let thread = thread.unwrap_or("unnamed");
     let at = location.map_or_else(|| "an unknown place".to_string(), |(f, l)| format!("{}:{l}", source_file(f)));
     // Paths go line by line, before the lines are joined: one runs to its line's end.
-    format!("panic in the thread {thread} at {at}: {}", one_line(&without_paths(message)))
+    format!("panic in the thread {thread} at {at}: {}", one_line(&without_paths(&without_quotes(message))))
 }
 
 /// The log line of an error in the script of the window `label`: its
 /// message, shortened, and the script and line it names.
 pub fn page_error_line(label: &str, message: &str, source: Option<&str>, line: Option<u32>) -> String {
-    let message: String = one_line(&without_paths(message)).chars().take(MESSAGE_CHARS).collect();
+    let message: String = one_line(&without_paths(&without_quotes(message))).chars().take(MESSAGE_CHARS).collect();
     // A script is named by its file: `http://tauri.localhost/settings.js` is `settings.js`.
     let script = source.and_then(|s| s.rsplit('/').next()).filter(|s| !s.is_empty());
     let at = match (script, line) {
@@ -202,6 +248,34 @@ mod tests {
         assert_eq!(source_file("/rustc/abc/library/core/src/option.rs"), "src/option.rs");
         let git = "/home/u/.cargo/git/checkouts/wry-1a2b3c/0d9e8f7/src/lib.rs";
         assert_eq!(source_file(git), "wry-1a2b3c/0d9e8f7/src/lib.rs");
+    }
+
+    #[test]
+    fn what_a_message_quotes_leaves_it() {
+        let cases = [
+            (
+                "byte index 3 is not a char boundary; it is inside 'е' (bytes 2..4) of `Петренко`",
+                "byte index 3 is not a char boundary; it is inside '<text>' (bytes 2..4) of `<text>`",
+            ),
+            (
+                r#"called `Result::unwrap()` on an `Err` value: Parse { header: "White \"Olena\"" }"#,
+                r#"called `<text>` on an `<text>` value: Parse { header: "<text>" }"#,
+            ),
+            (
+                r#"Unexpected token 'O', "Olena Petrenko" is not valid JSON"#,
+                r#"Unexpected token '<text>', "<text>" is not valid JSON"#,
+            ),
+            ("Cannot read properties of null (reading 'append')", "Cannot read properties of null (reading '<text>')"),
+            ("an open \"quote runs to the end\nnext line", "an open \"<text>\nnext line"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(without_quotes(text), expected, "{text}");
+        }
+        for text in ["can't open it, it's gone", "index out of bounds: the len is 3 but the index is 7"] {
+            assert_eq!(without_quotes(text), text);
+        }
+        assert!(!panic_line(None, None, "of `Olena Petrenko`").contains("Olena"));
+        assert!(!page_error_line("settings", "\"Olena\" is not valid JSON", None, None).contains("Olena"));
     }
 
     #[test]

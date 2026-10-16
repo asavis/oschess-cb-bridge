@@ -8,14 +8,15 @@ use std::path::Path;
 
 use crate::folders;
 
-/// Posts the file `body` to `url` with `headers`, through `curl.exe` over
+/// Posts (`--data-binary`) the file `body` to `url` with `headers`, through `curl.exe` over
 /// HTTPS only, and answers the HTTP status of the answer. `Err` when no
 /// answer came: no network, no such host, or a time-out. The tool runs
 /// outside the Store package, so it is given the path at which it finds the
 /// file ([`folders::outside`], #289).
 pub fn post(url: &str, headers: &[String], body: &Path) -> Result<u16, String> {
     let mut curl = system_tool("curl.exe")?;
-    curl.args(["--silent", "--show-error", "--proto", "=https", "--request", "POST"]).args([
+    // `-q` first: no `.curlrc` of the user's changes what is printed.
+    curl.args(["-q", "--silent", "--show-error", "--proto", "=https"]).args([
         "--connect-timeout",
         "15",
         "--max-time",

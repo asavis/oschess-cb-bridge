@@ -148,6 +148,7 @@ pub struct Context {
 /// A report ready to go.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
+    pub kind: Kind,
     /// The event's id, 32 hex digits.
     pub id: String,
     /// The report code a user quotes: the id's first 8 digits, also the tag
@@ -208,17 +209,19 @@ pub fn event(report: &Report, context: &Context, id: [u8; 16], now: SystemTime) 
     .to_string();
     let header = json!({ "event_id": id });
     let item = json!({ "type": "event", "length": payload.len() });
-    Event { id, code, envelope: format!("{header}\n{item}\n{payload}\n") }
+    Event { kind: report.kind, id, code, envelope: format!("{header}\n{item}\n{payload}\n") }
 }
 
 /// The reports waiting to go: `reports` in the data folder, one file each,
-/// named by the time they were filed so that the oldest sorts first.
+/// named by the time they were filed, so that the oldest sorts first, and by
+/// their kind.
 pub struct Outbox {
     dir: PathBuf,
 }
 
-/// The extension of a waiting report.
+/// The extension of a waiting report, and of one being written.
 const ENVELOPE: &str = "envelope";
+const PART: &str = "part";
 
 impl Outbox {
     pub fn in_data(data: &Path) -> Outbox {
@@ -230,25 +233,31 @@ impl Outbox {
     pub fn put(&self, event: &Event, now: SystemTime) -> io::Result<PathBuf> {
         std::fs::create_dir_all(&self.dir)?;
         let millis = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-        let path = self.dir.join(format!("{millis:015}-{}.{ENVELOPE}", event.id));
-        // Written aside and moved in, so the sender never reads half a report.
-        let part = path.with_extension("part");
-        std::fs::write(&part, &event.envelope)?;
-        std::fs::rename(&part, &path)?;
+        let path = self.dir.join(format!("{millis:015}-{}-{}.{ENVELOPE}", event.id, event.kind.tag()));
+        write_whole(&path, event.envelope.as_bytes())?;
         self.trim();
         Ok(path)
     }
 
     /// The waiting reports, oldest first.
     pub fn waiting(&self) -> Vec<PathBuf> {
+        self.files(ENVELOPE)
+    }
+
+    fn files(&self, extension: &str) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else { return Vec::new() };
         let mut files: Vec<PathBuf> =
-            entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == ENVELOPE)).collect();
+            entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == extension)).collect();
         files.sort();
         files
     }
 
+    /// Drops the reports beyond the caps, oldest first, and what a crash left
+    /// half written. Called by the one filing, so nothing else is written.
     fn trim(&self) {
+        for part in self.files(PART) {
+            let _gone = std::fs::remove_file(part);
+        }
         let mut files: Vec<(PathBuf, u64)> = self
             .waiting()
             .into_iter()
@@ -267,34 +276,63 @@ impl Outbox {
         }
     }
 
+    /// Drops every waiting report but those sent by hand: the user turned the
+    /// reports off. Answers how many went.
+    pub fn drop_automatic(&self) -> usize {
+        let automatic = self.waiting().into_iter().filter(|f| !by_hand(f));
+        automatic.filter(|f| std::fs::remove_file(f).is_ok()).count()
+    }
+
     /// The file that records which failures went today.
     fn seen(&self) -> PathBuf {
         self.dir.join("seen.json")
     }
 
-    /// Whether the failure `fingerprint` of `kind` in `version` is the first
-    /// of its kind on `day` (days since 1970), and records it: one failure
-    /// goes at most once a day per version, so that one that repeats does
-    /// not flood the project. Records older than yesterday are forgotten.
-    pub fn first_today(&self, version: &str, kind: Kind, fingerprint: &str, day: u64) -> bool {
-        let mut digest = bridge::sha256::Sha256::new();
-        digest.update(format!("{version}\n{}\n{fingerprint}", kind.tag()).as_bytes());
-        let key = bridge::sha256::hex(&digest.finish())[..16].to_string();
-        let path = self.seen();
-        let mut seen: BTreeMap<String, u64> =
-            std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        seen.retain(|_, d| *d + 1 >= day);
-        if seen.get(&key) == Some(&day) {
-            return false;
-        }
-        seen.insert(key, day);
-        let written = std::fs::create_dir_all(&self.dir)
-            .and_then(|()| std::fs::write(&path, serde_json::to_vec(&seen).unwrap_or_default()));
-        if let Err(e) = written {
-            bridge::log!("report: {} cannot be written: {e}", "seen.json");
-        }
-        true
+    /// The code of the report the failure `fingerprint` of `kind` in
+    /// `version` went as on `day` (days since 1970), if it went already: one
+    /// failure goes at most once a day per version, so that one that repeats
+    /// does not flood the project, and the user still has a code to quote.
+    pub fn sent_today(&self, version: &str, kind: Kind, fingerprint: &str, day: u64) -> Option<String> {
+        let key = seen_key(version, kind, fingerprint);
+        self.read_seen().remove(&key).filter(|(d, _)| *d == day).map(|(_, code)| code)
     }
+
+    /// Records that the failure went on `day` as the report `code`. Records
+    /// older than yesterday are forgotten.
+    pub fn remember(&self, version: &str, kind: Kind, fingerprint: &str, day: u64, code: &str) {
+        let mut seen = self.read_seen();
+        seen.retain(|_, (d, _)| *d + 1 >= day);
+        seen.insert(seen_key(version, kind, fingerprint), (day, code.to_string()));
+        let bytes = serde_json::to_vec(&seen).unwrap_or_default();
+        let written = std::fs::create_dir_all(&self.dir).and_then(|()| write_whole(&self.seen(), &bytes));
+        if let Err(e) = written {
+            bridge::log!("report: seen.json cannot be written: {e}");
+        }
+    }
+
+    fn read_seen(&self) -> BTreeMap<String, (u64, String)> {
+        std::fs::read(self.seen()).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+    }
+}
+
+/// What names a failure in `seen.json`: no message, only a digest.
+fn seen_key(version: &str, kind: Kind, fingerprint: &str) -> String {
+    let mut digest = bridge::sha256::Sha256::new();
+    digest.update(format!("{version}\n{}\n{fingerprint}", kind.tag()).as_bytes());
+    bridge::sha256::hex(&digest.finish())[..16].to_string()
+}
+
+/// Writes `bytes` to `path` aside and moves them in, so that no reader ever
+/// sees half of them.
+fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let part = path.with_extension(PART);
+    std::fs::write(&part, bytes)?;
+    std::fs::rename(&part, path)
+}
+
+/// Whether the waiting report `file` was sent by hand, by its name.
+fn by_hand(file: &Path) -> bool {
+    file.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with(&format!("-{}", Kind::Manual.tag())))
 }
 
 /// How a post is made: the system's `curl.exe` on Windows, a stand-in in
@@ -331,10 +369,15 @@ pub fn retry_after(failures: u32) -> Duration {
 }
 
 /// Posts every waiting report, oldest first, until one must wait. Answers
-/// whether one still waits.
-pub fn deliver(outbox: &Outbox, dsn: &Dsn, version: &str, transport: &dyn Transport) -> bool {
+/// whether one still waits. With `automatic` off, as when the user turned the
+/// reports off, only reports sent by hand go and the rest are dropped.
+pub fn deliver(outbox: &Outbox, dsn: &Dsn, version: &str, transport: &dyn Transport, automatic: bool) -> bool {
     let (url, headers) = (dsn.url(), dsn.headers(version));
     for file in outbox.waiting() {
+        if !automatic && !by_hand(&file) {
+            forget(&file);
+            continue;
+        }
         let answer = transport.post(&url, &headers, &file);
         match outcome(&answer) {
             Outcome::Sent => forget(&file),
@@ -541,9 +584,17 @@ mod tests {
         assert!(!waiting.contains(&first), "the oldest went first");
         assert!(waiting.windows(2).all(|w| w[0] < w[1]), "oldest first");
         // By size: a report as big as the cap leaves only itself.
-        let big = Event { id: "f".repeat(32), code: "ffffffff".into(), envelope: "x".repeat(MAX_BYTES as usize) };
+        let big = Event {
+            kind: Kind::Window,
+            id: "f".repeat(32),
+            code: "ffffffff".into(),
+            envelope: "x".repeat(MAX_BYTES as usize),
+        };
         outbox.put(&big, UNIX_EPOCH + Duration::from_secs(5000)).unwrap();
         assert_eq!(outbox.waiting().len(), 1);
+        // What a crash left half written goes at the next filing.
+        std::fs::write(dir.join("reports").join("000-left.part"), "half").unwrap();
+        filed(&outbox, 99, 6000);
         assert!(
             std::fs::read_dir(dir.join("reports"))
                 .unwrap()
@@ -557,15 +608,22 @@ mod tests {
     fn a_failure_goes_once_a_day_per_version() {
         let dir = scratch("seen");
         let outbox = Outbox::in_data(&dir);
-        assert!(outbox.first_today("1.0", Kind::Window, "settings built", 20_000));
-        assert!(!outbox.first_today("1.0", Kind::Window, "settings built", 20_000));
-        assert!(outbox.first_today("1.0", Kind::Window, "settings requested", 20_000), "another failure");
-        assert!(outbox.first_today("1.1", Kind::Window, "settings built", 20_000), "another version");
-        assert!(outbox.first_today("1.0", Kind::Window, "settings built", 20_001), "the next day");
+        let sent = |version: &str, fingerprint: &str, day| outbox.sent_today(version, Kind::Window, fingerprint, day);
+        assert_eq!(sent("1.0", "settings built", 20_000), None);
+        outbox.remember("1.0", Kind::Window, "settings built", 20_000, "3f9a1c2e");
+        // The same failure again that day gives the code it went as.
+        assert_eq!(sent("1.0", "settings built", 20_000).as_deref(), Some("3f9a1c2e"));
+        assert_eq!(sent("1.0", "settings requested", 20_000), None, "another failure");
+        assert_eq!(sent("1.1", "settings built", 20_000), None, "another version");
+        assert_eq!(sent("1.0", "settings built", 20_001), None, "the next day");
+        assert_eq!(outbox.sent_today("1.0", Kind::Panic, "settings built", 20_000), None, "another kind");
         // The record stays small: days before yesterday are forgotten.
-        assert!(outbox.first_today("1.0", Kind::Panic, "x.rs:1", 20_010));
-        let seen: BTreeMap<String, u64> = serde_json::from_slice(&std::fs::read(outbox.seen()).unwrap()).unwrap();
+        outbox.remember("1.0", Kind::Panic, "x.rs:1", 20_010, "0badc0de");
+        let seen: BTreeMap<String, (u64, String)> =
+            serde_json::from_slice(&std::fs::read(outbox.seen()).unwrap()).unwrap();
         assert_eq!(seen.len(), 1);
+        let text = std::fs::read_to_string(outbox.seen()).unwrap();
+        assert!(!text.contains("x.rs"), "a failure is named by a digest only");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -621,7 +679,7 @@ mod tests {
         let first = std::fs::read_to_string(&files[0]).unwrap();
         let fake =
             Fake { answers: RefCell::new(vec![Ok(200), Ok(400), Err("no answer".into())]), posted: RefCell::default() };
-        assert!(deliver(&outbox, &dsn(), "1.2", &fake), "one still waits");
+        assert!(deliver(&outbox, &dsn(), "1.2", &fake, true), "one still waits");
         assert_eq!(outbox.waiting(), files[2..], "sent and refused ones are gone, the rest wait in order");
         let posted = fake.posted.borrow();
         assert_eq!(posted.len(), 3);
@@ -630,8 +688,37 @@ mod tests {
         assert_eq!(posted[0].2, first, "the file is posted as it is");
         drop(posted);
         let fake = Fake { answers: RefCell::new(vec![Ok(200), Ok(200)]), posted: RefCell::default() };
-        assert!(!deliver(&outbox, &dsn(), "1.2", &fake));
+        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, true));
         assert!(outbox.waiting().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn filed_as(outbox: &Outbox, kind: Kind, n: u8) -> PathBuf {
+        let report = Report { kind, message: "x".into(), tags: vec![], fingerprint: "x".into() };
+        let at = UNIX_EPOCH + Duration::from_secs(1000 + u64::from(n));
+        outbox.put(&event(&report, &context(), [n; 16], at), at).unwrap()
+    }
+
+    /// With the reports turned off, nothing filed before goes but a report
+    /// sent by hand (#333).
+    #[test]
+    fn turned_off_only_reports_by_hand_go() {
+        let dir = scratch("off");
+        let outbox = Outbox::in_data(&dir);
+        filed_as(&outbox, Kind::Window, 1);
+        let manual = filed_as(&outbox, Kind::Manual, 2);
+        filed_as(&outbox, Kind::Panic, 3);
+        let fake = Fake { answers: RefCell::new(vec![Ok(200)]), posted: RefCell::default() };
+        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, false));
+        assert_eq!(fake.posted.borrow().len(), 1, "only the report by hand was posted");
+        assert!(outbox.waiting().is_empty(), "the others were dropped, the one by hand went");
+        // Turning them off drops what waits at once, but the ones by hand.
+        filed_as(&outbox, Kind::Window, 4);
+        let manual_again = filed_as(&outbox, Kind::Manual, 5);
+        filed_as(&outbox, Kind::Stall, 6);
+        assert_eq!(outbox.drop_automatic(), 2);
+        assert_eq!(outbox.waiting(), [manual_again]);
+        assert!(manual.file_name().unwrap().to_string_lossy().ends_with("-manual.envelope"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

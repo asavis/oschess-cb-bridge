@@ -63,26 +63,50 @@ pub fn available() -> bool {
     Dsn::parse(reports::DSN).is_some()
 }
 
-/// Files `report` and wakes the sender. Answers the code a user can quote,
-/// or `None` when nothing goes: this build has no DSN, the user turned
-/// reports off (a report by hand goes all the same), or the same failure
-/// went today.
+/// The user turned the reports off: the ones waiting go no more, but those
+/// sent by hand.
+pub fn turned_off(app: &AppHandle) {
+    let Ok(data) = shared(app).dir() else { return };
+    let dropped = Outbox::in_data(&data).drop_automatic();
+    if dropped > 0 {
+        bridge::log!("report: turned off, so {dropped} waiting reports are dropped");
+    }
+}
+
+/// Files `report` and wakes the sender. Answers the code a user can quote:
+/// the new report's, or that of the report the same failure went as today.
+/// `None` when nothing goes: this build has no DSN, or the user turned
+/// reports off (a report by hand goes all the same).
 pub fn file(report: Report) -> Option<String> {
     let reporter = REPORTER.get()?;
-    if FILING.get() {
-        return None;
+    let _filing = Filing::enter()?;
+    let (code, filed) = file_now(reporter, &report)?;
+    if filed {
+        let (filed, wake) = &reporter.filed;
+        *filed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_one();
     }
-    FILING.set(true);
-    let code = file_now(reporter, &report);
-    FILING.set(false);
-    let code = code?;
-    let (filed, wake) = &reporter.filed;
-    *filed.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    wake.notify_one();
     Some(code)
 }
 
-fn file_now(reporter: &Reporter, report: &Report) -> Option<String> {
+/// This thread files a report while it is held; released when dropped, a
+/// panic's unwinding included.
+struct Filing;
+
+impl Filing {
+    fn enter() -> Option<Filing> {
+        (!FILING.replace(true)).then_some(Filing)
+    }
+}
+
+impl Drop for Filing {
+    fn drop(&mut self) {
+        FILING.set(false);
+    }
+}
+
+/// The code to quote, and whether a new report was filed for it.
+fn file_now(reporter: &Reporter, report: &Report) -> Option<(String, bool)> {
     let by_hand = report.kind == Kind::Manual;
     if !by_hand && !crate::prefs::load(&reporter.data).send_reports {
         return None;
@@ -91,8 +115,9 @@ fn file_now(reporter: &Reporter, report: &Report) -> Option<String> {
     let outbox = Outbox::in_data(&reporter.data);
     let now = SystemTime::now();
     let day = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 86_400;
-    if !by_hand && !outbox.first_today(env!("CARGO_PKG_VERSION"), report.kind, &report.fingerprint, day) {
-        return None;
+    let version = env!("CARGO_PKG_VERSION");
+    if !by_hand && let Some(code) = outbox.sent_today(version, report.kind, &report.fingerprint, day) {
+        return Some((code, false));
     }
     let mut id = [0u8; 16];
     if let Err(e) = getrandom::fill(&mut id) {
@@ -104,8 +129,11 @@ fn file_now(reporter: &Reporter, report: &Report) -> Option<String> {
         bridge::log!("report: it cannot be filed: {e}");
         return None;
     }
+    if !by_hand {
+        outbox.remember(version, report.kind, &report.fingerprint, day, &event.code);
+    }
     bridge::log!("report {} filed: {}", event.code, report.kind.tag());
-    Some(event.code)
+    Some((event.code, true))
 }
 
 /// What every report says about the bridge and the computer, and the words
@@ -136,7 +164,9 @@ fn send() {
     let outbox = Outbox::in_data(&reporter.data);
     let mut failures = 0;
     loop {
-        let waits = reports::deliver(&outbox, &reporter.dsn, env!("CARGO_PKG_VERSION"), &Curl);
+        // Turned off, only reports sent by hand go: those filed before wait no more.
+        let automatic = crate::prefs::load(&reporter.data).send_reports;
+        let waits = reports::deliver(&outbox, &reporter.dsn, env!("CARGO_PKG_VERSION"), &Curl, automatic);
         failures = if waits { failures + 1 } else { 0 };
         let wait = if waits { reports::retry_after(failures) } else { IDLE };
         let (filed, wake) = &reporter.filed;

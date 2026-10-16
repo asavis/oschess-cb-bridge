@@ -53,9 +53,9 @@
   "failure.stage.requested": "The window was not created.",
   "failure.stage.built": "The window was created, but its contents did not load.",
   "failure.advice": "The details are in the bridge's log. Try quitting the bridge (the menu by the clock → “Quit”) and starting it again.",
-  "failure.code": "A failure report went to oschess. Report code: {code} (copied).",
+  "failure.code": "The bridge is sending oschess a failure report. Report code: {code} (copied).",
   "report.ask": "Send oschess a technical report on how the bridge runs? It holds the versions of the bridge, Windows and WebView2 and the end of the bridge's log — no database names, games, file paths or pairing code.",
-  "report.sent": "The report went. Report code: {code} (copied). Quote it when you write to oschess support.",
+  "report.sent": "The report is on its way; without a network the bridge sends it later. Report code: {code} (copied). Quote it when you write to oschess support.",
   "report.none": "The report could not be made. The details are in the bridge's log.",
 
   "flyout.working": "running",
