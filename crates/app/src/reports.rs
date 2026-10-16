@@ -28,7 +28,7 @@ use crate::diagnostics;
 /// Where reports go: the `bridge` project of oschess's GlitchTip
 /// (asavis/oschess#16588). Its key only lets a client submit events, as the
 /// updater's public key only checks them. Empty, nothing is sent.
-pub const DSN: &str = "";
+pub const DSN: &str = "https://038868ecb06a4659b6beba386440d9e5@glitchtip.oschess.org/4";
 
 /// The `environment` of a debug build's reports, apart from the users'.
 pub const DEVELOPMENT: &str = "development";
