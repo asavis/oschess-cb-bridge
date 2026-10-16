@@ -320,8 +320,9 @@ Roles:
 - Approvers: [@asavis](https://github.com/asavis), who approves every signing
   request.
 
-Privacy: the bridge collects no information about you, your computer or your
-databases. It opens ChessBase databases read-only, changes a PGN file only
+Privacy: the bridge collects no information about you or your databases, and
+about your computer only what a failure report below names. It opens
+ChessBase databases read-only, changes a PGN file only
 when you save a game into it in oschess, and serves your databases only to the
 oschess page in a browser on the same computer, over the loopback address
 `127.0.0.1`, and only to a browser that holds the pairing code. Beyond this
@@ -344,6 +345,22 @@ computer, what it connects to depends on where you got it:
   after it starts and every six hours after that, and downloads the newest
   build when the Stockfish the bridge installed is older. These requests carry
   nothing about you or your databases.
+- Either copy sends a failure report to oschess's error tracker,
+  `glitchtip.oschess.org`, when it fails: when one of its windows does not
+  open, when it stops responding, on an error in its own code, and when you
+  choose «Report a problem» in its menu. A report holds what failed and
+  where, the versions of the bridge, Windows and WebView2, the app's
+  language, how long the bridge had run, and the last 100 lines of its log,
+  which name no database, game, query or file of yours. Before a report
+  leaves, the bridge takes out anything shaped like a path, and the names of
+  your databases, your pairing code and your user and computer names. A
+  report has no account, no user or computer name, and nothing it could tell
+  you apart by; the message about a window that did not open shows the
+  report's code, so that you can quote it to oschess. «Send failure reports»
+  in the settings, on unless you turn it off, stops all of them but the one
+  you send from the menu. A report waits in the `reports` folder of the data
+  folder until it goes, at most 20 of them, and the same failure goes at
+  most once a day.
 
 Either copy looks for updates a minute after it starts, every six hours after
 that, and when you ask from the menu or the settings; «Update automatically»

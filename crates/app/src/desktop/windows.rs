@@ -20,9 +20,10 @@ use tauri::{
     Window, WindowEvent, Wry,
 };
 
-use super::{alerts, faults, shared};
+use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
 use crate::opening::{self, LIMIT, Stage};
+use crate::reports::{Kind, Report};
 
 /// Translate native titles as well as the documents inside their webviews.
 pub fn translate(app: &AppHandle) {
@@ -88,9 +89,10 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
         match build_window(&app, &spec) {
             Ok(_) => shared(&app).openings.built(spec.label, attempt),
             Err(e) => {
-                bridge::log!("the {} window: {e}", spec.label);
+                let line = format!("the {} window: {e}", spec.label);
+                bridge::log!("{line}");
                 shared(&app).openings.failed(spec.label, attempt);
-                tell_not_opened(&app, spec.label, Stage::Requested);
+                failed_to_open(&app, spec.label, Stage::Requested, &line);
             }
         }
     });
@@ -113,18 +115,26 @@ fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
     let spawned = std::thread::Builder::new().name("window-watch".into()).spawn(move || {
         std::thread::sleep(LIMIT);
         let Some(stage) = shared(&watched).openings.overdue(label, attempt) else { return };
-        bridge::log!("the {label} window stopped at \"{}\" after {} s", stage.name(), LIMIT.as_secs());
-        tell_not_opened(&watched, label, stage);
+        let line = format!("the {label} window stopped at \"{}\" after {} s", stage.name(), LIMIT.as_secs());
+        bridge::log!("{line}");
+        failed_to_open(&watched, label, stage, &line);
     });
     if let Err(e) = spawned {
         bridge::log!("the {label} window is not watched: {e}");
     }
 }
 
-/// Tells the user in a native message that `label`'s window did not open,
-/// and how far it got. The flyout, built hidden at the start, has the log
-/// line only: nobody has asked for it yet.
-fn tell_not_opened(app: &AppHandle, label: &str, stage: Stage) {
+/// Reports that `label`'s window did not open (#333), its log `line` the
+/// report's message, and tells the user in a native message how far it got,
+/// with the report's code, copied. The flyout, built hidden at the start, is
+/// reported and not shown: nobody has asked for it yet.
+fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str) {
+    let code = reporting::file(Report {
+        kind: Kind::Window,
+        message: line.to_string(),
+        tags: vec![("window", label.to_string()), ("stage", stage.name().to_string())],
+        fingerprint: format!("{label} {}", stage.name()),
+    });
     let shared = shared(app);
     let strings = &shared.strings;
     let what = match label {
@@ -137,7 +147,13 @@ fn tell_not_opened(app: &AppHandle, label: &str, stage: Stage) {
         Stage::Built => strings.get("failure.stage.built"),
         Stage::Ready => return,
     };
-    alerts::warn(strings.get("failure.title"), &format!("{what}\n\n{why}\n\n{}", strings.get("failure.advice")));
+    let mut text = format!("{what}\n\n{why}\n\n{}", strings.get("failure.advice"));
+    if let Some(code) = code {
+        reporting::copy(app, &code);
+        text.push_str("\n\n");
+        text.push_str(&strings.fill("failure.code", &[("code", &code)]));
+    }
+    alerts::warn(strings.get("failure.title"), &text);
 }
 
 /// Builds the flyout, hidden until the tray mark is clicked.

@@ -24,6 +24,7 @@ const COMMANDS: &[&str] = &[
     "set_autostart",
     "set_auto_update",
     "set_stockfish_auto_update",
+    "set_send_reports",
     "check_updates",
     "update_progress",
     "pairing_code",

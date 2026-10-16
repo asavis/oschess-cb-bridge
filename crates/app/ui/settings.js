@@ -90,6 +90,9 @@ function renderSettings(settings) {
   if (settings.autostartBlocked) document.getElementById('autostart-state').textContent = t('settings.autostart.blocked');
   toggle('auto-update', settings.autoUpdate);
   toggle('stockfish-update', settings.stockfishAutoUpdate);
+  // A build without a DSN sends no reports, so it has no switch for them (#333).
+  document.getElementById('reports-row').hidden = !settings.reports;
+  toggle('send-reports', settings.sendReports);
   const rows = settings.extras.map((extra) => {
     const remove = el('button', 'btn', t('settings.folders.remove'));
     remove.addEventListener('click', () => act(call('remove_database', { path: extra.path }).then(renderSettings)));
@@ -325,6 +328,8 @@ function wire() {
     act(call('set_auto_update', { on: !current.autoUpdate }).then(renderSettings)));
   document.getElementById('stockfish-update').addEventListener('click', () =>
     act(call('set_stockfish_auto_update', { on: !current.stockfishAutoUpdate }).then(renderSettings)));
+  document.getElementById('send-reports').addEventListener('click', () =>
+    act(call('set_send_reports', { on: !current.sendReports }).then(renderSettings)));
   document.getElementById('check-updates').addEventListener('click', checkUpdates);
 
   document.getElementById('show-code').addEventListener('click', () =>

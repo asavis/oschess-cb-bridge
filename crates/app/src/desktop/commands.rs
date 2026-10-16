@@ -20,11 +20,12 @@ use tauri_plugin_opener::OpenerExt;
 
 use super::autostart::{self, State};
 use super::server::{self, Pairing};
-use super::{SharedState, channel, engine_updates, shared, tray, updater, windows};
+use super::{SharedState, channel, engine_updates, reporting, shared, tray, updater, windows};
 use crate::choices::{self, Choices, EnginesView, InstallProgress};
 use crate::diagnostics::{self, Admit};
 use crate::i18n::Lang;
 use crate::prefs;
+use crate::reports::Report;
 use crate::settings::{self, Extra, Failure};
 use crate::status::View;
 use crate::stockfish_updates::Known;
@@ -47,6 +48,10 @@ pub struct SettingsView {
     updates: bool,
     /// Whether the Microsoft Store installed this copy and updates it (#112).
     store: bool,
+    /// Whether failure reports go to oschess (#333).
+    send_reports: bool,
+    /// Whether this build sends reports at all: one without a DSN does not.
+    reports: bool,
 }
 
 /// A command's answer; a failure goes to the window as a dictionary key and
@@ -143,6 +148,8 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
         stockfish_auto_update: prefs.stockfish_auto_update,
         updates: updater::enabled(app),
         store: channel().is_store(),
+        send_reports: prefs.send_reports,
+        reports: reporting::available(),
     })
 }
 
@@ -326,6 +333,18 @@ pub async fn set_stockfish_auto_update(app: AppHandle, on: bool) -> Answer<Setti
     settings_view(&app)
 }
 
+/// Turns the failure reports on or off (#333). A report sent by hand from the
+/// tray menu goes either way.
+#[tauri::command]
+pub async fn set_send_reports(app: AppHandle, on: bool) -> Answer<SettingsView> {
+    let dir = shared(&app).dir()?;
+    prefs::update(&dir, |prefs| prefs.send_reports = on)?;
+    if !on {
+        reporting::turned_off(&app);
+    }
+    settings_view(&app)
+}
+
 /// Starts a check or returns the existing job; its result stays available.
 #[tauri::command]
 pub fn check_updates(app: AppHandle) -> crate::updates::Progress {
@@ -402,8 +421,9 @@ pub fn window_ready(app: AppHandle, window: WebviewWindow) {
     shared(&app).openings.ready(window.label());
 }
 
-/// An error in a window's script, which reached no log before (#332). A run
-/// logs at most `diagnostics::PAGE_ERRORS` of each window.
+/// An error in a window's script, which reached no log before (#332), and is
+/// reported (#333). A run logs at most `diagnostics::PAGE_ERRORS` of each
+/// window.
 #[tauri::command]
 pub async fn report_ui_error(
     app: AppHandle,
@@ -415,7 +435,9 @@ pub async fn report_ui_error(
     let label = window.label();
     let admitted = shared(&app).page_errors.admit(label);
     if admitted != Admit::No {
-        bridge::log!("{}", diagnostics::page_error_line(label, &message, source.as_deref(), line));
+        let logged = diagnostics::page_error_line(label, &message, source.as_deref(), line);
+        bridge::log!("{logged}");
+        reporting::file(Report::script(label, &logged));
     }
     if admitted == Admit::Last {
         bridge::log!("the {label} page reports too many errors; this run logs no more of them");

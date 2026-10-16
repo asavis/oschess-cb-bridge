@@ -1,7 +1,7 @@
 //! The event loop's watchdog (#332, `crate::busy`): a thread asks the event
 //! loop for a beat every [`BEAT`]. When none has come for `busy::STALL`, it
-//! logs what the event loop was running, and once the beats come back, how
-//! long the stall lasted.
+//! logs and reports what the event loop was running (#333), and once the
+//! beats come back, how long the stall lasted.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 
+use super::reporting;
 use crate::busy::{self, BUSY, Event, Watch};
+use crate::reports::{Kind, Report};
 
 /// How often the event loop is asked for a beat.
 const BEAT: Duration = Duration::from_secs(2);
@@ -36,7 +38,15 @@ pub fn start(app: &AppHandle) {
             std::thread::sleep(BEAT);
             let (beat, now) = (*last.lock().unwrap_or_else(|e| e.into_inner()), Instant::now());
             match watch.check(beat, now) {
-                Some(Event::Stopped { silent }) => bridge::log!("{}", busy::stopped_line(silent, BUSY.current(), now)),
+                Some(Event::Stopped { silent }) => {
+                    let running = BUSY.current();
+                    let what = running.as_ref().map_or_else(|| "none".to_string(), |(what, _)| what.clone());
+                    let line = busy::stopped_line(silent, running, now);
+                    bridge::log!("{line}");
+                    // Reported from this thread: the event loop is what failed (#333).
+                    let tags = vec![("busy", what.clone())];
+                    reporting::file(Report { kind: Kind::Stall, message: line, tags, fingerprint: what });
+                }
                 Some(Event::Answered { after }) => {
                     bridge::log!("the event loop answered again after {} s", after.as_secs());
                 }

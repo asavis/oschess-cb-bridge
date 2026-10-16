@@ -24,11 +24,20 @@ pub struct Prefs {
     /// The bridge version whose Stockfish offer the user put off with
     /// «Пізніше»; the next bridge version offers again.
     pub stockfish_offer_dismissed: Option<String>,
+    /// Send failure reports to oschess (#333): on unless the user turned it
+    /// off, as the owner decided.
+    pub send_reports: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { language: None, auto_update: true, stockfish_auto_update: true, stockfish_offer_dismissed: None }
+        Prefs {
+            language: None,
+            auto_update: true,
+            stockfish_auto_update: true,
+            stockfish_offer_dismissed: None,
+            send_reports: true,
+        }
     }
 }
 
@@ -96,6 +105,7 @@ mod tests {
             .unwrap();
             assert!(!prefs.auto_update);
             assert!(prefs.stockfish_auto_update, "a file from before #322 keeps Stockfish up to date");
+            assert!(prefs.send_reports, "a file from before #333 sends failure reports");
             assert_eq!(prefs.stockfish_offer_dismissed.as_deref(), Some("1.2.3"));
             assert_eq!(prefs.language(0x0422), Lang::Uk);
             assert_eq!(prefs.language(0x0419), Lang::Uk);
@@ -175,6 +185,7 @@ mod tests {
             auto_update: false,
             stockfish_auto_update: false,
             stockfish_offer_dismissed: Some("0.2.0".into()),
+            send_reports: false,
         };
         save(&dir, &saved).unwrap();
         assert_eq!(load(&dir), saved);

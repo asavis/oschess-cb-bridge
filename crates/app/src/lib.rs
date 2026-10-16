@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod i18n;
 pub mod opening;
 pub mod prefs;
+pub mod reports;
 pub mod settings;
 pub mod status;
 pub mod stockfish_updates;

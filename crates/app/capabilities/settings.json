@@ -20,6 +20,7 @@
     "allow-set-autostart",
     "allow-set-auto-update",
     "allow-set-stockfish-auto-update",
+    "allow-set-send-reports",
     "allow-check-updates",
     "allow-update-progress",
     "allow-pairing-code",
