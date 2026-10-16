@@ -25,7 +25,7 @@ use crate::choices::{self, Choices, EnginesView, InstallProgress};
 use crate::diagnostics::{self, Admit};
 use crate::i18n::Lang;
 use crate::prefs;
-use crate::reports::{Kind, Report};
+use crate::reports::Report;
 use crate::settings::{self, Extra, Failure};
 use crate::status::View;
 use crate::stockfish_updates::Known;
@@ -437,9 +437,7 @@ pub async fn report_ui_error(
     if admitted != Admit::No {
         let logged = diagnostics::page_error_line(label, &message, source.as_deref(), line);
         bridge::log!("{logged}");
-        let first: String = message.chars().take(120).collect();
-        let tags = vec![("window", label.to_string())];
-        reporting::file(Report { kind: Kind::Script, message: logged, tags, fingerprint: format!("{label} {first}") });
+        reporting::file(Report::script(label, &logged));
     }
     if admitted == Admit::Last {
         bridge::log!("the {label} page reports too many errors; this run logs no more of them");

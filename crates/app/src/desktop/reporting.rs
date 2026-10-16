@@ -67,6 +67,8 @@ pub fn available() -> bool {
 /// sent by hand.
 pub fn turned_off(app: &AppHandle) {
     let Ok(data) = shared(app).dir() else { return };
+    // After any filing under way: what it filed is dropped as well.
+    let _filing = REPORTER.get().map(|r| r.filing.lock().unwrap_or_else(|e| e.into_inner()));
     let dropped = Outbox::in_data(&data).drop_automatic();
     if dropped > 0 {
         bridge::log!("report: turned off, so {dropped} waiting reports are dropped");
@@ -108,10 +110,12 @@ impl Drop for Filing {
 /// The code to quote, and whether a new report was filed for it.
 fn file_now(reporter: &Reporter, report: &Report) -> Option<(String, bool)> {
     let by_hand = report.kind == Kind::Manual;
+    // The switch is read under the filing lock that `turned_off` takes too:
+    // a report either is filed before the outbox is emptied, or sees it off.
+    let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
     if !by_hand && !crate::prefs::load(&reporter.data).send_reports {
         return None;
     }
-    let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
     let outbox = Outbox::in_data(&reporter.data);
     let now = SystemTime::now();
     let day = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 86_400;
@@ -164,9 +168,9 @@ fn send() {
     let outbox = Outbox::in_data(&reporter.data);
     let mut failures = 0;
     loop {
-        // Turned off, only reports sent by hand go: those filed before wait no more.
-        let automatic = crate::prefs::load(&reporter.data).send_reports;
-        let waits = reports::deliver(&outbox, &reporter.dsn, env!("CARGO_PKG_VERSION"), &Curl, automatic);
+        // Asked before each report goes: turned off, only reports sent by hand go.
+        let automatic = || crate::prefs::load(&reporter.data).send_reports;
+        let waits = reports::deliver(&outbox, &reporter.dsn, env!("CARGO_PKG_VERSION"), &Curl, &automatic);
         failures = if waits { failures + 1 } else { 0 };
         let wait = if waits { reports::retry_after(failures) } else { IDLE };
         let (filed, wake) = &reporter.filed;

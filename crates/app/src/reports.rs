@@ -124,6 +124,22 @@ pub struct Report {
     pub fingerprint: String,
 }
 
+impl Report {
+    /// The report of a page script's error, from its log line `logged`
+    /// (`diagnostics::page_error_line`), which holds nothing the script's
+    /// message quoted. The fingerprint is built from that line too, never from
+    /// the raw message: it leaves with the report (#335).
+    pub fn script(label: &str, logged: &str) -> Report {
+        let first: String = logged.chars().take(160).collect();
+        Report {
+            kind: Kind::Script,
+            message: logged.to_string(),
+            tags: vec![("window", label.to_string())],
+            fingerprint: first,
+        }
+    }
+}
+
 /// What every report says about the bridge and the computer.
 #[derive(Clone, Debug, Default)]
 pub struct Context {
@@ -369,12 +385,19 @@ pub fn retry_after(failures: u32) -> Duration {
 }
 
 /// Posts every waiting report, oldest first, until one must wait. Answers
-/// whether one still waits. With `automatic` off, as when the user turned the
-/// reports off, only reports sent by hand go and the rest are dropped.
-pub fn deliver(outbox: &Outbox, dsn: &Dsn, version: &str, transport: &dyn Transport, automatic: bool) -> bool {
+/// whether one still waits. `automatic` is asked right before each report
+/// goes: once the user turned the reports off, only reports sent by hand go
+/// and the rest are dropped, even within a pass that began before (#335).
+pub fn deliver(
+    outbox: &Outbox,
+    dsn: &Dsn,
+    version: &str,
+    transport: &dyn Transport,
+    automatic: &dyn Fn() -> bool,
+) -> bool {
     let (url, headers) = (dsn.url(), dsn.headers(version));
     for file in outbox.waiting() {
-        if !automatic && !by_hand(&file) {
+        if !by_hand(&file) && !automatic() {
             forget(&file);
             continue;
         }
@@ -679,7 +702,7 @@ mod tests {
         let first = std::fs::read_to_string(&files[0]).unwrap();
         let fake =
             Fake { answers: RefCell::new(vec![Ok(200), Ok(400), Err("no answer".into())]), posted: RefCell::default() };
-        assert!(deliver(&outbox, &dsn(), "1.2", &fake, true), "one still waits");
+        assert!(deliver(&outbox, &dsn(), "1.2", &fake, &|| true), "one still waits");
         assert_eq!(outbox.waiting(), files[2..], "sent and refused ones are gone, the rest wait in order");
         let posted = fake.posted.borrow();
         assert_eq!(posted.len(), 3);
@@ -688,7 +711,7 @@ mod tests {
         assert_eq!(posted[0].2, first, "the file is posted as it is");
         drop(posted);
         let fake = Fake { answers: RefCell::new(vec![Ok(200), Ok(200)]), posted: RefCell::default() };
-        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, true));
+        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, &|| true));
         assert!(outbox.waiting().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -709,7 +732,7 @@ mod tests {
         let manual = filed_as(&outbox, Kind::Manual, 2);
         filed_as(&outbox, Kind::Panic, 3);
         let fake = Fake { answers: RefCell::new(vec![Ok(200)]), posted: RefCell::default() };
-        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, false));
+        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, &|| false));
         assert_eq!(fake.posted.borrow().len(), 1, "only the report by hand was posted");
         assert!(outbox.waiting().is_empty(), "the others were dropped, the one by hand went");
         // Turning them off drops what waits at once, but the ones by hand.
@@ -720,5 +743,52 @@ mod tests {
         assert_eq!(outbox.waiting(), [manual_again]);
         assert!(manual.file_name().unwrap().to_string_lossy().ends_with("-manual.envelope"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Turned off in the middle of a pass, the reports after that do not go
+    /// (#335): the switch is asked before each one.
+    #[test]
+    fn turned_off_during_a_pass_stops_the_rest() {
+        let dir = scratch("off-during");
+        let outbox = Outbox::in_data(&dir);
+        let first = filed_as(&outbox, Kind::Window, 1);
+        let first_text = std::fs::read_to_string(&first).unwrap();
+        filed_as(&outbox, Kind::Panic, 2);
+        let manual = filed_as(&outbox, Kind::Manual, 3);
+        filed_as(&outbox, Kind::Stall, 4);
+        let fake = Fake { answers: RefCell::new(vec![Ok(200), Ok(200)]), posted: RefCell::default() };
+        let asked = std::cell::Cell::new(0);
+        // On for the first report, off from then on.
+        let automatic = || {
+            asked.set(asked.get() + 1);
+            asked.get() == 1
+        };
+        assert!(!deliver(&outbox, &dsn(), "1.2", &fake, &automatic));
+        let posted = fake.posted.borrow();
+        assert_eq!(posted.len(), 2, "the first one and the one by hand");
+        assert_eq!(posted[0].2, first_text, "the first one went whole");
+        assert!(posted[1].2.contains("\"kind\":\"manual\""), "the second post is the report by hand");
+        assert!(outbox.waiting().is_empty());
+        assert!(!manual.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A script's error quotes what it failed on, and that leaves in no part
+    /// of the report, its fingerprint included (#335).
+    #[test]
+    fn a_script_error_report_holds_nothing_it_quoted() {
+        let logged = crate::diagnostics::page_error_line(
+            "settings",
+            r#"Unexpected token 'S', "Synthetic Player Private" is not valid JSON"#,
+            Some("http://tauri.localhost/settings.js"),
+            Some(48),
+        );
+        let report = Report::script("settings", &logged);
+        let event = event(&report, &context(), [3; 16], SystemTime::now());
+        assert!(!event.envelope.contains("Synthetic"), "{}", event.envelope);
+        let p = payload(&event.envelope).unwrap();
+        assert_eq!(p["tags"]["window"], "settings");
+        assert_eq!(p["fingerprint"][0], "script");
+        assert!(p["fingerprint"][1].as_str().unwrap().contains("is not valid JSON"));
     }
 }

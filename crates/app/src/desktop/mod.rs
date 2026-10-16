@@ -113,6 +113,8 @@ pub fn run() {
             let started = Shared::start(strings);
             let shared = Arc::new(started.shared);
             app.manage(shared.clone());
+            // Before any window is built: a failure of the first ones is reported too.
+            reporting::start(app.handle());
             tray::create(app.handle())?;
             windows::create_flyout(app.handle());
             if started.first_run {
@@ -123,7 +125,6 @@ pub fn run() {
             }
             watch(app.handle().clone(), shared);
             watchdog::start(app.handle());
-            reporting::start(app.handle());
             updater::start(app.handle());
             engine_updates::start(app.handle());
             Ok(())
