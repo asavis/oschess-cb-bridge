@@ -268,23 +268,44 @@ fn only_quick_commands_are_synchronous() {
     let files = sources();
     let mut synchronous = Vec::new();
     for (_, text) in &files {
-        synchronous.extend(
-            command_fns(text)
-                .into_iter()
-                .filter(|(_, signature, _)| !signature.contains("async fn"))
-                .map(|(n, _, _)| n.to_string()),
-        );
+        for (name, signature, rest) in command_fns(text) {
+            if signature.contains("async fn") {
+                continue;
+            }
+            synchronous.push(name.to_string());
+            // Nor does one of them come to wait later: none touches the disk,
+            // the settings, the startup task or the shell.
+            let body = body(rest, name).unwrap();
+            for waits in WAITING {
+                assert!(!body.contains(waits), "the synchronous command {name} calls {waits}");
+            }
+        }
     }
     let quick = ON_THE_EVENT_LOOP.map(String::from).to_vec();
     assert_same(("the synchronous commands", synchronous), ("ON_THE_EVENT_LOOP", quick));
 }
+
+/// What waits on the disk, on Windows or on another program.
+const WAITING: [&str; 11] = [
+    "settings_view(",
+    "change_config(",
+    "config::",
+    "prefs::",
+    "autostart::",
+    "token::",
+    ".pairing()",
+    "opener()",
+    "std::fs",
+    "stockfish::",
+    "spawn_blocking",
+];
 
 /// Every window's page says once when it has drawn (#332); without it each
 /// opening of the window would be reported as stopped.
 #[test]
 fn every_page_says_when_it_is_ready() {
     for (window, _) in capabilities() {
-        let script = app_file(&format!("ui/{window}.js"));
+        let script = code(&app_file(&format!("ui/{window}.js")));
         assert_eq!(script.matches("call('window_ready')").count(), 1, "ui/{window}.js says once that it is ready");
     }
 }

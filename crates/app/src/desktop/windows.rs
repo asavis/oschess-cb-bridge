@@ -22,7 +22,7 @@ use tauri::{
 
 use super::{alerts, faults, shared};
 use crate::i18n::Strings;
-use crate::opening::{LIMIT, Stage};
+use crate::opening::{self, LIMIT, Stage};
 
 /// Translate native titles as well as the documents inside their webviews.
 pub fn translate(app: &AppHandle) {
@@ -79,7 +79,8 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
         if app.get_webview_window(spec.label).is_some() {
             return;
         }
-        let attempt = shared(&app).openings.request(spec.label, Instant::now());
+        // A second click while the window is being built builds nothing.
+        let Some(attempt) = shared(&app).openings.request(spec.label, Instant::now()) else { return };
         watch_opening(&app, spec.label, attempt);
         if faults::on("build-hangs") {
             std::future::pending::<()>().await;
@@ -275,10 +276,24 @@ fn bring_forward(window: &WebviewWindow) -> Result<(), String> {
     window.unminimize().map_err(text)?;
     window.show().map_err(text)?;
     // On no screen, as after the screen it was on went away: to the main one.
-    if window.current_monitor().map_err(text)?.is_none() {
+    if !on_a_screen(window)? {
+        bridge::log!("the settings window was on no screen and is moved to the main one");
         to_primary(window)?;
     }
     window.set_focus().map_err(text)
+}
+
+/// Whether `window` can be seen on one of the screens (`opening::on_a_screen`).
+fn on_a_screen(window: &WebviewWindow) -> Result<bool, String> {
+    let text = |e: tauri::Error| e.to_string();
+    let (at, size) = (window.outer_position().map_err(text)?, window.outer_size().map_err(text)?);
+    let screens: Vec<opening::Rect> = window
+        .available_monitors()
+        .map_err(text)?
+        .iter()
+        .map(|m| (m.position().x, m.position().y, m.size().width, m.size().height))
+        .collect();
+    Ok(opening::on_a_screen((at.x, at.y, size.width, size.height), &screens))
 }
 
 /// Centres `window` in the work area of the primary screen.

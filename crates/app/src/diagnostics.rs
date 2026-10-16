@@ -17,9 +17,9 @@ pub const PAGE_ERRORS: u32 = 20;
 
 /// `text` with every path in it replaced by `<path>`: from a drive (`C:\`,
 /// `C:/`), a UNC or escaped start (`\\`), or a `/` that opens a word, to the
-/// next quote or the end of the line. A path may hold spaces and brackets,
-/// so only a quote ends it: a message loses more than it must rather than
-/// keep part of a path.
+/// next colon, quote or end of the line. A path may hold spaces and
+/// brackets, so they do not end it; a Windows path holds no colon but its
+/// drive's, so the reason after `path: ` stays.
 pub fn without_paths(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -27,7 +27,9 @@ pub fn without_paths(text: &str) -> String {
     while i < chars.len() {
         if path_starts(&chars, i) {
             out.push_str(PATH);
-            while i < chars.len() && !matches!(chars[i], '"' | '\'' | '`' | '\n') {
+            let start = i;
+            let ends = |at: usize, c: char| matches!(c, '"' | '\'' | '`' | '\n') || (c == ':' && at != start + 1);
+            while i < chars.len() && !ends(i, chars[i]) {
                 i += 1;
             }
             continue;
@@ -133,7 +135,11 @@ mod tests {
         let cases = [
             (r"cannot open C:\Users\Олена Петренко\Documents\ChessBase\Mega 2024.cbh", "cannot open <path>"),
             (r#"Os { message: "C:\\Users\\Olena\\bridge.toml" } at once"#, r#"Os { message: "<path>" } at once"#),
-            (r"read \\server\share\db.pgn: denied", "read <path>"),
+            (r"read \\server\share\db.pgn: denied", "read <path>: denied"),
+            (
+                r"cannot open C:\x\Mega 2024.cbh: Access is denied. (os error 5)",
+                "cannot open <path>: Access is denied. (os error 5)",
+            ),
             ("no file /home/olena/.config/oschess-bridge/bridge.toml", "no file <path>"),
             (r"c:/Program Files (x86)/ChessBase/Mega.cbh", "<path>"),
             ("line one C:\\a\nline two", "line one <path>\nline two"),

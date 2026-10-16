@@ -9,8 +9,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MB_SETF
 pub fn warn(title: &str, text: &str) {
     let (title, text) = (wide(title), wide(text));
     let spawned = std::thread::Builder::new().name("message".into()).spawn(move || {
-        // Both strings end in a NUL and live until the call returns; the
-        // message has no owner window.
+        // SAFETY: both strings are NUL-terminated UTF-16 that outlive the
+        // call, and the message has no owner window.
         unsafe {
             MessageBoxW(
                 std::ptr::null_mut(),
