@@ -256,6 +256,49 @@ fn commands_that_open_windows_are_async() {
     assert!(checked >= 1, "no command that opens a window was found");
 }
 
+/// The only commands that run on the event loop's thread: they read the app's
+/// memory or move a window, and `check_updates` starts a thread of its own.
+/// Every other command is asynchronous, so that one waiting on the disk or on
+/// Windows cannot leave the whole tray dead (#332).
+const ON_THE_EVENT_LOOP: [&str; 7] =
+    ["view", "language", "hide_flyout", "fit_flyout", "check_updates", "update_progress", "window_ready"];
+
+#[test]
+fn only_quick_commands_are_synchronous() {
+    let files = sources();
+    let mut synchronous = Vec::new();
+    for (_, text) in &files {
+        synchronous.extend(
+            command_fns(text)
+                .into_iter()
+                .filter(|(_, signature, _)| !signature.contains("async fn"))
+                .map(|(n, _, _)| n.to_string()),
+        );
+    }
+    let quick = ON_THE_EVENT_LOOP.map(String::from).to_vec();
+    assert_same(("the synchronous commands", synchronous), ("ON_THE_EVENT_LOOP", quick));
+}
+
+/// Every window's page says once when it has drawn (#332); without it each
+/// opening of the window would be reported as stopped.
+#[test]
+fn every_page_says_when_it_is_ready() {
+    for (window, _) in capabilities() {
+        let script = app_file(&format!("ui/{window}.js"));
+        assert_eq!(script.matches("call('window_ready')").count(), 1, "ui/{window}.js says once that it is ready");
+    }
+}
+
+/// `windows.rs` drops the result of no call on a window (#332): a settings
+/// window that could not be shown stayed invisible and left no trace.
+#[test]
+fn no_window_call_drops_its_result() {
+    let files = sources();
+    let windows = source(&files, "windows.rs");
+    assert!(!windows.contains("let _ = window."), "desktop/windows.rs drops a window call's result");
+    assert!(!windows.contains("let _ = "), "desktop/windows.rs drops a result");
+}
+
 /// Tauri makes a permission only for a command in `COMMANDS` in `build.rs`,
 /// the handler in `desktop/mod.rs` runs only the functions it names, and a
 /// window may call only what its capability allows. A command left out of one

@@ -31,6 +31,8 @@ const COMMANDS: &[&str] = &[
     "new_code",
     "set_port",
     "open_pairing",
+    "window_ready",
+    "report_ui_error",
 ];
 
 fn main() {

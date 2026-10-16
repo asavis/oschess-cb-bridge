@@ -48,6 +48,8 @@ async function main() {
   renderSettings(await call('settings'));
   renderUpdateProgress(await call('update_progress'));
   act(call('engines').then(renderEngines));
+  // The app follows each window's opening up to here (#332).
+  call('window_ready');
 }
 
 // `code` opens the general section with the pairing code shown.

@@ -88,6 +88,8 @@ async function main() {
     footer();
     readChangedEngines();
   });
+  // The app follows each window's opening up to here (#332).
+  call('window_ready');
 }
 
 function readChangedEngines() {

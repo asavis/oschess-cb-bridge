@@ -1,5 +1,10 @@
 //! The commands the windows call. Each window's capability file allows only
 //! the ones it needs.
+//!
+//! A synchronous command runs on the event loop's thread, and while one waits
+//! there, on the disk or on Windows, the whole tray is dead (#332). So only
+//! the commands that read the app's memory or move a window are synchronous;
+//! every other one is `async`, and `window_rules` keeps the list.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -17,6 +22,7 @@ use super::autostart::{self, State};
 use super::server::{self, Pairing};
 use super::{SharedState, channel, engine_updates, shared, tray, updater, windows};
 use crate::choices::{self, Choices, EnginesView, InstallProgress};
+use crate::diagnostics::{self, Admit};
 use crate::i18n::Lang;
 use crate::prefs;
 use crate::settings::{self, Extra, Failure};
@@ -57,7 +63,7 @@ pub fn view(shared: SharedState<'_>) -> View {
 }
 
 #[tauri::command]
-pub fn open_oschess(app: AppHandle) {
+pub async fn open_oschess(app: AppHandle) {
     open_oschess_now(&app);
 }
 
@@ -90,7 +96,7 @@ pub fn fit_flyout(app: AppHandle, height: f64) {
 }
 
 #[tauri::command]
-pub fn settings(app: AppHandle) -> Answer<SettingsView> {
+pub async fn settings(app: AppHandle) -> Answer<SettingsView> {
     settings_view(&app)
 }
 
@@ -103,7 +109,7 @@ pub fn language(app: AppHandle, window: WebviewWindow) -> &'static str {
 }
 
 #[tauri::command]
-pub fn set_language(app: AppHandle, language: String) -> Answer<()> {
+pub async fn set_language(app: AppHandle, language: String) -> Answer<()> {
     let lang = Lang::from_code(&language).ok_or_else(|| Failure::new("settings.language.invalid"))?;
     let shared = shared(&app);
     let dir = shared.dir()?;
@@ -147,7 +153,7 @@ pub async fn add_folder(app: AppHandle, window: WebviewWindow) -> Answer<Option<
 }
 
 #[tauri::command]
-pub fn remove_database(app: AppHandle, path: String) -> Answer<SettingsView> {
+pub async fn remove_database(app: AppHandle, path: String) -> Answer<SettingsView> {
     change_config(&app, |c| settings::without_database(c, Path::new(&path)))?;
     settings_view(&app)
 }
@@ -227,7 +233,7 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
 /// Opens the licence of the Stockfish `version` the bridge installed. Only a
 /// version is taken from the window; the path is the bridge's own.
 #[tauri::command]
-pub fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
+pub async fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
     let licence =
         stockfish::licence(&shared(&app).dir()?, &version).ok_or_else(|| "not a Stockfish version".to_string())?;
     if !licence.is_file() {
@@ -297,7 +303,7 @@ pub fn switch_autostart(app: &AppHandle, on: bool) -> Result<State, String> {
 }
 
 #[tauri::command]
-pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
+pub async fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
     prefs::update(&dir, |prefs| prefs.auto_update = on)?;
     settings_view(&app)
@@ -305,7 +311,7 @@ pub fn set_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
 
 /// Turned on, it looks for a newer Stockfish at once.
 #[tauri::command]
-pub fn set_stockfish_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
+pub async fn set_stockfish_auto_update(app: AppHandle, on: bool) -> Answer<SettingsView> {
     let dir = shared(&app).dir()?;
     prefs::update(&dir, |prefs| prefs.stockfish_auto_update = on)?;
     if on {
@@ -326,12 +332,12 @@ pub fn update_progress() -> crate::updates::Progress {
 }
 
 #[tauri::command]
-pub fn pairing_code(shared: SharedState<'_>) -> Answer<Pairing> {
+pub async fn pairing_code(shared: SharedState<'_>) -> Answer<Pairing> {
     Ok(shared.pairing()?)
 }
 
 #[tauri::command]
-pub fn copy_code(app: AppHandle) -> Answer<()> {
+pub async fn copy_code(app: AppHandle) -> Answer<()> {
     let code = shared(&app).pairing()?.code;
     Ok(app.clipboard().write_text(code).map_err(text)?)
 }
@@ -340,7 +346,7 @@ pub fn copy_code(app: AppHandle) -> Answer<()> {
 /// server keeps accepting the old one. The restarted bridge opens the pairing
 /// link, which pairs the default browser again.
 #[tauri::command]
-pub fn new_code(app: AppHandle) -> Answer<()> {
+pub async fn new_code(app: AppHandle) -> Answer<()> {
     let dir = shared(&app).dir()?;
     token::replace(&dir).map_err(text)?;
     server::pair_on_next_start(&dir)?;
@@ -351,7 +357,7 @@ pub fn new_code(app: AppHandle) -> Answer<()> {
 /// Saves a new port and restarts the bridge on it, which then opens the
 /// pairing link. An invalid port is refused with its own message.
 #[tauri::command]
-pub fn set_port(app: AppHandle, port: String) -> Answer<()> {
+pub async fn set_port(app: AppHandle, port: String) -> Answer<()> {
     let port = settings::parse_port(&port).ok_or(Failure::new("settings.port.error"))?;
     change_config(&app, |c| config::Config { port, ..c.clone() })?;
     // A paired browser looks for the old port; the pairing link carries the new one.
@@ -369,7 +375,7 @@ fn restart_soon(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn open_pairing(app: AppHandle) -> Answer<()> {
+pub async fn open_pairing(app: AppHandle) -> Answer<()> {
     open_pairing_now(&app);
     Ok(())
 }
@@ -378,5 +384,34 @@ pub fn open_pairing(app: AppHandle) -> Answer<()> {
 pub fn open_pairing_now(app: &AppHandle) {
     if let Ok(pairing) = shared(app).pairing() {
         let _ = app.opener().open_url(pairing.link, None::<&str>);
+    }
+}
+
+/// A window's page has drawn what it shows first (#332): its opening is done.
+#[tauri::command]
+pub fn window_ready(app: AppHandle, window: WebviewWindow) {
+    if super::faults::on("page-not-ready") {
+        return;
+    }
+    shared(&app).openings.ready(window.label());
+}
+
+/// An error in a window's script, which reached no log before (#332). A run
+/// logs at most `diagnostics::PAGE_ERRORS` of each window.
+#[tauri::command]
+pub async fn report_ui_error(
+    app: AppHandle,
+    window: WebviewWindow,
+    message: String,
+    source: Option<String>,
+    line: Option<u32>,
+) {
+    let label = window.label();
+    let admitted = shared(&app).page_errors.admit(label);
+    if admitted != Admit::No {
+        bridge::log!("{}", diagnostics::page_error_line(label, &message, source.as_deref(), line));
+    }
+    if admitted == Admit::Last {
+        bridge::log!("the {label} page reports too many errors; this run logs no more of them");
     }
 }

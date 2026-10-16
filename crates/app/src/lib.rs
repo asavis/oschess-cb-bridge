@@ -4,9 +4,12 @@
 //! What does not touch the desktop lives in the modules below and is tested on
 //! every system. `desktop` is the Tauri app and builds on Windows only.
 
+pub mod busy;
 pub mod channel;
 pub mod choices;
+pub mod diagnostics;
 pub mod i18n;
+pub mod opening;
 pub mod prefs;
 pub mod settings;
 pub mod status;

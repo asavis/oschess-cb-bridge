@@ -7,7 +7,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Wry};
 
 use super::autostart::{self, State};
-use super::{commands, shared, updater, windows};
+use super::{commands, faults, shared, updater, windows};
+use crate::busy::BUSY;
 use crate::i18n::Strings;
 use crate::status::{Theme, View, icon_file, icon_size};
 
@@ -80,6 +81,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(on_menu)
         .on_tray_icon_event(|tray, event| {
+            let _busy = BUSY.mark("a click on the tray mark");
             if let TrayIconEvent::Click {
                 button: MouseButton::Left, button_state: MouseButtonState::Up, rect, ..
             } = event
@@ -143,9 +145,15 @@ pub fn update(app: &AppHandle, strings: &Strings, view: &View, theme: Theme, sca
 }
 
 fn on_menu(app: &AppHandle, event: MenuEvent) {
+    let _busy = BUSY.mark(format!("the menu item {}", event.id().as_ref()));
     match event.id().as_ref() {
         "open" => commands::open_oschess_now(app),
-        "settings" => windows::open_settings(app, "databases"),
+        "settings" => {
+            if faults::on("menu-blocks") {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            }
+            windows::open_settings(app, "databases");
+        }
         "code" => windows::open_settings(app, "code"),
         AUTOSTART => {
             let on = autostart::state(app) != State::On;

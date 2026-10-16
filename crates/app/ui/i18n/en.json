@@ -46,6 +46,13 @@
   "toast.update.required.title": "The bridge needs updating",
   "toast.update.waiting.body": "To update the bridge, choose “Check for updates” in its menu.",
 
+  "failure.title": "oschess bridge",
+  "failure.window.settings": "The bridge's settings could not be opened.",
+  "failure.window.firstRun": "The bridge's first-run window could not be opened.",
+  "failure.stage.requested": "The window was not created.",
+  "failure.stage.built": "The window was created, but its contents did not load.",
+  "failure.advice": "The details are in the bridge's log. Try quitting the bridge (the menu by the clock → “Quit”) and starting it again.",
+
   "flyout.working": "running",
   "flyout.notWorking": "not running",
   "flyout.downloading.one": "{n} database downloading",

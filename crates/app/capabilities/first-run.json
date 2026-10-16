@@ -1,6 +1,6 @@
 {
   "identifier": "first-run",
-  "description": "The first-run wizard: the databases and folders, the engine and its Stockfish install, autostart and updates, then the pairing code, opening oschess with it, following the bridge's state to say when oschess connected, and closing itself.",
+  "description": "The first-run wizard: the databases and folders, the engine and its Stockfish install, autostart and updates, then the pairing code, opening oschess with it, following the bridge's state to say when oschess connected, and closing itself. It tells the app when its page is ready and what fails in its script.",
   "windows": ["first-run"],
   "permissions": [
     "core:window:allow-close",
@@ -20,6 +20,8 @@
     "allow-set-stockfish-auto-update",
     "allow-pairing-code",
     "allow-copy-code",
-    "allow-open-pairing"
+    "allow-open-pairing",
+    "allow-window-ready",
+    "allow-report-ui-error"
   ]
 }
