@@ -37,14 +37,17 @@ Store's copy, which updates itself through the Store (#153).
 > Windows.
 >
 > Міст відповідає лише браузеру, який ви з ним з’єднали, і лише на адресі
-> цього комп’ютера. В інтернет він звертається лише в трьох випадках. Через
+> цього комп’ютера. В інтернет він звертається лише в чотирьох випадках. Через
 > хвилину після запуску й далі кожні шість годин він питає Microsoft Store,
 > чи вийшла нова версія, і оновлюється через Store; «Оновлювати автоматично»
 > в налаштуваннях вимикає ці перевірки. Коли ви просите встановити
 > Stockfish, міст завантажує його офіційну збірку з GitHub. А Stockfish, який
 > він установив, міст тримає свіжим: у ті самі години питає GitHub, чи вийшов
 > новий Stockfish, і встановлює його через тиждень після виходу; «Оновлювати
-> Stockfish автоматично» в налаштуваннях вимикає це.
+> Stockfish автоматично» в налаштуваннях вимикає це. А коли міст дає збій,
+> він надсилає в oschess технічний звіт: що зламалося, версії мосту, Windows
+> і WebView2 та кінець свого журналу, без назв баз, партій, шляхів до файлів
+> і коду підключення; «Надсилати звіти про збої» в налаштуваннях вимикає це.
 >
 > Відкритий код, ліцензія AGPL-3.0: https://github.com/asavis/oschess-cb-bridge
 
@@ -78,14 +81,18 @@ Store's copy, which updates itself through the Store (#153).
 > start with Windows.
 >
 > The bridge answers only the browser you paired it with, and only on this
-> computer's own address. It goes online in three cases only. A minute after
+> computer's own address. It goes online in four cases only. A minute after
 > it starts, and every six hours after that, it asks the Microsoft Store
 > whether a new version is out, and updates through the Store; «Update
 > automatically» in the settings turns these checks off. When you ask it to
 > install Stockfish, it downloads the official build from GitHub. And it keeps
 > the Stockfish it installed up to date: at the same times it asks GitHub
 > whether a new Stockfish is out, and installs it once it is a week old;
-> «Update Stockfish automatically» in the settings turns this off.
+> «Update Stockfish automatically» in the settings turns this off. And when
+> the bridge fails, it sends oschess a technical report: what failed, the
+> versions of the bridge, Windows and WebView2 and the end of its log, with
+> no database names, games, file paths or pairing code; «Send failure
+> reports» in the settings turns this off.
 >
 > Open source under the AGPL-3.0 licence: https://github.com/asavis/oschess-cb-bridge
 
@@ -105,7 +112,9 @@ open, and the bridge's settings window with its engine section.
 
 A utility with no violence, no user-generated content shared with others, no
 chat, no purchases, no location and no personal data collected: every
-content question is answered «No».
+content question is answered «No». The failure reports (#333) carry technical
+data only, as README's "Privacy" lists it: no account, name or identifier of
+the user.
 
 ## Restricted capability: runFullTrust
 

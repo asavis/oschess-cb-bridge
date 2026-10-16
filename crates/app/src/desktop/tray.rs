@@ -7,7 +7,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Wry};
 
 use super::autostart::{self, State};
-use super::{commands, shared, updater, windows};
+use super::{commands, reporting, shared, updater, windows};
 use crate::busy::BUSY;
 use crate::i18n::Strings;
 use crate::status::{Theme, View, icon_file, icon_size};
@@ -65,15 +65,17 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     // The Store's package looks through the Store (#153); a direct build only
     // with a real updater key, and the item stays greyed without one.
     let update = MenuItem::with_id(app, "update", strings.get("menu.update"), updater::enabled(app), None::<&str>)?;
-    let (open, settings, code, quit) = (
+    let (open, settings, code, report, quit) = (
         item("open", strings.get("menu.open"))?,
         item("settings", strings.get("menu.settings"))?,
         item("code", strings.get("menu.code"))?,
+        // A report by hand (#333) works when no window of the bridge opens.
+        item("report", strings.get("menu.report"))?,
         item("quit", strings.get("menu.quit"))?,
     );
     let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);
     let items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
-        vec![&open, &settings, &code, &first, &tick, &update, &second, &quit];
+        vec![&open, &settings, &code, &report, &first, &tick, &update, &second, &quit];
     let menu = Menu::with_items(app, &items)?;
     let mut builder = TrayIconBuilder::with_id(TRAY)
         .tooltip(view.tooltip(strings))
@@ -93,7 +95,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(image);
     }
     builder.build(app)?;
-    app.manage(MenuLabels { open, settings, code, update, quit });
+    app.manage(MenuLabels { open, settings, code, report, update, quit });
     Ok(())
 }
 
@@ -101,6 +103,7 @@ struct MenuLabels {
     open: MenuItem<Wry>,
     settings: MenuItem<Wry>,
     code: MenuItem<Wry>,
+    report: MenuItem<Wry>,
     update: MenuItem<Wry>,
     quit: MenuItem<Wry>,
 }
@@ -112,6 +115,7 @@ pub fn translate(app: &AppHandle) {
         let _ = labels.open.set_text(strings.get("menu.open"));
         let _ = labels.settings.set_text(strings.get("menu.settings"));
         let _ = labels.code.set_text(strings.get("menu.code"));
+        let _ = labels.report.set_text(strings.get("menu.report"));
         let _ = labels.update.set_text(strings.get("menu.update"));
         let _ = labels.quit.set_text(strings.get("menu.quit"));
     }
@@ -150,6 +154,7 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
         "open" => commands::open_oschess_now(app),
         "settings" => windows::open_settings(app, "databases"),
         "code" => windows::open_settings(app, "code"),
+        "report" => reporting::by_hand(app),
         AUTOSTART => {
             let on = autostart::state(app) != State::On;
             // Only Windows' own settings turn a task the user turned off there

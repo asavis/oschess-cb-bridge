@@ -18,6 +18,8 @@ bridge = { version = "0.1.0", path = "../bridge" }
 # in the tree through tauri-plugin-updater.
 base64 = "0.22"
 minisign-verify = "0.2"
+# The id of a failure report (#333); already in the tree through the bridge.
+getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -8,6 +8,7 @@ mod engine_updates;
 mod faults;
 mod notices;
 mod package;
+mod reporting;
 mod server;
 mod store_updates;
 mod system;
@@ -26,6 +27,7 @@ use crate::busy::BUSY;
 use crate::channel::Channel;
 use crate::diagnostics;
 use crate::i18n::Strings;
+use crate::reports::{Kind, Report};
 use crate::status::{Problem, View};
 use server::Shared;
 
@@ -86,6 +88,7 @@ pub fn run() {
         commands::set_autostart,
         commands::set_auto_update,
         commands::set_stockfish_auto_update,
+        commands::set_send_reports,
         commands::pairing_code,
         commands::copy_code,
         commands::new_code,
@@ -120,6 +123,7 @@ pub fn run() {
             }
             watch(app.handle().clone(), shared);
             watchdog::start(app.handle());
+            reporting::start(app.handle());
             updater::start(app.handle());
             engine_updates::start(app.handle());
             Ok(())
@@ -146,15 +150,19 @@ pub fn run() {
     }
 }
 
-/// Writes every panic to the log, then hands it to the hook before (#332).
-/// The tray app has no standard error, where the default hook writes, so a
-/// panic in a worker, such as the one building a window, left no trace.
+/// Writes every panic to the log and reports it (#333), then hands it to
+/// the hook before (#332). The tray app has no standard error, where the
+/// default hook writes, so a panic in a worker, such as the one building a
+/// window, left no trace.
 fn log_panics() {
     let before = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
         let location = info.location().map(|l| (l.file(), l.line()));
-        bridge::log!("{}", diagnostics::panic_line(thread.name(), location, info.payload_as_str().unwrap_or("")));
+        let line = diagnostics::panic_line(thread.name(), location, info.payload_as_str().unwrap_or(""));
+        bridge::log!("{line}");
+        let at = location.map_or_else(String::new, |(file, line)| format!("{}:{line}", diagnostics::source_file(file)));
+        reporting::file(Report { kind: Kind::Panic, message: line, tags: vec![], fingerprint: at });
         before(info);
     }));
 }

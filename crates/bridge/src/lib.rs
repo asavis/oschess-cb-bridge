@@ -44,4 +44,5 @@ pub mod store;
 pub mod sync;
 pub mod texts;
 pub mod token;
+pub mod tools;
 pub mod write;

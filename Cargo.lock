@@ -54,6 +54,7 @@ dependencies = [
  "base64 0.22.1",
  "bridge",
  "cbformat",
+ "getrandom 0.3.4",
  "minisign-verify",
  "serde",
  "serde_json",
