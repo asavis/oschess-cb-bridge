@@ -192,7 +192,9 @@ pub fn event(report: &Report, context: &Context, id: [u8; 16], now: SystemTime) 
         "platform": "native",
         "level": report.kind.level(),
         "logger": "oschess-bridge",
-        "release": format!("oschess-bridge@{}", context.version),
+        // The version alone: oschess's issue reader keeps a release's first
+        // 12 characters, a web build's short SHA (asavis/oschess#16588).
+        "release": context.version,
         "environment": context.environment,
         "message": { "formatted": clean(&report.message) },
         "tags": tags,
@@ -456,7 +458,7 @@ mod tests {
         assert_eq!(item["length"], lines[2].len());
         let p = payload(&event.envelope).unwrap();
         assert_eq!(p["level"], "error");
-        assert_eq!(p["release"], "oschess-bridge@1.2610.1601");
+        assert_eq!(p["release"], "1.2610.1601");
         assert_eq!(p["environment"], "store");
         assert_eq!(p["timestamp"], 1_792_141_000);
         assert_eq!(p["tags"]["kind"], "window");
