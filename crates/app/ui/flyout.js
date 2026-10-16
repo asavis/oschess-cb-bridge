@@ -8,19 +8,24 @@ function retranslate() {
 }
 
 async function main() {
-  await loadWords();
-  document.getElementById('settings').append(icon('gear'));
-  document.getElementById('open').prepend(icon('open', 16));
-  document.getElementById('settings').addEventListener('click', () => call('open_settings', { section: 'databases' }));
-  document.getElementById('open').addEventListener('click', () => call('open_oschess'));
+  // The buttons work before the words load: a failure there must not leave
+  // the gear without its click (#332).
+  document.getElementById('settings').addEventListener('click', () =>
+    call('open_settings', { section: 'databases' }).catch(reportError));
+  document.getElementById('open').addEventListener('click', () => call('open_oschess').catch(reportError));
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') call('hide_flyout');
   });
+  await loadWords();
+  document.getElementById('settings').append(icon('gear'));
+  document.getElementById('open').prepend(icon('open', 16));
   // The window follows the panel's height, whatever changes it.
   const panel = document.getElementById('panel');
   new ResizeObserver(() => call('fit_flyout', { height: panel.offsetHeight })).observe(panel);
   render(await call('view'));
   on('view', render);
+  // The app follows each window's opening up to here (#332).
+  call('window_ready');
 }
 
 function render(view) {

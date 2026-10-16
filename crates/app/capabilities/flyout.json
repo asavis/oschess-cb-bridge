@@ -1,6 +1,6 @@
 {
   "identifier": "flyout",
-  "description": "The status flyout: reads the bridge's state, opens oschess and the settings, and sizes itself.",
+  "description": "The status flyout: reads the bridge's state, opens oschess and the settings, and sizes itself. It tells the app when its page is ready and what fails in its script.",
   "windows": ["flyout"],
   "permissions": [
     "core:event:allow-listen",
@@ -10,6 +10,8 @@
     "allow-open-oschess",
     "allow-open-settings",
     "allow-hide-flyout",
-    "allow-fit-flyout"
+    "allow-fit-flyout",
+    "allow-window-ready",
+    "allow-report-ui-error"
   ]
 }

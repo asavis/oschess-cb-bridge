@@ -93,6 +93,22 @@ function call(command, args = {}) {
   return window.__TAURI__.core.invoke(command, args);
 }
 
+// An error in a page's script goes to the app's log (#332): before, an error
+// or a rejected promise that nothing handled left no trace at all. A failure
+// the app answered is logged by its key alone, since its values may name a
+// path.
+function reportError(error, source = null, line = null) {
+  const message = error instanceof Error ? `${error.name}: ${error.message}`
+    : typeof error?.key === 'string' ? `failure ${error.key}` : String(error);
+  const at = /([\w-]+\.js):(\d+)/.exec(error instanceof Error ? error.stack ?? '' : '');
+  const where = { source: source ?? at?.[1] ?? null, line: line ?? (at ? Number(at[2]) : null) };
+  // A report that fails itself has nowhere left to go.
+  call('report_ui_error', { message, ...where }).catch(() => null);
+}
+
+window.addEventListener('error', (e) => reportError(e.error ?? e.message, e.filename, e.lineno));
+window.addEventListener('unhandledrejection', (e) => reportError(e.reason));
+
 function on(event, handler) {
   return window.__TAURI__.event.listen(event, (e) => handler(e.payload));
 }

@@ -1,6 +1,6 @@
 {
   "identifier": "settings",
-  "description": "The settings window: the databases and folders, the engine, autostart, updates, the pairing code and the port.",
+  "description": "The settings window: the databases and folders, the engine, autostart, updates, the pairing code and the port. It tells the app when its page is ready and what fails in its script.",
   "windows": ["settings"],
   "permissions": [
     "core:event:allow-listen",
@@ -25,6 +25,8 @@
     "allow-pairing-code",
     "allow-copy-code",
     "allow-new-code",
-    "allow-set-port"
+    "allow-set-port",
+    "allow-window-ready",
+    "allow-report-ui-error"
   ]
 }

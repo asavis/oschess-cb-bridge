@@ -80,7 +80,9 @@ bridge\index`, some 4 GB for the Mega Database. Delete the folders by hand to
 remove them too. The log says what went wrong, naming a
 database by its id and never by its name or path, so you can attach it to an
 issue as it is; past 1 MiB, the bridge moves it to `bridge.log.1` when it
-starts.
+starts. It also says when a window of the bridge's own did not open and how
+far it got (the bridge then tells you so in a message), when the tray stopped
+answering and what it was busy with, and every error of the windows' scripts.
 
 The copy from the Microsoft Store uses the same folders, but Windows keeps the
 ones it creates inside the package:

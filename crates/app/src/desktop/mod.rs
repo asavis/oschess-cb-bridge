@@ -1,9 +1,11 @@
 //! The Tauri app: the tray mark and its menu, the status flyout, the settings
 //! and first-run windows, and the commands the windows call. Windows only.
 
+mod alerts;
 mod autostart;
 mod commands;
 mod engine_updates;
+mod faults;
 mod notices;
 mod package;
 mod server;
@@ -11,6 +13,7 @@ mod store_updates;
 mod system;
 mod tray;
 mod updater;
+mod watchdog;
 mod windows;
 
 use std::sync::{Arc, OnceLock};
@@ -19,7 +22,9 @@ use std::time::Duration;
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
+use crate::busy::BUSY;
 use crate::channel::Channel;
+use crate::diagnostics;
 use crate::i18n::Strings;
 use crate::status::{Problem, View};
 use server::Shared;
@@ -39,6 +44,7 @@ pub(crate) fn channel() -> &'static Channel {
 }
 
 pub fn run() {
+    log_panics();
     let prefs = bridge::start::data_dir().ok().map(|dir| crate::prefs::load(&dir)).unwrap_or_default();
     let strings = Strings::new(prefs.language(system::display_language()));
     let context = tauri::generate_context!();
@@ -60,38 +66,47 @@ pub fn run() {
     if let Some(updater) = updater::plugin(context.config()).filter(|_| !channel().is_store()) {
         builder = builder.plugin(updater);
     }
+    let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+        commands::view,
+        commands::open_oschess,
+        commands::open_settings,
+        commands::hide_flyout,
+        commands::fit_flyout,
+        commands::settings,
+        commands::language,
+        commands::set_language,
+        commands::add_folder,
+        commands::remove_database,
+        commands::engines,
+        commands::choose_engine,
+        commands::pick_engine,
+        commands::install_stockfish,
+        commands::dismiss_stockfish_offer,
+        commands::open_stockfish_licence,
+        commands::set_autostart,
+        commands::set_auto_update,
+        commands::set_stockfish_auto_update,
+        commands::pairing_code,
+        commands::copy_code,
+        commands::new_code,
+        commands::set_port,
+        commands::open_pairing,
+        commands::check_updates,
+        commands::update_progress,
+        commands::window_ready,
+        commands::report_ui_error,
+    ];
     let app = builder
-        .invoke_handler(tauri::generate_handler![
-            commands::view,
-            commands::open_oschess,
-            commands::open_settings,
-            commands::hide_flyout,
-            commands::fit_flyout,
-            commands::settings,
-            commands::language,
-            commands::set_language,
-            commands::add_folder,
-            commands::remove_database,
-            commands::engines,
-            commands::choose_engine,
-            commands::pick_engine,
-            commands::install_stockfish,
-            commands::dismiss_stockfish_offer,
-            commands::open_stockfish_licence,
-            commands::set_autostart,
-            commands::set_auto_update,
-            commands::set_stockfish_auto_update,
-            commands::pairing_code,
-            commands::copy_code,
-            commands::new_code,
-            commands::set_port,
-            commands::open_pairing,
-            commands::check_updates,
-            commands::update_progress,
-        ])
+        // What the event loop runs, for its watchdog (#332). An asynchronous
+        // command only starts here; a synchronous one runs inside the mark.
+        .invoke_handler(move |invoke| {
+            let _busy = BUSY.mark(format!("the command {}", invoke.message.command()));
+            handler(invoke)
+        })
         // The plugins set up first, so a second start has handed over and
         // exited before this one touches the port.
         .setup(move |app| {
+            let _busy = BUSY.mark("the start");
             let started = Shared::start(strings);
             let shared = Arc::new(started.shared);
             app.manage(shared.clone());
@@ -104,6 +119,7 @@ pub fn run() {
                 commands::open_pairing_now(app.handle());
             }
             watch(app.handle().clone(), shared);
+            watchdog::start(app.handle());
             updater::start(app.handle());
             engine_updates::start(app.handle());
             Ok(())
@@ -128,6 +144,19 @@ pub fn run() {
             std::process::exit(1);
         }
     }
+}
+
+/// Writes every panic to the log, then hands it to the hook before (#332).
+/// The tray app has no standard error, where the default hook writes, so a
+/// panic in a worker, such as the one building a window, left no trace.
+fn log_panics() {
+    let before = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let location = info.location().map(|l| (l.file(), l.line()));
+        bridge::log!("{}", diagnostics::panic_line(thread.name(), location, info.payload_as_str().unwrap_or("")));
+        before(info);
+    }));
 }
 
 /// Follows the bridge once a second: redraws the tray mark when the state,

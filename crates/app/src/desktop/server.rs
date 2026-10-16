@@ -10,7 +10,9 @@ use bridge::pairing;
 use bridge::snapshot::Background;
 use bridge::start::{self, Cause, Options};
 
+use crate::diagnostics::PageErrors;
 use crate::i18n::Strings;
+use crate::opening::Openings;
 use crate::status::{Problem, View};
 
 /// How long a start waits for its port: after a restart the process before
@@ -25,6 +27,10 @@ pub struct Shared {
     running: Option<Running>,
     view: Mutex<View>,
     pub flyout: Mutex<Flyout>,
+    /// How far each window's latest opening got (#332).
+    pub openings: Openings,
+    /// The script errors each window logged in this run (#332).
+    pub page_errors: PageErrors,
 }
 
 struct Running {
@@ -82,7 +88,15 @@ impl Shared {
         // Asked for by the start before, and done once the bridge serves.
         let asked =
             running.is_some() && dir.as_ref().is_some_and(|d| std::fs::remove_file(d.join(PAIR_ON_START)).is_ok());
-        let shared = Shared { strings, dir, running, view: Mutex::new(view), flyout: Mutex::default() };
+        let shared = Shared {
+            strings,
+            dir,
+            running,
+            view: Mutex::new(view),
+            flyout: Mutex::default(),
+            openings: Openings::default(),
+            page_errors: PageErrors::default(),
+        };
         Started { shared, first_run, pair: asked }
     }
 

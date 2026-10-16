@@ -46,6 +46,13 @@
   "toast.update.required.title": "Потрібно оновити міст",
   "toast.update.waiting.body": "Щоб оновити міст, виберіть «Перевірити оновлення» в його меню.",
 
+  "failure.title": "oschess міст",
+  "failure.window.settings": "Не вдалося відкрити налаштування мосту.",
+  "failure.window.firstRun": "Не вдалося відкрити вікно першого запуску мосту.",
+  "failure.stage.requested": "Вікно не створилося.",
+  "failure.stage.built": "Вікно створилося, але його вміст не завантажився.",
+  "failure.advice": "Подробиці записано в журнал мосту. Спробуйте вийти з мосту (меню біля годинника → «Вийти») і запустити його знову.",
+
   "flyout.working": "працює",
   "flyout.notWorking": "не працює",
   "flyout.downloading.one": "{n} база завантажується",
