@@ -16,12 +16,13 @@ const MESSAGE_CHARS: usize = 300;
 pub const PAGE_ERRORS: u32 = 20;
 
 /// `text` with every path in it replaced by `<path>`: from a drive (`C:\`,
-/// `C:/`), a UNC or escaped start (`\\`), or a `/` that opens a word, to the
-/// first character a Windows file name cannot hold (a colon after the
-/// drive's, a double quote, `<`, `>`, `|`, `?`, `*`) or the end of the line.
-/// A name may hold spaces, brackets, apostrophes and backticks, so they do
-/// not end it: a path in single quotes takes the rest of its line with it,
-/// as a message loses more than it must rather than keep part of a name.
+/// `C:/`), a UNC, namespace or escaped start (`\\`, `\\?\`, `\??\`), or a `/`
+/// that opens a word, to the first character a Windows file name cannot hold
+/// (a double quote, `<`, `>`, `|`, `*`, a `?` outside a namespace prefix, a
+/// colon that is no drive's) or the end of the line. A name may hold spaces,
+/// brackets, apostrophes and backticks, so they do not end it: a path in
+/// single quotes takes the rest of its line with it, as a message loses more
+/// than it must rather than keep part of a name.
 pub fn without_paths(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -30,10 +31,7 @@ pub fn without_paths(text: &str) -> String {
         if path_starts(&chars, i) {
             out.push_str(PATH);
             let start = i;
-            let ends = |at: usize, c: char| {
-                matches!(c, '"' | '<' | '>' | '|' | '?' | '*' | '\n' | '\r') || (c == ':' && at != start + 1)
-            };
-            while i < chars.len() && !ends(i, chars[i]) {
+            while i < chars.len() && !path_ends(&chars, start, i) {
                 i += 1;
             }
             continue;
@@ -49,8 +47,28 @@ fn path_starts(chars: &[char], i: usize) -> bool {
     let word_start = i == 0 || !chars[i - 1].is_alphanumeric();
     let drive = chars[i].is_ascii_alphabetic() && at(1) == Some(':') && matches!(at(2), Some('\\' | '/'));
     let unc = chars[i] == '\\' && at(1) == Some('\\');
+    // `\??\C:\…`, the NT form of a path.
+    let nt = chars[i] == '\\' && at(1) == Some('?') && at(2) == Some('?') && at(3) == Some('\\');
     let rooted = chars[i] == '/' && at(1).is_some_and(|c| c.is_alphanumeric() || c == '.') && word_start;
-    (drive && word_start) || unc || rooted
+    (drive && word_start) || unc || nt || rooted
+}
+
+/// Whether the character at `at` ends the path that starts at `start`.
+fn path_ends(chars: &[char], start: usize, at: usize) -> bool {
+    let near = |n: isize| at.checked_add_signed(n).and_then(|i| chars.get(i)).copied();
+    match chars[at] {
+        '"' | '<' | '>' | '|' | '*' | '\n' | '\r' => true,
+        // `\\?\`, `\??\`: a namespace prefix, not the end of a name.
+        '?' => !(matches!(near(-1), Some('\\' | '?')) && matches!(near(1), Some('\\' | '?'))),
+        // A drive's colon: its letter opens the path or follows a separator,
+        // as in `\\?\C:\`.
+        ':' => {
+            let letter = near(-1).is_some_and(|c| c.is_ascii_alphabetic());
+            let opens = at == start + 1 || matches!(near(-2), Some('\\' | '/'));
+            !(letter && opens)
+        }
+        _ => false,
+    }
 }
 
 /// A source file as a panic names it, short enough to name no folder of the
@@ -149,6 +167,13 @@ mod tests {
             (r#"Os { path: "C:\\Users\\O'Neil\\db`s.cbh" }"#, r#"Os { path: "<path>" }"#),
             (r"read C:\x\it`s.pgn", "read <path>"),
             ("in '/home/o'neil/x.toml' now", "in '<path>"),
+            // Namespace prefixes hold a `?` and a drive after them (#334).
+            (r"cannot open \\?\UNC\SyntheticServer\PrivateShare\Private.cbh: denied", "cannot open <path>: denied"),
+            (r"cannot open \\?\C:\Users\Olena\Private.cbh: denied", "cannot open <path>: denied"),
+            (r"cannot open \\.\C:\Users\Olena\Private.cbh", "cannot open <path>"),
+            (r"cannot open \??\C:\Users\Olena\Private.cbh: denied", "cannot open <path>: denied"),
+            (r#"Os { path: "\\\\?\\UNC\\Server\\Share\\x.cbh" }"#, r#"Os { path: "<path>" }"#),
+            ("is it C:\\x? no", "is it <path>? no"),
             ("no file /home/olena/.config/oschess-bridge/bridge.toml", "no file <path>"),
             (r"c:/Program Files (x86)/ChessBase/Mega.cbh", "<path>"),
             ("line one C:\\a\nline two", "line one <path>\nline two"),
