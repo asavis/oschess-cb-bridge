@@ -59,6 +59,9 @@ fn text<E: std::fmt::Display>(e: E) -> String {
 
 #[tauri::command]
 pub fn view(shared: SharedState<'_>) -> View {
+    if super::faults::on("view-blocks") {
+        std::thread::sleep(Duration::from_secs(20));
+    }
     shared.view()
 }
 

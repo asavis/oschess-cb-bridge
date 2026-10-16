@@ -9,7 +9,8 @@
 //! - `build-fails`: a window's build fails;
 //! - `page-not-ready`: no page says it is ready;
 //! - `show-fails`: the settings window cannot be brought forward;
-//! - `menu-blocks`: the menu's «Settings» holds the event loop for 20 s.
+//! - `view-blocks`: the command `view`, which the flyout calls as it loads,
+//!   holds the event loop for 20 s.
 //!
 //! A release build has none of them.
 
