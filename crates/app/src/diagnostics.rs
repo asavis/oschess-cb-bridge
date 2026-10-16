@@ -17,9 +17,11 @@ pub const PAGE_ERRORS: u32 = 20;
 
 /// `text` with every path in it replaced by `<path>`: from a drive (`C:\`,
 /// `C:/`), a UNC or escaped start (`\\`), or a `/` that opens a word, to the
-/// next colon, quote or end of the line. A path may hold spaces and
-/// brackets, so they do not end it; a Windows path holds no colon but its
-/// drive's, so the reason after `path: ` stays.
+/// first character a Windows file name cannot hold (a colon after the
+/// drive's, a double quote, `<`, `>`, `|`, `?`, `*`) or the end of the line.
+/// A name may hold spaces, brackets, apostrophes and backticks, so they do
+/// not end it: a path in single quotes takes the rest of its line with it,
+/// as a message loses more than it must rather than keep part of a name.
 pub fn without_paths(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -28,7 +30,9 @@ pub fn without_paths(text: &str) -> String {
         if path_starts(&chars, i) {
             out.push_str(PATH);
             let start = i;
-            let ends = |at: usize, c: char| matches!(c, '"' | '\'' | '`' | '\n') || (c == ':' && at != start + 1);
+            let ends = |at: usize, c: char| {
+                matches!(c, '"' | '<' | '>' | '|' | '?' | '*' | '\n' | '\r') || (c == ':' && at != start + 1)
+            };
             while i < chars.len() && !ends(i, chars[i]) {
                 i += 1;
             }
@@ -140,6 +144,11 @@ mod tests {
                 r"cannot open C:\x\Mega 2024.cbh: Access is denied. (os error 5)",
                 "cannot open <path>: Access is denied. (os error 5)",
             ),
+            // A name may hold an apostrophe or a backtick (#334).
+            (r"cannot open C:\Users\O'Neil\Documents\ChessBase\Private.cbh: denied", "cannot open <path>: denied"),
+            (r#"Os { path: "C:\\Users\\O'Neil\\db`s.cbh" }"#, r#"Os { path: "<path>" }"#),
+            (r"read C:\x\it`s.pgn", "read <path>"),
+            ("in '/home/o'neil/x.toml' now", "in '<path>"),
             ("no file /home/olena/.config/oschess-bridge/bridge.toml", "no file <path>"),
             (r"c:/Program Files (x86)/ChessBase/Mega.cbh", "<path>"),
             ("line one C:\\a\nline two", "line one <path>\nline two"),

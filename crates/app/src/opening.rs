@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long a window may take from its request to a drawn page.
@@ -35,6 +36,9 @@ impl Stage {
 #[derive(Default)]
 pub struct Openings {
     latest: Mutex<HashMap<String, Opening>>,
+    /// The last attempt given, of any window: an attempt is never named twice,
+    /// so the watcher of one that ended never takes a later one for it (#334).
+    attempts: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,7 +60,7 @@ impl Openings {
         if before.is_some_and(|o| o.stage != Stage::Ready && now.saturating_duration_since(o.since) < LIMIT) {
             return None;
         }
-        let attempt = before.map_or(1, |o| o.attempt + 1);
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         latest.insert(label.to_string(), Opening { attempt, stage: Stage::Requested, since: now });
         Some(attempt)
     }
@@ -198,6 +202,27 @@ mod tests {
         let attempt = openings.request("settings", Instant::now()).unwrap();
         openings.failed("settings", attempt);
         assert_eq!(openings.overdue("settings", attempt), None);
+    }
+
+    /// The watcher of an opening that ended does not take the next one for
+    /// its own (#334).
+    #[test]
+    fn an_attempt_is_never_named_twice() {
+        let openings = Openings::default();
+        let start = Instant::now();
+        let first = openings.request("settings", start).unwrap();
+        openings.built("settings", first);
+        openings.ready("settings");
+        openings.closed("settings");
+        let second = openings.request("settings", start + LIMIT * 9 / 10).unwrap();
+        assert_ne!(first, second);
+        openings.built("settings", second);
+        assert_eq!(openings.overdue("settings", first), None, "the first watcher has nothing to report");
+        // The same after a failed build.
+        openings.failed("settings", second);
+        let third = openings.request("settings", start + LIMIT).unwrap();
+        assert!(third != first && third != second);
+        assert_eq!(openings.overdue("settings", second), None);
     }
 
     #[test]
