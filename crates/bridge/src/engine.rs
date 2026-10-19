@@ -4,8 +4,10 @@
 //! first analysis, and ends after [`IDLE`] without one, when it crashes, or
 //! when the bridge stops. It searches one position at a time: a newer analysis
 //! takes it from the running one, which stops. From the browser only the
-//! position, the number of lines and an optional depth or time reach the
-//! engine, each checked here; `Threads` and `Hash` come from the configuration.
+//! position, the number of lines, an optional depth or time, and what narrows
+//! a search further (a node limit, a mate search, the moves searched and a new
+//! game, #336) reach the engine, each checked here; `Threads` and `Hash` come
+//! from the configuration unless the analysis names them.
 //! The process and the UCI it speaks are in `engine/uci.rs`; what this
 //! computer allows the engine comes from [`crate::machine`].
 
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant};
 use chesscore::{Board, Move, Piece, Square};
 
 use crate::http::Sink;
-use crate::json::Obj;
+use crate::json::{self, Obj};
 use crate::machine;
 use crate::sync::lock;
 
@@ -43,6 +45,15 @@ pub const MAX_MOVETIME_MS: u32 = 600_000;
 pub const MAX_MOVES: usize = 600;
 /// The longest FEN.
 pub const MAX_FEN: usize = 128;
+/// The most nodes a search may be limited to.
+pub const MAX_NODES: u64 = 1_000_000_000;
+/// The longest mate a mate search may look for, in moves.
+pub const MAX_MATE: u32 = 99;
+/// The most moves a search may be restricted to; no position has more legal ones.
+pub const MAX_SEARCHMOVES: usize = 256;
+/// The parameters that narrow a search beyond its depth or time (#336), as
+/// `/v1/status` lists them and an answer acknowledges them.
+pub const NARROWING: [&str; 4] = ["nodes", "mate", "searchmoves", "newgame"];
 /// The hash table when the configuration names none, before the memory cap.
 pub const DEFAULT_HASH_MB: u32 = 512;
 /// The smallest hash table an analysis may ask for.
@@ -86,6 +97,25 @@ pub struct Search {
     pub limit: Limit,
     pub threads: Option<u32>,
     pub hash_mb: Option<u32>,
+    /// A node limit (`go nodes`), beside the depth or time.
+    pub nodes: Option<u64>,
+    /// A mate search in this many moves (`go mate`).
+    pub mate: Option<u32>,
+    /// The only moves searched (`go searchmoves`), in UCI as the engine reads it.
+    pub searchmoves: Vec<String>,
+    /// Whether the engine hears `ucinewgame` before the position, which clears its table.
+    pub newgame: bool,
+}
+
+/// What narrows a search beyond its depth or time (#336): a node limit, a
+/// mate search, the moves searched, and a new game. None of them by default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Narrowing<'a> {
+    pub nodes: Option<u64>,
+    pub mate: Option<u32>,
+    /// UCI moves separated by spaces, as `moves` is given.
+    pub searchmoves: &'a str,
+    pub newgame: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +132,24 @@ impl Search {
     /// must describe a legal standard position. The error names the
     /// parameter and why.
     pub fn new(fen: Option<&str>, moves: &str, multipv: u32, limit: Limit) -> Result<Search, (&'static str, String)> {
+        Search::narrowed(fen, moves, multipv, limit, Narrowing::default())
+    }
+
+    /// [`Search::new`] narrowed as `narrowing` asks (#336). Each move of
+    /// `searchmoves` must be legal in the position after `moves`.
+    pub fn narrowed(
+        fen: Option<&str>,
+        moves: &str,
+        multipv: u32,
+        limit: Limit,
+        narrowing: Narrowing,
+    ) -> Result<Search, (&'static str, String)> {
+        if narrowing.nodes.is_some_and(|n| !(1..=MAX_NODES).contains(&n)) {
+            return Err(("nodes", format!("nodes is 1 to {MAX_NODES}")));
+        }
+        if narrowing.mate.is_some_and(|m| !(1..=MAX_MATE).contains(&m)) {
+            return Err(("mate", format!("mate is 1 to {MAX_MATE}")));
+        }
         if !(1..=MAX_MULTIPV).contains(&multipv) {
             return Err(("multipv", format!("multipv is 1 to {MAX_MULTIPV}")));
         }
@@ -145,7 +193,56 @@ impl Search {
             position.push(' ');
             position.push_str(&uci);
         }
-        Ok(Search { position, multipv, limit, threads: None, hash_mb: None })
+        let searched: Vec<&str> = narrowing.searchmoves.split_whitespace().collect();
+        if searched.len() > MAX_SEARCHMOVES {
+            return Err(("searchmoves", format!("At most {MAX_SEARCHMOVES} moves")));
+        }
+        let mut searchmoves = Vec::with_capacity(searched.len());
+        for (i, text) in searched.iter().enumerate() {
+            let shown: String = text.chars().take(12).collect();
+            let illegal = |why: &str| ("searchmoves", format!("Move {} ({shown:?}): {why}", i + 1));
+            let mv: Move = text.parse().map_err(|_| illegal("not a UCI move"))?;
+            let mv = castling_as_king_takes_rook(&board, mv);
+            if !board.is_legal(mv) {
+                return Err(illegal("not legal in the position"));
+            }
+            searchmoves.push(standard_uci(&board, mv));
+        }
+        Ok(Search {
+            position,
+            multipv,
+            limit,
+            threads: None,
+            hash_mb: None,
+            nodes: narrowing.nodes,
+            mate: narrowing.mate,
+            searchmoves,
+            newgame: narrowing.newgame,
+        })
+    }
+
+    /// The line that acknowledges what narrows this search (#336), as
+    /// `docs/api.md` «Compatibility» asks of a parameter an older bridge
+    /// ignores: `{"search":{…}}` with each one applied. `None` when nothing does.
+    pub fn acknowledgement(&self) -> Option<String> {
+        if self.nodes.is_none() && self.mate.is_none() && self.searchmoves.is_empty() && !self.newgame {
+            return None;
+        }
+        let mut applied = Obj::new();
+        if let Some(n) = self.nodes {
+            // Within MAX_NODES, so it fits.
+            applied = applied.num("nodes", i64::try_from(n).unwrap_or(i64::MAX));
+        }
+        if let Some(m) = self.mate {
+            applied = applied.num("mate", i64::from(m));
+        }
+        if !self.searchmoves.is_empty() {
+            applied = applied.raw("searchmoves", &json::array(self.searchmoves.iter().map(|m| json::string(m))));
+        }
+        if self.newgame {
+            applied = applied.bool("newgame", true);
+        }
+        Some(Obj::new().raw("search", &applied.done()).done())
     }
 
     /// This search with the engine's `Threads` and `Hash` as the client asks,
@@ -168,11 +265,25 @@ impl Search {
     }
 
     fn go(&self) -> String {
-        match self.limit {
+        let mut go = match self.limit {
+            // A node limit or a mate search ends the search by itself.
+            Limit::Infinite if self.nodes.is_some() || self.mate.is_some() => "go".to_string(),
             Limit::Infinite => "go infinite".into(),
             Limit::Depth(d) => format!("go depth {d}"),
             Limit::MovetimeMs(t) => format!("go movetime {t}"),
+        };
+        if let Some(n) = self.nodes {
+            go.push_str(&format!(" nodes {n}"));
         }
+        if let Some(m) = self.mate {
+            go.push_str(&format!(" mate {m}"));
+        }
+        // `searchmoves` takes every word after it, so it comes last.
+        if !self.searchmoves.is_empty() {
+            go.push_str(" searchmoves ");
+            go.push_str(&self.searchmoves.join(" "));
+        }
+        go
     }
 }
 
@@ -517,6 +628,9 @@ impl Inner {
         if !p.sync(threads, hash_mb, Some(search)).unwrap_or(false) {
             return exited(sink);
         }
+        if let Some(acknowledgement) = search.acknowledgement() {
+            let _ = sink.line(&acknowledgement);
+        }
         if p.send(&search.go()).is_err() {
             return exited(sink);
         }
@@ -637,6 +751,71 @@ mod tests {
         assert_eq!(refused(None, "", 1, Limit::MovetimeMs(MAX_MOVETIME_MS + 1)), "movetime");
         // The side not to move is in check.
         assert_eq!(refused(Some("4k3/8/8/8/8/8/8/4R1K1 w - - 0 1"), "", 1, Limit::Infinite), "fen");
+    }
+
+    #[test]
+    fn a_narrowed_search_writes_its_limits_and_acknowledges_them() {
+        let narrowed = |fen: Option<&str>, moves: &str, limit, narrowing| {
+            Search::narrowed(fen, moves, 2, limit, narrowing).unwrap()
+        };
+        let plain = narrowed(None, "", Limit::Depth(20), Narrowing::default());
+        assert_eq!((plain.go(), plain.acknowledgement()), ("go depth 20".into(), None));
+        let s = narrowed(
+            None,
+            "e2e4",
+            Limit::Depth(20),
+            Narrowing { nodes: Some(25_000_000), searchmoves: "e7e5 c7c5", ..Narrowing::default() },
+        );
+        assert_eq!(s.go(), "go depth 20 nodes 25000000 searchmoves e7e5 c7c5");
+        assert_eq!(s.acknowledgement().unwrap(), r#"{"search":{"nodes":25000000,"searchmoves":["e7e5","c7c5"]}}"#);
+        // A node limit or a mate search alone ends the search: no `infinite`.
+        let s = narrowed(None, "", Limit::Infinite, Narrowing { nodes: Some(1), ..Narrowing::default() });
+        assert_eq!(s.go(), "go nodes 1");
+        let fen = "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1";
+        let s = narrowed(
+            Some(fen),
+            "",
+            Limit::Infinite,
+            Narrowing { mate: Some(1), nodes: Some(MAX_NODES), searchmoves: "a1a8", newgame: true },
+        );
+        assert_eq!(s.go(), format!("go nodes {MAX_NODES} mate 1 searchmoves a1a8"));
+        assert_eq!(
+            s.acknowledgement().unwrap(),
+            format!(r#"{{"search":{{"nodes":{MAX_NODES},"mate":1,"searchmoves":["a1a8"],"newgame":true}}}}"#)
+        );
+        let s = narrowed(None, "", Limit::MovetimeMs(500), Narrowing { mate: Some(MAX_MATE), ..Narrowing::default() });
+        assert_eq!(s.go(), format!("go movetime 500 mate {MAX_MATE}"));
+        let s = narrowed(None, "", Limit::Infinite, Narrowing { newgame: true, ..Narrowing::default() });
+        assert_eq!(
+            (s.go(), s.acknowledgement().unwrap()),
+            ("go infinite".into(), r#"{"search":{"newgame":true}}"#.into())
+        );
+        // Castling is searched as the king's two-square step, either way it is named.
+        let castles = Some("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        for named in ["e1g1", "e1h1"] {
+            let s = narrowed(castles, "", Limit::Depth(1), Narrowing { searchmoves: named, ..Narrowing::default() });
+            assert_eq!(s.searchmoves, ["e1g1"], "{named}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_narrowing_out_of_bounds_or_not_legal() {
+        let refused =
+            |moves: &str, narrowing| Search::narrowed(None, moves, 1, Limit::Infinite, narrowing).unwrap_err().0;
+        let n = Narrowing::default;
+        assert_eq!(refused("", Narrowing { nodes: Some(0), ..n() }), "nodes");
+        assert_eq!(refused("", Narrowing { nodes: Some(MAX_NODES + 1), ..n() }), "nodes");
+        assert_eq!(refused("", Narrowing { mate: Some(0), ..n() }), "mate");
+        assert_eq!(refused("", Narrowing { mate: Some(MAX_MATE + 1), ..n() }), "mate");
+        // Legal in the position after the moves, not before them.
+        assert_eq!(refused("e2e4", Narrowing { searchmoves: "e2e4", ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: "e2e5", ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: "e2e4 quit", ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: "e2e4\nquit", ..n() }), "searchmoves");
+        let too_many = "g1f3 ".repeat(MAX_SEARCHMOVES + 1);
+        assert_eq!(refused("", Narrowing { searchmoves: &too_many, ..n() }), "searchmoves");
+        let most = "g1f3 ".repeat(MAX_SEARCHMOVES);
+        assert!(Search::narrowed(None, "", 1, Limit::Infinite, Narrowing { searchmoves: &most, ..n() }).is_ok());
     }
 
     #[test]

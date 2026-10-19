@@ -15,7 +15,7 @@ use chesscore::Board;
 use crate::access::{Policy, Verdict, cors};
 use crate::budget;
 use crate::catalog::{Catalog, Entry, State};
-use crate::engine::{self, Engine, Limit, Search};
+use crate::engine::{self, Engine, Limit, Narrowing, Search};
 use crate::explorer;
 use crate::explorer::fragment::Filter;
 use crate::foreground;
@@ -209,6 +209,8 @@ fn status(app: &App) -> Response {
                 .str("name", &name)
                 .raw("threads", &range(threads, limits.max_threads))
                 .raw("hash", &range(hash_mb, limits.max_hash_mb))
+                // What can narrow an analysis beyond depth and time (#336).
+                .raw("search", &json::array(engine::NARROWING.iter().map(|p| json::string(p))))
                 .done()
         }
         _ => "null".to_string(),
@@ -850,8 +852,23 @@ impl AnalyzeQuery {
             return Err(bad_parameter("stream", "stream is at most 64 letters, digits, - and _"));
         }
         let (threads, hash_mb) = resources(req)?;
-        let search = Search::new(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit)
-            .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()));
+        let narrowing = Narrowing {
+            nodes: match req.param("nodes").map(str::parse::<u64>) {
+                None => None,
+                Some(Ok(n)) => Some(n),
+                Some(Err(_)) => return Err(bad_parameter("nodes", "nodes is a whole number")),
+            },
+            mate: whole(req, "mate")?,
+            searchmoves: req.param("searchmoves").unwrap_or_default(),
+            newgame: match req.param("newgame") {
+                None | Some("0") => false,
+                Some("1") => true,
+                Some(_) => return Err(bad_parameter("newgame", "newgame is 0 or 1")),
+            },
+        };
+        let search =
+            Search::narrowed(req.param("fen"), req.param("moves").unwrap_or_default(), multipv, limit, narrowing)
+                .and_then(|s| s.with_resources(threads, hash_mb, engine::limits()));
         Ok(AnalyzeQuery { search: checked(search)?, stream: stream.to_string() })
     }
 }
@@ -1072,6 +1089,7 @@ mod tests {
         let analysis = |query: &str| refused(AnalyzeQuery::parse(&Request::get(&format!("/?{query}"))));
         let stream = "stream is at most 64 letters, digits, - and _";
         let long = format!("stream={}", "a".repeat(65));
+        let too_many_moves = format!("searchmoves={}", "g1f3+".repeat(engine::MAX_SEARCHMOVES + 1));
         for (query, parameter, message) in [
             ("multipv=x", "multipv", "multipv is a whole number"),
             ("multipv=6", "multipv", "multipv is 1 to 5"),
@@ -1085,6 +1103,13 @@ mod tests {
             ("threads=x&hash=y", "threads", "threads is a whole number"),
             ("hash=x", "hash", "hash is a whole number"),
             ("multipv=9&threads=x", "threads", "threads is a whole number"),
+            ("nodes=x", "nodes", "nodes is a whole number"),
+            ("nodes=-1", "nodes", "nodes is a whole number"),
+            ("nodes=0", "nodes", "nodes is 1 to 1000000000"),
+            ("mate=x", "mate", "mate is a whole number"),
+            ("mate=100", "mate", "mate is 1 to 99"),
+            (too_many_moves.as_str(), "searchmoves", "At most 256 moves"),
+            ("newgame=yes", "newgame", "newgame is 0 or 1"),
         ] {
             assert_eq!(analysis(query), bad(parameter, message), "{query}");
         }
@@ -1104,6 +1129,18 @@ mod tests {
             (search.multipv, search.limit, search.threads, search.hash_mb, query.stream.as_str()),
             (2, Limit::Depth(6), Some(1), Some(16), "")
         );
+        let Ok(query) = AnalyzeQuery::parse(&Request::get(
+            "/?moves=e2e4&multipv=2&depth=20&nodes=25000000&mate=3&searchmoves=e7e5+c7c5&newgame=1",
+        )) else {
+            panic!("refused")
+        };
+        let search = &query.search;
+        assert_eq!(
+            (search.limit, search.nodes, search.mate, search.searchmoves.as_slice(), search.newgame),
+            (Limit::Depth(20), Some(25_000_000), Some(3), ["e7e5".to_string(), "c7c5".to_string()].as_slice(), true)
+        );
+        let Ok(query) = AnalyzeQuery::parse(&Request::get("/?newgame=0")) else { panic!("refused") };
+        assert!(!query.search.newgame && query.search.acknowledgement().is_none());
         let longest = "a".repeat(64);
         for (query, name) in [("stream=".to_string(), ""), (format!("stream={longest}"), longest.as_str())] {
             let Ok(parsed) = AnalyzeQuery::parse(&Request::get(&format!("/?{query}"))) else { panic!("{query}") };

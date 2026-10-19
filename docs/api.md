@@ -278,7 +278,7 @@ streams; a forgotten stream starts afresh.
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
   "download": { "present": 104857600, "total": 734003200 },
   "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ],
-  "engine": { "name": "Stockfish 19", "threads": { "default": 6, "max": 8 }, "hash": { "default": 512, "max": 8192 } }
+  "engine": { "name": "Stockfish 19", "threads": { "default": 6, "max": 8 }, "hash": { "default": 512, "max": 8192 }, "search": ["nodes", "mate", "searchmoves", "newgame"] }
 }
 ```
 
@@ -313,7 +313,9 @@ name until it has run once. `threads` and `hash` (MB) are what an analysis
 may ask for on this computer (#58): `max` is the logical processors, and the
 largest power of two at or below half the physical memory, from 16 to 32768
 MB. `default` is what an analysis naming none gets, from `bridge.toml` or
-computed, and never above `max`.
+computed, and never above `max`. `search` lists the parameters beyond `depth`
+and `movetime` that narrow an analysis (#336); a bridge without the field
+takes none of them.
 
 ### `GET /v1/databases`
 
@@ -1356,6 +1358,10 @@ defaults, no engine.
 | `multipv` | Lines to search, 1 to 5; 1 by default. |
 | `depth` | Search to this depth, 1 to 99, then name the best move. |
 | `movetime` | Search this many milliseconds, 1 to 600000, then name the best move. Only one of `depth` and `movetime`. |
+| `nodes` | Search at most this many nodes, 1 to 1000000000, then name the best move. With `depth`, `movetime` or `mate`, the first limit reached ends the search. |
+| `mate` | Search for a mate in at most this many moves, 1 to 99 (`go mate`), then name the best move. |
+| `searchmoves` | Search only these UCI moves, separated by spaces, at most 256, each legal in the position after `moves`; castling as for `moves`. The lines then rank only them. |
+| `newgame` | `1` tells the engine a new game starts (`ucinewgame`) before the position, which clears its table; `0`, as without it, keeps the table, so the positions of one game share it. |
 | `stream` | The client's view, at most 64 letters, digits, `-` and `_`, for example one browser tab. |
 | `threads` | The engine's `Threads`, 1 to `engine.threads.max` of `GET /v1/status`; the default there without it. |
 | `hash` | The engine's `Hash` in MB, 16 to `engine.hash.max`; the default there without it. |
@@ -1384,8 +1390,19 @@ body: one JSON object per line, until the search ends.
   empty `pv`, and the best move is `(none)`.
 - With nothing new for two seconds, the last lines are written again, so a
   long step of the search keeps the connection alive.
-- `bestmove` ends a search with `depth` or `movetime`. Without either, the
-  search goes on until the client closes the connection, which stops it.
+- When `nodes`, `mate`, `searchmoves` or `newgame` is given, the first line
+  acknowledges each one the bridge applied, as «Compatibility» asks of a
+  parameter an older bridge ignores:
+
+  ```
+  {"search":{"nodes":25000000,"mate":3,"searchmoves":["e2e4","d2d4"],"newgame":true}}
+  ```
+
+  A client that sent one and does not find it there talks to an older bridge,
+  which searched without it.
+- `bestmove` ends a search with `depth`, `movetime`, `nodes` or `mate`.
+  Without any, the search goes on until the client closes the connection,
+  which stops it.
 - `{"superseded":true}` ends the search when a newer request with another
   `stream` took the engine. A newer request with the same `stream` ends it
   without that line. The engine searches one position at a time.
