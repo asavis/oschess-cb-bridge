@@ -859,7 +859,7 @@ impl AnalyzeQuery {
                 Some(Err(_)) => return Err(bad_parameter("nodes", "nodes is a whole number")),
             },
             mate: whole(req, "mate")?,
-            searchmoves: req.param("searchmoves").unwrap_or_default(),
+            searchmoves: req.param("searchmoves"),
             newgame: match req.param("newgame") {
                 None | Some("0") => false,
                 Some("1") => true,
@@ -1109,6 +1109,8 @@ mod tests {
             ("mate=x", "mate", "mate is a whole number"),
             ("mate=100", "mate", "mate is 1 to 99"),
             (too_many_moves.as_str(), "searchmoves", "At most 256 moves"),
+            ("searchmoves=", "searchmoves", "searchmoves names at least one move"),
+            ("searchmoves=+++", "searchmoves", "searchmoves names at least one move"),
             ("newgame=yes", "newgame", "newgame is 0 or 1"),
         ] {
             assert_eq!(analysis(query), bad(parameter, message), "{query}");

@@ -315,6 +315,8 @@ fn refuses_bad_input_and_a_missing_engine() {
         ("moves=e2e4&searchmoves=e2e4", "searchmoves"),
         ("searchmoves=e2e4%0Aquit", "searchmoves"),
         ("newgame=2", "newgame"),
+        ("searchmoves=", "searchmoves"),
+        ("searchmoves=+++", "searchmoves"),
     ] {
         let a = Analysis::open(port, query);
         assert_eq!(a.status, 400, "{query}");
@@ -355,6 +357,15 @@ fn a_narrowed_search_is_acknowledged_and_reaches_the_engine() {
     assert_eq!(lines[0], r#"{"search":{"mate":4}}"#);
     assert!(lines.iter().any(|l| l.contains(r#""depth":4,"#) && l.contains(r#""score":{"mate":4}"#)), "{lines:?}");
     assert_eq!(lines.last().unwrap(), BEST);
+    // A mate search that finds no mate ends at its other limit, and without one
+    // it goes on like an unlimited search until the client leaves.
+    let lines = Analysis::open(port, "moves=c2c3&mate=2&nodes=5000&stream=tab1").rest();
+    assert_eq!(lines[0], r#"{"search":{"nodes":5000,"mate":2}}"#);
+    assert_eq!(lines.last().unwrap(), BEST);
+    assert!(lines.iter().all(|l| !l.contains(r#""mate":2}"#) || l.starts_with(r#"{"search":"#)), "{lines:?}");
+    let mut endless = Analysis::open(port, "moves=c2c3&mate=2&stream=tab1");
+    assert!(endless.rest_within(Duration::from_secs(1)).is_none(), "no mate, no bound");
+    drop(endless);
     // Without a narrowing parameter nothing is acknowledged.
     let lines = Analysis::open(port, "depth=2&stream=tab1").rest();
     assert!(lines[0].starts_with(r#"{"info":"#), "{lines:?}");
@@ -429,6 +440,10 @@ fn a_real_engine_analyses() {
     assert_eq!(lines[0], r#"{"search":{"mate":1,"searchmoves":["a1a8"],"newgame":true}}"#, "{lines:?}");
     assert!(lines.iter().any(|l| l.contains(r#""score":{"mate":1}"#) && l.contains(r#""pv":["a1a8""#)), "{lines:?}");
     assert_eq!(lines.last().unwrap(), r#"{"bestmove":"a1a8"}"#);
+    // A mate search with no mate to find ends at its node limit.
+    let lines = Analysis::open(port, "mate=1&nodes=20000&stream=real").rest();
+    assert!(lines.last().unwrap().starts_with(r#"{"bestmove":""#), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains(r#""score":{"mate":"#)), "{lines:?}");
     // The moves searched are the only ones the lines start with.
     let lines = Analysis::open(port, "multipv=2&depth=8&searchmoves=a2a3+h2h3&stream=real").rest();
     assert!(

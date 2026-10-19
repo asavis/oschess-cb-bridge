@@ -113,8 +113,9 @@ pub struct Search {
 pub struct Narrowing<'a> {
     pub nodes: Option<u64>,
     pub mate: Option<u32>,
-    /// UCI moves separated by spaces, as `moves` is given.
-    pub searchmoves: &'a str,
+    /// UCI moves separated by spaces, as `moves` is given; `None` searches
+    /// every move, and a list naming none is refused.
+    pub searchmoves: Option<&'a str>,
     pub newgame: bool,
 }
 
@@ -193,7 +194,11 @@ impl Search {
             position.push(' ');
             position.push_str(&uci);
         }
-        let searched: Vec<&str> = narrowing.searchmoves.split_whitespace().collect();
+        let searched: Vec<&str> = narrowing.searchmoves.unwrap_or_default().split_whitespace().collect();
+        // An empty restriction must not become a search of every move.
+        if narrowing.searchmoves.is_some() && searched.is_empty() {
+            return Err(("searchmoves", "searchmoves names at least one move".into()));
+        }
         if searched.len() > MAX_SEARCHMOVES {
             return Err(("searchmoves", format!("At most {MAX_SEARCHMOVES} moves")));
         }
@@ -266,7 +271,8 @@ impl Search {
 
     fn go(&self) -> String {
         let mut go = match self.limit {
-            // A node limit or a mate search ends the search by itself.
+            // A node limit ends the search by itself, and a mate search when it
+            // finds the mate; `infinite` would hold back even that best move.
             Limit::Infinite if self.nodes.is_some() || self.mate.is_some() => "go".to_string(),
             Limit::Infinite => "go infinite".into(),
             Limit::Depth(d) => format!("go depth {d}"),
@@ -764,7 +770,7 @@ mod tests {
             None,
             "e2e4",
             Limit::Depth(20),
-            Narrowing { nodes: Some(25_000_000), searchmoves: "e7e5 c7c5", ..Narrowing::default() },
+            Narrowing { nodes: Some(25_000_000), searchmoves: Some("e7e5 c7c5"), ..Narrowing::default() },
         );
         assert_eq!(s.go(), "go depth 20 nodes 25000000 searchmoves e7e5 c7c5");
         assert_eq!(s.acknowledgement().unwrap(), r#"{"search":{"nodes":25000000,"searchmoves":["e7e5","c7c5"]}}"#);
@@ -776,7 +782,7 @@ mod tests {
             Some(fen),
             "",
             Limit::Infinite,
-            Narrowing { mate: Some(1), nodes: Some(MAX_NODES), searchmoves: "a1a8", newgame: true },
+            Narrowing { mate: Some(1), nodes: Some(MAX_NODES), searchmoves: Some("a1a8"), newgame: true },
         );
         assert_eq!(s.go(), format!("go nodes {MAX_NODES} mate 1 searchmoves a1a8"));
         assert_eq!(
@@ -793,7 +799,8 @@ mod tests {
         // Castling is searched as the king's two-square step, either way it is named.
         let castles = Some("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
         for named in ["e1g1", "e1h1"] {
-            let s = narrowed(castles, "", Limit::Depth(1), Narrowing { searchmoves: named, ..Narrowing::default() });
+            let s =
+                narrowed(castles, "", Limit::Depth(1), Narrowing { searchmoves: Some(named), ..Narrowing::default() });
             assert_eq!(s.searchmoves, ["e1g1"], "{named}");
         }
     }
@@ -808,14 +815,17 @@ mod tests {
         assert_eq!(refused("", Narrowing { mate: Some(0), ..n() }), "mate");
         assert_eq!(refused("", Narrowing { mate: Some(MAX_MATE + 1), ..n() }), "mate");
         // Legal in the position after the moves, not before them.
-        assert_eq!(refused("e2e4", Narrowing { searchmoves: "e2e4", ..n() }), "searchmoves");
-        assert_eq!(refused("", Narrowing { searchmoves: "e2e5", ..n() }), "searchmoves");
-        assert_eq!(refused("", Narrowing { searchmoves: "e2e4 quit", ..n() }), "searchmoves");
-        assert_eq!(refused("", Narrowing { searchmoves: "e2e4\nquit", ..n() }), "searchmoves");
+        assert_eq!(refused("e2e4", Narrowing { searchmoves: Some("e2e4"), ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: Some("e2e5"), ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: Some("e2e4 quit"), ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: Some("e2e4\nquit"), ..n() }), "searchmoves");
+        for empty in ["", "   ", "\t"] {
+            assert_eq!(refused("", Narrowing { searchmoves: Some(empty), ..n() }), "searchmoves", "{empty:?}");
+        }
         let too_many = "g1f3 ".repeat(MAX_SEARCHMOVES + 1);
-        assert_eq!(refused("", Narrowing { searchmoves: &too_many, ..n() }), "searchmoves");
+        assert_eq!(refused("", Narrowing { searchmoves: Some(&too_many), ..n() }), "searchmoves");
         let most = "g1f3 ".repeat(MAX_SEARCHMOVES);
-        assert!(Search::narrowed(None, "", 1, Limit::Infinite, Narrowing { searchmoves: &most, ..n() }).is_ok());
+        assert!(Search::narrowed(None, "", 1, Limit::Infinite, Narrowing { searchmoves: Some(&most), ..n() }).is_ok());
     }
 
     #[test]

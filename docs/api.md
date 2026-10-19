@@ -1359,8 +1359,8 @@ defaults, no engine.
 | `depth` | Search to this depth, 1 to 99, then name the best move. |
 | `movetime` | Search this many milliseconds, 1 to 600000, then name the best move. Only one of `depth` and `movetime`. |
 | `nodes` | Search at most this many nodes, 1 to 1000000000, then name the best move. With `depth`, `movetime` or `mate`, the first limit reached ends the search. |
-| `mate` | Search for a mate in at most this many moves, 1 to 99 (`go mate`), then name the best move. |
-| `searchmoves` | Search only these UCI moves, separated by spaces, at most 256, each legal in the position after `moves`; castling as for `moves`. The lines then rank only them. |
+| `mate` | Search for a mate in at most this many moves, 1 to 99 (`go mate`). The search ends when it finds one; one that finds none ends at `nodes`, `depth` or `movetime`, and without them goes on until the client closes the connection. |
+| `searchmoves` | Search only these UCI moves, separated by spaces, 1 to 256, each legal in the position after `moves`; castling as for `moves`. The lines then rank only them. A list naming no move is `400`, never a search of every move. |
 | `newgame` | `1` tells the engine a new game starts (`ucinewgame`) before the position, which clears its table; `0`, as without it, keeps the table, so the positions of one game share it. |
 | `stream` | The client's view, at most 64 letters, digits, `-` and `_`, for example one browser tab. |
 | `threads` | The engine's `Threads`, 1 to `engine.threads.max` of `GET /v1/status`; the default there without it. |
@@ -1400,9 +1400,9 @@ body: one JSON object per line, until the search ends.
 
   A client that sent one and does not find it there talks to an older bridge,
   which searched without it.
-- `bestmove` ends a search with `depth`, `movetime`, `nodes` or `mate`.
-  Without any, the search goes on until the client closes the connection,
-  which stops it.
+- `bestmove` ends a search with `depth`, `movetime` or `nodes`, and a `mate`
+  search once it found its mate. Without any of them, the search goes on until
+  the client closes the connection, which stops it.
 - `{"superseded":true}` ends the search when a newer request with another
   `stream` took the engine. A newer request with the same `stream` ends it
   without that line. The engine searches one position at a time.

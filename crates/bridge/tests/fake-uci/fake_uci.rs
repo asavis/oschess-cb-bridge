@@ -16,7 +16,9 @@
 //!
 //! A search ends at its `depth`, `movetime`, `nodes` (1000 a depth) or `mate`
 //! (the first line then scores that mate, found at that depth), whichever
-//! comes first. With `searchmoves`, line k starts with the k-th of them.
+//! comes first; with `c2c3` among the moves there is no mate to find, and a
+//! mate search goes on like an unlimited one. With `searchmoves`, line k
+//! starts with the k-th of them.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
@@ -98,7 +100,7 @@ fn main() {
             s.depth += 1;
             let depth = s.depth;
             let nodes = u64::from(depth) * 1000;
-            let found = s.mate.filter(|&m| depth >= m);
+            let found = s.mate.filter(|&m| depth >= m && !position.contains(" c2c3"));
             for k in 1..=multipv {
                 let first =
                     s.searchmoves.get((k as usize - 1) % s.searchmoves.len().max(1)).map_or("e2e4", String::as_str);
