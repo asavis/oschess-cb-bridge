@@ -308,6 +308,15 @@ fn refuses_bad_input_and_a_missing_engine() {
         ("threads=x", "threads"),
         ("hash=15", "hash"),
         ("hash=99999999", "hash"),
+        ("nodes=0", "nodes"),
+        ("nodes=x", "nodes"),
+        ("mate=0", "mate"),
+        ("mate=100", "mate"),
+        ("moves=e2e4&searchmoves=e2e4", "searchmoves"),
+        ("searchmoves=e2e4%0Aquit", "searchmoves"),
+        ("newgame=2", "newgame"),
+        ("searchmoves=", "searchmoves"),
+        ("searchmoves=+++", "searchmoves"),
     ] {
         let a = Analysis::open(port, query);
         assert_eq!(a.status, 400, "{query}");
@@ -320,13 +329,68 @@ fn refuses_bad_input_and_a_missing_engine() {
     assert!(a.body().contains(r#""code":"no_engine""#));
 }
 
+/// The `seldepth` of the deepest line: how many `ucinewgame` the fake engine heard, in hundreds.
+fn new_games_of(lines: &[String]) -> u64 {
+    let line = lines.iter().rev().find(|l| l.contains(r#""seldepth":"#)).expect("an info line");
+    line.split(r#""seldepth":"#).nth(1).unwrap().split(',').next().unwrap().parse::<u64>().unwrap() / 100
+}
+
+#[test]
+fn a_narrowed_search_is_acknowledged_and_reaches_the_engine() {
+    let (port, _bridge) = start(Engine::new(fake()));
+    let mut a = Analysis::open(port, "moves=e2e4&multipv=2&depth=6&nodes=3000&searchmoves=e7e5+c7c5&stream=tab1");
+    assert_eq!(a.status, 200);
+    let lines = a.rest();
+    assert_eq!(lines[0], r#"{"search":{"nodes":3000,"searchmoves":["e7e5","c7c5"]}}"#, "{lines:?}");
+    // The node limit ends the search before its depth, with the moves searched.
+    assert_eq!(lines.last().unwrap(), r#"{"bestmove":"e7e5"}"#, "{lines:?}");
+    for (k, first) in [(1, "e7e5"), (2, "c7c5")] {
+        let deepest = format!(r#""info":{{"depth":3,"seldepth":5,"multipv":{k},"score":{{"cp":{}}}}}"#, 10 * k);
+        assert!(
+            lines.iter().any(|l| has_members(l, &deepest) && l.contains(&format!(r#""pv":["{first}""#))),
+            "{k}: {lines:?}"
+        );
+    }
+    assert!(lines.iter().all(|l| !l.contains(r#""depth":4,"#)), "{lines:?}");
+    // A mate search ends by itself, with no depth or time.
+    let lines = Analysis::open(port, "mate=4&stream=tab1").rest();
+    assert_eq!(lines[0], r#"{"search":{"mate":4}}"#);
+    assert!(lines.iter().any(|l| l.contains(r#""depth":4,"#) && l.contains(r#""score":{"mate":4}"#)), "{lines:?}");
+    assert_eq!(lines.last().unwrap(), BEST);
+    // A mate search that finds no mate ends at its other limit, and without one
+    // it goes on like an unlimited search until the client leaves.
+    let lines = Analysis::open(port, "moves=c2c3&mate=2&nodes=5000&stream=tab1").rest();
+    assert_eq!(lines[0], r#"{"search":{"nodes":5000,"mate":2}}"#);
+    assert_eq!(lines.last().unwrap(), BEST);
+    assert!(lines.iter().all(|l| !l.contains(r#""mate":2}"#) || l.starts_with(r#"{"search":"#)), "{lines:?}");
+    let mut endless = Analysis::open(port, "moves=c2c3&mate=2&stream=tab1");
+    assert!(endless.rest_within(Duration::from_secs(1)).is_none(), "no mate, no bound");
+    drop(endless);
+    // Without a narrowing parameter nothing is acknowledged.
+    let lines = Analysis::open(port, "depth=2&stream=tab1").rest();
+    assert!(lines[0].starts_with(r#"{"info":"#), "{lines:?}");
+    assert_eq!(new_games_of(&lines), 0);
+}
+
+#[test]
+fn a_new_game_is_announced_only_when_asked() {
+    let (port, _bridge) = start(Engine::new(fake()));
+    let search = |extra: &str| new_games_of(&Analysis::open(port, &format!("depth=2&stream=tab1{extra}")).rest());
+    assert_eq!(search("&newgame=1"), 1);
+    assert_eq!(search(""), 1, "a search without it keeps the table");
+    assert_eq!(search("&newgame=0"), 1);
+    assert_eq!(search("&newgame=1"), 2);
+    let lines = Analysis::open(port, "depth=1&newgame=1&stream=tab1").rest();
+    assert_eq!(lines[0], r#"{"search":{"newgame":true}}"#, "{lines:?}");
+}
+
 #[test]
 fn the_status_names_the_engine() {
     let (port, _bridge) = start(Engine::new(fake()));
     let (_, status) = get(port, "/v1/status");
     let limits = bridge::engine::limits();
     let engine = format!(
-        r#""engine":{{"name":"fake-uci","threads":{{"default":1,"max":{}}},"hash":{{"default":16,"max":{}}}}}"#,
+        r#""engine":{{"name":"fake-uci","threads":{{"default":1,"max":{}}},"hash":{{"default":16,"max":{}}},"search":["nodes","mate","searchmoves","newgame"]}}"#,
         limits.max_threads, limits.max_hash_mb
     );
     assert!(has_members(&status, &engine), "{status}");
@@ -367,6 +431,35 @@ fn a_real_engine_analyses() {
     drop(b);
     let mut c = Analysis::open(port, "depth=8&stream=real");
     assert!(c.rest().last().unwrap().starts_with(r#"{"bestmove":""#));
+    // A mate search over the moves asked for, on a fresh table (#336).
+    let lines = Analysis::open(
+        port,
+        "fen=6k1%2F5ppp%2F8%2F8%2F8%2F8%2F5PPP%2FR5K1+w+-+-+0+1&mate=1&searchmoves=a1a8&newgame=1&stream=real",
+    )
+    .rest();
+    assert_eq!(lines[0], r#"{"search":{"mate":1,"searchmoves":["a1a8"],"newgame":true}}"#, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains(r#""score":{"mate":1}"#) && l.contains(r#""pv":["a1a8""#)), "{lines:?}");
+    assert_eq!(lines.last().unwrap(), r#"{"bestmove":"a1a8"}"#);
+    // A mate search with no mate to find ends at its node limit.
+    let lines = Analysis::open(port, "mate=1&nodes=20000&stream=real").rest();
+    assert!(lines.last().unwrap().starts_with(r#"{"bestmove":""#), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains(r#""score":{"mate":"#)), "{lines:?}");
+    // The moves searched are the only ones the lines start with.
+    let lines = Analysis::open(port, "multipv=2&depth=8&searchmoves=a2a3+h2h3&stream=real").rest();
+    assert!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with(r#"{"info":"#))
+            .all(|l| l.contains(r#""pv":["a2a3""#) || l.contains(r#""pv":["h2h3""#)),
+        "{lines:?}"
+    );
+    // A node limit ends a search long before a depth it could not reach in time.
+    let started = Instant::now();
+    let lines = Analysis::open(port, "depth=60&nodes=50000&stream=real").rest();
+    assert!(
+        lines.last().unwrap().starts_with(r#"{"bestmove":""#) && started.elapsed() < Duration::from_secs(20),
+        "{lines:?}"
+    );
     // A decided position keeps its score, with no moves to give.
     for (fen, score) in [
         ("7k%2F6Q1%2F5K2%2F8%2F8%2F8%2F8%2F8+b+-+-+0+1", r#""score":{"mate":0}"#),

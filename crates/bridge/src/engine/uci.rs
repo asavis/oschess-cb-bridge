@@ -162,6 +162,10 @@ impl Process {
             setup.push(format!("setoption name MultiPV value {multipv}"));
         }
         if let Some(search) = search {
+            // A new game clears the table before its first position (#336).
+            if search.newgame {
+                setup.push("ucinewgame".into());
+            }
             setup.push(format!("position {}", search.position));
         }
         setup.push("isready".into());
