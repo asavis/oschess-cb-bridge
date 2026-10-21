@@ -259,10 +259,14 @@ impl Process {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// How the engine's process ended when its output has closed, waiting a
-    /// moment for it to exit; `still running` at once while its output is
-    /// open, so that a program that only does not speak UCI costs no wait.
+    /// How the engine's process ended: its status when it has exited, even
+    /// with its output held open by a program it started; when its output has
+    /// closed, after a moment's wait for it to exit; else `still running` at
+    /// once, so that a program that only does not speak UCI costs no wait.
     fn how_ended(&mut self) -> String {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return status.to_string();
+        }
         loop {
             match self.lines.try_recv() {
                 Ok(_) => {}

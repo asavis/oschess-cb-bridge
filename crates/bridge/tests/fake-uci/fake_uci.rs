@@ -11,7 +11,9 @@
 //! long as they can be written.
 //! Started under a name containing `silent`, it answers `uci` with nothing,
 //! and waits until its input ends. Started under a name containing `unready`,
-//! it exits with 46 when it is asked whether it is ready.
+//! it exits with 46 when it is asked whether it is ready; under one containing
+//! `forking`, it then first starts a copy of itself that holds its output open
+//! for 3 s, and exits with 44.
 //!
 //! Its `nps` tells what it was set to (#58): `Threads` × 10⁹ + `Hash` × 10³ +
 //! how many `Threads` and `Hash` options it has been sent. Its `seldepth` is
@@ -28,6 +30,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn main() {
+    // The copy a `forking` engine starts: it only holds the output it inherited.
+    if std::env::args().nth(1).as_deref() == Some("--hold") {
+        std::thread::sleep(Duration::from_secs(3));
+        return;
+    }
     let (tx, commands) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
@@ -63,6 +70,11 @@ fn main() {
                         say("uciok");
                     }
                     ["isready"] => {
+                        if std::env::args().next().is_some_and(|name| name.contains("forking")) {
+                            let me = std::env::current_exe().unwrap();
+                            let _holder = std::process::Command::new(me).arg("--hold").spawn();
+                            std::process::exit(44);
+                        }
                         if std::env::args().next().is_some_and(|name| name.contains("unready")) {
                             std::process::exit(46);
                         }

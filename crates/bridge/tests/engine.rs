@@ -270,6 +270,17 @@ fn an_engine_that_exits_before_it_is_ready_is_reported_with_its_status() {
     assert_eq!(raised.len(), 1, "{raised:?}");
     let expected = format!("the engine {name} did not start as an engine: The engine did not get ready (exit");
     assert!(raised[0].starts_with(&expected) && raised[0].ends_with("46)"), "{raised:?}");
+
+    // The same with a program it started that holds its output open.
+    let name = format!("forking-{id}");
+    let engine = Engine::new(EngineConfig::new(fake_copy(&dir, &name), Some(1), Some(16)));
+    let (port, _bridge) = start(engine);
+    assert_eq!(warm(port, "threads=1&hash=16").0, 502);
+    let raised: Vec<String> = faults().into_iter().filter(|f| f.contains(&name)).collect();
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(raised[0].ends_with("44)"), "{raised:?}");
+    // The copy that held the output ends by itself.
+    std::thread::sleep(Duration::from_secs(3));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

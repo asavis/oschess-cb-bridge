@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -183,6 +183,12 @@ fn context(reporter: &Reporter) -> Context {
     let shared = shared(&reporter.app);
     let mut private: Vec<String> = shared.view().databases.into_iter().map(|d| d.name).collect();
     private.extend(shared.pairing().ok().map(|p| p.code));
+    context_with(&reporter.data, shared.strings.lang().code(), reporter.started.elapsed(), private)
+}
+
+/// The context of a report from the data folder `data`, with the app's
+/// `language`, its `uptime` and the `private` words the app knows.
+fn context_with(data: &Path, language: &'static str, uptime: Duration, mut private: Vec<String>) -> Context {
     private.extend(["USERNAME", "COMPUTERNAME"].into_iter().filter_map(|name| std::env::var(name).ok()));
     let channel = if channel().is_store() { "store" } else { "direct" };
     Context {
@@ -191,11 +197,48 @@ fn context(reporter: &Reporter) -> Context {
         environment: if cfg!(debug_assertions) { reports::DEVELOPMENT } else { channel },
         windows: system::windows_version(),
         webview2: tauri::webview_version().unwrap_or_else(|_| "unknown".to_string()),
-        language: shared.strings.lang().code(),
-        uptime: reporter.started.elapsed(),
-        log: reports::log_tail(&reporter.data.join(bridge::log::FILE_NAME)),
+        language,
+        uptime,
+        log: reports::log_tail(&data.join(bridge::log::FILE_NAME)),
         private,
     }
+}
+
+/// Files `report` as the app ends because it could not start, and tries once
+/// to send what waits (#342): no sender runs after the exit, and an app that
+/// keeps failing to start would never send it later. With the reports
+/// started, their context; before, one made from the data folder alone.
+pub fn file_at_exit(report: Report) {
+    let Ok(data) = bridge::start::data_dir() else { return };
+    file_at_exit_in(&data, report, &Curl);
+}
+
+fn file_at_exit_in(data: &Path, report: Report, transport: &dyn Transport) {
+    let Some(dsn) = Dsn::parse(reports::DSN) else { return };
+    if !crate::prefs::load(data).send_reports {
+        return;
+    }
+    let context = match REPORTER.get() {
+        Some(reporter) => context(reporter),
+        None => {
+            let language = crate::prefs::load(data).language(system::display_language()).code();
+            context_with(data, language, Duration::ZERO, Vec::new())
+        }
+    };
+    let mut id = [0u8; 16];
+    if let Err(e) = getrandom::fill(&mut id) {
+        bridge::log!("report: no randomness for its id: {e}");
+        return;
+    }
+    let now = SystemTime::now();
+    let event = reports::event(&report, &context, id, now);
+    let outbox = Outbox::in_data(data);
+    if let Err(e) = outbox.put(&event, now) {
+        bridge::log!("report: it cannot be filed: {e}");
+        return;
+    }
+    bridge::log!("report {} filed: {}", event.code, report.kind.tag());
+    reports::deliver(&outbox, &dsn, env!("CARGO_PKG_VERSION"), transport, &|| true);
 }
 
 /// Posts what waits, then sleeps until a report is filed, or until the next
@@ -267,5 +310,74 @@ pub fn by_hand(app: &AppHandle) {
     });
     if let Err(e) = spawned {
         bridge::log!("report: no thread for a report by hand: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    /// Answers each post with `answer` and keeps what was posted.
+    struct Fake {
+        answer: Result<u16, String>,
+        posted: RefCell<Vec<String>>,
+    }
+
+    impl Transport for Fake {
+        fn post(&self, _url: &str, _headers: &[String], body: &Path) -> Result<u16, String> {
+            self.posted.borrow_mut().push(std::fs::read_to_string(body).unwrap());
+            self.answer.clone()
+        }
+    }
+
+    fn folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bridge-report-at-exit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn failure() -> Report {
+        Report {
+            kind: Kind::Error,
+            message: "the app cannot start: no tray".into(),
+            tags: vec![],
+            fingerprint: "x:1".into(),
+        }
+    }
+
+    /// A start that fails files its report and sends it before the exit; one
+    /// that cannot go waits in the outbox for a later start; none is filed
+    /// with the reports turned off (#342).
+    #[test]
+    fn a_failed_start_is_filed_and_sent_before_the_exit() {
+        let dir = folder("sent");
+        let fake = Fake { answer: Ok(200), posted: RefCell::default() };
+        file_at_exit_in(&dir, failure(), &fake);
+        let posted = fake.posted.borrow();
+        assert_eq!(posted.len(), 1);
+        assert!(
+            posted[0].contains("the app cannot start: no tray") && posted[0].contains(r#""kind":"error""#),
+            "{}",
+            posted[0]
+        );
+        assert!(Outbox::in_data(&dir).waiting().is_empty(), "sent, it is gone");
+
+        let dir = folder("waits");
+        let offline = Fake { answer: Err("no answer".into()), posted: RefCell::default() };
+        file_at_exit_in(&dir, failure(), &offline);
+        assert_eq!(Outbox::in_data(&dir).waiting().len(), 1, "it waits for the next start");
+
+        let dir = folder("off");
+        let prefs = crate::prefs::Prefs { send_reports: false, ..Default::default() };
+        crate::prefs::save(&dir, &prefs).unwrap();
+        let unused = Fake { answer: Ok(200), posted: RefCell::default() };
+        file_at_exit_in(&dir, failure(), &unused);
+        assert!(unused.posted.borrow().is_empty() && Outbox::in_data(&dir).waiting().is_empty());
+        for name in ["sent", "waits", "off"] {
+            let _ = std::fs::remove_dir_all(folder(name));
+        }
     }
 }
