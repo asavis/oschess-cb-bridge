@@ -290,7 +290,11 @@ pub fn install(
         return Ok(build.installed(data));
     }
     let engines = data.join("engines");
-    std::fs::create_dir_all(&engines).map_err(|e| format!("{}: {e}", engines.display()))?;
+    std::fs::create_dir_all(&engines).map_err(|e| {
+        // The bridge's own folder, before any download: no network failure (#342).
+        crate::fault!("the engines folder cannot be made: {e}");
+        format!("{}: {e}", engines.display())
+    })?;
     let zip = engines.join(format!(".download-{}", build.asset));
     let staging = engines.join(format!(".unpack-stockfish-{}", build.version));
     let clean = || {
@@ -585,6 +589,22 @@ mod tests {
         for bad in ["", "19/../..", "../19", r"19\..", "/19", "19 ", "dev", "19.", ".19", "1..9"] {
             assert_eq!(licence(&dir, bad), None, "{bad:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An engines folder that cannot be made is the bridge's own failure,
+    /// reported before anything is downloaded (#342).
+    #[test]
+    fn an_engines_folder_that_cannot_be_made_is_reported() {
+        let dir = data("no-folder");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("engines"), b"a file where the folder goes").unwrap();
+        crate::log::testing::faults();
+        let transport = fake(b"hello world");
+        let error = install(&dir, &TEST_BUILD, &transport, &mut |_| {}).unwrap_err();
+        assert!(transport.asked.lock().unwrap().is_empty(), "nothing is downloaded: {error}");
+        let raised = crate::log::testing::faults();
+        assert!(raised.iter().any(|f| f.2.starts_with("the engines folder cannot be made: ")), "{raised:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

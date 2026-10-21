@@ -304,7 +304,8 @@ impl MaskBuilds {
                     }
                 };
             });
-        if spawned.is_err() {
+        if let Err(e) = spawned {
+            crate::fault!("the masks of database {id} are not built: no thread: {e}");
             let why = "the masks thread could not start".to_string();
             let failed = MaskState::Failed { at: Instant::now(), why, again: true };
             slots.insert(id.to_string(), MaskSlot { build_id, state: failed });

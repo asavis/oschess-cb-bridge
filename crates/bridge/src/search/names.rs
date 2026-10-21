@@ -403,7 +403,7 @@ impl NameTable {
         // the start and the write (#236); dropped with the thread's work when
         // it cannot start.
         let active = activity.map(|a| a.begin("names"));
-        let _ =
+        let spawned =
             std::thread::Builder::new().name("bridge-names".into()).stack_size(crate::THREAD_STACK).spawn(move || {
                 let _active = active;
                 if let Err(e) = table.write_file(&path, kind, generation) {
@@ -412,6 +412,9 @@ impl NameTable {
                     crate::fault!("writing a names file of database {id} failed: {e}");
                 }
             });
+        if let Err(e) = spawned {
+            crate::fault!("a names file is not written: no thread: {e}");
+        }
     }
 
     /// Writes the table as the names file `path` of `kind` at `generation`:

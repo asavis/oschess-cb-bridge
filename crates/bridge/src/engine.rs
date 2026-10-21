@@ -418,14 +418,18 @@ impl Engine {
         let engine = Engine { shared: Arc::new(shared) };
         engine.current();
         let watched = Arc::downgrade(&engine.shared);
-        let _ = std::thread::Builder::new().name("bridge-engine-config".into()).stack_size(crate::THREAD_STACK).spawn(
-            move || {
+        let watching = std::thread::Builder::new()
+            .name("bridge-engine-config".into())
+            .stack_size(crate::THREAD_STACK)
+            .spawn(move || {
                 while let Some(shared) = watched.upgrade() {
                     Engine { shared }.current();
                     std::thread::sleep(poll);
                 }
-            },
-        );
+            });
+        if let Err(e) = watching {
+            crate::fault!("the engine's settings are not watched: no thread: {e}");
+        }
         engine
     }
 
@@ -583,15 +587,19 @@ impl Inner {
         });
         let reaper = Arc::downgrade(&inner);
         let every = (idle / 4).clamp(Duration::from_millis(20), Duration::from_secs(30));
-        let _ = std::thread::Builder::new().name("bridge-engine-idle".into()).stack_size(crate::THREAD_STACK).spawn(
-            move || {
+        let reaping = std::thread::Builder::new()
+            .name("bridge-engine-idle".into())
+            .stack_size(crate::THREAD_STACK)
+            .spawn(move || {
                 while let Some(inner) = reaper.upgrade() {
                     inner.end_if_idle();
                     drop(inner);
                     std::thread::sleep(every);
                 }
-            },
-        );
+            });
+        if let Err(e) = reaping {
+            crate::fault!("an idle engine is not ended: no thread: {e}");
+        }
         inner
     }
 
@@ -609,8 +617,8 @@ impl Inner {
             Some(p) => Ok(p),
             None => {
                 // The chosen engine answered as one when it was chosen: not now is a failure (#342).
-                let p = Process::start(&self.config, handshake).map_err(|NotStarted { why, ran }| {
-                    if ran {
+                let p = Process::start(&self.config, handshake).map_err(|NotStarted { why, reported }| {
+                    if !reported {
                         crate::fault!(
                             "the engine {} did not start as an engine: {why}",
                             file_stem(&self.config.program)

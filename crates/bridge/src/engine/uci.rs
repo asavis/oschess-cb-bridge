@@ -49,19 +49,19 @@ fn spawn(command: &mut Command) -> io::Result<Child> {
     }
 }
 
-/// Why an engine did not start: what the caller is told, and whether its
-/// program ran at all. A program that did not run is reported at once (#342),
-/// whoever started it; one that ran and did not answer as an engine is
-/// reported by the caller that expected an engine.
+/// Why an engine did not start: what the caller is told, and whether it was
+/// reported already (#342). A program that did not run, or whose output no
+/// thread could read, is reported at once, whoever started it; one that ran
+/// and did not answer as an engine is left to the caller that expected one.
 #[derive(Debug)]
 pub(super) struct NotStarted {
     pub(super) why: String,
-    pub(super) ran: bool,
+    pub(super) reported: bool,
 }
 
 impl NotStarted {
     fn no_answer(why: &str) -> NotStarted {
-        NotStarted { why: why.into(), ran: true }
+        NotStarted { why: why.into(), reported: false }
     }
 }
 
@@ -103,7 +103,7 @@ impl Process {
         let mut child = spawn(&mut command).map_err(|e| {
             // Windows' answer says why, such as an Application Control policy (os error 4551).
             crate::fault!("the engine {} did not start: {e}", file_stem(&config.program));
-            NotStarted { why: format!("The engine {} did not start: {e}", config.program.display()), ran: false }
+            NotStarted { why: format!("The engine {} did not start: {e}", config.program.display()), reported: true }
         })?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
@@ -111,10 +111,16 @@ impl Process {
             return Err(NotStarted::no_answer("The engine's input and output are not available"));
         };
         let (tx, lines) = mpsc::sync_channel(QUEUED_LINES);
-        let _ = std::thread::Builder::new()
+        let reading = std::thread::Builder::new()
             .name("bridge-engine-out".into())
             .stack_size(crate::THREAD_STACK)
             .spawn(move || forward_lines(stdout, &tx));
+        if let Err(e) = reading {
+            let _ = child.kill();
+            let _ = child.wait();
+            crate::fault!("the output of the engine {} cannot be read: no thread: {e}", file_stem(&config.program));
+            return Err(NotStarted { why: format!("The engine's output cannot be read: {e}"), reported: true });
+        }
         let mut p = Process {
             child,
             stdin,

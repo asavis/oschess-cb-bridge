@@ -115,7 +115,9 @@ fn accept(
                 }
             });
         // A failed spawn drops the closure, and with it the guard and the stream.
-        drop(spawned);
+        if let Err(e) = spawned {
+            crate::fault!("a connection is not served: no thread: {e}");
+        }
     }
 }
 
