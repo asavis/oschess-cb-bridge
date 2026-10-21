@@ -337,6 +337,8 @@ computer, what it connects to depends on where you got it:
   has an update for it, and updates through the Store. Windows makes these
   requests as it does for any app installed from the Store; the bridge adds
   nothing about you or your databases to them.
+- The copy from the Microsoft Store carries the pinned Stockfish inside its package,
+  so it needs no download for that build.
 - Either copy downloads the official Stockfish build from Stockfish's GitHub
   releases when you ask for it in the settings or the first-run wizard: it
   asks GitHub's API which release is the newest, and downloads that one's
@@ -378,6 +380,12 @@ from this code must release it under the same licence, with its source, and a
 modified version that people use over a network, as a service, must offer them
 its source too. Releases up to and including v1.0.3 were published under the
 MIT licence, and those releases keep it.
+
+The Microsoft Store package also ships the official Stockfish
+(`GPL-3.0-or-later`) as a separate program that the bridge starts and talks to
+over UCI. Its licence, `Copying.txt`, and a `NOTICE.txt` with the offer of its
+source sit beside it in the package, and each release carries the matching
+source as `stockfish-sf_<version>-source.tar.gz`.
 
 The oschess name and logo, in `crates/app/icons` and `crates/app/ui/img`, are
 not covered by the AGPL-3.0 licence; see

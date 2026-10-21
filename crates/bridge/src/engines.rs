@@ -34,6 +34,9 @@ pub struct Roots {
     pub app_data: Option<PathBuf>,
     pub program_files: Vec<PathBuf>,
     pub bridge_data: Option<PathBuf>,
+    /// The folder holding the `engines` the Store package ships beside the
+    /// app (#338): signed with the package, so Smart App Control lets it run.
+    pub bundled: Option<PathBuf>,
 }
 
 impl Roots {
@@ -46,8 +49,15 @@ impl Roots {
         let mut program_files: Vec<PathBuf> =
             ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().filter_map(|n| var(n)).collect();
         program_files.dedup();
-        Roots { app_data: var("APPDATA"), program_files, bridge_data: None }
+        Roots { app_data: var("APPDATA"), program_files, bridge_data: None, bundled: bundled_root() }
     }
+}
+
+/// The folder of the running app when it holds the `engines` folder of a
+/// package; none for a copy that ships no engine.
+pub fn bundled_root() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    dir.join("engines").is_dir().then_some(dir)
 }
 
 /// The source of an engine the bridge installed itself.
@@ -69,14 +79,21 @@ pub fn find(roots: &Roots) -> Vec<Found> {
             found.push(f);
         }
     };
-    // The builds the bridge installed first, each in engines\stockfish-<version>.
-    if let Some(data) = &roots.bridge_data {
-        for folder in folders(&data.join("engines")) {
+    // The builds the bridge ships or installed first, each in
+    // engines\stockfish-<version>: the package's, which is signed, before the
+    // data folder's of the same version.
+    let mut versions: Vec<String> = Vec::new();
+    for base in roots.bundled.iter().chain(&roots.bridge_data) {
+        for folder in folders(&base.join("engines")) {
             let Some(version) = folder.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("stockfish-"))
             else {
                 continue;
             };
+            if versions.iter().any(|v| v == version) {
+                continue;
+            }
             for path in files(&folder).into_iter().filter(|p| is_stockfish(p)) {
+                versions.push(version.into());
                 add(Found {
                     name: format!("Stockfish {version}"),
                     path,
@@ -248,7 +265,8 @@ mod tests {
         t.file("AppData/ChessBase/Engines.UCI/Inactive/Old.uci", uci("Old", &sf16).as_bytes());
         t.file("AppData/ChessBase/Engines.UCI/Empty.uci", b"[ENGINE]\r\nName=Empty\r\n");
         t.file("AppData/ChessBase/Engines.UCI/Gone.uci", uci("Gone", &t.0.join("missing.exe")).as_bytes());
-        let roots = Roots { app_data: Some(t.0.join("AppData")), program_files: vec![pf], bridge_data: None };
+        let roots =
+            Roots { app_data: Some(t.0.join("AppData")), program_files: vec![pf], bridge_data: None, bundled: None };
         let found = find(&roots);
         let names: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.source)).collect();
         assert_eq!(
@@ -265,13 +283,38 @@ mod tests {
         t.file("data/engines/stockfish-19/Copying.txt", b"GPL");
         t.file("data/engines/.unpack-stockfish-20/stockfish/stockfish.exe", b"MZ");
         t.file("PF/ChessBase/Engines/Stockfish 16/stockfish.exe", b"MZ");
-        let roots = Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: Some(t.0.join("data")) };
+        let roots = Roots {
+            app_data: None,
+            program_files: vec![t.0.join("PF")],
+            bridge_data: Some(t.0.join("data")),
+            bundled: None,
+        };
         let found = find(&roots);
         let names: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.source)).collect();
         assert_eq!(names, [("Stockfish 19", BRIDGE), ("Stockfish 16", "ChessBase")]);
         assert_eq!(found[0].path, installed);
         let versions: Vec<Option<&str>> = found.iter().map(|f| f.version.as_deref()).collect();
         assert_eq!(versions, [Some("19"), None], "only a build the bridge installed has a version");
+    }
+
+    /// The build the Store package ships (#338) is listed as the bridge's own,
+    /// with the version that finds its licence beside the app; a copy of the
+    /// same version in the data folder is not listed twice.
+    #[test]
+    fn lists_the_build_the_package_ships_once() {
+        use crate::stockfish;
+        let t = Tree::new("bundled");
+        let shipped = t.file("app/engines/stockfish-19/stockfish-windows-x86-64-universal.exe", b"MZ");
+        t.file("app/engines/stockfish-19/Copying.txt", b"GPL");
+        t.file("data/engines/stockfish-19/stockfish-windows-x86-64-universal.exe", b"MZ");
+        t.file("data/engines/stockfish-20/stockfish-windows-x86-64-universal.exe", b"MZ");
+        let roots = Roots { bridge_data: Some(t.0.join("data")), bundled: Some(t.0.join("app")), ..Roots::default() };
+        let found = find(&roots);
+        let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["Stockfish 19", "Stockfish 20"]);
+        assert_eq!(found[0].path, shipped);
+        let licence = stockfish::licence(&t.0.join("app"), "19").expect("a Stockfish version");
+        assert!(licence.is_file());
     }
 
     /// A build laid out as `stockfish::install` lays it out is listed with the
@@ -301,16 +344,19 @@ mod tests {
         let t = Tree::new("names");
         t.file("PF/ChessBase/Engines/Stockfish 16/sf.exe", b"MZ");
         t.file("PF/ChessBase/Engines/Fritz 20 Engines/stockfish-fritz.exe", b"MZ");
-        let found = find(&Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: None });
+        let found =
+            find(&Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: None, bundled: None });
         let names: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.source)).collect();
         assert_eq!(names, [("stockfish-fritz", "Fritz")]);
-        let found = find(&Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: None });
+        let found =
+            find(&Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: None, bundled: None });
         assert!(
             found.iter().all(|f| f.path.file_name().unwrap() != "sf.exe"),
             "only files named stockfish are guessed"
         );
         t.file("PF/ChessBase/Engines/Stockfish 16/stockfish.exe", b"MZ");
-        let found = find(&Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: None });
+        let found =
+            find(&Roots { app_data: None, program_files: vec![t.0.join("PF")], bridge_data: None, bundled: None });
         assert!(found.iter().any(|f| f.name == "Stockfish 16"));
     }
 

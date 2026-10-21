@@ -132,6 +132,54 @@ class Packing(unittest.TestCase):
         self.assertEqual(new[new.index("/of") + 1], os.path.join(folder, "resources.pri"))
         self.assertEqual(pack[pack.index("/d") + 1], folder)
 
+    def stockfish_zip(self, pin, members=None):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work)
+        path = os.path.join(work, pin["asset"])
+        with msix.zipfile.ZipFile(path, "w") as z:
+            for name, data in (members or {pin["exe"]: b"MZ", "Copying.txt": b"GPL"}).items():
+                z.writestr(f"stockfish/{name}", data)
+        return path
+
+    REAL_PIN = staticmethod(msix.pinned_stockfish)
+
+    def pinned_to(self, path):
+        pin = dict(self.REAL_PIN())
+        with open(path, "rb") as f:
+            pin["size"], pin["sha256"] = os.path.getsize(path), msix.hashlib.sha256(f.read()).hexdigest()
+        return pin
+
+    def test_the_pin_is_read_from_the_apps_own_pinned_build(self):
+        pin = msix.pinned_stockfish()
+        self.assertRegex(pin["version"], r"^\d+(\.\d+)*$")
+        self.assertEqual(pin["exe"], "stockfish-windows-x86-64-universal.exe")
+        self.assertEqual(len(pin["sha256"]), 64)
+
+    def test_ships_the_pinned_stockfish_with_its_licence_and_source_offer(self):
+        pin = msix.pinned_stockfish()
+        archive = self.stockfish_zip(pin)
+        with mock.patch.object(msix, "pinned_stockfish", lambda: self.pinned_to(archive)):
+            _, folder = self.pack("--stockfish", archive)
+        target = os.path.join(folder, "engines", f"stockfish-{pin['version']}")
+        self.assertEqual(sorted(os.listdir(target)), sorted([pin["exe"], "Copying.txt", "NOTICE.txt"]))
+        with open(os.path.join(target, "NOTICE.txt"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(f"stockfish-sf_{pin['version']}-source.tar.gz", text)
+        self.assertIn("General Public License", text)
+
+    def test_refuses_an_archive_that_is_not_the_pinned_one(self):
+        pin = msix.pinned_stockfish()
+        archive = self.stockfish_zip(pin)
+        with self.assertRaises(SystemExit):
+            self.pack("--stockfish", archive)
+
+    def test_refuses_an_archive_without_the_licence(self):
+        pin = msix.pinned_stockfish()
+        archive = self.stockfish_zip(pin, {pin["exe"]: b"MZ"})
+        with mock.patch.object(msix, "pinned_stockfish", lambda: self.pinned_to(archive)):
+            with self.assertRaises(SystemExit):
+                self.pack("--stockfish", archive)
+
     def test_a_staged_folder_is_indexed_too(self):
         ran, _ = self.pack("--stage-only")
         self.assertEqual([command[:2] for command in ran], [["makepri", "createconfig"], ["makepri", "new"]])

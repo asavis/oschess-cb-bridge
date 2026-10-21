@@ -8,8 +8,11 @@ oschess-bridge.exe, which the Tauri CLI renames, or a cargo build's
 target/release/oschess-bridge-app.exe, never the console bridge that cargo
 names oschess-bridge.exe. With it go the manifest
 crates/app/msix/AppxManifest.xml with its values filled in, and the images in
-crates/app/icons/msix as Assets. It carries no engine: as the installed app,
-the Store's copy installs Stockfish only when the user asks (#13).
+crates/app/icons/msix as Assets. With --stockfish, the official Stockfish
+archive the release downloaded, it also carries the pinned x64 Stockfish under
+engines\\stockfish-<version> with its licence and a notice (#338): the Store signs
+the whole package, so Smart App Control lets the engine run, which it does not
+for the unsigned download the installed app would fetch on request (#13).
 
 The identity comes from the variables MSSTORE_IDENTITY_NAME, MSSTORE_PUBLISHER
 and MSSTORE_PUBLISHER_DISPLAY_NAME, the values Partner Center shows on the
@@ -30,12 +33,14 @@ come from --makeappx and --makepri or from the newest Windows SDK;
 
 import argparse
 import glob
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tomllib
+import zipfile
 from typing import NoReturn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -106,6 +111,62 @@ def identity():
     return given
 
 
+def pinned_stockfish(root=ROOT):
+    """The x64 build crates/bridge/src/stockfish.rs pins: its version, release
+    asset, size, SHA-256 and executable name. One pin serves the download the
+    app offers and the build the package ships."""
+    text = read(os.path.join(root, "crates", "bridge", "src", "stockfish.rs"))
+    found = re.search(
+        r'version: Cow::Borrowed\("([^"]+)"\),\s*arch: Arch::X86_64,\s*asset: "([^"]+)",\s*size: ([\d_]+),\s*'
+        r'sha256: Cow::Borrowed\("([0-9a-f]{64})"\),\s*exe: "([^"]+)"',
+        text,
+    )
+    if not found:
+        fail("stockfish.rs pins no x86-64 build in the shape msix.py reads")
+    version, asset, size, sha256, exe = found.groups()
+    return {"version": version, "asset": asset, "size": int(size.replace("_", "")), "sha256": sha256, "exe": exe}
+
+
+def notice(pin, bridge_version):
+    return (
+        f"Stockfish {pin['version']} is part of this package.\r\n\r\n"
+        "Stockfish is free software under the GNU General Public License, version 3 or\r\n"
+        "later; its licence is in Copying.txt beside it. The bridge runs it as a separate\r\n"
+        "program and talks to it over the UCI protocol.\r\n\r\n"
+        "Source code: the Stockfish project publishes it at\r\n"
+        f"https://github.com/official-stockfish/Stockfish/tree/sf_{pin['version']}\r\n"
+        "The same source is attached to the release of this version of the bridge,\r\n"
+        f"stockfish-sf_{pin['version']}-source.tar.gz at\r\n"
+        f"https://github.com/asavis/oschess-cb-bridge/releases/tag/v{bridge_version}\r\n"
+        "and for three years after the last release that includes this build, anyone who\r\n"
+        "asks for it there gets the complete source of Stockfish as shipped, at no\r\n"
+        "charge beyond the cost of the copy.\r\n"
+    )
+
+
+def bundle_stockfish(folder, archive, pin, bridge_version):
+    """Puts the pinned Stockfish from the official `archive` under the staged
+    folder: refused unless the archive is the pinned one, byte for byte."""
+    if os.path.getsize(archive) != pin["size"]:
+        fail(f"{archive}: {os.path.getsize(archive)} bytes, the pin says {pin['size']}")
+    with open(archive, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    if digest != pin["sha256"]:
+        fail(f"{archive}: SHA-256 {digest}, the pin says {pin['sha256']}")
+    target = os.path.join(folder, "engines", f"stockfish-{pin['version']}")
+    os.makedirs(target)
+    with zipfile.ZipFile(archive) as z:
+        for name in (pin["exe"], "Copying.txt"):
+            try:
+                data = z.read(f"stockfish/{name}")
+            except KeyError:
+                fail(f"{archive} has no stockfish/{name}")
+            with open(os.path.join(target, name), "wb") as f:
+                f.write(data)
+    with open(os.path.join(target, "NOTICE.txt"), "w", encoding="utf-8", newline="") as f:
+        f.write(notice(pin, bridge_version))
+
+
 def stage(folder, exe, values):
     if os.path.exists(folder):
         shutil.rmtree(folder)
@@ -162,6 +223,10 @@ def main():
         " or a cargo build's oschess-bridge-app.exe",
     )
     parser.add_argument("--out", required=True, help="the .msix to write; its folder also gets the staging folder")
+    parser.add_argument(
+        "--stockfish",
+        help="the official Stockfish archive, the pinned stockfish-windows-x86-64-universal.zip, to ship in the package",
+    )
     parser.add_argument("--makeappx", help="makeappx.exe, instead of the newest Windows SDK's")
     parser.add_argument("--makepri", help="makepri.exe, instead of the newest Windows SDK's")
     parser.add_argument("--stage-only", action="store_true", help="fill and index the staging folder and stop")
@@ -174,6 +239,8 @@ def main():
     values["VERSION"] = package_version(app_version())
     folder = os.path.join(out_dir, "msix-stage")
     stage(folder, args.exe, values)
+    if args.stockfish:
+        bundle_stockfish(folder, args.stockfish, pinned_stockfish(), app_version())
     index(folder, sdk_tool("makepri", args.makepri), out_dir)
     print(f"msix: staged {folder} as {values['NAME']} {values['VERSION']}")
     if args.stage_only:

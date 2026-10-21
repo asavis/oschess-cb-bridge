@@ -185,7 +185,9 @@ pub fn offer_for(data: &Path, chosen: Option<&Path>, found: &[Found], running: &
         return None;
     }
     let dismissed = prefs::load(data).stockfish_offer_dismissed.as_deref() == Some(running);
-    (!stockfish::is_installed(data, newest) && !dismissed).then_some(name)
+    // A build the package ships is in `found` too, with no copy in `data`.
+    let listed = found.iter().any(|f| f.version.as_deref() == Some(&*newest.version));
+    (!listed && !stockfish::is_installed(data, newest) && !dismissed).then_some(name)
 }
 
 /// Whether the first-run wizard recommends installing the `newest` Stockfish
@@ -720,6 +722,22 @@ mod tests {
             offer_for(&dir, Some(&installed_19), &found, "1.2.1", &newer).as_deref(),
             Some(build.exe.trim_end_matches(".exe"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build the Store package ships (#338) is listed with no copy in the
+    /// data folder, and ends the offer of the same version.
+    #[test]
+    fn a_listed_packaged_build_ends_the_offer_without_a_copy_in_the_data_folder() {
+        let dir = folder("offer-bundled");
+        let pinned = pinned();
+        let mut packaged = listed(&format!("Stockfish {}", pinned.version), r"C:\App\engines\stockfish-19\sf.exe");
+        packaged.version = Some(pinned.version.to_string());
+        let found = [listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe")];
+        let chosen = Some(Path::new(r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"));
+        assert!(offer_for(&dir, chosen, &found, "1.2.1", pinned).is_some());
+        let with_packaged = [found[0].clone(), packaged];
+        assert_eq!(offer_for(&dir, chosen, &with_packaged, "1.2.1", pinned), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

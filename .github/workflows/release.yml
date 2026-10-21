@@ -290,12 +290,29 @@ jobs:
           path: exe
       - name: Pack
         # makepri and makeappx from the runner's Windows SDK. Unsigned: the Store signs it.
-        run: python scripts/msix.py --exe exe/oschess-bridge.exe --out dist/oschess-bridge.msix
+        # With the pinned Stockfish inside (#338): the Store signs the package, so
+        # Smart App Control lets the engine run. msix.py checks the archive
+        # against the pin in stockfish.rs.
+        shell: bash
+        run: |
+          version=$(sed -n 's/.*version: Cow::Borrowed("\([0-9.]*\)").*/\1/p' crates/bridge/src/stockfish.rs | head -1)
+          [ -n "$version" ] || { echo "stockfish.rs pins no version"; exit 1; }
+          mkdir -p dist
+          base=https://github.com/official-stockfish/Stockfish
+          curl --fail --location --silent --show-error --output stockfish.zip \
+            "$base/releases/download/sf_$version/stockfish-windows-x86-64-universal.zip"
+          # The source GPL-3.0 asks to accompany the binary, kept with the release
+          # for as long as it ships the build (the notice in the package names it).
+          curl --fail --location --silent --show-error --output "dist/stockfish-sf_$version-source.tar.gz" \
+            "$base/archive/refs/tags/sf_$version.tar.gz"
+          python scripts/msix.py --exe exe/oschess-bridge.exe --stockfish stockfish.zip --out dist/oschess-bridge.msix
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           overwrite: true
           name: msix
-          path: dist/oschess-bridge.msix
+          path: |
+            dist/oschess-bridge.msix
+            dist/stockfish-sf_*-source.tar.gz
           if-no-files-found: error
 
   release:
@@ -392,6 +409,8 @@ jobs:
             if [ -f dist/oschess-bridge.msix ]; then
               echo
               echo "\`oschess-bridge.msix\` is the package for the Microsoft Store, which signs it: it goes to Partner Center and installs only from the Store."
+              echo
+              echo "The package carries the pinned Stockfish (GPL-3.0-or-later); \`stockfish-sf_*-source.tar.gz\` is its source."
             fi
             echo
             echo "| File | SHA-256 |"

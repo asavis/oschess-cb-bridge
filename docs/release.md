@@ -257,12 +257,23 @@ as the installer, and the app tells where it came from by its package identity
 - the data folder is the same, and Windows keeps it for the package, removing
   it on uninstall.
 
-Everything else is the installed app's, the engine included: the package
-carries no Stockfish, as #13 decided, and «Install Stockfish» downloads the
-newest official build a week old (the pinned one when GitHub's API does not
-answer)
-into the data folder on the user's request; «Update Stockfish automatically»
-keeps it up to date (#322).
+Everything else is the installed app's, the engine apart (#338). The package
+carries the pinned x64 Stockfish under `engines\stockfish-<version>` beside the
+app, with its `Copying.txt` and a `NOTICE.txt` that offers the source. Smart
+App Control blocks the unsigned build that the app downloads into the data
+folder, and runs the one inside the package because the Store signs the whole
+package. The engine list shows the packaged build first, as the bridge's own,
+and no install is offered while a build of the newest version is listed.
+«Install Stockfish» still downloads the newest official build a week old (the
+pinned one when GitHub's API does not answer) into the data folder on the
+user's request, and «Update Stockfish automatically» keeps it up to date
+(#322); where Smart App Control is on, such a build stays blocked until a
+bridge release pins it and ships it in the package.
+
+The release attaches the matching Stockfish source,
+`stockfish-sf_<version>-source.tar.gz`, as GPL-3.0 asks of whoever ships the
+binary; `NOTICE.txt` in the package points to it. Keep it attached for as long
+as a release ships that build.
 
 The package is x64 only; ARM64 Windows runs it emulated. It uses the system's
 WebView2, which Windows 11 has, since a package cannot run the WebView2

@@ -243,12 +243,17 @@ pub async fn install_stockfish(app: AppHandle, window: WebviewWindow) -> Answer<
     tauri::async_runtime::spawn_blocking(move || engines_view(&app)).await.map_err(text)?
 }
 
-/// Opens the licence of the Stockfish `version` the bridge installed. Only a
+/// Opens the licence of the Stockfish `version` the bridge installed or ships. Only a
 /// version is taken from the window; the path is the bridge's own.
 #[tauri::command]
 pub async fn open_stockfish_licence(app: AppHandle, version: String) -> Answer<()> {
-    let licence =
-        stockfish::licence(&shared(&app).dir()?, &version).ok_or_else(|| "not a Stockfish version".to_string())?;
+    let not_a_version = || "not a Stockfish version".to_string();
+    let licence = stockfish::licence(&shared(&app).dir()?, &version).ok_or_else(not_a_version)?;
+    // A build the package ships keeps its licence beside the app (#338).
+    let licence = match engines::bundled_root() {
+        Some(base) if !licence.is_file() => stockfish::licence(&base, &version).ok_or_else(not_a_version)?,
+        _ => licence,
+    };
     if !licence.is_file() {
         return Err(format!("{} is missing", licence.display()).into());
     }
