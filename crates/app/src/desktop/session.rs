@@ -84,7 +84,8 @@ fn install(end: impl Fn(Ending) + Send + Sync + 'static) {
     let hook =
         unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(on_message), std::ptr::null_mut(), GetCurrentThreadId()) };
     if hook.is_null() {
-        bridge::log!("the end of the session is not watched: {}", std::io::Error::last_os_error());
+        // Before the reports start: kept for them (#342).
+        bridge::fault!("the end of the session is not watched: {}", std::io::Error::last_os_error());
     }
 }
 

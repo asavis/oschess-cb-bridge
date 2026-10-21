@@ -340,7 +340,7 @@ impl Registry {
             Ok(Built::Unsuited) => (State::Unsuited(generation), None),
             Ok(Built::Changed) => (State::Waiting(Instant::now()), None),
             Err(why) => {
-                crate::log!("copying the headers of database {id} failed: {why}");
+                crate::fault!("copying the headers of database {id} failed: {why}");
                 (State::Waiting(Instant::now()), None)
             }
         };

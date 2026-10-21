@@ -629,6 +629,8 @@ impl Out {
                         let _ = synced.sync_data();
                     }
                 })
+                // The build goes on without syncing behind itself.
+                .inspect_err(|e| crate::fault!("an index build syncs at its end alone: no thread: {e}"))
                 .ok()?;
             Some(Behind { ask, thread })
         });

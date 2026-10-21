@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge::api::App;
@@ -219,6 +219,114 @@ fn a_crashed_engine_ends_the_stream_and_starts_again() {
     assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_exited"}"#), "{lines:?}");
     let mut b = Analysis::open(port, "depth=2&stream=tab1");
     assert_eq!(b.rest().last().unwrap(), BEST);
+}
+
+/// The failures `bridge::fault!` raised in this test binary (#342), from the
+/// first call on: a test calls it before it acts, and tells its own failures
+/// by the engine's file name.
+fn faults() -> Vec<String> {
+    static RAISED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    bridge::log::on_fault(|_, _, text| RAISED.lock().unwrap().push(text.into()));
+    RAISED.lock().unwrap().clone()
+}
+
+/// An engine whose program does not start, and one that stops in the middle
+/// of an analysis, are failures the bridge reports (#342), with why.
+#[test]
+fn an_engine_that_does_not_start_or_stops_is_reported() {
+    faults();
+    let raised = |prefix: &str| faults().iter().any(|f| f.starts_with(prefix));
+    let id = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bridge-engine-faults-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let missing = dir.join(format!("missing-{id}{}", std::env::consts::EXE_SUFFIX));
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(missing, Some(1), Some(16))));
+    let lines = Analysis::open(port, "depth=1&stream=tab1").rest();
+    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_failed"}"#), "{lines:?}");
+    assert!(raised(&format!("the engine missing-{id} did not start: ")), "{:?}", faults());
+
+    let crashing = fake_copy(&dir, &format!("crashing-{id}"));
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(crashing, Some(1), Some(16))));
+    let lines = Analysis::open(port, "moves=h2h3&stream=tab1").rest();
+    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_exited"}"#), "{lines:?}");
+    assert!(raised(&format!("the engine crashing-{id} stopped during an analysis: exit")), "{:?}", faults());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A chosen engine that answers `uci` and exits when asked whether it is
+/// ready is reported with its exit status (#342).
+#[test]
+fn an_engine_that_exits_before_it_is_ready_is_reported_with_its_status() {
+    faults();
+    let id = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bridge-engine-unready-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("unready-{id}");
+    let engine = Engine::new(EngineConfig::new(fake_copy(&dir, &name), Some(1), Some(16)));
+    let (port, _bridge) = start(engine);
+    assert_eq!(warm(port, "threads=1&hash=16").0, 502);
+    let raised: Vec<String> = faults().into_iter().filter(|f| f.contains(&name)).collect();
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    let expected = format!("the engine {name} did not start as an engine: The engine did not get ready (exit");
+    assert!(raised[0].starts_with(&expected) && raised[0].ends_with("46)"), "{raised:?}");
+
+    // The same with a program it started that holds its output open.
+    let name = format!("forking-{id}");
+    let engine = Engine::new(EngineConfig::new(fake_copy(&dir, &name), Some(1), Some(16)));
+    let (port, _bridge) = start(engine);
+    assert_eq!(warm(port, "threads=1&hash=16").0, 502);
+    let raised: Vec<String> = faults().into_iter().filter(|f| f.contains(&name)).collect();
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(raised[0].ends_with("44)"), "{raised:?}");
+    // The copy that held the output ends by itself.
+    std::thread::sleep(Duration::from_secs(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An engine that exits rather than stop when its client leaves, and one that
+/// exits while it waits for the next analysis, are reported with their exit
+/// status, the idle one before the idle limit lets it go; an engine that stops
+/// as asked is not (#342).
+#[test]
+fn an_engine_that_ends_when_stopped_or_while_idle_is_reported() {
+    faults();
+    let mine = |name: &str| faults().into_iter().filter(|f| f.contains(name)).collect::<Vec<_>>();
+    let id = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bridge-engine-ends-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let stopping = format!("stopping-{id}");
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(fake_copy(&dir, &stopping), Some(1), Some(16))));
+    let mut a = Analysis::open(port, "stream=tab1");
+    assert!(a.line().unwrap().starts_with(r#"{"info":"#));
+    drop(a);
+    let mut b = Analysis::open(port, "depth=2&stream=tab1");
+    assert_eq!(b.rest().last().unwrap(), BEST);
+    assert!(mine(&stopping).is_empty(), "a stop as asked is no failure: {:?}", mine(&stopping));
+    let mut c = Analysis::open(port, "moves=d2d3&stream=tab1");
+    assert!(c.line().unwrap().starts_with(r#"{"info":"#));
+    drop(c);
+    until("the failed stop is reported", WAIT_LIMIT, || !mine(&stopping).is_empty());
+    let raised = mine(&stopping);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(
+        raised[0].starts_with(&format!("the engine {stopping} did not stop when its client left: exit")),
+        "{raised:?}"
+    );
+    assert!(raised[0].ends_with("43"), "{raised:?}");
+
+    let idle = format!("idle-{id}");
+    let config = EngineConfig::new(fake_copy(&dir, &idle), Some(1), Some(16));
+    let (port, bridge) = start(Engine::with_idle(config, Duration::from_millis(300)));
+    let mut a = Analysis::open(port, "moves=f2f3&depth=1&stream=tab1");
+    assert_eq!(a.rest().last().unwrap(), BEST);
+    until("the idle limit lets the engine go", WAIT_LIMIT, || !bridge.app.engine.is_running());
+    let raised = mine(&idle);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(raised[0].starts_with(&format!("the engine {idle} had stopped between analyses: exit")), "{raised:?}");
+    assert!(raised[0].ends_with("42"), "{raised:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

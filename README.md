@@ -347,8 +347,12 @@ computer, what it connects to depends on where you got it:
   nothing about you or your databases.
 - Either copy sends a failure report to oschess's error tracker,
   `glitchtip.oschess.org`, when it fails: when one of its windows does not
-  open, when it stops responding, on an error in its own code, and when you
-  choose «Report a problem» in its menu. A report holds what failed and
+  open, when it stops responding, on an error in its own code, when
+  something fails that should not while it works normally, such as an
+  engine that does not start or stops in the middle of an analysis, or a
+  file of its own it cannot write, and when you choose «Report a problem» in
+  its menu. A failure that ordinary conditions explain, such as no network,
+  is not reported. A report holds what failed and
   where, the versions of the bridge, Windows and WebView2, the app's
   language, how long the bridge had run, and the last 100 lines of its log,
   which name no database, game, query or file of yours. Before a report

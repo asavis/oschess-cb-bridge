@@ -13,7 +13,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::lock;
@@ -36,6 +36,93 @@ macro_rules! log {
     ($($arg:tt)*) => {
         $crate::log::write(format_args!($($arg)*))
     };
+}
+
+/// Writes a line for a failure that should not happen while the bridge works
+/// normally (#342), as [`log!`] does, and hands it to the sink [`on_fault`]
+/// set, which the app reports: `fault!("the engine did not start: {e}")`. A
+/// failure that ordinary conditions explain, such as no network or a busy
+/// database, stays a [`log!`] line.
+#[macro_export]
+macro_rules! fault {
+    ($($arg:tt)*) => {
+        $crate::log::fault(file!(), line!(), format_args!($($arg)*))
+    };
+}
+
+/// What [`fault!`] hands each failure to: the source file and line that raised
+/// it, and its line as the log has it.
+type FaultSink = Box<dyn Fn(&str, u32, &str) + Send + Sync>;
+
+/// A failure [`fault!`] raised: its source file, line and text.
+type Raised = (&'static str, u32, String);
+
+/// The failures most kept while no sink is set; later ones are logged alone.
+const EARLY_FAULTS: usize = 32;
+
+/// Where [`fault!`] hands its failures: the sink once set, and until then the
+/// failures raised before it, such as those of the bridge's start, which runs
+/// before the app's reports do.
+struct Faults {
+    sink: OnceLock<FaultSink>,
+    early: Mutex<Vec<Raised>>,
+}
+
+impl Faults {
+    const fn new() -> Faults {
+        Faults { sink: OnceLock::new(), early: Mutex::new(Vec::new()) }
+    }
+
+    fn raise(&self, file: &'static str, line: u32, text: String) {
+        if self.sink.get().is_none() {
+            // Checked again under the lock that `set` takes: a failure is
+            // kept for the sink, or the sink is there to take it.
+            let mut early = lock(&self.early);
+            if self.sink.get().is_none() {
+                if early.len() < EARLY_FAULTS {
+                    early.push((file, line, text));
+                }
+                return;
+            }
+        }
+        if let Some(sink) = self.sink.get() {
+            sink(file, line, &text);
+        }
+    }
+
+    /// Sets the sink, if none is, and hands it the failures raised before.
+    fn set(&self, sink: FaultSink) {
+        let waiting = {
+            let mut early = lock(&self.early);
+            if self.sink.set(sink).is_err() {
+                return;
+            }
+            std::mem::take(&mut *early)
+        };
+        if let Some(sink) = self.sink.get() {
+            for (file, line, text) in waiting {
+                sink(file, line, &text);
+            }
+        }
+    }
+}
+
+static FAULTS: Faults = Faults::new();
+
+/// Sets what [`fault!`] hands its failures to, and hands it those raised
+/// before; only the first call sets it. The sink runs on the thread that
+/// raised the failure, under whatever locks that thread holds, so it only
+/// queues.
+pub fn on_fault(sink: impl Fn(&str, u32, &str) + Send + Sync + 'static) {
+    FAULTS.set(Box::new(sink));
+}
+
+/// Writes the line of a failure raised at `file`:`line` and hands it to the
+/// sink, or keeps it for the sink to come. Called by [`fault!`].
+pub fn fault(file: &'static str, line: u32, message: fmt::Arguments<'_>) {
+    let text = message.to_string();
+    write(format_args!("{text}"));
+    FAULTS.raise(file, line, text);
 }
 
 /// Sends the lines from now on to `bridge.log` in `dir` as well, making the
@@ -185,6 +272,19 @@ pub(crate) mod testing {
             *lock(&super::FILE) = None;
         }
     }
+
+    /// A failure `fault!` raised: its source file, line and text.
+    pub(crate) type Raised = (String, u32, String);
+
+    static RAISED: Mutex<Vec<Raised>> = Mutex::new(Vec::new());
+
+    /// The failures `fault!` raised in this test binary since its first call,
+    /// which sets the sink: a test calls it before it acts, and again after,
+    /// and tells its own failures by what their text names.
+    pub(crate) fn faults() -> Vec<Raised> {
+        super::on_fault(|file, line, text| lock(&RAISED).push((file.into(), line, text.into())));
+        lock(&RAISED).clone()
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +410,43 @@ mod tests {
         assert!(time.len() == 20 && time.ends_with('Z'), "{time}");
         drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failure raised before the sink is set reaches it once it is: the
+    /// bridge's start runs before the app's reports (#342). Past the bound,
+    /// the earliest are kept.
+    #[test]
+    fn a_fault_raised_before_the_sink_reaches_it_when_it_is_set() {
+        let faults = Faults::new();
+        for n in 0..EARLY_FAULTS + 3 {
+            faults.raise("src/start.rs", 7, format!("early {n}"));
+        }
+        let got = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let into = std::sync::Arc::clone(&got);
+        faults.set(Box::new(move |file, line, text| lock(&into).push(format!("{file}:{line} {text}"))));
+        faults.raise("src/engine.rs", 9, "later".into());
+        let got = lock(&got).clone();
+        assert_eq!(got.len(), EARLY_FAULTS + 1);
+        assert_eq!(got[0], "src/start.rs:7 early 0");
+        assert_eq!(got[EARLY_FAULTS - 1], format!("src/start.rs:7 early {}", EARLY_FAULTS - 1));
+        assert_eq!(got[EARLY_FAULTS], "src/engine.rs:9 later");
+        assert!(lock(&faults.early).is_empty());
+    }
+
+    /// A failure goes to the sink with where it was raised (#342); a plain
+    /// line does not.
+    #[test]
+    fn a_fault_reaches_the_sink_with_its_place_and_a_log_line_does_not() {
+        let before = testing::faults().len();
+        let token = format!("fault-{}", std::process::id());
+        crate::log!("{token}: a plain line");
+        let line = line!() + 1;
+        crate::fault!("{token}: a failure {}", 7);
+        let raised: Vec<_> = testing::faults().into_iter().skip(before).filter(|f| f.2.starts_with(&token)).collect();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let (file, at, text) = &raised[0];
+        assert!(file.replace('\\', "/").ends_with("src/log.rs"), "{file}");
+        assert_eq!((*at, text.as_str()), (line, format!("{token}: a failure 7").as_str()));
     }
 
     #[test]

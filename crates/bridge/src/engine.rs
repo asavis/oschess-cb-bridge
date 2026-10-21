@@ -29,7 +29,7 @@ use crate::json::{self, Obj};
 use crate::machine;
 use crate::sync::lock;
 
-use uci::{Pacer, Process, bestmove, info_json};
+use uci::{NotStarted, Pacer, Process, bestmove, info_json};
 
 /// How often an engine that follows `bridge.toml` looks at the file.
 pub const CONFIG_POLL: Duration = Duration::from_secs(1);
@@ -418,14 +418,18 @@ impl Engine {
         let engine = Engine { shared: Arc::new(shared) };
         engine.current();
         let watched = Arc::downgrade(&engine.shared);
-        let _ = std::thread::Builder::new().name("bridge-engine-config".into()).stack_size(crate::THREAD_STACK).spawn(
-            move || {
+        let watching = std::thread::Builder::new()
+            .name("bridge-engine-config".into())
+            .stack_size(crate::THREAD_STACK)
+            .spawn(move || {
                 while let Some(shared) = watched.upgrade() {
                     Engine { shared }.current();
                     std::thread::sleep(poll);
                 }
-            },
-        );
+            });
+        if let Err(e) = watching {
+            crate::fault!("the engine's settings are not watched: no thread: {e}");
+        }
         engine
     }
 
@@ -540,6 +544,8 @@ impl Engine {
         let threads = search.threads.unwrap_or(inner.config.threads);
         let hash_mb = search.hash_mb.unwrap_or(inner.config.hash_mb);
         if !p.sync(threads, hash_mb, None).unwrap_or(false) {
+            let ended = p.ended();
+            crate::fault!("the engine {} did not get ready for a warm-up: {ended}", p.program);
             *slot = None;
             return Warmed::Failed("the engine did not say it is ready".into());
         }
@@ -581,15 +587,19 @@ impl Inner {
         });
         let reaper = Arc::downgrade(&inner);
         let every = (idle / 4).clamp(Duration::from_millis(20), Duration::from_secs(30));
-        let _ = std::thread::Builder::new().name("bridge-engine-idle".into()).stack_size(crate::THREAD_STACK).spawn(
-            move || {
+        let reaping = std::thread::Builder::new()
+            .name("bridge-engine-idle".into())
+            .stack_size(crate::THREAD_STACK)
+            .spawn(move || {
                 while let Some(inner) = reaper.upgrade() {
                     inner.end_if_idle();
                     drop(inner);
                     std::thread::sleep(every);
                 }
-            },
-        );
+            });
+        if let Err(e) = reaping {
+            crate::fault!("an idle engine is not ended: no thread: {e}");
+        }
         inner
     }
 
@@ -598,13 +608,23 @@ impl Inner {
     /// `/v1/status`; one that has exited is replaced. Why a new one did not
     /// start.
     fn process<'a>(&self, slot: &'a mut Option<Process>, handshake: Duration) -> Result<&'a mut Process, String> {
-        if slot.as_mut().is_some_and(|p| !p.alive()) {
+        if let Some(p) = slot.as_mut()
+            && ended_while_idle(p)
+        {
             *slot = None;
         }
         match slot {
             Some(p) => Ok(p),
             None => {
-                let p = Process::start(&self.config, handshake)?;
+                // The chosen engine answered as one when it was chosen: not now is a failure (#342).
+                let p = Process::start(&self.config, handshake).map_err(|NotStarted { why, reported, ended }| {
+                    if !reported {
+                        let ended = ended.as_deref().unwrap_or("unknown");
+                        let program = file_stem(&self.config.program);
+                        crate::fault!("the engine {program} did not start as an engine: {why} ({ended})");
+                    }
+                    why
+                })?;
                 *lock(&self.name) = Some(p.name.clone());
                 Ok(slot.insert(p))
             }
@@ -619,26 +639,32 @@ impl Inner {
 
     fn end_if_idle(&self) {
         let Ok(mut slot) = self.slot.try_lock() else { return };
-        if slot.as_ref().is_some_and(|p| p.used.elapsed() >= self.idle) {
+        if let Some(p) = slot.as_mut()
+            && p.used.elapsed() >= self.idle
+        {
+            // An engine that ended on its own is reported before it is let go.
+            ended_while_idle(p);
             *slot = None;
         }
     }
 
     fn run(&self, p: &mut Process, search: &Search, ticket: u64, stream: &str, sink: &mut dyn Sink) -> Outcome {
-        let exited = |sink: &mut dyn Sink| {
+        let exited = |p: &mut Process, sink: &mut dyn Sink, when: &str| {
+            let ended = p.ended();
+            crate::fault!("the engine {} stopped {when}: {ended}", p.program);
             let _ = sink.line(&error_line("engine_exited", "The engine stopped"));
             Outcome::Lost
         };
         let threads = search.threads.unwrap_or(self.config.threads);
         let hash_mb = search.hash_mb.unwrap_or(self.config.hash_mb);
         if !p.sync(threads, hash_mb, Some(search)).unwrap_or(false) {
-            return exited(sink);
+            return exited(p, sink, "before an analysis, not ready");
         }
         if let Some(acknowledgement) = search.acknowledgement() {
             let _ = sink.line(&acknowledgement);
         }
         if p.send(&search.go()).is_err() {
-            return exited(sink);
+            return exited(p, sink, "as an analysis began");
         }
         let mut pacer = Pacer::new();
         loop {
@@ -655,19 +681,41 @@ impl Inner {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     let _ = pacer.flush(sink);
-                    return exited(sink);
+                    return exited(p, sink, "during an analysis");
                 }
             }
             if self.turn.load(Ordering::SeqCst) != ticket {
-                let outcome = p.stop();
+                let outcome = stop(p, "for a newer analysis");
                 self.superseded(stream, sink);
                 return outcome;
             }
             if sink.gone() || pacer.tick(sink).is_err() {
-                return p.stop();
+                return stop(p, "when its client left");
             }
         }
     }
+}
+
+/// Whether `p`'s process ended on its own while it waited for an analysis,
+/// which is reported with how it ended (#342).
+fn ended_while_idle(p: &mut Process) -> bool {
+    if p.alive() {
+        return false;
+    }
+    let ended = p.ended();
+    crate::fault!("the engine {} had stopped between analyses: {ended}", p.program);
+    true
+}
+
+/// Stops `p`'s search `when` it is no longer wanted. An engine that does not
+/// stop as asked is let go, and reported with how it ended (#342).
+fn stop(p: &mut Process, when: &str) -> Outcome {
+    let outcome = p.stop();
+    if outcome == Outcome::Lost {
+        let ended = p.ended();
+        crate::fault!("the engine {} did not stop {when}: {ended}", p.program);
+    }
+    outcome
 }
 
 /// Whether `program` is a UCI engine: runs its handshake within the usual
@@ -679,7 +727,7 @@ pub fn probe(program: &Path) -> Result<String, String> {
 /// [`probe`] with `handshake` in place of [`HANDSHAKE`] (tests).
 pub fn probe_within(program: &Path, handshake: Duration) -> Result<String, String> {
     let config = EngineConfig { program: program.to_path_buf(), threads: 1, hash_mb: 16 };
-    Process::start(&config, handshake).map(|p| p.name.clone())
+    Process::start(&config, handshake).map(|p| p.name.clone()).map_err(|e| e.why)
 }
 
 fn file_stem(path: &Path) -> String {

@@ -4,11 +4,16 @@
 //!
 //! The moves of a position steer it: with `h2h3` among them it exits when it
 //! is told to search; with `a2a3` it ignores `stop`; with `b2b3` it writes one
-//! line and then nothing until it is stopped. Started under a name containing
+//! line and then nothing until it is stopped; with `d2d3` it exits with 43
+//! when it is told to stop; with `f2f3` it exits with 42 a moment after its
+//! best move, while it waits for the next search. Started under a name containing
 //! `chatty`, it answers `uci` with `id name` lines, never `uciok`, for as
 //! long as they can be written.
 //! Started under a name containing `silent`, it answers `uci` with nothing,
-//! and waits until its input ends.
+//! and waits until its input ends. Started under a name containing `unready`,
+//! it exits with 46 when it is asked whether it is ready; under one containing
+//! `forking`, it then first starts a copy of itself that holds its output open
+//! for 3 s, and exits with 44.
 //!
 //! Its `nps` tells what it was set to (#58): `Threads` × 10⁹ + `Hash` × 10³ +
 //! how many `Threads` and `Hash` options it has been sent. Its `seldepth` is
@@ -25,6 +30,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn main() {
+    // The copy a `forking` engine starts: it only holds the output it inherited.
+    if std::env::args().nth(1).as_deref() == Some("--hold") {
+        std::thread::sleep(Duration::from_secs(3));
+        return;
+    }
     let (tx, commands) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
@@ -60,6 +70,14 @@ fn main() {
                         say("uciok");
                     }
                     ["isready"] => {
+                        if std::env::args().next().is_some_and(|name| name.contains("forking")) {
+                            let me = std::env::current_exe().unwrap();
+                            let _holder = std::process::Command::new(me).arg("--hold").spawn();
+                            std::process::exit(44);
+                        }
+                        if std::env::args().next().is_some_and(|name| name.contains("unready")) {
+                            std::process::exit(46);
+                        }
                         say("readyok");
                     }
                     ["setoption", "name", "MultiPV", "value", n] => multipv = n.parse().unwrap_or(1),
@@ -81,6 +99,7 @@ fn main() {
                         say("info string searching");
                         search = Some(Search::of(rest));
                     }
+                    ["stop"] if position.contains(" d2d3") => std::process::exit(43),
                     ["stop"] if !position.contains(" a2a3") => {
                         if search.take().is_some() {
                             say("bestmove e2e4 ponder e7e5");
@@ -124,6 +143,10 @@ fn main() {
                 let best = s.searchmoves.first().cloned().unwrap_or_else(|| "e2e4".into());
                 search = None;
                 say(&format!("bestmove {best} ponder e7e5"));
+                if position.contains(" f2f3") {
+                    std::thread::sleep(Duration::from_millis(50));
+                    std::process::exit(42);
+                }
             }
         }
     }

@@ -178,6 +178,7 @@ fn write(entry: &Entry, req: &Request, op: Op) -> Response {
         return not_found();
     }
     let Some(index) = entry.pgn().index_path(&entry.id) else {
+        crate::fault!("the bridge has no data folder for the header index of database {}", entry.id);
         return error(500, "internal", "The bridge has no data folder for the header index");
     };
     let done = entry.pgn().while_idle(&entry.id, || {
@@ -191,7 +192,10 @@ fn write(entry: &Entry, req: &Request, op: Op) -> Response {
     let written = match done {
         None => return unavailable(State::Opening),
         Some(Err(Failure::Damaged)) => {
-            crate::log!("the header index of database {} claims more games than its file holds; read again", entry.id);
+            crate::fault!(
+                "the header index of database {} claims more games than its file holds; read again",
+                entry.id
+            );
             drop(writing);
             // The next look opens the file again: its index is gone, so
             // reading it starts now.
@@ -247,12 +251,12 @@ fn refused(entry: &Entry, failure: Failure) -> Response {
             "The edit would join games: a game next to it in the file lacks its result or holds tags alone",
         ),
         Failure::Io(e) => {
-            crate::log!("writing the PGN file of database {} failed: {e}", entry.id);
+            crate::fault!("writing the PGN file of database {} failed: {e}", entry.id);
             error(500, "write_failed", "The file system refused the write; the file is as it was")
         }
         Failure::Damaged => unavailable(State::Opening),
         Failure::Lost => {
-            crate::log!("the PGN file of database {} was gone right after a write", entry.id);
+            crate::fault!("the PGN file of database {} was gone right after a write", entry.id);
             error(500, "internal", "The file was written, then was gone")
         }
     }
@@ -399,7 +403,7 @@ fn edit_file(
         Ok(games) => Some(games),
         Err(e) => {
             // The file is written; the next request reads it whole instead.
-            crate::log!("the header index of database {} after a write: {}", entry.id, crate::log::error(&e));
+            crate::fault!("the header index of database {} after a write: {}", entry.id, crate::log::error(&e));
             None
         }
     };

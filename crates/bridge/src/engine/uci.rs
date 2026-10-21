@@ -49,12 +49,34 @@ fn spawn(command: &mut Command) -> io::Result<Child> {
     }
 }
 
+/// Why an engine did not start: what the caller is told, and whether it was
+/// reported already (#342). A program that did not run, or whose output no
+/// thread could read, is reported at once, whoever started it; one that ran
+/// and did not answer as an engine is left to the caller that expected one.
+#[derive(Debug)]
+pub(super) struct NotStarted {
+    pub(super) why: String,
+    pub(super) reported: bool,
+    /// How its process ended, for one that ran: `still running` while its
+    /// output is open.
+    pub(super) ended: Option<String>,
+}
+
+impl NotStarted {
+    fn no_answer(p: &mut Process, why: &str) -> NotStarted {
+        NotStarted { why: why.into(), reported: false, ended: Some(p.how_ended()) }
+    }
+}
+
 /// The engine's process, its input, and its output line by line.
 pub(super) struct Process {
     child: Child,
     stdin: ChildStdin,
     pub(super) lines: Receiver<String>,
     pub(super) name: String,
+    /// Its program's file name without the extension, which a failure's line
+    /// names (#342).
+    pub(super) program: String,
     /// The `Threads`, `Hash` and `MultiPV` the engine was last set to.
     threads: u32,
     hash_mb: u32,
@@ -65,7 +87,7 @@ pub(super) struct Process {
 impl Process {
     /// Starts the engine of `config`, which may take `handshake` to answer
     /// `uci` with `uciok`, and sets it up.
-    pub(super) fn start(config: &EngineConfig, handshake: Duration) -> Result<Process, String> {
+    pub(super) fn start(config: &EngineConfig, handshake: Duration) -> Result<Process, NotStarted> {
         // The engine runs outside the Store package, so it is started from
         // the folder where it finds itself (#289).
         let program = crate::folders::outside(&config.program);
@@ -81,37 +103,62 @@ impl Process {
             // Below the browser, as ChessBase starts its engines; no console window.
             command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
         }
-        let mut child =
-            spawn(&mut command).map_err(|e| format!("The engine {} did not start: {e}", config.program.display()))?;
+        let mut child = spawn(&mut command).map_err(|e| {
+            // Windows' answer says why, such as an Application Control policy (os error 4551).
+            crate::fault!("the engine {} did not start: {e}", file_stem(&config.program));
+            NotStarted {
+                why: format!("The engine {} did not start: {e}", config.program.display()),
+                reported: true,
+                ended: None,
+            }
+        })?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("The engine's input and output are not available".into());
+            return Err(NotStarted {
+                why: "The engine's input and output are not available".into(),
+                reported: false,
+                ended: None,
+            });
         };
         let (tx, lines) = mpsc::sync_channel(QUEUED_LINES);
-        let _ = std::thread::Builder::new()
+        let reading = std::thread::Builder::new()
             .name("bridge-engine-out".into())
             .stack_size(crate::THREAD_STACK)
             .spawn(move || forward_lines(stdout, &tx));
+        if let Err(e) = reading {
+            let _ = child.kill();
+            let _ = child.wait();
+            crate::fault!("the output of the engine {} cannot be read: no thread: {e}", file_stem(&config.program));
+            return Err(NotStarted {
+                why: format!("The engine's output cannot be read: {e}"),
+                reported: true,
+                ended: None,
+            });
+        }
         let mut p = Process {
             child,
             stdin,
             lines,
             name: file_stem(&config.program),
+            program: file_stem(&config.program),
             threads: config.threads,
             hash_mb: config.hash_mb,
             multipv: 1,
             used: Instant::now(),
         };
         if p.send("uci").is_err() {
-            return Err("The engine closed its input".into());
+            return Err(NotStarted::no_answer(&mut p, "The engine closed its input"));
         }
         let deadline = Instant::now() + handshake;
         loop {
             // The deadline holds however much the engine writes: a line already
             // queued is not taken once it has passed.
             let Some(left) = until(deadline) else {
-                return Err("The file is not a UCI engine: it did not answer uciok in time".into());
+                return Err(NotStarted::no_answer(
+                    &mut p,
+                    "The file is not a UCI engine: it did not answer uciok in time",
+                ));
             };
             match p.lines.recv_timeout(left) {
                 Ok(line) if line == "uciok" => break,
@@ -123,10 +170,13 @@ impl Process {
                 // The deadline passed while the engine wrote nothing more: the
                 // same failure as the check above, told the same way.
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err("The file is not a UCI engine: it did not answer uciok in time".into());
+                    return Err(NotStarted::no_answer(
+                        &mut p,
+                        "The file is not a UCI engine: it did not answer uciok in time",
+                    ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("The file is not a UCI engine: it did not answer uciok".into());
+                    return Err(NotStarted::no_answer(&mut p, "The file is not a UCI engine: it did not answer uciok"));
                 }
             }
         }
@@ -136,7 +186,7 @@ impl Process {
             "isready".into(),
         ];
         if options.iter().any(|c| p.send(c).is_err()) || p.wait_for("readyok", READY).is_none() {
-            return Err("The engine did not get ready".into());
+            return Err(NotStarted::no_answer(&mut p, "The engine did not get ready"));
         }
         Ok(p)
     }
@@ -207,6 +257,37 @@ impl Process {
 
     pub(super) fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// How the engine's process ended: its status when it has exited, even
+    /// with its output held open by a program it started; when its output has
+    /// closed, after a moment's wait for it to exit; else `still running` at
+    /// once, so that a program that only does not speak UCI costs no wait.
+    fn how_ended(&mut self) -> String {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return status.to_string();
+        }
+        loop {
+            match self.lines.try_recv() {
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => return "still running".into(),
+                Err(mpsc::TryRecvError::Disconnected) => return self.ended(),
+            }
+        }
+    }
+
+    /// How the engine's process ended, waiting a moment for it, since its
+    /// output closes just before it exits: `still running` when it has not.
+    pub(super) fn ended(&mut self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.to_string(),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => return "still running".into(),
+                Err(e) => return format!("unknown: {e}"),
+            }
+        }
     }
 }
 

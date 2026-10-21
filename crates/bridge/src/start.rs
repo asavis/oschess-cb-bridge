@@ -107,7 +107,14 @@ pub fn prepare(dir: &Path, options: &Options) -> Result<Bridge, Failure> {
             Ok(bridge)
         }
         Err(failure) => {
-            crate::log!("the bridge cannot start: {}", failure.logged);
+            // The port in use and a bridge.toml that cannot be read are the
+            // user's to fix and the window says so; anything else is reported (#342).
+            match failure.cause {
+                Cause::PortInUse(_) | Cause::Other { port: None } => {
+                    crate::log!("the bridge cannot start: {}", failure.logged);
+                }
+                Cause::Other { port: Some(_) } => crate::fault!("the bridge cannot start: {}", failure.logged),
+            }
             Err(failure)
         }
     }

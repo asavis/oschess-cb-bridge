@@ -16,7 +16,7 @@ use crate::toast;
 /// that could not be shown is logged.
 pub(super) fn notify(app: &AppHandle, title: String, body: &str) {
     if let Err(e) = show(app, &title, body) {
-        bridge::log!("notice: {e}");
+        bridge::fault!("notice: {e}");
     }
 }
 

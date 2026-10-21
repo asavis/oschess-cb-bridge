@@ -201,7 +201,7 @@ impl Scheduler {
                 true
             }
             Err(e) => {
-                crate::log!("cannot start an index thread: {e}");
+                crate::fault!("cannot start an index thread: {e}");
                 // The thread ends only once both queues are empty, so this
                 // is the only build queued.
                 let jobs = (std::mem::take(&mut q.requested), std::mem::take(&mut q.background));
@@ -308,7 +308,7 @@ impl Scheduler {
                         Kind::Background => q.background.push_front(job),
                     }
                 }
-                Err(_) => crate::log!("an index build failed with a bug"),
+                Err(_) => crate::fault!("an index build failed with a bug"),
             }
         }
     }

@@ -198,7 +198,7 @@ impl Registry {
             return Opening::Ready(db);
         }
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            crate::log!("the index folder cannot be made for database {id}: {e}");
+            crate::fault!("the index folder cannot be made for database {id}: {e}");
             *b = Build::Failed(generation, Instant::now());
             return Opening::Failed;
         }
@@ -218,7 +218,7 @@ impl Registry {
             *lock(&job_build) = match built {
                 Ok(_) => Build::Idle,
                 Err(e) => {
-                    crate::log!("indexing the PGN file of database {id} failed: {}", crate::log::error(&e));
+                    crate::fault!("indexing the PGN file of database {id} failed: {}", crate::log::error(&e));
                     Build::Failed(generation, Instant::now())
                 }
             };

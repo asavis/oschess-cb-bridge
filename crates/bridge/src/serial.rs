@@ -71,7 +71,7 @@ impl Serial {
                 true
             }
             Err(e) => {
-                crate::log!("cannot start a {} thread: {e}", self.label);
+                crate::fault!("cannot start a {} thread: {e}", self.label);
                 // No thread runs, so this is the only job queued.
                 let job = queue.0.pop_back();
                 drop(queue);
@@ -104,7 +104,7 @@ impl Serial {
             };
             // A panicking job must not end the thread.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                crate::log!("a {} job failed with a bug", self.label);
+                crate::fault!("a {} job failed with a bug", self.label);
             }
         }
     }

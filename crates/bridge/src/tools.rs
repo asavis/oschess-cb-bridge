@@ -45,7 +45,18 @@ fn status(written: &[u8]) -> Result<u16, String> {
 /// `limit` bytes: a tool that writes more is stopped, so that nothing it
 /// writes is held beyond that. A failure is `failed` with the tool's exit
 /// status and the reason it gave.
-pub fn run(mut command: std::process::Command, name: &str, failed: &str, limit: u64) -> Result<Vec<u8>, String> {
+pub fn run(command: std::process::Command, name: &str, failed: &str, limit: u64) -> Result<Vec<u8>, String> {
+    run_coded(command, name, failed, limit).map_err(|(_, why)| why)
+}
+
+/// [`run`], with the tool's exit code beside why it failed when it exited
+/// with one: what tells curl's own refusals from the network's (#342).
+pub fn run_coded(
+    mut command: std::process::Command,
+    name: &str,
+    failed: &str,
+    limit: u64,
+) -> Result<Vec<u8>, (Option<i32>, String)> {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = command
@@ -53,11 +64,11 @@ pub fn run(mut command: std::process::Command, name: &str, failed: &str, limit: 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{name}: {e}"))?;
+        .map_err(|e| (None, format!("{name}: {e}")))?;
     let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("{name}: no output"));
+        return Err((None, format!("{name}: no output")));
     };
     // The error output is read beside the output, so that neither pipe
     // stalls the tool, and only its end is kept.
@@ -77,12 +88,12 @@ pub fn run(mut command: std::process::Command, name: &str, failed: &str, limit: 
         let _ = child.kill();
         let _ = child.wait();
         let _ = errors.join();
-        return Err(format!("{failed}: more than {limit} bytes"));
+        return Err((None, format!("{failed}: more than {limit} bytes")));
     }
-    let status = child.wait().map_err(|e| format!("{name}: {e}"))?;
+    let status = child.wait().map_err(|e| (None, format!("{name}: {e}")))?;
     let stderr = errors.join().unwrap_or_default();
-    read.map_err(|e| format!("{name}: {e}"))?;
-    if status.success() { Ok(out) } else { Err(failure(failed, &status.to_string(), &stderr)) }
+    read.map_err(|e| (None, format!("{name}: {e}")))?;
+    if status.success() { Ok(out) } else { Err((status.code(), failure(failed, &status.to_string(), &stderr))) }
 }
 
 /// The most a tool that should write nothing, `curl.exe` writing to a file
@@ -123,6 +134,28 @@ pub fn system_tool(name: &str) -> Result<std::process::Command, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure carries the tool's exit code, which tells curl's refusals
+    /// from the network's (#342); a tool stopped at its limit has none.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_carries_the_tools_exit_code() {
+        let sh = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        let (code, why) = run_coded(
+            sh("echo 'curl: (63) Maximum file size exceeded' >&2; exit 63"),
+            "sh",
+            "The download failed",
+            QUIET,
+        )
+        .unwrap_err();
+        assert_eq!(code, Some(63));
+        assert!(why.ends_with("curl: (63) Maximum file size exceeded"), "{why}");
+        assert_eq!(run_coded(sh("yes"), "sh", "The lookup failed", 4).unwrap_err().0, None);
+    }
 
     /// A tool's output is read up to the limit and no further: one that
     /// writes more, without end here, is stopped and refused (#322). Its

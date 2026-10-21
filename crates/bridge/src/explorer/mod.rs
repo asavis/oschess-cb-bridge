@@ -293,13 +293,19 @@ impl MaskBuilds {
                 slot.state = match result {
                     Ok(m) => MaskState::Ready(Arc::new(m)),
                     Err(unbuilt) => {
-                        crate::log!("the masks of database {key} were not built: {}", unbuilt.why);
+                        // A build stopped or kept waiting is tried again; another failed (#342).
+                        if unbuilt.again {
+                            crate::log!("the masks of database {key} were not built: {}", unbuilt.why);
+                        } else {
+                            crate::fault!("the masks of database {key} were not built: {}", unbuilt.why);
+                        }
                         let why = "the masks could not be built".into();
                         MaskState::Failed { at: Instant::now(), why, again: unbuilt.again }
                     }
                 };
             });
-        if spawned.is_err() {
+        if let Err(e) = spawned {
+            crate::fault!("the masks of database {id} are not built: no thread: {e}");
             let why = "the masks thread could not start".to_string();
             let failed = MaskState::Failed { at: Instant::now(), why, again: true };
             slots.insert(id.to_string(), MaskSlot { build_id, state: failed });
@@ -586,7 +592,11 @@ impl Registry {
                 // The database changed meanwhile: the next request starts afresh.
                 Ok(_) => State::Idle,
                 Err(failure) => {
-                    crate::log!("indexing database {} failed: {}", entry.id, failure.logged());
+                    if failure.unexpected() {
+                        crate::fault!("indexing database {} failed: {}", entry.id, failure.logged());
+                    } else {
+                        crate::log!("indexing database {} failed: {}", entry.id, failure.logged());
+                    }
                     let busy = failure.busy();
                     State::Failed { at: Instant::now(), why: failure.answered(&dir), generation, busy }
                 }
@@ -851,6 +861,25 @@ impl Failure {
     fn busy(&self) -> bool {
         matches!(self, Failure::Build(SearchError::WorkersBusy))
     }
+
+    /// Whether the failure should not happen while the bridge works
+    /// normally, and is reported (#342): not one of searches holding the
+    /// memory or the workers, a stopped build, a qualifier ChessBase lacks,
+    /// or a budget set too small for the database.
+    fn unexpected(&self) -> bool {
+        !matches!(
+            self,
+            Failure::Busy
+                | Failure::Open(Bad::Busy)
+                | Failure::Build(
+                    SearchError::Busy
+                        | SearchError::WorkersBusy
+                        | SearchError::Superseded
+                        | SearchError::Unsupported(_)
+                        | SearchError::TooLarge
+                )
+        )
+    }
 }
 
 /// The index file at `path` and its move stream when they are the whole
@@ -932,6 +961,35 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    /// An index build that searches kept busy, that was stopped, or that the
+    /// budget or ChessBase's qualifiers rule out is no failure to report; one
+    /// that could not write, read or open what it built is (#342).
+    #[test]
+    fn only_a_failure_normal_work_does_not_explain_is_reported() {
+        let io = || std::io::Error::other("the disk is full");
+        for expected in [
+            Failure::Busy,
+            Failure::Open(Bad::Busy),
+            Failure::Build(SearchError::Busy),
+            Failure::Build(SearchError::WorkersBusy),
+            Failure::Build(SearchError::Superseded),
+            Failure::Build(SearchError::Unsupported("x".into())),
+            Failure::Build(SearchError::TooLarge),
+        ] {
+            assert!(!expected.unexpected(), "{}", expected.logged());
+        }
+        for unexpected in [
+            Failure::Folder(io()),
+            Failure::Open(Bad::Io(io())),
+            Failure::Open(Bad::Corrupt("a CRC")),
+            Failure::Build(SearchError::IndexDamaged),
+            Failure::Build(SearchError::Bug("a stream")),
+            Failure::Build(SearchError::Read(cbformat::Error::Format("bad".into()))),
+        ] {
+            assert!(unexpected.unexpected(), "{}", unexpected.logged());
+        }
+    }
     use crate::catalog::{Busy, Catalog};
     use crate::search::memory::Cancel;
     use crate::search::workers;

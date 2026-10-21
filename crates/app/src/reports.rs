@@ -93,6 +93,8 @@ pub enum Kind {
     Script,
     /// A report the user sent from the tray menu.
     Manual,
+    /// A failure `bridge::fault!` raised (#342).
+    Error,
 }
 
 impl Kind {
@@ -103,6 +105,7 @@ impl Kind {
             Kind::Stall => "stall",
             Kind::Script => "script",
             Kind::Manual => "manual",
+            Kind::Error => "error",
         }
     }
 

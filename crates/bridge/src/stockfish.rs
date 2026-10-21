@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::tools::{QUIET, run, system_tool};
+use crate::tools::{QUIET, run, run_coded, system_tool};
 use crate::{folders, sha256};
 
 /// A processor architecture Stockfish publishes a Windows build for.
@@ -290,7 +290,11 @@ pub fn install(
         return Ok(build.installed(data));
     }
     let engines = data.join("engines");
-    std::fs::create_dir_all(&engines).map_err(|e| format!("{}: {e}", engines.display()))?;
+    std::fs::create_dir_all(&engines).map_err(|e| {
+        // The bridge's own folder, before any download: no network failure (#342).
+        crate::fault!("the engines folder cannot be made: {e}");
+        format!("{}: {e}", engines.display())
+    })?;
     let zip = engines.join(format!(".download-{}", build.asset));
     let staging = engines.join(format!(".unpack-stockfish-{}", build.version));
     let clean = || {
@@ -300,34 +304,53 @@ pub fn install(
     clean();
     let result = (|| {
         download_with_progress(transport, build, &zip, progress)?;
-        progress(Progress::Checking);
-        // The length first: a wrong one is refused before any hashing.
-        let size = std::fs::metadata(&zip).map_err(|e| e.to_string())?.len();
-        if size != build.size {
-            return Err(format!("The download does not match the pinned build: {size} bytes, expected {}", build.size));
+        // A download can fail with the network; what follows should not, so
+        // its failure is reported (#342).
+        let installed = check_and_commit(data, build, transport, &zip, &staging, progress);
+        if let Err(e) = &installed {
+            crate::fault!("Stockfish {} was downloaded and not installed: {e}", build.version);
         }
-        let digest = sha256::hex(&sha256::file(&zip).map_err(|e| e.to_string())?);
-        if digest != *build.sha256 {
-            return Err(format!(
-                "The download does not match the pinned build: SHA-256 {digest}, expected {}",
-                build.sha256
-            ));
-        }
-        progress(Progress::Unpacking);
-        std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-        let members = [format!("stockfish/{}", build.exe), format!("stockfish/{LICENCE}")];
-        transport.extract(&zip, &members, &staging)?;
-        // Both files are there before anything is installed.
-        for name in [build.exe, LICENCE] {
-            if !staging.join("stockfish").join(name).is_file() {
-                return Err(format!("The archive has no stockfish/{name}"));
-            }
-        }
-        commit(&staging.join("stockfish"), &build.dir(data))?;
-        Ok(build.installed(data))
+        installed
     })();
     clean();
     result
+}
+
+/// Checks the downloaded `zip` against `build`'s pin, unpacks it into
+/// `staging` and puts the build in place in the data folder `data`.
+fn check_and_commit(
+    data: &Path,
+    build: &Build,
+    transport: &dyn Transport,
+    zip: &Path,
+    staging: &Path,
+    progress: &mut (dyn FnMut(Progress) + Send),
+) -> Result<PathBuf, String> {
+    progress(Progress::Checking);
+    // The length first: a wrong one is refused before any hashing.
+    let size = std::fs::metadata(zip).map_err(|e| e.to_string())?.len();
+    if size != build.size {
+        return Err(format!("The download does not match the pinned build: {size} bytes, expected {}", build.size));
+    }
+    let digest = sha256::hex(&sha256::file(zip).map_err(|e| e.to_string())?);
+    if digest != *build.sha256 {
+        return Err(format!(
+            "The download does not match the pinned build: SHA-256 {digest}, expected {}",
+            build.sha256
+        ));
+    }
+    progress(Progress::Unpacking);
+    std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
+    let members = [format!("stockfish/{}", build.exe), format!("stockfish/{LICENCE}")];
+    transport.extract(zip, &members, staging)?;
+    // Both files are there before anything is installed.
+    for name in [build.exe, LICENCE] {
+        if !staging.join("stockfish").join(name).is_file() {
+            return Err(format!("The archive has no stockfish/{name}"));
+        }
+    }
+    commit(&staging.join("stockfish"), &build.dir(data))?;
+    Ok(build.installed(data))
 }
 
 /// Puts the unpacked folder `from` in place of `dir`: by renaming, so that a
@@ -414,6 +437,13 @@ fn stockfish_major(text: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Whether curl's exit `code` is a refusal of its own rather than the
+/// network's, and so reported (#342): 63, more than the pinned size came,
+/// and 23, the file could not be written (#289).
+fn refused_by_curl(code: Option<i32>) -> bool {
+    matches!(code, Some(23 | 63))
+}
+
 /// The system's own tools: `curl.exe` and `tar.exe`, part of Windows 10 and 11,
 /// called by their full paths so that no other program on the path answers.
 pub struct System;
@@ -431,7 +461,12 @@ impl Transport for System {
             .arg("--output")
             .arg(folders::outside(to))
             .arg(url);
-        run(curl, "curl.exe", "The download failed", QUIET).map(drop)
+        run_coded(curl, "curl.exe", "The download failed", QUIET).map(drop).map_err(|(code, why)| {
+            if refused_by_curl(code) {
+                crate::fault!("the Stockfish download was refused: {why}");
+            }
+            why
+        })
     }
 
     fn extract(&self, zip: &Path, members: &[String], to: &Path) -> Result<(), String> {
@@ -557,12 +592,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An engines folder that cannot be made is the bridge's own failure,
+    /// reported before anything is downloaded (#342).
+    #[test]
+    fn an_engines_folder_that_cannot_be_made_is_reported() {
+        let dir = data("no-folder");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("engines"), b"a file where the folder goes").unwrap();
+        crate::log::testing::faults();
+        let transport = fake(b"hello world");
+        let error = install(&dir, &TEST_BUILD, &transport, &mut |_| {}).unwrap_err();
+        assert!(transport.asked.lock().unwrap().is_empty(), "nothing is downloaded: {error}");
+        let raised = crate::log::testing::faults();
+        assert!(raised.iter().any(|f| f.2.starts_with("the engines folder cannot be made: ")), "{raised:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// curl's refusals of its own are reported; the network's are not (#342).
+    #[test]
+    fn only_curls_own_refusals_are_reported() {
+        assert!(refused_by_curl(Some(63)), "more than the pinned size");
+        assert!(refused_by_curl(Some(23)), "the file could not be written");
+        for network in [None, Some(6), Some(7), Some(22), Some(28), Some(35), Some(56)] {
+            assert!(!refused_by_curl(network), "{network:?}");
+        }
+    }
+
+    /// A download that does not match its pin is refused and reported (#342).
     #[test]
     fn refuses_a_download_that_does_not_match_and_leaves_nothing() {
         let dir = data("tampered");
+        crate::log::testing::faults();
         for archive in [&b"hello World"[..], b"hello world!"] {
             let error = install(&dir, &TEST_BUILD, &fake(archive), &mut |_| {}).unwrap_err();
             assert!(error.contains("does not match"), "{error}");
+            let raised = crate::log::testing::faults();
+            assert!(raised.iter().any(|f| f.2.ends_with(&format!("was downloaded and not installed: {error}"))));
             assert!(!TEST_BUILD.dir(&dir).exists());
             assert_eq!(std::fs::read_dir(dir.join("engines")).unwrap().count(), 0);
         }

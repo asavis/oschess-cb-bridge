@@ -393,10 +393,13 @@ pub async fn set_port(app: AppHandle, port: String) -> Answer<()> {
 
 /// Restarts the app once the command's answer has reached the window.
 fn restart_soon(app: AppHandle) {
-    let _ = std::thread::Builder::new().name("restart".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("restart".into()).spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
         app.restart();
     });
+    if let Err(e) = spawned {
+        bridge::fault!("the app does not restart: no thread: {e}");
+    }
 }
 
 #[tauri::command]

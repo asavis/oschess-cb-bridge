@@ -148,7 +148,11 @@ pub fn run() {
             if let Ok(dir) = bridge::start::data_dir() {
                 bridge::log::open(&dir);
             }
-            bridge::log!("the app cannot start: {e}");
+            let line = format!("the app cannot start: {e}");
+            bridge::log!("{line}");
+            // Filed and sent before the exit: nothing sends it after (#342).
+            let fingerprint = format!("{}:{}", diagnostics::source_file(file!()), line!());
+            reporting::file_at_exit(Report { kind: Kind::Error, message: line, tags: vec![], fingerprint });
             std::process::exit(1);
         }
     }
@@ -199,7 +203,7 @@ fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
         }
     });
     if let Err(e) = spawned {
-        bridge::log!("no status thread: {e}");
+        bridge::fault!("no status thread: {e}");
     }
 }
 
