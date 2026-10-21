@@ -67,7 +67,10 @@ const PAIR_ON_START: &str = "pair-on-start";
 
 /// Asks the next start to open the pairing link.
 pub fn pair_on_next_start(dir: &std::path::Path) -> Result<(), String> {
-    std::fs::write(dir.join(PAIR_ON_START), b"").map_err(|e| e.to_string())
+    std::fs::write(dir.join(PAIR_ON_START), b"").map_err(|e| {
+        bridge::fault!("{PAIR_ON_START} cannot be written: {e}");
+        e.to_string()
+    })
 }
 
 /// The pairing code and the link that carries it.

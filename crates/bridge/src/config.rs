@@ -155,11 +155,18 @@ fn create(path: &Path) -> Result<(), Error> {
     if path.exists() {
         return Ok(());
     }
+    // The bridge's own file, which nobody wrote wrong: a failure is reported (#342).
     let error = |why| Error { path: path.to_owned(), why };
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| error(Why::Folder(e)))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            crate::fault!("the folder of bridge.toml cannot be made: {e}");
+            error(Why::Folder(e))
+        })?;
     }
-    crate::files::write_atomic(path, TEMPLATE.as_bytes()).map_err(|e| error(Why::Io(e)))
+    crate::files::write_atomic(path, TEMPLATE.as_bytes()).map_err(|e| {
+        crate::fault!("the default bridge.toml cannot be written: {e}");
+        error(Why::Io(e))
+    })
 }
 
 /// The settings of the `bridge.toml` at `path`; `None` when there is no file.
@@ -301,7 +308,10 @@ pub fn render(config: &Config) -> String {
 /// Writes `config` to `path` through a temporary file, so a reader never sees
 /// half a file.
 pub fn save(path: &Path, config: &Config) -> Result<(), String> {
-    crate::files::write_atomic(path, render(config).as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    crate::files::write_atomic(path, render(config).as_bytes()).map_err(|e| {
+        crate::fault!("bridge.toml cannot be saved: {e}");
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// Changes the `bridge.toml` at `path`: reads it, applies `change` and saves
@@ -527,6 +537,24 @@ fn parse_string(text: &str) -> Result<(String, &str), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bridge.toml is the bridge's own file: a default it cannot make, or
+    /// settings it cannot save, are reported (#342).
+    #[test]
+    fn a_bridge_toml_that_cannot_be_written_is_reported() {
+        let dir = std::env::temp_dir().join(format!("bridge-config-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a file");
+        std::fs::write(&file, b"").unwrap();
+        let before = crate::log::testing::faults().len();
+        assert!(create(&file.join("bridge.toml")).is_err());
+        assert!(save(&dir.join("missing").join("bridge.toml"), &Config::default()).is_err());
+        let raised: Vec<String> = crate::log::testing::faults().into_iter().skip(before).map(|f| f.2).collect();
+        assert!(raised.iter().any(|f| f.starts_with("the folder of bridge.toml cannot be made: ")), "{raised:?}");
+        assert!(raised.iter().any(|f| f.starts_with("bridge.toml cannot be saved: ")), "{raised:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn template_parses_to_the_defaults() {

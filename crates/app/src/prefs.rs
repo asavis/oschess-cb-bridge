@@ -85,11 +85,17 @@ pub fn hold_if(dir: &Path, keep: impl FnOnce(&Prefs) -> bool) -> Option<Held> {
 
 pub fn save(dir: &Path, prefs: &Prefs) -> Result<(), String> {
     let text = serde_json::to_string_pretty(prefs).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // The app's own file: a failure to write it is reported (#342).
+    std::fs::create_dir_all(dir).map_err(|e| {
+        bridge::fault!("the folder of {FILE} cannot be made: {e}");
+        format!("{}: {e}", dir.display())
+    })?;
     // Replaced whole: a cut file would load as the defaults and silently turn
     // automatic updates back on (#62).
-    bridge::files::write_atomic(&dir.join(FILE), (text + "\n").as_bytes())
-        .map_err(|e| format!("{}: {e}", dir.join(FILE).display()))
+    bridge::files::write_atomic(&dir.join(FILE), (text + "\n").as_bytes()).map_err(|e| {
+        bridge::fault!("{FILE} cannot be saved: {e}");
+        format!("{}: {e}", dir.join(FILE).display())
+    })
 }
 
 #[cfg(test)]

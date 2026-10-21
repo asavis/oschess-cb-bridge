@@ -318,12 +318,21 @@ pub fn store_step(found: bool, silent: bool, mandatory: bool, asked: bool) -> St
 /// note by its file name alone: it goes to the log, which holds no path
 /// (#117).
 pub fn note(dir: &Path, version: &str) -> Result<(), String> {
-    std::fs::write(dir.join(NOTE), version).map_err(|e| format!("{NOTE}: {e}"))
+    write_note(dir, NOTE, version)
 }
 
 /// Notes in `dir` that a Store install starts from `running` (#153).
 pub fn note_from(dir: &Path, running: &str) -> Result<(), String> {
-    std::fs::write(dir.join(FROM), running).map_err(|e| format!("{FROM}: {e}"))
+    write_note(dir, FROM, running)
+}
+
+/// Writes the note `name` in `dir`. A note that cannot be written is the
+/// app's own failure, not the network's, and is reported (#342).
+fn write_note(dir: &Path, name: &str, text: &str) -> Result<(), String> {
+    std::fs::write(dir.join(name), text).map_err(|e| {
+        bridge::fault!("the note {name} cannot be written: {e}");
+        format!("{name}: {e}")
+    })
 }
 
 /// Removes the notes, after an install that did not take place.
@@ -345,7 +354,7 @@ pub fn updated(dir: &Path, running: &str) -> Option<String> {
     let last = std::fs::read_to_string(dir.join(LAST)).ok();
     forget(dir);
     // A start that cannot be recorded only costs the next update its notice.
-    let _ = std::fs::write(dir.join(LAST), running);
+    let _ = write_note(dir, LAST, running);
     let reached = to.is_some_and(|v| v.trim() == running);
     let moved = from.is_some_and(|v| !v.trim().is_empty() && v.trim() != running);
     let newer = last.is_some_and(|v| newer_than(running, v.trim()));
@@ -361,10 +370,40 @@ fn newer_than(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use bridge::catalog::State;
 
     use crate::status::testing::{self, view};
+
+    /// The failures `bridge::fault!` raised in this test binary from the
+    /// first call on, told apart by what their text names.
+    fn faults() -> Vec<String> {
+        static RAISED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        bridge::log::on_fault(|_, _, text| RAISED.lock().unwrap().push(text.into()));
+        RAISED.lock().unwrap().clone()
+    }
+
+    /// An update note that cannot be written is the app's own failure, not
+    /// the network's, and is reported (#342).
+    #[test]
+    fn a_note_that_cannot_be_written_is_reported() {
+        let dir = std::env::temp_dir().join(format!("bridge-notes-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in [NOTE, FROM] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        faults();
+        assert!(note(&dir, "1.2.3").is_err());
+        assert!(note_from(&dir, "1.2.2").is_err());
+        let raised = faults();
+        for name in [NOTE, FROM] {
+            let start = format!("the note {name} cannot be written: ");
+            assert!(raised.iter().any(|f| f.starts_with(&start)), "{name}: {raised:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A public key as `tauri signer generate` prints it, made here from an
     /// arbitrary key id and key.
