@@ -146,14 +146,22 @@ impl Drop for Filing {
 
 /// The code to quote, and whether a new report was filed for it.
 fn file_now(reporter: &Reporter, report: &Report) -> Option<(String, bool)> {
-    let by_hand = report.kind == Kind::Manual;
     // The switch is read under the filing lock that `turned_off` takes too:
     // a report either is filed before the outbox is emptied, or sees it off.
     let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
-    if !by_hand && !crate::prefs::load(&reporter.data).send_reports {
+    file_in(&reporter.data, report, || context(reporter))
+}
+
+/// Files `report` in the outbox of the data folder `data`, with the context
+/// `context` makes, as [`file_now`] and [`file_at_exit`] both do: not while
+/// reports are off, but for one by hand, and not again today for a failure
+/// already sent today by this version.
+fn file_in(data: &Path, report: &Report, context: impl FnOnce() -> Context) -> Option<(String, bool)> {
+    let by_hand = report.kind == Kind::Manual;
+    if !by_hand && !crate::prefs::load(data).send_reports {
         return None;
     }
-    let outbox = Outbox::in_data(&reporter.data);
+    let outbox = Outbox::in_data(data);
     let now = SystemTime::now();
     let day = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 86_400;
     let version = env!("CARGO_PKG_VERSION");
@@ -165,7 +173,7 @@ fn file_now(reporter: &Reporter, report: &Report) -> Option<(String, bool)> {
         bridge::log!("report: no randomness for its id: {e}");
         return None;
     }
-    let event = reports::event(report, &context(reporter), id, now);
+    let event = reports::event(report, &context(), id, now);
     if let Err(e) = outbox.put(&event, now) {
         bridge::log!("report: it cannot be filed: {e}");
         return None;
@@ -215,30 +223,27 @@ pub fn file_at_exit(report: Report) {
 
 fn file_at_exit_in(data: &Path, report: Report, transport: &dyn Transport) {
     let Some(dsn) = Dsn::parse(reports::DSN) else { return };
-    if !crate::prefs::load(data).send_reports {
-        return;
-    }
-    let context = match REPORTER.get() {
+    let context = || match REPORTER.get() {
         Some(reporter) => context(reporter),
         None => {
             let language = crate::prefs::load(data).language(system::display_language()).code();
             context_with(data, language, Duration::ZERO, Vec::new())
         }
     };
-    let mut id = [0u8; 16];
-    if let Err(e) = getrandom::fill(&mut id) {
-        bridge::log!("report: no randomness for its id: {e}");
+    let filed = match REPORTER.get() {
+        Some(reporter) => {
+            let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
+            file_in(data, &report, context)
+        }
+        None => file_in(data, &report, context),
+    };
+    // Sent today already, or reports off: nothing new goes.
+    if !matches!(filed, Some((_, true))) {
         return;
     }
-    let now = SystemTime::now();
-    let event = reports::event(&report, &context, id, now);
-    let outbox = Outbox::in_data(data);
-    if let Err(e) = outbox.put(&event, now) {
-        bridge::log!("report: it cannot be filed: {e}");
-        return;
-    }
-    bridge::log!("report {} filed: {}", event.code, report.kind.tag());
-    reports::deliver(&outbox, &dsn, env!("CARGO_PKG_VERSION"), transport, &|| true);
+    // Asked before each report goes, as the sender asks.
+    let automatic = || crate::prefs::load(data).send_reports;
+    reports::deliver(&Outbox::in_data(data), &dsn, env!("CARGO_PKG_VERSION"), transport, &automatic);
 }
 
 /// Posts what waits, then sleeps until a report is filed, or until the next
@@ -319,15 +324,24 @@ mod tests {
 
     use super::*;
 
-    /// Answers each post with `answer` and keeps what was posted.
+    /// Answers each post with `answer`, keeps what was posted, and runs
+    /// `then` after each post.
     struct Fake {
         answer: Result<u16, String>,
         posted: RefCell<Vec<String>>,
+        then: Box<dyn Fn()>,
+    }
+
+    impl Fake {
+        fn answering(answer: Result<u16, String>) -> Fake {
+            Fake { answer, posted: RefCell::default(), then: Box::new(|| {}) }
+        }
     }
 
     impl Transport for Fake {
         fn post(&self, _url: &str, _headers: &[String], body: &Path) -> Result<u16, String> {
             self.posted.borrow_mut().push(std::fs::read_to_string(body).unwrap());
+            (self.then)();
             self.answer.clone()
         }
     }
@@ -339,45 +353,61 @@ mod tests {
         dir
     }
 
-    fn failure() -> Report {
+    fn failure(fingerprint: &str) -> Report {
         Report {
             kind: Kind::Error,
             message: "the app cannot start: no tray".into(),
             tags: vec![],
-            fingerprint: "x:1".into(),
+            fingerprint: fingerprint.into(),
         }
     }
 
-    /// A start that fails files its report and sends it before the exit; one
-    /// that cannot go waits in the outbox for a later start; none is filed
-    /// with the reports turned off (#342).
+    /// A start that fails files its report and sends it before the exit,
+    /// once a day like any failure; one that cannot go waits in the outbox for
+    /// a later start; none is filed with the reports turned off (#342).
     #[test]
-    fn a_failed_start_is_filed_and_sent_before_the_exit() {
+    fn a_failed_start_is_filed_and_sent_before_the_exit_once_a_day() {
         let dir = folder("sent");
-        let fake = Fake { answer: Ok(200), posted: RefCell::default() };
-        file_at_exit_in(&dir, failure(), &fake);
+        let fake = Fake::answering(Ok(200));
+        file_at_exit_in(&dir, failure("x:1"), &fake);
+        file_at_exit_in(&dir, failure("x:1"), &fake);
         let posted = fake.posted.borrow();
-        assert_eq!(posted.len(), 1);
-        assert!(
-            posted[0].contains("the app cannot start: no tray") && posted[0].contains(r#""kind":"error""#),
-            "{}",
-            posted[0]
-        );
+        assert_eq!(posted.len(), 1, "the same failure goes once a day");
+        assert!(posted[0].contains("the app cannot start: no tray") && posted[0].contains(r#""kind":"error""#));
         assert!(Outbox::in_data(&dir).waiting().is_empty(), "sent, it is gone");
 
         let dir = folder("waits");
-        let offline = Fake { answer: Err("no answer".into()), posted: RefCell::default() };
-        file_at_exit_in(&dir, failure(), &offline);
+        file_at_exit_in(&dir, failure("x:1"), &Fake::answering(Err("no answer".into())));
         assert_eq!(Outbox::in_data(&dir).waiting().len(), 1, "it waits for the next start");
 
         let dir = folder("off");
-        let prefs = crate::prefs::Prefs { send_reports: false, ..Default::default() };
-        crate::prefs::save(&dir, &prefs).unwrap();
-        let unused = Fake { answer: Ok(200), posted: RefCell::default() };
-        file_at_exit_in(&dir, failure(), &unused);
+        crate::prefs::save(&dir, &crate::prefs::Prefs { send_reports: false, ..Default::default() }).unwrap();
+        let unused = Fake::answering(Ok(200));
+        file_at_exit_in(&dir, failure("x:1"), &unused);
         assert!(unused.posted.borrow().is_empty() && Outbox::in_data(&dir).waiting().is_empty());
         for name in ["sent", "waits", "off"] {
             let _ = std::fs::remove_dir_all(folder(name));
         }
+    }
+
+    /// Reports turned off while the exit sends what waits stop the rest, as
+    /// they stop the sender (#342).
+    #[test]
+    fn reports_turned_off_during_the_exits_sending_stop_it() {
+        let dir = folder("turned-off");
+        for n in 1..=2 {
+            file_in(&dir, &failure(&format!("waiting:{n}")), || context_with(&dir, "en", Duration::ZERO, vec![]));
+        }
+        let off = dir.clone();
+        let fake = Fake {
+            answer: Ok(200),
+            posted: RefCell::default(),
+            then: Box::new(move || {
+                crate::prefs::save(&off, &crate::prefs::Prefs { send_reports: false, ..Default::default() }).unwrap();
+            }),
+        };
+        file_at_exit_in(&dir, failure("x:2"), &fake);
+        assert_eq!(fake.posted.borrow().len(), 1, "only the post before reports were turned off");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
