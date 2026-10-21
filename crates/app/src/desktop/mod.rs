@@ -10,6 +10,7 @@ mod notices;
 mod package;
 mod reporting;
 mod server;
+mod session;
 mod store_updates;
 mod system;
 mod tray;
@@ -110,6 +111,8 @@ pub fn run() {
         // exited before this one touches the port.
         .setup(move |app| {
             let _busy = BUSY.mark("the start");
+            // First: an end of the session during the start ends the bridge too (#340).
+            session::start(app.handle());
             let started = Shared::start(strings);
             let shared = Arc::new(started.shared);
             app.manage(shared.clone());
