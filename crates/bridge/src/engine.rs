@@ -617,12 +617,11 @@ impl Inner {
             Some(p) => Ok(p),
             None => {
                 // The chosen engine answered as one when it was chosen: not now is a failure (#342).
-                let p = Process::start(&self.config, handshake).map_err(|NotStarted { why, reported }| {
+                let p = Process::start(&self.config, handshake).map_err(|NotStarted { why, reported, ended }| {
                     if !reported {
-                        crate::fault!(
-                            "the engine {} did not start as an engine: {why}",
-                            file_stem(&self.config.program)
-                        );
+                        let ended = ended.as_deref().unwrap_or("unknown");
+                        let program = file_stem(&self.config.program);
+                        crate::fault!("the engine {program} did not start as an engine: {why} ({ended})");
                     }
                     why
                 })?;

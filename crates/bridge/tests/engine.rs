@@ -254,6 +254,25 @@ fn an_engine_that_does_not_start_or_stops_is_reported() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A chosen engine that answers `uci` and exits when asked whether it is
+/// ready is reported with its exit status (#342).
+#[test]
+fn an_engine_that_exits_before_it_is_ready_is_reported_with_its_status() {
+    faults();
+    let id = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bridge-engine-unready-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("unready-{id}");
+    let engine = Engine::new(EngineConfig::new(fake_copy(&dir, &name), Some(1), Some(16)));
+    let (port, _bridge) = start(engine);
+    assert_eq!(warm(port, "threads=1&hash=16").0, 502);
+    let raised: Vec<String> = faults().into_iter().filter(|f| f.contains(&name)).collect();
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    let expected = format!("the engine {name} did not start as an engine: The engine did not get ready (exit");
+    assert!(raised[0].starts_with(&expected) && raised[0].ends_with("46)"), "{raised:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An engine that exits rather than stop when its client leaves, and one that
 /// exits while it waits for the next analysis, are reported with their exit
 /// status, the idle one before the idle limit lets it go; an engine that stops

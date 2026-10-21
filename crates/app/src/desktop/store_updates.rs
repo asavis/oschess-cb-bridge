@@ -44,7 +44,11 @@ fn text(e: windows::core::Error) -> String {
 
 /// Asks Windows to start the bridge again after it closes it for an install.
 fn register_restart() -> Result<(), String> {
-    unsafe { RegisterApplicationRestart(PCWSTR::null(), REGISTER_APPLICATION_RESTART_FLAGS(0)) }.map_err(text)
+    // Windows' own call, not the Store's or the network's: a failure is reported (#342).
+    unsafe { RegisterApplicationRestart(PCWSTR::null(), REGISTER_APPLICATION_RESTART_FLAGS(0)) }.map_err(|e| {
+        bridge::fault!("the restart after an install cannot be registered: {e}");
+        text(e)
+    })
 }
 
 /// Waits until a Store install would lose no work and Windows would start the

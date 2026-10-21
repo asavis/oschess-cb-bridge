@@ -10,7 +10,8 @@
 //! `chatty`, it answers `uci` with `id name` lines, never `uciok`, for as
 //! long as they can be written.
 //! Started under a name containing `silent`, it answers `uci` with nothing,
-//! and waits until its input ends.
+//! and waits until its input ends. Started under a name containing `unready`,
+//! it exits with 46 when it is asked whether it is ready.
 //!
 //! Its `nps` tells what it was set to (#58): `Threads` × 10⁹ + `Hash` × 10³ +
 //! how many `Threads` and `Hash` options it has been sent. Its `seldepth` is
@@ -62,6 +63,9 @@ fn main() {
                         say("uciok");
                     }
                     ["isready"] => {
+                        if std::env::args().next().is_some_and(|name| name.contains("unready")) {
+                            std::process::exit(46);
+                        }
                         say("readyok");
                     }
                     ["setoption", "name", "MultiPV", "value", n] => multipv = n.parse().unwrap_or(1),
