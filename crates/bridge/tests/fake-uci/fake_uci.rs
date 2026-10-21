@@ -4,7 +4,9 @@
 //!
 //! The moves of a position steer it: with `h2h3` among them it exits when it
 //! is told to search; with `a2a3` it ignores `stop`; with `b2b3` it writes one
-//! line and then nothing until it is stopped. Started under a name containing
+//! line and then nothing until it is stopped; with `d2d3` it exits with 43
+//! when it is told to stop; with `f2f3` it exits with 42 a moment after its
+//! best move, while it waits for the next search. Started under a name containing
 //! `chatty`, it answers `uci` with `id name` lines, never `uciok`, for as
 //! long as they can be written.
 //! Started under a name containing `silent`, it answers `uci` with nothing,
@@ -81,6 +83,7 @@ fn main() {
                         say("info string searching");
                         search = Some(Search::of(rest));
                     }
+                    ["stop"] if position.contains(" d2d3") => std::process::exit(43),
                     ["stop"] if !position.contains(" a2a3") => {
                         if search.take().is_some() {
                             say("bestmove e2e4 ponder e7e5");
@@ -124,6 +127,10 @@ fn main() {
                 let best = s.searchmoves.first().cloned().unwrap_or_else(|| "e2e4".into());
                 search = None;
                 say(&format!("bestmove {best} ponder e7e5"));
+                if position.contains(" f2f3") {
+                    std::thread::sleep(Duration::from_millis(50));
+                    std::process::exit(42);
+                }
             }
         }
     }

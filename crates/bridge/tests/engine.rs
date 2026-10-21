@@ -254,6 +254,51 @@ fn an_engine_that_does_not_start_or_stops_is_reported() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An engine that exits rather than stop when its client leaves, and one that
+/// exits while it waits for the next analysis, are reported with their exit
+/// status, the idle one before the idle limit lets it go; an engine that stops
+/// as asked is not (#342).
+#[test]
+fn an_engine_that_ends_when_stopped_or_while_idle_is_reported() {
+    faults();
+    let mine = |name: &str| faults().into_iter().filter(|f| f.contains(name)).collect::<Vec<_>>();
+    let id = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bridge-engine-ends-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let stopping = format!("stopping-{id}");
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(fake_copy(&dir, &stopping), Some(1), Some(16))));
+    let mut a = Analysis::open(port, "stream=tab1");
+    assert!(a.line().unwrap().starts_with(r#"{"info":"#));
+    drop(a);
+    let mut b = Analysis::open(port, "depth=2&stream=tab1");
+    assert_eq!(b.rest().last().unwrap(), BEST);
+    assert!(mine(&stopping).is_empty(), "a stop as asked is no failure: {:?}", mine(&stopping));
+    let mut c = Analysis::open(port, "moves=d2d3&stream=tab1");
+    assert!(c.line().unwrap().starts_with(r#"{"info":"#));
+    drop(c);
+    until("the failed stop is reported", WAIT_LIMIT, || !mine(&stopping).is_empty());
+    let raised = mine(&stopping);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(
+        raised[0].starts_with(&format!("the engine {stopping} did not stop when its client left: exit")),
+        "{raised:?}"
+    );
+    assert!(raised[0].ends_with("43"), "{raised:?}");
+
+    let idle = format!("idle-{id}");
+    let config = EngineConfig::new(fake_copy(&dir, &idle), Some(1), Some(16));
+    let (port, bridge) = start(Engine::with_idle(config, Duration::from_millis(300)));
+    let mut a = Analysis::open(port, "moves=f2f3&depth=1&stream=tab1");
+    assert_eq!(a.rest().last().unwrap(), BEST);
+    until("the idle limit lets the engine go", WAIT_LIMIT, || !bridge.app.engine.is_running());
+    let raised = mine(&idle);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(raised[0].starts_with(&format!("the engine {idle} had stopped between analyses: exit")), "{raised:?}");
+    assert!(raised[0].ends_with("42"), "{raised:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_engine_that_ignores_stop_is_replaced() {
     let (port, _bridge) = start(Engine::new(fake()));

@@ -54,23 +54,75 @@ macro_rules! fault {
 /// it, and its line as the log has it.
 type FaultSink = Box<dyn Fn(&str, u32, &str) + Send + Sync>;
 
-static FAULTS: OnceLock<FaultSink> = OnceLock::new();
+/// A failure [`fault!`] raised: its source file, line and text.
+type Raised = (&'static str, u32, String);
 
-/// Sets what [`fault!`] hands its failures to; only the first call sets it.
-/// The sink runs on the thread that raised the failure, under whatever locks
-/// that thread holds, so it only queues.
+/// The failures most kept while no sink is set; later ones are logged alone.
+const EARLY_FAULTS: usize = 32;
+
+/// Where [`fault!`] hands its failures: the sink once set, and until then the
+/// failures raised before it, such as those of the bridge's start, which runs
+/// before the app's reports do.
+struct Faults {
+    sink: OnceLock<FaultSink>,
+    early: Mutex<Vec<Raised>>,
+}
+
+impl Faults {
+    const fn new() -> Faults {
+        Faults { sink: OnceLock::new(), early: Mutex::new(Vec::new()) }
+    }
+
+    fn raise(&self, file: &'static str, line: u32, text: String) {
+        if self.sink.get().is_none() {
+            // Checked again under the lock that `set` takes: a failure is
+            // kept for the sink, or the sink is there to take it.
+            let mut early = lock(&self.early);
+            if self.sink.get().is_none() {
+                if early.len() < EARLY_FAULTS {
+                    early.push((file, line, text));
+                }
+                return;
+            }
+        }
+        if let Some(sink) = self.sink.get() {
+            sink(file, line, &text);
+        }
+    }
+
+    /// Sets the sink, if none is, and hands it the failures raised before.
+    fn set(&self, sink: FaultSink) {
+        let waiting = {
+            let mut early = lock(&self.early);
+            if self.sink.set(sink).is_err() {
+                return;
+            }
+            std::mem::take(&mut *early)
+        };
+        if let Some(sink) = self.sink.get() {
+            for (file, line, text) in waiting {
+                sink(file, line, &text);
+            }
+        }
+    }
+}
+
+static FAULTS: Faults = Faults::new();
+
+/// Sets what [`fault!`] hands its failures to, and hands it those raised
+/// before; only the first call sets it. The sink runs on the thread that
+/// raised the failure, under whatever locks that thread holds, so it only
+/// queues.
 pub fn on_fault(sink: impl Fn(&str, u32, &str) + Send + Sync + 'static) {
-    let _ = FAULTS.set(Box::new(sink));
+    FAULTS.set(Box::new(sink));
 }
 
 /// Writes the line of a failure raised at `file`:`line` and hands it to the
-/// sink, if one is set. Called by [`fault!`].
-pub fn fault(file: &str, line: u32, message: fmt::Arguments<'_>) {
+/// sink, or keeps it for the sink to come. Called by [`fault!`].
+pub fn fault(file: &'static str, line: u32, message: fmt::Arguments<'_>) {
     let text = message.to_string();
     write(format_args!("{text}"));
-    if let Some(sink) = FAULTS.get() {
-        sink(file, line, &text);
-    }
+    FAULTS.raise(file, line, text);
 }
 
 /// Sends the lines from now on to `bridge.log` in `dir` as well, making the
@@ -358,6 +410,27 @@ mod tests {
         assert!(time.len() == 20 && time.ends_with('Z'), "{time}");
         drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failure raised before the sink is set reaches it once it is: the
+    /// bridge's start runs before the app's reports (#342). Past the bound,
+    /// the earliest are kept.
+    #[test]
+    fn a_fault_raised_before_the_sink_reaches_it_when_it_is_set() {
+        let faults = Faults::new();
+        for n in 0..EARLY_FAULTS + 3 {
+            faults.raise("src/start.rs", 7, format!("early {n}"));
+        }
+        let got = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let into = std::sync::Arc::clone(&got);
+        faults.set(Box::new(move |file, line, text| lock(&into).push(format!("{file}:{line} {text}"))));
+        faults.raise("src/engine.rs", 9, "later".into());
+        let got = lock(&got).clone();
+        assert_eq!(got.len(), EARLY_FAULTS + 1);
+        assert_eq!(got[0], "src/start.rs:7 early 0");
+        assert_eq!(got[EARLY_FAULTS - 1], format!("src/start.rs:7 early {}", EARLY_FAULTS - 1));
+        assert_eq!(got[EARLY_FAULTS], "src/engine.rs:9 later");
+        assert!(lock(&faults.early).is_empty());
     }
 
     /// A failure goes to the sink with where it was raised (#342); a plain

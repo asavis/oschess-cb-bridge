@@ -601,10 +601,8 @@ impl Inner {
     /// start.
     fn process<'a>(&self, slot: &'a mut Option<Process>, handshake: Duration) -> Result<&'a mut Process, String> {
         if let Some(p) = slot.as_mut()
-            && !p.alive()
+            && ended_while_idle(p)
         {
-            let ended = p.ended();
-            crate::fault!("the engine {} had stopped between analyses: {ended}", p.program);
             *slot = None;
         }
         match slot {
@@ -634,7 +632,11 @@ impl Inner {
 
     fn end_if_idle(&self) {
         let Ok(mut slot) = self.slot.try_lock() else { return };
-        if slot.as_ref().is_some_and(|p| p.used.elapsed() >= self.idle) {
+        if let Some(p) = slot.as_mut()
+            && p.used.elapsed() >= self.idle
+        {
+            // An engine that ended on its own is reported before it is let go.
+            ended_while_idle(p);
             *slot = None;
         }
     }
@@ -676,15 +678,37 @@ impl Inner {
                 }
             }
             if self.turn.load(Ordering::SeqCst) != ticket {
-                let outcome = p.stop();
+                let outcome = stop(p, "for a newer analysis");
                 self.superseded(stream, sink);
                 return outcome;
             }
             if sink.gone() || pacer.tick(sink).is_err() {
-                return p.stop();
+                return stop(p, "when its client left");
             }
         }
     }
+}
+
+/// Whether `p`'s process ended on its own while it waited for an analysis,
+/// which is reported with how it ended (#342).
+fn ended_while_idle(p: &mut Process) -> bool {
+    if p.alive() {
+        return false;
+    }
+    let ended = p.ended();
+    crate::fault!("the engine {} had stopped between analyses: {ended}", p.program);
+    true
+}
+
+/// Stops `p`'s search `when` it is no longer wanted. An engine that does not
+/// stop as asked is let go, and reported with how it ended (#342).
+fn stop(p: &mut Process, when: &str) -> Outcome {
+    let outcome = p.stop();
+    if outcome == Outcome::Lost {
+        let ended = p.ended();
+        crate::fault!("the engine {} did not stop {when}: {ended}", p.program);
+    }
+    outcome
 }
 
 /// Whether `program` is a UCI engine: runs its handshake within the usual

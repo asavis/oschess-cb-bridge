@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::tools::{QUIET, run, system_tool};
+use crate::tools::{QUIET, run, run_coded, system_tool};
 use crate::{folders, sha256};
 
 /// A processor architecture Stockfish publishes a Windows build for.
@@ -433,6 +433,13 @@ fn stockfish_major(text: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Whether curl's exit `code` is a refusal of its own rather than the
+/// network's, and so reported (#342): 63, more than the pinned size came,
+/// and 23, the file could not be written (#289).
+fn refused_by_curl(code: Option<i32>) -> bool {
+    matches!(code, Some(23 | 63))
+}
+
 /// The system's own tools: `curl.exe` and `tar.exe`, part of Windows 10 and 11,
 /// called by their full paths so that no other program on the path answers.
 pub struct System;
@@ -450,7 +457,12 @@ impl Transport for System {
             .arg("--output")
             .arg(folders::outside(to))
             .arg(url);
-        run(curl, "curl.exe", "The download failed", QUIET).map(drop)
+        run_coded(curl, "curl.exe", "The download failed", QUIET).map(drop).map_err(|(code, why)| {
+            if refused_by_curl(code) {
+                crate::fault!("the Stockfish download was refused: {why}");
+            }
+            why
+        })
     }
 
     fn extract(&self, zip: &Path, members: &[String], to: &Path) -> Result<(), String> {
@@ -574,6 +586,16 @@ mod tests {
             assert_eq!(licence(&dir, bad), None, "{bad:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// curl's refusals of its own are reported; the network's are not (#342).
+    #[test]
+    fn only_curls_own_refusals_are_reported() {
+        assert!(refused_by_curl(Some(63)), "more than the pinned size");
+        assert!(refused_by_curl(Some(23)), "the file could not be written");
+        for network in [None, Some(6), Some(7), Some(22), Some(28), Some(35), Some(56)] {
+            assert!(!refused_by_curl(network), "{network:?}");
+        }
     }
 
     /// A download that does not match its pin is refused and reported (#342).
