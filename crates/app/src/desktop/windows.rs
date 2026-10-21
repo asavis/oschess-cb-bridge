@@ -41,7 +41,7 @@ pub fn translate_window(window: &WebviewWindow, strings: &Strings) {
         _ => return,
     };
     if let Err(e) = window.set_title(title) {
-        bridge::log!("the {} window's title: {e}", window.label());
+        bridge::fault!("the {} window's title: {e}", window.label());
     }
 }
 
@@ -120,7 +120,7 @@ fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
         failed_to_open(&watched, label, stage, &line);
     });
     if let Err(e) = spawned {
-        bridge::log!("the {label} window is not watched: {e}");
+        bridge::fault!("the {label} window is not watched: {e}");
     }
 }
 
@@ -184,7 +184,7 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
     let Some(window) = app.get_webview_window(FLYOUT) else { return };
     if window.is_visible().unwrap_or(false) {
         if let Err(e) = window.hide() {
-            bridge::log!("the flyout cannot be hidden: {e}");
+            bridge::fault!("the flyout cannot be hidden: {e}");
         }
         return;
     }
@@ -202,7 +202,7 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
     };
     place(&window, anchor);
     if let Err(e) = window.show().and_then(|()| window.set_focus()) {
-        bridge::log!("the flyout cannot be shown: {e}");
+        bridge::fault!("the flyout cannot be shown: {e}");
     }
 }
 
@@ -211,7 +211,7 @@ pub fn fit_flyout(app: &AppHandle, height: f64) {
     let Some(window) = app.get_webview_window(FLYOUT) else { return };
     let height = height.clamp(160.0, 720.0);
     if let Err(e) = window.set_size(tauri::LogicalSize::new(FLYOUT_WIDTH, height)) {
-        bridge::log!("the flyout cannot be sized: {e}");
+        bridge::fault!("the flyout cannot be sized: {e}");
     }
     let anchor = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).anchor;
     place(&window, anchor);
@@ -221,7 +221,7 @@ pub fn hide_flyout(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(FLYOUT)
         && let Err(e) = window.hide()
     {
-        bridge::log!("the flyout cannot be hidden: {e}");
+        bridge::fault!("the flyout cannot be hidden: {e}");
     }
 }
 
@@ -241,7 +241,7 @@ fn place(window: &WebviewWindow, anchor: Option<(f64, f64, f64, f64)>) {
     let fx = (cx - fw / 2.0).clamp(left + margin, (left + width - fw - margin).max(left + margin));
     let fy = if cy > top + height / 2.0 { top + height - fh - margin } else { top + margin };
     if let Err(e) = window.set_position(PhysicalPosition::new(fx.round() as i32, fy.round() as i32)) {
-        bridge::log!("the flyout cannot be placed: {e}");
+        bridge::fault!("the flyout cannot be placed: {e}");
     }
 }
 
@@ -270,14 +270,14 @@ pub fn open_settings(app: &AppHandle, section: &str) {
     match shown {
         Ok(()) => {
             if let Err(e) = window.emit_to(SETTINGS, "section", section) {
-                bridge::log!("the settings window's section: {e}");
+                bridge::fault!("the settings window's section: {e}");
             }
         }
         Err(e) => {
-            bridge::log!("the settings window cannot be brought forward, so it is built again: {e}");
+            bridge::fault!("the settings window cannot be brought forward, so it is built again: {e}");
             match window.destroy() {
                 Ok(()) => build_when_gone(app, spec),
-                Err(e) => bridge::log!("the settings window cannot be destroyed: {e}"),
+                Err(e) => bridge::fault!("the settings window cannot be destroyed: {e}"),
             }
         }
     }
@@ -333,7 +333,7 @@ fn build_when_gone(app: &AppHandle, spec: Spec) {
         let start = Instant::now();
         while app.get_webview_window(spec.label).is_some() {
             if start.elapsed() > GONE_WAIT {
-                bridge::log!(
+                bridge::fault!(
                     "the {} window is still there {} s after it was destroyed",
                     spec.label,
                     GONE_WAIT.as_secs()
@@ -345,7 +345,7 @@ fn build_when_gone(app: &AppHandle, spec: Spec) {
         spawn_window(&app, spec);
     });
     if let Err(e) = spawned {
-        bridge::log!("the {label} window is not built again: {e}");
+        bridge::fault!("the {label} window is not built again: {e}");
     }
 }
 
@@ -369,7 +369,7 @@ pub fn on_event(window: &Window, event: &WindowEvent) {
         WindowEvent::Destroyed => shared(window.app_handle()).openings.closed(window.label()),
         WindowEvent::Focused(false) if window.label() == FLYOUT => {
             if let Err(e) = window.hide() {
-                bridge::log!("the flyout cannot be hidden: {e}");
+                bridge::fault!("the flyout cannot be hidden: {e}");
             }
             let shared = shared(window.app_handle());
             shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).hidden_at = Some(Instant::now());

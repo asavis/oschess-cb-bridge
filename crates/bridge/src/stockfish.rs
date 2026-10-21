@@ -300,34 +300,53 @@ pub fn install(
     clean();
     let result = (|| {
         download_with_progress(transport, build, &zip, progress)?;
-        progress(Progress::Checking);
-        // The length first: a wrong one is refused before any hashing.
-        let size = std::fs::metadata(&zip).map_err(|e| e.to_string())?.len();
-        if size != build.size {
-            return Err(format!("The download does not match the pinned build: {size} bytes, expected {}", build.size));
+        // A download can fail with the network; what follows should not, so
+        // its failure is reported (#342).
+        let installed = check_and_commit(data, build, transport, &zip, &staging, progress);
+        if let Err(e) = &installed {
+            crate::fault!("Stockfish {} was downloaded and not installed: {e}", build.version);
         }
-        let digest = sha256::hex(&sha256::file(&zip).map_err(|e| e.to_string())?);
-        if digest != *build.sha256 {
-            return Err(format!(
-                "The download does not match the pinned build: SHA-256 {digest}, expected {}",
-                build.sha256
-            ));
-        }
-        progress(Progress::Unpacking);
-        std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-        let members = [format!("stockfish/{}", build.exe), format!("stockfish/{LICENCE}")];
-        transport.extract(&zip, &members, &staging)?;
-        // Both files are there before anything is installed.
-        for name in [build.exe, LICENCE] {
-            if !staging.join("stockfish").join(name).is_file() {
-                return Err(format!("The archive has no stockfish/{name}"));
-            }
-        }
-        commit(&staging.join("stockfish"), &build.dir(data))?;
-        Ok(build.installed(data))
+        installed
     })();
     clean();
     result
+}
+
+/// Checks the downloaded `zip` against `build`'s pin, unpacks it into
+/// `staging` and puts the build in place in the data folder `data`.
+fn check_and_commit(
+    data: &Path,
+    build: &Build,
+    transport: &dyn Transport,
+    zip: &Path,
+    staging: &Path,
+    progress: &mut (dyn FnMut(Progress) + Send),
+) -> Result<PathBuf, String> {
+    progress(Progress::Checking);
+    // The length first: a wrong one is refused before any hashing.
+    let size = std::fs::metadata(zip).map_err(|e| e.to_string())?.len();
+    if size != build.size {
+        return Err(format!("The download does not match the pinned build: {size} bytes, expected {}", build.size));
+    }
+    let digest = sha256::hex(&sha256::file(zip).map_err(|e| e.to_string())?);
+    if digest != *build.sha256 {
+        return Err(format!(
+            "The download does not match the pinned build: SHA-256 {digest}, expected {}",
+            build.sha256
+        ));
+    }
+    progress(Progress::Unpacking);
+    std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
+    let members = [format!("stockfish/{}", build.exe), format!("stockfish/{LICENCE}")];
+    transport.extract(zip, &members, staging)?;
+    // Both files are there before anything is installed.
+    for name in [build.exe, LICENCE] {
+        if !staging.join("stockfish").join(name).is_file() {
+            return Err(format!("The archive has no stockfish/{name}"));
+        }
+    }
+    commit(&staging.join("stockfish"), &build.dir(data))?;
+    Ok(build.installed(data))
 }
 
 /// Puts the unpacked folder `from` in place of `dir`: by renaming, so that a
@@ -557,12 +576,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A download that does not match its pin is refused and reported (#342).
     #[test]
     fn refuses_a_download_that_does_not_match_and_leaves_nothing() {
         let dir = data("tampered");
+        crate::log::testing::faults();
         for archive in [&b"hello World"[..], b"hello world!"] {
             let error = install(&dir, &TEST_BUILD, &fake(archive), &mut |_| {}).unwrap_err();
             assert!(error.contains("does not match"), "{error}");
+            let raised = crate::log::testing::faults();
+            assert!(raised.iter().any(|f| f.2.ends_with(&format!("was downloaded and not installed: {error}"))));
             assert!(!TEST_BUILD.dir(&dir).exists());
             assert_eq!(std::fs::read_dir(dir.join("engines")).unwrap().count(), 0);
         }

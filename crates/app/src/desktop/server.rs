@@ -173,7 +173,7 @@ fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
             (Some(running), view, first_run)
         }
         Err(e) => {
-            bridge::log!("the bridge cannot start: no server thread: {e}");
+            bridge::fault!("the bridge cannot start: no server thread: {e}");
             (None, failed(port, format!("no server thread: {e}")), false)
         }
     }

@@ -29,7 +29,7 @@ use crate::json::{self, Obj};
 use crate::machine;
 use crate::sync::lock;
 
-use uci::{Pacer, Process, bestmove, info_json};
+use uci::{NotStarted, Pacer, Process, bestmove, info_json};
 
 /// How often an engine that follows `bridge.toml` looks at the file.
 pub const CONFIG_POLL: Duration = Duration::from_secs(1);
@@ -540,6 +540,8 @@ impl Engine {
         let threads = search.threads.unwrap_or(inner.config.threads);
         let hash_mb = search.hash_mb.unwrap_or(inner.config.hash_mb);
         if !p.sync(threads, hash_mb, None).unwrap_or(false) {
+            let ended = p.ended();
+            crate::fault!("the engine {} did not get ready for a warm-up: {ended}", p.program);
             *slot = None;
             return Warmed::Failed("the engine did not say it is ready".into());
         }
@@ -598,13 +600,26 @@ impl Inner {
     /// `/v1/status`; one that has exited is replaced. Why a new one did not
     /// start.
     fn process<'a>(&self, slot: &'a mut Option<Process>, handshake: Duration) -> Result<&'a mut Process, String> {
-        if slot.as_mut().is_some_and(|p| !p.alive()) {
+        if let Some(p) = slot.as_mut()
+            && !p.alive()
+        {
+            let ended = p.ended();
+            crate::fault!("the engine {} had stopped between analyses: {ended}", p.program);
             *slot = None;
         }
         match slot {
             Some(p) => Ok(p),
             None => {
-                let p = Process::start(&self.config, handshake)?;
+                // The chosen engine answered as one when it was chosen: not now is a failure (#342).
+                let p = Process::start(&self.config, handshake).map_err(|NotStarted { why, ran }| {
+                    if ran {
+                        crate::fault!(
+                            "the engine {} did not start as an engine: {why}",
+                            file_stem(&self.config.program)
+                        );
+                    }
+                    why
+                })?;
                 *lock(&self.name) = Some(p.name.clone());
                 Ok(slot.insert(p))
             }
@@ -625,20 +640,22 @@ impl Inner {
     }
 
     fn run(&self, p: &mut Process, search: &Search, ticket: u64, stream: &str, sink: &mut dyn Sink) -> Outcome {
-        let exited = |sink: &mut dyn Sink| {
+        let exited = |p: &mut Process, sink: &mut dyn Sink, when: &str| {
+            let ended = p.ended();
+            crate::fault!("the engine {} stopped {when}: {ended}", p.program);
             let _ = sink.line(&error_line("engine_exited", "The engine stopped"));
             Outcome::Lost
         };
         let threads = search.threads.unwrap_or(self.config.threads);
         let hash_mb = search.hash_mb.unwrap_or(self.config.hash_mb);
         if !p.sync(threads, hash_mb, Some(search)).unwrap_or(false) {
-            return exited(sink);
+            return exited(p, sink, "before an analysis, not ready");
         }
         if let Some(acknowledgement) = search.acknowledgement() {
             let _ = sink.line(&acknowledgement);
         }
         if p.send(&search.go()).is_err() {
-            return exited(sink);
+            return exited(p, sink, "as an analysis began");
         }
         let mut pacer = Pacer::new();
         loop {
@@ -655,7 +672,7 @@ impl Inner {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     let _ = pacer.flush(sink);
-                    return exited(sink);
+                    return exited(p, sink, "during an analysis");
                 }
             }
             if self.turn.load(Ordering::SeqCst) != ticket {
@@ -679,7 +696,7 @@ pub fn probe(program: &Path) -> Result<String, String> {
 /// [`probe`] with `handshake` in place of [`HANDSHAKE`] (tests).
 pub fn probe_within(program: &Path, handshake: Duration) -> Result<String, String> {
     let config = EngineConfig { program: program.to_path_buf(), threads: 1, hash_mb: 16 };
-    Process::start(&config, handshake).map(|p| p.name.clone())
+    Process::start(&config, handshake).map(|p| p.name.clone()).map_err(|e| e.why)
 }
 
 fn file_stem(path: &Path) -> String {

@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge::api::App;
@@ -219,6 +219,39 @@ fn a_crashed_engine_ends_the_stream_and_starts_again() {
     assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_exited"}"#), "{lines:?}");
     let mut b = Analysis::open(port, "depth=2&stream=tab1");
     assert_eq!(b.rest().last().unwrap(), BEST);
+}
+
+/// The failures `bridge::fault!` raised in this test binary (#342), from the
+/// first call on: a test calls it before it acts, and tells its own failures
+/// by the engine's file name.
+fn faults() -> Vec<String> {
+    static RAISED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    bridge::log::on_fault(|_, _, text| RAISED.lock().unwrap().push(text.into()));
+    RAISED.lock().unwrap().clone()
+}
+
+/// An engine whose program does not start, and one that stops in the middle
+/// of an analysis, are failures the bridge reports (#342), with why.
+#[test]
+fn an_engine_that_does_not_start_or_stops_is_reported() {
+    faults();
+    let raised = |prefix: &str| faults().iter().any(|f| f.starts_with(prefix));
+    let id = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bridge-engine-faults-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let missing = dir.join(format!("missing-{id}{}", std::env::consts::EXE_SUFFIX));
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(missing, Some(1), Some(16))));
+    let lines = Analysis::open(port, "depth=1&stream=tab1").rest();
+    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_failed"}"#), "{lines:?}");
+    assert!(raised(&format!("the engine missing-{id} did not start: ")), "{:?}", faults());
+
+    let crashing = fake_copy(&dir, &format!("crashing-{id}"));
+    let (port, _bridge) = start(Engine::new(EngineConfig::new(crashing, Some(1), Some(16))));
+    let lines = Analysis::open(port, "moves=h2h3&stream=tab1").rest();
+    assert!(has_members(lines.last().unwrap(), r#""error":{"code":"engine_exited"}"#), "{lines:?}");
+    assert!(raised(&format!("the engine crashing-{id} stopped during an analysis: exit")), "{:?}", faults());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

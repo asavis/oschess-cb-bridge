@@ -199,7 +199,7 @@ fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
         }
     });
     if let Err(e) = spawned {
-        bridge::log!("no status thread: {e}");
+        bridge::fault!("no status thread: {e}");
     }
 }
 

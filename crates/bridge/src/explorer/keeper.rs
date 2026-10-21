@@ -90,7 +90,7 @@ pub fn start(app: &Arc<App>) {
             }
         });
     if let Err(e) = spawned {
-        crate::log!("cannot start the keeper of the position indexes: {e}");
+        crate::fault!("cannot start the keeper of the position indexes: {e}");
     }
 }
 

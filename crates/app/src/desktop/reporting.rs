@@ -1,9 +1,12 @@
 //! Sending the failure reports (#333, `crate::reports`). [`file`] puts a
 //! report in the outbox and wakes the sender, a thread of its own that posts
 //! it with the system's `curl.exe`. Neither the event loop nor WebView2 takes
-//! part, so a report leaves when they are what failed.
+//! part, so a report leaves when they are what failed. A failure
+//! `bridge::fault!` raises (#342) waits in [`FAULTS`] and is filed by the
+//! sender itself.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +15,7 @@ use tauri::AppHandle;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use super::{alerts, channel, shared, system};
+use crate::diagnostics;
 use crate::reports::{self, Context, Dsn, Kind, Outbox, Report, Transport};
 
 /// How long the sender sleeps when nothing waits; a report filed meanwhile
@@ -30,6 +34,16 @@ struct Reporter {
 }
 
 static REPORTER: OnceLock<Reporter> = OnceLock::new();
+
+/// The failures `bridge::fault!` raised that wait for the sender. A failure
+/// can be raised under a lock that a report's context takes, such as the
+/// status the view reads, so the thread that raised it only queues it, and
+/// the sender files it holding nothing.
+static FAULTS: Mutex<VecDeque<Report>> = Mutex::new(VecDeque::new());
+
+/// The most failures that wait; more are logged and not reported. One failure
+/// goes once a day per version, so only many different ones fill it.
+const MAX_FAULTS: usize = 32;
 
 thread_local! {
     /// This thread is filing a report: a panic while it does reports nothing,
@@ -53,6 +67,7 @@ pub fn start(app: &AppHandle) {
     if REPORTER.set(reporter).is_err() {
         return;
     }
+    bridge::log::on_fault(raise);
     if let Err(e) = std::thread::Builder::new().name("reports".into()).spawn(send) {
         bridge::log!("report: no sender: {e}");
     }
@@ -89,6 +104,28 @@ pub fn file(report: Report) -> Option<String> {
         wake.notify_one();
     }
     Some(code)
+}
+
+/// Queues the failure `bridge::fault!` raised at `file`:`line` and wakes the
+/// sender. Called on the thread that raised it.
+fn raise(file: &str, line: u32, text: &str) {
+    let Some(reporter) = REPORTER.get() else { return };
+    let report = Report {
+        kind: Kind::Error,
+        message: text.to_string(),
+        tags: vec![],
+        fingerprint: format!("{}:{line}", diagnostics::source_file(file)),
+    };
+    {
+        let mut waiting = FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.len() >= MAX_FAULTS {
+            return;
+        }
+        waiting.push_back(report);
+    }
+    let (filed, wake) = &reporter.filed;
+    *filed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    wake.notify_one();
 }
 
 /// This thread files a report while it is held; released when dropped, a
@@ -168,6 +205,13 @@ fn send() {
     let outbox = Outbox::in_data(&reporter.data);
     let mut failures = 0;
     loop {
+        // The failures raised meanwhile, filed here, where no lock is held.
+        loop {
+            let next = FAULTS.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            let Some(report) = next else { break };
+            let _filing = Filing::enter();
+            file_now(reporter, &report);
+        }
         // Asked before each report goes: turned off, only reports sent by hand go.
         let automatic = || crate::prefs::load(&reporter.data).send_reports;
         let waits = reports::deliver(&outbox, &reporter.dsn, env!("CARGO_PKG_VERSION"), &Curl, &automatic);

@@ -13,7 +13,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sync::lock;
@@ -36,6 +36,41 @@ macro_rules! log {
     ($($arg:tt)*) => {
         $crate::log::write(format_args!($($arg)*))
     };
+}
+
+/// Writes a line for a failure that should not happen while the bridge works
+/// normally (#342), as [`log!`] does, and hands it to the sink [`on_fault`]
+/// set, which the app reports: `fault!("the engine did not start: {e}")`. A
+/// failure that ordinary conditions explain, such as no network or a busy
+/// database, stays a [`log!`] line.
+#[macro_export]
+macro_rules! fault {
+    ($($arg:tt)*) => {
+        $crate::log::fault(file!(), line!(), format_args!($($arg)*))
+    };
+}
+
+/// What [`fault!`] hands each failure to: the source file and line that raised
+/// it, and its line as the log has it.
+type FaultSink = Box<dyn Fn(&str, u32, &str) + Send + Sync>;
+
+static FAULTS: OnceLock<FaultSink> = OnceLock::new();
+
+/// Sets what [`fault!`] hands its failures to; only the first call sets it.
+/// The sink runs on the thread that raised the failure, under whatever locks
+/// that thread holds, so it only queues.
+pub fn on_fault(sink: impl Fn(&str, u32, &str) + Send + Sync + 'static) {
+    let _ = FAULTS.set(Box::new(sink));
+}
+
+/// Writes the line of a failure raised at `file`:`line` and hands it to the
+/// sink, if one is set. Called by [`fault!`].
+pub fn fault(file: &str, line: u32, message: fmt::Arguments<'_>) {
+    let text = message.to_string();
+    write(format_args!("{text}"));
+    if let Some(sink) = FAULTS.get() {
+        sink(file, line, &text);
+    }
 }
 
 /// Sends the lines from now on to `bridge.log` in `dir` as well, making the
@@ -185,6 +220,19 @@ pub(crate) mod testing {
             *lock(&super::FILE) = None;
         }
     }
+
+    /// A failure `fault!` raised: its source file, line and text.
+    pub(crate) type Raised = (String, u32, String);
+
+    static RAISED: Mutex<Vec<Raised>> = Mutex::new(Vec::new());
+
+    /// The failures `fault!` raised in this test binary since its first call,
+    /// which sets the sink: a test calls it before it acts, and again after,
+    /// and tells its own failures by what their text names.
+    pub(crate) fn faults() -> Vec<Raised> {
+        super::on_fault(|file, line, text| lock(&RAISED).push((file.into(), line, text.into())));
+        lock(&RAISED).clone()
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +358,22 @@ mod tests {
         assert!(time.len() == 20 && time.ends_with('Z'), "{time}");
         drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failure goes to the sink with where it was raised (#342); a plain
+    /// line does not.
+    #[test]
+    fn a_fault_reaches_the_sink_with_its_place_and_a_log_line_does_not() {
+        let before = testing::faults().len();
+        let token = format!("fault-{}", std::process::id());
+        crate::log!("{token}: a plain line");
+        let line = line!() + 1;
+        crate::fault!("{token}: a failure {}", 7);
+        let raised: Vec<_> = testing::faults().into_iter().skip(before).filter(|f| f.2.starts_with(&token)).collect();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let (file, at, text) = &raised[0];
+        assert!(file.replace('\\', "/").ends_with("src/log.rs"), "{file}");
+        assert_eq!((*at, text.as_str()), (line, format!("{token}: a failure 7").as_str()));
     }
 
     #[test]

@@ -30,7 +30,7 @@ fn later(title: &str, text: &str, icon: MESSAGEBOX_STYLE) {
         show(&title, &text, MB_OK | icon);
     });
     if let Err(e) = spawned {
-        bridge::log!("no message: {e}");
+        bridge::fault!("no message: {e}");
     }
 }
 

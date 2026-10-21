@@ -485,7 +485,7 @@ pub(crate) fn search_error(app: &App, entry: &Entry, generation: u64, e: SearchE
         SearchError::Read(e) => internal(&entry.id, &e),
         SearchError::IndexDamaged => explorer::rebuilding(app, entry),
         SearchError::Bug(what) => {
-            crate::log!("internal error on database {}: a bug: {what}", entry.id);
+            crate::fault!("internal error on database {}: a bug: {what}", entry.id);
             error(500, "internal", &format!("a bug: {what}"))
         }
     }
@@ -504,7 +504,7 @@ pub(crate) fn unsupported_qualifier(qualifier: &str) -> Response {
 /// out of both (#117, #173).
 fn internal(id: &str, e: &Error) -> Response {
     let why = crate::log::error(e);
-    crate::log!("internal error on database {id}: {why}");
+    crate::fault!("internal error on database {id}: {why}");
     error(500, "internal", &why)
 }
 

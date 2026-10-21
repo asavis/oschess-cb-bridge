@@ -55,6 +55,6 @@ pub fn start(app: &AppHandle) {
         }
     });
     if let Err(e) = spawned {
-        bridge::log!("the event loop is not watched: {e}");
+        bridge::fault!("the event loop is not watched: {e}");
     }
 }

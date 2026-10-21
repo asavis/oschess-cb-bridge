@@ -86,7 +86,7 @@ pub fn start(app: &AppHandle) {
         }
     });
     if let Err(e) = spawned {
-        bridge::log!("no update thread: {e}");
+        bridge::fault!("no update thread: {e}");
     }
 }
 
@@ -100,7 +100,7 @@ pub fn look_now(app: &AppHandle) -> Progress {
     let _ = app.emit("update-progress", &started);
     let worker_app = app.clone();
     if let Err(e) = std::thread::Builder::new().name("update-now".into()).spawn(move || look(&worker_app, true)) {
-        bridge::log!("update: no worker thread: {e}");
+        bridge::fault!("update: no worker thread: {e}");
         report(app, Phase::Failed, None);
     }
     progress()

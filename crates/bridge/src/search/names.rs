@@ -409,7 +409,7 @@ impl NameTable {
                 if let Err(e) = table.write_file(&path, kind, generation) {
                     // The file is named after the database's id.
                     let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    crate::log!("writing a names file of database {id} failed: {e}");
+                    crate::fault!("writing a names file of database {id} failed: {e}");
                 }
             });
     }

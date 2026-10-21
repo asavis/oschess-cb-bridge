@@ -32,7 +32,7 @@ pub fn start(app: &AppHandle) {
         }
     });
     if let Err(e) = spawned {
-        bridge::log!("no Stockfish update thread: {e}");
+        bridge::fault!("no Stockfish update thread: {e}");
     }
 }
 
@@ -41,7 +41,7 @@ pub fn start(app: &AppHandle) {
 pub fn look_now(app: &AppHandle) {
     let app = app.clone();
     if let Err(e) = std::thread::Builder::new().name("stockfish-update-now".into()).spawn(move || look(&app)) {
-        bridge::log!("Stockfish update: no worker thread: {e}");
+        bridge::fault!("Stockfish update: no worker thread: {e}");
     }
 }
 
