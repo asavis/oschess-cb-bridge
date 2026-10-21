@@ -230,18 +230,18 @@ fn file_at_exit_in(data: &Path, report: Report, transport: &dyn Transport) {
             context_with(data, language, Duration::ZERO, Vec::new())
         }
     };
-    let filed = match REPORTER.get() {
+    match REPORTER.get() {
         Some(reporter) => {
             let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
-            file_in(data, &report, context)
+            file_in(data, &report, context);
         }
-        None => file_in(data, &report, context),
-    };
-    // Sent today already, or reports off: nothing new goes.
-    if !matches!(filed, Some((_, true))) {
-        return;
+        None => {
+            file_in(data, &report, context);
+        }
     }
-    // Asked before each report goes, as the sender asks.
+    // What waits goes too, the same failure filed by an earlier start that
+    // could not send it included: no sender runs to send it later. Asked
+    // before each report goes, as the sender asks.
     let automatic = || crate::prefs::load(data).send_reports;
     reports::deliver(&Outbox::in_data(data), &dsn, env!("CARGO_PKG_VERSION"), transport, &automatic);
 }
@@ -379,6 +379,12 @@ mod tests {
         let dir = folder("waits");
         file_at_exit_in(&dir, failure("x:1"), &Fake::answering(Err("no answer".into())));
         assert_eq!(Outbox::in_data(&dir).waiting().len(), 1, "it waits for the next start");
+        // The next start fails the same way the same day, online: the report
+        // filed before goes, and no second one is filed.
+        let online = Fake::answering(Ok(200));
+        file_at_exit_in(&dir, failure("x:1"), &online);
+        assert_eq!(online.posted.borrow().len(), 1);
+        assert!(Outbox::in_data(&dir).waiting().is_empty());
 
         let dir = folder("off");
         crate::prefs::save(&dir, &crate::prefs::Prefs { send_reports: false, ..Default::default() }).unwrap();
