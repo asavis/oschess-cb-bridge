@@ -24,6 +24,9 @@ pub struct Prefs {
     /// The bridge version whose Stockfish offer the user put off with
     /// «Пізніше»; the next bridge version offers again.
     pub stockfish_offer_dismissed: Option<String>,
+    /// The bridge version that told of the Stockfish offer in a notice (#344);
+    /// the next bridge version tells again.
+    pub stockfish_offer_noticed: Option<String>,
     /// Send failure reports to oschess (#333): on unless the user turned it
     /// off, as the owner decided.
     pub send_reports: bool,
@@ -36,6 +39,7 @@ impl Default for Prefs {
             auto_update: true,
             stockfish_auto_update: true,
             stockfish_offer_dismissed: None,
+            stockfish_offer_noticed: None,
             send_reports: true,
         }
     }
@@ -191,6 +195,7 @@ mod tests {
             auto_update: false,
             stockfish_auto_update: false,
             stockfish_offer_dismissed: Some("0.2.0".into()),
+            stockfish_offer_noticed: Some("0.2.0".into()),
             send_reports: false,
         };
         save(&dir, &saved).unwrap();

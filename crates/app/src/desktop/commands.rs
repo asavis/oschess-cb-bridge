@@ -188,10 +188,14 @@ fn engines_view(app: &AppHandle) -> Answer<EnginesView> {
     let shared = shared(app);
     let config = config::load_or_create(&shared.config_path()?)?;
     let data = shared.dir()?;
-    let roots = Roots { bridge_data: Some(data.clone()), ..Roots::system() };
-    let found = engines::find(&roots);
     let newest = KNOWN.newest(stockfish::machine_arch());
-    Ok(EnginesView::new(&data, config.engine.as_deref(), found, env!("CARGO_PKG_VERSION"), &newest))
+    Ok(EnginesView::new(&data, config.engine.as_deref(), found_engines(&data), env!("CARGO_PKG_VERSION"), &newest))
+}
+
+/// The engines on this computer and those the bridge installed in its data
+/// folder `data`.
+pub(super) fn found_engines(data: &Path) -> Vec<engines::Found> {
+    engines::find(&Roots { bridge_data: Some(data.to_path_buf()), ..Roots::system() })
 }
 
 /// The engine choices and Stockfish installations, in the order

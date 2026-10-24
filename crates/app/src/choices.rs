@@ -188,6 +188,26 @@ pub fn offer_for(data: &Path, chosen: Option<&Path>, found: &[Found], running: &
     (!stockfish::is_installed(data, newest) && !dismissed).then_some(name)
 }
 
+/// The name of the `chosen` engine when a notice tells of the engine
+/// section's offer (#344): the section offers the `newest` build
+/// ([`offer_for`]), and no notice told of it in the `running` bridge version.
+/// The notice is noted as told before the name is answered; when that cannot
+/// be noted, none is told, so that no look repeats it.
+pub fn offer_notice(
+    data: &Path,
+    chosen: Option<&Path>,
+    found: &[Found],
+    running: &str,
+    newest: &Build,
+) -> Option<String> {
+    let name = offer_for(data, chosen, found, running, newest)?;
+    if prefs::load(data).stockfish_offer_noticed.as_deref() == Some(running) {
+        return None;
+    }
+    prefs::update(data, |prefs| prefs.stockfish_offer_noticed = Some(running.into())).ok()?;
+    Some(name)
+}
+
 /// Whether the first-run wizard recommends installing the `newest` Stockfish
 /// build beside the engines `found` (#287): none of them, nor the `chosen`
 /// engine, is a Stockfish of that major version or newer
@@ -778,6 +798,51 @@ mod tests {
             Some("Stockfish 17.1"),
             "the next version"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A notice tells of the offer once per bridge version (#344), and only
+    /// of an offer the engine section makes: not of one put off with
+    /// «Later», of an installed newest build, of a current Stockfish or of
+    /// one whose version nobody names, such as a development build.
+    #[test]
+    fn a_notice_tells_of_the_offer_once_per_bridge_version() {
+        let dir = folder("notice");
+        let found = [
+            listed("Stockfish 17.1", r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe"),
+            listed("Stockfish dev-20261017-effdc3fd", r"C:\Apps\stockfish\stockfish.exe"),
+            listed("Stockfish 19", r"C:\CB\Engines.x64\Stockfish 19\sf.exe"),
+        ];
+        let notice =
+            |chosen: &str, running: &str| offer_notice(&dir, Some(Path::new(chosen)), &found, running, pinned());
+        let older = r"C:\CB\Engines.x64\Stockfish 17.1\sf.exe";
+        for chosen in [r"C:\Apps\stockfish\stockfish.exe", r"C:\CB\Engines.x64\Stockfish 19\sf.exe", r"C:\lc0\lc0.exe"]
+        {
+            assert_eq!(notice(chosen, "1.2.1"), None, "{chosen}");
+        }
+        assert_eq!(offer_notice(&dir, None, &found, "1.2.1", pinned()), None, "no engine");
+        assert_eq!(prefs::load(&dir).stockfish_offer_noticed, None, "nothing told, nothing noted");
+        assert_eq!(notice(older, "1.2.1").as_deref(), Some("Stockfish 17.1"));
+        assert_eq!(prefs::load(&dir).stockfish_offer_noticed.as_deref(), Some("1.2.1"));
+        assert_eq!(notice(older, "1.2.1"), None, "told once in a version");
+        assert_eq!(
+            offer_for(&dir, Some(Path::new(older)), &found, "1.2.1", pinned()).as_deref(),
+            Some("Stockfish 17.1"),
+            "the section still offers it"
+        );
+        assert_eq!(notice(older, "1.3.0").as_deref(), Some("Stockfish 17.1"), "the next version tells again");
+
+        // Put off with «Later» in a version that has not told yet: not told.
+        dismiss_offer(&dir, "1.4.0").unwrap();
+        assert_eq!(notice(older, "1.4.0"), None);
+        assert_eq!(prefs::load(&dir).stockfish_offer_noticed.as_deref(), Some("1.3.0"));
+        // Once the newest build is installed, it is listed and nothing is offered.
+        let build = Build::for_arch(stockfish::machine_arch());
+        for file in [build.installed(&dir), build.dir(&dir).join(stockfish::LICENCE)] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"MZ").unwrap();
+        }
+        assert_eq!(notice(older, "1.5.0"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
