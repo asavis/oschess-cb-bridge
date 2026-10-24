@@ -2,16 +2,22 @@
 //! the start and every six hours while «Update Stockfish automatically» is on,
 //! and one when the user turns it on. What a look does is
 //! `stockfish_updates::Look`; this runs it on a thread and says what it did.
+//! Each look, whether the option is on or not, also tells once per bridge
+//! version of the engine section's offer of a newer Stockfish (#344).
 
+use std::path::Path;
 use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, SystemTime};
 
-use bridge::{engine, stockfish};
+use bridge::stockfish::Arch;
+use bridge::{config, engine, stockfish};
 use tauri::{AppHandle, Emitter};
 
-use super::commands::{CHOICES, KNOWN};
-use super::notices::notify;
+use super::commands::{CHOICES, KNOWN, found_engines};
+use super::notices::{notify, notify_opening};
 use super::{shared, updater};
+use crate::choices;
+use crate::i18n::Strings;
 use crate::prefs;
 use crate::stockfish_updates::{Look, Outcome};
 
@@ -94,4 +100,23 @@ fn look(app: &AppHandle) {
         Ok(Outcome::Off | Outcome::Current | Outcome::NotOurs) => {}
         Err(e) => bridge::log!("Stockfish update: {e}"),
     }
+    notice_offer(app, &shared.strings, &data, &config_path, arch);
+}
+
+/// Tells in a notice, once per bridge version, of the engine section's offer
+/// of a newer Stockfish in place of the chosen one (#344); a click opens that
+/// section, whose «Update» installs it beside the engines found.
+fn notice_offer(app: &AppHandle, strings: &Strings, data: &Path, config_path: &Path, arch: Arch) {
+    let Ok(config) = config::load_or_create(config_path) else { return };
+    let newest = KNOWN.newest(arch);
+    let found = found_engines(data);
+    let running = env!("CARGO_PKG_VERSION");
+    let Some(chosen) = choices::offer_notice(data, config.engine.as_deref(), &found, running, &newest) else { return };
+    bridge::log!("Stockfish offer: Stockfish {} in place of {chosen}, told in a notice", newest.version);
+    notify_opening(
+        app,
+        strings.fill("toast.stockfishOffer.title", &[("version", &newest.version)]),
+        &strings.fill("toast.stockfishOffer.body", &[("current", &chosen)]),
+        "engine",
+    );
 }

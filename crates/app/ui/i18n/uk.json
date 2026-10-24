@@ -37,6 +37,8 @@
   "toast.updated.body": "Він і далі працює у фоні.",
   "toast.stockfishUpdated.title": "Stockfish оновлено до {version}",
   "toast.stockfishUpdated.body": "Міст установив нову версію з GitHub. Вимкнути це можна в налаштуваннях, у розділі «Загальне».",
+  "toast.stockfishOffer.title": "Доступна Stockfish {version}",
+  "toast.stockfishOffer.body": "Зараз вибрано {current}. Натисніть, щоб відкрити розділ «Рушій» у налаштуваннях і оновити його.",
   "toast.update.latest.title": "Оновлень немає",
   "toast.update.latest.body": "Служба оновлень зараз не пропонує нової версії. Установлена версія: {version}.",
   "toast.update.installing": "Оновлюємо міст до {version}…",

@@ -37,6 +37,8 @@
   "toast.updated.body": "It keeps running in the background.",
   "toast.stockfishUpdated.title": "Stockfish was updated to {version}",
   "toast.stockfishUpdated.body": "The bridge installed the new release from GitHub. You can turn this off in the settings, under General.",
+  "toast.stockfishOffer.title": "Stockfish {version} is available",
+  "toast.stockfishOffer.body": "{current} is chosen now. Click to open the Engine section of the settings and update it.",
   "toast.update.latest.title": "No updates",
   "toast.update.latest.body": "The update service is not offering a new version right now. Installed version: {version}.",
   "toast.update.installing": "Updating the bridge to {version}…",
