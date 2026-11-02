@@ -186,12 +186,12 @@ fn suggestions_by_prefix_and_count() {
 }
 
 /// Guiding texts and analyses have header layouts of their own: they are found
-/// and sorted by their title and author, and any field only games have leaves
-/// them out.
+/// and sorted by their title and author, an analysis by its date and moves too
+/// (#349), and any field only games have leaves them out.
 #[test]
 fn texts_and_analyses_by_their_own_layout() {
     let extra = [
-        "11 | analysis | - | - | Morphy's openings | ????.??.?? | - | * | - | 0 | 0 | 0 | Tal, Mikhail | -",
+        "11 | analysis | - | - | Morphy's openings | 1914.05.01 | - | * | - | 40 | 0 | 0 | Tal, Mikhail | -",
         "12 | text     | - | - | Aaa survey        | ????.??.?? | - | * | - | 0 | 0 | 0 | Steinitz, Wilhelm | -",
     ];
     let f = fixture("search-other", &extra);
@@ -208,6 +208,15 @@ fn texts_and_analyses_by_their_own_layout() {
     assert_eq!(q("sort:tournament")[..3], [12, 8, 9], "titles sort among tournaments");
     assert_eq!(q("sort:annotator")[7..], [3, 5, 12, 10, 11], "authors sort as annotators");
     assert_eq!(q("sort:white")[..3], [8, 11, 12], "no other key: first ascending, by number");
+    // An analysis has a date and moves, a guiding text neither (#349).
+    assert_eq!(q("date:1914"), [5, 6, 11]);
+    assert_eq!(q("date:1914 openings"), [11]);
+    assert_eq!(q("-date:1914"), [1, 2, 3, 4, 7, 9, 10], "negated, the text is still left out");
+    assert_eq!(q("moves:>=40"), [3, 4, 10, 11]);
+    assert_eq!(q("-moves:>=40"), [1, 2, 5, 6, 7, 9]);
+    assert_eq!(q("date:1914 result:*"), Vec::<u32>::new(), "a game-only term still leaves the analysis out");
+    assert_eq!(q("sort:date"), [10, 7, 6, 11, 5, 4, 3, 2, 1, 8, 9, 12], "dates sort among the games'");
+    assert_eq!(q("sort:moves"), [4, 10, 3, 11, 5, 6, 2, 9, 1, 7, 8, 12]);
     // Neither is counted for suggestions.
     let annotators = suggested(&db, &idx, SuggestField::Annotator, "t", 20).unwrap();
     assert_eq!(annotators, [("Tal, Mikhail".to_string(), 1)]);

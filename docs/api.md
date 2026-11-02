@@ -564,8 +564,8 @@ the oschess Library's keys plus `number` and the two Elo keys. Without a
 direction, `date` and `moves` sort descending and the others ascending, as in
 the Library. Ties are broken by `number`, ascending, in both directions.
 Unknown values come first ascending and last descending. A guiding text or an
-analysis sorts by its title (as `tournament`) and its author (as `annotator`)
-and has no other key.
+analysis sorts by its title (as `tournament`) and its author (as `annotator`),
+an analysis by its `date` and `moves` too (#349), and has no other key.
 
 ```json
 {
@@ -612,7 +612,7 @@ and has no other key.
 
 A row for a guiding text or an analysis has `kind: "text"` or `"analysis"`,
 its title in `event`, its author in `annotator`, `result: "*"`, and empty game
-fields.
+fields, except that an analysis's row has its `date` and `moves` (#349).
 
 With `line`, every game row ends with one more field (#81), so that one window
 brings its games' openings, for example to build a player's opening tree:
@@ -783,10 +783,11 @@ to the same answer limit.
 
 An analysis (a 2CBH record of its own kind, `kind: "analysis"` in its row) is
 served as a game is (#323): its moves and annotations are written in either
-form exactly as a game's. Its header holds only a title and an author, so its
-tags are `Event` (the title, `?` when it has none), `Site`, `Round`, `White`
-and `Black` as `?`, `Date` as `????.??.??` and `Result` as `*`, with no Elo or
-ECO tag, and `SetUp`/`FEN` when it starts from another position. As for a
+form exactly as a game's. Its header holds a title, an author, a date and a
+move count, so its tags are `Event` (the title, `?` when it has none), `Date`
+(its date, as its row has it; #349), `Site`, `Round`, `White` and `Black` as
+`?` and `Result` as `*`, with no Elo or ECO tag, and `SetUp`/`FEN` when it
+starts from another position. As for a
 game, no tag names the annotator; the row's `annotator` holds the author.
 
 #### Both forms

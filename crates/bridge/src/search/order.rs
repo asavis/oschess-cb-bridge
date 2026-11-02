@@ -1,6 +1,6 @@
 //! Sort orders: every record number, in the order of one key.
 
-use cbformat::game::Eco;
+use cbformat::game::{Eco, RecordKind};
 
 use super::SearchError;
 use super::memory::{Cancel, Held, Hold, Refused};
@@ -39,17 +39,21 @@ fn result_rank(pgn: &str) -> u32 {
 /// The key of `r` as a number whose order is the key's order. Unknown values
 /// are 0, so they come first ascending and last descending. A guiding text or
 /// an analysis has its own layout: it sorts by its title as the tournament and
-/// by its author as the annotator, and has no other key.
+/// by its author as the annotator, an analysis by its date and moves too
+/// (#349), and has no other key.
 fn key(r: &impl Head, key: SortKey, ranks: &Ranks<'_>) -> u32 {
     // An empty name has rank 0, and so has a missing one.
     let rank = |table: Option<&[u32]>, id: i64| {
         usize::try_from(id).ok().and_then(|i| table.and_then(|t| t.get(i))).copied().unwrap_or(0)
     };
     if let Some((title, author)) = r.other() {
+        let analysis = r.kind() == RecordKind::Analysis;
         return match key {
             SortKey::Number => r.id(),
             SortKey::Tournament => rank(ranks.titles, ranks.title_table.map_or(title, |t| t.slot(title))),
             SortKey::Annotator => rank(ranks.annotators, author),
+            SortKey::Moves if analysis => moves_key(r),
+            SortKey::Date if analysis => date_key(r),
             _ => 0,
         };
     }
@@ -62,19 +66,27 @@ fn key(r: &impl Head, key: SortKey, ranks: &Ranks<'_>) -> u32 {
         SortKey::WhiteElo => r.elo().0.max(0) as u32,
         SortKey::BlackElo => r.elo().1.max(0) as u32,
         SortKey::Result => result_rank(r.result().pgn()),
-        SortKey::Moves => r.move_count().max(0) as u32,
+        SortKey::Moves => moves_key(r),
         // The code as shown; ChessBase's hidden sub-code does not order it.
         SortKey::Eco => match r.eco() {
             Eco::Code { code, .. } => u32::from(code) + 1,
             _ => 0,
         },
-        SortKey::Date => (r.played_date().0 & 0x1f_ffff) as u32,
+        SortKey::Date => date_key(r),
         // A sub-round is shown only with a round.
         SortKey::Round => match r.round() {
             (n, _) if n <= 0 => 0,
             (n, s) => ((n as u32) << 16) | s.max(0) as u32,
         },
     }
+}
+
+fn moves_key(r: &impl Head) -> u32 {
+    r.move_count().max(0) as u32
+}
+
+fn date_key(r: &impl Head) -> u32 {
+    (r.played_date().0 & 0x1f_ffff) as u32
 }
 
 /// Each record's packed key and number, for a worker's run.

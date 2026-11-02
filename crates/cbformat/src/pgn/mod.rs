@@ -163,7 +163,10 @@ pub fn game_from(
     let start = moves.start()?;
     let tags = match r.kind() {
         RecordKind::Game => Tags::new(r, db.tag_names(r)?, &start, moves.is_chess960())?,
-        RecordKind::Analysis => Tags::analysis(db.entities().title(r.analysis_title())?, &start, moves.is_chess960())?,
+        RecordKind::Analysis => {
+            let title = db.entities().title(r.analysis_title())?;
+            Tags::analysis(title, r.analysis_date(), &start, moves.is_chess960())?
+        }
         _ => return Err(Error::Format(format!("record {} is not a game", r.id()))),
     };
     let text = write_movetext(moves, annotations, options)?;
@@ -210,15 +213,15 @@ impl Tags {
         })
     }
 
-    /// The tags of an analysis titled `title`, played from `start`. Its header
-    /// has no players, tournament, date, round, result, ratings or ECO, so
-    /// only `Event` (the title) and a start position other than the usual one
-    /// are written; the rest are PGN's unknowns.
-    fn analysis(title: Option<String>, start: &Start, chess960: bool) -> Result<Tags> {
+    /// The tags of an analysis titled `title` and dated `date`, played from
+    /// `start`. Its header has no players, tournament, round, result, ratings
+    /// or ECO, so only `Event` (the title), `Date` (#349) and a start position
+    /// other than the usual one are written; the rest are PGN's unknowns.
+    fn analysis(title: Option<String>, date: Date, start: &Start, chess960: bool) -> Result<Tags> {
         let tournament = title.map(|title| Tournament { title, place: String::new(), start: Date::default(), kind: 0 });
         Ok(Tags {
             names: Names { tournament, ..Names::default() },
-            date: Date::default(),
+            date,
             round: (0, 0),
             result: GameResult::Line,
             elo: (0, 0),

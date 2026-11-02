@@ -84,6 +84,16 @@ impl Record {
     pub fn analysis_author(&self) -> i64 {
         self.b.le_i64::<0x28>()
     }
+    /// An analysis's date, the one ChessBase lists it with; packed as a
+    /// game's is (#349).
+    pub fn analysis_date(&self) -> Date {
+        Date(self.b.le_i32::<0x4c>())
+    }
+    /// Number of full moves in an analysis's main line, as ChessBase lists
+    /// it: 0 where it shows none (#349).
+    pub fn analysis_move_count(&self) -> i16 {
+        self.b.le_i16::<0x50>()
+    }
     pub fn result(&self) -> GameResult {
         GameResult::from_field(self.b[0x58])
     }
@@ -154,8 +164,12 @@ impl Head for Record {
     fn eco(&self) -> Eco {
         Record::eco(self)
     }
+    /// An analysis keeps its date at an offset of its own (#349).
     fn played_date(&self) -> Date {
-        Record::played_date(self)
+        match Record::kind(self) {
+            RecordKind::Analysis => self.analysis_date(),
+            _ => Record::played_date(self),
+        }
     }
     fn round(&self) -> (i32, i32) {
         (i32::from(Record::round(self)), i32::from(self.subround()))
@@ -164,7 +178,10 @@ impl Head for Record {
         (i32::from(self.white_elo()), i32::from(self.black_elo()))
     }
     fn move_count(&self) -> i32 {
-        i32::from(Record::move_count(self))
+        i32::from(match Record::kind(self) {
+            RecordKind::Analysis => self.analysis_move_count(),
+            _ => Record::move_count(self),
+        })
     }
     fn bytes(&self) -> &[u8] {
         Record::bytes(self)
@@ -181,5 +198,24 @@ mod tests {
         let mut b = [0u8; HEADER_RECORD_SIZE];
         b[0x80..0x82].copy_from_slice(&(500u16 * 128 + 5).to_le_bytes());
         assert_eq!(Record { id: 1, b }.eco(), Eco::Code { code: 499, sub: 5 });
+    }
+
+    /// An analysis answers its date and moves from its own offsets, a game
+    /// from the game's (#349).
+    #[test]
+    fn analysis_date_and_moves() {
+        let mut b = [0u8; HEADER_RECORD_SIZE];
+        let (game_date, analysis_date) = ((2020 << 9) | (2 << 5) | 15, (2021 << 9) | (11 << 5) | 3);
+        b[0xbc..0xc0].copy_from_slice(&i32::to_le_bytes(game_date));
+        b[0x8a..0x8c].copy_from_slice(&40i16.to_le_bytes());
+        b[0x4c..0x50].copy_from_slice(&i32::to_le_bytes(analysis_date));
+        b[0x50..0x52].copy_from_slice(&12i16.to_le_bytes());
+        b[2] = 1;
+        let game = Record { id: 1, b };
+        assert_eq!((Head::played_date(&game).pgn(), Head::move_count(&game)), ("2020.02.15".into(), 40));
+        b[2] = 2;
+        let analysis = Record { id: 1, b };
+        assert_eq!(Head::kind(&analysis), RecordKind::Analysis);
+        assert_eq!((Head::played_date(&analysis).pgn(), Head::move_count(&analysis)), ("2021.11.03".into(), 12));
     }
 }

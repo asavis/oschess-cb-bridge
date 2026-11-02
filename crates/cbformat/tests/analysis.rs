@@ -1,7 +1,7 @@
 //! Analyses (asavis/oschess-cb-bridge#323): a 2CBH record of a kind of its
 //! own, with moves and annotations as a game has, under a header that holds
-//! only a title and an author. Its PGN is a game's movetext under the tags the
-//! header holds.
+//! a title, an author, a date and a move count (#349). Its PGN is a game's
+//! movetext under the tags the header holds.
 
 use cbformat::Limits;
 use cbformat::fixture::{Builder, TempDb, annotations, lid_with, quiet, strings, symbols, text, titles};
@@ -17,10 +17,10 @@ const MOVES: u16 = movetable::MOVES;
 const END: u16 = movetable::END_OF_LINE;
 
 /// Record 1 a game and record 2 an analysis, both of `1. e4 e5` with a
-/// comment and a symbol on `1. e4`. The analysis's title is game tag 0 and its
-/// author player 1. Read through the game layout, its offsets would name
-/// player 0 (`Morphy, Paul`) as White and tournament 1 (`Paris m`) as the
-/// event.
+/// comment and a symbol on `1. e4`. The analysis's title is game tag 0, its
+/// author player 1 and its date 2021.11.03. Read through the game layout, its
+/// offsets would name player 0 (`Morphy, Paul`) as White, tournament 1
+/// (`Paris m`) as the event and 1858.12.20 as the date.
 fn database(name: &str) -> TempDb {
     let mut b = Builder::new();
     let moves = b.moves(1, &[MOVES, quiet(W, Pawn, "e2", "e4"), quiet(B, Pawn, "e7", "e5"), END]);
@@ -35,6 +35,8 @@ fn database(name: &str) -> TempDb {
     analysis[2] = 2;
     analysis[0x18..0x20].copy_from_slice(&0i64.to_le_bytes()); // title: game tag 0
     analysis[0x28..0x30].copy_from_slice(&1i64.to_le_bytes()); // author: player 1
+    analysis[0x4c..0x50].copy_from_slice(&((2021 << 9) | (11 << 5) | 3i32).to_le_bytes()); // its date
+    analysis[0xbc..0xc0].copy_from_slice(&((1858 << 9) | (12 << 5) | 20i32).to_le_bytes()); // a game's date
     b.lid(lid_with(
         256,
         2,
@@ -64,7 +66,7 @@ fn an_analysis_is_written_as_its_header_holds() {
         let (tags, movetext) = split(&analysis.pgn);
         assert_eq!(
             tags,
-            "[Event \"1.e4 e5 2.♘f3\"]\n[Site \"?\"]\n[Date \"????.??.??\"]\n[Round \"?\"]\n\
+            "[Event \"1.e4 e5 2.♘f3\"]\n[Site \"?\"]\n[Date \"2021.11.03\"]\n[Round \"?\"]\n\
              [White \"?\"]\n[Black \"?\"]\n[Result \"*\"]",
             "full: {full}"
         );
@@ -77,7 +79,7 @@ fn an_analysis_is_written_as_its_header_holds() {
 }
 
 /// An analysis whose title tag is unused is `Event "?"`, as a game with no
-/// tournament is.
+/// tournament is, and one without a date is `Date "????.??.??"`.
 #[test]
 fn an_analysis_without_a_title_has_an_unknown_event() {
     let mut b = Builder::new();
@@ -88,7 +90,7 @@ fn an_analysis_without_a_title_has_an_unknown_event() {
     let tmp = b.write("analysis-untitled");
     let db = Database::open(tmp.base()).unwrap();
     let pgn = pgn::game_with(&db, 1, &Options::default(), Limits::default()).unwrap().pgn;
-    assert!(pgn.starts_with("[Event \"?\"]\n"), "{pgn}");
+    assert!(pgn.starts_with("[Event \"?\"]\n[Site \"?\"]\n[Date \"????.??.??\"]\n"), "{pgn}");
     assert!(pgn.ends_with("\n\n1. e4 *\n"), "{pgn}");
 }
 
