@@ -63,10 +63,12 @@ read whole.
 Names are shown and matched as `Last, First`.
 
 **Guiding texts and analyses** have header layouts of their own, with a title
-and an author instead of the game fields. Their title stands for the tournament
-and their author for the annotator, as in their list row: words, `event:`,
-`tournament:` and `annotator:` apply to them. A query with any other qualifier
-term (except `sort:`) lists games only, and this holds for negated terms too.
+and an author instead of the game fields, and an analysis a date and a move
+count too (#349). Their title stands for the tournament and their author for
+the annotator, as in their list row: words, `event:`, `tournament:` and
+`annotator:` apply to them, and `date:` and `moves:` apply to analyses. A query
+with any other qualifier term (except `sort:`) lists games only, a `date:` or
+`moves:` term leaves guiding texts out, and this holds for negated terms too.
 
 **Library-only qualifiers.** `tag:`, `created:`, `updated:`, `is:`, `has:` and
 `no:` exist in the Library but not in a ChessBase database. A query that uses
@@ -145,7 +147,7 @@ name) are one key, which comes first in ascending order and last in descending
 order. Names are compared in full and ignoring case: names equal but for case
 are equal keys. A guiding text or an analysis sorts by its title as the
 tournament (among the tournaments' names) and by its author as the annotator,
-and has no other key. Records with equal keys stay in number order, ascending,
+an analysis by its date and moves too, and has no other key. Records with equal keys stay in number order, ascending,
 in both directions.
 
 The Library's `name`, `title`, `created` and `updated` keys do not exist for a

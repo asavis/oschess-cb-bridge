@@ -13,6 +13,7 @@
 
 use chesscore::{Board, Move};
 
+use cbformat::game::Head;
 use cbformat::pgn::{self, Options};
 use cbformat::replay::{TreeVisitor, walk};
 use cbformat::{Limits, cbh, v2};
@@ -73,7 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b = v2::Database::open(new)?;
     println!("records            {} / {}", a.record_count(), b.record_count());
     let n = a.record_count().min(b.record_count());
-    let names = ["kind", "deleted", "result", "eco", "date", "elo", "round", "white", "black", "event", "site"];
+    let names =
+        ["kind", "deleted", "result", "eco", "date", "moves", "elo", "round", "white", "black", "event", "site"];
+    // The checks from here on compare names.
+    const FIRST_NAME: usize = 8;
     let mut header: Vec<Diff> = names.iter().map(|_| Diff::default()).collect();
     let (mut unrepresentable, mut truncated, mut texts, mut analyses) = (0u64, 0u64, 0u64, 0u64);
     let (mut trees, mut starts, mut errors_a, mut errors_b, mut compared) =
@@ -102,7 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ra.is_deleted() == rb.is_deleted(),
             ra.result() == rb.result() || analysis,
             ra.eco() == rb.eco(),
-            ra.played_date() == rb.played_date() || analysis,
+            // An analysis's date and moves become the classic game's (#349).
+            Head::played_date(&ra) == Head::played_date(&rb),
+            Head::move_count(&ra) == Head::move_count(&rb).min(255),
             (i32::from(ra.white_elo()), i32::from(ra.black_elo()))
                 == (i32::from(rb.white_elo()), i32::from(rb.black_elo())),
             (i32::from(ra.round()), i32::from(ra.subround())) == (i32::from(rb.round()), i32::from(rb.subround())),
@@ -126,11 +132,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut name_exception = false;
         for (i, (d, ok)) in header.iter_mut().zip(checks).enumerate() {
             // An analysis record's entity fields are not a game's.
-            if !ok && !(analysis && i >= 7) {
-                if i >= 7 && !single_byte(&texts_b[i - 7]) {
+            if !ok && !(analysis && i >= FIRST_NAME) {
+                if i >= FIRST_NAME && !single_byte(&texts_b[i - FIRST_NAME]) {
                     unrepresentable += 1;
                     name_exception = true;
-                } else if i >= 7 && !texts_a[i - 7].is_empty() && texts_b[i - 7].starts_with(&texts_a[i - 7]) {
+                } else if i >= FIRST_NAME
+                    && !texts_a[i - FIRST_NAME].is_empty()
+                    && texts_b[i - FIRST_NAME].starts_with(&texts_a[i - FIRST_NAME])
+                {
                     truncated += 1;
                     name_exception = true;
                 } else {

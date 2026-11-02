@@ -664,8 +664,8 @@ pub fn put(rec: &mut [u8; 192], at: usize, bytes: &[u8]) {
 
 /// The fixture of the document, written to a temporary directory, plus `extra`
 /// rows in the same form. A guiding text or an analysis takes its title from
-/// the event column and its author from the annotator column, and stores them
-/// in its own header layout.
+/// the event column and its author from the annotator column, an analysis its
+/// date and moves from theirs too, and stores them in its own header layout.
 pub fn fixture(name: &str, extra: &[&str]) -> TempDb {
     fixture_of(name, &rows(extra))
 }
@@ -848,6 +848,9 @@ pub fn fixture_of(name: &str, rows: &[String]) -> TempDb {
             }
             "analysis" => {
                 rec[2] = 2;
+                // Its date and moves at offsets of its own (#349).
+                put(rec, 0x4c, &row.packed_date().to_le_bytes());
+                put(rec, 0x50, &row.moves.to_le_bytes());
                 &[(0x18, titles.id(row.event)), (0x28, annotator)]
             }
             kind => {

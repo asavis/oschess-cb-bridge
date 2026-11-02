@@ -70,6 +70,36 @@ Evidence, counting tournaments whose title names the time control:
 A title is a weak witness, which is why some marked tournaments name no time
 control and some that name one are not marked; the bridge reads the mark.
 
+## Analyses: a date and a move count of their own
+
+An analysis header (kind 2 at byte 2) holds its title's game tag at 0x18 and
+its author at 0x28, as the description gives them, and two fields it does not
+name (#349):
+
+| Offset | Contents |
+|---|---|
+| 0x4c | the date ChessBase lists the analysis with, an `int` packed as a game's date (`year << 9 \| month << 5 \| day`) |
+| 0x50 | the full moves of its main line as ChessBase lists them, a 16-bit `int`; 0 where the list shows none |
+
+The game's offsets for these, 0xbc and 0x8a, hold something else in an
+analysis, and the reader does not take them.
+
+Evidence:
+
+- ChessBase's own game list, for a user database of 24 records: each of its
+  16 analyses is listed with the date at 0x4c, and 11 with the move count at
+  0x50; the other 5 are listed with none and hold 0 there. 0xbc holds another
+  date in 12 of them and 0 in the other 4.
+- ChessBase's own conversion: each of the 5 analyses of the partial Mega that
+  became games in its classic copy has the classic date of 0x4c and the
+  classic move count of 0x50 (`cbh_pairs`).
+- 935 analyses in 137 of 322 local databases: 0x4c holds a valid packed date
+  in all of them, never 0; 0x50 holds a count from 1 up in 929 and 0 in 6;
+  the two bytes after it are 0 in all.
+
+ChessBase lists no ECO code for an analysis, though 0x80 holds one in most of
+them, and the bridge shows none.
+
 ## Promotion captures
 
 The 16 words for a pawn capture on the rank before promotion are ordered by the
@@ -1102,7 +1132,9 @@ The reader was checked against:
   three bytes of UTF-8. A name cut in UTF-8 ends before a character that
   would cross the end: a first name of ten two-byte characters keeps nine.
 - **2CBH analyses** are stored as ordinary games in a converted classic
-  database (5 in the partial Mega); their move trees are the same.
+  database (5 in the partial Mega); their move trees are the same, and so are
+  their dates and move counts, which the 2CBH header keeps at offsets of its
+  own (see "Analyses: a date and a move count of their own").
 - **Guiding texts** keep their titles, one per language, at the head of their
   own `.cbg` record, where 2CBH names a title as a game tag entity. Of the
   1,628 texts in the classic-only databases, none names a tournament in its

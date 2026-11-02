@@ -8,7 +8,9 @@
 //! at 32 (bit 7 deleted, bit 6 a record with a layout of its own), a kind
 //! the formats do not name at 33, the result field at 34, and at 35 the game's
 //! own time control (#268): its bits with bit 0 set, 0 where the game's time
-//! control is its tournament's ([`Head::time_control`]).
+//! control is its tournament's ([`Head::time_control`]). A record with a layout
+//! of its own keeps its title key at 0 and its author at 4, and an analysis
+//! its date at 16 and moves at 28 too (#349).
 
 use cbformat::game::{Date, Eco, GameResult, Head, RecordKind, TimeControl};
 
@@ -53,6 +55,10 @@ impl Slim {
                 b[32] |= OTHER;
                 put_i32(&mut b, 0, title)?;
                 put_i32(&mut b, 4, author)?;
+                if r.kind() == RecordKind::Analysis {
+                    b[16..20].copy_from_slice(&r.played_date().0.to_le_bytes());
+                    put_i16(&mut b, 28, r.move_count())?;
+                }
             }
             None => {
                 put_i32(&mut b, 0, r.white())?;
@@ -94,10 +100,14 @@ fn put_i16(b: &mut [u8; ROW], at: usize, v: i32) -> Option<()> {
 }
 
 /// Whether `b` answers every method a pass calls as `a` does. A record with a
-/// layout of its own is read through `other` only (`Head::other`).
+/// layout of its own is read through `other` only (`Head::other`), and an
+/// analysis through its date and moves too (#349).
 pub fn same(a: &impl Head, b: &impl Head) -> bool {
     if a.id() != b.id() || a.kind() != b.kind() || a.is_deleted() != b.is_deleted() || a.other() != b.other() {
         return false;
+    }
+    if a.kind() == RecordKind::Analysis {
+        return a.played_date().0 == b.played_date().0 && a.move_count() == b.move_count();
     }
     a.other().is_some()
         || (a.white() == b.white()

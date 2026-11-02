@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use cbformat::game::{Eco, ROUND_TEXT_BYTES, RecordKind, round_text};
+use cbformat::game::{Date, Eco, ROUND_TEXT_BYTES, RecordKind, round_text};
 
 use crate::json::Obj;
 use crate::store::{Head, MAX_GAME_BYTES, Store};
@@ -140,32 +140,38 @@ pub(crate) fn row<S: Store>(
 /// One list row, open for the fields an answer adds to it. Guiding texts and
 /// analyses have header layouts of their own (only the first eight bytes are
 /// shared with games): their row carries the title in `event` and the author
-/// in `annotator`, and no game fields.
+/// in `annotator`, an analysis's its date and moves too (#349), and no other
+/// game fields.
 pub(crate) fn row_obj<S: Store>(names: &mut Names<'_, S>, r: &S::Head) -> cbformat::Result<Obj> {
     let base = Obj::new().num("number", r.id());
-    let other = |base: Obj, kind: &str, title: String, author: String| {
+    let other = |base: Obj, kind: &str, title: String, author: String, (moves, date): (i32, String)| {
         base.str("kind", kind)
             .str("white", "")
             .num("whiteElo", 0)
             .str("black", "")
             .num("blackElo", 0)
             .str("result", "*")
-            .num("moves", 0)
+            .num("moves", moves)
             .str("eco", "")
             .str("event", &title)
             .str("site", "")
-            .str("date", "????.??.??")
+            .str("date", &date)
             .str("round", "")
             .str("annotator", &author)
             .raw("flags", &Obj::new().bool("deleted", r.is_deleted()).bool("chess960", false).done())
     };
+    let undated = || (0, Date::default().pgn());
     match r.kind() {
-        kind @ (RecordKind::Text | RecordKind::Analysis) => {
+        RecordKind::Text => {
             let (title, author) = r.other().unwrap_or((-1, -1));
-            let kind = if kind == RecordKind::Text { "text" } else { "analysis" };
-            Ok(other(base, kind, names.title(title)?, names.annotator(author)?))
+            Ok(other(base, "text", names.title(title)?, names.annotator(author)?, undated()))
         }
-        RecordKind::Unknown(_) => Ok(other(base, "unknown", String::new(), String::new())),
+        RecordKind::Analysis => {
+            let (title, author) = r.other().unwrap_or((-1, -1));
+            let dated = (r.move_count().max(0), r.played_date().pgn());
+            Ok(other(base, "analysis", names.title(title)?, names.annotator(author)?, dated))
+        }
+        RecordKind::Unknown(_) => Ok(other(base, "unknown", String::new(), String::new(), undated())),
         RecordKind::Game => {
             let (event, site) = names.tournament(r.tournament())?;
             // The fields as search matches them and PGN writes them (#68).

@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cbformat::game::{ROUND_TEXT_BYTES, TimeControl, round_text};
+use cbformat::game::{ROUND_TEXT_BYTES, RecordKind, TimeControl, round_text};
 use cbformat::v2::HEADER_RECORD_SIZE;
 
 use super::compare::{IntCmp, TextCmp, int_cmp, normalize_date, text_cmps};
@@ -204,8 +204,10 @@ struct CompiledTerm {
 pub struct Matcher<'a> {
     terms: Vec<CompiledTerm>,
     /// A term on a field only games have keeps guiding texts and analyses out,
-    /// as the Library keeps folders out of such searches.
+    /// as the Library keeps folders out of such searches; a term on a field
+    /// only games and analyses have keeps guiding texts out (#349).
     games_only: bool,
+    texts_out: bool,
     /// Where a title's key finds its id.
     titles: Option<&'a NameTable>,
 }
@@ -230,12 +232,20 @@ struct Other {
     /// The title's id in the titles' table.
     title: i64,
     author: i64,
+    /// An analysis, which has a date and moves of its own (#349).
+    analysis: bool,
 }
 
 /// Fields a guiding text or an analysis has too: its title as the event and
 /// its author as the annotator, as its list row shows them.
 pub fn shared(field: Field) -> bool {
     matches!(field, Field::Text | Field::Event | Field::Annotator)
+}
+
+/// Fields an analysis has besides those [`shared`] with guiding texts: its
+/// date and moves, as its list row shows them (#349).
+fn analyses_have(field: Field) -> bool {
+    shared(field) || matches!(field, Field::Date | Field::Moves)
 }
 
 impl<'a> Matcher<'a> {
@@ -285,14 +295,18 @@ impl<'a> Matcher<'a> {
             }
             terms.push(CompiledTerm { negated: term.negated, tests });
         }
-        let games_only = query.terms.iter().any(|t| !shared(t.field));
-        Ok(Matcher { terms, games_only, titles: tables.titles })
+        let games_only = query.terms.iter().any(|t| !analyses_have(t.field));
+        let texts_out = query.terms.iter().any(|t| !shared(t.field));
+        Ok(Matcher { terms, games_only, texts_out, titles: tables.titles })
     }
 
     pub fn matches(&self, r: &impl Head) -> bool {
-        let other =
-            r.other().map(|(title, author)| Other { title: self.titles.map_or(title, |t| t.slot(title)), author });
-        if other.is_some() && self.games_only {
+        let other = r.other().map(|(title, author)| Other {
+            title: self.titles.map_or(title, |t| t.slot(title)),
+            author,
+            analysis: r.kind() == RecordKind::Analysis,
+        });
+        if other.as_ref().is_some_and(|o| self.games_only || (self.texts_out && !o.analysis)) {
             return false;
         }
         self.terms.iter().all(|t| t.tests.iter().any(|test| test.holds(r, other.as_ref())) != t.negated)
@@ -342,14 +356,16 @@ fn date_test(v: &Value) -> Test {
 impl Test {
     fn holds(&self, r: &impl Head, other: Option<&Other>) -> bool {
         if let Some(o) = other {
-            return match self {
+            match self {
                 Test::Text { players, annotators, titles, .. } => {
-                    titles.contains_id(o.title) || annotators.as_ref().unwrap_or(players).contains_id(o.author)
+                    return titles.contains_id(o.title) || annotators.as_ref().unwrap_or(players).contains_id(o.author);
                 }
-                Test::Event { titles, .. } => titles.contains_id(o.title),
-                Test::Players(set, Role::Annotator) => set.contains_id(o.author),
-                _ => false,
-            };
+                Test::Event { titles, .. } => return titles.contains_id(o.title),
+                Test::Players(set, Role::Annotator) => return set.contains_id(o.author),
+                // An analysis's date and moves read as a game's (#349).
+                Test::Date { .. } | Test::DateContains(_) | Test::Moves(_) if o.analysis => {}
+                _ => return false,
+            }
         }
         match self {
             Test::Text { players, annotators, tournaments, .. } => {

@@ -363,7 +363,8 @@ fn a_connection_serves_several_requests() {
 }
 
 /// Guiding texts and analyses have header layouts of their own; their rows
-/// carry their title and author, never fields read through the game layout.
+/// carry their title and author, an analysis's its date and moves too (#349),
+/// never fields read through the game layout.
 #[test]
 fn texts_and_analyses_are_read_with_their_own_layouts() {
     let mut b = Builder::new();
@@ -375,10 +376,17 @@ fn texts_and_analyses_are_read_with_their_own_layouts() {
     text[0x10..0x18].copy_from_slice(&1i64.to_le_bytes()); // a text's tournament
     text[0x20..0x28].copy_from_slice(&1i64.to_le_bytes()); // author: player 1
     text[0x28..0x30].copy_from_slice(&0i64.to_le_bytes()); // title: game tag 0
+    let date = |y: i32, m: i32, d: i32| ((y << 9) | (m << 5) | d).to_le_bytes();
+    text[0x4c..0x50].copy_from_slice(&date(2020, 1, 1)); // not a text's date
+    text[0x50..0x52].copy_from_slice(&9i16.to_le_bytes());
     let analysis = b.game(e4);
     analysis[2] = 2;
     analysis[0x18..0x20].copy_from_slice(&1i64.to_le_bytes()); // title: game tag 1
     analysis[0x28..0x30].copy_from_slice(&1i64.to_le_bytes()); // author: player 1
+    analysis[0x4c..0x50].copy_from_slice(&date(2021, 11, 3)); // its date
+    analysis[0x50..0x52].copy_from_slice(&12i16.to_le_bytes()); // its moves
+    analysis[0xbc..0xc0].copy_from_slice(&date(1858, 12, 20)); // a game's date
+    analysis[0x8a..0x8c].copy_from_slice(&40i16.to_le_bytes()); // a game's moves
     b.lid(lid_with(
         256,
         2,
@@ -400,15 +408,17 @@ fn texts_and_analyses_are_read_with_their_own_layouts() {
     assert!(has_members(rows[1], r#""kind":"text","white":"""#), "{}", rows[1]);
     assert!(has_members(rows[1], r#""event":"Review text","site":"""#), "{}", rows[1]);
     assert!(has_members(rows[1], r#""annotator":"Author, Text""#), "{}", rows[1]);
+    assert!(has_members(rows[1], r#""moves":0,"date":"????.??.??""#), "{}", rows[1]);
     assert!(has_members(rows[2], r#""kind":"analysis","white":"""#), "{}", rows[2]);
     assert!(has_members(rows[2], r#""event":"1.d4 d5 2.c4","annotator":"Author, Text""#), "{}", rows[2]);
+    assert!(has_members(rows[2], r#""moves":12,"date":"2021.11.03","eco":"""#), "{}", rows[2]);
     // An analysis is served as PGN with the tags its header holds (#323); a
     // guiding text is not.
     let game = |n: u32| get_reply(r.port, &format!("/v1/databases/{}/games/{n}", r.id));
     let a = game(3);
     assert_eq!(a.status, 200, "{}", a.body);
     let pgn = member(&a.body, "pgn");
-    assert!(pgn.starts_with(r#""[Event \"1.d4 d5 2.c4\"]\n[Site \"?\"]"#), "{pgn}");
+    assert!(pgn.starts_with(r#""[Event \"1.d4 d5 2.c4\"]\n[Site \"?\"]\n[Date \"2021.11.03\"]"#), "{pgn}");
     assert!(pgn.contains(r#"[White \"?\"]\n[Black \"?\"]\n[Result \"*\"]"#), "{pgn}");
     assert!(pgn.ends_with(r#"1. e4 *\n""#), "{pgn}");
     assert!(has_members(&a.body, r#""number":3"#) && has_members(&a.body, r#""annotations":"none""#), "{}", a.body);
