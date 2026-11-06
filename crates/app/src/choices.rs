@@ -210,7 +210,7 @@ pub fn offer_notice(
 
 /// Whether the first-run wizard recommends installing the `newest` Stockfish
 /// build beside the engines `found` (#287): none of them, nor the `chosen`
-/// engine, is a Stockfish of that major version or newer
+/// engine, is a Stockfish of that version or newer
 /// ([`stockfish::is_current`]). A build the bridge installed is listed by its
 /// version, so an installed newest build ends the recommendation.
 pub fn recommend_install(chosen: Option<&Path>, found: &[Found], newest: &Build) -> bool {

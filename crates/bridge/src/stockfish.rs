@@ -403,38 +403,38 @@ fn download_with_progress(
 
 /// Whether to offer `build` instead of the chosen engine `current`: it is an
 /// older Stockfish, installed by the bridge or named so by its engine or file,
-/// and its major version is below the build's.
+/// whose version is below the build's, compared number by number
+/// ([`is_newer`]): `Stockfish 19` is offered 19.1 as well as 20 (#351).
 pub fn offer(build: &Build, current: Option<(&Path, &str)>) -> bool {
     let Some((path, name)) = current else { return false };
-    major(build).zip(major_of(path, name)).is_some_and(|(newest, major)| major < newest)
+    version_of(path, name).is_some_and(|version| is_newer(&build.version, &version))
 }
 
 /// Whether the engine at `path`, named `name`, is a Stockfish of `build`'s
-/// major version or a newer one, its version read as [`offer`] reads it. An
+/// version or a newer one, its version read as [`offer`] reads it. An
 /// engine whose version cannot be read is not.
 pub fn is_current(build: &Build, path: &Path, name: &str) -> bool {
-    major(build).zip(major_of(path, name)).is_some_and(|(newest, major)| major >= newest)
+    is_version(&build.version) && version_of(path, name).is_some_and(|version| !is_newer(&build.version, &version))
 }
 
-fn major(build: &Build) -> Option<u32> {
-    build.version.split('.').next()?.parse().ok()
-}
-
-/// The Stockfish major version that an engine's name or its folder names.
-fn major_of(path: &Path, name: &str) -> Option<u32> {
+/// The Stockfish version that an engine's name or its folder names.
+fn version_of(path: &Path, name: &str) -> Option<String> {
     // The folder's name whichever separator the path uses.
     let text = path.to_string_lossy();
     let folder = text.rsplit(['\\', '/']).nth(1).unwrap_or_default();
-    [name, folder].iter().find_map(|text| stockfish_major(text))
+    [name, folder].iter().find_map(|text| stockfish_version(text))
 }
 
-/// The major version in a name such as `Stockfish 17.1`, `stockfish-16` or
-/// `Stockfish_15_x64`.
-fn stockfish_major(text: &str) -> Option<u32> {
+/// The version in a name such as `Stockfish 17.1`, `stockfish-16` or
+/// `Stockfish_15_x64`: the numbers and dots after the name, without a dot
+/// that ends them, as `Stockfish 16.1.exe` has; none for a development
+/// build's `Stockfish dev-…`.
+fn stockfish_version(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     let rest = lower.strip_prefix("stockfish")?.trim_start_matches([' ', '-', '_']);
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    let version: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let version = version.trim_end_matches('.');
+    is_version(version).then(|| version.to_string())
 }
 
 /// Whether curl's exit `code` is a refusal of its own rather than the
@@ -721,9 +721,26 @@ mod tests {
         // A newer release GitHub named is offered in place of the pinned version.
         let newer = Build::released(Arch::X86_64, "20", 1, &"a".repeat(64)).unwrap();
         assert!(offer(&newer, Some((Path::new(r"C:\x\stockfish-19\sf.exe"), "Stockfish 19"))));
+        // And so is a point release, number by number (#351).
+        let point = Build::released(Arch::X86_64, "19.1", 1, &"a".repeat(64)).unwrap();
+        for (path, name) in [
+            (r"C:\x\stockfish-19\sf.exe", "Stockfish 19"),
+            (r"C:\CB\Engines.x64\Stockfish 19\sf.exe", "sf"),
+            (r"C:\x\y\stockfish_18.2.exe", "Stockfish 18.2"),
+        ] {
+            assert!(offer(&point, Some((Path::new(path), name))), "{name}");
+        }
+        for (path, name) in [
+            (r"C:\x\stockfish-19.1\sf.exe", "Stockfish 19.1"),
+            (r"C:\x\y\engine.exe", "Stockfish_20_x64"),
+            (r"C:\x\sf.exe", "Stockfish dev-20261101-1a2b3c4d"),
+            (r"C:\CB\Engines\stockfish.exe", "stockfish"),
+        ] {
+            assert!(!offer(&point, Some((Path::new(path), name))), "{name}");
+        }
     }
 
-    /// Only a Stockfish whose name or folder names the pinned major version or
+    /// Only a Stockfish whose name or folder names the pinned version or
     /// a newer one is current; an older one, another engine and a Stockfish of
     /// unknown version are not.
     #[test]
@@ -746,6 +763,38 @@ mod tests {
         }
         let newer = Build::released(Arch::X86_64, "20", 1, &"a".repeat(64)).unwrap();
         assert!(!is_current(&newer, Path::new(r"C:\x\stockfish-19\stockfish.exe"), "Stockfish 19"));
+        // A point release counts (#351): 19 is not current against 19.1.
+        let point = Build::released(Arch::X86_64, "19.1", 1, &"a".repeat(64)).unwrap();
+        assert!(!is_current(&point, Path::new(r"C:\x\stockfish-19\stockfish.exe"), "Stockfish 19"));
+        for (path, name) in [
+            (r"C:\x\stockfish-19.1\stockfish.exe", "sf"),
+            (r"C:\x\sf.exe", "Stockfish 19.1"),
+            (r"C:\x\sf.exe", "Stockfish 19.1.0"),
+            (r"C:\x\sf.exe", "Stockfish 20"),
+        ] {
+            assert!(is_current(&point, Path::new(path), name), "{name}");
+        }
+    }
+
+    /// An engine's version is the numbers and dots after `Stockfish` in its
+    /// name or its folder's, without a dot that ends them; a development
+    /// build, a name that is not a Stockfish's and a malformed number have
+    /// none (#351).
+    #[test]
+    fn a_stockfish_names_its_whole_version() {
+        for (text, version) in [
+            ("Stockfish 17.1", Some("17.1")),
+            ("stockfish-16", Some("16")),
+            ("Stockfish_15_x64", Some("15")),
+            ("stockfish_16.1.exe", Some("16.1")),
+            ("Stockfish 19.1 by the Stockfish developers", Some("19.1")),
+            ("Stockfish dev-20261101-1a2b3c4d", None),
+            ("Stockfish", None),
+            ("Stockfish 1..9", None),
+            ("Lc0 v0.31", None),
+        ] {
+            assert_eq!(stockfish_version(text).as_deref(), version, "{text}");
+        }
     }
 
     /// A release GitHub named takes the asset and executable names of the
