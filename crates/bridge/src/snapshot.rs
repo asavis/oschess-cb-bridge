@@ -175,6 +175,19 @@ fn work_of(databases: &[Database], headers: bool, indexing: bool, analysing: boo
     work
 }
 
+/// What a [`Snapshot`] shows that may change on the bridge's side, read
+/// without looking at any database (#348): how many times its background work
+/// began or ended, whether it stopped, whether an analysis holds updates back
+/// and whether a paired browser was served. A user interface that sees it
+/// change takes a snapshot at once rather than at its slower pace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pulse {
+    pub changes: u64,
+    pub stopped: bool,
+    pub analysing: bool,
+    pub served: bool,
+}
+
 /// A bridge serving on a thread of its own.
 pub struct Background {
     app: Arc<App>,
@@ -200,6 +213,17 @@ impl Background {
             *lock(&record) = Some(reason);
         })?;
         Ok(Background { app, port, stopped })
+    }
+
+    /// What changes when the snapshot may have, without looking at any
+    /// database (#348).
+    pub fn pulse(&self) -> Pulse {
+        Pulse {
+            changes: self.app.catalog.changes(),
+            stopped: lock(&self.stopped).is_some(),
+            analysing: self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES),
+            served: self.app.served.load(Ordering::Relaxed),
+        }
     }
 
     /// The state now. Checking a database opens it when it is ready, so call

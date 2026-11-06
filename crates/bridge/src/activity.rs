@@ -11,6 +11,7 @@
 //! to another. Once it is nothing, nothing of the catalog waits or runs, and
 //! only a request or the keeper can raise it again.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -23,6 +24,8 @@ pub struct Activity {
     counts: Mutex<Vec<(&'static str, usize)>>,
     /// Told when no work waits or runs any more.
     idle: Condvar,
+    /// How many times work began or ended (#348).
+    changes: AtomicU64,
 }
 
 /// Work of one kind, counted until the guard is dropped.
@@ -39,7 +42,15 @@ impl Activity {
             Some((_, n)) => *n += 1,
             None => counts.push((kind, 1)),
         }
+        self.changes.fetch_add(1, Ordering::Relaxed);
         Active { activity: Arc::clone(self), kind }
+    }
+
+    /// How many times work began or ended so far (#348): a reader that sees
+    /// it change knows that the work it shows may have, without asking each
+    /// queue.
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Relaxed)
     }
 
     /// Waits until no work waits or runs, until `deadline`: the kinds of the
@@ -62,6 +73,7 @@ impl Drop for Active {
         if let Some((_, n)) = counts.iter_mut().find(|(k, _)| *k == self.kind) {
             *n = n.saturating_sub(1);
         }
+        self.activity.changes.fetch_add(1, Ordering::Relaxed);
         if counts.iter().all(|(_, n)| *n == 0) {
             self.activity.idle.notify_all();
         }
@@ -73,6 +85,23 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Each beginning and each end of work changes the count of changes, of
+    /// whichever kind, and nothing else does (#348).
+    #[test]
+    fn each_beginning_and_end_is_a_change() {
+        let activity = Arc::new(Activity::default());
+        assert_eq!(activity.changes(), 0);
+        let a = activity.begin("a");
+        let b = activity.begin("b");
+        assert_eq!(activity.changes(), 2);
+        assert_eq!(activity.wait_idle(Instant::now()), Err(vec!["a", "b"]));
+        assert_eq!(activity.changes(), 2, "a wait changes nothing");
+        drop(a);
+        assert_eq!(activity.changes(), 3);
+        drop(b);
+        assert_eq!(activity.changes(), 4);
+    }
 
     /// Work counts from its beginning until its guard drops, of whichever
     /// kind: a wait ends at its deadline naming the kinds still counted, and
