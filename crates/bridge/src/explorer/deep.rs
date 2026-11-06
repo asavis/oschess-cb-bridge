@@ -37,7 +37,6 @@ use std::time::Instant;
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
 use crate::search::memory::Refused;
-use crate::search::workers::threads;
 use crate::sync::{lock, unpoisoned};
 
 use super::build::{Chunks, Out, Passes, Turns, from_bad, plan_pass};
@@ -46,7 +45,7 @@ use super::format::{
     BLOCK_BUCKETS, DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, deep_bucket, deep_print, structure_of,
     structures_in_vectors, structures_of, varint,
 };
-use super::runs::{Limits, PassTime, Progress, on_workers};
+use super::runs::{Limits, PassTime, Progress, on_workers, pass_workers};
 use super::source::MAX_STRUCTURES;
 use super::stream::{self, Stream};
 
@@ -138,7 +137,7 @@ pub(super) fn write(
         least: MIN_WORKER_POSTINGS,
         largest: 0,
     };
-    let room = passes.room(share, threads(), stream.header.records(), limits.pass_bytes)?;
+    let room = passes.room(share, pass_workers(progress), stream.header.records(), limits.pass_bytes)?;
     let (_memory, want, room) = room.reserve(progress)?;
     let (capacity, want) = passes.capacity(room, want);
     let mut table = Vec::new();

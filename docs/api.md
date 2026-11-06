@@ -252,7 +252,10 @@ builds, such as its matches or its share of a name table, grows in steps of a
 256th of the budget, from 64 KiB to 1 MiB. A search's workers take at most half the
 budget with their buffers and one step each, which leaves the other half for
 the rest of what they build, and with little budget left a search runs on
-fewer workers, down to one.
+fewer workers, down to one. A pass of a position index build takes at most
+half the workers, and all of them but two when a request waits for the build
+(see **Building** under the explorer), so that a search finds one free
+whenever there are two workers or more.
 
 ## Cancellation
 
@@ -1239,14 +1242,16 @@ With `q` the answer also acknowledges the search (#268):
   block table, and waits for no build of another database. When the search
   memory has no room for that table, the request is answered `503 busy` and
   the next one tries again. Otherwise the index is built in the background,
-  one database at a time, on at most half of the search workers and within
-  half of the search memory budget, which it never takes from searches (while
-  searches hold memory, a build takes less and runs more passes, and it waits
-  for the least it needs).
+  one database at a time, within half of the search memory budget, which it
+  never takes from searches (while searches hold memory, a build takes less
+  and runs more passes, and it waits for the least it needs). Each of its
+  passes runs on at most half of the search workers, and a requested build's
+  on all of them but two, never fewer than half (#346), so that a search that
+  arrives meanwhile still finds two free (one, with two or three workers).
   - A database's index is built when its explorer or the games of one of its
     positions are asked for. That build goes first, at below-normal priority,
-    and stops a background build of another database at its next batch,
-    which waits its turn again.
+    on a requested build's workers, and stops a background build of another
+    database at its next batch, which waits its turn again.
   - It is also built, unasked, for each database in use whose index is not
     of the database as it is now: once built, whenever the database changes.
     A database is in use when its index is kept on disk, or its explorer or
@@ -1265,7 +1270,7 @@ With `q` the answer also acknowledges the search (#268):
     half a second at a time, so that it still ends if they never stop. A
     requested build never gives way, and a background build that a request
     for its database's positions makes the requested one gives way no
-    longer.
+    longer, and takes a requested build's workers from its next pass on.
 
   A build reads header and move records, a few megabytes at a time, never
   annotations, and needs no temporary space. It needs free space of about 400

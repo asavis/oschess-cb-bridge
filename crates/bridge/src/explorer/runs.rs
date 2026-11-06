@@ -118,6 +118,11 @@ pub struct Progress {
     /// build's patience; 0 for a build that never gives way, as a requested
     /// one (#149).
     patience: AtomicU64,
+    /// Whether a request waits for the build, which then takes the workers
+    /// searches leave free ([`pass_workers`]): a build queued in the
+    /// background is not, until a request promotes it. A build run outside
+    /// the queues, as `cbtool profile` runs one, is.
+    requested: AtomicBool,
 }
 
 /// A build that waits for its turn.
@@ -135,6 +140,7 @@ impl Default for Progress {
             stop: Arc::default(),
             priority: AtomicU8::new(Priority::Normal as u8),
             patience: AtomicU64::new(0),
+            requested: AtomicBool::new(true),
         }
     }
 }
@@ -194,6 +200,17 @@ impl Progress {
     /// time; none for a build that never gives way.
     pub fn patience(&self) -> Duration {
         Duration::from_micros(self.patience.load(Ordering::Relaxed))
+    }
+
+    /// Makes the build one a request waits for, or one queued in the
+    /// background, from its next pass on ([`pass_workers`]).
+    pub fn set_requested(&self, requested: bool) {
+        self.requested.store(requested, Ordering::Relaxed);
+    }
+
+    /// Whether a request waits for the build.
+    pub fn requested(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
     }
 
     /// Gives way to foreground work (#149), as each of the build's threads
@@ -338,6 +355,20 @@ pub const MEMORY_WAIT: Duration = Duration::from_secs(60);
 /// one, before the build gives up (#180): as long as it waits for memory,
 /// where a search waits [`workers::WAIT`].
 pub const WORKERS_WAIT: Duration = MEMORY_WAIT;
+
+/// The most workers a pass of the build that reports on `progress` takes
+/// (#346): a requested build, the one a request waits for, all the search
+/// workers but two and never fewer than half of them, so that a search that
+/// arrives meanwhile still finds two free; a background build half of them,
+/// so that searches keep the rest. A pass takes fewer when its share of the
+/// budget holds fewer, or when it has less work.
+pub fn pass_workers(progress: &Progress) -> usize {
+    let (all, half) = (workers::threads(), workers::threads().div_ceil(2));
+    match progress.requested() {
+        true => all.saturating_sub(2).max(half),
+        false => half,
+    }
+}
 
 /// Runs `task` on up to `want` workers for a pass of the build that reports
 /// on `progress` ([`workers::run`]): the pass waits for its first worker up
@@ -519,6 +550,23 @@ mod tests {
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(50) && waited < soon, "{waited:?}");
         drop(working);
+    }
+
+    /// A requested build's passes take every worker but two, never fewer than
+    /// half; a background build's half; a promoted build's, from then on, a
+    /// requested one's (#346).
+    #[test]
+    fn a_requested_build_takes_all_workers_but_two() {
+        let (all, half) = (workers::threads(), workers::threads().div_ceil(2));
+        let requested = all.saturating_sub(2).max(half);
+        let progress = Progress::default();
+        assert!(progress.requested(), "a build outside the queues is waited for");
+        assert_eq!(pass_workers(&progress), requested);
+        progress.set_requested(false);
+        assert_eq!(pass_workers(&progress), half);
+        progress.set_requested(true);
+        assert_eq!(pass_workers(&progress), requested);
+        assert!(all - requested >= 2 || requested == half, "{all} workers, {requested} taken");
     }
 
     /// A build's timings read back from their line, and nothing else.
