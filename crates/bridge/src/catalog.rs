@@ -491,15 +491,16 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     if format == cbformat::view::Format::Pgn {
         hash.write(&cbformat::pgnfile::VERSION.to_le_bytes());
     }
+    // One look a file: on Windows its metadata and id from one open (#348).
     for (i, (path, _)) in format.files(path).into_iter().enumerate() {
-        match std::fs::metadata(&path) {
-            Ok(m) if !m.is_file() => {
+        match cbformat::file::look(&path) {
+            Ok((m, _)) if !m.is_file() => {
                 files.irregular = true;
                 hash.write(&[0xfe]);
             }
-            Ok(m) => {
+            Ok((m, id)) => {
                 hash.write_meta(&m);
-                hash.write_id(cbformat::file::file_id(&path, &m));
+                hash.write_id(id);
                 files.modified = files.modified.max(m.modified().ok());
                 if read_by_reader(format, &path) {
                     files.read_modified = files.read_modified.max(m.modified().ok());
@@ -883,6 +884,53 @@ mod tests {
         salted.write_meta(&meta);
         salted.write_id(cbformat::file::file_id(&path, &meta));
         assert_eq!(generation, salted.finish());
+    }
+
+    /// The generation as a look took it before one open a file (#348): the
+    /// metadata from the path, then the id through a handle of its own.
+    fn two_opens(path: &Path, format: Format) -> u64 {
+        let format = format.view().unwrap();
+        let mut hash = Hash::new();
+        if format == cbformat::view::Format::Pgn {
+            hash.write(&cbformat::pgnfile::VERSION.to_le_bytes());
+        }
+        for (i, (path, _)) in format.files(path).into_iter().enumerate() {
+            match std::fs::metadata(&path) {
+                Ok(m) if !m.is_file() => hash.write(&[0xfe]),
+                Ok(m) => {
+                    hash.write_meta(&m);
+                    hash.write_id(cbformat::file::file_id(&path, &m));
+                }
+                Err(_) if i == 0 => panic!("no main file"),
+                Err(_) => hash.write(&[0xff]),
+            }
+        }
+        hash.finish()
+    }
+
+    /// A look that opens each file once gives each format the generation that
+    /// two opens a file gave (#348), so that no database is opened again and
+    /// no cache built again: a 2CBH database, a classic one, with an optional
+    /// file missing, and a PGN file.
+    #[test]
+    fn one_open_a_file_keeps_every_generation() {
+        let two = cbformat::fixture::Builder::new().write("catalog-one-open-2cbh");
+        let classic = {
+            let mut b = cbformat::fixture_cbh::Builder::new();
+            b.game(&cbformat::fixture_cbh::move_record(0, None, None, &[]));
+            b.write("catalog-one-open-cbh")
+        };
+        let _ = std::fs::remove_file(classic.dir().join("db.cba"));
+        let pgn = cbformat::fixture::pgn_file("catalog-one-open-pgn", b"[White \"A\"]\n\n1. e4 *\n");
+        for (path, format) in [
+            (two.dir().join("db.2cbh"), Format::TwoCbh),
+            (classic.dir().join("db.cbh"), Format::Cbh),
+            (pgn.dir().join("db.pgn"), Format::Pgn),
+        ] {
+            let looked = generation_of(&path, format, &System);
+            assert!(!looked.irregular && looked.present.len() > 0, "{path:?}");
+            assert_eq!(looked.generation, Some(two_opens(&path, format)), "{path:?}");
+        }
     }
 
     /// A file put in place of another, of the same bytes, size and time of
