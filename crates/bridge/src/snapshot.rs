@@ -1,7 +1,7 @@
 //! The bridge's state at one moment, for a user interface to poll: whether it
 //! still serves, why it stopped, and the state of each database.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -36,6 +36,9 @@ pub enum Work {
     /// An analysis streamed to an analysis board, for [`ANALYSIS_HOLDS_UPDATES`].
     Analysing,
 }
+
+/// The most threads that look at the databases of a list at once (#348).
+pub const LOOKERS: usize = 8;
 
 /// How long a running analysis holds an update back: one left running longer,
 /// as in a tab left open, does not keep the bridge from updating for good.
@@ -114,6 +117,42 @@ impl Database {
             modified: look.and_then(|l| l.modified),
         }
     }
+
+    /// Every database of `entries`, in their order, each as [`Database::of`]
+    /// shows it, from a look at each on up to [`LOOKERS`] threads, the calling
+    /// one among them, each taking the next entry none has taken (#348): a
+    /// list of hundreds of databases, and the first open of each one on it,
+    /// take a part of the time one thread takes. A thread that cannot start
+    /// leaves the entries to the others. The threads run at the caller's
+    /// priority.
+    pub fn all(entries: &[Arc<Entry>]) -> Vec<Database> {
+        let next = AtomicUsize::new(0);
+        let priority = crate::machine::current();
+        let look = || {
+            crate::machine::follow(priority);
+            let mut seen = Vec::new();
+            loop {
+                let at = next.fetch_add(1, Ordering::Relaxed);
+                let Some(entry) = entries.get(at) else { return seen };
+                seen.push((at, Database::of(entry)));
+            }
+        };
+        let mut seen: Vec<(usize, Database)> = std::thread::scope(|s| {
+            let helpers: Vec<_> = (1..LOOKERS.min(entries.len()))
+                .filter_map(|_| {
+                    let thread = std::thread::Builder::new().name("bridge-look".into());
+                    thread.stack_size(crate::THREAD_STACK).spawn_scoped(s, look).ok()
+                })
+                .collect();
+            let mut seen = look();
+            for helper in helpers {
+                seen.extend(helper.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+            seen
+        });
+        seen.sort_unstable_by_key(|(at, _)| *at);
+        seen.into_iter().map(|(_, database)| database).collect()
+    }
 }
 
 /// The work a restart would lose: the databases downloading or opening, a
@@ -166,7 +205,7 @@ impl Background {
     /// The state now. Checking a database opens it when it is ready, so call
     /// this from a thread that may wait on the disk.
     pub fn snapshot(&self) -> Snapshot {
-        let databases: Vec<Database> = self.app.catalog.entries().iter().map(|e| Database::of(e)).collect();
+        let databases = Database::all(&self.app.catalog.entries());
         let catalog = &self.app.catalog;
         let work = work_of(
             &databases,
@@ -253,6 +292,32 @@ mod tests {
         );
         assert_eq!(snapshot.databases[0].id, crate::catalog::id_of(&missing));
         assert!(snapshot.databases.iter().all(|d| d.listed));
+    }
+
+    /// The databases of a list, looked at on several threads and opened
+    /// there the first time, are those one thread sees, in the list's order
+    /// (#348): ready, missing and of every format, more of them than threads.
+    #[test]
+    fn a_list_looked_at_on_threads_is_the_one_thread_sees() {
+        let dbs: Vec<TempDb> = (0..12).map(|i| ready(&format!("snapshot-all-{i}"), i % 4 + 1)).collect();
+        let mut paths: Vec<PathBuf> = dbs.iter().map(|db| db.dir().join("db.2cbh")).collect();
+        for (i, missing) in
+            ["/no/such/folder/A.2cbh", "/no/such/folder/B.pgn", "/no/such/folder/C.cbh"].iter().enumerate()
+        {
+            paths.insert(i * 5, PathBuf::from(missing));
+        }
+        let catalog = Catalog::new(paths.clone());
+        let entries = catalog.entries();
+        assert_eq!(entries.len(), 15);
+        assert!(entries.len() > LOOKERS);
+        let threads = Database::all(&entries);
+        let one: Vec<Database> = entries.iter().map(|e| Database::of(e)).collect();
+        assert_eq!(threads, one);
+        let ids: Vec<String> = paths.iter().map(|p| crate::catalog::id_of(p)).collect();
+        assert_eq!(threads.iter().map(|d| d.id.clone()).collect::<Vec<_>>(), ids, "in the list's order");
+        let ready = threads.iter().filter(|d| d.state == State::Ready).count();
+        assert_eq!((ready, threads.len() - ready), (12, 3));
+        assert_eq!(Database::all(&[]), []);
     }
 
     /// The status line of a `GET /v1/status` sent with `token`.
