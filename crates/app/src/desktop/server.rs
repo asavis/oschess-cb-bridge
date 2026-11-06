@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bridge::config::{self, DEFAULT_PORT};
 use bridge::pairing;
-use bridge::snapshot::Background;
+use bridge::snapshot::{Background, Pulse};
 use bridge::start::{self, Cause, Options};
 
 use crate::diagnostics::PageErrors;
@@ -101,6 +101,12 @@ impl Shared {
             page_errors: PageErrors::default(),
         };
         Started { shared, first_run, pair: asked }
+    }
+
+    /// What changes when the serving bridge's snapshot may have, without
+    /// looking at any database (#348); none when it does not serve.
+    pub fn pulse(&self) -> Option<Pulse> {
+        self.running.as_ref().map(|r| r.background.pulse())
     }
 
     /// The state now: the serving bridge's snapshot, or why it does not serve.

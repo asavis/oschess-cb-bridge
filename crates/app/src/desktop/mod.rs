@@ -29,7 +29,7 @@ use crate::channel::Channel;
 use crate::diagnostics;
 use crate::i18n::Strings;
 use crate::reports::{Kind, Report};
-use crate::status::{Problem, View};
+use crate::status::{Pace, Problem, View};
 use server::Shared;
 
 /// The argument the Run key starts the app with. Nothing reads it: a start at
@@ -177,13 +177,22 @@ fn log_panics() {
 
 /// Follows the bridge once a second: redraws the tray mark when the state,
 /// the taskbar theme or the display scale changes, sends the windows the new
-/// view, and tells the user once when a problem appears.
+/// view, and tells the user once when a problem appears. It takes the
+/// bridge's snapshot, which looks at every database, at the pace [`Pace`]
+/// sets (#348): every ten seconds, every second while a window is open, and
+/// at once when the bridge's work changes.
 fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
     let spawned = std::thread::Builder::new().name("bridge-status".into()).spawn(move || {
         let mut last: Option<View> = None;
         let mut drawn = String::new();
+        let mut pace = Pace::default();
         loop {
-            let view = shared.current_view();
+            let shown = app.webview_windows().values().any(|w| w.is_visible().unwrap_or(false));
+            let due = pace.due(std::time::Instant::now(), shown, shared.pulse());
+            let view = match (&last, due) {
+                (Some(view), false) => view.clone(),
+                _ => shared.current_view(),
+            };
             let theme = system::taskbar_theme();
             let scale = app.primary_monitor().ok().flatten().map_or(1.0, |m| m.scale_factor());
             let key = tray::update(&app, &shared.strings, &view, theme, scale, &drawn);
