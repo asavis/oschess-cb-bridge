@@ -30,13 +30,15 @@ use std::time::{Duration, Instant};
 use crate::indexdir;
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
-use crate::search::workers::{Worker, threads};
+use crate::search::workers::Worker;
 use crate::sync::{lock, unpoisoned};
 
 use super::deep;
 use super::file::{Bad, write_at};
 use super::format::{DEEP_BLOCK_BITS, HEADER_LEN, Header, MAX_PLY, deep_bits, deep_bucket, part_bits, part_of};
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, Room, io, on_workers, opened, reserve};
+use super::runs::{
+    ENTRY_BYTES, Entry, Limits, MAX_GAME, Progress, Room, io, on_workers, opened, pass_workers, reserve,
+};
 use super::source::{Line, Source, Workspace};
 use super::stream::{self, BATCH, Stream};
 use super::tree::{self, Shallow};
@@ -98,7 +100,7 @@ fn build_in(
     let moves_partial = indexdir::partial(&moves);
     let (part_bits, bits) = (part_bits(plan.last), deep_bits(plan.last));
     let started = Instant::now();
-    let anchor = ranking_anchor(source, plan, progress)?;
+    let anchor = ranking_anchor(source, plan, progress, limits)?;
     let mut writer = stream::Writer::create(&moves_partial, plan.first, plan.last)?;
     writer.anchor = anchor;
     let counted = read_games(source, plan, &writer, part_bits, bits, progress, limits)?;
@@ -146,23 +148,48 @@ fn build_in(
     Ok(header)
 }
 
-/// The ranking anchor is found once, before any shallow entries are folded.
-/// Batches reuse one budgeted workspace and observe build cancellation.
-fn ranking_anchor(source: &dyn Source, plan: &Plan, progress: &Progress) -> Result<u32, SearchError> {
-    let _memory = reserve(Workspace::BYTES, progress)?;
-    let mut work = Workspace::new().ok_or(Refused::Busy)?;
-    progress.start("checking", u64::from(plan.last));
-    let mut newest = 0;
-    for first in (plan.first..=plan.last).step_by(super::source::RECORDS) {
-        if progress.stopped() {
-            return Err(SearchError::Superseded);
-        }
-        progress.give_way();
-        let last = first.saturating_add(super::source::RECORDS as u32 - 1).min(plan.last);
-        newest = newest.max(source.newest_date(first, last, &mut work)?);
-        progress.done.store(u64::from(last), Ordering::Relaxed);
+/// The ranking anchor, the newest date of the games, found once before any
+/// shallow entries are folded: on the build's workers (#346), each taking
+/// the next batch of headers no worker has taken, in a workspace of its own
+/// held in the budget. A worker other than the first that finds no room for
+/// it now leaves the batches to the others, rather than waiting for searches
+/// to give room back.
+fn ranking_anchor(source: &dyn Source, plan: &Plan, progress: &Progress, limits: &Limits) -> Result<u32, SearchError> {
+    let total = (u64::from(plan.last) + 1).saturating_sub(u64::from(plan.first));
+    progress.start("checking", total);
+    let size = super::source::RECORDS as u64;
+    let batches = total.div_ceil(size);
+    if batches == 0 {
+        return Ok(0);
     }
-    Ok(newest)
+    let fit = (limits.share / Workspace::BYTES).max(1);
+    let want = pass_workers(progress).min(usize::try_from(batches).unwrap_or(usize::MAX)).min(fit);
+    let next = AtomicU64::new(0);
+    let newest = on_workers(want, progress, limits, |w| {
+        let _memory = match Hold::reserve_quietly(Workspace::BYTES) {
+            Ok(hold) => hold,
+            Err(_) if w.index > 0 => return Ok(0),
+            Err(_) => reserve(Workspace::BYTES, progress)?,
+        };
+        let mut work = Workspace::new().ok_or(Refused::Busy)?;
+        let mut newest = 0;
+        loop {
+            progress.give_way();
+            let batch = next.fetch_add(1, Ordering::Relaxed);
+            if batch >= batches {
+                break;
+            }
+            if w.stopped() || progress.stopped() {
+                return Err(SearchError::Superseded);
+            }
+            let first = u64::from(plan.first) + batch * size;
+            let last = (first + size - 1).min(u64::from(plan.last));
+            newest = newest.max(source.newest_date(first as u32, last as u32, &mut work)?);
+            progress.done.fetch_add(last - first + 1, Ordering::Relaxed);
+        }
+        Ok(newest)
+    })?;
+    Ok(newest.into_iter().max().unwrap_or(0))
 }
 
 /// A failure of the file at `path`, which the build wrote, as a build's
@@ -196,14 +223,15 @@ pub(super) struct Counted {
 /// background build gives way every so many games as well.
 const GIVE_WAY_EVERY: u32 = 256;
 
-/// The stream pass: reads records `plan.first..=plan.last` on at most half
-/// the shared workers, so that searches keep the rest, a block of the stream
-/// at a time, and writes each game's line to `writer`; counts what each line
-/// adds to the tree, in parts of `part_bits` bits, and to the deep section,
-/// of buckets of `bits` bits; and folds the entries of the positions that
-/// games from the standard start reach first within [`tree::SHALLOW_PLY`]
-/// plies, unless they do not fold into the room a worker has for them, when
-/// the tree's passes collect them as they do the others.
+/// The stream pass: reads records `plan.first..=plan.last` on the build's
+/// workers ([`pass_workers`]), so that searches keep the rest, a block of
+/// the stream at a time, and writes each game's line to `writer`; counts
+/// what each line adds to the tree, in parts of `part_bits` bits, and to the
+/// deep section, of buckets of `bits` bits; and folds the entries of the
+/// positions that games from the standard start reach first within
+/// [`tree::SHALLOW_PLY`] plies, unless they do not fold into the room a
+/// worker has for them, when the tree's passes collect them as they do the
+/// others.
 fn read_games(
     source: &dyn Source,
     plan: &Plan,
@@ -231,7 +259,7 @@ fn read_games(
         return Ok(counted);
     }
     let batches = total.div_ceil(BATCH as u64);
-    // Half the workers at most, and no more than the share holds with their
+    // The build's workers at most, and no more than the share holds with their
     // read buffers, their part of the stream and their counts; then each a
     // room for its folded entries from what the share has beside them, no
     // larger than the entries all the games add, of a few positions each.
@@ -240,7 +268,7 @@ fn read_games(
     if fit == 0 {
         return Err(SearchError::TooLarge);
     }
-    let want = threads().div_ceil(2).min(batches as usize).min(fit).max(1);
+    let want = pass_workers(progress).min(batches as usize).min(fit).max(1);
     let spare = limits.share.saturating_sub(bytes + want * reading) / want;
     let room = (spare / ENTRY_BYTES).saturating_sub(tree::FOLD_ENTRIES).min(tree::SHALLOW_ENTRIES);
     let added = usize::try_from(total * (u64::from(tree::SHALLOW_PLY) + 1)).unwrap_or(usize::MAX);
@@ -449,20 +477,20 @@ pub(super) struct Passes {
 
 impl Passes {
     /// What the passes reserve ([`Room::reserve`]) of the build's `share` of
-    /// the budget, for a database of `records` records, with `threads`
-    /// shared workers and at most `pass_bytes` of entries or postings in a
-    /// pass ([`Limits::pass_bytes`]). Half the workers at most, and one for
-    /// every 64 records at most: as many as the share holds beside a quarter
-    /// of it for the buffers and beside the largest unit's room, one at
-    /// least. The buffers take the rest of the share, but no more than the
-    /// entries or postings take, twice over, and that room: a small
-    /// database's build holds a little of the budget, however large its
-    /// share, and takes one pass. `TooLarge` when that is less than a
+    /// the budget, for a database of `records` records, with up to `workers`
+    /// of the shared workers ([`pass_workers`]) and at most `pass_bytes` of
+    /// entries or postings in a pass ([`Limits::pass_bytes`]). Those workers
+    /// at most, and one for every 64 records at most: as many as the share
+    /// holds beside a quarter of it for the buffers and beside the largest
+    /// unit's room, one at least. The buffers take the rest of the share, but
+    /// no more than the entries or postings take, twice over, and that room:
+    /// a small database's build holds a little of the budget, however large
+    /// its share, and takes one pass. `TooLarge` when that is less than a
     /// worker's least room.
     pub fn room(
         &self,
         share: usize,
-        threads: usize,
+        workers: usize,
         records: u64,
         pass_bytes: Option<usize>,
     ) -> Result<Room, SearchError> {
@@ -470,7 +498,7 @@ impl Passes {
         let largest = self.largest.max(least);
         let rest = share.saturating_sub(self.table);
         let fit = ((rest / 4 * 3).min(rest.saturating_sub(largest)) / self.worker).max(1);
-        let workers = threads.div_ceil(2).min(records.div_ceil(64) as usize).min(fit).max(1);
+        let workers = workers.min(records.div_ceil(64) as usize).min(fit).max(1);
         let room = share.checked_sub(self.table + workers * self.worker).ok_or(SearchError::TooLarge)?;
         let usable =
             usize::try_from(self.items).unwrap_or(usize::MAX).saturating_mul(2 * self.item).saturating_add(largest);
@@ -798,7 +826,7 @@ impl<'a, T, M, W> Turns<'a, T, M, W> {
 pub(crate) mod tests {
     use super::*;
     use crate::search::memory::Cancel;
-    use crate::search::workers;
+    use crate::search::workers::{self, threads};
 
     /// Units made on many workers, each taking its time, are placed in
     /// their order, some in pieces among them, and each piece written once,
@@ -966,10 +994,10 @@ pub(crate) mod tests {
         let search = workers::one(&Cancel::never()).unwrap();
         let (built, after) = std::thread::scope(|s| {
             let build = s.spawn(|| build_with(&Unread, &plan, &target, &progress, &limits));
-            // Its stream pass starts reading, which takes a worker first.
+            // Its pre-pass starts checking, which takes a worker first.
             let until = Instant::now() + workers::tests::PATIENCE;
-            while progress.phase() != "reading" {
-                assert!(Instant::now() < until, "the build starts reading");
+            while progress.phase() != "checking" {
+                assert!(Instant::now() < until, "the build starts checking");
                 std::thread::sleep(Duration::from_millis(1));
             }
             let asked = Instant::now();
@@ -984,18 +1012,99 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A section's passes take half the workers at most, one for every 64
-    /// records at most, and as many as the share holds beside a quarter of it
-    /// for the buffers and beside the largest unit's room; the buffers take
-    /// the rest, but no more than the entries take twice over and that room,
-    /// nor than a pass may; a share without room for one worker and its least
-    /// is too small.
+    /// Records whose games the stream pass's workers wait to read until
+    /// released, counting those that wait; they hold no game.
+    struct Gated {
+        records: u32,
+        waiting: Mutex<(usize, bool)>,
+        changed: Condvar,
+    }
+
+    impl Gated {
+        fn new(records: u32) -> Gated {
+            Gated { records, waiting: Mutex::new((0, false)), changed: Condvar::new() }
+        }
+
+        /// Waits until `workers` workers wait to read.
+        fn arrived(&self, workers: usize) {
+            let until = Instant::now() + Duration::from_secs(60);
+            let mut waiting = lock(&self.waiting);
+            while waiting.0 < workers {
+                assert!(Instant::now() < until, "{} of {workers} workers came to read", waiting.0);
+                waiting = unpoisoned(self.changed.wait_timeout(waiting, Duration::from_millis(10))).0;
+            }
+        }
+
+        fn release(&self) {
+            lock(&self.waiting).1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl Source for Gated {
+        fn records(&self) -> u32 {
+            self.records
+        }
+
+        fn lines(&self, _: u32, _: u32, _: u8, _: &mut Workspace, _: &mut dyn FnMut(&Line)) -> cbformat::Result<()> {
+            let mut waiting = lock(&self.waiting);
+            waiting.0 += 1;
+            self.changed.notify_all();
+            while !waiting.1 {
+                waiting = unpoisoned(self.changed.wait(waiting));
+            }
+            Ok(())
+        }
+    }
+
+    /// A requested build's passes take every worker but two (#346): while its
+    /// stream pass holds them, a search finds two free, and no third; a
+    /// background build's take half, and leave the other half. The eight
+    /// workers run in a child process, which has them however many the
+    /// computer or `OSCHESS_BRIDGE_THREADS` gives this one.
+    #[test]
+    fn a_search_finds_two_workers_while_a_requested_build_runs() {
+        let name = "explorer::build::tests::a_search_finds_two_workers_while_a_requested_build_runs";
+        if !in_child(name, 8, Duration::from_secs(120)) {
+            return;
+        }
+        assert_eq!(threads(), 8);
+        let dir = std::env::temp_dir().join(format!("bridge-build-two-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (requested, taken) in [(true, 6), (false, 4)] {
+            let source = Gated::new(16 * BATCH as u32);
+            let (target, progress, limits) = (dir.join("db.idx"), Progress::default(), Limits::default());
+            progress.set_requested(requested);
+            let plan = Plan { first: 1, last: source.records, generation: 7 };
+            std::thread::scope(|s| {
+                let build = s.spawn(|| build_with(&source, &plan, &target, &progress, &limits));
+                source.arrived(taken);
+                assert_eq!(workers::taken(), taken, "requested: {requested}");
+                let free: Vec<_> = (taken..8).map(|_| workers::one(&Cancel::never()).unwrap()).collect();
+                let none = workers::run_waiting(1, 0, &Cancel::never(), Duration::from_millis(20), |_| Ok(()));
+                assert!(matches!(none, Err(SearchError::WorkersBusy)), "requested: {requested}");
+                drop(free);
+                source.release();
+                build.join().unwrap().unwrap();
+            });
+            assert_eq!(workers::taken(), 0);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A section's passes take the workers they are given at most, one for
+    /// every 64 records at most, and as many as the share holds beside a
+    /// quarter of it for the buffers and beside the largest unit's room; the
+    /// buffers take the rest, but no more than the entries take twice over
+    /// and that room, nor than a pass may; a share without room for one
+    /// worker and its least is too small.
     #[test]
     fn passes_plan_their_room_within_the_share() {
         let mb = 1 << 20;
         let passes = Passes { table: mb, worker: 4 * mb, item: 16, items: 1 << 30, least: 64, largest: 0 };
         let plan = |passes: &Passes, share: usize, records: u64, pass_bytes: Option<usize>| {
-            let room = passes.room(share, 32, records, pass_bytes).unwrap();
+            let room = passes.room(share, 16, records, pass_bytes).unwrap();
             assert_eq!((room.fixed, room.each), (mb, 4 * mb));
             (room.workers, room.least, room.room)
         };
@@ -1010,9 +1119,9 @@ pub(crate) mod tests {
         assert_eq!(plan(&few, 1 << 34, 10_000_000, None), (16, 1024, 1_000 * 32 + 1024));
         assert_eq!(plan(&passes, 1 << 34, 10_000_000, Some(4096)), (16, 1024, 4096));
         for share in [5 * mb + 1023, 5 * mb - 1, 0] {
-            assert!(matches!(passes.room(share, 32, 10_000_000, None), Err(SearchError::TooLarge)), "{share}");
+            assert!(matches!(passes.room(share, 16, 10_000_000, None), Err(SearchError::TooLarge)), "{share}");
         }
-        assert!(matches!(passes.room(1 << 34, 32, 10_000_000, Some(1023)), Err(SearchError::TooLarge)));
+        assert!(matches!(passes.room(1 << 34, 16, 10_000_000, Some(1023)), Err(SearchError::TooLarge)));
         // Each worker kept holds a worker's least of the entries.
         assert_eq!(passes.capacity(4 * mb, 3), (1 << 18, 3));
         assert_eq!(passes.capacity(2048, 3), (128, 2));

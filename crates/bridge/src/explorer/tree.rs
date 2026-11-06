@@ -24,7 +24,6 @@ use std::time::Instant;
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
-use crate::search::workers::threads;
 
 use super::build::{Chunks, Counted, Out, Passes, Turns, from_bad, plan_pass};
 use super::follow::{Keys, standard_keys};
@@ -32,7 +31,7 @@ use super::format::{
     BLOCK_DATA, BLOCK_ENTRY, BLOCK_KEYS, Block, Counts, KEY_ENTRY, MAX_BLOCK_DATA, MAX_PLY, NO_MOVE, TOP_GAMES,
     encode_record, order_moves, part_of, rank_top,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, grow, on_workers};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, grow, on_workers, pass_workers};
 use super::stream::{self, Stream};
 
 /// A position's run of entries this long or shorter is left as it is when a
@@ -178,7 +177,7 @@ pub(super) fn write(
         least: MIN_WORKER_ENTRIES,
         largest: largest.saturating_mul(ENTRY_BYTES),
     };
-    let room = passes.room(share, threads(), stream.header.records(), limits.pass_bytes)?;
+    let room = passes.room(share, pass_workers(progress), stream.header.records(), limits.pass_bytes)?;
     let (_memory, want, room) = room.reserve(progress)?;
     let (capacity, want) = passes.capacity(room, want);
     let mut table = Vec::new();
