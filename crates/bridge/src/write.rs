@@ -1215,8 +1215,29 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// Whether `id` is mapped in this process's user namespace, as `map`
+    /// (`/proc/self/uid_map` or `/proc/self/gid_map`) lists the ranges of ids
+    /// it maps: a namespace that maps one user and one group, as a sandbox's,
+    /// refuses any other id with `EINVAL` (#353). Where the map cannot be read,
+    /// every id counts as mapped.
+    #[cfg(target_os = "linux")]
+    fn mapped(map: &str, id: u32) -> bool {
+        let Ok(text) = std::fs::read_to_string(map) else { return true };
+        text.lines().any(|line| {
+            let range: Vec<u64> = line.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+            matches!(range[..], [first, _, count] if (first..first.saturating_add(count)).contains(&u64::from(id)))
+        })
+    }
+
+    /// Elsewhere every id counts as mapped.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn mapped(_map: &str, _id: u32) -> bool {
+        true
+    }
+
     /// A group of the user's own other than the one new files take, for a
-    /// file the user may move into it; `None` for a user in one group.
+    /// file the user may move into it; `None` for a user in one group, or in
+    /// a user namespace that maps no other of the user's groups (#353).
     #[cfg(unix)]
     fn other_group() -> Option<u32> {
         // SAFETY: a null list of size 0 asks for the count alone.
@@ -1227,7 +1248,7 @@ mod tests {
         groups.truncate(usize::try_from(count).ok()?);
         // SAFETY: getegid takes nothing and cannot fail.
         let own = unsafe { libc::getegid() };
-        groups.into_iter().find(|&g| g != own)
+        groups.into_iter().find(|&g| g != own && mapped("/proc/self/gid_map", g))
     }
 
     /// A file's group is kept: given to the temporary file when the user
@@ -1240,7 +1261,7 @@ mod tests {
     fn a_group_that_cannot_be_kept_fails_a_mode_that_grants_it() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let Some(group) = other_group() else {
-            eprintln!("skipped: the user is in one group only");
+            eprintln!("skipped: the user is in one group only, or no other is mapped here");
             return;
         };
         let dir = std::env::temp_dir().join(format!("bridge-write-group-{}", std::process::id()));
@@ -1319,9 +1340,14 @@ mod tests {
     }
 
     /// Sets the extended attribute `name` of the file or folder `file` to
-    /// `value`; `false` where the file system has no access control lists.
+    /// `value`, a list of [`restrictive_acl`]; `false` where the file system
+    /// has no access control lists, or where the user namespace does not map
+    /// user 65534, whom the list names, and refuses it (#353).
     #[cfg(target_os = "linux")]
     fn set_attribute(file: &File, name: &std::ffi::CStr, value: &[u8]) -> bool {
+        if !mapped("/proc/self/uid_map", 65534) {
+            return false;
+        }
         use std::os::fd::AsRawFd;
         // SAFETY: the value is all of `value`.
         let set = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
@@ -1333,8 +1359,8 @@ mod tests {
         true
     }
 
-    /// Gives `file` the list of [`restrictive_acl`]; `false` where the file
-    /// system has no lists.
+    /// Gives `file` the list of [`restrictive_acl`]; `false` where it cannot
+    /// have it ([`set_attribute`]).
     #[cfg(target_os = "linux")]
     fn restrict(file: &File) -> bool {
         set_attribute(file, ACL_ACCESS, &restrictive_acl())
@@ -1355,7 +1381,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         // The folder's default list comes after the file, which has none.
         if !set_attribute(&File::open(&dir).unwrap(), c"system.posix_acl_default", &restrictive_acl()) {
-            eprintln!("skipped: the file system of {} has no access control lists", dir.display());
+            eprintln!("skipped: no access control lists on {}, or user 65534 is not mapped here", dir.display());
             return;
         }
         let source = File::open(&path).unwrap();
@@ -1381,7 +1407,7 @@ mod tests {
         std::fs::write(&path, b"1. e4 *\n").unwrap();
         let source = File::open(&path).unwrap();
         if !restrict(&source) {
-            eprintln!("skipped: the file system of {} has no access control lists", dir.display());
+            eprintln!("skipped: no access control lists on {}, or user 65534 is not mapped here", dir.display());
             return;
         }
         let acl = acl_of(&source).expect("a list");
