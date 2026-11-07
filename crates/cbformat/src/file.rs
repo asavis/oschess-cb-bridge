@@ -391,6 +391,43 @@ pub fn file_id(_path: &Path, meta: &std::fs::Metadata) -> Option<(u64, u128)> {
     Some((meta.dev(), u128::from(meta.ino())))
 }
 
+/// A look at the file at `path`, for a database's generation (#348): its
+/// metadata, as `std::fs::metadata` reads it, following links, and for a
+/// file its volume and id, as [`file_id`] reads them. On Windows both come
+/// from one handle, opened as `std::fs::metadata` and [`file_id`] each open
+/// one: with no access to the file's contents and every sharing mode, so that
+/// a look opens each file once instead of twice. A path that handle cannot
+/// open is looked at as before: its metadata read by `std::fs::metadata`,
+/// which reads it another way when sharing or access refuses the handle, and
+/// no id.
+#[cfg(windows)]
+pub fn look(path: &Path) -> std::io::Result<(std::fs::Metadata, Option<(u64, u128)>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// FILE_FLAG_BACKUP_SEMANTICS, with which a folder opens too, as
+    /// `std::fs::metadata` opens one.
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+    let opened = std::fs::OpenOptions::new().access_mode(0).share_mode(0x7).custom_flags(BACKUP_SEMANTICS).open(path);
+    let Ok(file) = opened else {
+        return std::fs::metadata(path).map(|meta| (meta, None));
+    };
+    let meta = file.metadata()?;
+    let id = match meta.is_file() {
+        true => file_id_info(&file).map(|(volume, id)| (volume, u128::from_le_bytes(id))),
+        false => None,
+    };
+    Ok((meta, id))
+}
+
+/// [`look`] elsewhere: the metadata, which opens nothing, and the device and
+/// inode from it.
+#[cfg(unix)]
+pub fn look(path: &Path) -> std::io::Result<(std::fs::Metadata, Option<(u64, u128)>)> {
+    let meta = std::fs::metadata(path)?;
+    let id = file_id(path, &meta);
+    Ok((meta, id))
+}
+
 /// Whether a 128-bit file id names a file: a file system without ids gives
 /// all zeros or all ones, in 64 bits or 128.
 #[cfg(windows)]
