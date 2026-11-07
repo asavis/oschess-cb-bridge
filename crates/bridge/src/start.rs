@@ -362,17 +362,19 @@ mod tests {
     fn started_in(dir: &Path, options: &Options) -> Bridge {
         for _ in 0..20 {
             match prepare(dir, options) {
-                Err(e) if matches!(e.cause, Cause::PortInUse(_)) => {
-                    let path = dir.join("bridge.toml");
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let rest: String =
-                        text.lines().filter(|l| !l.starts_with("port = ")).map(|l| format!("{l}\n")).collect();
-                    std::fs::write(&path, format!("port = {}\n{rest}", free_port())).unwrap();
-                }
+                Err(e) if matches!(e.cause, Cause::PortInUse(_)) => set_port(dir, free_port()),
                 started => return started.unwrap(),
             }
         }
         panic!("no free port stayed free until a start bound it");
+    }
+
+    /// Writes `port` into a test folder's `bridge.toml`, keeping its other lines.
+    fn set_port(dir: &Path, port: u16) {
+        let path = dir.join("bridge.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rest: String = text.lines().filter(|l| !l.starts_with("port = ")).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, format!("port = {port}\n{rest}")).unwrap();
     }
 
     /// A port another process binds between the look and the start does not
@@ -382,8 +384,15 @@ mod tests {
     fn a_test_start_moves_off_a_port_taken_meanwhile() {
         let _log = log::testing::hold();
         let dir = folder("taken-meanwhile", None);
-        let taken = port_of(&dir);
-        let _other = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+        // The other process's listener is bound first, on a port free_port
+        // offers, again on another should something take that one meanwhile,
+        // and only then written into the folder: the fixture has no gap of
+        // its own between a look and a bind.
+        let other = std::iter::repeat_with(|| std::net::TcpListener::bind(("127.0.0.1", free_port())))
+            .find_map(Result::ok)
+            .unwrap();
+        let taken = other.local_addr().unwrap().port();
+        set_port(&dir, taken);
         let e = prepare(&dir, &Options::default()).err().unwrap();
         assert_eq!(e.cause, Cause::PortInUse(taken));
         let bridge = started_in(&dir, &Options::default());
