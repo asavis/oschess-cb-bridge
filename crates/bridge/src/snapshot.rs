@@ -111,7 +111,7 @@ impl Database {
             size,
             progress,
             listed: entry.listed(),
-            writable: state == State::Ready && entry.writable_file(),
+            writable: state == State::Ready && look.is_some_and(|l| l.writable),
             folder: entry.folder(),
             created: look.and_then(|l| l.created),
             modified: look.and_then(|l| l.modified),
