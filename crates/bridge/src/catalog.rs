@@ -928,7 +928,7 @@ mod tests {
             (pgn.dir().join("db.pgn"), Format::Pgn),
         ] {
             let looked = generation_of(&path, format, &System);
-            assert!(!looked.irregular && looked.present.len() > 0, "{path:?}");
+            assert!(!looked.irregular && !looked.present.is_empty(), "{path:?}");
             assert_eq!(looked.generation, Some(two_opens(&path, format)), "{path:?}");
         }
     }
