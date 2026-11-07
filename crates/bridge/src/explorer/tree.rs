@@ -177,15 +177,24 @@ pub(super) fn write(
         least: MIN_WORKER_ENTRIES,
         largest: largest.saturating_mul(ENTRY_BYTES),
     };
-    let room = passes.room(share, pass_workers(progress), stream.header.records(), limits.pass_bytes)?;
-    let (_memory, want, room) = room.reserve(progress)?;
-    let (capacity, want) = passes.capacity(room, want);
+    let records = stream.header.records();
+    let plan = passes.room(share, pass_workers(progress), records, limits.pass_bytes)?;
+    let (mut memory, mut workers, room) = plan.reserve(progress)?;
+    let (capacity, mut want) = passes.capacity(room, workers);
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let table_memory = Hold::default();
     let mut sink = Sink { at: out.offset, table, table_memory, keys: 0, blocks: 0, games: 0, progress };
     let mut first = 0;
     while first < counts.len() {
+        // A build promoted since the last pass takes a requested build's
+        // workers from this one on (#346).
+        if let Ok(now) = passes.room(share, pass_workers(progress), records, limits.pass_bytes)
+            && now.workers > workers
+        {
+            workers = plan.more_workers(&mut memory, workers, now.workers);
+            want = passes.capacity(room, workers).1;
+        }
         let (end, planned) = plan_pass(first, counts.len(), capacity, collected);
         let hi = AtomicUsize::new(end);
         progress.tree_passes.fetch_add(1, Ordering::Relaxed);
@@ -198,7 +207,7 @@ pub(super) fn write(
         let end = hi.load(Ordering::Relaxed);
         write_parts(&buffers, &pass, end, counts, &mut sink, out, want)?;
         out.sync_behind();
-        let time = PassTime { replay: replayed - started, write: replayed.elapsed() };
+        let time = PassTime { replay: replayed - started, write: replayed.elapsed(), workers: buffers.len() };
         progress.time(|t| t.tree.push(time));
         first = end;
     }
