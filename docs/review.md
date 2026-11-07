@@ -128,8 +128,6 @@ you could not finish.
 
 ## After the verdict
 
-- The round is over: remove the review worktree,
-  `python3 scripts/worktrees.py remove <name>`.
 - `FINDINGS`: the implementing backend fixes every confirmed finding on the same
   branch, pushes, and requests a new review of the new head.
 - `CLEAN` naming the current head, with the prose comment naming the same SHA:

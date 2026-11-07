@@ -14,9 +14,10 @@
   (#362). The checks below go through it, and so does a session started to
   work in a worktree, such as a review:
   `python3 scripts/target_slot.py -C <worktree> codex exec -C <worktree> ...`.
-- Remove a worktree once its work is done: a review worktree when its round
-  ends, a stress worktree when its campaign ends, and the pull request's own
-  when it is merged or closed, with `python3 scripts/worktrees.py remove
+- Reuse a review or stress worktree for the next round rather than adding one
+  per job, and lock one kept for reuse (`git worktree lock --reason <why>
+  <path>`). Remove a worktree once nothing needs it, at the latest when its
+  pull request is merged or closed: `python3 scripts/worktrees.py remove
   <name>`. `python3 scripts/worktrees.py` lists the worktrees with their sizes
   and verdicts, and `python3 scripts/worktrees.py clean --apply` removes every
   finished one. Neither removes a worktree with uncommitted changes, one a
