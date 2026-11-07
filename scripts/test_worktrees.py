@@ -270,21 +270,39 @@ class Remove(Repo):
         )
         self.assertFalse((self.repo / ".worktrees" / "open").exists())
 
-    def lookup_that_commits(self, github, when):
+    def lookup_that(self, github, when, action):
         """`github`, but its `when` request ("pulls" or "commit_pulls") first
-        commits in the in-main worktree, once: another agent at work while
-        `remove` waits for GitHub."""
-        tree = self.repo / ".worktrees" / "in-main"
-        pending = [lambda: self.commit("during the lookup", cwd=tree)]
+        does `action`, once: another agent at work while `remove` waits for
+        GitHub."""
+        pending = [action]
         answer = getattr(github, when)
 
-        def committing(*args):
+        def acting(*args):
             while pending:
                 pending.pop()()
             return answer(*args)
 
-        setattr(github, when, committing)
-        return github, tree
+        setattr(github, when, acting)
+        return github
+
+    def lookup_that_commits(self, github, when):
+        tree = self.repo / ".worktrees" / "in-main"
+        return self.lookup_that(github, when, lambda: self.commit("during the lookup", cwd=tree)), tree
+
+    def test_a_process_started_during_the_commits_lookup_keeps_the_worktree(self):
+        github = self.every_state()
+        tree = self.repo / ".worktrees" / "in-main"
+
+        def start():
+            sleeper = subprocess.Popen(["sleep", "60"], cwd=tree)
+            self.addCleanup(sleeper.wait)
+            self.addCleanup(sleeper.kill)
+
+        told = io.StringIO()
+        code = worktrees.remove(self.repo, ["in-main"], self.lookup_that(github, "commit_pulls", start), out=told)
+        self.assertEqual(code, 1)
+        self.assertEqual(told.getvalue(), "kept in-main: in use\n")
+        self.assertTrue(tree.exists())
 
     def test_a_commit_during_the_list_of_pull_requests_keeps_the_worktree(self):
         github, tree = self.lookup_that_commits(self.every_state(), "pulls")

@@ -303,26 +303,53 @@ def recheck(repo, row, min_idle, now=time.time):
     goes: its HEAD, branch and lock as git lists them now, its changes, the
     processes running now and its idle time. The survey may be minutes old, and
     another agent may have committed in the worktree or started work in it
-    since. The pull requests are the survey's."""
+    since. The pull requests are the survey's. The looks at git's refs come
+    first, then the changes, the processes and the idle time, then whether the
+    HEAD moved meanwhile, so that what could change fastest is read last."""
     tree = current(repo, row.tree)
     if tree is None or tree.prunable:
         return "keep", "gone since the survey"
     if (tree.head, tree.branch) != (row.tree.head, row.tree.branch):
         return "keep", "its HEAD moved since the survey"
     pulls = list(row.pulls)
+    kept = held(repo, tree.head, pulls)
+    merged = in_main(repo, tree.head)
     verdict, why = judge(
         tree,
         dirty=dirty(tree),
         busy=in_use(tree, open_paths()),
         idle=now() - last_change(tree),
-        kept=held(repo, tree.head, pulls),
-        merged=in_main(repo, tree.head),
+        kept=kept,
+        merged=merged,
         pulls=pulls,
         min_idle=min_idle,
     )
     if verdict == "remove" and moved(repo, tree):
         return "keep", "its HEAD moved while it was judged"
     return verdict, why
+
+
+def unsafe(repo, tree, pulls):
+    """Why `remove` may not remove the worktree now, or None. The pull
+    requests, the slow part, are found before; this reads the rest at this
+    moment: the worktree as git lists it, its lock, whether its commit is held,
+    its changes and the processes in it, then whether its HEAD moved meanwhile."""
+    now = current(repo, tree)
+    if now is None or now.prunable:
+        return "gone while it was judged"
+    if (now.head, now.branch) != (tree.head, tree.branch):
+        return "its HEAD moved while it was judged"
+    if now.locked:
+        return "locked"
+    if not held(repo, now.head, pulls):
+        return "no ref and no pull request holds its commit"
+    if dirty(now):
+        return "uncommitted changes"
+    if in_use(now, open_paths()):
+        return "in use"
+    if moved(repo, now):
+        return "its HEAD moved while it was judged"
+    return None
 
 
 def survey(repo, github, min_idle, now=time.time):
@@ -463,22 +490,13 @@ def remove(repo, names, github, out=sys.stdout):
     failed = 0
     for name in names:
         tree = {tree.name: tree for tree in trees(repo)}.get(name)
-        why = None
         if tree is None:
             why = "no such worktree under .worktrees/"
         elif tree.prunable:
             print(f"pruned {name}: its folder was gone", file=out)
             continue
-        elif tree.locked:
-            why = "locked"
-        elif dirty(tree):
-            why = "uncommitted changes"
-        elif in_use(tree, open_paths()):
-            why = "in use"
-        elif not held(repo, tree.head, belongs(tree, listed, github)):
-            why = "no ref and no pull request holds its commit"
-        elif moved(repo, tree):
-            why = "its HEAD moved while it was judged"
+        else:
+            why = unsafe(repo, tree, belongs(tree, listed, github))
         if why is None:
             gone = git("worktree", "remove", str(tree.path), cwd=repo)
             why = None if gone.returncode == 0 else gone.stderr.strip()
