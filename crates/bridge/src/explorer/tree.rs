@@ -179,8 +179,8 @@ pub(super) fn write(
     };
     let records = stream.header.records();
     let plan = passes.room(share, pass_workers(progress), records, limits.pass_bytes)?;
-    let (mut memory, mut workers, room) = plan.reserve(progress)?;
-    let (capacity, mut want) = passes.capacity(room, workers);
+    let (mut memory, mut workers, mut room) = plan.reserve(progress)?;
+    let (mut capacity, mut want) = passes.capacity(room, workers);
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let table_memory = Hold::default();
@@ -188,12 +188,12 @@ pub(super) fn write(
     let mut first = 0;
     while first < counts.len() {
         // A build promoted since the last pass takes a requested build's
-        // workers from this one on (#346).
+        // workers from this one on, within its share (#346).
         if let Ok(now) = passes.room(share, pass_workers(progress), records, limits.pass_bytes)
             && now.workers > workers
         {
-            workers = plan.more_workers(&mut memory, workers, now.workers);
-            want = passes.capacity(room, workers).1;
+            (workers, room) = now.more_workers(&mut memory, workers, room);
+            (capacity, want) = passes.capacity(room, workers);
         }
         let (end, planned) = plan_pass(first, counts.len(), capacity, collected);
         let hi = AtomicUsize::new(end);

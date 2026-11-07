@@ -1277,7 +1277,9 @@ With `q` the answer also acknowledges the search (#268):
     half a second at a time, so that it still ends if they never stop. A
     requested build never gives way, and a background build that a request
     for its database's positions makes the requested one gives way no
-    longer, and takes a requested build's workers from its next pass on.
+    longer, and takes a requested build's workers from its next pass on,
+    within the same half of the budget: the room each worker more needs
+    comes out of what its passes hold, so that they may take more passes.
 
   A build reads header and move records, a few megabytes at a time, never
   annotations, and needs no temporary space. It needs free space of about 400

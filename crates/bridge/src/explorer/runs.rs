@@ -433,17 +433,31 @@ impl Room {
         Ok((hold, workers, self.least + more))
     }
 
-    /// More workers for the passes of a section still to come, from
-    /// `workers` up to `want`, each adding its `each` bytes to `hold` while
-    /// the budget has them free now, never waiting (#346): a build that a
-    /// request promoted while the section runs takes a requested build's
-    /// workers from its next pass on, as many as the budget lets it.
-    pub fn more_workers(&self, hold: &mut Hold, workers: usize, want: usize) -> usize {
-        let mut workers = workers;
-        while workers < want && hold.grow_quietly(self.each).is_ok() {
-            workers += 1;
+    /// The workers and the room of the passes of a section still to come,
+    /// for a build whose `hold` holds the passes' `workers` and `room` bytes
+    /// of entries or postings, when these passes, planned again as `self`,
+    /// take more workers (#346): a build that a request promoted while the
+    /// section runs takes a requested build's workers from its next pass on,
+    /// within its share as a requested build does. The most of
+    /// `self.workers` that fit: the room gives each worker more the bytes
+    /// that the share no longer holds beside it, keeping no more than `self`
+    /// plans for its workers and each one fewer's bytes, and the budget
+    /// gives what more they take, while it has that free now, never waiting.
+    /// The workers and the room as they were when it has not even one more
+    /// worker's free.
+    pub fn more_workers(&self, hold: &mut Hold, workers: usize, room: usize) -> (usize, usize) {
+        for more in (workers + 1..=self.workers).rev() {
+            let fits = room.min(self.room + (self.workers - more) * self.each);
+            let (added, freed) = ((more - workers) * self.each, room - fits);
+            if added <= freed {
+                hold.shrink(hold.bytes() + added - freed);
+                return (more, fits);
+            }
+            if hold.grow_quietly(added - freed).is_ok() {
+                return (more, fits);
+            }
         }
-        workers
+        (workers, room)
     }
 }
 
@@ -589,6 +603,28 @@ mod tests {
         progress.set_requested(true);
         assert_eq!(pass_workers(&progress), requested);
         assert!(all - requested >= 2 || requested == half, "{all} workers, {requested} taken");
+    }
+
+    /// A promoted build's passes take their workers more within the share
+    /// they were planned in (#346): while their room fills it, each worker
+    /// more takes its bytes from the room and the hold stays as it was;
+    /// while the room is smaller than the share holds beside them, from the
+    /// budget; in between, from both. The room never grows.
+    #[test]
+    fn more_workers_keep_to_the_share() {
+        let kib = 1 << 10;
+        // A 4 KiB table and workers of 8 KiB each in a 64 KiB share: room
+        // for 28 KiB beside four workers, 12 KiB beside six.
+        let plan = |workers: usize, room: usize| Room { fixed: 4 * kib, each: 8 * kib, workers, least: kib, room };
+        for (four, six, held) in [(28, 12, 64), (6, 6, 58), (20, 12, 64)] {
+            let (mut hold, workers, room) = plan(4, four * kib).reserve(&Progress::default()).unwrap();
+            assert_eq!((workers, room), (4, four * kib));
+            let more = plan(6, six * kib).more_workers(&mut hold, workers, room);
+            assert_eq!((more, hold.bytes()), ((6, six * kib), held * kib), "{four} KiB of room for four");
+        }
+        let (mut hold, workers, room) = plan(4, 28 * kib).reserve(&Progress::default()).unwrap();
+        assert_eq!(plan(4, 28 * kib).more_workers(&mut hold, workers, room), (4, 28 * kib), "none more");
+        assert_eq!(hold.bytes(), 64 * kib);
     }
 
     /// A build's timings read back from their line, and nothing else.

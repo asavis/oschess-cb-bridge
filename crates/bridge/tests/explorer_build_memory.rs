@@ -9,6 +9,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bridge::explorer::format::structure;
@@ -232,18 +233,23 @@ fn crowded(name: &str, others: u32, games: u32) -> TempDb {
 /// [`CHILD_LIMIT`] at least. A build at 16 MiB reads all its games on one
 /// worker, which takes half a minute on a quiet computer and as many times
 /// longer as the load holds that worker back, so no fixed limit fits it.
+/// Measured once a process: the tests that run side by side share it, and
+/// their builds, in the same folders, never meet (#346).
 fn child_limit() -> Duration {
-    warm_up();
-    let db = crowded("build-memory-reference", 0, REFERENCE);
-    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let dir = index_dir("reference");
-    let started = Instant::now();
-    drop(explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap());
-    let took = started.elapsed();
-    std::fs::remove_dir_all(&dir).unwrap();
-    let limit = CHILD_LIMIT.max(took * (OTHERS + CROWDED) / REFERENCE * 10);
-    println!("{REFERENCE} crowded games built in {took:?}: each child may take {limit:?}");
-    limit
+    static LIMIT: OnceLock<Duration> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        warm_up();
+        let db = crowded("build-memory-reference", 0, REFERENCE);
+        let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+        let dir = index_dir("reference");
+        let started = Instant::now();
+        drop(explorer::prepare(&d, 1, &dir, "db", &Progress::default()).unwrap());
+        let took = started.elapsed();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let limit = CHILD_LIMIT.max(took * (OTHERS + CROWDED) / REFERENCE * 10);
+        println!("{REFERENCE} crowded games built in {took:?}: each child may take {limit:?}");
+        limit
+    })
 }
 
 /// The child's build of the crowded database at `db` into `dir`: within its
@@ -379,4 +385,78 @@ fn a_promoted_build_takes_more_workers_from_its_next_pass() {
     assert!(tree.iter().all(|&w| w == 4), "a background build's tree: {tree:?}");
     assert_eq!(deep[0], 4, "promoted as the deep section's first pass starts: {deep:?}");
     assert!(deep[1..].iter().all(|&w| w == 6), "then six: {deep:?}");
+}
+
+/// A background build that a request promotes while its passes' room fills
+/// its share takes a requested build's workers within that share (#346): each
+/// worker more takes its bytes from the room, so that the build holds no more
+/// of the budget than before and a search finds the other half free as every
+/// pass starts. Of eight workers in 64 MiB, the tree's passes of 16,384 games
+/// fill the 32 MiB share; the promoted build's first pass takes four workers,
+/// every pass after it six, in less room and so in more passes.
+#[test]
+fn a_promoted_build_keeps_to_its_share() {
+    const NAME: &str = "a_promoted_build_keeps_to_its_share";
+    if !is_child(CHILD) {
+        let limit = child_limit();
+        return passed(child(NAME, 64, 8, &[]).end_within(limit));
+    }
+    assert_eq!((budget(), threads()), (64 << 20, 8));
+    // 4,096 games, each 16 times: their records appended 15 times more, as
+    // `crowded` appends its game's, so that the fixture is made at once.
+    let mut b = Builder::new();
+    add_random_games(&mut b, 4_096, 0x3461);
+    let db = b.write("build-memory-promoted-share");
+    let cbh = db.dir().join("db.2cbh");
+    let written = std::fs::read(&cbh).unwrap();
+    let records = &written[written.len() - 4_096 * 192..];
+    let mut out = std::fs::OpenOptions::new().append(true).open(&cbh).unwrap();
+    for _ in 1..16 {
+        out.write_all(records).unwrap();
+    }
+    drop(out);
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    // As each pass starts: the tree's passes so far, what the process holds
+    // of the budget, and whether a search finds the build's other half free
+    // then, but for a page.
+    static STARTS: Mutex<Vec<(u64, usize, bool)>> = Mutex::new(Vec::new());
+    fn note(p: &Progress) {
+        let free = Hold::reserve_quietly(budget() / 2 - 4096).is_ok();
+        STARTS.lock().unwrap().push((p.tree_passes.load(Ordering::Relaxed), held(), free));
+    }
+    let build = |started: fn(&Progress)| {
+        STARTS.lock().unwrap().clear();
+        let dir = index_dir("promoted-share");
+        let progress = Progress::default();
+        progress.set_requested(false);
+        let limits = Limits { pass_started: Some(started), ..Limits::default() };
+        let loaded = explorer::prepare_with(&d, 1, &dir, "db", &progress, &limits).unwrap();
+        let tree: Vec<usize> = loaded.built.clone().unwrap().tree.iter().map(|p| p.workers).collect();
+        drop(loaded);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let starts = std::mem::take(&mut *STARTS.lock().unwrap());
+        (tree, starts)
+    };
+    let (tree, background) = build(note);
+    assert!(tree.len() >= 2 && tree.iter().all(|&w| w == 4), "in the background: {tree:?}");
+    let most = background.iter().map(|s| s.1).max().unwrap();
+    assert!(most >= budget() / 2, "the tree's passes fill the share: {most} bytes held");
+    let promote: fn(&Progress) = |p| {
+        note(p);
+        if p.tree_passes.load(Ordering::Relaxed) == 1 {
+            p.set_requested(true);
+        }
+    };
+    let (promoted, starts) = build(promote);
+    assert_eq!(promoted[0], 4, "promoted as the tree's first pass starts: {promoted:?}");
+    assert!(promoted[1..].iter().all(|&w| w == 6), "then six: {promoted:?}");
+    for (pass, bytes, free) in background.iter().chain(&starts) {
+        assert!(free, "after tree pass {pass}: {bytes} bytes held, a search does not find its half");
+    }
+    let promoted_most = starts.iter().map(|s| s.1).max().unwrap();
+    assert!(promoted_most <= most, "promoted: {promoted_most} bytes held, in the background {most}");
+    assert!(promoted.len() > tree.len(), "in less room, more passes: {promoted:?} against {tree:?}");
+    println!(
+        "64 MiB, 8 workers: {most} bytes held in the background, {promoted_most} promoted; tree passes' workers {tree:?}, promoted {promoted:?}"
+    );
 }
