@@ -198,6 +198,7 @@ pub(super) fn write(
         let (end, planned) = plan_pass(first, counts.len(), capacity, collected);
         let hi = AtomicUsize::new(end);
         progress.tree_passes.fetch_add(1, Ordering::Relaxed);
+        limits.pass_started.inspect(|started| started(progress));
         let pass = Pass { stream, part_bits, first, hi: &hi, capacity, planned, folded, progress, limits };
         let started = Instant::now();
         // As many workers as each hold the pass's first part in its share

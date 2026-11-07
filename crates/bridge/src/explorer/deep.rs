@@ -159,6 +159,7 @@ pub(super) fn write(
         let (end, planned) = plan_pass(first, counts.len(), capacity, |block| counts[block]);
         let hi = AtomicU64::new(block_point(end as u64));
         progress.deep_passes.fetch_add(1, Ordering::Relaxed);
+        limits.pass_started.inspect(|started| started(progress));
         let rest = AtomicU64::new(0);
         let pass = Pass { stream, bits, lo, hi: &hi, split, rest, capacity, planned, progress, limits };
         let started = Instant::now();
