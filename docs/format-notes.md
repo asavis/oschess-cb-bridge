@@ -638,11 +638,15 @@ stream, `<id>.moves` (see "Move stream" below). Integers are little-endian.
   rebuilds both. A crash between writing one and the other, or a file copied
   from another build, never pairs an index with a stream it was not built
   with.
-- **The build** (#147) first scans game headers in bounded batches (phase
-  `checking`) to find the newest valid date before any search filter, without
-  reading names, moves or annotations. It observes cancellation and yields to
-  foreground searches between batches. It then runs three kinds of pass, on at
-  most half the search workers and within half the search memory budget, and writes nothing but
+- **The build** (#147) first scans game headers in bounded batches of 2,048
+  records (phase `checking`) to find the newest valid date before any search
+  filter, without reading names, moves or annotations, on the build's workers,
+  each taking the next batch no worker has taken (#346). It observes
+  cancellation and yields to foreground searches between batches. It then runs
+  three kinds of pass within half the search memory budget, each on the
+  build's workers: at most half the search workers for a background build, and
+  all of them but two, never fewer than half, for a requested one (#346). It
+  writes nothing but
   `<id>.moves.partial` and `<id>.idx.partial`, renamed `<id>.moves` and
   `<id>.idx` at the end; the database's former files are deleted when it
   starts, so that the folder never holds more than the new files.

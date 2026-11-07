@@ -37,7 +37,6 @@ use std::time::Instant;
 use crate::indexdir::crc32_update;
 use crate::search::SearchError;
 use crate::search::memory::Refused;
-use crate::search::workers::threads;
 use crate::sync::{lock, unpoisoned};
 
 use super::build::{Chunks, Out, Passes, Turns, from_bad, plan_pass};
@@ -46,7 +45,7 @@ use super::format::{
     BLOCK_BUCKETS, DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, deep_bucket, deep_print, structure_of,
     structures_in_vectors, structures_of, varint,
 };
-use super::runs::{Limits, PassTime, Progress, on_workers};
+use super::runs::{Limits, PassTime, Progress, on_workers, pass_workers};
 use super::source::MAX_STRUCTURES;
 use super::stream::{self, Stream};
 
@@ -138,9 +137,10 @@ pub(super) fn write(
         least: MIN_WORKER_POSTINGS,
         largest: 0,
     };
-    let room = passes.room(share, threads(), stream.header.records(), limits.pass_bytes)?;
-    let (_memory, want, room) = room.reserve(progress)?;
-    let (capacity, want) = passes.capacity(room, want);
+    let records = stream.header.records();
+    let plan = passes.room(share, pass_workers(progress), records, limits.pass_bytes)?;
+    let (mut memory, mut workers, room) = plan.reserve(progress)?;
+    let (capacity, mut want) = passes.capacity(room, workers);
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let mut sink = Sink { at: out.offset, table, start: 0, crc: !0, postings: 0 };
@@ -148,9 +148,18 @@ pub(super) fn write(
     while lo < block_point(counts.len() as u64) {
         // From the block the last pass ended in, counted whole.
         let first = (lo >> (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)) as usize;
+        // A build promoted since the last pass takes a requested build's
+        // workers from this one on (#346).
+        if let Ok(now) = passes.room(share, pass_workers(progress), records, limits.pass_bytes)
+            && now.workers > workers
+        {
+            workers = plan.more_workers(&mut memory, workers, now.workers);
+            want = passes.capacity(room, workers).1;
+        }
         let (end, planned) = plan_pass(first, counts.len(), capacity, |block| counts[block]);
         let hi = AtomicU64::new(block_point(end as u64));
         progress.deep_passes.fetch_add(1, Ordering::Relaxed);
+        limits.pass_started.inspect(|started| started(progress));
         let rest = AtomicU64::new(0);
         let pass = Pass { stream, bits, lo, hi: &hi, split, rest, capacity, planned, progress, limits };
         let started = Instant::now();
@@ -159,7 +168,7 @@ pub(super) fn write(
         let hi = hi.load(Ordering::Relaxed);
         split = write_blocks(&buffers, &pass, hi, counts, &mut sink, out, want)?.unwrap_or_default();
         out.sync_behind();
-        let time = PassTime { replay: replayed - started, write: replayed.elapsed() };
+        let time = PassTime { replay: replayed - started, write: replayed.elapsed(), workers: buffers.len() };
         progress.time(|t| t.deep.push(time));
         lo = hi;
     }
