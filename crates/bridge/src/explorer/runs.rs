@@ -493,6 +493,9 @@ pub struct Limits {
     /// first chunk; tests use it to start the workers as a busy machine does
     /// (#237).
     pub late_start: Duration,
+    /// Called as each pass of the tree or of the deep section starts, its
+    /// workers taken; tests use it to promote a build at a given pass (#346).
+    pub pass_started: Option<fn(&Progress)>,
 }
 
 impl Default for Limits {
@@ -502,6 +505,7 @@ impl Default for Limits {
             pass_bytes: None,
             workers_wait: WORKERS_WAIT,
             late_start: Duration::ZERO,
+            pass_started: None,
         }
     }
 }

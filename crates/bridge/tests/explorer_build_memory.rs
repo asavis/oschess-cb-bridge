@@ -325,10 +325,10 @@ fn counts_every_game(loaded: &Loaded) {
 /// A background build that a request promotes while one of its sections
 /// runs takes a requested build's workers from that section's next pass on
 /// (#346), in the tree's passes and in the deep section's: of eight workers,
-/// the passes planned before the promotion take four, the passes after it
-/// six. A build requested from the start takes six in every pass. Each pass
-/// lasts at least `late_start`, so that the promotion lands while the
-/// section's first pass runs.
+/// the section's first pass, planned before the promotion, takes four, and
+/// every pass after it six. A build requested from the start takes six in
+/// every pass. The build is promoted as the section's first pass starts
+/// ([`Limits::pass_started`]), whatever the machine's pace.
 #[test]
 fn a_promoted_build_takes_more_workers_from_its_next_pass() {
     const NAME: &str = "a_promoted_build_takes_more_workers_from_its_next_pass";
@@ -340,25 +340,14 @@ fn a_promoted_build_takes_more_workers_from_its_next_pass() {
     add_random_games(&mut b, 16_384, 0x346);
     let db = b.write("build-memory-promoted");
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
-    let limits = Limits { pass_bytes: Some(2 << 20), late_start: Duration::from_millis(400), ..Limits::default() };
-    // The workers of each tree pass and each deep pass of a build promoted
-    // once `passes` of `progress` counts its first pass; none, from the start.
-    let build = |promote: Option<fn(&Progress) -> u64>| {
+    // The workers of each tree pass and each deep pass of a build that starts
+    // as a requested one or not, and whose passes call `started`.
+    let build = |requested: bool, started: Option<fn(&Progress)>| {
         let dir = index_dir("promoted");
         let progress = Progress::default();
-        progress.set_requested(promote.is_none());
-        let loaded = std::thread::scope(|s| {
-            let built = s.spawn(|| explorer::prepare_with(&d, 1, &dir, "db", &progress, &limits));
-            if let Some(passes) = promote {
-                let until = Instant::now() + CHILD_LIMIT;
-                while passes(&progress) == 0 {
-                    assert!(Instant::now() < until && !built.is_finished(), "the section never started");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                progress.set_requested(true);
-            }
-            built.join().unwrap().unwrap()
-        });
+        progress.set_requested(requested);
+        let limits = Limits { pass_bytes: Some(2 << 20), pass_started: started, ..Limits::default() };
+        let loaded = explorer::prepare_with(&d, 1, &dir, "db", &progress, &limits).unwrap();
         let timings = loaded.built.clone().unwrap();
         drop(loaded);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -366,13 +355,26 @@ fn a_promoted_build_takes_more_workers_from_its_next_pass() {
             |passes: &[bridge::explorer::runs::PassTime]| passes.iter().map(|p| p.workers).collect::<Vec<_>>();
         (workers(&timings.tree), workers(&timings.deep))
     };
-    let (tree, deep) = build(None);
+    let (tree, deep) = build(true, None);
     assert!(tree.len() >= 2 && deep.len() >= 2, "passes: tree {tree:?}, deep {deep:?}");
     assert!(tree.iter().chain(&deep).all(|&w| w == 6), "requested from the start: tree {tree:?}, deep {deep:?}");
-    let (tree, deep) = build(Some(|p| p.tree_passes.load(Ordering::Relaxed)));
-    assert_eq!((tree[0], tree[tree.len() - 1]), (4, 6), "promoted in the tree's first pass: {tree:?}");
-    assert!(deep.iter().all(|&w| w == 6), "and so in every deep pass: {deep:?}");
-    let (tree, deep) = build(Some(|p| p.deep_passes.load(Ordering::Relaxed)));
+    let (tree, deep) = build(false, None);
+    assert!(tree.iter().chain(&deep).all(|&w| w == 4), "in the background: tree {tree:?}, deep {deep:?}");
+    let in_tree: fn(&Progress) = |p| {
+        if p.tree_passes.load(Ordering::Relaxed) == 1 {
+            p.set_requested(true);
+        }
+    };
+    let (tree, deep) = build(false, Some(in_tree));
+    assert_eq!(tree[0], 4, "promoted as the tree's first pass starts: {tree:?}");
+    assert!(tree[1..].iter().chain(&deep).all(|&w| w == 6), "then six: tree {tree:?}, deep {deep:?}");
+    let in_deep: fn(&Progress) = |p| {
+        if p.deep_passes.load(Ordering::Relaxed) == 1 {
+            p.set_requested(true);
+        }
+    };
+    let (tree, deep) = build(false, Some(in_deep));
     assert!(tree.iter().all(|&w| w == 4), "a background build's tree: {tree:?}");
-    assert_eq!((deep[0], deep[deep.len() - 1]), (4, 6), "promoted in the deep section's first pass: {deep:?}");
+    assert_eq!(deep[0], 4, "promoted as the deep section's first pass starts: {deep:?}");
+    assert!(deep[1..].iter().all(|&w| w == 6), "then six: {deep:?}");
 }
