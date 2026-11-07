@@ -290,6 +290,14 @@ def current(repo, tree):
     return next((now for now in trees(repo) if now.path == tree.path), None)
 
 
+def moved(repo, tree):
+    """Whether the worktree is gone, or its HEAD or branch is no longer the one
+    it was judged by. Asked last, right before a removal, after every slower
+    look, a GitHub request among them."""
+    now = current(repo, tree)
+    return now is None or (now.head, now.branch) != (tree.head, tree.branch)
+
+
 def recheck(repo, row, min_idle, now=time.time):
     """Judges a worktree again from what is true at this moment, right before it
     goes: its HEAD, branch and lock as git lists them now, its changes, the
@@ -302,7 +310,7 @@ def recheck(repo, row, min_idle, now=time.time):
     if (tree.head, tree.branch) != (row.tree.head, row.tree.branch):
         return "keep", "its HEAD moved since the survey"
     pulls = list(row.pulls)
-    return judge(
+    verdict, why = judge(
         tree,
         dirty=dirty(tree),
         busy=in_use(tree, open_paths()),
@@ -312,6 +320,9 @@ def recheck(repo, row, min_idle, now=time.time):
         pulls=pulls,
         min_idle=min_idle,
     )
+    if verdict == "remove" and moved(repo, tree):
+        return "keep", "its HEAD moved while it was judged"
+    return verdict, why
 
 
 def survey(repo, github, min_idle, now=time.time):
@@ -447,12 +458,11 @@ def clean(repo, rows, apply, target_idle, min_idle=HOUR, out=sys.stdout, now=tim
 
 def remove(repo, names, github, out=sys.stdout):
     """Removes the named worktrees that are clean, unused and unlocked and
-    whose commit is held."""
-    known = {tree.name: tree for tree in trees(repo)}
+    whose commit is held, each judged as git lists it at that moment."""
     listed = github.pulls() if github else None
     failed = 0
     for name in names:
-        tree = known.get(name)
+        tree = {tree.name: tree for tree in trees(repo)}.get(name)
         why = None
         if tree is None:
             why = "no such worktree under .worktrees/"
@@ -467,6 +477,8 @@ def remove(repo, names, github, out=sys.stdout):
             why = "in use"
         elif not held(repo, tree.head, belongs(tree, listed, github)):
             why = "no ref and no pull request holds its commit"
+        elif moved(repo, tree):
+            why = "its HEAD moved while it was judged"
         if why is None:
             gone = git("worktree", "remove", str(tree.path), cwd=repo)
             why = None if gone.returncode == 0 else gone.stderr.strip()

@@ -32,12 +32,13 @@ its worktree had last when that one is free. When every slot is taken it waits,
 then builds in a folder of its own, which goes once no process of the command
 holds its lock any more.
 
-A command started inside another one that holds a slot for the same worktree,
-such as a check inside a review session started through this script, keeps that
-slot, but only while the lease is still held: the slot's lock taken and the
-slot marked with the lease's token. A process that outlived its lease finds the
-lock free, or the slot passed on under another token, and takes a lease of its
-own.
+A command started through this script inside another one that holds a slot
+for the same worktree, such as a check inside a review session started through
+this script, joins that lease: it holds the slot's lock, shared, with a
+descriptor of its own, for as long as it lives, so the slot stays this
+worktree's even if the command that took it ends first. It joins only while
+the slot still carries the lease's token; a process that outlived its lease
+finds the slot passed on under another token, and takes a lease of its own.
 
     CB_TARGET_ROOT          the slots' folder (~/.cache/oschess-cb-bridge/targets)
     CB_TARGET_SLOTS         how many slots there are (4)
@@ -203,8 +204,8 @@ def prepare(lease, workspace, names, max_bytes, out=sys.stderr):
 
 
 def take(lock):
-    """Takes the lock in the file `lock`, without waiting: its descriptor, or
-    None when another process holds it."""
+    """Takes the lock in the file `lock` alone, without waiting: its
+    descriptor, or None when any process holds it, alone or shared."""
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -229,35 +230,66 @@ def sweep(root, now=time.time):
             os.close(fd)
 
 
-def marked(folder, fd, slot):
-    """The lease of a folder whose lock `fd` holds, its token written there."""
-    token = secrets.token_hex(8)
-    (folder / "lease").write_text(f"{token}\n")
-    return Lease(folder, fd, slot, token)
+def acquire(folder, slot):
+    """Takes `folder` for a new lease, or returns None when a process holds it.
+
+    The holders of a lease hold the folder's lock shared, so that a command
+    inside the lease can join it with a descriptor of its own. A new lease takes
+    the lock alone, which succeeds only when no process holds it at all, marks
+    the folder with its token, then shares the lock. The gate keeps two new
+    leases from both finding the lock free while one of them turns it from
+    exclusive to shared."""
+    gate = os.open(folder / "gate", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        fd = take(folder / "lock")
+        if fd is None:
+            return None
+        token = secrets.token_hex(8)
+        (folder / "lease").write_text(f"{token}\n")
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        return Lease(folder, fd, slot, token)
+    finally:
+        os.close(gate)
 
 
-def held_lease(env, workspace, root):
-    """Whether the environment names a lease for `workspace` that is still
-    held: some process holds its folder's lock, and the folder still carries
-    the lease's token. A process that outlived its lease, having lost the lock's
-    descriptor, finds the lock free or the folder passed on under another
-    token."""
+def join(env, workspace, root, tries=40, nap=0.05):
+    """Joins the lease the environment names for `workspace`: a descriptor
+    holding the folder's lock shared, for this process and the command it
+    becomes, or None when there is no such lease to join. The folder must still
+    carry the lease's token once the lock is held: a process that outlived its
+    lease finds the folder passed on under another token. A lease that ended
+    and that no other lease has taken since is this worktree's still, and
+    joining it holds it again."""
     name, token = env.get("CB_TARGET_SLOT"), env.get("CB_TARGET_SLOT_TOKEN")
     if env.get("CB_TARGET_SLOT_WORKTREE") != str(workspace) or not name or not token or "/" in name:
-        return False
+        return None
     folder = root / name
     if env.get("CARGO_TARGET_DIR") != str(folder / "target"):
-        return False
+        return None
     try:
-        if (folder / "lease").read_text().strip() != token:
-            return False
-        fd = take(folder / "lock")
+        fd = os.open(folder / "lock", os.O_RDWR | os.O_CLOEXEC)
     except OSError:
-        return False
-    if fd is not None:
+        return None
+    # A new lease or a look (--status, a sweep) holds the lock alone for a
+    # moment; wait that out.
+    for _ in range(tries):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            time.sleep(nap)
+    else:
         os.close(fd)
-        return False
-    return True
+        return None
+    try:
+        ours = (folder / "lease").read_text().strip() == token
+    except OSError:
+        ours = False
+    if not ours:
+        os.close(fd)
+        return None
+    return fd
 
 
 def remove_private(folder, out=sys.stderr):
@@ -286,9 +318,9 @@ def lease(config, workspace, out=sys.stderr, sleep=time.sleep, clock=time.monoto
     while True:
         for folder in slots:
             folder.mkdir(exist_ok=True)
-            fd = take(folder / "lock")
-            if fd is not None:
-                return marked(folder, fd, slot=True)
+            held = acquire(folder, slot=True)
+            if held is not None:
+                return held
         left = deadline - clock()
         if left <= 0:
             break
@@ -297,9 +329,8 @@ def lease(config, workspace, out=sys.stderr, sleep=time.sleep, clock=time.monoto
             told = True
         sleep(min(5.0, left))
     folder = Path(tempfile.mkdtemp(prefix="private-", dir=config.root))
-    fd = take(folder / "lock")
     print(f"{NAME}: every slot is in use: building in {folder}, which goes when the command ends", file=out)
-    return marked(folder, fd, slot=False)
+    return acquire(folder, slot=False)
 
 
 def run(command, held, workspace, env=os.environ):
@@ -364,10 +395,14 @@ def main(argv):
     workspace = worktree(cwd)
     env = dict(os.environ)
     config = settings(env)
-    if held_lease(env, workspace, config.root):
+    joined = join(env, workspace, config.root)
+    if joined is not None:
+        # The command holds the lease through this descriptor for as long as
+        # it lives, whatever becomes of the process that took the lease.
+        os.set_inheritable(joined, True)
         os.execvp(argv[0], argv)
-    # A lease that has ended, or one for another worktree, is not this
-    # command's to build in.
+    # A lease passed on, or one for another worktree, is not this command's
+    # to build in.
     for name in ("CARGO_TARGET_DIR", "CB_TARGET_SLOT", "CB_TARGET_SLOT_WORKTREE", "CB_TARGET_SLOT_TOKEN"):
         env.pop(name, None)
     try:

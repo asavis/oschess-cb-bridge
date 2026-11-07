@@ -175,6 +175,25 @@ class Clean(Repo):
         self.assertIn("kept earlier: uncommitted changes", told.getvalue())
         self.assertEqual(self.names(), ["busy", "dirty", "earlier", "in-main", "local", "locked", "merged", "no-pr", "open"])
 
+    def test_a_worktree_that_gets_a_commit_while_it_is_judged_is_kept(self):
+        github = self.every_state()
+        rows = worktrees.survey(self.repo, github, 0)
+        judged = next(row.tree.head for row in rows if row.tree.name == "in-main")
+        original = worktrees.in_main
+        commits = [lambda: self.commit("while judged", cwd=self.repo / ".worktrees" / "in-main")]
+
+        def in_main(repo, sha):
+            # in-main gets a commit while it is judged, and only then.
+            while sha == judged and commits:
+                commits.pop()()
+            return original(repo, sha)
+
+        told = io.StringIO()
+        with mock.patch.object(worktrees, "in_main", in_main):
+            worktrees.clean(self.repo, rows, True, None, min_idle=0, out=told)
+        self.assertIn("kept in-main: its HEAD moved while it was judged", told.getvalue())
+        self.assertIn("in-main", self.names())
+
     def test_a_worktree_that_moved_after_the_survey_waits_for_its_idle_time(self):
         github = self.every_state()
         rows = worktrees.survey(self.repo, github, 0, now=lambda: time.time() + 2 * worktrees.HOUR)
@@ -250,6 +269,37 @@ class Remove(Repo):
             ],
         )
         self.assertFalse((self.repo / ".worktrees" / "open").exists())
+
+    def lookup_that_commits(self, github, when):
+        """`github`, but its `when` request ("pulls" or "commit_pulls") first
+        commits in the in-main worktree, once: another agent at work while
+        `remove` waits for GitHub."""
+        tree = self.repo / ".worktrees" / "in-main"
+        pending = [lambda: self.commit("during the lookup", cwd=tree)]
+        answer = getattr(github, when)
+
+        def committing(*args):
+            while pending:
+                pending.pop()()
+            return answer(*args)
+
+        setattr(github, when, committing)
+        return github, tree
+
+    def test_a_commit_during_the_list_of_pull_requests_keeps_the_worktree(self):
+        github, tree = self.lookup_that_commits(self.every_state(), "pulls")
+        told = io.StringIO()
+        self.assertEqual(worktrees.remove(self.repo, ["in-main"], github, out=told), 1)
+        self.assertEqual(told.getvalue(), "kept in-main: no ref and no pull request holds its commit\n")
+        self.assertTrue(tree.exists())
+
+    def test_a_commit_during_the_commits_lookup_keeps_the_worktree(self):
+        github, tree = self.lookup_that_commits(self.every_state(), "commit_pulls")
+        told = io.StringIO()
+        self.assertEqual(worktrees.remove(self.repo, ["in-main"], github, out=told), 1)
+        self.assertEqual(told.getvalue(), "kept in-main: its HEAD moved while it was judged\n")
+        self.assertTrue(tree.exists())
+        self.assertEqual(self.git("log", "-1", "--format=%s", cwd=tree), "during the lookup")
 
 
 class GitHubAnswers(unittest.TestCase):

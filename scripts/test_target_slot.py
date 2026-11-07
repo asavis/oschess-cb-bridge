@@ -1,5 +1,6 @@
 """The shared target slots (#362): python3 -m unittest discover -s scripts"""
 
+import fcntl
 import importlib.util
 import io
 import os
@@ -205,10 +206,11 @@ class Main(Temp):
         self.assertEqual(shown.stdout.strip(), "slot-1")
 
     def inherited(self, token):
-        """The environment a process of an earlier lease of slot-1 had."""
+        """The environment a process of a lease of slot-1 has."""
         slot = self.config.root / "slot-1"
         slot.mkdir(parents=True, exist_ok=True)
         write(slot / "lease", f"{token}\n")
+        write(slot / "lock")
         return dict(
             self.env,
             CARGO_TARGET_DIR=str(slot / "target"),
@@ -217,27 +219,56 @@ class Main(Temp):
             CB_TARGET_SLOT_TOKEN=token,
         )
 
-    def test_a_lease_that_has_ended_is_not_reused(self):
-        env = self.inherited("ended")
-        shown = self.script("printenv", "CB_TARGET_SLOT_TOKEN", env=env)
-        self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertNotIn(shown.stdout.strip(), ("", "ended"))
-        self.assertEqual((self.config.root / "slot-1" / "lease").read_text().strip(), shown.stdout.strip())
+    def share(self, lock):
+        """Holds `lock` as a lease's holders do, shared, until the test ends or
+        the descriptor is closed."""
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return fd
 
     def test_a_slot_passed_on_to_another_lease_is_not_reused(self):
         env = self.inherited("old")
-        holder = target_slot.take(self.config.root / "slot-1" / "lock")
+        holder = self.share(self.config.root / "slot-1" / "lock")
         self.addCleanup(os.close, holder)
         write(self.config.root / "slot-1" / "lease", "new\n")
         shown = self.script("printenv", "CARGO_TARGET_DIR", env=env)
         self.assertIn("private-", shown.stdout)
 
-    def test_a_held_lease_with_its_token_is_reused(self):
+    def test_a_held_lease_with_its_token_is_joined(self):
         env = self.inherited("live")
-        holder = target_slot.take(self.config.root / "slot-1" / "lock")
+        holder = self.share(self.config.root / "slot-1" / "lock")
         self.addCleanup(os.close, holder)
         shown = self.script("printenv", "CB_TARGET_SLOT_TOKEN", env=env)
         self.assertEqual(shown.stdout.strip(), "live")
+
+    def test_an_ended_lease_that_no_lease_took_since_is_held_again(self):
+        env = self.inherited("ended")
+        shown = self.script("printenv", "CB_TARGET_SLOT_TOKEN", env=env)
+        self.assertEqual(shown.stdout.strip(), "ended")
+
+    def test_a_joined_lease_holds_the_slot_after_the_command_that_took_it_ends(self):
+        env = self.inherited("live")
+        outer = self.share(self.config.root / "slot-1" / "lock")
+        wait = "import sys, time; print('joined', flush=True); sys.stdin.read()"
+        # Started without the outer lease's descriptor, as an ordinary Popen
+        # starts a process.
+        inner = subprocess.Popen(
+            [sys.executable, str(SCRIPT), sys.executable, "-c", wait],
+            cwd=self.ws, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )  # fmt: skip
+        self.addCleanup(inner.wait)
+        self.addCleanup(inner.stdin.close)
+        self.assertEqual(inner.stdout.readline().strip(), "joined")
+        os.close(outer)
+        self.assertIsNone(target_slot.take(self.config.root / "slot-1" / "lock"))
+        other = git_init(workspace(self.tmp / "other"))
+        shown = self.script("printenv", "CARGO_TARGET_DIR", cwd=other)
+        self.assertIn("private-", shown.stdout)
+        inner.stdin.close()
+        inner.wait()
+        fd = target_slot.take(self.config.root / "slot-1" / "lock")
+        self.assertIsNotNone(fd)
+        os.close(fd)
 
     def test_a_private_folder_stays_while_a_process_of_the_command_holds_it(self):
         slot = self.config.root / "slot-1"
