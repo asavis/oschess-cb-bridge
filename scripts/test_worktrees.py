@@ -156,9 +156,32 @@ class Clean(Repo):
     def test_apply_removes_the_finished_ones_and_keeps_their_branches(self):
         github = self.every_state()
         rows = worktrees.survey(self.repo, github, 0)
-        self.assertEqual(worktrees.clean(self.repo, rows, True, None, out=io.StringIO()), 0)
+        self.assertEqual(worktrees.clean(self.repo, rows, True, None, min_idle=0, out=io.StringIO()), 0)
         self.assertEqual(self.names(), ["busy", "dirty", "local", "locked", "no-pr", "open"])
         self.assertIn("feat/a", self.git("branch", "--list", "feat/a"))
+
+    def test_a_worktree_that_changed_after_the_survey_is_kept(self):
+        github = self.every_state()
+        rows = worktrees.survey(self.repo, github, 0)
+        self.commit("after the survey", cwd=self.repo / ".worktrees" / "in-main")
+        sleeper = subprocess.Popen(["sleep", "60"], cwd=self.repo / ".worktrees" / "merged")
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        (self.repo / ".worktrees" / "earlier" / "new.txt").write_text("work")
+        told = io.StringIO()
+        worktrees.clean(self.repo, rows, True, None, min_idle=0, out=told)
+        self.assertIn("kept in-main: its HEAD moved since the survey", told.getvalue())
+        self.assertIn("kept merged: in use", told.getvalue())
+        self.assertIn("kept earlier: uncommitted changes", told.getvalue())
+        self.assertEqual(self.names(), ["busy", "dirty", "earlier", "in-main", "local", "locked", "merged", "no-pr", "open"])
+
+    def test_a_worktree_that_moved_after_the_survey_waits_for_its_idle_time(self):
+        github = self.every_state()
+        rows = worktrees.survey(self.repo, github, 0, now=lambda: time.time() + 2 * worktrees.HOUR)
+        told = io.StringIO()
+        worktrees.clean(self.repo, rows, True, None, min_idle=worktrees.HOUR, out=told)
+        self.assertIn("kept merged: moved 0.0 h ago", told.getvalue())
+        self.assertIn("merged", self.names())
 
     def test_an_unused_target_is_emptied_but_the_stress_output_kept(self):
         tree, _ = self.branch_with_commit("open", "feat/b", "b")
@@ -169,9 +192,37 @@ class Clean(Repo):
         later = lambda: time.time() + 48 * worktrees.HOUR  # noqa: E731
         rows = worktrees.survey(self.repo, github, 0, now=later)
         told = io.StringIO()
-        worktrees.clean(self.repo, rows, True, 24 * worktrees.HOUR, out=told)
+        worktrees.clean(self.repo, rows, True, 24 * worktrees.HOUR, min_idle=0, out=told, now=later)
         self.assertEqual(sorted(p.name for p in (tree / "target").iterdir()), ["stress"])
         self.assertIn("emptied open/target", told.getvalue())
+
+    def test_a_target_linked_to_a_folder_elsewhere_is_left_alone(self):
+        tree, _ = self.branch_with_commit("open", "feat/b", "b")
+        elsewhere = self.tmp / "elsewhere" / ("a-long-folder-name-" * 8)
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "keep.txt").write_text("not a build")
+        (tree / "target").symlink_to(elsewhere)
+        github = FakeGitHub(pulls=[("feat/b", Pull(2, "OPEN", "f" * 40))])
+        later = lambda: time.time() + 48 * worktrees.HOUR  # noqa: E731
+        rows = worktrees.survey(self.repo, github, 0, now=later)
+        told = io.StringIO()
+        worktrees.clean(self.repo, rows, True, 24 * worktrees.HOUR, min_idle=0, out=told, now=later)
+        self.assertTrue((elsewhere / "keep.txt").exists())
+        self.assertNotIn("emptied", told.getvalue())
+        self.assertEqual(worktrees.empty_target(rows[0].tree), 0)
+        self.assertTrue((elsewhere / "keep.txt").exists())
+
+    def test_a_target_used_after_the_survey_stays(self):
+        tree, _ = self.branch_with_commit("open", "feat/b", "b")
+        (tree / "target" / "debug").mkdir(parents=True)
+        (tree / "target" / "debug" / "x").write_text("x" * 5000)
+        later = lambda: time.time() + 48 * worktrees.HOUR  # noqa: E731
+        rows = worktrees.survey(self.repo, FakeGitHub(), 0, now=later)
+        sleeper = subprocess.Popen(["sleep", "60"], cwd=tree / "target")
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        worktrees.clean(self.repo, rows, True, 24 * worktrees.HOUR, min_idle=0, out=io.StringIO(), now=later)
+        self.assertTrue((tree / "target" / "debug" / "x").exists())
 
     def test_a_target_that_moved_lately_stays(self):
         tree, _ = self.branch_with_commit("open", "feat/b", "b")

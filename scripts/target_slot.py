@@ -29,9 +29,15 @@ one command to the next, and they are most of a build. When a slot passes to
 another worktree, the workspace members' fingerprints go first, so that Cargo
 builds the members again from this worktree's sources. A command takes the slot
 its worktree had last when that one is free. When every slot is taken it waits,
-then builds in a folder of its own that goes when the command ends. A command
-started inside another one that holds a slot for the same worktree, such as a
-check inside a review session started through this script, keeps that slot.
+then builds in a folder of its own, which goes once no process of the command
+holds its lock any more.
+
+A command started inside another one that holds a slot for the same worktree,
+such as a check inside a review session started through this script, keeps that
+slot, but only while the lease is still held: the slot's lock taken and the
+slot marked with the lease's token. A process that outlived its lease finds the
+lock free, or the slot passed on under another token, and takes a lease of its
+own.
 
     CB_TARGET_ROOT          the slots' folder (~/.cache/oschess-cb-bridge/targets)
     CB_TARGET_SLOTS         how many slots there are (4)
@@ -47,6 +53,7 @@ folder takes its 10 GB only while its command runs.
 import fcntl
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -86,11 +93,12 @@ def settings(env=os.environ):
 @dataclass
 class Lease:
     """A held folder: a slot, or a private folder that goes at the end. `fd`
-    holds the folder's lock."""
+    holds the folder's lock, and `token` marks the folder as this lease's."""
 
     folder: Path
     fd: int
     slot: bool
+    token: str = ""
 
     @property
     def target(self):
@@ -221,6 +229,51 @@ def sweep(root, now=time.time):
             os.close(fd)
 
 
+def marked(folder, fd, slot):
+    """The lease of a folder whose lock `fd` holds, its token written there."""
+    token = secrets.token_hex(8)
+    (folder / "lease").write_text(f"{token}\n")
+    return Lease(folder, fd, slot, token)
+
+
+def held_lease(env, workspace, root):
+    """Whether the environment names a lease for `workspace` that is still
+    held: some process holds its folder's lock, and the folder still carries
+    the lease's token. A process that outlived its lease, having lost the lock's
+    descriptor, finds the lock free or the folder passed on under another
+    token."""
+    name, token = env.get("CB_TARGET_SLOT"), env.get("CB_TARGET_SLOT_TOKEN")
+    if env.get("CB_TARGET_SLOT_WORKTREE") != str(workspace) or not name or not token or "/" in name:
+        return False
+    folder = root / name
+    if env.get("CARGO_TARGET_DIR") != str(folder / "target"):
+        return False
+    try:
+        if (folder / "lease").read_text().strip() != token:
+            return False
+        fd = take(folder / "lock")
+    except OSError:
+        return False
+    if fd is not None:
+        os.close(fd)
+        return False
+    return True
+
+
+def remove_private(folder, out=sys.stderr):
+    """Removes a private folder, unless a process its command started still
+    holds its lock: sweep() removes it once none does."""
+    try:
+        fd = take(folder / "lock")
+    except OSError:
+        return
+    if fd is None:
+        print(f"{NAME}: {folder} stays while a process of the command holds it", file=out)
+        return
+    shutil.rmtree(folder, ignore_errors=True)
+    os.close(fd)
+
+
 def lease(config, workspace, out=sys.stderr, sleep=time.sleep, clock=time.monotonic):
     """Takes a free slot, the one `workspace` used last first, waiting up to
     `config.wait` seconds for one, else a private folder."""
@@ -235,7 +288,7 @@ def lease(config, workspace, out=sys.stderr, sleep=time.sleep, clock=time.monoto
             folder.mkdir(exist_ok=True)
             fd = take(folder / "lock")
             if fd is not None:
-                return Lease(folder, fd, slot=True)
+                return marked(folder, fd, slot=True)
         left = deadline - clock()
         if left <= 0:
             break
@@ -246,7 +299,7 @@ def lease(config, workspace, out=sys.stderr, sleep=time.sleep, clock=time.monoto
     folder = Path(tempfile.mkdtemp(prefix="private-", dir=config.root))
     fd = take(folder / "lock")
     print(f"{NAME}: every slot is in use: building in {folder}, which goes when the command ends", file=out)
-    return Lease(folder, fd, slot=False)
+    return marked(folder, fd, slot=False)
 
 
 def run(command, held, workspace, env=os.environ):
@@ -254,7 +307,7 @@ def run(command, held, workspace, env=os.environ):
     exit status. The command inherits the lock, so the folder stays held while
     any process of it lives, even if this one is killed."""
     child_env = dict(env, CARGO_TARGET_DIR=str(held.target), CB_TARGET_SLOT=held.folder.name)
-    child_env["CB_TARGET_SLOT_WORKTREE"] = str(workspace)
+    child_env.update(CB_TARGET_SLOT_WORKTREE=str(workspace), CB_TARGET_SLOT_TOKEN=held.token)
     try:
         child = subprocess.Popen(command, env=child_env, pass_fds=(held.fd,))
     except OSError as error:
@@ -310,12 +363,13 @@ def main(argv):
         return 0 if argv else 2
     workspace = worktree(cwd)
     env = dict(os.environ)
-    if env.get("CB_TARGET_SLOT_WORKTREE") == str(workspace) and env.get("CARGO_TARGET_DIR"):
-        os.execvp(argv[0], argv)
-    # A slot held for another worktree is not this one's to build in.
-    for name in ("CARGO_TARGET_DIR", "CB_TARGET_SLOT", "CB_TARGET_SLOT_WORKTREE"):
-        env.pop(name, None)
     config = settings(env)
+    if held_lease(env, workspace, config.root):
+        os.execvp(argv[0], argv)
+    # A lease that has ended, or one for another worktree, is not this
+    # command's to build in.
+    for name in ("CARGO_TARGET_DIR", "CB_TARGET_SLOT", "CB_TARGET_SLOT_WORKTREE", "CB_TARGET_SLOT_TOKEN"):
+        env.pop(name, None)
     try:
         held = lease(config, workspace)
     except OSError as error:
@@ -326,9 +380,9 @@ def main(argv):
             prepare(held, workspace, workspace_members(workspace), config.max_bytes)
         return run(argv, held, workspace, env)
     finally:
-        if not held.slot:
-            shutil.rmtree(held.folder, ignore_errors=True)
         os.close(held.fd)
+        if not held.slot:
+            remove_private(held.folder)
 
 
 if __name__ == "__main__":

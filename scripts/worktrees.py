@@ -23,11 +23,17 @@ The pull requests a worktree belongs to are those whose branch it has checked
 out, whose head it is, or that GitHub lists for its commit. When `gh` fails,
 only origin/main says that a worktree is done.
 
+The survey takes a while, and another agent may commit in a worktree or start
+work in it meanwhile. So `clean --apply` judges each worktree again just before
+it removes it, from its HEAD, lock, changes, processes and idle time at that
+moment, and keeps it when its HEAD moved or the verdict changed.
+
 `clean` also empties the target/ folder of a worktree that nothing uses and
 nothing has moved in for a day (`--target-idle`), all but target/stress, where
-the stress runner keeps the output of failed runs. Builds go to the shared
-slots of scripts/target_slot.py; a target/ of a worktree's own is left from
-before them, or from a build outside a slot.
+the stress runner keeps the output of failed runs, and never a target/ that is
+a link to a folder elsewhere. Builds go to the shared slots of
+scripts/target_slot.py; a target/ of a worktree's own is left from before them,
+or from a build outside a slot.
 
 `remove` takes worktrees by their folder's name and removes each one that is
 clean, unused and unlocked and whose commit a ref or a pull request holds,
@@ -276,6 +282,36 @@ class Row:
     target: int
     idle: float
     busy: bool
+    pulls: tuple = ()
+
+
+def current(repo, tree):
+    """The worktree as git lists it now, or None when it is gone."""
+    return next((now for now in trees(repo) if now.path == tree.path), None)
+
+
+def recheck(repo, row, min_idle, now=time.time):
+    """Judges a worktree again from what is true at this moment, right before it
+    goes: its HEAD, branch and lock as git lists them now, its changes, the
+    processes running now and its idle time. The survey may be minutes old, and
+    another agent may have committed in the worktree or started work in it
+    since. The pull requests are the survey's."""
+    tree = current(repo, row.tree)
+    if tree is None or tree.prunable:
+        return "keep", "gone since the survey"
+    if (tree.head, tree.branch) != (row.tree.head, row.tree.branch):
+        return "keep", "its HEAD moved since the survey"
+    pulls = list(row.pulls)
+    return judge(
+        tree,
+        dirty=dirty(tree),
+        busy=in_use(tree, open_paths()),
+        idle=now() - last_change(tree),
+        kept=held(repo, tree.head, pulls),
+        merged=in_main(repo, tree.head),
+        pulls=pulls,
+        min_idle=min_idle,
+    )
 
 
 def survey(repo, github, min_idle, now=time.time):
@@ -303,7 +339,8 @@ def survey(repo, github, min_idle, now=time.time):
             pulls=pulls,
             min_idle=min_idle,
         )
-        rows.append(Row(tree, verdict, why, disk_usage(tree.path), disk_usage(tree.path / "target"), idle, busy))
+        sizes = disk_usage(tree.path), disk_usage(tree.path / "target")
+        rows.append(Row(tree, verdict, why, *sizes, idle, busy, tuple(pulls)))
     return rows
 
 
@@ -322,12 +359,20 @@ def report(rows, out=sys.stdout):
     print(f"{len(rows)} worktrees, {gigabytes(total)}; finished: {gigabytes(going)}", file=out)
 
 
+def own_target(tree):
+    """The worktree's target/ folder, or None when it is not a folder of the
+    worktree's own: missing, or a link to a folder elsewhere, which nothing
+    here may empty."""
+    target = tree.path / "target"
+    return target if target.is_dir() and not target.is_symlink() else None
+
+
 def empty_target(tree):
     """Removes everything in the worktree's target/ but what KEPT_IN_TARGET
     names, and returns the bytes it took."""
-    target = tree.path / "target"
+    target = own_target(tree)
     freed = 0
-    for entry in target.iterdir() if target.is_dir() else []:
+    for entry in target.iterdir() if target else []:
         if entry.name in KEPT_IN_TARGET:
             continue
         freed += disk_usage(entry)
@@ -339,37 +384,60 @@ def empty_target(tree):
 
 
 def stale_target(row, target_idle):
+    target = own_target(row.tree)
     return (
         row.verdict == "keep"
         and not row.busy
         and not row.tree.locked
         and row.idle >= target_idle
         and row.target > 0
-        and any(entry.name not in KEPT_IN_TARGET for entry in (row.tree.path / "target").iterdir())
+        and target is not None
+        and any(entry.name not in KEPT_IN_TARGET for entry in target.iterdir())
     )
 
 
-def clean(repo, rows, apply, target_idle, out=sys.stdout):
+def target_still_stale(repo, row, target_idle, now=time.time):
+    """Whether the target/ is still unused and unmoved, and its worktree
+    unlocked, at this moment."""
+    tree = current(repo, row.tree)
+    if tree is None or tree.prunable or tree.locked or own_target(tree) is None:
+        return False
+    return not in_use(tree, open_paths()) and now() - last_change(tree) >= target_idle
+
+
+def clean(repo, rows, apply, target_idle, min_idle=HOUR, out=sys.stdout, now=time.time):
     """Removes the finished worktrees and empties the stale targets, or says
-    what it would do. Returns 1 when a removal failed."""
-    word = "removed" if apply else "would remove"
+    what it would do. Each one is judged again just before it goes. Returns 1
+    when a removal failed."""
     failed = freed = 0
     for row in rows:
         if row.verdict != "remove":
             continue
-        print(f"{word} {row.tree.name} ({gigabytes(row.size)}): {row.why}", file=out)
-        if apply:
-            gone = git("worktree", "remove", str(row.tree.path), cwd=repo)
-            if gone.returncode != 0:
-                print(f"  failed: {gone.stderr.strip()}", file=out)
-                failed += 1
-                continue
+        if not apply:
+            print(f"would remove {row.tree.name} ({gigabytes(row.size)}): {row.why}", file=out)
+            freed += row.size
+            continue
+        verdict, why = recheck(repo, row, min_idle, now)
+        if verdict != "remove":
+            print(f"kept {row.tree.name}: {why}", file=out)
+            continue
+        gone = git("worktree", "remove", str(row.tree.path), cwd=repo)
+        if gone.returncode != 0:
+            print(f"failed to remove {row.tree.name}: {gone.stderr.strip()}", file=out)
+            failed += 1
+            continue
+        print(f"removed {row.tree.name} ({gigabytes(row.size)}): {why}", file=out)
         freed += row.size
     if target_idle is not None:
         for row in rows:
-            if stale_target(row, target_idle):
-                size = empty_target(row.tree) if apply else row.target
-                print(f"{'emptied' if apply else 'would empty'} {row.tree.name}/target ({gigabytes(size)})", file=out)
+            if not stale_target(row, target_idle):
+                continue
+            if not apply:
+                print(f"would empty {row.tree.name}/target ({gigabytes(row.target)})", file=out)
+                freed += row.target
+            elif target_still_stale(repo, row, target_idle, now):
+                size = empty_target(row.tree)
+                print(f"emptied {row.tree.name}/target ({gigabytes(size)})", file=out)
                 freed += size
     if apply:
         git("worktree", "prune", cwd=repo)
@@ -382,7 +450,6 @@ def remove(repo, names, github, out=sys.stdout):
     whose commit is held."""
     known = {tree.name: tree for tree in trees(repo)}
     listed = github.pulls() if github else None
-    paths = open_paths()
     failed = 0
     for name in names:
         tree = known.get(name)
@@ -396,7 +463,7 @@ def remove(repo, names, github, out=sys.stdout):
             why = "locked"
         elif dirty(tree):
             why = "uncommitted changes"
-        elif in_use(tree, paths):
+        elif in_use(tree, open_paths()):
             why = "in use"
         elif not held(repo, tree.head, belongs(tree, listed, github)):
             why = "no ref and no pull request holds its commit"
@@ -436,7 +503,7 @@ def main(argv):
     min_idle = args.idle * HOUR if args.command == "clean" else HOUR
     rows = survey(repo, github, min_idle)
     if args.command == "clean":
-        return clean(repo, rows, args.apply, None if args.keep_targets else args.target_idle * HOUR)
+        return clean(repo, rows, args.apply, None if args.keep_targets else args.target_idle * HOUR, min_idle)
     report(rows)
     return 0
 

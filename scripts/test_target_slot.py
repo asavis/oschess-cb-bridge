@@ -204,6 +204,58 @@ class Main(Temp):
         shown = self.script("printenv", "CB_TARGET_SLOT", env=env)
         self.assertEqual(shown.stdout.strip(), "slot-1")
 
+    def inherited(self, token):
+        """The environment a process of an earlier lease of slot-1 had."""
+        slot = self.config.root / "slot-1"
+        slot.mkdir(parents=True, exist_ok=True)
+        write(slot / "lease", f"{token}\n")
+        return dict(
+            self.env,
+            CARGO_TARGET_DIR=str(slot / "target"),
+            CB_TARGET_SLOT="slot-1",
+            CB_TARGET_SLOT_WORKTREE=str(self.ws.resolve()),
+            CB_TARGET_SLOT_TOKEN=token,
+        )
+
+    def test_a_lease_that_has_ended_is_not_reused(self):
+        env = self.inherited("ended")
+        shown = self.script("printenv", "CB_TARGET_SLOT_TOKEN", env=env)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertNotIn(shown.stdout.strip(), ("", "ended"))
+        self.assertEqual((self.config.root / "slot-1" / "lease").read_text().strip(), shown.stdout.strip())
+
+    def test_a_slot_passed_on_to_another_lease_is_not_reused(self):
+        env = self.inherited("old")
+        holder = target_slot.take(self.config.root / "slot-1" / "lock")
+        self.addCleanup(os.close, holder)
+        write(self.config.root / "slot-1" / "lease", "new\n")
+        shown = self.script("printenv", "CARGO_TARGET_DIR", env=env)
+        self.assertIn("private-", shown.stdout)
+
+    def test_a_held_lease_with_its_token_is_reused(self):
+        env = self.inherited("live")
+        holder = target_slot.take(self.config.root / "slot-1" / "lock")
+        self.addCleanup(os.close, holder)
+        shown = self.script("printenv", "CB_TARGET_SLOT_TOKEN", env=env)
+        self.assertEqual(shown.stdout.strip(), "live")
+
+    def test_a_private_folder_stays_while_a_process_of_the_command_holds_it(self):
+        slot = self.config.root / "slot-1"
+        slot.mkdir(parents=True)
+        holder = target_slot.take(slot / "lock")
+        self.addCleanup(os.close, holder)
+        shown = self.script("sh", "-c", 'sleep 2 >/dev/null 2>&1 & printf %s "$CARGO_TARGET_DIR"')
+        private = Path(shown.stdout).parent
+        self.assertTrue(private.name.startswith("private-"))
+        self.assertTrue(private.exists())
+        deadline = time.monotonic() + 10
+        while (fd := target_slot.take(private / "lock")) is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertIsNotNone(fd)
+        os.close(fd)
+        target_slot.sweep(self.config.root, now=lambda: time.time() + 2 * target_slot.PRIVATE_GRACE)
+        self.assertFalse(private.exists())
+
     def test_dash_c_names_the_worktree(self):
         shown = self.script("-C", str(self.ws), "printenv", "CB_TARGET_SLOT_WORKTREE", cwd=self.tmp)
         self.assertEqual(shown.stdout.strip(), str(self.ws.resolve()))
