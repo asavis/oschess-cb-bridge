@@ -354,6 +354,59 @@ mod tests {
             .expect("no free port from 20000 to 32767")
     }
 
+    /// [`prepare`] in a test's folder, for a start the test expects to bind
+    /// its port: [`free_port`] found the port free when it looked, but another
+    /// test process may bind it before this start does (#360), when the folder
+    /// takes another free port and the start is tried again. A start the test
+    /// expects to meet a port in use calls [`prepare`] itself.
+    fn started_in(dir: &Path, options: &Options) -> Bridge {
+        for _ in 0..20 {
+            match prepare(dir, options) {
+                Err(e) if matches!(e.cause, Cause::PortInUse(_)) => set_port(dir, free_port()),
+                started => return started.unwrap(),
+            }
+        }
+        panic!("no free port stayed free until a start bound it");
+    }
+
+    /// A listener standing for another process on a free port, bound before
+    /// its port is written into the test folder, so that the fixture has no
+    /// gap of its own between a look and a bind (#360): on another free port
+    /// should something take the one [`free_port`] offered before the bind.
+    fn held_port(dir: &Path) -> TcpListener {
+        let held = std::iter::repeat_with(|| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, free_port())))
+            .find_map(Result::ok)
+            .unwrap();
+        set_port(dir, held.local_addr().unwrap().port());
+        held
+    }
+
+    /// Writes `port` into a test folder's `bridge.toml`, keeping its other lines.
+    fn set_port(dir: &Path, port: u16) {
+        let path = dir.join("bridge.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rest: String = text.lines().filter(|l| !l.starts_with("port = ")).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, format!("port = {port}\n{rest}")).unwrap();
+    }
+
+    /// A port another process binds between the look and the start does not
+    /// fail a test's start: it moves to another free port (#360). The plain
+    /// start fails there every time.
+    #[test]
+    fn a_test_start_moves_off_a_port_taken_meanwhile() {
+        let _log = log::testing::hold();
+        let dir = folder("taken-meanwhile", None);
+        let other = held_port(&dir);
+        let taken = other.local_addr().unwrap().port();
+        let e = prepare(&dir, &Options::default()).err().unwrap();
+        assert_eq!(e.cause, Cause::PortInUse(taken));
+        let bridge = started_in(&dir, &Options::default());
+        assert_ne!(bridge.port, taken);
+        assert_eq!(port_of(&dir), bridge.port);
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A test bridge's port lies below the ports the system hands out for
     /// port 0 and for connections, which Linux lists in
     /// `ip_local_port_range`: so no other socket takes it between the look
@@ -384,17 +437,17 @@ mod tests {
     fn the_first_run_is_the_one_that_creates_the_token() {
         let _log = log::testing::hold();
         let dir = folder("first", None);
-        let first = prepare(&dir, &Options::default()).unwrap();
+        let first = started_in(&dir, &Options::default());
         assert!(first.first_run);
         assert!(token::is_valid(&first.token));
         assert_eq!(first.link, pairing::link(pairing::DEFAULT_WEB, &first.token, first.port));
         let token = first.token.clone();
         drop(first);
-        let again = prepare(&dir, &Options::default()).unwrap();
+        let again = started_in(&dir, &Options::default());
         assert!(!again.first_run);
         assert_eq!(again.token, token);
         drop(again);
-        let renewed = prepare(&dir, &Options { new_token: true, ..Options::default() }).unwrap();
+        let renewed = started_in(&dir, &Options { new_token: true, ..Options::default() });
         assert!(!renewed.first_run);
         assert_ne!(renewed.token, token);
         drop(renewed);
@@ -405,7 +458,7 @@ mod tests {
     fn the_site_must_be_an_allowed_origin() {
         let _log = log::testing::hold();
         let dir = folder("staging", Some("https://staging.oschess.org/"));
-        let bridge = prepare(&dir, &Options::default()).unwrap();
+        let bridge = started_in(&dir, &Options::default());
         assert!(bridge.link.starts_with("https://staging.oschess.org/library?"));
         drop(bridge);
         let _ = std::fs::remove_dir_all(&dir);
@@ -429,7 +482,7 @@ mod tests {
         assert!(e.starts_with("no pairing token yet"), "{e}");
         assert!(!token::exists(&dir), "reading the pairing creates no token");
         assert_eq!(site(&dir).unwrap(), "https://staging.oschess.org");
-        let bridge = prepare(&dir, &Options::default()).unwrap();
+        let bridge = started_in(&dir, &Options::default());
         assert!(bridge.first_run);
         assert!(bridge.link.starts_with("https://staging.oschess.org/library?"));
         assert_eq!(pairing(&dir).unwrap(), Pairing { token: bridge.token.clone(), link: bridge.link.clone() });
@@ -459,20 +512,25 @@ mod tests {
         // The Windows app passes its release version, which differs from this
         // library's package version.
         let dir = folder("version", None);
-        let app = prepare(&dir, &Options { version: Some("9.8.7"), ..Options::default() }).unwrap();
+        let app = started_in(&dir, &Options { version: Some("9.8.7"), ..Options::default() });
         assert_eq!(app.app.version, "9.8.7");
-        drop(app);
-        let console = prepare(&dir, &Options::default()).unwrap();
+        // The second bridge starts in a folder, and so on a port, of its own
+        // while the first still holds its port: no port is freed and bound
+        // again, which another test process could take in between (#356). A
+        // second start in the first one's folder fails here every time.
+        let other = folder("version-console", None);
+        let console = started_in(&other, &Options::default());
         assert_eq!(console.app.version, env!("CARGO_PKG_VERSION"));
-        drop(console);
+        drop((console, app));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]
     fn a_taken_port_stops_the_start_before_the_token() {
         let _log = log::testing::hold();
         let dir = folder("taken", None);
-        let running = prepare(&dir, &Options::default()).unwrap();
+        let running = started_in(&dir, &Options::default());
         let e = prepare(&dir, &Options { new_token: true, ..Options::default() }).err().unwrap();
         assert!(e.to_string().starts_with(&format!("port {}", running.port)), "{e}");
         assert_eq!(e.cause, Cause::PortInUse(running.port));
@@ -489,8 +547,8 @@ mod tests {
     fn a_port_held_by_another_listener_is_a_port_in_use() {
         let _log = log::testing::hold();
         let dir = folder("held", None);
+        let held = held_port(&dir);
         let port = port_of(&dir);
-        let held = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
         let e = prepare(&dir, &Options::default()).err().unwrap();
         assert_eq!(e.cause, Cause::PortInUse(port));
         assert!(e.to_string().starts_with(&format!("port {port}: ")), "{e}");
@@ -526,8 +584,8 @@ mod tests {
     fn only_a_port_in_use_is_waited_for() {
         let _log = log::testing::hold();
         let dir = folder("refused-held", Some("https://example.com"));
+        let held = held_port(&dir);
         let port = port_of(&dir);
-        let held = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
         // A wait for the port twice the patience, which a start that waited
         // would outlast.
         let patience = crate::search::workers::tests::PATIENCE;
@@ -546,7 +604,7 @@ mod tests {
     fn a_start_is_logged_in_the_data_folder() {
         let _log = log::testing::hold();
         let dir = folder("logged", None);
-        let running = prepare(&dir, &Options::default()).unwrap();
+        let running = started_in(&dir, &Options::default());
         let port = running.port;
         assert!(prepare(&dir, &Options::default()).is_err());
         drop(running);
@@ -574,7 +632,7 @@ mod tests {
     fn a_broken_file_is_logged_once_for_each_change() {
         let _log = log::testing::hold();
         let dir = folder("broken", None);
-        let bridge = prepare(&dir, &Options::default()).unwrap();
+        let bridge = started_in(&dir, &Options::default());
         let path = dir.join(config::FILE_NAME);
         let good = std::fs::read(&path).unwrap();
         // Replaced whole, so that no look reads it half written; each text of
@@ -612,7 +670,7 @@ mod tests {
     fn a_data_folder_keeps_its_indexes_where_a_start_does() {
         let _log = log::testing::hold();
         let dir = folder("indexes", None);
-        let started = prepare(&dir, &Options::default()).unwrap();
+        let started = started_in(&dir, &Options::default());
         let alone = Catalog::new(Vec::new());
         alone.use_data_dir(&dir);
         let kept = |catalog: &Catalog| (catalog.explorer.dir(), catalog.pgn().dir());

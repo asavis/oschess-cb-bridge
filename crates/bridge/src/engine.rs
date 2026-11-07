@@ -495,6 +495,12 @@ impl Engine {
         self.current().is_some_and(|i| i.slot.try_lock().map(|s| s.is_some()).unwrap_or(true))
     }
 
+    /// Whether the engine's process has ended on its own while it waits for
+    /// an analysis, which nothing has noticed yet (tests, #355).
+    pub fn has_ended(&self) -> bool {
+        self.current().is_some_and(|i| i.slot.try_lock().is_ok_and(|mut s| s.as_mut().is_some_and(|p| !p.alive())))
+    }
+
     /// Runs `search` and writes its lines to `sink` until it ends, the client
     /// leaves, or a newer analysis takes the engine. `stream` names the
     /// client's view: a newer analysis from another one ends this one with
