@@ -141,6 +141,9 @@ pub struct Look {
     /// When the file of them that changed last changed, by its modification
     /// time: a game added to a 2CBH database changes `.2cbg` alone.
     pub modified: Option<SystemTime>,
+    /// Whether it is a PGN file without the read-only attribute, which takes
+    /// writes (`docs/api.md`, "Writing games"), from the same look (#348).
+    pub writable: bool,
 }
 
 /// What stays with a database when the list is read again or the window
@@ -179,6 +182,8 @@ struct Files {
     /// [`Files::modified`] of the files the reader opens alone: a 2CBH
     /// database's `.2lgd` and `.2lcd` are among its files but never read.
     read_modified: Option<SystemTime>,
+    /// A PGN file without the read-only attribute.
+    writable: bool,
 }
 
 impl Files {
@@ -191,7 +196,7 @@ impl Files {
     }
 
     fn look(&self) -> Look {
-        Look { size: self.size(), created: self.created, modified: self.read_modified }
+        Look { size: self.size(), created: self.created, modified: self.read_modified, writable: self.writable }
     }
 }
 
@@ -240,7 +245,8 @@ impl Entry {
         if self.format == Format::Other {
             return match std::fs::metadata(&self.path) {
                 Ok(m) => {
-                    let look = Look { size: m.len(), created: m.created().ok(), modified: m.modified().ok() };
+                    let look =
+                        Look { size: m.len(), created: m.created().ok(), modified: m.modified().ok(), writable: false };
                     (Err(State::Unsupported), Some(look))
                 }
                 Err(_) => (Err(State::Missing), None),
@@ -349,7 +355,8 @@ impl Entry {
 
     /// Whether the database takes writes (`docs/api.md`, "Writing games"): a
     /// PGN file without the read-only attribute. Whether it is ready is told
-    /// apart.
+    /// apart. A look at the list reads it from its own look instead
+    /// ([`Look::writable`]).
     pub fn writable_file(&self) -> bool {
         self.format == Format::Pgn && std::fs::metadata(&self.path).is_ok_and(|m| !m.permissions().readonly())
     }
@@ -475,6 +482,16 @@ fn read_by_reader(format: cbformat::view::Format, file: &Path) -> bool {
 /// for no access to the file's contents (`cbformat::file::file_id`). A PGN
 /// database is its one file; another file has no generation.
 fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
+    generation_with(path, format, cloud, &cbformat::file::look)
+}
+
+/// A look at one file: its metadata, and its volume and id when it is a file
+/// ([`cbformat::file::look`]).
+type LookAt<'a> = &'a dyn Fn(&Path) -> std::io::Result<(std::fs::Metadata, Option<(u64, u128)>)>;
+
+/// [`generation_of`], each file looked at through `look`, once, and no file
+/// looked at otherwise (#348): tests count the looks.
+fn generation_with(path: &Path, format: Format, cloud: &dyn Cloud, look: LookAt<'_>) -> Files {
     let mut hash = Hash::new();
     let mut files = Files {
         generation: None,
@@ -483,6 +500,7 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
         modified: None,
         created: None,
         read_modified: None,
+        writable: false,
     };
     let Some(format) = format.view() else { return files };
     // Every cache keyed on a PGN database's generation (the header index, the
@@ -491,21 +509,23 @@ fn generation_of(path: &Path, format: Format, cloud: &dyn Cloud) -> Files {
     if format == cbformat::view::Format::Pgn {
         hash.write(&cbformat::pgnfile::VERSION.to_le_bytes());
     }
-    for (i, (path, _)) in format.files(path).into_iter().enumerate() {
-        match std::fs::metadata(&path) {
-            Ok(m) if !m.is_file() => {
+    // One look a file: on Windows its metadata and id from one open (#348).
+    for (i, path) in format.paths(path).into_iter().enumerate() {
+        match look(&path) {
+            Ok((m, _)) if !m.is_file() => {
                 files.irregular = true;
                 hash.write(&[0xfe]);
             }
-            Ok(m) => {
+            Ok((m, id)) => {
                 hash.write_meta(&m);
-                hash.write_id(cbformat::file::file_id(&path, &m));
+                hash.write_id(id);
                 files.modified = files.modified.max(m.modified().ok());
                 if read_by_reader(format, &path) {
                     files.read_modified = files.read_modified.max(m.modified().ok());
                 }
                 if i == 0 {
                     files.created = m.created().ok();
+                    files.writable = format == cbformat::view::Format::Pgn && !m.permissions().readonly();
                 }
                 let cloud_only = cloud.is_cloud_only(&path, &m);
                 files.present.push((path, m.len(), cloud_only));
@@ -883,6 +903,86 @@ mod tests {
         salted.write_meta(&meta);
         salted.write_id(cbformat::file::file_id(&path, &meta));
         assert_eq!(generation, salted.finish());
+    }
+
+    /// The generation as a look took it before one open a file (#348): the
+    /// metadata from the path, then the id through a handle of its own.
+    fn two_opens(path: &Path, format: Format) -> u64 {
+        let format = format.view().unwrap();
+        let mut hash = Hash::new();
+        if format == cbformat::view::Format::Pgn {
+            hash.write(&cbformat::pgnfile::VERSION.to_le_bytes());
+        }
+        for (i, (path, _)) in format.files(path).into_iter().enumerate() {
+            match std::fs::metadata(&path) {
+                Ok(m) if !m.is_file() => hash.write(&[0xfe]),
+                Ok(m) => {
+                    hash.write_meta(&m);
+                    hash.write_id(cbformat::file::file_id(&path, &m));
+                }
+                Err(_) if i == 0 => panic!("no main file"),
+                Err(_) => hash.write(&[0xff]),
+            }
+        }
+        hash.finish()
+    }
+
+    /// A look that opens each file once gives each format the generation that
+    /// two opens a file gave (#348), so that no database is opened again and
+    /// no cache built again: a 2CBH database, a classic one, with an optional
+    /// file missing, and a PGN file.
+    #[test]
+    fn one_open_a_file_keeps_every_generation() {
+        let two = cbformat::fixture::Builder::new().write("catalog-one-open-2cbh");
+        let classic = {
+            let mut b = cbformat::fixture_cbh::Builder::new();
+            b.game(&cbformat::fixture_cbh::move_record(0, None, None, &[]));
+            b.write("catalog-one-open-cbh")
+        };
+        let _ = std::fs::remove_file(classic.dir().join("db.cba"));
+        let pgn = cbformat::fixture::pgn_file("catalog-one-open-pgn", b"[White \"A\"]\n\n1. e4 *\n");
+        for (path, format) in [
+            (two.dir().join("db.2cbh"), Format::TwoCbh),
+            (classic.dir().join("db.cbh"), Format::Cbh),
+            (pgn.dir().join("db.pgn"), Format::Pgn),
+        ] {
+            let looked = generation_of(&path, format, &System);
+            assert!(!looked.irregular && !looked.present.is_empty(), "{path:?}");
+            assert_eq!(looked.generation, Some(two_opens(&path, format)), "{path:?}");
+        }
+    }
+
+    /// A look at a database looks at each of its files once, the files
+    /// missing among them too, and at no file otherwise (#348): a 2CBH
+    /// database, a classic one, whose move and annotation files' sizes decide
+    /// whether `.cbj` is required, and a PGN file.
+    #[test]
+    fn a_look_looks_at_each_file_once() {
+        let two = cbformat::fixture::Builder::new().write("catalog-look-once-2cbh");
+        let classic = {
+            let mut b = cbformat::fixture_cbh::Builder::new();
+            b.game(&cbformat::fixture_cbh::move_record(0, None, None, &[]));
+            b.write("catalog-look-once-cbh")
+        };
+        let pgn = cbformat::fixture::pgn_file("catalog-look-once-pgn", b"[White \"A\"]\n\n1. e4 *\n");
+        for (path, format, files) in [
+            (two.dir().join("db.2cbh"), Format::TwoCbh, cbformat::v2::EXTENSIONS.len()),
+            (classic.dir().join("db.cbh"), Format::Cbh, cbformat::cbh::READ.len()),
+            (pgn.dir().join("db.pgn"), Format::Pgn, 1),
+        ] {
+            let looked = std::cell::RefCell::new(Vec::new());
+            let counted = |p: &Path| {
+                looked.borrow_mut().push(p.to_path_buf());
+                cbformat::file::look(p)
+            };
+            let generation = generation_with(&path, format, &System, &counted).generation;
+            let mut looked = looked.into_inner();
+            assert_eq!(looked.len(), files, "{path:?}: {looked:?}");
+            looked.sort();
+            looked.dedup();
+            assert_eq!(looked.len(), files, "{path:?}: each once");
+            assert_eq!(generation, generation_of(&path, format, &System).generation);
+        }
     }
 
     /// A file put in place of another, of the same bytes, size and time of

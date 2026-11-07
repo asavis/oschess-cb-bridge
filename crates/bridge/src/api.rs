@@ -185,7 +185,7 @@ pub const FEATURES: [&str; 4] = ["explorerSearch", "fragmentSearch", "analysisGa
 
 fn status(app: &App) -> Response {
     let entries = app.catalog.entries();
-    let states: Vec<State> = entries.iter().map(|e| Database::of(e).state).collect();
+    let states: Vec<State> = Database::all(&entries).iter().map(|d| d.state).collect();
     let count = |s: State| states.iter().filter(|&&x| x == s).count() as i64;
     let dbs = Obj::new()
         .num("ready", count(State::Ready))
@@ -274,8 +274,8 @@ fn progress(present: u64, total: u64) -> String {
 
 fn databases(app: &App) -> Response {
     let entries = app.catalog.entries();
-    let items = entries.iter().map(|e| database(&Database::of(e)));
-    ok(Obj::new().raw("databases", &json::array(items)).done())
+    let all = Database::all(&entries);
+    ok(Obj::new().raw("databases", &json::array(all.iter().map(database))).done())
 }
 
 /// A database of `GET /v1/databases`, as the tray app shows it too.

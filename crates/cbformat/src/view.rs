@@ -239,14 +239,14 @@ impl Format {
     /// ([`cbh::needs_wide`]). The sizes are taken from metadata, following
     /// links, and no file is opened, so a cloud-only file is not downloaded.
     pub fn files(self, path: &Path) -> Vec<(PathBuf, bool)> {
-        let (main, extensions, required): (&str, &[&str], &[&str]) = match self {
-            Format::TwoCbh => ("2cbh", &v2::EXTENSIONS, &[".2cbh", ".2cbg", ".2lid"]),
+        let (extensions, required): (&[&str], &[&str]) = match self {
+            Format::TwoCbh => (&v2::EXTENSIONS, &[".2cbh", ".2cbg", ".2lid"]),
             // The annotations are optional, and the 64-bit offsets are
             // required only for a move or annotation file over 4 GiB.
-            Format::Cbh => ("cbh", &cbh::READ, &[".cbh", ".cbg", ".cbp", ".cbt", ".cbc", ".cbs"]),
+            Format::Cbh => (&cbh::READ, &[".cbh", ".cbg", ".cbp", ".cbt", ".cbc", ".cbs"]),
             Format::Pgn => return vec![(path.to_path_buf(), true)],
         };
-        let files = crate::file::with_extensions(&crate::file::stem(path, main), extensions);
+        let files = self.paths(path);
         // A missing file has no size.
         let len = |ext: &str| {
             let file = files.get(extensions.iter().position(|e| *e == ext)?)?;
@@ -258,6 +258,18 @@ impl Format {
             .zip(extensions)
             .map(|(file, &ext)| (file, required.contains(&ext) || (wide && ext == ".cbj")))
             .collect()
+    }
+
+    /// The paths of [`Format::files`], main file first, without whether each
+    /// is required: no file is looked at, so a caller that looks at each file
+    /// itself, as a database's generation does, looks at it once (#348).
+    pub fn paths(self, path: &Path) -> Vec<PathBuf> {
+        let (main, extensions): (&str, &[&str]) = match self {
+            Format::TwoCbh => ("2cbh", &v2::EXTENSIONS),
+            Format::Cbh => ("cbh", &cbh::READ),
+            Format::Pgn => return vec![path.to_path_buf()],
+        };
+        crate::file::with_extensions(&crate::file::stem(path, main), extensions)
     }
 }
 

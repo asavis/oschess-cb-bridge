@@ -175,7 +175,14 @@ with them.
   `.cbt`, `.cbc`, `.cbs` and, when present, `.cbj` of a classic one (see
   [Classic databases](#classic-databases)); a PGN file itself (see
   [PGN files](#pgn-files)). For a PGN file, a bridge whose reading of PGN
-  files changed also reports a new generation.
+  files changed also reports a new generation. On Windows the bridge reads
+  each file's size, times, attributes and id through one handle that asks for
+  no access to its contents (#348), so that a look at a database opens each of
+  its files once.
+- `/v1/status`, `/v1/databases` and the tray app look at the databases of the
+  list on up to 8 threads at once, each taking the next database, and open
+  there each one ready but not yet opened (#348). A request for one database's
+  games or positions looks at that database alone.
 - A write into a PGN file names the generation its client read and answers
   with the new one ([Writing games](#writing-games)).
 
