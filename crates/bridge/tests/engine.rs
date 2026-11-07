@@ -318,7 +318,11 @@ fn an_engine_that_ends_when_stopped_or_while_idle_is_reported() {
 
     let idle = format!("idle-{id}");
     let config = EngineConfig::new(fake_copy(&dir, &idle), Some(1), Some(16));
-    let (port, bridge) = start(Engine::with_idle(config, Duration::from_millis(300)));
+    // The fake exits 400 ms after its best move, as a loaded machine may
+    // delay it; an idle limit far longer lets it end on its own first, or the
+    // bridge ends it as idle, which is no failure, and nothing is reported:
+    // with the 300 ms limit this test had, it failed every time (#355).
+    let (port, bridge) = start(Engine::with_idle(config, Duration::from_secs(3)));
     let mut a = Analysis::open(port, "moves=f2f3&depth=1&stream=tab1");
     assert_eq!(a.rest().last().unwrap(), BEST);
     until("the idle limit lets the engine go", WAIT_LIMIT, || !bridge.app.engine.is_running());

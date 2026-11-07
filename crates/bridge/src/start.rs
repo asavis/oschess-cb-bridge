@@ -461,11 +461,18 @@ mod tests {
         let dir = folder("version", None);
         let app = prepare(&dir, &Options { version: Some("9.8.7"), ..Options::default() }).unwrap();
         assert_eq!(app.app.version, "9.8.7");
+        let port = app.port;
         drop(app);
-        let console = prepare(&dir, &Options::default()).unwrap();
+        // A folder, and so a port, of its own: the first bridge's port, freed,
+        // may be taken by another test process before it is bound again, as
+        // this listener takes it (#356).
+        let _taken = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let other = folder("version-console", None);
+        let console = prepare(&other, &Options::default()).unwrap();
         assert_eq!(console.app.version, env!("CARGO_PKG_VERSION"));
         drop(console);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]
