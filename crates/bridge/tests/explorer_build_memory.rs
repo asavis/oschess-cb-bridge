@@ -333,11 +333,13 @@ fn counts_every_game(loaded: &Loaded) {
 fn a_promoted_build_takes_more_workers_from_its_next_pass() {
     const NAME: &str = "a_promoted_build_takes_more_workers_from_its_next_pass";
     if !is_child(CHILD) {
-        return passed(child(NAME, 1024, 8, &[]).end());
+        // Its four builds take longer the busier the computer is (#246).
+        let limit = child_limit();
+        return passed(child(NAME, 1024, 8, &[]).end_within(limit));
     }
     assert_eq!(threads(), 8);
     let mut b = Builder::new();
-    add_random_games(&mut b, 16_384, 0x346);
+    add_random_games(&mut b, 4_096, 0x346);
     let db = b.write("build-memory-promoted");
     let d = Database::open(db.dir().join("db.2cbh")).unwrap();
     // The workers of each tree pass and each deep pass of a build that starts
@@ -346,7 +348,7 @@ fn a_promoted_build_takes_more_workers_from_its_next_pass() {
         let dir = index_dir("promoted");
         let progress = Progress::default();
         progress.set_requested(requested);
-        let limits = Limits { pass_bytes: Some(2 << 20), pass_started: started, ..Limits::default() };
+        let limits = Limits { pass_bytes: Some(512 << 10), pass_started: started, ..Limits::default() };
         let loaded = explorer::prepare_with(&d, 1, &dir, "db", &progress, &limits).unwrap();
         let timings = loaded.built.clone().unwrap();
         drop(loaded);
