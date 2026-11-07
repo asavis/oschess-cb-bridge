@@ -257,11 +257,13 @@ pub struct Timings {
     pub renaming: Duration,
 }
 
-/// One pass: its games replayed, then what they gave written.
+/// One pass: its games replayed, then what they gave written, and the
+/// workers that replayed them (#346).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PassTime {
     pub replay: Duration,
     pub write: Duration,
+    pub workers: usize,
 }
 
 impl PassTime {
@@ -276,12 +278,14 @@ impl Timings {
         self.reading + passes + self.closing + self.renaming
     }
 
-    /// One line of numbers, in microseconds, which [`Timings::parse`] reads:
-    /// `reading=5903000 tree=512000+230000,500000+210000 deep=… closing=… renaming=…`.
+    /// One line of numbers, in microseconds, which [`Timings::parse`] reads,
+    /// each pass with its workers after a colon:
+    /// `reading=5903000 tree=512000+230000:8,500000+210000:8 deep=… closing=… renaming=…`.
     pub fn line(&self) -> String {
         let us = |d: Duration| d.as_micros();
         let passes = |all: &[PassTime]| {
-            all.iter().map(|p| format!("{}+{}", us(p.replay), us(p.write))).collect::<Vec<_>>().join(",")
+            let each = all.iter().map(|p| format!("{}+{}:{}", us(p.replay), us(p.write), p.workers));
+            each.collect::<Vec<_>>().join(",")
         };
         format!(
             "reading={} tree={} deep={} closing={} renaming={}",
@@ -300,8 +304,9 @@ impl Timings {
             v.split(',')
                 .filter(|p| !p.is_empty())
                 .map(|p| {
-                    let (replay, write) = p.split_once('+')?;
-                    Some(PassTime { replay: us(replay)?, write: us(write)? })
+                    let (times, workers) = p.split_once(':').unwrap_or((p, "0"));
+                    let (replay, write) = times.split_once('+')?;
+                    Some(PassTime { replay: us(replay)?, write: us(write)?, workers: workers.parse().ok()? })
                 })
                 .collect()
         };
@@ -426,6 +431,19 @@ impl Room {
             more /= 2;
         }
         Ok((hold, workers, self.least + more))
+    }
+
+    /// More workers for the passes of a section still to come, from
+    /// `workers` up to `want`, each adding its `each` bytes to `hold` while
+    /// the budget has them free now, never waiting (#346): a build that a
+    /// request promoted while the section runs takes a requested build's
+    /// workers from its next pass on, as many as the budget lets it.
+    pub fn more_workers(&self, hold: &mut Hold, workers: usize, want: usize) -> usize {
+        let mut workers = workers;
+        while workers < want && hold.grow_quietly(self.each).is_ok() {
+            workers += 1;
+        }
+        workers
     }
 }
 
@@ -573,7 +591,7 @@ mod tests {
     #[test]
     fn timings_read_back_from_their_line() {
         let ms = Duration::from_millis;
-        let pass = |replay, write| PassTime { replay: ms(replay), write: ms(write) };
+        let pass = |replay, write| PassTime { replay: ms(replay), write: ms(write), workers: 8 };
         let t = Timings {
             reading: Duration::from_micros(5_903_217),
             tree: vec![pass(512, 230), pass(500, 210)],
@@ -584,9 +602,22 @@ mod tests {
         assert_eq!(Timings::parse(&t.line()), Some(t.clone()));
         assert_eq!(t.total(), ms(5_903 + 742 + 710 + 1_100 + 30) + Duration::from_micros(217));
         assert!(t.to_string().starts_with("reading 5.90 s, tree 2 passes 1.45 s (replay 1.01 s, write 0.44 s)"));
+        assert!(t.line().contains("tree=512000+230000:8,500000+210000:8 "), "{}", t.line());
+        // A line of an older build, without the workers, reads with none.
+        let older = Timings::parse("reading=1 tree=2+3 deep= closing=0 renaming=0").unwrap();
+        assert_eq!(
+            older.tree,
+            [PassTime { replay: Duration::from_micros(2), write: Duration::from_micros(3), workers: 0 }]
+        );
         let none = Timings::default();
         assert_eq!(Timings::parse(&none.line()), Some(none));
-        for bad in ["", "reading=1", "reading=x tree= deep= closing=0 renaming=0", "port 80"] {
+        for bad in [
+            "",
+            "reading=1",
+            "reading=x tree= deep= closing=0 renaming=0",
+            "port 80",
+            "reading=1 tree=2+3:x deep= closing=0 renaming=0",
+        ] {
             assert_eq!(Timings::parse(bad), None, "{bad}");
         }
     }

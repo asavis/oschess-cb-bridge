@@ -321,3 +321,58 @@ fn counts_every_game(loaded: &Loaded) {
     let crowded: Vec<u32> = games.into_iter().filter(|&g| g > OTHERS).collect();
     assert!(crowded.iter().copied().eq(OTHERS + 1..=OTHERS + CROWDED), "{} crowded games found", crowded.len());
 }
+
+/// A background build that a request promotes while one of its sections
+/// runs takes a requested build's workers from that section's next pass on
+/// (#346), in the tree's passes and in the deep section's: of eight workers,
+/// the passes planned before the promotion take four, the passes after it
+/// six. A build requested from the start takes six in every pass. Each pass
+/// lasts at least `late_start`, so that the promotion lands while the
+/// section's first pass runs.
+#[test]
+fn a_promoted_build_takes_more_workers_from_its_next_pass() {
+    const NAME: &str = "a_promoted_build_takes_more_workers_from_its_next_pass";
+    if !is_child(CHILD) {
+        return passed(child(NAME, 1024, 8, &[]).end());
+    }
+    assert_eq!(threads(), 8);
+    let mut b = Builder::new();
+    add_random_games(&mut b, 16_384, 0x346);
+    let db = b.write("build-memory-promoted");
+    let d = Database::open(db.dir().join("db.2cbh")).unwrap();
+    let limits = Limits { pass_bytes: Some(2 << 20), late_start: Duration::from_millis(400), ..Limits::default() };
+    // The workers of each tree pass and each deep pass of a build promoted
+    // once `passes` of `progress` counts its first pass; none, from the start.
+    let build = |promote: Option<fn(&Progress) -> u64>| {
+        let dir = index_dir("promoted");
+        let progress = Progress::default();
+        progress.set_requested(promote.is_none());
+        let loaded = std::thread::scope(|s| {
+            let built = s.spawn(|| explorer::prepare_with(&d, 1, &dir, "db", &progress, &limits));
+            if let Some(passes) = promote {
+                let until = Instant::now() + CHILD_LIMIT;
+                while passes(&progress) == 0 {
+                    assert!(Instant::now() < until && !built.is_finished(), "the section never started");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                progress.set_requested(true);
+            }
+            built.join().unwrap().unwrap()
+        });
+        let timings = loaded.built.clone().unwrap();
+        drop(loaded);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let workers =
+            |passes: &[bridge::explorer::runs::PassTime]| passes.iter().map(|p| p.workers).collect::<Vec<_>>();
+        (workers(&timings.tree), workers(&timings.deep))
+    };
+    let (tree, deep) = build(None);
+    assert!(tree.len() >= 2 && deep.len() >= 2, "passes: tree {tree:?}, deep {deep:?}");
+    assert!(tree.iter().chain(&deep).all(|&w| w == 6), "requested from the start: tree {tree:?}, deep {deep:?}");
+    let (tree, deep) = build(Some(|p| p.tree_passes.load(Ordering::Relaxed)));
+    assert_eq!((tree[0], tree[tree.len() - 1]), (4, 6), "promoted in the tree's first pass: {tree:?}");
+    assert!(deep.iter().all(|&w| w == 6), "and so in every deep pass: {deep:?}");
+    let (tree, deep) = build(Some(|p| p.deep_passes.load(Ordering::Relaxed)));
+    assert!(tree.iter().all(|&w| w == 4), "a background build's tree: {tree:?}");
+    assert_eq!((deep[0], deep[deep.len() - 1]), (4, 6), "promoted in the deep section's first pass: {deep:?}");
+}
