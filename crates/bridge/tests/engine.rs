@@ -318,10 +318,19 @@ fn an_engine_that_ends_when_stopped_or_while_idle_is_reported() {
 
     let idle = format!("idle-{id}");
     let config = EngineConfig::new(fake_copy(&dir, &idle), Some(1), Some(16));
-    let (port, bridge) = start(Engine::with_idle(config, Duration::from_millis(300)));
+    // The fake exits 400 ms after its best move, as a loaded machine may
+    // delay it, past the 300 ms idle limit this test had, which then ended it
+    // as idle, no failure, every time (#355). An idle limit no run reaches
+    // leaves the engine to end on its own whatever the pace; once it has, the
+    // next analysis finds it ended and reports how.
+    let (port, bridge) = start(Engine::with_idle(config, Duration::from_secs(3600)));
     let mut a = Analysis::open(port, "moves=f2f3&depth=1&stream=tab1");
     assert_eq!(a.rest().last().unwrap(), BEST);
-    until("the idle limit lets the engine go", WAIT_LIMIT, || !bridge.app.engine.is_running());
+    until("the engine ends on its own", WAIT_LIMIT, || bridge.app.engine.has_ended());
+    assert!(mine(&idle).is_empty(), "nothing noticed it yet: {:?}", mine(&idle));
+    let mut b = Analysis::open(port, "depth=1&stream=tab1");
+    assert_eq!(b.rest().last().unwrap(), BEST);
+    until("the ended engine is reported", WAIT_LIMIT, || !mine(&idle).is_empty());
     let raised = mine(&idle);
     assert_eq!(raised.len(), 1, "{raised:?}");
     assert!(raised[0].starts_with(&format!("the engine {idle} had stopped between analyses: exit")), "{raised:?}");
