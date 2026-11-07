@@ -5,6 +5,22 @@
 - Canonical checkout: `/home/asavi/projects/oschess-cb-bridge`. Keep its `main`
   worktree clean; make every change in a dedicated worktree under
   `.worktrees/<name>` on a feature branch.
+- Build in a worktree through `scripts/target_slot.py`: it runs a command with
+  its Cargo builds in one of four shared target folders under
+  `~/.cache/oschess-cb-bridge/targets`, which that command holds alone until it
+  ends. A worktree's own `target/` takes 8 GB, and thirty of them filled the
+  disk on 2026-11-07; one target folder shared without a lease hands a worktree
+  another worktree's build, whose tests then run the other commit's code
+  (#362). The checks below go through it, and so does a session started to
+  work in a worktree, such as a review:
+  `python3 scripts/target_slot.py -C <worktree> codex exec -C <worktree> ...`.
+- Remove a worktree once its work is done: a review worktree when its round
+  ends, a stress worktree when its campaign ends, and the pull request's own
+  when it is merged or closed, with `python3 scripts/worktrees.py remove
+  <name>`. `python3 scripts/worktrees.py` lists the worktrees with their sizes
+  and verdicts, and `python3 scripts/worktrees.py clean --apply` removes every
+  finished one. Neither removes a worktree with uncommitted changes, one a
+  process uses, a locked one, or one whose commit nothing else holds.
 - This public repository is independent from the private `oschess` repository.
   Copy no code, prompts, data or configuration from `oschess` into it.
 - Keep all GitHub-facing content in English: issues, pull requests, review
@@ -88,9 +104,9 @@ Before every push, in the pull request's worktree:
 
 ```
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-scripts/clippy-windows.sh
-cargo test
+python3 scripts/target_slot.py cargo clippy --all-targets -- -D warnings
+python3 scripts/target_slot.py scripts/clippy-windows.sh
+python3 scripts/target_slot.py cargo test
 ```
 
 `scripts/clippy-windows.sh` runs clippy for `x86_64-pc-windows-gnu`, which
@@ -113,12 +129,14 @@ its pull request reports:
    reproduction fails on the old code every time and passes on the new one, and
    stays in the suite when the seam is cheap.
 2. Every test binary the change touches, under load:
-   `python3 scripts/stress.py --bin <binary> --runs 200 --jobs 4
-   --min-slowdown 5`, and all 200 runs pass. A campaign whose loaded runs took
-   less than five times the run without the load is void (exit status 2) and
-   runs again under a harder load (`--hogs`, `--hog-nice 0`).
+   `python3 scripts/target_slot.py python3 scripts/stress.py --bin <binary>
+   --runs 200 --jobs 4 --min-slowdown 5`, and all 200 runs pass. A campaign
+   whose loaded runs took less than five times the run without the load is void
+   (exit status 2) and runs again under a harder load (`--hogs`,
+   `--hog-nice 0`).
 3. The whole suite, as a smoke test:
-   `python3 scripts/stress.py --runs 16 --jobs 8 --fail-fast`.
+   `python3 scripts/target_slot.py python3 scripts/stress.py --runs 16 --jobs 8
+   --fail-fast`.
 
 A failure in a test the change does not touch gets its own ticket and resets no
 count. The ticket gives the test, the commit, the message and the kept log; the

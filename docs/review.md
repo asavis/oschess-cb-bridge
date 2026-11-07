@@ -22,10 +22,17 @@ env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL \
   GIT_COMMITTER_NAME=oschess-codex-bot \
   GIT_COMMITTER_EMAIL=287075638+oschess-codex-bot@users.noreply.github.com \
   CODEX_HOME=/home/asavi/.codex-oschess-bot \
+  python3 scripts/target_slot.py -C <worktree> \
   codex exec --dangerously-bypass-approvals-and-sandbox \
     -c model=<model> -c model_reasoning_effort=high \
     -C <worktree> - < prompt.txt
 ```
+
+`scripts/target_slot.py` gives the review one shared target folder for the
+whole session, so that the reviewer's builds neither fill a target/ of the
+review worktree's own nor meet another worktree's build. A Codex sandbox, when
+one is used instead, needs that folder writable:
+`-c 'sandbox_workspace_write.writable_roots=["/home/asavi/.cache/oschess-cb-bridge/targets"]'`.
 
 `<model>` is the newest Codex model the account offers, resolved when the
 review starts (`gpt-6.1-sol` on 2026-10-08), and the prompt names it.
@@ -74,9 +81,9 @@ not findings.
 Verify by running things, not only by reading:
 
   cargo fmt --all --check
-  cargo clippy --all-targets -- -D warnings
-  scripts/clippy-windows.sh
-  cargo test
+  python3 scripts/target_slot.py cargo clippy --all-targets -- -D warnings
+  python3 scripts/target_slot.py scripts/clippy-windows.sh
+  python3 scripts/target_slot.py cargo test
 
 Write your own probes rather than trusting the bundled tests; a test written by
 the author of the code is not independent evidence of it. Build malformed
@@ -121,6 +128,8 @@ you could not finish.
 
 ## After the verdict
 
+- The round is over: remove the review worktree,
+  `python3 scripts/worktrees.py remove <name>`.
 - `FINDINGS`: the implementing backend fixes every confirmed finding on the same
   branch, pushes, and requests a new review of the new head.
 - `CLEAN` naming the current head, with the prose comment naming the same SHA:
