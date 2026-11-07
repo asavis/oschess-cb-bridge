@@ -369,6 +369,18 @@ mod tests {
         panic!("no free port stayed free until a start bound it");
     }
 
+    /// A listener standing for another process on a free port, bound before
+    /// its port is written into the test folder, so that the fixture has no
+    /// gap of its own between a look and a bind (#360): on another free port
+    /// should something take the one [`free_port`] offered before the bind.
+    fn held_port(dir: &Path) -> TcpListener {
+        let held = std::iter::repeat_with(|| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, free_port())))
+            .find_map(Result::ok)
+            .unwrap();
+        set_port(dir, held.local_addr().unwrap().port());
+        held
+    }
+
     /// Writes `port` into a test folder's `bridge.toml`, keeping its other lines.
     fn set_port(dir: &Path, port: u16) {
         let path = dir.join("bridge.toml");
@@ -384,15 +396,8 @@ mod tests {
     fn a_test_start_moves_off_a_port_taken_meanwhile() {
         let _log = log::testing::hold();
         let dir = folder("taken-meanwhile", None);
-        // The other process's listener is bound first, on a port free_port
-        // offers, again on another should something take that one meanwhile,
-        // and only then written into the folder: the fixture has no gap of
-        // its own between a look and a bind.
-        let other = std::iter::repeat_with(|| std::net::TcpListener::bind(("127.0.0.1", free_port())))
-            .find_map(Result::ok)
-            .unwrap();
+        let other = held_port(&dir);
         let taken = other.local_addr().unwrap().port();
-        set_port(&dir, taken);
         let e = prepare(&dir, &Options::default()).err().unwrap();
         assert_eq!(e.cause, Cause::PortInUse(taken));
         let bridge = started_in(&dir, &Options::default());
@@ -542,8 +547,8 @@ mod tests {
     fn a_port_held_by_another_listener_is_a_port_in_use() {
         let _log = log::testing::hold();
         let dir = folder("held", None);
+        let held = held_port(&dir);
         let port = port_of(&dir);
-        let held = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
         let e = prepare(&dir, &Options::default()).err().unwrap();
         assert_eq!(e.cause, Cause::PortInUse(port));
         assert!(e.to_string().starts_with(&format!("port {port}: ")), "{e}");
@@ -579,8 +584,8 @@ mod tests {
     fn only_a_port_in_use_is_waited_for() {
         let _log = log::testing::hold();
         let dir = folder("refused-held", Some("https://example.com"));
+        let held = held_port(&dir);
         let port = port_of(&dir);
-        let held = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
         // A wait for the port twice the patience, which a start that waited
         // would outlast.
         let patience = crate::search::workers::tests::PATIENCE;
