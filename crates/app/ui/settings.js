@@ -68,7 +68,7 @@ function renderServed(view) {
   const rows = view.databases.map(databaseRow);
   if (view.problem) {
     rows.unshift(problemRow(view.problem));
-  } else if (!rows.length) {
+  } else if (!rows.length && view.known) {
     rows.push(el('div', 'row empty-row', t('settings.served.none')));
   }
   document.getElementById('served').replaceChildren(...rows);

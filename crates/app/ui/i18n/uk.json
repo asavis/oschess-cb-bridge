@@ -14,6 +14,7 @@
   "tray.missing.few": "oschess міст — {n} бази не знайдено",
   "tray.missing.many": "oschess міст — {n} баз не знайдено",
   "tray.none": "oschess міст — баз поки немає",
+  "tray.running": "oschess міст — працює",
   "tray.noneReady": "oschess міст — готових баз немає",
   "tray.downloading": "oschess міст — база завантажується",
   "tray.downloadingPercent": "oschess міст — завантаження бази: {percent} %",

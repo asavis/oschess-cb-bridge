@@ -140,7 +140,7 @@ fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
     // never runs.
     report(app, Phase::Downloading, Some(update.version.clone()));
     let bytes = tauri::async_runtime::block_on(update.download(|_, _| {}, || {})).map_err(|e| e.to_string())?;
-    if !updates::idle(&shared.view(), super::commands::installing()) {
+    if !updates::idle(&shared.view_for_update(), super::commands::installing()) {
         report(app, Phase::WaitingIdle, Some(update.version.clone()));
     }
     wait_idle(&shared);
@@ -167,7 +167,7 @@ pub(super) fn wait_idle_while(shared: &Shared, wanted: impl Fn() -> bool) -> boo
         if !wanted() {
             return false;
         }
-        if updates::idle(&shared.view(), super::commands::installing()) {
+        if updates::idle(&shared.view_for_update(), super::commands::installing()) {
             return true;
         }
         std::thread::sleep(IDLE_POLL);

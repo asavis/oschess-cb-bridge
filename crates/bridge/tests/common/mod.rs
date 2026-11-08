@@ -132,6 +132,7 @@ impl TestBridge {
     /// every `tick`, with `quiet` as the quiet period.
     pub fn keep(&self, tick: Duration, quiet: Duration) {
         self.app.catalog.explorer.set_keeping(tick, quiet);
+        self.app.catalog.explorer.set_keeping_after_requests(None);
         bridge::explorer::keeper::start(&self.app);
     }
 }

@@ -24,6 +24,7 @@ use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
 use crate::opening::{self, LIMIT, Stage};
 use crate::reports::{Kind, Report};
+use crate::status::Asked;
 
 /// Translate native titles as well as the documents inside their webviews.
 pub fn translate(app: &AppHandle) {
@@ -75,6 +76,7 @@ struct Spec {
 /// Builds the window of `spec` on a worker thread, unless it exists already,
 /// and watches it get ready.
 fn spawn_window(app: &AppHandle, spec: Spec) {
+    shared(app).ask(Asked::Window);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if app.get_webview_window(spec.label).is_some() {
@@ -201,6 +203,7 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
         flyout.anchor
     };
     place(&window, anchor);
+    shared.ask(Asked::Window);
     if let Err(e) = window.show().and_then(|()| window.set_focus()) {
         bridge::fault!("the flyout cannot be shown: {e}");
     }
@@ -262,6 +265,7 @@ pub fn open_settings(app: &AppHandle, section: &str) {
         spawn_window(app, spec);
         return;
     };
+    shared(app).ask(Asked::Window);
     let shown = if shared(app).openings.usable(SETTINGS, Instant::now()) {
         bring_forward(&window)
     } else {

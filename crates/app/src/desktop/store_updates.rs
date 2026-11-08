@@ -56,7 +56,7 @@ fn register_restart() -> Result<(), String> {
 fn wait_ready(app: &AppHandle, shared: &Shared) {
     let mut shown = None;
     loop {
-        let view = shared.view();
+        let view = shared.view_for_update();
         let installing = super::commands::installing();
         if updates::store_ready(&view, installing, super::updater::alive()) {
             break;

@@ -14,7 +14,7 @@ use crate::busy::{self, BUSY, Event, Watch};
 use crate::reports::{Kind, Report};
 
 /// How often the event loop is asked for a beat.
-const BEAT: Duration = Duration::from_secs(2);
+const BEAT: Duration = Duration::from_secs(5);
 
 pub fn start(app: &AppHandle) {
     let app = app.clone();

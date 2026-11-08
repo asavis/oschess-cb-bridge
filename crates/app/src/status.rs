@@ -77,6 +77,9 @@ pub struct View {
     /// A paired browser has reached the bridge since it started: the
     /// first-run window stops waiting for the connection.
     pub connected: bool,
+    /// Whether the databases were looked at: until then `databases` says
+    /// nothing, and a window must not read it as «no databases» (#365).
+    pub known: bool,
     /// [`View::tray`]'s name, for the windows to show the same state.
     pub mark: &'static str,
     /// Whether the bridge has work a restart would lose (#61), for an update
@@ -146,8 +149,25 @@ impl View {
                 })
                 .collect(),
             connected: snapshot.served,
+            known: true,
             mark: "",
             busy: !snapshot.work.is_empty(),
+        }
+        .marked()
+    }
+
+    /// The view of a bridge that serves and has looked at no database yet
+    /// (#365): at the start none is touched until someone uses the bridge.
+    pub fn serving(version: &str, port: u16) -> View {
+        View {
+            version: version.to_string(),
+            port,
+            problem: None,
+            databases: Vec::new(),
+            connected: false,
+            known: false,
+            mark: "",
+            busy: false,
         }
         .marked()
     }
@@ -160,6 +180,7 @@ impl View {
             problem: Some(problem),
             databases: Vec::new(),
             connected: false,
+            known: true,
             mark: "",
             busy: false,
         }
@@ -195,6 +216,7 @@ impl View {
         match &self.problem {
             Some(Problem::PortBusy { port }) => strings.fill("tray.portBusy", &[("port", &port.to_string())]),
             Some(Problem::Stopped { .. }) => strings.get("tray.stopped").to_string(),
+            None if !self.known => strings.get("tray.running").to_string(),
             None if self.counting(State::Downloading) > 0 => {
                 let first = self.databases.iter().find_map(|d| d.progress.filter(|_| d.state == State::Downloading));
                 match first {
@@ -233,34 +255,84 @@ pub fn icon_file(theme: Theme, tray: Tray, size: u32) -> String {
     format!("{}-{}-{size}.png", theme.name(), tray.name())
 }
 
-/// How often the status thread takes the bridge's snapshot when nothing asks
-/// for it sooner (#348): a snapshot looks at every database's files, which with
-/// hundreds of databases costs a third of a second.
-pub const SNAPSHOT_EVERY: Duration = Duration::from_secs(10);
+/// A snapshot looks at every database's files, which with hundreds of
+/// databases costs a quarter of a second of processor time, and nothing needs
+/// one while nobody uses the bridge: `/v1/status` and `/v1/databases` look for
+/// themselves (#365). These are the least times between snapshots:
+///
+/// while a window shows the state and the bridge works, for its progress;
+pub const WINDOW_WORK_EVERY: Duration = Duration::from_secs(1);
+/// while a window shows the state and the bridge has nothing to do;
+pub const WINDOW_EVERY: Duration = Duration::from_secs(5);
+/// while the bridge works and no window is open;
+pub const WORK_EVERY: Duration = Duration::from_secs(10);
+/// when only the count of work begun and ended changed;
+pub const CHANGE_GAP: Duration = Duration::from_secs(5);
+/// after a hover on the tray mark;
+pub const HOVER_GAP: Duration = Duration::from_secs(10);
+/// and while the web app sends requests, each of which looks for itself.
+pub const REQUESTS_GAP: Duration = Duration::from_secs(60);
 
-/// When the status thread, which ticks once a second, takes the bridge's
-/// snapshot (#348): at its first tick; every [`SNAPSHOT_EVERY`]; at every
-/// tick while a window that shows the state is open; and at once when the
-/// bridge's [`Pulse`] changed, as when a download, an index build or an
-/// analysis begins or ends, an index build that waited for its turn starts or
-/// waits again, the server stops or a browser is first served.
-/// At the other ticks the tray keeps the view it drew.
+/// How often the status thread ticks while a window is open or the bridge
+/// works, and otherwise. A tick reads the pulse and the taskbar's theme: it
+/// looks at no database.
+pub const TICK: Duration = Duration::from_secs(1);
+pub const IDLE_TICK: Duration = Duration::from_secs(5);
+
+/// What asked the status thread for a look at the databases, the stronger
+/// last (#365).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Asked {
+    #[default]
+    Nothing,
+    /// The pointer came over the tray mark, whose tooltip is about to show.
+    Hover,
+    /// A window that shows the state is being opened.
+    Window,
+}
+
+/// When the status thread takes the bridge's snapshot (#365): when a window
+/// is being opened; after a hover on the mark; at once when the bridge's
+/// [`Pulse`] says something the user would see changed (a build starts or
+/// waits again, an analysis begins or ends, the server stops, a browser is
+/// first served, or the bridge starts or stops serving); while a window is
+/// open or the bridge works, at the pace above; and after work began or ended
+/// or requests came, at most that often. Otherwise never: an idle bridge
+/// touches no file, from its start on.
 #[derive(Default)]
 pub struct Pace {
-    last: Option<(Instant, Option<Pulse>)>,
+    /// When the last snapshot was taken.
+    at: Option<Instant>,
+    /// The pulse of the last snapshot, or of the first tick.
+    seen: Option<Option<Pulse>>,
 }
 
 impl Pace {
     /// Whether to take a snapshot at `now`, with a window open (`shown`) or
-    /// not, and the bridge's `pulse` (none when it does not serve); noted as
-    /// taken when it is.
-    pub fn due(&mut self, now: Instant, shown: bool, pulse: Option<Pulse>) -> bool {
-        let due = match self.last {
-            None => true,
-            Some((at, seen)) => shown || seen != pulse || now.saturating_duration_since(at) >= SNAPSHOT_EVERY,
+    /// not, what `asked` for one, and the bridge's `pulse` (none when it does
+    /// not serve); noted as taken when it is.
+    pub fn due(&mut self, now: Instant, shown: bool, asked: Asked, pulse: Option<Pulse>) -> bool {
+        let seen = *self.seen.get_or_insert(pulse);
+        let since = self.at.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+        let working = pulse.is_some_and(|p| p.working());
+        let plain = |p: Pulse| Pulse { changes: 0, requests: 0, ..p };
+        let (urgent, counted, requested) = match (seen, pulse) {
+            (Some(a), Some(b)) => (plain(a) != plain(b), a.changes != b.changes, a.requests != b.requests),
+            (None, None) => (false, false, false),
+            _ => (true, false, false),
+        };
+        let due = match asked {
+            Asked::Window => true,
+            Asked::Hover if since >= HOVER_GAP => true,
+            _ if urgent => true,
+            _ if shown => since >= if working { WINDOW_WORK_EVERY } else { WINDOW_EVERY },
+            _ if working => since >= WORK_EVERY,
+            _ if counted => since >= CHANGE_GAP,
+            _ if requested => since >= REQUESTS_GAP,
+            _ => false,
         };
         if due {
-            self.last = Some((now, pulse));
+            (self.at, self.seen) = (Some(now), Some(pulse));
         }
         due
     }
@@ -309,6 +381,7 @@ pub(crate) mod testing {
                 })
                 .collect(),
             connected: false,
+            known: true,
             mark: "",
             busy: false,
         }
@@ -325,39 +398,110 @@ mod tests {
     use super::*;
     use crate::i18n::Lang;
 
-    /// The snapshot is taken at the first tick, then every ten seconds, at
-    /// every tick while a window is open, and at once when the bridge's pulse
-    /// changes (#348).
+    fn nothing_looks(
+        pace: &mut Pace,
+        at: impl Fn(u64) -> Instant,
+        seconds: std::ops::RangeInclusive<u64>,
+        pulse: Pulse,
+    ) {
+        for s in seconds {
+            assert!(!pace.due(at(s), false, Asked::Nothing, Some(pulse)), "at second {s}");
+        }
+    }
+
+    /// An idle bridge is looked at by nobody: from its start on, for as long
+    /// as nothing asks (#365).
     #[test]
-    fn the_snapshot_is_taken_at_the_slower_pace_and_when_asked() {
+    fn an_idle_bridge_takes_no_snapshot() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut pace = Pace::default();
+        nothing_looks(&mut pace, at, 0..=86_400, Pulse::default());
+    }
+
+    /// A window being opened takes one at once; a window that stays open every
+    /// five seconds, and each second while the bridge works, for its progress.
+    #[test]
+    fn a_window_takes_snapshots_at_its_pace() {
         let start = Instant::now();
         let at = |s: u64| start + Duration::from_secs(s);
         let quiet = Some(Pulse::default());
         let mut pace = Pace::default();
-        assert!(pace.due(at(0), false, quiet), "the first tick");
-        let taken: Vec<u64> = (1..=25).filter(|&s| pace.due(at(s), false, quiet)).collect();
-        assert_eq!(taken, [10, 20], "every ten seconds");
-        assert!(pace.due(at(26), true, quiet), "a window opened");
-        assert!(pace.due(at(27), true, quiet), "and every tick while it is open");
-        assert!(!pace.due(at(28), false, quiet), "closed again");
-        let downloading = Some(Pulse { changes: 1, ..Pulse::default() });
-        assert!(pace.due(at(29), false, downloading), "work began");
-        assert!(!pace.due(at(30), false, downloading));
-        let ended = Pulse { changes: 2, ..Pulse::default() };
-        let done = Some(ended);
-        assert!(pace.due(at(31), false, done), "work ended");
-        for changed in
-            [Pulse { stopped: true, ..ended }, Pulse { analysing: true, ..ended }, Pulse { served: true, ..ended }]
-        {
+        assert!(pace.due(at(0), false, Asked::Window, quiet), "being opened");
+        let taken: Vec<u64> = (1..=12).filter(|&s| pace.due(at(s), true, Asked::Nothing, quiet)).collect();
+        assert_eq!(taken, [5, 10], "open");
+        let downloading = Some(Pulse { downloading: true, ..Pulse::default() });
+        assert!(pace.due(at(13), true, Asked::Nothing, downloading), "the work began");
+        assert!(pace.due(at(14), true, Asked::Nothing, downloading), "each second");
+        assert!(!pace.due(at(14), true, Asked::Nothing, downloading), "not twice in one");
+    }
+
+    /// A hover looks at most every ten seconds, as the pointer may pass often.
+    #[test]
+    fn a_hover_takes_a_snapshot_at_most_every_ten_seconds() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let quiet = Some(Pulse::default());
+        let mut pace = Pace::default();
+        assert!(pace.due(at(0), false, Asked::Hover, quiet));
+        assert!(!pace.due(at(9), false, Asked::Hover, quiet));
+        assert!(pace.due(at(10), false, Asked::Hover, quiet));
+    }
+
+    /// What the user would see at once takes one at once; running work every
+    /// ten seconds; only the count of work every five at most; requests once
+    /// a minute at most, each change seen once.
+    #[test]
+    fn the_bridge_side_takes_snapshots_with_measure() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let quiet = Pulse::default();
+        for changed in [
+            Pulse { indexing: true, ..quiet },
+            Pulse { headers: true, ..quiet },
+            Pulse { stopped: true, ..quiet },
+            Pulse { analysing: true, ..quiet },
+            Pulse { served: true, ..quiet },
+        ] {
             let mut pace = Pace::default();
-            assert!(pace.due(at(0), false, done));
-            assert!(!pace.due(at(1), false, done));
-            assert!(pace.due(at(2), false, Some(changed)), "{changed:?}");
+            assert!(!pace.due(at(0), false, Asked::Nothing, Some(quiet)));
+            assert!(pace.due(at(1), false, Asked::Nothing, Some(changed)), "{changed:?}");
         }
-        let mut stopped = Pace::default();
-        assert!(stopped.due(at(0), false, done));
-        assert!(stopped.due(at(1), false, None), "the bridge no longer serves");
-        assert!(!stopped.due(at(2), false, None));
+        let mut pace = Pace::default();
+        assert!(!pace.due(at(0), false, Asked::Nothing, Some(quiet)));
+        assert!(pace.due(at(1), false, Asked::Nothing, None), "the bridge no longer serves");
+        assert!(!pace.due(at(2), false, Asked::Nothing, None));
+
+        let working = Pulse { indexing: true, ..quiet };
+        let mut pace = Pace::default();
+        assert!(pace.due(at(0), false, Asked::Window, Some(working)));
+        let taken: Vec<u64> = (1..=25).filter(|&s| pace.due(at(s), false, Asked::Nothing, Some(working))).collect();
+        assert_eq!(taken, [10, 20], "while it works");
+
+        let counted = Pulse { changes: 2, ..quiet };
+        let mut pace = Pace::default();
+        assert!(pace.due(at(0), false, Asked::Window, Some(quiet)));
+        assert!(!pace.due(at(4), false, Asked::Nothing, Some(counted)));
+        assert!(pace.due(at(5), false, Asked::Nothing, Some(counted)), "the count changed");
+        nothing_looks(&mut pace, at, 6..=600, counted);
+
+        let requested = Pulse { requests: 7, ..quiet };
+        let mut pace = Pace::default();
+        assert!(pace.due(at(0), false, Asked::Window, Some(quiet)));
+        nothing_looks(&mut pace, at, 1..=59, requested);
+        assert!(pace.due(at(60), false, Asked::Nothing, Some(requested)), "requests came");
+        nothing_looks(&mut pace, at, 61..=600, requested);
+    }
+
+    /// A view that knows no database yet says the bridge runs: it does not
+    /// claim there are none (#365).
+    #[test]
+    fn a_view_that_looked_at_nothing_says_the_bridge_runs() {
+        let uk = Strings::new(Lang::Uk);
+        let view = View::serving("0.1.0", 39581);
+        assert_eq!(view.tray(), Tray::Ready);
+        assert_eq!(view.tooltip(&uk), uk.get("tray.running"));
+        assert_ne!(view.tooltip(&uk), uk.get("tray.none"));
     }
 
     #[test]
@@ -426,7 +570,7 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         assert_eq!(
             json,
-            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"connected":true,"mark":"ready"}"#
+            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"connected":true,"known":true,"mark":"ready"}"#
         );
         let stopped = View::of(&Snapshot { stopped: Some("accept failed".into()), ..snapshot });
         assert_eq!(stopped.problem, Some(Problem::Stopped { reason: "accept failed".into() }));

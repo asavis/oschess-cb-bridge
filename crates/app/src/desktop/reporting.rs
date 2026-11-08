@@ -189,7 +189,7 @@ fn file_in(data: &Path, report: &Report, context: impl FnOnce() -> Context) -> O
 /// it must not carry.
 fn context(reporter: &Reporter) -> Context {
     let shared = shared(&reporter.app);
-    let mut private: Vec<String> = shared.view().databases.into_iter().map(|d| d.name).collect();
+    let mut private: Vec<String> = shared.database_names();
     private.extend(shared.pairing().ok().map(|p| p.code));
     context_with(&reporter.data, shared.strings.lang().code(), reporter.started.elapsed(), private)
 }

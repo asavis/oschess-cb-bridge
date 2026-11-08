@@ -167,8 +167,9 @@ it over HTTP as oschess does:
 - a small answer over a kept and over a new connection.
 
 With `--background`, the first bridge keeps its indexes as a serving bridge
-does (#149): the database, the largest one ready, has its position index
-built unasked from the bridge's start, while the flows run. Each sort and
+does while oschess is used (#149, #365): the database, the largest one ready,
+has its position index built unasked from the bridge's start, while the flows
+run. Each sort and
 search row says whether the build still ran, and the time from the bridge's
 start to the index ready, with the mode it ran in
 (`OSCHESS_BRIDGE_BACKGROUND_MODE`), how long it gave way to the flows at most

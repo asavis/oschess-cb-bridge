@@ -178,26 +178,45 @@ fn work_of(databases: &[Database], headers: bool, indexing: bool, analysing: boo
 /// Whether `catalog` builds a header index, and a position index, as work a
 /// restart would lose: a position index build that waits for its turn loses
 /// nothing. A [`Snapshot`]'s work and its [`Pulse`] both read them here.
+///
+/// None of it looks at a file.
 fn builds(catalog: &Catalog) -> (bool, bool) {
     (catalog.pgn().building(), catalog.explorer.building().iter().any(|b| b.1 != "waiting"))
 }
 
 /// What a [`Snapshot`] shows that may change on the bridge's side, read
 /// without looking at any database (#348): how many times its background work
-/// began or ended, whether a header index and a position index are built as
-/// its work shows them (a build that waited for its turn starts, or waits
-/// again, with no work beginning or ending), whether it stopped, whether an
-/// analysis holds updates back and whether a paired browser was served. A
-/// user interface that sees it change takes a snapshot at once rather than at
-/// its slower pace.
+/// began or ended, how many requests it served (#365), whether a database
+/// downloads, whether a header index and a position index are built as its
+/// work shows them (a build that waited for its turn starts, or waits again,
+/// with no work beginning or ending), whether it stopped, whether an analysis
+/// holds updates back and whether a paired browser was served. A user
+/// interface that sees it change takes a snapshot when it needs one, rather
+/// than look at every database to find out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pulse {
     pub changes: u64,
+    pub requests: u64,
+    pub downloading: bool,
     pub headers: bool,
     pub indexing: bool,
     pub stopped: bool,
     pub analysing: bool,
     pub served: bool,
+}
+
+impl Pulse {
+    /// Whether the bridge runs work whose progress a user may follow: a
+    /// download or a build.
+    pub fn working(&self) -> bool {
+        self.downloading || self.headers || self.indexing
+    }
+
+    /// Whether the bridge has work a restart would lose: what a snapshot's
+    /// `work` lists, without looking at any database (#365).
+    pub fn busy(&self) -> bool {
+        self.working() || self.analysing
+    }
 }
 
 /// A bridge serving on a thread of its own.
@@ -233,12 +252,20 @@ impl Background {
         let (headers, indexing) = builds(&self.app.catalog);
         Pulse {
             changes: self.app.catalog.changes(),
+            requests: self.app.requests.load(Ordering::Relaxed),
+            downloading: self.app.catalog.downloading(),
             headers,
             indexing,
             stopped: lock(&self.stopped).is_some(),
             analysing: self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES),
             served: self.app.served.load(Ordering::Relaxed),
         }
+    }
+
+    /// The names of the databases listed, without looking at any of them
+    /// (#365).
+    pub fn names(&self) -> Vec<String> {
+        self.app.catalog.names()
     }
 
     /// The state now. Checking a database opens it when it is ready, so call
@@ -274,10 +301,14 @@ mod tests {
     const TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
 
     fn bridge(databases: Vec<PathBuf>) -> Bridge {
+        bridge_of(Catalog::new(databases))
+    }
+
+    fn bridge_of(catalog: Catalog) -> Bridge {
         let listeners = server::bind(0).unwrap();
         let port = listeners[0].local_addr().unwrap().port();
         let policy = Policy { port, origins: DEFAULT_ORIGINS.map(String::from).to_vec(), token: TOKEN.into() };
-        let app = App::new("test", policy, Catalog::new(databases));
+        let app = App::new("test", policy, catalog);
         Bridge { listeners, app: Arc::new(app), port, token: TOKEN.into(), link: String::new(), first_run: false }
     }
 
@@ -388,6 +419,54 @@ mod tests {
         assert!(snapshot.databases.is_empty());
     }
 
+    /// A download counts as work from the moment it is asked for, in the
+    /// pulse as in a snapshot, and no longer once it ended (#365): an update
+    /// reads the pulse and must not restart the bridge over it.
+    #[test]
+    fn a_download_is_work_in_the_pulse_as_in_a_snapshot() {
+        use crate::fetch::Cloud;
+        use crate::sources::Sources;
+        use std::sync::atomic::AtomicBool;
+
+        struct Provider {
+            cloud: AtomicBool,
+            release: AtomicBool,
+        }
+        impl Cloud for Provider {
+            fn is_cloud_only(&self, _: &std::path::Path, _: &std::fs::Metadata) -> bool {
+                self.cloud.load(Ordering::SeqCst)
+            }
+            fn fetch(&self, _: &std::path::Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+                while !self.release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.cloud.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let db = ready("snapshot-download", 3);
+        let provider = Arc::new(Provider { cloud: AtomicBool::new(true), release: AtomicBool::new(false) });
+        let sources = Sources { fixed: vec![db.dir().join("db.2cbh")], ..Sources::default() };
+        let bridge = bridge_of(Catalog::with_sources(sources, provider.clone()));
+        let app = Arc::clone(&bridge.app);
+        let background = Background::serve(bridge).unwrap();
+        assert!(!background.pulse().busy(), "nothing asked yet");
+        let entry = Arc::clone(&app.catalog.entries()[0]);
+        assert!(matches!(entry.open_to_read(), Err(State::Downloading)));
+        let during = background.pulse();
+        assert!(during.downloading && during.working() && during.busy());
+        assert!(background.snapshot().work.contains(&Work::Downloading));
+        provider.release.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while background.pulse().downloading {
+            assert!(std::time::Instant::now() < deadline, "the download did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!background.pulse().busy());
+        assert!(background.snapshot().work.is_empty());
+        assert!(app.catalog.settle(Duration::from_secs(60)).is_ok(), "the download's work did not end");
+    }
+
     /// A background build that waited for its turn changes the pulse as it
     /// starts, though no work begins or ends then (#348): the snapshot now
     /// shows the build as work a restart would lose, and a tray that keeps
@@ -435,6 +514,7 @@ mod tests {
         // The keeper's first look, as the bridge starts, queues the build of
         // the largest database; there is no other look.
         explorer.set_keeping(Duration::from_secs(3600), Duration::ZERO);
+        explorer.set_keeping_after_requests(None);
         let background = Background::serve(bridge).unwrap();
         until("the build is not queued", &|| explorer.building().iter().any(|b| b.1 == "waiting"));
         // The keeper stopped, its look over: the build alone counts as work.
@@ -443,12 +523,14 @@ mod tests {
         });
         assert!(!background.snapshot().work.contains(&Work::Indexing), "a waiting build loses nothing");
         let waiting = background.pulse();
+        assert!(!waiting.busy(), "as a snapshot's work says");
         power.0.store(false, Ordering::Relaxed);
         explorer.set_machine(Arc::clone(&power) as Arc<dyn Machine>);
         until("the build did not start", &|| background.snapshot().work.contains(&Work::Indexing));
         let running = background.pulse();
         assert_ne!(running, waiting, "the build started");
         assert_eq!((waiting.indexing, running.indexing, running.changes), (false, true, waiting.changes));
+        assert!(running.busy() && running.working(), "as a snapshot's work says");
         HELD.store(false, Ordering::Relaxed);
         assert!(app.catalog.settle(Duration::from_secs(60)).is_ok(), "the build did not end");
         explorer.release();

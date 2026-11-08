@@ -1259,8 +1259,12 @@ With `q` the answer also acknowledges the search (#268):
     positions are asked for. That build goes first, at below-normal priority,
     on a requested build's workers, and stops a background build of another
     database at its next batch, which waits its turn again.
-  - It is also built, unasked, for each database in use whose index is not
-    of the database as it is now: once built, whenever the database changes.
+  - While oschess is used, that is, until 10 minutes after the last request
+    the bridge served (#365), it is also built, unasked, for each database in
+    use whose index is not of the database as it is now: once built, whenever
+    the database changes. A bridge nobody uses looks at no database and builds
+    nothing: the index of a database that changed meanwhile is built when
+    oschess is used again.
     A database is in use when its index is kept on disk, or its explorer or
     the games of one of its positions were asked for since the bridge
     started; the database with the most records is in use from the start. A

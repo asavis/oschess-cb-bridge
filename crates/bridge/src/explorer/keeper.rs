@@ -39,23 +39,30 @@ pub const TICK: Duration = Duration::from_secs(60);
 /// How long a database keeps its generation before its index is rebuilt in
 /// the background.
 pub const QUIET: Duration = Duration::from_secs(60);
+/// How long after the last request the keeper still looks (#365): with no
+/// request for this long oschess is not being used, and a bridge that nobody
+/// uses touches no file. The index of a database changed meanwhile is built
+/// again once oschess is used again.
+pub const ACTIVE_FOR: Duration = Duration::from_secs(10 * 60);
 /// The kind of work a look of the keeper counts as in the catalog's activity
 /// (#236).
 const LOOK: &str = "keeper";
 
 /// How often the keeper looks, how long a database must have kept its
-/// generation before its index is rebuilt in the background, and whether the
+/// generation before its index is rebuilt in the background, for how long
+/// after a request it looks (`None`: with or without one), and whether the
 /// keeper was stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Keeping {
     tick: Duration,
     quiet: Duration,
+    active_for: Option<Duration>,
     stopped: bool,
 }
 
 impl Default for Keeping {
     fn default() -> Keeping {
-        Keeping { tick: TICK, quiet: QUIET, stopped: false }
+        Keeping { tick: TICK, quiet: QUIET, active_for: Some(ACTIVE_FOR), stopped: false }
     }
 }
 
@@ -66,9 +73,11 @@ pub(super) struct Seen {
     since: Instant,
 }
 
-/// Starts the keeper of the indexes of `app`'s databases, which looks at once
-/// and then every [`TICK`], and ends once `app` is gone or the keeper is
-/// stopped ([`Registry::stop_keeping`]). It keeps indexes only in an index
+/// Starts the keeper of the indexes of `app`'s databases, which looks every
+/// [`TICK`] while a request came within [`ACTIVE_FOR`] (#365), and ends once
+/// `app` is gone or the keeper is stopped ([`Registry::stop_keeping`]). A
+/// tick with no such request looks at nothing and counts as no work, so that
+/// nothing else wakes for it. It keeps indexes only in an index
 /// folder the bridge was given ([`Registry::set_dir`]), never in the default
 /// one. The priority of the builds it queues is chosen now
 /// ([`machine::BACKGROUND_MODE`]) and logged.
@@ -79,12 +88,17 @@ pub fn start(app: &Arc<App>) {
         std::thread::Builder::new().name("bridge-keeper".into()).stack_size(crate::THREAD_STACK).spawn(move || {
             while let Some(app) = app.upgrade() {
                 let registry = &app.catalog.explorer;
-                // The reading of the list counts as the look's work too.
-                let Some((Keeping { tick, .. }, look)) = registry.look() else { return };
-                if lock(&registry.dir).is_some() {
-                    registry.keep(&app.catalog.entries());
+                let Keeping { tick, active_for, .. } = *lock(&registry.keeping);
+                if active_for.is_none_or(|within| app.asked_within(within)) {
+                    // The reading of the list counts as the look's work too.
+                    let Some((_, look)) = registry.look() else { return };
+                    if lock(&registry.dir).is_some() {
+                        registry.keep(&app.catalog.entries());
+                    }
+                    drop(look);
+                } else if registry.stopped() {
+                    return;
                 }
-                drop(look);
                 drop(app);
                 std::thread::sleep(tick);
             }
@@ -102,6 +116,13 @@ impl Registry {
     pub fn set_keeping(&self, tick: Duration, quiet: Duration) {
         let mut keeping = lock(&self.keeping);
         (keeping.tick, keeping.quiet) = (tick, quiet);
+    }
+
+    /// Sets for how long after a request the keeper looks: `None` looks with
+    /// or without one, as tests and a profile of a keeping bridge do;
+    /// [`ACTIVE_FOR`] unless set (#365).
+    pub fn set_keeping_after_requests(&self, active_for: Option<Duration>) {
+        lock(&self.keeping).active_for = active_for;
     }
 
     /// Stops the keeper for good, at once: no look begins from now on, and

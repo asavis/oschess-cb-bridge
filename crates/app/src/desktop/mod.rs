@@ -19,7 +19,6 @@ mod watchdog;
 mod windows;
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
@@ -29,7 +28,7 @@ use crate::channel::Channel;
 use crate::diagnostics;
 use crate::i18n::Strings;
 use crate::reports::{Kind, Report};
-use crate::status::{Pace, Problem, View};
+use crate::status::{Asked, IDLE_TICK, Pace, Problem, TICK, View};
 use server::Shared;
 
 /// The argument the Run key starts the app with. Nothing reads it: a start at
@@ -175,24 +174,24 @@ fn log_panics() {
     }));
 }
 
-/// Follows the bridge once a second: redraws the tray mark when the state,
-/// the taskbar theme or the display scale changes, sends the windows the new
-/// view, and tells the user once when a problem appears. It takes the
-/// bridge's snapshot, which looks at every database, at the pace [`Pace`]
-/// sets (#348): every ten seconds, every second while a window is open, and
-/// at once when the bridge's work changes.
+/// Follows the bridge: redraws the tray mark when the state, the taskbar
+/// theme or the display scale changes, sends the windows the new view, and
+/// tells the user once when a problem appears. It ticks once a second while a
+/// window is open or the bridge works, and every five seconds otherwise, woken
+/// sooner when a look is asked for. It takes the bridge's snapshot, which
+/// looks at every database, only when [`Pace`] says so: an idle bridge takes
+/// none (#365).
 fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
     let spawned = std::thread::Builder::new().name("bridge-status".into()).spawn(move || {
         let mut last: Option<View> = None;
         let mut drawn = String::new();
         let mut pace = Pace::default();
+        let mut asked = Asked::Nothing;
         loop {
             let shown = app.webview_windows().values().any(|w| w.is_visible().unwrap_or(false));
-            let due = pace.due(std::time::Instant::now(), shown, shared.pulse());
-            let view = match (&last, due) {
-                (Some(view), false) => view.clone(),
-                _ => shared.current_view(),
-            };
+            let pulse = shared.pulse();
+            let due = pace.due(std::time::Instant::now(), shown, asked, pulse);
+            let view = if due { shared.current_view() } else { last.clone().unwrap_or_else(|| shared.view()) };
             let theme = system::taskbar_theme();
             let scale = app.primary_monitor().ok().flatten().map_or(1.0, |m| m.scale_factor());
             let key = tray::update(&app, &shared.strings, &view, theme, scale, &drawn);
@@ -208,7 +207,7 @@ fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
                 let _ = app.emit("view", &view);
                 last = Some(view);
             }
-            std::thread::sleep(Duration::from_secs(1));
+            asked = shared.wait_asked(if shown || pulse.is_some_and(|p| p.working()) { TICK } else { IDLE_TICK });
         }
     });
     if let Err(e) = spawned {

@@ -3,9 +3,9 @@
 use std::fmt::Display;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cbformat::Error;
 use cbformat::game::RecordKind;
@@ -92,6 +92,11 @@ pub struct App {
     /// reached the bridge. The Windows app's first-run window stops waiting
     /// for it then.
     pub served: AtomicBool,
+    /// The requests the policy served, and when it served the last one
+    /// (#365): whether oschess is being used, which a bridge that has nothing
+    /// to do waits for before it looks at any file.
+    pub requests: AtomicU64,
+    pub last_request: Mutex<Option<Instant>>,
     /// How long an open connection may wait for a request before the bridge
     /// closes it: [`IDLE_TIMEOUT`]. The tests' bridges wait longer, since a
     /// loaded machine can stall a test between its connect and its write
@@ -106,6 +111,11 @@ pub struct App {
 }
 
 impl App {
+    /// Whether the policy served a request within `within` of now (#365).
+    pub fn asked_within(&self, within: Duration) -> bool {
+        lock(&self.last_request).is_some_and(|at| at.elapsed() < within)
+    }
+
     /// A bridge serving `catalog` under `policy`, with no engine and no hook
     /// between reads; a caller that needs either sets it with struct update
     /// syntax, `App { engine, ..App::new(..) }`.
@@ -117,6 +127,8 @@ impl App {
             between_reads: None,
             engine: Engine::none(),
             served: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            last_request: Mutex::new(None),
             idle_timeout: IDLE_TIMEOUT,
             busy_read: BUSY_READ,
         }
@@ -129,6 +141,8 @@ pub fn admit(app: &App, req: &Request) -> Verdict {
     let verdict = app.policy.check(req);
     if matches!(verdict, Verdict::Serve { .. }) {
         app.served.store(true, Ordering::Relaxed);
+        app.requests.fetch_add(1, Ordering::Relaxed);
+        *lock(&app.last_request) = Some(Instant::now());
     }
     verdict
 }

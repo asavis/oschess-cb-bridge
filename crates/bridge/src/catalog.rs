@@ -670,6 +670,18 @@ impl Catalog {
         Arc::clone(&lock(&self.entries))
     }
 
+    /// Whether a database is downloading or waits to, from what the catalog
+    /// holds: no file is looked at (#365).
+    pub fn downloading(&self) -> bool {
+        self.listed().iter().any(|entry| entry.progress().is_some())
+    }
+
+    /// The names of the databases as listed last, from what the catalog
+    /// holds: no file is looked at (#365).
+    pub fn names(&self) -> Vec<String> {
+        self.listed().iter().map(|entry| entry.name.clone()).collect()
+    }
+
     /// Sweeps the index folder, and the PGN header index folder, of what the
     /// list no longer uses (#60), now and
     /// from now on: after each change of the list, and at least once a minute
