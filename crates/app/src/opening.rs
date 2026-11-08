@@ -56,6 +56,17 @@ pub enum FlyoutStep {
     Destroy,
 }
 
+/// What a Store look does for the window that is to own what it shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlyoutOwner {
+    /// The flyout is there and stays.
+    Use,
+    /// It is going: wait until it is gone.
+    Wait,
+    /// There is none: build one.
+    Build,
+}
+
 /// Who wants the flyout, which lives only while someone does (#365): a click
 /// waiting for its page, a Store look holding it as the owner of what it
 /// shows, or its being open. Every decision that destroys it is taken on the
@@ -95,6 +106,20 @@ impl FlyoutLife {
 
     pub fn release(&mut self) {
         self.held = false;
+    }
+
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    /// What a Store look does with a flyout that `exists` or not: one whose
+    /// destruction is already queued cannot own anything.
+    pub fn owner(&self, exists: bool) -> FlyoutOwner {
+        match (exists, self.closing) {
+            (true, false) => FlyoutOwner::Use,
+            (true, true) => FlyoutOwner::Wait,
+            (false, _) => FlyoutOwner::Build,
+        }
     }
 
     /// The flyout that exists is to close: it hides while a Store look holds
@@ -267,13 +292,36 @@ mod tests {
         assert!(!life.settle(false, false), "none is left");
     }
 
-    /// A build that a click gave up on goes when its page comes.
+    /// A build that a click gave up on goes when its page comes, and also
+    /// when its window only exists after the click gave up: its page may
+    /// never come (the review's first finding on 07a4086).
     #[test]
     fn a_flyout_nobody_waits_for_goes() {
         let mut life = FlyoutLife::default();
         life.wait();
         assert!(life.give_up());
         assert!(life.settle(true, false));
+        let mut late = FlyoutLife::default();
+        late.wait();
+        assert!(late.give_up());
+        assert!(!late.settle(false, false), "nothing to destroy yet");
+        assert!(late.settle(true, false), "the build ended after the deadline");
+    }
+
+    /// A Store look never takes a flyout whose destruction is already queued
+    /// (the review's second finding on 07a4086): it waits, then builds one.
+    #[test]
+    fn a_store_look_takes_no_flyout_that_is_going() {
+        let mut life = FlyoutLife::default();
+        assert_eq!(life.owner(false), FlyoutOwner::Build);
+        assert_eq!(life.owner(true), FlyoutOwner::Use);
+        assert_eq!(life.close(), FlyoutStep::Destroy);
+        life.hold();
+        assert_eq!(life.owner(true), FlyoutOwner::Wait, "its destruction is queued");
+        life.closed();
+        assert_eq!(life.owner(false), FlyoutOwner::Build, "gone");
+        assert_eq!(life.owner(true), FlyoutOwner::Use, "built again");
+        assert_eq!(life.close(), FlyoutStep::Hide, "and held");
     }
 
     /// The end of a Store look leaves a flyout the user opened meanwhile, and

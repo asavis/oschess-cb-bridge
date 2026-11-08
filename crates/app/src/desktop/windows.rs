@@ -22,7 +22,7 @@ use tauri::{
 
 use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
-use crate::opening::{self, FlyoutClick, FlyoutStep, LIMIT, Stage};
+use crate::opening::{self, FlyoutClick, FlyoutOwner, FlyoutStep, LIMIT, Stage};
 use crate::reports::{Kind, Report};
 use crate::status::Asked;
 
@@ -88,7 +88,14 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
             std::future::pending::<()>().await;
         }
         match build_window(&app, &spec) {
-            Ok(_) => shared(&app).openings.built(spec.label, attempt),
+            Ok(_) => {
+                shared(&app).openings.built(spec.label, attempt);
+                // A click may have given up on it while it was built, and its
+                // page may never come.
+                if spec.label == FLYOUT {
+                    settle_flyout(&app);
+                }
+            }
             Err(e) => {
                 let line = format!("the {} window: {e}", spec.label);
                 bridge::log!("{line}");
@@ -223,6 +230,8 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
     }
     match (click, window) {
         (FlyoutClick::Show, Some(window)) => show_flyout(app, &window),
+        // A Store look owns it for now: its page is not needed for that.
+        (FlyoutClick::Rebuild, Some(_)) if shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.held() => {}
         (FlyoutClick::Rebuild, Some(window)) => match window.destroy() {
             Ok(()) => build_when_gone(app, flyout_spec(app)),
             Err(e) => bridge::fault!("the flyout cannot be destroyed: {e}"),
@@ -286,15 +295,20 @@ fn settle_flyout(app: &AppHandle) {
 /// window came within [`LIMIT`]. Call it off the event loop's thread: it
 /// waits for the window.
 pub fn hold_flyout(app: &AppHandle) -> (FlyoutHold, Option<WebviewWindow>) {
-    shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.hold();
+    let shared = shared(app);
+    shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.hold();
     let hold = FlyoutHold(app.clone());
-    if app.get_webview_window(FLYOUT).is_none() {
-        create_flyout(app);
-    }
-    let start = Instant::now();
+    let (start, mut asked) = (Instant::now(), false);
     loop {
-        if let Some(window) = app.get_webview_window(FLYOUT) {
-            return (hold, Some(window));
+        let window = app.get_webview_window(FLYOUT);
+        let owner = shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.owner(window.is_some());
+        match (owner, window) {
+            (FlyoutOwner::Use, Some(window)) => return (hold, Some(window)),
+            (FlyoutOwner::Build, _) if !asked => {
+                create_flyout(app);
+                asked = true;
+            }
+            _ => {}
         }
         if start.elapsed() > LIMIT {
             return (hold, None);
