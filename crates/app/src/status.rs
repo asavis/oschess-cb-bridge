@@ -342,13 +342,12 @@ mod tests {
         let downloading = Some(Pulse { changes: 1, ..Pulse::default() });
         assert!(pace.due(at(29), false, downloading), "work began");
         assert!(!pace.due(at(30), false, downloading));
-        let done = Some(Pulse { changes: 2, ..Pulse::default() });
+        let ended = Pulse { changes: 2, ..Pulse::default() };
+        let done = Some(ended);
         assert!(pace.due(at(31), false, done), "work ended");
-        for changed in [
-            Pulse { stopped: true, ..done.unwrap() },
-            Pulse { analysing: true, ..done.unwrap() },
-            Pulse { served: true, ..done.unwrap() },
-        ] {
+        for changed in
+            [Pulse { stopped: true, ..ended }, Pulse { analysing: true, ..ended }, Pulse { served: true, ..ended }]
+        {
             let mut pace = Pace::default();
             assert!(pace.due(at(0), false, done));
             assert!(!pace.due(at(1), false, done));
