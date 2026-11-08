@@ -48,6 +48,84 @@ pub enum FlyoutClick {
     Rebuild,
 }
 
+/// What to do with the flyout's window now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlyoutStep {
+    Nothing,
+    Hide,
+    Destroy,
+}
+
+/// Who wants the flyout, which lives only while someone does (#365): a click
+/// waiting for its page, a Store look holding it as the owner of what it
+/// shows, or its being open. Every decision that destroys it is taken on the
+/// event loop's thread, where the clicks and the pages are handled too.
+#[derive(Debug, Default)]
+pub struct FlyoutLife {
+    /// A click waits for its page, to show it.
+    waiting: bool,
+    /// Its window is being destroyed.
+    closing: bool,
+    /// A Store look holds it.
+    held: bool,
+}
+
+impl FlyoutLife {
+    /// A click waits for the page.
+    pub fn wait(&mut self) {
+        self.waiting = true;
+    }
+
+    pub fn waiting(&self) -> bool {
+        self.waiting
+    }
+
+    /// The click no longer waits; whether one did.
+    pub fn give_up(&mut self) -> bool {
+        std::mem::take(&mut self.waiting)
+    }
+
+    pub fn closing(&self) -> bool {
+        self.closing
+    }
+
+    pub fn hold(&mut self) {
+        self.held = true;
+    }
+
+    pub fn release(&mut self) {
+        self.held = false;
+    }
+
+    /// The flyout that exists is to close: it hides while a Store look holds
+    /// it, and otherwise goes, once.
+    pub fn close(&mut self) -> FlyoutStep {
+        self.waiting = false;
+        if self.held {
+            FlyoutStep::Hide
+        } else if self.closing {
+            FlyoutStep::Nothing
+        } else {
+            self.closing = true;
+            FlyoutStep::Destroy
+        }
+    }
+
+    /// Its window is gone, or could not be destroyed.
+    pub fn closed(&mut self) {
+        self.closing = false;
+    }
+
+    /// Whether a flyout that `exists`, `visible` or not, has nobody left: a
+    /// page that failed, a build a click gave up on, a Store look that ended.
+    /// It is then being destroyed.
+    pub fn settle(&mut self, exists: bool, visible: bool) -> bool {
+        let unwanted = exists && !visible && !self.waiting && !self.held && !self.closing;
+        self.closing |= unwanted;
+        unwanted
+    }
+}
+
 /// The latest opening of each window, by its label.
 #[derive(Default)]
 pub struct Openings {
@@ -171,6 +249,61 @@ pub fn on_a_screen(window: Rect, screens: &[Rect]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page that never got ready leaves no window behind, once the click
+    /// that waited for it was told; the focus WebView2 takes while it builds
+    /// closes nothing (the review's first finding on c0c2b7f).
+    #[test]
+    fn a_flyout_whose_page_fails_goes() {
+        let mut life = FlyoutLife::default();
+        life.wait();
+        assert!(life.waiting(), "the focus lost while it is built is ignored");
+        assert!(!life.settle(true, false), "a click still waits");
+        assert!(life.give_up(), "the click is told");
+        assert!(life.settle(true, false), "and the window goes");
+        assert!(life.closing());
+        assert!(!life.settle(true, false), "once");
+        life.closed();
+        assert!(!life.settle(false, false), "none is left");
+    }
+
+    /// A build that a click gave up on goes when its page comes.
+    #[test]
+    fn a_flyout_nobody_waits_for_goes() {
+        let mut life = FlyoutLife::default();
+        life.wait();
+        assert!(life.give_up());
+        assert!(life.settle(true, false));
+    }
+
+    /// The end of a Store look leaves a flyout the user opened meanwhile, and
+    /// takes one nobody uses (the review's second finding on c0c2b7f): the
+    /// decision is made where the clicks are handled, so it sees them.
+    #[test]
+    fn the_end_of_a_store_look_leaves_what_the_user_opened() {
+        let mut life = FlyoutLife::default();
+        life.hold();
+        assert_eq!(life.close(), FlyoutStep::Hide, "held, it only hides");
+        life.wait();
+        life.release();
+        assert!(!life.settle(true, false), "a click waits for it");
+        assert!(life.give_up());
+        assert!(!life.settle(true, true), "it is open");
+        assert!(life.settle(true, false), "nobody uses it");
+    }
+
+    /// Closing destroys the flyout once, and a flyout not held only: the
+    /// focus it loses as it goes closes nothing more.
+    #[test]
+    fn closing_destroys_once() {
+        let mut life = FlyoutLife::default();
+        life.wait();
+        assert_eq!(life.close(), FlyoutStep::Destroy);
+        assert!(!life.waiting() && life.closing());
+        assert_eq!(life.close(), FlyoutStep::Nothing);
+        life.closed();
+        assert_eq!(life.close(), FlyoutStep::Destroy);
+    }
 
     /// A click builds the flyout when there is none, closes an open one,
     /// shows one whose page is ready, leaves one being built alone, and

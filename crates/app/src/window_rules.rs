@@ -250,11 +250,25 @@ fn the_flyout_lives_only_while_it_is_used() {
     assert!(body(windows, "hide_flyout").unwrap().contains("window.destroy()"), "closing the flyout keeps it");
     assert!(body(windows, "toggle_flyout").unwrap().contains("create_flyout(app)"), "a click does not build it");
     assert!(source(&files, "commands.rs").contains("windows::page_ready"), "its page does not show it");
+    // Cleaning up is decided where the clicks are handled, and a click finds
+    // a window that is going (the review's second finding on c0c2b7f).
+    assert!(body(windows, "settle_flyout").unwrap().contains("run_on_main_thread"), "settled off the event loop");
+    assert!(body(windows, "toggle_flyout").unwrap().contains("build_when_gone"), "a click on a going flyout is lost");
+    let hold_end = &windows[windows.find("impl Drop for FlyoutHold").unwrap()..];
+    assert!(
+        hold_end[..hold_end.find("\n}\n").unwrap()].contains("settle_flyout"),
+        "a Store look's end skips the settling"
+    );
+    assert!(body(windows, "failed_to_open").unwrap().contains("settle_flyout"), "a failed page leaves its window");
+    assert!(
+        body(windows, "page_ready").unwrap().contains("settle_flyout"),
+        "a page nobody waits for leaves its window"
+    );
     let on_event = body(windows, "on_event").unwrap();
     assert!(on_event.contains("hide_flyout") && !on_event.contains("window.hide()"), "losing the focus keeps it");
     let focus = &on_event[on_event.find("Focused(false)").unwrap()..];
     assert!(
-        focus.find(".opening").unwrap() < focus.find("hide_flyout").unwrap(),
+        focus.find(".waiting()").unwrap() < focus.find("hide_flyout").unwrap(),
         "a flyout still being built closes when WebView2 takes the focus from it"
     );
 }
