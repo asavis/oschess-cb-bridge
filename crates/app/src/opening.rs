@@ -32,95 +32,101 @@ impl Stage {
     }
 }
 
-/// What a click on the tray mark does with the flyout, which exists only
-/// while someone uses it (#365).
+/// What a click on the tray mark does with the flyout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlyoutClick {
-    /// There is none: build it, and show it when its page is ready.
-    Build,
-    /// It is open: close it.
-    Close,
-    /// Hidden with its page ready: show it.
-    Show,
-    /// It is being built: it shows when its page is ready.
+    /// There is none: build the one with this number.
+    Build(u64),
+    /// This one is open: close it.
+    Close(u64),
+    /// One is being built: it shows when its page is ready.
     Wait,
-    /// Its page never got ready: build it again.
-    Rebuild,
 }
 
-/// Who wants the flyout, which lives only while someone does (#365): a click
-/// waiting for its page, or its being open. Every decision that destroys it
-/// is taken on the event loop's thread, where the clicks and the pages are
-/// handled too.
+/// Which flyout is wanted, which is the only one that may live (#365). Each
+/// window of the flyout has a number of its own, in its label, and every
+/// event says which one it is about: an event about any but the wanted one
+/// changes nothing here and only sees that window go. So a late build, a page
+/// ready as its window is destroyed or the failure of an opening a later click
+/// replaced cannot touch the flyout someone is waiting for.
 #[derive(Debug, Default)]
 pub struct FlyoutLife {
-    /// A click waits for its page, to show it.
-    waiting: bool,
-    /// Its window is being destroyed.
-    closing: bool,
-    /// Which opening a click last started, so that the failure of an older
-    /// one cancels nothing.
-    opening: u64,
+    /// The numbers given so far.
+    made: u64,
+    /// The flyout someone wants: being built, or open.
+    wanted: Option<u64>,
+    /// Whether the wanted one has been shown.
+    shown: bool,
 }
 
 impl FlyoutLife {
-    /// A click waits for the page.
-    pub fn wait(&mut self) {
-        self.waiting = true;
+    pub fn shown(&self) -> bool {
+        self.shown
     }
 
-    /// A click waits for the page of a build it starts; the build's number.
-    pub fn begin(&mut self) -> u64 {
-        self.waiting = true;
-        self.opening += 1;
-        self.opening
+    /// The flyout someone wants, if any.
+    pub fn current(&self) -> Option<u64> {
+        self.wanted
     }
 
-    /// The number of the opening a click last started.
-    pub fn opening(&self) -> u64 {
-        self.opening
+    /// A click on the tray mark.
+    pub fn click(&mut self) -> FlyoutClick {
+        match self.wanted {
+            Some(flyout) if self.shown => {
+                self.wanted = None;
+                self.shown = false;
+                FlyoutClick::Close(flyout)
+            }
+            Some(_) => FlyoutClick::Wait,
+            None => {
+                self.made += 1;
+                self.wanted = Some(self.made);
+                FlyoutClick::Build(self.made)
+            }
+        }
     }
 
-    /// The opening numbered `opening` failed: when it is still the latest, the
-    /// click no longer waits, and whether one did is returned. An older one's
-    /// failure cancels nothing: the click waits for the build that replaced
-    /// it (the review's finding on 4c6df21).
-    pub fn fail(&mut self, opening: u64) -> bool {
-        self.opening == opening && std::mem::take(&mut self.waiting)
+    /// `flyout`'s page has drawn: whether to show it. Otherwise it goes.
+    pub fn ready(&mut self, flyout: u64) -> bool {
+        let wanted = self.wanted == Some(flyout);
+        self.shown |= wanted;
+        wanted
     }
 
-    pub fn waiting(&self) -> bool {
-        self.waiting
+    /// Whether `flyout`, whose window has just been built, is no longer
+    /// wanted, and goes.
+    pub fn unwanted(&self, flyout: u64) -> bool {
+        self.wanted != Some(flyout)
     }
 
-    /// The click no longer waits; whether one did.
-    pub fn give_up(&mut self) -> bool {
-        std::mem::take(&mut self.waiting)
+    /// `flyout` failed to open. `None` when it is showing after all, and
+    /// stays; otherwise it goes, and whether a click was waiting for it.
+    pub fn failed(&mut self, flyout: u64) -> Option<bool> {
+        if self.wanted != Some(flyout) {
+            return Some(false);
+        }
+        if self.shown {
+            return None;
+        }
+        self.wanted = None;
+        Some(true)
     }
 
-    pub fn closing(&self) -> bool {
-        self.closing
+    /// `flyout` lost the focus: whether it closes. WebView2 takes the focus
+    /// and gives it back while it is built, so only a shown one does.
+    pub fn focus_lost(&mut self, flyout: u64) -> bool {
+        let closes = self.shown && self.wanted == Some(flyout);
+        if closes {
+            self.wanted = None;
+            self.shown = false;
+        }
+        closes
     }
 
-    /// The flyout that exists is to close; whether to destroy it now, which
-    /// happens once.
-    pub fn close(&mut self) -> bool {
-        self.waiting = false;
-        !std::mem::replace(&mut self.closing, true)
-    }
-
-    /// Its window is gone, or could not be destroyed.
-    pub fn closed(&mut self) {
-        self.closing = false;
-    }
-
-    /// Whether a flyout that `exists`, `visible` or not, has nobody left: a
-    /// page that failed, or a build a click gave up on. It is then being
-    /// destroyed.
-    pub fn settle(&mut self, exists: bool, visible: bool) -> bool {
-        let unwanted = exists && !visible && !self.waiting && !self.closing;
-        self.closing |= unwanted;
-        unwanted
+    /// Nobody wants the flyout any more: the one to destroy, if any.
+    pub fn abandon(&mut self) -> Option<u64> {
+        self.shown = false;
+        self.wanted.take()
     }
 }
 
@@ -199,22 +205,6 @@ impl Openings {
         self.lock().get(label).filter(|o| o.attempt == attempt && o.stage != Stage::Ready).map(|o| o.stage)
     }
 
-    /// What a click at `now` does with `label`'s flyout, which `exists` or
-    /// not, and is `visible` or not.
-    pub fn flyout_click(&self, label: &str, exists: bool, visible: bool, now: Instant) -> FlyoutClick {
-        if !exists {
-            return FlyoutClick::Build;
-        }
-        if visible {
-            return FlyoutClick::Close;
-        }
-        match self.lock().get(label) {
-            Some(o) if o.stage != Stage::Ready && now.saturating_duration_since(o.since) < LIMIT => FlyoutClick::Wait,
-            Some(o) if o.stage != Stage::Ready => FlyoutClick::Rebuild,
-            _ => FlyoutClick::Show,
-        }
-    }
-
     /// Whether `label`'s existing window can be brought forward at `now`: its
     /// page is ready, or it is still within [`LIMIT`] of its request. A window
     /// with no opening on record, built before this was kept, can be.
@@ -248,93 +238,83 @@ pub fn on_a_screen(window: Rect, screens: &[Rect]) -> bool {
 mod tests {
     use super::*;
 
-    /// A page that never got ready leaves no window behind, once the click
-    /// that waited for it was told; the focus WebView2 takes while it builds
-    /// closes nothing (the review's first finding on c0c2b7f).
+    /// A click builds a flyout, its page shows it, and a click closes it;
+    /// a click while it is being built builds nothing more.
+    #[test]
+    fn a_click_opens_and_closes_the_flyout() {
+        let mut life = FlyoutLife::default();
+        assert_eq!(life.click(), FlyoutClick::Build(1));
+        assert_eq!(life.click(), FlyoutClick::Wait, "a second click joins the build");
+        assert_eq!(life.current(), Some(1));
+        assert!(life.ready(1));
+        assert!(life.shown());
+        assert_eq!(life.click(), FlyoutClick::Close(1));
+        assert_eq!(life.current(), None);
+        assert_eq!(life.click(), FlyoutClick::Build(2), "each window has its own number");
+    }
+
+    /// WebView2 takes the focus and gives it back while it is built: only a
+    /// flyout that was shown closes when it loses the focus.
+    #[test]
+    fn only_a_shown_flyout_closes_on_losing_the_focus() {
+        let mut life = FlyoutLife::default();
+        assert_eq!(life.click(), FlyoutClick::Build(1));
+        assert!(!life.focus_lost(1), "being built");
+        assert_eq!(life.current(), Some(1));
+        assert!(life.ready(1));
+        assert!(life.focus_lost(1));
+        assert_eq!(life.current(), None);
+        assert!(!life.focus_lost(1), "once");
+    }
+
+    /// A page that never got ready: the click is told and its window goes.
+    /// Its build may end later still, and its page come: that window goes.
     #[test]
     fn a_flyout_whose_page_fails_goes() {
         let mut life = FlyoutLife::default();
-        life.wait();
-        assert!(life.waiting(), "the focus lost while it is built is ignored");
-        assert!(!life.settle(true, false), "a click still waits");
-        assert!(life.give_up(), "the click is told");
-        assert!(life.settle(true, false), "and the window goes");
-        assert!(life.closing());
-        assert!(!life.settle(true, false), "once");
-        life.closed();
-        assert!(!life.settle(false, false), "none is left");
+        assert_eq!(life.click(), FlyoutClick::Build(1));
+        assert_eq!(life.failed(1), Some(true));
+        assert!(life.unwanted(1), "a build that ends after the deadline");
+        assert!(!life.ready(1), "a page that comes after the deadline");
+        assert_eq!(life.click(), FlyoutClick::Build(2), "the next click starts afresh");
     }
 
-    /// A build that a click gave up on goes when its page comes, and also
-    /// when its window only exists after the click gave up: its page may
-    /// never come (the review's first finding on 07a4086).
+    /// A flyout nobody wants any more goes when it is built, however late.
     #[test]
-    fn a_flyout_nobody_waits_for_goes() {
+    fn an_abandoned_build_goes() {
         let mut life = FlyoutLife::default();
-        life.wait();
-        assert!(life.give_up());
-        assert!(life.settle(true, false));
-        let mut late = FlyoutLife::default();
-        late.wait();
-        assert!(late.give_up());
-        assert!(!late.settle(false, false), "nothing to destroy yet");
-        assert!(late.settle(true, false), "the build ended after the deadline");
+        assert_eq!(life.click(), FlyoutClick::Build(1));
+        assert_eq!(life.abandon(), Some(1));
+        assert_eq!(life.abandon(), None);
+        assert!(life.unwanted(1));
     }
 
-    /// The failure of an opening a click has replaced cancels nothing: the
-    /// click waits for its new build.
+    /// The failure of an opening a later click replaced cancels nothing; nor
+    /// does the page of a window that is being destroyed answer for the one
+    /// that replaced it.
     #[test]
-    fn an_old_failure_cancels_no_newer_opening() {
+    fn an_old_flyout_touches_no_newer_one() {
         let mut life = FlyoutLife::default();
-        let first = life.begin();
-        let second = life.begin();
-        assert!(!life.fail(first), "an older opening's failure");
-        assert!(life.waiting(), "the click still waits");
-        assert!(!life.settle(true, false), "and its window stays");
-        assert!(life.fail(second), "the latest one's failure tells the click");
-        assert!(life.settle(true, false), "and its window goes");
+        assert_eq!(life.click(), FlyoutClick::Build(1));
+        assert_eq!(life.failed(1), Some(true));
+        assert_eq!(life.click(), FlyoutClick::Build(2));
+        assert_eq!(life.failed(1), Some(false), "it goes; nobody is told");
+        assert!(!life.ready(1), "the old page");
+        assert!(!life.shown());
+        assert_eq!(life.current(), Some(2), "the new one is still waited for");
+        assert!(!life.unwanted(2));
+        assert!(life.ready(2));
+        assert_eq!(life.click(), FlyoutClick::Close(2));
     }
 
-    /// Closing destroys the flyout once: the focus it loses as it goes
-    /// closes nothing more.
+    /// A failure reported as the page came leaves the flyout that is showing.
     #[test]
-    fn closing_destroys_once() {
+    fn a_failure_leaves_a_flyout_that_is_showing() {
         let mut life = FlyoutLife::default();
-        life.wait();
-        assert!(life.close());
-        assert!(!life.waiting() && life.closing());
-        assert!(!life.close());
-        life.closed();
-        assert!(life.close());
-    }
-
-    /// A flyout that is open stays, and one with a click waiting for it.
-    #[test]
-    fn a_flyout_someone_uses_stays() {
-        let mut life = FlyoutLife::default();
-        assert!(!life.settle(true, true), "it is open");
-        life.wait();
-        assert!(!life.settle(true, false), "a click waits for it");
-    }
-
-    /// A click builds the flyout when there is none, closes an open one,
-    /// shows one whose page is ready, leaves one being built alone, and
-    /// builds again one whose page never got ready (#365).
-    #[test]
-    fn a_click_does_what_the_flyout_needs() {
-        let label = "flyout";
-        let start = Instant::now();
-        let openings = Openings::default();
-        assert_eq!(openings.flyout_click(label, false, false, start), FlyoutClick::Build);
-        let attempt = openings.request(label, start).unwrap();
-        openings.built(label, attempt);
-        assert_eq!(openings.flyout_click(label, true, false, start + LIMIT / 2), FlyoutClick::Wait);
-        assert_eq!(openings.flyout_click(label, true, false, start + LIMIT), FlyoutClick::Rebuild);
-        openings.ready(label);
-        assert_eq!(openings.flyout_click(label, true, false, start + LIMIT), FlyoutClick::Show);
-        assert_eq!(openings.flyout_click(label, true, true, start + LIMIT), FlyoutClick::Close);
-        openings.closed(label);
-        assert_eq!(openings.flyout_click(label, false, false, start + LIMIT), FlyoutClick::Build);
+        assert_eq!(life.click(), FlyoutClick::Build(1));
+        assert!(life.ready(1));
+        assert_eq!(life.failed(1), None);
+        assert_eq!(life.current(), Some(1));
     }
 
     #[test]
