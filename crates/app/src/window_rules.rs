@@ -220,9 +220,8 @@ fn capabilities() -> Vec<(String, Vec<String>)> {
     found
 }
 
-/// Only a window a user opens asks for a look at the databases: a flyout
-/// built hidden for a Store look must not make the bridge open every database
-/// (#365).
+/// Only a window a user opens asks for a look at the databases: a window
+/// built hidden must not make the bridge open every database (#365).
 #[test]
 fn only_the_windows_a_user_opens_ask_for_a_look() {
     let files = sources();
@@ -240,12 +239,12 @@ fn only_the_windows_a_user_opens_ask_for_a_look() {
 }
 
 /// No WebView2 lives while no window is open (#365): nothing builds the
-/// flyout at the start, and closing it destroys it unless a Store look holds
-/// it for now.
+/// flyout at the start or for a Store look, and closing it destroys it.
 #[test]
 fn the_flyout_lives_only_while_it_is_used() {
     let files = sources();
     assert!(!source(&files, "mod.rs").contains("create_flyout"), "the start builds the flyout");
+    assert!(!source(&files, "store_updates.rs").contains("FLYOUT"), "a Store look takes the flyout again");
     let windows = source(&files, "windows.rs");
     assert!(body(windows, "hide_flyout").unwrap().contains("window.destroy()"), "closing the flyout keeps it");
     assert!(body(windows, "toggle_flyout").unwrap().contains("create_flyout(app)"), "a click does not build it");
@@ -254,11 +253,6 @@ fn the_flyout_lives_only_while_it_is_used() {
     // a window that is going (the review's second finding on c0c2b7f).
     assert!(body(windows, "settle_flyout").unwrap().contains("run_on_main_thread"), "settled off the event loop");
     assert!(body(windows, "toggle_flyout").unwrap().contains("build_when_gone"), "a click on a going flyout is lost");
-    let hold_end = &windows[windows.find("impl Drop for FlyoutHold").unwrap()..];
-    assert!(
-        hold_end[..hold_end.find("\n}\n").unwrap()].contains("settle_flyout"),
-        "a Store look's end skips the settling"
-    );
     assert!(body(windows, "failed_to_open").unwrap().contains("settle_flyout"), "a failed page leaves its window");
     assert!(
         body(windows, "page_ready").unwrap().contains("settle_flyout"),
@@ -268,7 +262,6 @@ fn the_flyout_lives_only_while_it_is_used() {
         body(windows, "spawn_window").unwrap().contains("settle_flyout"),
         "a build nobody waits for leaves its window"
     );
-    assert!(body(windows, "hold_flyout").unwrap().contains(".owner("), "a Store look may take a flyout that is going");
     let on_event = body(windows, "on_event").unwrap();
     assert!(on_event.contains("hide_flyout") && !on_event.contains("window.hide()"), "losing the focus keeps it");
     let focus = &on_event[on_event.find("Focused(false)").unwrap()..];

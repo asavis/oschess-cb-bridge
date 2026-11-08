@@ -22,7 +22,7 @@ use tauri::{
 
 use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
-use crate::opening::{self, FlyoutClick, FlyoutOwner, FlyoutStep, LIMIT, Stage};
+use crate::opening::{self, FlyoutClick, LIMIT, Stage};
 use crate::reports::{Kind, Report};
 use crate::status::Asked;
 
@@ -134,8 +134,8 @@ fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
 
 /// Reports that `label`'s window did not open (#333), its log `line` the
 /// report's message, and tells the user in a native message how far it got,
-/// with the report's code, copied. A flyout no click waits for, as one built
-/// for a Store look, is reported and not shown: nobody has asked for it.
+/// with the report's code, copied. A flyout no click waits for any more is
+/// reported and not shown: nobody is waiting for it.
 fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str) {
     let code = reporting::file(Report {
         kind: Kind::Window,
@@ -230,8 +230,6 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
     }
     match (click, window) {
         (FlyoutClick::Show, Some(window)) => show_flyout(app, &window),
-        // A Store look owns it for now: its page is not needed for that.
-        (FlyoutClick::Rebuild, Some(_)) if shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.held() => {}
         (FlyoutClick::Rebuild, Some(window)) => match window.destroy() {
             Ok(()) => build_when_gone(app, flyout_spec(app)),
             Err(e) => bridge::fault!("the flyout cannot be destroyed: {e}"),
@@ -290,44 +288,6 @@ fn settle_flyout(app: &AppHandle) {
     }
 }
 
-/// The flyout, built hidden if there is none, for as long as the guard lives:
-/// a Store look needs a window to own what it shows (#365). `None` when no
-/// window came within [`LIMIT`]. Call it off the event loop's thread: it
-/// waits for the window.
-pub fn hold_flyout(app: &AppHandle) -> (FlyoutHold, Option<WebviewWindow>) {
-    let shared = shared(app);
-    shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.hold();
-    let hold = FlyoutHold(app.clone());
-    let (start, mut asked) = (Instant::now(), false);
-    loop {
-        let window = app.get_webview_window(FLYOUT);
-        let owner = shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.owner(window.is_some());
-        match (owner, window) {
-            (FlyoutOwner::Use, Some(window)) => return (hold, Some(window)),
-            (FlyoutOwner::Build, _) if !asked => {
-                create_flyout(app);
-                asked = true;
-            }
-            _ => {}
-        }
-        if start.elapsed() > LIMIT {
-            return (hold, None);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Keeps the flyout while it lives; a flyout nobody opened meanwhile goes
-/// with it.
-pub struct FlyoutHold(AppHandle);
-
-impl Drop for FlyoutHold {
-    fn drop(&mut self) {
-        shared(&self.0).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.release();
-        settle_flyout(&self.0);
-    }
-}
-
 /// Sizes the flyout to its page, keeping it by the tray mark.
 pub fn fit_flyout(app: &AppHandle, height: f64) {
     let Some(window) = app.get_webview_window(FLYOUT) else { return };
@@ -340,26 +300,17 @@ pub fn fit_flyout(app: &AppHandle, height: f64) {
 }
 
 /// Closes the flyout: its window goes, and its WebView2 processes with it
-/// (#365), unless a Store look holds it for now.
+/// (#365).
 pub fn hide_flyout(app: &AppHandle) {
     let shared = shared(app);
-    let window = app.get_webview_window(FLYOUT);
-    let step = {
-        let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
-        if window.is_some() {
-            flyout.life.close()
-        } else {
-            flyout.life.give_up();
-            FlyoutStep::Nothing
-        }
+    let Some(window) = app.get_webview_window(FLYOUT) else {
+        shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.give_up();
+        return;
     };
-    let Some(window) = window else { return };
-    let closed = match step {
-        FlyoutStep::Nothing => return,
-        FlyoutStep::Hide => window.hide(),
-        FlyoutStep::Destroy => window.destroy(),
-    };
-    if let Err(e) = closed {
+    if !shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.close() {
+        return;
+    }
+    if let Err(e) = window.destroy() {
         shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.closed();
         bridge::fault!("the flyout cannot be closed: {e}");
     }

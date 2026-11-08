@@ -13,12 +13,13 @@
 //! no version, and the start after an install says it was updated when it
 //! runs another version than the install started from.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use windows::Services::Store::{StoreContext, StorePackageUpdateState};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Recovery::{REGISTER_APPLICATION_RESTART_FLAGS, RegisterApplicationRestart};
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::core::{AgileReference, Interface, PCWSTR};
@@ -26,7 +27,6 @@ use windows::core::{AgileReference, Interface, PCWSTR};
 use super::server::Shared;
 use super::shared;
 use super::updater::report;
-use super::windows::hold_flyout;
 use crate::channel::STORE_PAGE;
 use crate::updates::{self, Phase, StoreCalls, StoreOutcome, StoreStep};
 
@@ -70,6 +70,62 @@ fn wait_ready(app: &AppHandle, shared: &Shared) {
     }
 }
 
+/// A hidden window that owns what a Store look shows, made and destroyed on
+/// the event loop's thread, which pumps its messages.
+struct OwnerWindow(usize, AppHandle);
+
+impl OwnerWindow {
+    fn new(app: &AppHandle) -> Result<OwnerWindow, String> {
+        let (made, got) = mpsc::channel();
+        app.run_on_main_thread(move || {
+            let _ = made.send(hidden_window());
+        })
+        .map_err(|e| e.to_string())?;
+        let hwnd = got.recv_timeout(crate::opening::LIMIT).map_err(|e| e.to_string())??;
+        Ok(OwnerWindow(hwnd, app.clone()))
+    }
+}
+
+impl Drop for OwnerWindow {
+    fn drop(&mut self) {
+        let hwnd = self.0;
+        let destroyed = self.1.run_on_main_thread(move || destroy_window(hwnd));
+        if let Err(e) = destroyed {
+            bridge::fault!("the Store's owner window is left: {e}");
+        }
+    }
+}
+
+/// A hidden top-level window of the system's own `STATIC` class, as a number
+/// so that it can cross threads.
+fn hidden_window() -> Result<usize, String> {
+    let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    // SAFETY: a window of a system class, no parent, no menu and no parameter;
+    // the strings outlive the call.
+    let hwnd = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+            windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+            class.as_ptr(),
+            class.as_ptr(),
+            windows_sys::Win32::UI::WindowsAndMessaging::WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if hwnd.is_null() { Err("the Store's owner window could not be made".to_string()) } else { Ok(hwnd as usize) }
+}
+
+fn destroy_window(hwnd: usize) {
+    // SAFETY: a window this module made on this thread, destroyed once.
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd as _) };
+}
+
 /// Looks for an update through the Store and acts on it; `asked`: the user
 /// asked. An install closes the bridge, so this returns only when there was
 /// nothing to install, the user declined one of Windows' dialogs, the Store
@@ -77,13 +133,11 @@ fn wait_ready(app: &AppHandle, shared: &Shared) {
 pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
     let context = StoreContext::GetDefault().map_err(text)?;
     // A desktop app's Store context needs a window to own anything it shows,
-    // Windows' update dialog included: the flyout, built hidden for as long
-    // as this look runs (#365).
-    let (_held, owner) = hold_flyout(app);
-    if let Some(window) = owner {
-        let hwnd = window.hwnd().map_err(|e| e.to_string())?;
-        unsafe { context.cast::<IInitializeWithWindow>().map_err(text)?.Initialize(hwnd).map_err(text)? };
-    }
+    // Windows' update dialog included: a hidden one of its own for as long as
+    // this look runs, which needs no WebView2 and no flyout (#365).
+    let owner = OwnerWindow::new(app)?;
+    let hwnd = HWND(owner.0 as *mut std::ffi::c_void);
+    unsafe { context.cast::<IInitializeWithWindow>().map_err(text)?.Initialize(hwnd).map_err(text)? };
     let found = context.GetAppAndOptionalStorePackageUpdatesAsync().and_then(|op| op.get()).map_err(text)?;
     let count = found.Size().map_err(text)?;
     let mandatory = (0..count).any(|i| found.GetAt(i).and_then(|u| u.Mandatory()).unwrap_or(false));
@@ -196,5 +250,26 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
             })
             .map(StoreOutcome::phase)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Store look's owner window can be made and destroyed on one thread,
+    /// hidden: what it owns is all it is for (#365).
+    #[test]
+    fn a_hidden_owner_window_is_made_and_destroyed() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, IsWindowVisible};
+        let hwnd = hidden_window().unwrap();
+        // SAFETY: only asks about the window just made.
+        unsafe {
+            assert_ne!(IsWindow(hwnd as _), 0);
+            assert_eq!(IsWindowVisible(hwnd as _), 0, "it stays hidden");
+        }
+        destroy_window(hwnd);
+        // SAFETY: only asks whether the handle is still a window.
+        assert_eq!(unsafe { IsWindow(hwnd as _) }, 0);
     }
 }

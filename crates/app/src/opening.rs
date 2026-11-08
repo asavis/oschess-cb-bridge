@@ -40,7 +40,7 @@ pub enum FlyoutClick {
     Build,
     /// It is open: close it.
     Close,
-    /// Hidden with its page ready, as while the Store holds it: show it.
+    /// Hidden with its page ready: show it.
     Show,
     /// It is being built: it shows when its page is ready.
     Wait,
@@ -48,37 +48,16 @@ pub enum FlyoutClick {
     Rebuild,
 }
 
-/// What to do with the flyout's window now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FlyoutStep {
-    Nothing,
-    Hide,
-    Destroy,
-}
-
-/// What a Store look does for the window that is to own what it shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FlyoutOwner {
-    /// The flyout is there and stays.
-    Use,
-    /// It is going: wait until it is gone.
-    Wait,
-    /// There is none: build one.
-    Build,
-}
-
 /// Who wants the flyout, which lives only while someone does (#365): a click
-/// waiting for its page, a Store look holding it as the owner of what it
-/// shows, or its being open. Every decision that destroys it is taken on the
-/// event loop's thread, where the clicks and the pages are handled too.
+/// waiting for its page, or its being open. Every decision that destroys it
+/// is taken on the event loop's thread, where the clicks and the pages are
+/// handled too.
 #[derive(Debug, Default)]
 pub struct FlyoutLife {
     /// A click waits for its page, to show it.
     waiting: bool,
     /// Its window is being destroyed.
     closing: bool,
-    /// A Store look holds it.
-    held: bool,
 }
 
 impl FlyoutLife {
@@ -100,40 +79,11 @@ impl FlyoutLife {
         self.closing
     }
 
-    pub fn hold(&mut self) {
-        self.held = true;
-    }
-
-    pub fn release(&mut self) {
-        self.held = false;
-    }
-
-    pub fn held(&self) -> bool {
-        self.held
-    }
-
-    /// What a Store look does with a flyout that `exists` or not: one whose
-    /// destruction is already queued cannot own anything.
-    pub fn owner(&self, exists: bool) -> FlyoutOwner {
-        match (exists, self.closing) {
-            (true, false) => FlyoutOwner::Use,
-            (true, true) => FlyoutOwner::Wait,
-            (false, _) => FlyoutOwner::Build,
-        }
-    }
-
-    /// The flyout that exists is to close: it hides while a Store look holds
-    /// it, and otherwise goes, once.
-    pub fn close(&mut self) -> FlyoutStep {
+    /// The flyout that exists is to close; whether to destroy it now, which
+    /// happens once.
+    pub fn close(&mut self) -> bool {
         self.waiting = false;
-        if self.held {
-            FlyoutStep::Hide
-        } else if self.closing {
-            FlyoutStep::Nothing
-        } else {
-            self.closing = true;
-            FlyoutStep::Destroy
-        }
+        !std::mem::replace(&mut self.closing, true)
     }
 
     /// Its window is gone, or could not be destroyed.
@@ -142,10 +92,10 @@ impl FlyoutLife {
     }
 
     /// Whether a flyout that `exists`, `visible` or not, has nobody left: a
-    /// page that failed, a build a click gave up on, a Store look that ended.
-    /// It is then being destroyed.
+    /// page that failed, or a build a click gave up on. It is then being
+    /// destroyed.
     pub fn settle(&mut self, exists: bool, visible: bool) -> bool {
-        let unwanted = exists && !visible && !self.waiting && !self.held && !self.closing;
+        let unwanted = exists && !visible && !self.waiting && !self.closing;
         self.closing |= unwanted;
         unwanted
     }
@@ -308,49 +258,26 @@ mod tests {
         assert!(late.settle(true, false), "the build ended after the deadline");
     }
 
-    /// A Store look never takes a flyout whose destruction is already queued
-    /// (the review's second finding on 07a4086): it waits, then builds one.
-    #[test]
-    fn a_store_look_takes_no_flyout_that_is_going() {
-        let mut life = FlyoutLife::default();
-        assert_eq!(life.owner(false), FlyoutOwner::Build);
-        assert_eq!(life.owner(true), FlyoutOwner::Use);
-        assert_eq!(life.close(), FlyoutStep::Destroy);
-        life.hold();
-        assert_eq!(life.owner(true), FlyoutOwner::Wait, "its destruction is queued");
-        life.closed();
-        assert_eq!(life.owner(false), FlyoutOwner::Build, "gone");
-        assert_eq!(life.owner(true), FlyoutOwner::Use, "built again");
-        assert_eq!(life.close(), FlyoutStep::Hide, "and held");
-    }
-
-    /// The end of a Store look leaves a flyout the user opened meanwhile, and
-    /// takes one nobody uses (the review's second finding on c0c2b7f): the
-    /// decision is made where the clicks are handled, so it sees them.
-    #[test]
-    fn the_end_of_a_store_look_leaves_what_the_user_opened() {
-        let mut life = FlyoutLife::default();
-        life.hold();
-        assert_eq!(life.close(), FlyoutStep::Hide, "held, it only hides");
-        life.wait();
-        life.release();
-        assert!(!life.settle(true, false), "a click waits for it");
-        assert!(life.give_up());
-        assert!(!life.settle(true, true), "it is open");
-        assert!(life.settle(true, false), "nobody uses it");
-    }
-
-    /// Closing destroys the flyout once, and a flyout not held only: the
-    /// focus it loses as it goes closes nothing more.
+    /// Closing destroys the flyout once: the focus it loses as it goes
+    /// closes nothing more.
     #[test]
     fn closing_destroys_once() {
         let mut life = FlyoutLife::default();
         life.wait();
-        assert_eq!(life.close(), FlyoutStep::Destroy);
+        assert!(life.close());
         assert!(!life.waiting() && life.closing());
-        assert_eq!(life.close(), FlyoutStep::Nothing);
+        assert!(!life.close());
         life.closed();
-        assert_eq!(life.close(), FlyoutStep::Destroy);
+        assert!(life.close());
+    }
+
+    /// A flyout that is open stays, and one with a click waiting for it.
+    #[test]
+    fn a_flyout_someone_uses_stays() {
+        let mut life = FlyoutLife::default();
+        assert!(!life.settle(true, true), "it is open");
+        life.wait();
+        assert!(!life.settle(true, false), "a click waits for it");
     }
 
     /// A click builds the flyout when there is none, closes an open one,
