@@ -220,6 +220,25 @@ fn capabilities() -> Vec<(String, Vec<String>)> {
     found
 }
 
+/// Only a window a user opens asks for a look at the databases: the flyout,
+/// built hidden at the start, must not make the bridge open every database
+/// at a sign-in (#365).
+#[test]
+fn only_the_windows_a_user_opens_ask_for_a_look() {
+    let files = sources();
+    let windows = source(&files, "windows.rs");
+    for opens in ["open_settings", "open_first_run", "toggle_flyout"] {
+        let body = body(windows, opens).unwrap_or_else(|| panic!("no fn {opens}"));
+        assert!(body.contains("ask(Asked::Window)"), "{opens} does not ask for a look");
+    }
+    for builds in ["spawn_window", "build_window", "create_flyout"] {
+        let body = body(windows, builds).unwrap_or_else(|| panic!("no fn {builds}"));
+        assert!(!body.contains(".ask("), "{builds} asks for a look, also for a window built hidden");
+    }
+    let start = source(&files, "mod.rs");
+    assert!(!start.contains(".ask("), "the start asks for a look");
+}
+
 #[test]
 fn windows_are_built_in_one_place() {
     let files = sources();

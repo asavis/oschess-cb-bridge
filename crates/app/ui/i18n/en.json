@@ -14,6 +14,7 @@
   "tray.missing.few": "oschess bridge — {n} databases not found",
   "tray.missing.many": "oschess bridge — {n} databases not found",
   "tray.none": "oschess bridge — no databases yet",
+  "tray.running": "oschess bridge — running",
   "tray.noneReady": "oschess bridge — no database ready",
   "tray.downloading": "oschess bridge — a database is downloading",
   "tray.downloadingPercent": "oschess bridge — downloading a database: {percent} %",

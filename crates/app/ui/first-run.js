@@ -174,7 +174,7 @@ function renderStepText() {
 // The footer's note and which buttons work.
 function footer() {
   let note = '';
-  if (step === 'databases' && view && !view.databases.length && settings && !settings.extras.length) {
+  if (step === 'databases' && view && view.known && !view.databases.length && settings && !settings.extras.length) {
     note = t('wizard.databases.later');
   } else if (step === 'engine' && enginesRead) {
     note = t('wizard.engine.looking');
@@ -221,7 +221,7 @@ function showView(next) {
   if (more > 0) rows.push(el('div', 'row more', plural('wizard.databases.more', more)));
   if (view.problem) rows.unshift(problemRow(view.problem));
   document.getElementById('served').replaceChildren(...rows);
-  const none = !view.databases.length && !view.problem;
+  const none = view.known && !view.databases.length && !view.problem;
   document.getElementById('db-found').hidden = none;
   document.getElementById('db-none').hidden = !none;
   document.getElementById('db-lead').textContent = t(none ? 'wizard.databases.leadNone' : 'wizard.databases.lead');

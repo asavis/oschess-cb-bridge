@@ -180,6 +180,9 @@ pub(crate) fn serve(args: &[String]) -> AnyResult<bool> {
         std::process::exit(0);
     });
     if background {
+        // Profiled without a browser: a keeper that waits for requests would
+        // build nothing (#365).
+        app.catalog.explorer.set_keeping_after_requests(None);
         bridge::explorer::keeper::start(&app);
     }
     let watched = Arc::clone(&app);

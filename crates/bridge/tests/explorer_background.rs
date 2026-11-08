@@ -551,6 +551,47 @@ fn a_database_unchanged_for_the_quiet_period_is_built_at_the_first_look() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A keeper looks at nothing while nobody uses the bridge, and builds
+/// nothing (#365): it begins once a request came, and stops some time after
+/// the last one.
+#[test]
+fn the_keeper_looks_only_for_a_while_after_a_request() {
+    let db = copies("background-asked", 10);
+    let path = db.dir().join("db.2cbh");
+    backdate(db.dir());
+    let (id, dir) = (id_of(&path), data_dir("asked"));
+    let computer = Arc::new(Computer::default());
+    let catalog = Catalog::new([path.clone()]);
+    catalog.explorer.set_machine(computer.clone());
+    let bridge = served(catalog, &dir);
+    let explorer = &bridge.app.catalog.explorer;
+    explorer.set_keeping(TICK, Duration::ZERO);
+    explorer.set_keeping_after_requests(Some(Duration::from_millis(500)));
+    bridge::explorer::keeper::start(&bridge.app);
+    // Forty ticks, each of which would have looked.
+    std::thread::sleep(TICK * 40);
+    assert_eq!(computer.looks(), 0, "no request came");
+    assert!(built_for(&dir, &id).is_none(), "built with no request");
+    // Asked again while it waits, as a machine under load may not wake the
+    // keeper within the half second a single request leaves it.
+    until("the keeper did not look after a request", WAIT_LIMIT, || {
+        assert_eq!(get(bridge.port, "/v1/status").0, 200);
+        computer.looks() > 0
+    });
+    until("the index was not built after a request", WAIT_LIMIT, || {
+        assert_eq!(get(bridge.port, "/v1/status").0, 200);
+        built_for(&dir, &id) == Some(generation(&path))
+    });
+    // Ten ticks with no look at all, some time after the last request.
+    until("the keeper did not stop looking", WAIT_LIMIT, || {
+        let looks = computer.looks();
+        std::thread::sleep(TICK * 10);
+        computer.looks() == looks && !bridge.app.asked_within(Duration::from_millis(500))
+    });
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A database replaced while the bridge watches it waits for the quiet
 /// period, even when the replacement's files keep older modification times,
 /// as a synced or restored copy's do; then it is built.

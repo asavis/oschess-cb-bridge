@@ -10,7 +10,7 @@ use super::autostart::{self, State};
 use super::{commands, reporting, shared, updater, windows};
 use crate::busy::BUSY;
 use crate::i18n::Strings;
-use crate::status::{Theme, View, icon_file, icon_size};
+use crate::status::{Asked, Theme, View, icon_file, icon_size};
 
 const TRAY: &str = "main";
 const AUTOSTART: &str = "autostart";
@@ -85,11 +85,13 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(on_menu)
         .on_tray_icon_event(|tray, event| {
             let _busy = BUSY.mark("a click on the tray mark");
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left, button_state: MouseButtonState::Up, rect, ..
-            } = event
-            {
-                windows::toggle_flyout(tray.app_handle(), rect);
+            match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left, button_state: MouseButtonState::Up, rect, ..
+                } => windows::toggle_flyout(tray.app_handle(), rect),
+                // The tooltip is about to show: it should say what is true now.
+                TrayIconEvent::Enter { .. } => super::shared(tray.app_handle()).ask(Asked::Hover),
+                _ => {}
             }
         });
     if let Some(image) = image(&icon_file(super::system::taskbar_theme(), view.tray(), 16)) {

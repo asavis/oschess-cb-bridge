@@ -2,7 +2,7 @@
 //! the status thread share.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge::config::{self, DEFAULT_PORT};
@@ -13,7 +13,7 @@ use bridge::start::{self, Cause, Options};
 use crate::diagnostics::PageErrors;
 use crate::i18n::Strings;
 use crate::opening::Openings;
-use crate::status::{Problem, View};
+use crate::status::{Asked, Problem, View};
 
 /// How long a start waits for its port: after a restart the process before
 /// may still hold it for a moment.
@@ -26,6 +26,10 @@ pub struct Shared {
     pub dir: Option<PathBuf>,
     running: Option<Running>,
     view: Mutex<View>,
+    /// What asked the status thread for a look at the databases, and what
+    /// wakes it to take one (#365).
+    asked: Mutex<Asked>,
+    wake: Condvar,
     pub flyout: Mutex<Flyout>,
     /// How far each window's latest opening got (#332).
     pub openings: Openings,
@@ -96,6 +100,8 @@ impl Shared {
             dir,
             running,
             view: Mutex::new(view),
+            asked: Mutex::default(),
+            wake: Condvar::new(),
             flyout: Mutex::default(),
             openings: Openings::default(),
             page_errors: PageErrors::default(),
@@ -107,6 +113,43 @@ impl Shared {
     /// looking at any database (#348); none when it does not serve.
     pub fn pulse(&self) -> Option<Pulse> {
         self.running.as_ref().map(|r| r.background.pulse())
+    }
+
+    /// Asks the status thread for a look at the databases, and wakes it.
+    pub fn ask(&self, asked: Asked) {
+        let mut waiting = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        *waiting = (*waiting).max(asked);
+        self.wake.notify_all();
+    }
+
+    /// Waits up to `limit` for a look to be asked for, and takes what asked.
+    pub fn wait_asked(&self, limit: Duration) -> Asked {
+        let waiting = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut waiting, _) = self
+            .wake
+            .wait_timeout_while(waiting, limit, |asked| *asked == Asked::Nothing)
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *waiting)
+    }
+
+    /// The view an update decides by: the last one seen, with `busy` read
+    /// from the bridge now, which looks at no database (#365).
+    pub fn view_for_update(&self) -> View {
+        let mut view = self.view();
+        if let Some(r) = &self.running {
+            view.busy = r.background.pulse().busy();
+        }
+        view
+    }
+
+    /// The names of the databases on the list, which a report must not
+    /// carry: read from the list, whether or not anyone looked at them yet
+    /// (#365).
+    pub fn database_names(&self) -> Vec<String> {
+        match &self.running {
+            Some(r) => r.background.names(),
+            None => self.view().databases.into_iter().map(|d| d.name).collect(),
+        }
     }
 
     /// The state now: the serving bridge's snapshot, or why it does not serve.
@@ -178,7 +221,9 @@ fn serve(dir: &std::path::Path) -> (Option<Running>, View, bool) {
     match Background::serve(bridge) {
         Ok(background) => {
             let running = Running { background, link, token };
-            let view = View::of(&running.background.snapshot());
+            // No database is touched at the start: the status thread looks
+            // when someone uses the bridge (#365).
+            let view = View::serving(env!("CARGO_PKG_VERSION"), port);
             (Some(running), view, first_run)
         }
         Err(e) => {

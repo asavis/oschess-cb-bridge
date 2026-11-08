@@ -47,8 +47,9 @@ function render(view) {
   document.getElementById('card-title').textContent = title;
   document.getElementById('card-body').textContent = body;
 
-  const none = view.databases.length === 0;
-  document.getElementById('count').textContent = none ? '' : number(view.databases.length);
+  // Not looked at yet (#365): nothing is known, which is not «none».
+  const none = view.known && view.databases.length === 0;
+  document.getElementById('count').textContent = !view.known || none ? '' : number(view.databases.length);
   document.getElementById('list').replaceChildren(...view.databases.map(row));
   document.getElementById('list-head').hidden = none && !!view.problem;
   document.getElementById('empty').hidden = !none || !!view.problem;

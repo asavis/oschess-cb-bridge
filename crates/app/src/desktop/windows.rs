@@ -24,6 +24,7 @@ use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
 use crate::opening::{self, LIMIT, Stage};
 use crate::reports::{Kind, Report};
+use crate::status::Asked;
 
 /// Translate native titles as well as the documents inside their webviews.
 pub fn translate(app: &AppHandle) {
@@ -201,6 +202,7 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
         flyout.anchor
     };
     place(&window, anchor);
+    shared.ask(Asked::Window);
     if let Err(e) = window.show().and_then(|()| window.set_focus()) {
         bridge::fault!("the flyout cannot be shown: {e}");
     }
@@ -258,6 +260,9 @@ pub fn open_settings(app: &AppHandle, section: &str) {
         title: shared(app).strings.get("window.settings").to_string(),
         configure: |b| b.inner_size(960.0, 680.0).min_inner_size(760.0, 520.0).center(),
     };
+    // Asked by the windows a user opens only: the flyout, built hidden at the
+    // start, must not make the bridge look at every database then (#365).
+    shared(app).ask(Asked::Window);
     let Some(window) = app.get_webview_window(SETTINGS) else {
         spawn_window(app, spec);
         return;
@@ -358,6 +363,7 @@ pub fn open_first_run(app: &AppHandle) {
         title: shared(app).strings.get("window.firstRun").to_string(),
         configure: |b| b.inner_size(760.0, 720.0).resizable(false).maximizable(false).minimizable(false).center(),
     };
+    shared(app).ask(Asked::Window);
     spawn_window(app, spec);
 }
 
