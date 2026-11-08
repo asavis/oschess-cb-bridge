@@ -76,7 +76,6 @@ struct Spec {
 /// Builds the window of `spec` on a worker thread, unless it exists already,
 /// and watches it get ready.
 fn spawn_window(app: &AppHandle, spec: Spec) {
-    shared(app).ask(Asked::Window);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if app.get_webview_window(spec.label).is_some() {
@@ -261,11 +260,13 @@ pub fn open_settings(app: &AppHandle, section: &str) {
         title: shared(app).strings.get("window.settings").to_string(),
         configure: |b| b.inner_size(960.0, 680.0).min_inner_size(760.0, 520.0).center(),
     };
+    // Asked by the windows a user opens only: the flyout, built hidden at the
+    // start, must not make the bridge look at every database then (#365).
+    shared(app).ask(Asked::Window);
     let Some(window) = app.get_webview_window(SETTINGS) else {
         spawn_window(app, spec);
         return;
     };
-    shared(app).ask(Asked::Window);
     let shown = if shared(app).openings.usable(SETTINGS, Instant::now()) {
         bring_forward(&window)
     } else {
@@ -362,6 +363,7 @@ pub fn open_first_run(app: &AppHandle) {
         title: shared(app).strings.get("window.firstRun").to_string(),
         configure: |b| b.inner_size(760.0, 720.0).resizable(false).maximizable(false).minimizable(false).center(),
     };
+    shared(app).ask(Asked::Window);
     spawn_window(app, spec);
 }
 
