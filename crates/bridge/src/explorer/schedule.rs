@@ -5,7 +5,8 @@
 //! again, behind it. A background build waits while the computer runs on
 //! battery. A background build's threads run at the priority of work nothing
 //! waits for ([`machine::background`]), a requested build's below the normal
-//! priority.
+//! priority. A background build's passes take half the search workers, a
+//! requested build's all of them but two (#346, [`super::runs::pass_workers`]).
 //!
 //! A background build also gives way to the work a user waits for
 //! ([`crate::foreground`]): while a search, sort, list or explorer answer
@@ -216,8 +217,8 @@ impl Scheduler {
     /// request now waits for it: a waiting one goes after the requested ones,
     /// before the background ones, and stops a background build of another
     /// database; a running one goes on at a requested build's priority, gives
-    /// way to foreground work no longer, and is no longer stopped for another
-    /// request.
+    /// way to foreground work no longer, takes a requested build's workers
+    /// from its next pass on, and is no longer stopped for another request.
     pub fn promote(&self, id: &str) {
         let mut q = lock(&self.queues);
         if let Some(at) = q.background.iter().position(|j| j.id == id) {
@@ -230,6 +231,7 @@ impl Scheduler {
         } else if let Some(running) = q.running.as_mut().filter(|r| r.id == id && r.kind == Kind::Background) {
             running.kind = Kind::Requested;
             running.progress.priority.store(Kind::Requested.priority() as u8, Ordering::Relaxed);
+            running.progress.set_requested(true);
             running.progress.set_patience(Duration::ZERO);
         }
     }
@@ -254,7 +256,7 @@ impl Scheduler {
     }
 
     /// The next build to run, marked running, its progress at its kind's
-    /// priority and patience: the first requested one, else the first
+    /// priority, patience and workers: the first requested one, else the first
     /// background one unless the computer runs on battery, when the thread
     /// waits for mains power or a requested build. `None`, the thread marked
     /// ended, once both queues are empty.
@@ -280,6 +282,7 @@ impl Scheduler {
         // Under the lock, so that a request that promotes the build from now
         // on has the last word.
         job.progress.priority.store(job.kind.priority() as u8, Ordering::Relaxed);
+        job.progress.set_requested(job.kind == Kind::Requested);
         job.progress.set_patience(job.kind.patience(self.patience()));
         Some(job)
     }
@@ -536,7 +539,8 @@ mod tests {
 
     /// A background build gives way to foreground work for the scheduler's
     /// patience from its start, a requested build never, and a background
-    /// build that a request promotes while it runs no longer (#149).
+    /// build that a request promotes while it runs no longer (#149); the
+    /// promoted build takes a requested build's workers (#346).
     #[test]
     fn only_a_background_build_gives_way() {
         let scheduler = Arc::new(Scheduler::default());
@@ -552,9 +556,9 @@ mod tests {
         assert!(scheduler.submit("a", Kind::Background, Arc::clone(&a), work));
         assert_eq!(next(&events), ("a", background_priority(), "run"));
         stalled(&a_stalls);
-        assert_eq!(a.patience(), patience);
+        assert_eq!((a.patience(), a.requested()), (patience, false));
         scheduler.promote("a");
-        assert_eq!(a.patience(), Duration::ZERO);
+        assert_eq!((a.patience(), a.requested()), (Duration::ZERO, true));
         // Its thread, which stalls in the batch it started before, takes the
         // requested priority at its next batch, which comes after its
         // release.
@@ -566,7 +570,7 @@ mod tests {
         b.set_patience(PATIENCE);
         assert!(scheduler.submit("b", Kind::Requested, Arc::clone(&b), build("b", &tx, &b, Some(held_b))));
         assert_eq!(next(&events), ("b", Priority::BelowNormal, "run"));
-        assert_eq!(b.patience(), Duration::ZERO);
+        assert_eq!((b.patience(), b.requested()), (Duration::ZERO, true));
         release_b.send(()).unwrap();
         assert_eq!(next(&events), ("b", Priority::BelowNormal, "done"));
     }

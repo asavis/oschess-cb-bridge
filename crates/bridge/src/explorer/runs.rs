@@ -118,6 +118,11 @@ pub struct Progress {
     /// build's patience; 0 for a build that never gives way, as a requested
     /// one (#149).
     patience: AtomicU64,
+    /// Whether a request waits for the build, which then takes the workers
+    /// searches leave free ([`pass_workers`]): a build queued in the
+    /// background is not, until a request promotes it. A build run outside
+    /// the queues, as `cbtool profile` runs one, is.
+    requested: AtomicBool,
 }
 
 /// A build that waits for its turn.
@@ -135,6 +140,7 @@ impl Default for Progress {
             stop: Arc::default(),
             priority: AtomicU8::new(Priority::Normal as u8),
             patience: AtomicU64::new(0),
+            requested: AtomicBool::new(true),
         }
     }
 }
@@ -196,6 +202,17 @@ impl Progress {
         Duration::from_micros(self.patience.load(Ordering::Relaxed))
     }
 
+    /// Makes the build one a request waits for, or one queued in the
+    /// background, from its next pass on ([`pass_workers`]).
+    pub fn set_requested(&self, requested: bool) {
+        self.requested.store(requested, Ordering::Relaxed);
+    }
+
+    /// Whether a request waits for the build.
+    pub fn requested(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
+    }
+
     /// Gives way to foreground work (#149), as each of the build's threads
     /// does before it takes its next batch: while searches, sorts, lists or
     /// explorer answers run ([`foreground`]), the thread of a build with
@@ -240,11 +257,13 @@ pub struct Timings {
     pub renaming: Duration,
 }
 
-/// One pass: its games replayed, then what they gave written.
+/// One pass: its games replayed, then what they gave written, and the
+/// workers that replayed them (#346).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PassTime {
     pub replay: Duration,
     pub write: Duration,
+    pub workers: usize,
 }
 
 impl PassTime {
@@ -259,12 +278,14 @@ impl Timings {
         self.reading + passes + self.closing + self.renaming
     }
 
-    /// One line of numbers, in microseconds, which [`Timings::parse`] reads:
-    /// `reading=5903000 tree=512000+230000,500000+210000 deep=… closing=… renaming=…`.
+    /// One line of numbers, in microseconds, which [`Timings::parse`] reads,
+    /// each pass with its workers after a colon:
+    /// `reading=5903000 tree=512000+230000:8,500000+210000:8 deep=… closing=… renaming=…`.
     pub fn line(&self) -> String {
         let us = |d: Duration| d.as_micros();
         let passes = |all: &[PassTime]| {
-            all.iter().map(|p| format!("{}+{}", us(p.replay), us(p.write))).collect::<Vec<_>>().join(",")
+            let each = all.iter().map(|p| format!("{}+{}:{}", us(p.replay), us(p.write), p.workers));
+            each.collect::<Vec<_>>().join(",")
         };
         format!(
             "reading={} tree={} deep={} closing={} renaming={}",
@@ -283,8 +304,9 @@ impl Timings {
             v.split(',')
                 .filter(|p| !p.is_empty())
                 .map(|p| {
-                    let (replay, write) = p.split_once('+')?;
-                    Some(PassTime { replay: us(replay)?, write: us(write)? })
+                    let (times, workers) = p.split_once(':').unwrap_or((p, "0"));
+                    let (replay, write) = times.split_once('+')?;
+                    Some(PassTime { replay: us(replay)?, write: us(write)?, workers: workers.parse().ok()? })
                 })
                 .collect()
         };
@@ -338,6 +360,20 @@ pub const MEMORY_WAIT: Duration = Duration::from_secs(60);
 /// one, before the build gives up (#180): as long as it waits for memory,
 /// where a search waits [`workers::WAIT`].
 pub const WORKERS_WAIT: Duration = MEMORY_WAIT;
+
+/// The most workers a pass of the build that reports on `progress` takes
+/// (#346): a requested build, the one a request waits for, all the search
+/// workers but two and never fewer than half of them, so that a search that
+/// arrives meanwhile still finds two free; a background build half of them,
+/// so that searches keep the rest. A pass takes fewer when its share of the
+/// budget holds fewer, or when it has less work.
+pub fn pass_workers(progress: &Progress) -> usize {
+    let (all, half) = (workers::threads(), workers::threads().div_ceil(2));
+    match progress.requested() {
+        true => all.saturating_sub(2).max(half),
+        false => half,
+    }
+}
 
 /// Runs `task` on up to `want` workers for a pass of the build that reports
 /// on `progress` ([`workers::run`]): the pass waits for its first worker up
@@ -396,6 +432,33 @@ impl Room {
         }
         Ok((hold, workers, self.least + more))
     }
+
+    /// The workers and the room of the passes of a section still to come,
+    /// for a build whose `hold` holds the passes' `workers` and `room` bytes
+    /// of entries or postings, when these passes, planned again as `self`,
+    /// take more workers (#346): a build that a request promoted while the
+    /// section runs takes a requested build's workers from its next pass on,
+    /// within its share as a requested build does. The most of
+    /// `self.workers` that fit: the room gives each worker more the bytes
+    /// that the share no longer holds beside it, keeping no more than `self`
+    /// plans for its workers and each one fewer's bytes, and the budget
+    /// gives what more they take, while it has that free now, never waiting.
+    /// The workers and the room as they were when it has not even one more
+    /// worker's free.
+    pub fn more_workers(&self, hold: &mut Hold, workers: usize, room: usize) -> (usize, usize) {
+        for more in (workers + 1..=self.workers).rev() {
+            let fits = room.min(self.room + (self.workers - more) * self.each);
+            let (added, freed) = ((more - workers) * self.each, room - fits);
+            if added <= freed {
+                hold.shrink(hold.bytes() + added - freed);
+                return (more, fits);
+            }
+            if hold.grow_quietly(added - freed).is_ok() {
+                return (more, fits);
+            }
+        }
+        (workers, room)
+    }
 }
 
 /// Opens with `open` a file the build wrote, whose tables it holds in the
@@ -444,6 +507,9 @@ pub struct Limits {
     /// first chunk; tests use it to start the workers as a busy machine does
     /// (#237).
     pub late_start: Duration,
+    /// Called as each pass of the tree or of the deep section starts, its
+    /// workers taken; tests use it to promote a build at a given pass (#346).
+    pub pass_started: Option<fn(&Progress)>,
 }
 
 impl Default for Limits {
@@ -453,6 +519,7 @@ impl Default for Limits {
             pass_bytes: None,
             workers_wait: WORKERS_WAIT,
             late_start: Duration::ZERO,
+            pass_started: None,
         }
     }
 }
@@ -521,11 +588,50 @@ mod tests {
         drop(working);
     }
 
+    /// A requested build's passes take every worker but two, never fewer than
+    /// half; a background build's half; a promoted build's, from then on, a
+    /// requested one's (#346).
+    #[test]
+    fn a_requested_build_takes_all_workers_but_two() {
+        let (all, half) = (workers::threads(), workers::threads().div_ceil(2));
+        let requested = all.saturating_sub(2).max(half);
+        let progress = Progress::default();
+        assert!(progress.requested(), "a build outside the queues is waited for");
+        assert_eq!(pass_workers(&progress), requested);
+        progress.set_requested(false);
+        assert_eq!(pass_workers(&progress), half);
+        progress.set_requested(true);
+        assert_eq!(pass_workers(&progress), requested);
+        assert!(all - requested >= 2 || requested == half, "{all} workers, {requested} taken");
+    }
+
+    /// A promoted build's passes take their workers more within the share
+    /// they were planned in (#346): while their room fills it, each worker
+    /// more takes its bytes from the room and the hold stays as it was;
+    /// while the room is smaller than the share holds beside them, from the
+    /// budget; in between, from both. The room never grows.
+    #[test]
+    fn more_workers_keep_to_the_share() {
+        let kib = 1 << 10;
+        // A 4 KiB table and workers of 8 KiB each in a 64 KiB share: room
+        // for 28 KiB beside four workers, 12 KiB beside six.
+        let plan = |workers: usize, room: usize| Room { fixed: 4 * kib, each: 8 * kib, workers, least: kib, room };
+        for (four, six, held) in [(28, 12, 64), (6, 6, 58), (20, 12, 64)] {
+            let (mut hold, workers, room) = plan(4, four * kib).reserve(&Progress::default()).unwrap();
+            assert_eq!((workers, room), (4, four * kib));
+            let more = plan(6, six * kib).more_workers(&mut hold, workers, room);
+            assert_eq!((more, hold.bytes()), ((6, six * kib), held * kib), "{four} KiB of room for four");
+        }
+        let (mut hold, workers, room) = plan(4, 28 * kib).reserve(&Progress::default()).unwrap();
+        assert_eq!(plan(4, 28 * kib).more_workers(&mut hold, workers, room), (4, 28 * kib), "none more");
+        assert_eq!(hold.bytes(), 64 * kib);
+    }
+
     /// A build's timings read back from their line, and nothing else.
     #[test]
     fn timings_read_back_from_their_line() {
         let ms = Duration::from_millis;
-        let pass = |replay, write| PassTime { replay: ms(replay), write: ms(write) };
+        let pass = |replay, write| PassTime { replay: ms(replay), write: ms(write), workers: 8 };
         let t = Timings {
             reading: Duration::from_micros(5_903_217),
             tree: vec![pass(512, 230), pass(500, 210)],
@@ -536,9 +642,22 @@ mod tests {
         assert_eq!(Timings::parse(&t.line()), Some(t.clone()));
         assert_eq!(t.total(), ms(5_903 + 742 + 710 + 1_100 + 30) + Duration::from_micros(217));
         assert!(t.to_string().starts_with("reading 5.90 s, tree 2 passes 1.45 s (replay 1.01 s, write 0.44 s)"));
+        assert!(t.line().contains("tree=512000+230000:8,500000+210000:8 "), "{}", t.line());
+        // A line of an older build, without the workers, reads with none.
+        let older = Timings::parse("reading=1 tree=2+3 deep= closing=0 renaming=0").unwrap();
+        assert_eq!(
+            older.tree,
+            [PassTime { replay: Duration::from_micros(2), write: Duration::from_micros(3), workers: 0 }]
+        );
         let none = Timings::default();
         assert_eq!(Timings::parse(&none.line()), Some(none));
-        for bad in ["", "reading=1", "reading=x tree= deep= closing=0 renaming=0", "port 80"] {
+        for bad in [
+            "",
+            "reading=1",
+            "reading=x tree= deep= closing=0 renaming=0",
+            "port 80",
+            "reading=1 tree=2+3:x deep= closing=0 renaming=0",
+        ] {
             assert_eq!(Timings::parse(bad), None, "{bad}");
         }
     }
