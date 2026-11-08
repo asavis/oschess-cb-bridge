@@ -242,7 +242,8 @@ pub const SNAPSHOT_EVERY: Duration = Duration::from_secs(10);
 /// snapshot (#348): at its first tick; every [`SNAPSHOT_EVERY`]; at every
 /// tick while a window that shows the state is open; and at once when the
 /// bridge's [`Pulse`] changed, as when a download, an index build or an
-/// analysis begins or ends, the server stops or a browser is first served.
+/// analysis begins or ends, an index build that waited for its turn starts or
+/// waits again, the server stops or a browser is first served.
 /// At the other ticks the tray keeps the view it drew.
 #[derive(Default)]
 pub struct Pace {

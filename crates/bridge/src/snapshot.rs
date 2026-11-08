@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::api::App;
-use crate::catalog::{Entry, State};
+use crate::catalog::{Catalog, Entry, State};
 use crate::server;
 use crate::start::Bridge;
 use crate::sync::lock;
@@ -175,14 +175,26 @@ fn work_of(databases: &[Database], headers: bool, indexing: bool, analysing: boo
     work
 }
 
+/// Whether `catalog` builds a header index, and a position index, as work a
+/// restart would lose: a position index build that waits for its turn loses
+/// nothing. A [`Snapshot`]'s work and its [`Pulse`] both read them here.
+fn builds(catalog: &Catalog) -> (bool, bool) {
+    (catalog.pgn().building(), catalog.explorer.building().iter().any(|b| b.1 != "waiting"))
+}
+
 /// What a [`Snapshot`] shows that may change on the bridge's side, read
 /// without looking at any database (#348): how many times its background work
-/// began or ended, whether it stopped, whether an analysis holds updates back
-/// and whether a paired browser was served. A user interface that sees it
-/// change takes a snapshot at once rather than at its slower pace.
+/// began or ended, whether a header index and a position index are built as
+/// its work shows them (a build that waited for its turn starts, or waits
+/// again, with no work beginning or ending), whether it stopped, whether an
+/// analysis holds updates back and whether a paired browser was served. A
+/// user interface that sees it change takes a snapshot at once rather than at
+/// its slower pace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pulse {
     pub changes: u64,
+    pub headers: bool,
+    pub indexing: bool,
     pub stopped: bool,
     pub analysing: bool,
     pub served: bool,
@@ -218,8 +230,11 @@ impl Background {
     /// What changes when the snapshot may have, without looking at any
     /// database (#348).
     pub fn pulse(&self) -> Pulse {
+        let (headers, indexing) = builds(&self.app.catalog);
         Pulse {
             changes: self.app.catalog.changes(),
+            headers,
+            indexing,
             stopped: lock(&self.stopped).is_some(),
             analysing: self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES),
             served: self.app.served.load(Ordering::Relaxed),
@@ -231,13 +246,8 @@ impl Background {
     pub fn snapshot(&self) -> Snapshot {
         let databases = Database::all(&self.app.catalog.entries());
         let catalog = &self.app.catalog;
-        let work = work_of(
-            &databases,
-            catalog.pgn().building(),
-            // A build that waits for its turn loses nothing.
-            catalog.explorer.building().iter().any(|b| b.1 != "waiting"),
-            self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES),
-        );
+        let (headers, indexing) = builds(catalog);
+        let work = work_of(&databases, headers, indexing, self.app.engine.analyzing(ANALYSIS_HOLDS_UPDATES));
         Snapshot {
             version: self.app.version,
             port: self.port,
@@ -376,6 +386,74 @@ mod tests {
         let snapshot = background.snapshot();
         assert_eq!(snapshot.stopped.as_deref(), Some("port lost"));
         assert!(snapshot.databases.is_empty());
+    }
+
+    /// A background build that waited for its turn changes the pulse as it
+    /// starts, though no work begins or ends then (#348): the snapshot now
+    /// shows the build as work a restart would lose, and a tray that keeps
+    /// its view until the pulse changes must not let an update restart the
+    /// bridge over it. The build waits while the computer runs on battery,
+    /// starts on mains power, and is held in its first tree pass.
+    #[test]
+    fn a_waiting_build_that_starts_changes_the_pulse() {
+        use crate::explorer::runs::{Limits, Progress};
+        use crate::machine::Machine;
+        use std::sync::atomic::AtomicBool;
+
+        struct Power(AtomicBool);
+        impl Machine for Power {
+            fn on_battery(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+            fn free_bytes(&self, _: &std::path::Path) -> Option<u64> {
+                None
+            }
+        }
+        static HELD: AtomicBool = AtomicBool::new(true);
+        fn held(_: &Progress) {
+            while HELD.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let db = ready("snapshot-waiting-build", 3);
+        let dir = std::env::temp_dir().join(format!("bridge-snapshot-waiting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bridge = bridge(vec![db.dir().join("db.2cbh")]);
+        let app = Arc::clone(&bridge.app);
+        let explorer = &app.catalog.explorer;
+        explorer.set_dir(dir.clone());
+        let power = Arc::new(Power(AtomicBool::new(true)));
+        explorer.set_machine(Arc::clone(&power) as Arc<dyn Machine>);
+        explorer.set_limits(Limits { pass_started: Some(held), ..Limits::default() });
+        // The keeper's first look, as the bridge starts, queues the build of
+        // the largest database; there is no other look.
+        explorer.set_keeping(Duration::from_secs(3600), Duration::ZERO);
+        let background = Background::serve(bridge).unwrap();
+        until("the build is not queued", &|| explorer.building().iter().any(|b| b.1 == "waiting"));
+        // The keeper stopped, its look over: the build alone counts as work.
+        until("the keeper's look did not end", &|| {
+            app.catalog.settle(Duration::ZERO).err().is_some_and(|busy| busy.0 == ["index builds"])
+        });
+        assert!(!background.snapshot().work.contains(&Work::Indexing), "a waiting build loses nothing");
+        let waiting = background.pulse();
+        power.0.store(false, Ordering::Relaxed);
+        explorer.set_machine(Arc::clone(&power) as Arc<dyn Machine>);
+        until("the build did not start", &|| background.snapshot().work.contains(&Work::Indexing));
+        let running = background.pulse();
+        assert_ne!(running, waiting, "the build started");
+        assert_eq!((waiting.indexing, running.indexing, running.changes), (false, true, waiting.changes));
+        HELD.store(false, Ordering::Relaxed);
+        assert!(app.catalog.settle(Duration::from_secs(60)).is_ok(), "the build did not end");
+        explorer.release();
+        drop(background);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The work an update waits for (#61): each kind once, whatever named it.
