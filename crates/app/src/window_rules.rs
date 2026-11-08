@@ -220,9 +220,9 @@ fn capabilities() -> Vec<(String, Vec<String>)> {
     found
 }
 
-/// Only a window a user opens asks for a look at the databases: the flyout,
-/// built hidden at the start, must not make the bridge open every database
-/// at a sign-in (#365).
+/// Only a window a user opens asks for a look at the databases: a flyout
+/// built hidden for a Store look must not make the bridge open every database
+/// (#365).
 #[test]
 fn only_the_windows_a_user_opens_ask_for_a_look() {
     let files = sources();
@@ -237,6 +237,21 @@ fn only_the_windows_a_user_opens_ask_for_a_look() {
     }
     let start = source(&files, "mod.rs");
     assert!(!start.contains(".ask("), "the start asks for a look");
+}
+
+/// No WebView2 lives while no window is open (#365): nothing builds the
+/// flyout at the start, and closing it destroys it unless a Store look holds
+/// it for now.
+#[test]
+fn the_flyout_lives_only_while_it_is_used() {
+    let files = sources();
+    assert!(!source(&files, "mod.rs").contains("create_flyout"), "the start builds the flyout");
+    let windows = source(&files, "windows.rs");
+    assert!(body(windows, "hide_flyout").unwrap().contains("window.destroy()"), "closing the flyout keeps it");
+    assert!(body(windows, "toggle_flyout").unwrap().contains("create_flyout(app)"), "a click does not build it");
+    assert!(source(&files, "commands.rs").contains("windows::page_ready"), "its page does not show it");
+    let on_event = body(windows, "on_event").unwrap();
+    assert!(on_event.contains("hide_flyout") && !on_event.contains("window.hide()"), "losing the focus keeps it");
 }
 
 #[test]

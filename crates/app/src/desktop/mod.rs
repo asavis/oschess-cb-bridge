@@ -118,7 +118,6 @@ pub fn run() {
             // Before any window is built: a failure of the first ones is reported too.
             reporting::start(app.handle());
             tray::create(app.handle())?;
-            windows::create_flyout(app.handle());
             if started.first_run {
                 windows::open_first_run(app.handle());
             }

@@ -52,6 +52,14 @@ pub struct Flyout {
     /// When the flyout last hid because it lost the focus. A click on the
     /// tray mark takes the focus first, so that click must not reopen it.
     pub hidden_at: Option<Instant>,
+    /// A click waits for the flyout's page, to show it (#365).
+    pub opening: bool,
+    /// Its window is being destroyed: the focus it loses meanwhile closes
+    /// nothing more.
+    pub closing: bool,
+    /// A Store look holds the flyout, as the owner of what it shows: it hides
+    /// rather than goes (#365).
+    pub held: bool,
 }
 
 /// A started bridge, and what the start should show.

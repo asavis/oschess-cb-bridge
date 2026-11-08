@@ -426,6 +426,7 @@ pub fn window_ready(app: AppHandle, window: WebviewWindow) {
         return;
     }
     shared(&app).openings.ready(window.label());
+    windows::page_ready(&app, &window);
 }
 
 /// An error in a window's script, which reached no log before (#332), and is

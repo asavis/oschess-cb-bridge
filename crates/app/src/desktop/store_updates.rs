@@ -16,7 +16,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use windows::Services::Store::{StoreContext, StorePackageUpdateState};
 use windows::Win32::System::Recovery::{REGISTER_APPLICATION_RESTART_FLAGS, RegisterApplicationRestart};
@@ -26,7 +26,7 @@ use windows::core::{AgileReference, Interface, PCWSTR};
 use super::server::Shared;
 use super::shared;
 use super::updater::report;
-use super::windows::FLYOUT;
+use super::windows::hold_flyout;
 use crate::channel::STORE_PAGE;
 use crate::updates::{self, Phase, StoreCalls, StoreOutcome, StoreStep};
 
@@ -77,9 +77,10 @@ fn wait_ready(app: &AppHandle, shared: &Shared) {
 pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
     let context = StoreContext::GetDefault().map_err(text)?;
     // A desktop app's Store context needs a window to own anything it shows,
-    // Windows' update dialog included; the flyout always exists, hidden until
-    // the tray mark is clicked.
-    if let Some(window) = app.get_webview_window(FLYOUT) {
+    // Windows' update dialog included: the flyout, built hidden for as long
+    // as this look runs (#365).
+    let (_held, owner) = hold_flyout(app);
+    if let Some(window) = owner {
         let hwnd = window.hwnd().map_err(|e| e.to_string())?;
         unsafe { context.cast::<IInitializeWithWindow>().map_err(text)?.Initialize(hwnd).map_err(text)? };
     }

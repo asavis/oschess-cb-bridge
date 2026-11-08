@@ -22,7 +22,7 @@ use tauri::{
 
 use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
-use crate::opening::{self, LIMIT, Stage};
+use crate::opening::{self, FlyoutClick, LIMIT, Stage};
 use crate::reports::{Kind, Report};
 use crate::status::Asked;
 
@@ -127,8 +127,8 @@ fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
 
 /// Reports that `label`'s window did not open (#333), its log `line` the
 /// report's message, and tells the user in a native message how far it got,
-/// with the report's code, copied. The flyout, built hidden at the start, is
-/// reported and not shown: nobody has asked for it yet.
+/// with the report's code, copied. A flyout no click waits for, as one built
+/// for a Store look, is reported and not shown: nobody has asked for it.
 fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str) {
     let code = reporting::file(Report {
         kind: Kind::Window,
@@ -138,9 +138,13 @@ fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str
     });
     let shared = shared(app);
     let strings = &shared.strings;
+    // The click is answered here: a later Store look's flyout must not show.
+    let waited =
+        label == FLYOUT && std::mem::take(&mut shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).opening);
     let what = match label {
         SETTINGS => strings.get("failure.window.settings"),
         FIRST_RUN => strings.get("failure.window.firstRun"),
+        FLYOUT if waited => strings.get("failure.window.flyout"),
         _ => return,
     };
     let why = match stage {
@@ -157,54 +161,133 @@ fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str
     alerts::warn(strings.get("failure.title"), &text);
 }
 
-/// Builds the flyout, hidden until the tray mark is clicked.
-pub fn create_flyout(app: &AppHandle) {
-    spawn_window(
-        app,
-        Spec {
-            label: FLYOUT,
-            page: "flyout",
-            query: String::new(),
-            title: shared(app).strings.get("window.flyout").to_string(),
-            configure: |b| {
-                b.inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
-                    .decorations(false)
-                    .resizable(false)
-                    .skip_taskbar(true)
-                    .always_on_top(true)
-                    .shadow(true)
-                    .visible(false)
-            },
+/// The flyout's window, hidden when built: it shows once its page is ready.
+fn flyout_spec(app: &AppHandle) -> Spec {
+    Spec {
+        label: FLYOUT,
+        page: "flyout",
+        query: String::new(),
+        title: shared(app).strings.get("window.flyout").to_string(),
+        configure: |b| {
+            b.inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
+                .decorations(false)
+                .resizable(false)
+                .skip_taskbar(true)
+                .always_on_top(true)
+                .shadow(true)
+                .visible(false)
         },
-    );
+    }
+}
+
+/// Builds the flyout, hidden.
+fn create_flyout(app: &AppHandle) {
+    spawn_window(app, flyout_spec(app));
 }
 
 /// Opens the flyout by the tray mark at `rect`, or closes it when it is open.
-/// A click in the moment before the flyout is built does nothing.
+/// The flyout exists only while someone uses it, as its WebView2 processes
+/// hold some 200 MB (#365): a click builds it, and it shows when its page is
+/// ready ([`page_ready`]).
 pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
-    let Some(window) = app.get_webview_window(FLYOUT) else { return };
-    if window.is_visible().unwrap_or(false) {
-        if let Err(e) = window.hide() {
-            bridge::fault!("the flyout cannot be hidden: {e}");
-        }
+    let window = app.get_webview_window(FLYOUT);
+    let visible = window.as_ref().is_some_and(|w| w.is_visible().unwrap_or(false));
+    let shared = shared(app);
+    let click = shared.openings.flyout_click(FLYOUT, window.is_some(), visible, Instant::now());
+    if click == FlyoutClick::Close {
+        hide_flyout(app);
         return;
     }
-    let shared = shared(app);
-    let anchor = {
+    {
         let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
         if flyout.hidden_at.is_some_and(|t| t.elapsed() < REOPEN_GUARD) {
             return;
         }
-        let scale = window.scale_factor().unwrap_or(1.0);
+        let scale = window
+            .as_ref()
+            .and_then(|w| w.scale_factor().ok())
+            .or_else(|| app.primary_monitor().ok().flatten().map(|m| m.scale_factor()))
+            .unwrap_or(1.0);
         let at = rect.position.to_physical::<f64>(scale);
         let size = rect.size.to_physical::<f64>(scale);
         flyout.anchor = Some((at.x, at.y, size.width, size.height));
+        flyout.opening = true;
+    }
+    shared.ask(Asked::Window);
+    match (click, window) {
+        (FlyoutClick::Show, Some(window)) => show_flyout(app, &window),
+        (FlyoutClick::Rebuild, Some(window)) => match window.destroy() {
+            Ok(()) => build_when_gone(app, flyout_spec(app)),
+            Err(e) => bridge::fault!("the flyout cannot be destroyed: {e}"),
+        },
+        (FlyoutClick::Build, _) => create_flyout(app),
+        _ => {}
+    }
+}
+
+/// Puts the flyout by the tray mark and shows it.
+fn show_flyout(app: &AppHandle, window: &WebviewWindow) {
+    let anchor = {
+        let shared = shared(app);
+        let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
+        flyout.opening = false;
         flyout.anchor
     };
-    place(&window, anchor);
-    shared.ask(Asked::Window);
+    place(window, anchor);
     if let Err(e) = window.show().and_then(|()| window.set_focus()) {
         bridge::fault!("the flyout cannot be shown: {e}");
+    }
+}
+
+/// A page has drawn: the flyout a click waits for shows now.
+pub fn page_ready(app: &AppHandle, window: &WebviewWindow) {
+    let waited = window.label() == FLYOUT && shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).opening;
+    if waited {
+        show_flyout(app, window);
+    }
+}
+
+/// The flyout, built hidden if there is none, for as long as the guard lives:
+/// a Store look needs a window to own what it shows (#365). `None` when no
+/// window came within [`LIMIT`]. Call it off the event loop's thread: it
+/// waits for the window.
+pub fn hold_flyout(app: &AppHandle) -> (FlyoutHold, Option<WebviewWindow>) {
+    shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).held = true;
+    let hold = FlyoutHold(app.clone());
+    if app.get_webview_window(FLYOUT).is_none() {
+        create_flyout(app);
+    }
+    let start = Instant::now();
+    loop {
+        if let Some(window) = app.get_webview_window(FLYOUT) {
+            return (hold, Some(window));
+        }
+        if start.elapsed() > LIMIT {
+            return (hold, None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Keeps the flyout while it lives; a flyout nobody opened meanwhile goes
+/// with it.
+pub struct FlyoutHold(AppHandle);
+
+impl Drop for FlyoutHold {
+    fn drop(&mut self) {
+        let waited = {
+            let shared = shared(&self.0);
+            let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
+            flyout.held = false;
+            flyout.opening
+        };
+        if let Some(window) = self.0.get_webview_window(FLYOUT)
+            && !waited
+            && !window.is_visible().unwrap_or(false)
+            && let Err(e) = window.destroy()
+        {
+            bridge::fault!("the flyout cannot be destroyed: {e}");
+        }
     }
 }
 
@@ -219,11 +302,26 @@ pub fn fit_flyout(app: &AppHandle, height: f64) {
     place(&window, anchor);
 }
 
+/// Closes the flyout: its window goes, and its WebView2 processes with it
+/// (#365), unless a Store look holds it for now.
 pub fn hide_flyout(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(FLYOUT)
-        && let Err(e) = window.hide()
-    {
-        bridge::fault!("the flyout cannot be hidden: {e}");
+    let shared = shared(app);
+    let window = app.get_webview_window(FLYOUT);
+    let held = {
+        let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
+        flyout.opening = false;
+        // The focus a window loses as it is destroyed closes nothing more.
+        if window.is_none() || (flyout.closing && !flyout.held) {
+            return;
+        }
+        flyout.closing = !flyout.held;
+        flyout.held
+    };
+    let Some(window) = window else { return };
+    let closed = if held { window.hide() } else { window.destroy() };
+    if let Err(e) = closed {
+        shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).closing = false;
+        bridge::fault!("the flyout cannot be closed: {e}");
     }
 }
 
@@ -367,16 +465,20 @@ pub fn open_first_run(app: &AppHandle) {
     spawn_window(app, spec);
 }
 
-/// The flyout hides when it loses the focus, as the system's own flyouts do.
+/// The flyout closes when it loses the focus, as the system's own flyouts do.
 /// A window that is gone ends its opening (#332): one closed before its page
 /// was ready is not reported as stopped.
 pub fn on_event(window: &Window, event: &WindowEvent) {
     match event {
-        WindowEvent::Destroyed => shared(window.app_handle()).openings.closed(window.label()),
-        WindowEvent::Focused(false) if window.label() == FLYOUT => {
-            if let Err(e) = window.hide() {
-                bridge::fault!("the flyout cannot be hidden: {e}");
+        WindowEvent::Destroyed => {
+            let shared = shared(window.app_handle());
+            shared.openings.closed(window.label());
+            if window.label() == FLYOUT {
+                shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).closing = false;
             }
+        }
+        WindowEvent::Focused(false) if window.label() == FLYOUT => {
+            hide_flyout(window.app_handle());
             let shared = shared(window.app_handle());
             shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).hidden_at = Some(Instant::now());
         }

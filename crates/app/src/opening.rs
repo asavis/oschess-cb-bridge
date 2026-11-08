@@ -32,6 +32,22 @@ impl Stage {
     }
 }
 
+/// What a click on the tray mark does with the flyout, which exists only
+/// while someone uses it (#365).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlyoutClick {
+    /// There is none: build it, and show it when its page is ready.
+    Build,
+    /// It is open: close it.
+    Close,
+    /// Hidden with its page ready, as while the Store holds it: show it.
+    Show,
+    /// It is being built: it shows when its page is ready.
+    Wait,
+    /// Its page never got ready: build it again.
+    Rebuild,
+}
+
 /// The latest opening of each window, by its label.
 #[derive(Default)]
 pub struct Openings {
@@ -107,6 +123,22 @@ impl Openings {
         self.lock().get(label).filter(|o| o.attempt == attempt && o.stage != Stage::Ready).map(|o| o.stage)
     }
 
+    /// What a click at `now` does with `label`'s flyout, which `exists` or
+    /// not, and is `visible` or not.
+    pub fn flyout_click(&self, label: &str, exists: bool, visible: bool, now: Instant) -> FlyoutClick {
+        if !exists {
+            return FlyoutClick::Build;
+        }
+        if visible {
+            return FlyoutClick::Close;
+        }
+        match self.lock().get(label) {
+            Some(o) if o.stage != Stage::Ready && now.saturating_duration_since(o.since) < LIMIT => FlyoutClick::Wait,
+            Some(o) if o.stage != Stage::Ready => FlyoutClick::Rebuild,
+            _ => FlyoutClick::Show,
+        }
+    }
+
     /// Whether `label`'s existing window can be brought forward at `now`: its
     /// page is ready, or it is still within [`LIMIT`] of its request. A window
     /// with no opening on record, built before this was kept, can be.
@@ -139,6 +171,26 @@ pub fn on_a_screen(window: Rect, screens: &[Rect]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A click builds the flyout when there is none, closes an open one,
+    /// shows one whose page is ready, leaves one being built alone, and
+    /// builds again one whose page never got ready (#365).
+    #[test]
+    fn a_click_does_what_the_flyout_needs() {
+        let label = "flyout";
+        let start = Instant::now();
+        let openings = Openings::default();
+        assert_eq!(openings.flyout_click(label, false, false, start), FlyoutClick::Build);
+        let attempt = openings.request(label, start).unwrap();
+        openings.built(label, attempt);
+        assert_eq!(openings.flyout_click(label, true, false, start + LIMIT / 2), FlyoutClick::Wait);
+        assert_eq!(openings.flyout_click(label, true, false, start + LIMIT), FlyoutClick::Rebuild);
+        openings.ready(label);
+        assert_eq!(openings.flyout_click(label, true, false, start + LIMIT), FlyoutClick::Show);
+        assert_eq!(openings.flyout_click(label, true, true, start + LIMIT), FlyoutClick::Close);
+        openings.closed(label);
+        assert_eq!(openings.flyout_click(label, false, false, start + LIMIT), FlyoutClick::Build);
+    }
 
     #[test]
     fn a_window_that_gets_ready_is_not_overdue() {
