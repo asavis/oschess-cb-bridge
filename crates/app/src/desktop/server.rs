@@ -142,8 +142,9 @@ impl Shared {
         view
     }
 
-    /// The names of the databases listed, which a report must not carry:
-    /// looks at no database, so that a look is not owed to a report (#365).
+    /// The names of the databases on the list, which a report must not
+    /// carry: read from the list, whether or not anyone looked at them yet
+    /// (#365).
     pub fn database_names(&self) -> Vec<String> {
         match &self.running {
             Some(r) => r.background.names(),

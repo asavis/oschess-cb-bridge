@@ -88,7 +88,8 @@ pub const MAX_FOLDERS: usize = 10_000;
 
 /// The most folders a walk may read and still be repeated on every request
 /// that looks for changes (#320). A larger tree is walked again only after
-/// [`LOOK_EVERY`]: the tray app looks once a second besides the requests, and
+/// [`LOOK_EVERY`]: an open window of the tray app looks every few seconds
+/// besides the requests, and
 /// a tree of 300 folders on OneDrive took 60 ms to walk on Windows, so 64
 /// folders take about 13 ms a look.
 pub const QUICK_FOLDERS: usize = 64;

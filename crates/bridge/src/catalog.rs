@@ -676,10 +676,10 @@ impl Catalog {
         self.listed().iter().any(|entry| entry.progress().is_some())
     }
 
-    /// The names of the databases as listed last, from what the catalog
-    /// holds: no file is looked at (#365).
+    /// The names of the databases on the list, read first if its sources
+    /// changed: the databases' own files are not looked at (#365).
     pub fn names(&self) -> Vec<String> {
-        self.listed().iter().map(|entry| entry.name.clone()).collect()
+        self.entries().iter().map(|entry| entry.name.clone()).collect()
     }
 
     /// Sweeps the index folder, and the PGN header index folder, of what the

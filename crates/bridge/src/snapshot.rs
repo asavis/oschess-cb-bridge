@@ -262,8 +262,8 @@ impl Background {
         }
     }
 
-    /// The names of the databases listed, without looking at any of them
-    /// (#365).
+    /// The names of the databases on the list, without looking at any of
+    /// them (#365).
     pub fn names(&self) -> Vec<String> {
         self.app.catalog.names()
     }
@@ -334,6 +334,7 @@ mod tests {
         let bridge = bridge(vec![missing.clone(), PathBuf::from("/no/such/folder/Old.pgn"), db.dir().join("db.2cbh")]);
         let port = bridge.port;
         let background = Background::serve(bridge).unwrap();
+        assert_eq!(background.names(), ["Games", "Old", "db"], "before anything looked at them (#365)");
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let request = format!(
             "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
