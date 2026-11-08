@@ -478,8 +478,13 @@ pub fn on_event(window: &Window, event: &WindowEvent) {
             }
         }
         WindowEvent::Focused(false) if window.label() == FLYOUT => {
-            hide_flyout(window.app_handle());
             let shared = shared(window.app_handle());
+            // WebView2 takes the focus and gives it back while it is built:
+            // only a flyout that was shown closes when it loses the focus.
+            if shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).opening {
+                return;
+            }
+            hide_flyout(window.app_handle());
             shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).hidden_at = Some(Instant::now());
         }
         _ => {}

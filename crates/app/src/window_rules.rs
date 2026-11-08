@@ -252,6 +252,11 @@ fn the_flyout_lives_only_while_it_is_used() {
     assert!(source(&files, "commands.rs").contains("windows::page_ready"), "its page does not show it");
     let on_event = body(windows, "on_event").unwrap();
     assert!(on_event.contains("hide_flyout") && !on_event.contains("window.hide()"), "losing the focus keeps it");
+    let focus = &on_event[on_event.find("Focused(false)").unwrap()..];
+    assert!(
+        focus.find(".opening").unwrap() < focus.find("hide_flyout").unwrap(),
+        "a flyout still being built closes when WebView2 takes the focus from it"
+    );
 }
 
 #[test]
