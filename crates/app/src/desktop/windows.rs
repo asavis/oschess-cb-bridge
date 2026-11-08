@@ -13,6 +13,7 @@
 //! stage it stopped at, and the user is told so in a native message. Before,
 //! the click did nothing and left nothing in the log.
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tauri::{
@@ -83,7 +84,8 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
         }
         // A second click while the window is being built builds nothing.
         let Some(attempt) = shared(&app).openings.request(spec.label, Instant::now()) else { return };
-        watch_opening(&app, spec.label, attempt);
+        let opening = shared(&app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.opening();
+        watch_opening(&app, spec.label, attempt, opening);
         if faults::on("build-hangs") {
             std::future::pending::<()>().await;
         }
@@ -100,7 +102,7 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
                 let line = format!("the {} window: {e}", spec.label);
                 bridge::log!("{line}");
                 shared(&app).openings.failed(spec.label, attempt);
-                failed_to_open(&app, spec.label, Stage::Requested, &line);
+                failed_to_open(&app, spec.label, opening, Stage::Requested, &line);
             }
         }
     });
@@ -118,14 +120,14 @@ fn build_window(app: &AppHandle, spec: &Spec) -> Result<WebviewWindow, String> {
 
 /// Watches `attempt` of `label`'s window from a thread of its own: a page that
 /// is not ready after [`LIMIT`] is logged, and the user is told.
-fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
+fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64, opening: u64) {
     let watched = app.clone();
     let spawned = std::thread::Builder::new().name("window-watch".into()).spawn(move || {
         std::thread::sleep(LIMIT);
         let Some(stage) = shared(&watched).openings.overdue(label, attempt) else { return };
         let line = format!("the {label} window stopped at \"{}\" after {} s", stage.name(), LIMIT.as_secs());
         bridge::log!("{line}");
-        failed_to_open(&watched, label, stage, &line);
+        failed_to_open(&watched, label, opening, stage, &line);
     });
     if let Err(e) = spawned {
         bridge::fault!("the {label} window is not watched: {e}");
@@ -136,7 +138,7 @@ fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
 /// report's message, and tells the user in a native message how far it got,
 /// with the report's code, copied. A flyout no click waits for any more is
 /// reported and not shown: nobody is waiting for it.
-fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str) {
+fn failed_to_open(app: &AppHandle, label: &'static str, opening: u64, stage: Stage, line: &str) {
     let code = reporting::file(Report {
         kind: Kind::Window,
         message: line.to_string(),
@@ -146,10 +148,7 @@ fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str
     let shared = shared(app);
     let strings = &shared.strings;
     // The click is answered here, and the window its page failed in goes.
-    let waited = label == FLYOUT && shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.give_up();
-    if label == FLYOUT {
-        settle_flyout(app);
-    }
+    let waited = label == FLYOUT && flyout_failed(app, opening);
     let what = match label {
         SETTINGS => strings.get("failure.window.settings"),
         FIRST_RUN => strings.get("failure.window.firstRun"),
@@ -220,7 +219,13 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
         let at = rect.position.to_physical::<f64>(scale);
         let size = rect.size.to_physical::<f64>(scale);
         flyout.anchor = Some((at.x, at.y, size.width, size.height));
-        flyout.life.wait();
+        // Numbered when it starts a build, so that an older one's failure
+        // cancels nothing.
+        if matches!(click, FlyoutClick::Build | FlyoutClick::Rebuild) || flyout.life.closing() {
+            flyout.life.begin();
+        } else {
+            flyout.life.wait();
+        }
         flyout.life.closing()
     };
     shared.ask(Asked::Window);
@@ -271,21 +276,49 @@ pub fn page_ready(app: &AppHandle, window: &WebviewWindow) {
 /// finds it going.
 fn settle_flyout(app: &AppHandle) {
     let handle = app.clone();
-    let queued = app.run_on_main_thread(move || {
-        let window = handle.get_webview_window(FLYOUT);
-        let visible = window.as_ref().is_some_and(|w| w.is_visible().unwrap_or(false));
-        let shared = shared(&handle);
-        let unwanted = shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.settle(window.is_some(), visible);
-        if let Some(window) = window.filter(|_| unwanted)
-            && let Err(e) = window.destroy()
-        {
-            shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.closed();
-            bridge::fault!("the flyout cannot be destroyed: {e}");
-        }
-    });
-    if let Err(e) = queued {
+    if let Err(e) = app.run_on_main_thread(move || settle_now(&handle)) {
         bridge::fault!("the flyout is not settled: {e}");
     }
+}
+
+/// [`settle_flyout`], on the event loop's thread.
+fn settle_now(app: &AppHandle) {
+    let window = app.get_webview_window(FLYOUT);
+    let visible = window.as_ref().is_some_and(|w| w.is_visible().unwrap_or(false));
+    let shared = shared(app);
+    let unwanted = shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.settle(window.is_some(), visible);
+    if let Some(window) = window.filter(|_| unwanted)
+        && let Err(e) = window.destroy()
+    {
+        shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.closed();
+        bridge::fault!("the flyout cannot be destroyed: {e}");
+    }
+}
+
+/// The flyout's opening numbered `opening` failed: on the event loop's thread,
+/// where the clicks are handled, the click waiting for it gives up and the
+/// window goes, unless a newer click replaced it. Whether a click waited, to
+/// be told. Call it off that thread: it waits for the answer.
+fn flyout_failed(app: &AppHandle, opening: u64) -> bool {
+    let (answer, answered) = mpsc::channel();
+    let handle = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let (latest, waited) = {
+            let shared = shared(&handle);
+            let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
+            (flyout.life.opening() == opening, flyout.life.fail(opening))
+        };
+        if latest {
+            settle_now(&handle);
+        }
+        // The caller gave up waiting only after a long stall, and then knows.
+        answer.send(waited).ok();
+    });
+    if let Err(e) = queued {
+        bridge::fault!("the flyout's failure is not handled: {e}");
+        return false;
+    }
+    answered.recv_timeout(LIMIT).unwrap_or(false)
 }
 
 /// Sizes the flyout to its page, keeping it by the tray mark.

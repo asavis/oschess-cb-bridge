@@ -253,7 +253,13 @@ fn the_flyout_lives_only_while_it_is_used() {
     // a window that is going (the review's second finding on c0c2b7f).
     assert!(body(windows, "settle_flyout").unwrap().contains("run_on_main_thread"), "settled off the event loop");
     assert!(body(windows, "toggle_flyout").unwrap().contains("build_when_gone"), "a click on a going flyout is lost");
-    assert!(body(windows, "failed_to_open").unwrap().contains("settle_flyout"), "a failed page leaves its window");
+    assert!(body(windows, "failed_to_open").unwrap().contains("flyout_failed"), "a failed page leaves its window");
+    let failed = body(windows, "flyout_failed").unwrap();
+    assert!(
+        failed.contains("run_on_main_thread") && failed.contains("settle_now"),
+        "a failure is handled off the event loop"
+    );
+    assert!(failed.contains(".fail(opening)"), "an older opening's failure cancels a newer click");
     assert!(
         body(windows, "page_ready").unwrap().contains("settle_flyout"),
         "a page nobody waits for leaves its window"

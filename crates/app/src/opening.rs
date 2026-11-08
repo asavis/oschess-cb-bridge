@@ -58,12 +58,35 @@ pub struct FlyoutLife {
     waiting: bool,
     /// Its window is being destroyed.
     closing: bool,
+    /// Which opening a click last started, so that the failure of an older
+    /// one cancels nothing.
+    opening: u64,
 }
 
 impl FlyoutLife {
     /// A click waits for the page.
     pub fn wait(&mut self) {
         self.waiting = true;
+    }
+
+    /// A click waits for the page of a build it starts; the build's number.
+    pub fn begin(&mut self) -> u64 {
+        self.waiting = true;
+        self.opening += 1;
+        self.opening
+    }
+
+    /// The number of the opening a click last started.
+    pub fn opening(&self) -> u64 {
+        self.opening
+    }
+
+    /// The opening numbered `opening` failed: when it is still the latest, the
+    /// click no longer waits, and whether one did is returned. An older one's
+    /// failure cancels nothing: the click waits for the build that replaced
+    /// it (the review's finding on 4c6df21).
+    pub fn fail(&mut self, opening: u64) -> bool {
+        self.opening == opening && std::mem::take(&mut self.waiting)
     }
 
     pub fn waiting(&self) -> bool {
@@ -256,6 +279,20 @@ mod tests {
         assert!(late.give_up());
         assert!(!late.settle(false, false), "nothing to destroy yet");
         assert!(late.settle(true, false), "the build ended after the deadline");
+    }
+
+    /// The failure of an opening a click has replaced cancels nothing: the
+    /// click waits for its new build.
+    #[test]
+    fn an_old_failure_cancels_no_newer_opening() {
+        let mut life = FlyoutLife::default();
+        let first = life.begin();
+        let second = life.begin();
+        assert!(!life.fail(first), "an older opening's failure");
+        assert!(life.waiting(), "the click still waits");
+        assert!(!life.settle(true, false), "and its window stays");
+        assert!(life.fail(second), "the latest one's failure tells the click");
+        assert!(life.settle(true, false), "and its window goes");
     }
 
     /// Closing destroys the flyout once: the focus it loses as it goes
