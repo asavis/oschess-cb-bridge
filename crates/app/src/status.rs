@@ -1,8 +1,10 @@
 //! The bridge's state as the app shows it: the tray mark's colour and
 //! tooltip, and the view the windows draw.
 
+use std::time::{Duration, Instant};
+
 use bridge::catalog::State;
-use bridge::snapshot::Snapshot;
+use bridge::snapshot::{Pulse, Snapshot};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
@@ -231,6 +233,39 @@ pub fn icon_file(theme: Theme, tray: Tray, size: u32) -> String {
     format!("{}-{}-{size}.png", theme.name(), tray.name())
 }
 
+/// How often the status thread takes the bridge's snapshot when nothing asks
+/// for it sooner (#348): a snapshot looks at every database's files, which with
+/// hundreds of databases costs a third of a second.
+pub const SNAPSHOT_EVERY: Duration = Duration::from_secs(10);
+
+/// When the status thread, which ticks once a second, takes the bridge's
+/// snapshot (#348): at its first tick; every [`SNAPSHOT_EVERY`]; at every
+/// tick while a window that shows the state is open; and at once when the
+/// bridge's [`Pulse`] changed, as when a download, an index build or an
+/// analysis begins or ends, an index build that waited for its turn starts or
+/// waits again, the server stops or a browser is first served.
+/// At the other ticks the tray keeps the view it drew.
+#[derive(Default)]
+pub struct Pace {
+    last: Option<(Instant, Option<Pulse>)>,
+}
+
+impl Pace {
+    /// Whether to take a snapshot at `now`, with a window open (`shown`) or
+    /// not, and the bridge's `pulse` (none when it does not serve); noted as
+    /// taken when it is.
+    pub fn due(&mut self, now: Instant, shown: bool, pulse: Option<Pulse>) -> bool {
+        let due = match self.last {
+            None => true,
+            Some((at, seen)) => shown || seen != pulse || now.saturating_duration_since(at) >= SNAPSHOT_EVERY,
+        };
+        if due {
+            self.last = Some((now, pulse));
+        }
+        due
+    }
+}
+
 /// Snapshots and views for this crate's tests, built in one place so that a
 /// field added to either is filled in once.
 #[cfg(test)]
@@ -289,6 +324,41 @@ mod tests {
     use super::testing::view;
     use super::*;
     use crate::i18n::Lang;
+
+    /// The snapshot is taken at the first tick, then every ten seconds, at
+    /// every tick while a window is open, and at once when the bridge's pulse
+    /// changes (#348).
+    #[test]
+    fn the_snapshot_is_taken_at_the_slower_pace_and_when_asked() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let quiet = Some(Pulse::default());
+        let mut pace = Pace::default();
+        assert!(pace.due(at(0), false, quiet), "the first tick");
+        let taken: Vec<u64> = (1..=25).filter(|&s| pace.due(at(s), false, quiet)).collect();
+        assert_eq!(taken, [10, 20], "every ten seconds");
+        assert!(pace.due(at(26), true, quiet), "a window opened");
+        assert!(pace.due(at(27), true, quiet), "and every tick while it is open");
+        assert!(!pace.due(at(28), false, quiet), "closed again");
+        let downloading = Some(Pulse { changes: 1, ..Pulse::default() });
+        assert!(pace.due(at(29), false, downloading), "work began");
+        assert!(!pace.due(at(30), false, downloading));
+        let ended = Pulse { changes: 2, ..Pulse::default() };
+        let done = Some(ended);
+        assert!(pace.due(at(31), false, done), "work ended");
+        for changed in
+            [Pulse { stopped: true, ..ended }, Pulse { analysing: true, ..ended }, Pulse { served: true, ..ended }]
+        {
+            let mut pace = Pace::default();
+            assert!(pace.due(at(0), false, done));
+            assert!(!pace.due(at(1), false, done));
+            assert!(pace.due(at(2), false, Some(changed)), "{changed:?}");
+        }
+        let mut stopped = Pace::default();
+        assert!(stopped.due(at(0), false, done));
+        assert!(stopped.due(at(1), false, None), "the bridge no longer serves");
+        assert!(!stopped.due(at(2), false, None));
+    }
 
     #[test]
     fn the_mark_and_the_tooltip_follow_the_state() {

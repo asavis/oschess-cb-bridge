@@ -624,6 +624,13 @@ impl Catalog {
     /// call it once they send none. It asks no build to stop, since a stopped
     /// build queues itself again. After `limit`, from the call, `Busy` names
     /// what still waits or runs, the keeper's look included.
+    /// How many times the catalog's background work began or ended so far
+    /// ([`Activity::changes`]): a download, an index build, a header index, a
+    /// names file, a keeper's look (#348).
+    pub fn changes(&self) -> u64 {
+        self.shared.activity.changes()
+    }
+
     pub fn settle(&self, limit: Duration) -> Result<(), Busy> {
         let deadline = Instant::now() + limit;
         // Takes a lock that is never held across a look: a stop never waits
