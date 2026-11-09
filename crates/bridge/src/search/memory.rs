@@ -187,7 +187,8 @@ pub fn register(cache: Weak<dyn Evict>) {
     caches.push(cache);
 }
 
-fn evict_all() {
+/// Drops what the caches retain (#365), or when the budget runs short.
+pub fn evict_all() {
     let live: Vec<Arc<dyn Evict>> = lock(&CACHES).iter().filter_map(Weak::upgrade).collect();
     for cache in live {
         cache.evict();

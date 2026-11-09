@@ -189,6 +189,9 @@ fn watch(app: tauri::AppHandle, shared: Arc<Shared>) {
         loop {
             let shown = app.webview_windows().values().any(|w| w.is_visible().unwrap_or(false));
             let pulse = shared.pulse();
+            if shown || asked != Asked::Nothing {
+                shared.touch();
+            }
             let due = pace.due(std::time::Instant::now(), shown, asked, pulse);
             let view = if due { shared.current_view() } else { last.clone().unwrap_or_else(|| shared.view()) };
             let theme = system::taskbar_theme();

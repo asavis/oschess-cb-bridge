@@ -670,10 +670,17 @@ impl Registry {
         *s = State::Idle;
     }
 
+    /// Whether the index of database `id` is held in memory. For tests.
+    #[doc(hidden)]
+    pub fn holds(&self, id: &str) -> bool {
+        matches!(*lock(&self.state(id)), State::Ready(_))
+    }
+
     /// Drops every index held in memory and leaves its files as they are: the
-    /// next request opens them again. A build running goes on. Tests release a
-    /// bridge's indexes before they change or remove the files, which a
-    /// mapped move stream keeps from being replaced or removed on Windows.
+    /// next request opens them again. A build running goes on. A bridge nobody
+    /// has used for a while does this (#365), and tests release a bridge's
+    /// indexes before they change or remove the files, which a mapped move
+    /// stream keeps from being replaced or removed on Windows.
     pub fn release(&self) {
         lock(&self.masks.slots).retain(|_, slot| matches!(slot.state, MaskState::Building { .. }));
         let states: Vec<Arc<Mutex<State>>> = lock(&self.states).values().cloned().collect();

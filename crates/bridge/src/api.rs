@@ -97,6 +97,10 @@ pub struct App {
     /// to do waits for before it looks at any file.
     pub requests: AtomicU64,
     pub last_request: Mutex<Option<Instant>>,
+    /// When a user last looked through the tray app, at a window or at the
+    /// mark. The tray's own snapshots, which follow the keeper's work, do not
+    /// count: the keeper would keep the bridge in use for ever.
+    pub last_look: Mutex<Option<Instant>>,
     /// How long an open connection may wait for a request before the bridge
     /// closes it: [`IDLE_TIMEOUT`]. The tests' bridges wait longer, since a
     /// loaded machine can stall a test between its connect and its write
@@ -111,6 +115,12 @@ pub struct App {
 }
 
 impl App {
+    /// When the bridge was last used: a request served, or a user's look
+    /// through the tray app (#365).
+    pub fn last_used(&self) -> Option<Instant> {
+        (*lock(&self.last_request)).max(*lock(&self.last_look))
+    }
+
     /// Whether the policy served a request within `within` of now (#365).
     pub fn asked_within(&self, within: Duration) -> bool {
         lock(&self.last_request).is_some_and(|at| at.elapsed() < within)
@@ -129,6 +139,7 @@ impl App {
             served: AtomicBool::new(false),
             requests: AtomicU64::new(0),
             last_request: Mutex::new(None),
+            last_look: Mutex::new(None),
             idle_timeout: IDLE_TIMEOUT,
             busy_read: BUSY_READ,
         }

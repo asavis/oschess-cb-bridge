@@ -1260,7 +1260,10 @@ With `q` the answer also acknowledges the search (#268):
     use whose index is not of the database as it is now: once built, whenever
     the database changes. A bridge nobody uses looks at no database and builds
     nothing: the index of a database that changed meanwhile is built when
-    oschess is used again.
+    oschess is used again. After those 10 minutes it also lets go of what
+    the last use left in memory: the open databases, the indexes held and the
+    search caches. The first request after that opens them again, and takes
+    longer.
     A database is in use when its index is kept on disk, or its explorer or
     the games of one of its positions were asked for since the bridge
     started; the database with the most records is in use from the start. A

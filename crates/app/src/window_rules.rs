@@ -238,6 +238,7 @@ fn only_the_windows_a_user_opens_ask_for_a_look() {
     }
     let start = source(&files, "mod.rs");
     assert!(!start.contains(".ask("), "the start asks for a look");
+    assert!(start.contains("shared.touch()"), "a window or a hover does not count as using the bridge");
 }
 
 /// No WebView2 lives while no window is open (#365): nothing builds the

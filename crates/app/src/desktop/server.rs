@@ -117,6 +117,13 @@ impl Shared {
         self.running.as_ref().map(|r| r.background.pulse())
     }
 
+    /// A user is looking through the app, which keeps the bridge in use.
+    pub fn touch(&self) {
+        if let Some(r) = &self.running {
+            r.background.touch();
+        }
+    }
+
     /// Asks the status thread for a look at the databases, and wakes it.
     pub fn ask(&self, asked: Asked) {
         let mut waiting = self.asked.lock().unwrap_or_else(|e| e.into_inner());
