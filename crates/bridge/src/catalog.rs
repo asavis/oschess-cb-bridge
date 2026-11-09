@@ -386,6 +386,12 @@ impl Entry {
         self.held.kept.load(Ordering::Relaxed)
     }
 
+    /// Whether the database is open in memory. For tests.
+    #[doc(hidden)]
+    pub fn is_open(&self) -> bool {
+        lock(&self.held.open).is_some()
+    }
+
     /// The download running or queued, if any.
     pub fn progress(&self) -> Option<Arc<Progress>> {
         lock(&self.held.running).clone()
@@ -674,6 +680,23 @@ impl Catalog {
     /// holds: no file is looked at (#365).
     pub fn downloading(&self) -> bool {
         self.listed().iter().any(|entry| entry.progress().is_some())
+    }
+
+    /// Lets go of what using the bridge left in memory, when nothing runs:
+    /// the open databases, the position indexes, the heads files and all the
+    /// search caches retain (#365). Their next use opens them again. Whether
+    /// it did: not while a request or any of the catalog's work runs.
+    pub fn release_unused(&self) -> bool {
+        if crate::foreground::running() || self.shared.activity.wait_idle(Instant::now()).is_err() {
+            return false;
+        }
+        for entry in self.listed().iter() {
+            *lock(&entry.held.open) = None;
+        }
+        self.explorer.release();
+        self.heads.release();
+        crate::search::memory::evict_all();
+        true
     }
 
     /// The names of the databases on the list, read first if its sources

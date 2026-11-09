@@ -592,6 +592,47 @@ fn the_keeper_looks_only_for_a_while_after_a_request() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Some time after the last request, what the requests left in memory is let
+/// go, and the next request opens it again and answers the same (#365).
+#[test]
+fn memory_is_let_go_some_time_after_the_last_request() {
+    let db = copies("background-release", 10);
+    let path = db.dir().join("db.2cbh");
+    let (id, dir) = (id_of(&path), data_dir("release"));
+    let bridge = served(Catalog::new([path.clone()]), &dir);
+    let explorer = &bridge.app.catalog.explorer;
+    explorer.set_keeping(TICK, Duration::from_secs(3600));
+    explorer.set_keeping_after_requests(Some(Duration::from_millis(500)));
+    bridge::explorer::keeper::start(&bridge.app);
+    let mut answer = String::new();
+    until("the explorer did not answer", WAIT_LIMIT, || {
+        let (status, body) = bridge.explorer(&id);
+        answer = body;
+        status == 200
+    });
+    let entry = Arc::clone(&bridge.app.catalog.entries()[0]);
+    until("the memory was not let go", WAIT_LIMIT, || !entry.is_open() && !explorer.holds(&id));
+    until("the next request did not answer", WAIT_LIMIT, || bridge.explorer(&id).0 == 200);
+    assert!(entry.is_open() && explorer.holds(&id), "the next request opens them again");
+    assert_eq!(bridge.explorer(&id), (200, answer), "and answers the same");
+    drop(bridge);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What used the bridge is not let go while work runs: the memory waits.
+#[test]
+fn memory_is_not_let_go_while_work_runs() {
+    let db = copies("background-release-work", 10);
+    let catalog = Catalog::new([db.dir().join("db.2cbh")]);
+    let (release, held) = mpsc::channel::<()>();
+    assert!(catalog.pgn().queue().submit(Box::new(move || {
+        let _ = held.recv();
+    })));
+    assert!(!catalog.release_unused(), "a job of the catalog's runs");
+    release.send(()).unwrap();
+    until("the job did not end", WAIT_LIMIT, || catalog.release_unused());
+}
+
 /// A database replaced while the bridge watches it waits for the quiet
 /// period, even when the replacement's files keep older modification times,
 /// as a synced or restored copy's do; then it is built.

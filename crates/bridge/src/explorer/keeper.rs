@@ -42,7 +42,8 @@ pub const QUIET: Duration = Duration::from_secs(60);
 /// How long after the last request the keeper still looks (#365): with no
 /// request for this long oschess is not being used, and a bridge that nobody
 /// uses touches no file. The index of a database changed meanwhile is built
-/// again once oschess is used again.
+/// again once oschess is used again. After this long nothing is left in
+/// memory either ([`crate::catalog::Catalog::release_unused`]).
 pub const ACTIVE_FOR: Duration = Duration::from_secs(10 * 60);
 /// The kind of work a look of the keeper counts as in the catalog's activity
 /// (#236).
@@ -77,7 +78,8 @@ pub(super) struct Seen {
 /// [`TICK`] while a request came within [`ACTIVE_FOR`] (#365), and ends once
 /// `app` is gone or the keeper is stopped ([`Registry::stop_keeping`]). A
 /// tick with no such request looks at nothing and counts as no work, so that
-/// nothing else wakes for it. It keeps indexes only in an index
+/// nothing else wakes for it, and once nothing has used the bridge for that
+/// long it lets go of what the last use left in memory. It keeps indexes only in an index
 /// folder the bridge was given ([`Registry::set_dir`]), never in the default
 /// one. The priority of the builds it queues is chosen now
 /// ([`machine::BACKGROUND_MODE`]) and logged.
@@ -86,6 +88,8 @@ pub fn start(app: &Arc<App>) {
     let app: Weak<App> = Arc::downgrade(app);
     let spawned =
         std::thread::Builder::new().name("bridge-keeper".into()).stack_size(crate::THREAD_STACK).spawn(move || {
+            // The last use whose memory was let go.
+            let mut released = None;
             while let Some(app) = app.upgrade() {
                 let registry = &app.catalog.explorer;
                 let Keeping { tick, active_for, .. } = *lock(&registry.keeping);
@@ -98,6 +102,15 @@ pub fn start(app: &Arc<App>) {
                     drop(look);
                 } else if registry.stopped() {
                     return;
+                }
+                if let Some(within) = active_for
+                    && let Some(used) = app.last_used()
+                    && released != Some(used)
+                    && used.elapsed() >= within
+                    && app.catalog.release_unused()
+                {
+                    released = Some(used);
+                    crate::log!("let go of the memory left by the last use");
                 }
                 drop(app);
                 std::thread::sleep(tick);

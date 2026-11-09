@@ -271,6 +271,7 @@ impl Background {
     /// The state now. Checking a database opens it when it is ready, so call
     /// this from a thread that may wait on the disk.
     pub fn snapshot(&self) -> Snapshot {
+        *lock(&self.app.last_snapshot) = Some(std::time::Instant::now());
         let databases = Database::all(&self.app.catalog.entries());
         let catalog = &self.app.catalog;
         let (headers, indexing) = builds(catalog);

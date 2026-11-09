@@ -289,6 +289,12 @@ pub enum Lookup {
 }
 
 impl Registry {
+    /// Lets go of the heads files held in memory: the next lookup reads them
+    /// again from their files (#365).
+    pub fn release(&self) {
+        lock(&self.states).retain(|_, state| !matches!(state, State::Ready(_)));
+    }
+
     /// Sets the size from which databases get a heads file, for tests.
     pub fn set_min_records(&self, n: u32) {
         *lock(&self.min_records) = Some(n);
