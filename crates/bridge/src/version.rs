@@ -71,15 +71,18 @@ mod tests {
 
     #[test]
     fn a_release_reads_as_its_number_and_a_build_by_hand_as_dev() {
-        for release in ["1.2611.801", "1.2701.101", "1.2701.1001", "1.2612.3199", "2.2611.801"] {
+        // The allocator's own edges: 2000 to 2099, any day, major to 65535.
+        let releases = ["1.2611.801", "1.2701.101", "1.2701.1001", "1.2612.3199", "2.2611.801"];
+        let edges = ["1.1901.101", "1.1.101", "1.9912.3199", "65535.2611.801"];
+        for release in releases.into_iter().chain(edges) {
             assert_eq!(shown(release), release);
         }
-        for by_hand in
-            ["1.4.0", "0.1.0", "1.1999.801", "1.2613.801", "1.2600.801", "1.2611.99", "1.2611.800", "1.2611.3201"]
-        {
-            assert_eq!(shown(by_hand), "dev", "{by_hand}");
+        let by_hand = ["1.4.0", "0.1.0", "0.2611.801", "65536.2611.801", "1.10001.101", "1.9913.801"];
+        let not_a_day = ["1.1999.801", "1.2613.801", "1.2600.801", "1.2611.99", "1.2611.800", "1.2611.3201"];
+        for version in by_hand.into_iter().chain(not_a_day) {
+            assert_eq!(shown(version), "dev", "{version}");
         }
-        for not_one in ["", "1.2611", "1.2611.801.0", "1.2611.x"] {
+        for not_one in ["", "1.2611", "1.2611.801.0", "1.2611.x", "+1.2611.801", "01.2611.801", "1.2611.0801"] {
             assert_eq!(shown(not_one), "dev", "{not_one:?}");
         }
     }
