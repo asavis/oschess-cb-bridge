@@ -262,6 +262,12 @@ impl Background {
         }
     }
 
+    /// A user is looking through the app: a window is open, or the pointer
+    /// came over the mark (#365).
+    pub fn touch(&self) {
+        *lock(&self.app.last_look) = Some(std::time::Instant::now());
+    }
+
     /// The names of the databases on the list, without looking at any of
     /// them (#365).
     pub fn names(&self) -> Vec<String> {
@@ -271,7 +277,6 @@ impl Background {
     /// The state now. Checking a database opens it when it is ready, so call
     /// this from a thread that may wait on the disk.
     pub fn snapshot(&self) -> Snapshot {
-        *lock(&self.app.last_snapshot) = Some(std::time::Instant::now());
         let databases = Database::all(&self.app.catalog.entries());
         let catalog = &self.app.catalog;
         let (headers, indexing) = builds(catalog);
@@ -336,6 +341,10 @@ mod tests {
         let port = bridge.port;
         let background = Background::serve(bridge).unwrap();
         assert_eq!(background.names(), ["Games", "Old", "db"], "before anything looked at them (#365)");
+        background.snapshot();
+        assert_eq!(background.app.last_used(), None, "the tray's own snapshot is no use of the bridge (#365)");
+        background.touch();
+        assert!(background.app.last_used().is_some(), "a user's look is");
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let request = format!(
             "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
