@@ -23,6 +23,25 @@ pub fn is_newer(version: &str, than: &str) -> bool {
     numbers(version).zip(numbers(than)).is_some_and(|(version, than)| version > than)
 }
 
+/// Whether `version` is one a release was stamped with: `major.yymm.ddnn`,
+/// as `scripts/store_version.py` allocates them (`docs/release.md`).
+pub fn is_release(version: &str) -> bool {
+    let numbers: Option<Vec<u32>> = version.split('.').map(|n| n.parse().ok()).collect();
+    let Some(&[major, yymm, ddnn]) = numbers.as_deref() else { return false };
+    major >= 1
+        && yymm >= 2000
+        && (1..=12).contains(&(yymm % 100))
+        && (1..=31).contains(&(ddnn / 100))
+        && (1..=99).contains(&(ddnn % 100))
+}
+
+/// What a person reads for the running `version`: a release's number, and
+/// `dev` for a build made by hand, whose committed number no release ever
+/// had (#387). Only for showing: what compares versions keeps the number.
+pub fn shown(version: &str) -> &str {
+    if is_release(version) { version } else { "dev" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +64,21 @@ mod tests {
         assert!(!is_newer("1.2.0", "1.2"));
         assert!(!is_newer("1.2", "1.2.0"));
         assert!(!is_newer("19.0", "19"));
+    }
+
+    #[test]
+    fn a_release_reads_as_its_number_and_a_build_by_hand_as_dev() {
+        for release in ["1.2611.801", "1.2701.101", "1.2701.1001", "1.2612.3199", "2.2611.801"] {
+            assert_eq!(shown(release), release);
+        }
+        for by_hand in
+            ["1.4.0", "0.1.0", "1.1999.801", "1.2613.801", "1.2600.801", "1.2611.99", "1.2611.800", "1.2611.3201"]
+        {
+            assert_eq!(shown(by_hand), "dev", "{by_hand}");
+        }
+        for not_one in ["", "1.2611", "1.2611.801.0", "1.2611.x"] {
+            assert_eq!(shown(not_one), "dev", "{not_one:?}");
+        }
     }
 
     #[test]
