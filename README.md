@@ -5,21 +5,31 @@ holds them: the ChessBase 2 format (`.2cbh`, `.2cbg`, `.2lid`, …, written by
 ChessBase 17 and later) and the classic format (`.cbh`, `.cbg`, `.cba`, …).
 PGN files (`.pgn`) are read as databases too.
 
+It is made for [oschess](https://oschess.org): the bridge brings the databases
+and chess engines of your computer to the oschess library and analysis board.
+
 The repository is a Cargo workspace:
 
 | Crate | What it is |
 |---|---|
 | [`cbformat`](crates/cbformat) | A reader library for both formats: game headers, players and tournaments, the full move tree of every game, checked move by move on a board, and its annotations. PGN output. A PGN file read as a database through a header index (`pgnfile`). `view::Base` reads every format the same way. |
-| [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, and `bridge` to run the bridge in a console. |
+| [`cbtool`](crates/cbtool) | A command-line tool over the library: `info`, `verify`, `pgn`, `databases`, `profile` to time the bridge's flows, and `bridge` to run the bridge in a console. |
 | [`chesscore`](crates/chesscore) | A dependency-free chess core: positions, legal moves, FEN, Chess960 and the Polyglot position key, tested against published perft counts and a `cozy-chess` oracle. |
-| [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
-| [`app`](crates/app) | The bridge for Windows as a tray app built with [Tauri 2](https://tauri.app): the bridge's state in the tray, a status flyout, settings and a first-run window. Released as `oschess-bridge.exe` and its installer. Windows only; elsewhere it builds as a stub. |
+| [`bridge`](crates/bridge) | `oschess-bridge`: serves the databases and chess engines of this machine to the [oschess](https://oschess.org) web app over a loopback-only HTTP API, specified in [docs/api.md](docs/api.md). |
+| [`app`](crates/app) | The bridge for Windows as a tray app built with [Tauri 2](https://tauri.app): the bridge's state in the tray, a status flyout, settings and a first-run wizard. Released as `oschess-bridge.exe` and its installer. Windows only; elsewhere it builds as a stub. |
 
 ## Install
 
 The bridge runs on Windows 10 and 11. Your databases stay on your computer:
 the bridge serves them only to the oschess page in a browser on the same
 computer.
+
+The simplest way is the
+[Microsoft Store](https://apps.microsoft.com/detail/9P65J7XR0RPZ): Microsoft
+signs that package, so Windows neither warns about it nor blocks it. Start at
+step 4 once the Store has installed and opened it. The first three steps are
+for a computer without the Store. Install one copy or the other, not both:
+they use the same port.
 
 1. Open the [latest release](https://github.com/asavis/oschess-cb-bridge/releases/latest)
    and download `oschess-bridge-setup.exe`. Your browser may warn that the file
@@ -29,17 +39,19 @@ computer.
    protected your PC»: choose **More info**, then **Run anyway**. Where Smart
    App Control is on (Windows 11, Windows Security → App & browser control),
    Windows blocks unsigned programs outright and offers no way past it; such
-   a computer needs a signed release. The release notes say whether a release
-   is signed.
+   a computer needs the copy from the Microsoft Store or a signed release. The
+   release notes say whether a release is signed.
 3. The installer needs no administrator: it installs for your Windows user
    into `%LOCALAPPDATA%\oschess bridge`, in Ukrainian or English after the
    Windows display language. Choose **Next** through its pages and
    **Install**; if Windows lacks Microsoft's WebView2 runtime, the installer
    downloads it first. On the last page leave «Run oschess bridge» ticked and
    choose **Finish**.
-4. The bridge starts in the tray, as the oschess mark by the clock. The «The
-   bridge is installed» window opens, and so does your default browser, on the
-   oschess Library with the pairing link.
+4. The bridge starts in the tray, as the oschess mark by the clock, and shows
+   the «Let's set up the bridge» wizard: Databases, Engine and Start-up.
+   Everything it found is already chosen, so **Next** is usually all it takes.
+   Its last screen, «All set», opens your default browser on the oschess
+   Library with the pairing link.
 5. The browser asks whether oschess may access devices on your local network.
    Choose **Allow**: the bridge is on your own computer, and this lets the page
    reach it. The Library's ChessBase section connects, and the tray mark's
@@ -49,16 +61,18 @@ If you chose **Block**, or take the permission back later, the ChessBase
 section says so. Allow it again in the site's settings (the icon to the left of
 the address → Site settings → Local network access), and the page connects
 without pairing again. If the page did not open or did not connect, the
-«The bridge is installed» window shows the pairing code: in oschess, open the
-Library → ChessBase → «Paste the code by hand».
+wizard's last screen shows the pairing code, and so does «Pairing code…» in
+the tray menu: in oschess, open the Library → ChessBase → «Paste the code by
+hand».
 
 Browsers: Chrome and Microsoft Edge 142 or later. Firefox has not been tried
 yet.
 
 Right-click the tray mark for the menu: open oschess (it pairs the browser it
 opens, so another browser or profile connects with nothing to copy), the
-settings, the pairing code, «Start with Windows» (off until you tick it), checking for updates, and
-quitting. Updates install by themselves while the bridge is idle, unless
+settings, the pairing code, reporting a problem, «Start with Windows» (on
+after the wizard's Start-up step unless you switch it off there), checking for
+updates, and quitting. Updates install by themselves while the bridge is idle, unless
 «Update automatically» is off in the settings. Idle means that no database is
 downloading or opening, no position index is being built, no Stockfish is
 being installed, and no analysis began less than five minutes ago; an
@@ -208,17 +222,21 @@ workers that all searches share, one per core and at most 16;
 or `OSCHESS_BRIDGE_SEARCH_MIB` ([docs/api.md](docs/api.md#search-memory)).
 
 The first request for a database's positions builds its position index in the
-background, on half of those workers and within the same memory, and keeps it
+background, on all of those workers but two and never fewer than half of them,
+within the same memory, and keeps it
 in its index folder (`%LOCALAPPDATA%\oschess bridge\index` on Windows, the data
 folder's `index` elsewhere): the games, results, moves and notable games of
 every position the games reach in their first 20 plies, and every game's main
 line, from which the positions past them are found. For the Mega Database it
 takes about half a minute and some 4 GB, and no other room while it is built.
 Once kept, the index answers from the first request after the bridge starts,
-until the database changes. The bridge keeps the indexes of the databases in
-use up to date by itself (#149): those whose index is kept, or whose positions
-were asked for since it started, and the largest ready database from the
-start. Such a database's index is built in the background, at a low priority
+until the database changes. While oschess is used, that is, until 10 minutes
+after the last request the bridge served (#365), the bridge keeps the indexes
+of the databases in use up to date by itself (#149): those whose index is
+kept, or whose positions were asked for since it started, and the largest
+ready database from the start. A bridge nobody uses looks at no database and
+builds nothing. Such a database's index is built in the background, on half of
+the workers, at a low priority
 and not while the computer runs on battery, once the database has not changed
 for a minute; a request for another database's positions goes first. It gives
 way to the answers a user waits for: while a search, a sort, a list of games,
