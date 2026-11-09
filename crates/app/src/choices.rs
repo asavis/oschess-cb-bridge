@@ -12,11 +12,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use bridge::config;
 use bridge::engines::Found;
 use bridge::stockfish::{self, Build, Progress};
+use bridge::sync::lock;
 use serde::Serialize;
 
 use crate::prefs;
@@ -61,7 +62,7 @@ impl Choices {
         engine: PathBuf,
         probe: impl FnOnce(&Path) -> Result<(), E>,
     ) -> Result<(), E> {
-        let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = lock(&self.choosing);
         probe(&engine)?;
         Ok(self.save(config_path, engine)?)
     }
@@ -123,7 +124,7 @@ impl Choices {
         probe: impl FnOnce(&Path) -> Result<(), String>,
         confirm: impl FnOnce() -> Option<G>,
     ) -> Result<bool, String> {
-        let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = lock(&self.choosing);
         probe(&exe)?;
         let Some(_confirmed) = confirm() else { return Ok(false) };
         // A choice made while the download ran stands; the build stays listed.
@@ -136,7 +137,7 @@ impl Choices {
     /// `None`, with `settled` not run, while an installation runs.
     pub fn while_settled<R>(&self, settled: impl FnOnce() -> R) -> Option<R> {
         let _installing = self.begin_installing().ok()?;
-        let _one = self.choosing.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = lock(&self.choosing);
         Some(settled())
     }
 

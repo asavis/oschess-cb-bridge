@@ -3,6 +3,7 @@
 //! scripts, which reached no log at all. The log names no file of the user's
 //! (#117), so text that may carry a path has it replaced by `<path>`.
 
+use bridge::sync::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -183,7 +184,7 @@ pub struct PageErrors {
 
 impl PageErrors {
     pub fn admit(&self, label: &str) -> Admit {
-        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts = lock(&self.counts);
         let count = counts.entry(label.to_string()).or_default();
         *count = count.saturating_add(1);
         match (*count).cmp(&PAGE_ERRORS) {

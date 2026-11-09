@@ -30,6 +30,7 @@ use super::system::wide;
 use super::updater::report;
 use crate::channel::STORE_PAGE;
 use crate::updates::{self, Phase, StoreCalls, StoreOutcome, StoreStep};
+use bridge::sync::lock;
 
 /// What automatic looks told this run: `Some(false)` that an update waits,
 /// `Some(true)` that one is required. A notice is repeated only when it says
@@ -199,7 +200,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
             })
         }
         StoreStep::Tell { mandatory } => {
-            let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+            let mut told = lock(&TOLD);
             if told.is_none_or(|was| mandatory && !was) {
                 let title = if mandatory {
                     strings.get("toast.update.required.title")

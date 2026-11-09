@@ -9,7 +9,7 @@ use bridge::config::{self, DEFAULT_PORT};
 use bridge::pairing;
 use bridge::snapshot::{Background, Pulse};
 use bridge::start::{self, Cause, Options};
-use bridge::sync::lock;
+use bridge::sync::{lock, unpoisoned};
 
 use crate::diagnostics::PageErrors;
 use crate::i18n::Strings;
@@ -135,10 +135,8 @@ impl Shared {
     /// Waits up to `limit` for a look to be asked for, and takes what asked.
     pub fn wait_asked(&self, limit: Duration) -> Asked {
         let waiting = lock(&self.asked);
-        let (mut waiting, _) = self
-            .wake
-            .wait_timeout_while(waiting, limit, |asked| *asked == Asked::Nothing)
-            .unwrap_or_else(|e| e.into_inner());
+        let (mut waiting, _) =
+            unpoisoned(self.wake.wait_timeout_while(waiting, limit, |asked| *asked == Asked::Nothing));
         std::mem::take(&mut *waiting)
     }
 

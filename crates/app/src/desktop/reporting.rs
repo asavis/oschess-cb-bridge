@@ -17,7 +17,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use super::{alerts, channel, shared, system};
 use crate::diagnostics;
 use crate::reports::{self, Context, Dsn, Kind, Outbox, Report, Transport};
-use bridge::sync::lock;
+use bridge::sync::{lock, unpoisoned};
 
 /// How long the sender sleeps when nothing waits; a report filed meanwhile
 /// wakes it.
@@ -268,7 +268,7 @@ fn send() {
         let wait = if waits { reports::retry_after(failures) } else { IDLE };
         let (filed, wake) = &reporter.filed;
         let guard = lock(filed);
-        let (mut guard, _) = wake.wait_timeout_while(guard, wait, |filed| !*filed).unwrap_or_else(|e| e.into_inner());
+        let (mut guard, _) = unpoisoned(wake.wait_timeout_while(guard, wait, |filed| !*filed));
         *guard = false;
     }
 }
