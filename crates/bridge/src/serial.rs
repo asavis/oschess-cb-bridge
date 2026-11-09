@@ -150,11 +150,9 @@ mod tests {
         assert!(lock(&serial.queue).0.is_empty());
         serial.refuse_starts(false);
         assert!(serial.submit(job(&ran)));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while ran.load(Ordering::SeqCst) < 1 || lock(&serial.queue).1 {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
+        crate::testing::until("the job ran and the queue stopped", std::time::Duration::from_secs(10), || {
+            ran.load(Ordering::SeqCst) >= 1 && !lock(&serial.queue).1
+        });
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 

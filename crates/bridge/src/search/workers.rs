@@ -569,13 +569,7 @@ pub(crate) mod tests {
             return;
         }
         assert_eq!(threads(), 1);
-        let until = |what: &str, done: &dyn Fn() -> bool| {
-            let end = Instant::now() + PATIENCE;
-            while !done() {
-                assert!(Instant::now() < end, "{what} within {PATIENCE:?}");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
+        let until = |what: &str, done: &dyn Fn() -> bool| crate::testing::until(what, PATIENCE, done);
         let busy = BUSY.load(Ordering::SeqCst);
         std::thread::scope(|s| {
             // Another pass holds every worker until released, or until a

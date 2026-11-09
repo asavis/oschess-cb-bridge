@@ -301,6 +301,8 @@ mod tests {
     use super::*;
     use crate::access::{DEFAULT_ORIGINS, Policy};
     use crate::catalog::Catalog;
+    use crate::machine::Machine;
+    use crate::testing::{HeldDownload, Power, until};
     use cbformat::fixture::{Builder, TempDb, lid_header, quiet};
     use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
@@ -435,28 +437,9 @@ mod tests {
     /// reads the pulse and must not restart the bridge over it.
     #[test]
     fn a_download_is_work_in_the_pulse_as_in_a_snapshot() {
-        use crate::fetch::Cloud;
         use crate::sources::Sources;
-        use std::sync::atomic::AtomicBool;
-
-        struct Provider {
-            cloud: AtomicBool,
-            release: AtomicBool,
-        }
-        impl Cloud for Provider {
-            fn is_cloud_only(&self, _: &std::path::Path, _: &std::fs::Metadata) -> bool {
-                self.cloud.load(Ordering::SeqCst)
-            }
-            fn fetch(&self, _: &std::path::Path, _: &mut dyn FnMut(u64)) -> std::io::Result<()> {
-                while !self.release.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                self.cloud.store(false, Ordering::SeqCst);
-                Ok(())
-            }
-        }
         let db = ready("snapshot-download", 3);
-        let provider = Arc::new(Provider { cloud: AtomicBool::new(true), release: AtomicBool::new(false) });
+        let provider = Arc::new(HeldDownload::new());
         let sources = Sources { fixed: vec![db.dir().join("db.2cbh")], ..Sources::default() };
         let bridge = bridge_of(Catalog::with_sources(sources, provider.clone()));
         let app = Arc::clone(&bridge.app);
@@ -467,12 +450,8 @@ mod tests {
         let during = background.pulse();
         assert!(during.downloading && during.working() && during.busy());
         assert!(background.snapshot().work.contains(&Work::Downloading));
-        provider.release.store(true, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while background.pulse().downloading {
-            assert!(std::time::Instant::now() < deadline, "the download did not end");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        provider.release();
+        until("the download did not end", Duration::from_secs(60), || !background.pulse().downloading);
         assert!(!background.pulse().busy());
         assert!(background.snapshot().work.is_empty());
         assert!(app.catalog.settle(Duration::from_secs(60)).is_ok(), "the download's work did not end");
@@ -487,31 +466,15 @@ mod tests {
     #[test]
     fn a_waiting_build_that_starts_changes_the_pulse() {
         use crate::explorer::runs::{Limits, Progress};
-        use crate::machine::Machine;
         use std::sync::atomic::AtomicBool;
 
-        struct Power(AtomicBool);
-        impl Machine for Power {
-            fn on_battery(&self) -> bool {
-                self.0.load(Ordering::Relaxed)
-            }
-            fn free_bytes(&self, _: &std::path::Path) -> Option<u64> {
-                None
-            }
-        }
         static HELD: AtomicBool = AtomicBool::new(true);
         fn held(_: &Progress) {
             while HELD.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        let until = |what: &str, done: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            while !done() {
-                assert!(std::time::Instant::now() < deadline, "{what}");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
+        let until = |what: &str, done: &dyn Fn() -> bool| until(what, Duration::from_secs(60), done);
         let db = ready("snapshot-waiting-build", 3);
         let dir = std::env::temp_dir().join(format!("bridge-snapshot-waiting-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

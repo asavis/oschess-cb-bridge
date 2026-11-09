@@ -343,30 +343,16 @@ impl Drop for Exit<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::mpsc;
     use std::time::Instant;
 
     use super::*;
+    use crate::testing::Power;
 
     /// The priority of a background build, in whichever mode the variable
     /// chose ([`machine::BACKGROUND_MODE`]).
     fn background_priority() -> Priority {
         Kind::Background.priority()
-    }
-
-    /// A computer whose power the test sets.
-    #[derive(Default)]
-    struct Power(AtomicBool);
-
-    impl Machine for Power {
-        fn on_battery(&self) -> bool {
-            self.0.load(Ordering::Relaxed)
-        }
-
-        fn free_bytes(&self, _: &Path) -> Option<u64> {
-            None
-        }
     }
 
     /// A build that tells `events` of each run, `(id, priority, "run")`, and
