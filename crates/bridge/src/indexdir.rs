@@ -1,11 +1,12 @@
 //! What the bridge's index folders share (#119). The data folder keeps files
 //! of each database: its position index and move stream, heads file and
 //! names files in `index`, and the header index of a PGN file in `pgn`. Each
-//! kind has a registry, which sweeps its folder in its own way; this module
-//! holds what they have in common: the names of the files, how long they
-//! outlive their database's place on the list (#60), how a build's file is
-//! written beside its place and renamed into it (#176), and the CRC-32 and
-//! fixed-width reads the files are checked and decoded with.
+//! kind has a registry, which says what its files are and what holds them;
+//! this module holds what they have in common: the names of the files, the
+//! sweep that removes them once they outlive their database's place on the
+//! list (#60), how a build's file is written beside its place and renamed
+//! into it (#176), and the CRC-32 and fixed-width reads the files are checked
+//! and decoded with.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -105,10 +106,70 @@ pub fn db_id<'a>(name: &'a str, suffixes: &[&str]) -> Option<(&'a str, usize)> {
     id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)).then_some((id, kind))
 }
 
+/// What a file in an index folder is, by its name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kept {
+    /// A database's own file, which outlives its place on the list by the
+    /// grace.
+    Index,
+    /// A build's work, which only the build running for its database uses.
+    Work,
+}
+
+/// A file a sweep found ([`Unlisted::sweep`]), of a database no build holds
+/// once the registry has looked.
+pub struct Swept<'a> {
+    id: &'a str,
+    path: PathBuf,
+    kept: Kept,
+    listed: &'a HashSet<String>,
+    unlisted: &'a mut Unlisted,
+    now: Instant,
+}
+
+impl<'a> Swept<'a> {
+    /// The database the file is of.
+    pub fn id(&self) -> &'a str {
+        self.id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn is_work(&self) -> bool {
+        self.kept == Kept::Work
+    }
+
+    /// Removes the file if nothing will use it: a build's work at once, a
+    /// database's file once its database has been off the list for the grace.
+    /// The registry calls this while it holds what keeps a build of the
+    /// database from starting. `leaving` runs just before a database's file
+    /// goes, to let go of what keeps it open. Whether a database's file went.
+    pub fn settle(self, leaving: impl FnOnce()) -> bool {
+        match self.kept {
+            Kept::Index if self.listed.contains(self.id) => false,
+            Kept::Index => {
+                let due = self.unlisted.due(self.id, self.now);
+                if due {
+                    leaving();
+                }
+                let gone = due && std::fs::remove_file(&self.path).is_ok();
+                if !gone {
+                    self.unlisted.still(self.id);
+                }
+                gone
+            }
+            Kept::Work => {
+                let _ = std::fs::remove_file(&self.path);
+                false
+            }
+        }
+    }
+}
+
 /// The databases off the list whose files a sweep found in an index folder,
-/// since when, and how long their files outlive that. A sweep asks
-/// [`Unlisted::due`] of each such file, marks with [`Unlisted::still`] each
-/// database a file of which stays, and ends with [`Unlisted::retain`].
+/// since when, and how long their files outlive that.
 pub struct Unlisted {
     since: HashMap<String, Instant>,
     /// The databases marked during the sweep that runs.
@@ -133,21 +194,46 @@ impl Unlisted {
         self.grace
     }
 
+    /// Goes once through `dir`, an index folder, for what no database in
+    /// `listed` will use (#60). `kind` names the files the bridge wrote there
+    /// by their database and what they are; anything else is never touched.
+    /// `each` gets every such file: it takes what keeps a build of the
+    /// database from starting and, unless a build holds the file, calls
+    /// [`Swept::settle`] with that still held. A file it leaves alone does not
+    /// count as staying, so its database starts afresh.
+    pub fn sweep(
+        &mut self,
+        dir: &Path,
+        listed: &HashSet<String>,
+        kind: impl Fn(&str) -> Option<(&str, Kept)>,
+        mut each: impl FnMut(Swept<'_>),
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let now = Instant::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some((id, kept)) = name.to_str().and_then(&kind) else { continue };
+            each(Swept { id, path: entry.path(), kept, listed, unlisted: &mut *self, now });
+        }
+        // A database back on the list, or an index gone, starts afresh.
+        self.retain();
+    }
+
     /// Whether a file of `id`, found off the list at `now`, goes: the grace
     /// has passed since a sweep first found `id` off the list.
-    pub fn due(&mut self, id: &str, now: Instant) -> bool {
+    fn due(&mut self, id: &str, now: Instant) -> bool {
         let since = *self.since.entry(id.to_string()).or_insert(now);
         now.duration_since(since) >= self.grace
     }
 
     /// Keeps the time `id` was first found off the list: a file of it stays.
-    pub fn still(&mut self, id: &str) {
+    fn still(&mut self, id: &str) {
         self.still.insert(id.to_string());
     }
 
     /// Ends a sweep. A database none of whose files stayed, being back on the
     /// list or its files gone, starts afresh.
-    pub fn retain(&mut self) {
+    fn retain(&mut self) {
         let still = std::mem::take(&mut self.still);
         self.since.retain(|id, _| still.contains(id));
     }
@@ -430,6 +516,72 @@ mod tests {
         assert!(!sweep(&mut unlisted, "b", 700));
         assert!(!sweep(&mut unlisted, "b", 1299));
         assert!(sweep(&mut unlisted, "b", 1300));
+    }
+
+    /// One sweep of a folder, as every registry's: what a build holds stays,
+    /// with its database's work, and what the bridge did not write stays; a
+    /// database on the list keeps its file and only its leftover work goes;
+    /// the file of a database off the list goes, after `leaving` let go of it.
+    #[test]
+    fn a_sweep_removes_only_what_no_build_holds() {
+        let dir = std::env::temp_dir().join(format!("bridge-index-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (on_list, held, off_list) = ("0000000000000001", "0000000000000002", "0000000000000003");
+        for name in [
+            format!("{on_list}.idx"),
+            format!("{on_list}.idx.partial"),
+            format!("{held}.idx"),
+            format!("{held}.idx.partial"),
+            format!("{off_list}.idx"),
+            format!("{off_list}.idx.partial"),
+            format!("{off_list}.other"),
+            "notes.txt".to_string(),
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        fn kind(name: &str) -> Option<(&str, Kept)> {
+            let (id, kind) = db_id(name, &[".idx", ".idx.partial"])?;
+            Some((id, if kind == 0 { Kept::Index } else { Kept::Work }))
+        }
+        let listed: HashSet<String> = [on_list.to_string()].into();
+        let mut unlisted = Unlisted::default();
+        unlisted.set_grace(Duration::ZERO);
+        let left = |dir: &Path| {
+            let mut names: Vec<String> =
+                std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            names.sort();
+            names
+        };
+
+        let (mut leaving, mut went) = (Vec::new(), Vec::new());
+        unlisted.sweep(&dir, &listed, kind, |file| {
+            if file.id() != held {
+                let id = file.id();
+                if file.settle(|| leaving.push(id.to_string())) {
+                    went.push(id.to_string());
+                }
+            }
+        });
+        assert_eq!(leaving, [off_list]);
+        assert_eq!(went, [off_list]);
+        assert_eq!(
+            left(&dir),
+            [
+                format!("{on_list}.idx"),
+                format!("{held}.idx"),
+                format!("{held}.idx.partial"),
+                format!("{off_list}.other"),
+                "notes.txt".to_string(),
+            ]
+        );
+
+        // Once no build holds them, they go too.
+        unlisted.sweep(&dir, &listed, kind, |file| {
+            file.settle(|| {});
+        });
+        assert_eq!(left(&dir), [format!("{on_list}.idx"), format!("{off_list}.other"), "notes.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A folder the indexes moved out of loses what the bridge wrote there,

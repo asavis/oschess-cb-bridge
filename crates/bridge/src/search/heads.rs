@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use cbformat::file::DbFile;
 
 use super::slim::{ROW, Slim};
-use crate::indexdir::{self, Unlisted, crc32, u32_at, u64_at};
+use crate::indexdir::{self, Kept, Unlisted, crc32, u32_at, u64_at};
 use crate::store::Store;
 use crate::sync::lock;
 
@@ -259,6 +259,12 @@ pub fn entry_id(name: &str) -> Option<&str> {
     indexdir::db_id(whole, &KEPT).map(|(id, _)| id)
 }
 
+/// The database id and kind of a file in the index folder that is a heads
+/// file or a build's partial one.
+fn entry_kind(name: &str) -> Option<(&str, Kept)> {
+    Some((entry_id(name)?, if name.ends_with(".partial") { Kept::Work } else { Kept::Index }))
+}
+
 /// Where the heads files of the listed databases stand.
 #[derive(Default)]
 pub struct Registry {
@@ -366,30 +372,16 @@ impl Registry {
     /// off the list for the grace, and a build's partial file when no build
     /// of its database runs. Nothing else in `dir` is touched.
     pub fn sweep(&self, dir: &Path, listed: &std::collections::HashSet<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        let now = Instant::now();
-        let mut unlisted = lock(&self.unlisted);
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(id) = entry_id(name) else { continue };
+        lock(&self.unlisted).sweep(dir, listed, entry_kind, |file| {
+            let id = file.id();
             let mut states = lock(&self.states);
-            if matches!(states.get(id), Some(State::Working(_))) {
-                continue;
+            if matches!(states.get(id), Some(State::Working(_))) || (file.is_work() && being_written(file.path())) {
+                return;
             }
-            if name.ends_with(".partial") {
-                if !being_written(&entry.path()) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            } else if !listed.contains(id) {
-                if unlisted.due(id, now) && std::fs::remove_file(entry.path()).is_ok() {
-                    states.remove(id);
-                } else {
-                    unlisted.still(id);
-                }
+            if file.settle(|| {}) {
+                states.remove(id);
             }
-        }
-        unlisted.retain();
+        });
     }
 }
 

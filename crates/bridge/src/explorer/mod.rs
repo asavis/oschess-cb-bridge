@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use crate::activity::Activity;
 use crate::catalog::{Entry, Opened};
-use crate::indexdir::{self, Unlisted};
+use crate::indexdir::{self, Kept, Unlisted};
 use crate::machine::Machine;
 use crate::search::SearchError;
 use crate::search::memory::Cancel;
@@ -371,24 +371,16 @@ impl Default for Registry {
     }
 }
 
-/// What a file in the index folder is, by its name.
-enum Kept {
-    /// `<id>.idx`, `<id>.moves` or `<id>.masks`: a database's index, its
-    /// move stream, or the masks of its games (#272).
-    Index,
-    /// `<id>.idx.partial`, `<id>.moves.partial` or `<id>.masks.partial`: a
-    /// build's work, which only the build running for `<id>` uses.
-    Work,
-}
-
 /// Whether an index folder entry named `name` is a database's index, move
 /// stream, or a build's work, which the bridge wrote.
 pub fn is_index_file(name: &str) -> bool {
     index_entry(name).is_some()
 }
 
-/// The database id and kind of an index folder entry; `None` for anything
-/// the bridge did not write there, which is never touched.
+/// The database id and kind of an index folder entry: `<id>.idx`, `<id>.moves`
+/// or `<id>.masks` are a database's index, its move stream and the masks of
+/// its games (#272), each with `.partial` after it a build's work; `None` for
+/// anything the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
     let (id, kind) =
         indexdir::db_id(name, &[".idx", ".moves", ".masks", ".idx.partial", ".moves.partial", ".masks.partial"])?;
@@ -618,40 +610,19 @@ impl Registry {
     /// touched, nor anything the bridge did not write.
     pub fn sweep(&self, listed: &HashSet<String>) {
         let Some(dir) = self.dir() else { return };
-        let Ok(entries) = std::fs::read_dir(&dir) else { return };
-        let now = Instant::now();
-        let mut unlisted = lock(&self.unlisted);
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some((id, kind)) = name.to_str().and_then(index_entry) else { continue };
+        lock(&self.unlisted).sweep(&dir, listed, index_entry, |file| {
+            let id = file.id();
             // Held while the files go, so no build of `id` starts meanwhile.
             let state = self.state(id);
             let mut s = lock(&state);
             if matches!(*s, State::Working(_)) || self.masks.building(id) {
-                continue;
+                return;
             }
-            let path = entry.path();
-            match kind {
-                Kept::Index if listed.contains(id) => {}
-                Kept::Index => {
-                    let due = unlisted.due(id, now);
-                    if due {
-                        // Masks held in memory keep their file mapped.
-                        self.masks.forget(id);
-                    }
-                    if due && std::fs::remove_file(&path).is_ok() {
-                        *s = State::Idle;
-                    } else {
-                        unlisted.still(id);
-                    }
-                }
-                Kept::Work => {
-                    let _ = std::fs::remove_file(&path);
-                }
+            // Masks held in memory keep their file mapped.
+            if file.settle(|| self.masks.forget(id)) {
+                *s = State::Idle;
             }
-        }
-        // A database back on the list, or an index gone, starts afresh.
-        unlisted.retain();
+        });
     }
 
     /// Drops the index of `id` after a read found it or its move stream
