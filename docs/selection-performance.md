@@ -62,11 +62,10 @@ Index version 6 and stream version 5 rebuild older cache files. Filtered
 answers include both lists in their existing budget and retain at most 64
 entries, keyed by build, database generation, position and filter.
 
-## Real database delivery evidence
+## On a real database
 
-This is delivery evidence, separate from repository-runnable acceptance.
-Neither a private database nor access to its owner's machine is needed to test
-or repair this change. No game, player or event contents are recorded here.
+These numbers come from a real database. The acceptance below does not need
+one, and no game, player or event is recorded here.
 
 Mega Database 2026: 11,966,514 records, 11,959,813 indexed games. Source files
 were read through the Windows filesystem mount from WSL; scratch indices were
@@ -101,9 +100,7 @@ To repeat with a local database, append its path to the command. To compare
 queries without rebuilding, append `--reuse` after that path; it reopens the
 existing scratch index and still makes fresh HTTP requests in a new process.
 Run both binaries on the same CPUs and alternate their order when investigating
-host load. The first build attempt encountered an OS header-read error
-(`ENOMEM`); a separate bounded scan and two subsequent complete builds read
-all headers successfully. The error did not reproduce.
+host load.
 
 ### Repeated comparison with existing indices
 

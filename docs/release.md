@@ -3,7 +3,8 @@
 A release of the Windows app is made by
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) from a
 collaborator dispatch on `main`. It assigns the version automatically and
-leaves a **draft** release; nobody gets it until the owner publishes the draft.
+leaves a **draft** release; nobody gets it until it is published, on the
+owner's order.
 
 | File | What it is |
 |---|---|
@@ -14,8 +15,8 @@ leaves a **draft** release; nobody gets it until the owner publishes the draft.
 | `oschess-bridge.msix` | The Microsoft Store package, unsigned, for Partner Center; attached only while the Store identity is set (see [Microsoft Store](#microsoft-store)). |
 
 The workflow runs on GitHub's hosted Windows runners, the one exception to the
-own-runners rule in [CLAUDE.md](../CLAUDE.md), because SignPath requires every
-job before a signing request to run there. Only a collaborator dispatch on
+own-runners rule in [CLAUDE.md](../CLAUDE.md), because SignPath would need every
+job before a signing request to run there if signing were switched on. Only a collaborator dispatch on
 `main` starts it. Its jobs, in order:
 
 1. **build**: checks that the dispatch selected `main`, that its source commit
@@ -45,7 +46,7 @@ last, over the installer as users download it.
 
 ## Automatic version policy
 
-Owner decision (2026-10-04): use `major.yymm.ddnn`. Major is **1** until an
+Versions are `major.yymm.ddnn`. Major is **1** until an
 explicit owner decision changes `store-version.json`. Month and daily sequence
 have two positions; the final integer is `day * 100 + sequence`. Components
 have no leading zeroes: the first build on 2027-01-01 is `1.2701.101`; its MSIX
@@ -74,7 +75,7 @@ keeps the committed Cargo version: release-number commits are unnecessary.
 
 1. When the owner requests a release, wait for the latest `ci` run for the
    intended main commit to pass. Do not ask the owner for a version.
-2. Dispatch the workflow on `main` (owner PowerShell command):
+2. Dispatch the workflow on `main`:
 
    ```powershell
    gh workflow run release.yml --repo asavis/oschess-cb-bridge --ref main
@@ -130,6 +131,10 @@ them all.
 
 ## Switching on signing
 
+Signing is off. No release on GitHub has been signed: the files carry no
+Authenticode signature, and the only signed copy of the bridge is the one
+Microsoft signs for the Store.
+
 SignPath Foundation signs open-source projects for free
 ([conditions](https://signpath.org/terms.html)). Before applying:
 
@@ -138,7 +143,9 @@ SignPath Foundation signs open-source projects for free
   two-factor authentication;
 - a first release is published, unsigned;
 - the README has the [Code signing policy](../README.md#code-signing-policy)
-  section, naming the roles and crediting SignPath Foundation;
+  section, naming the roles. It credits SignPath Foundation only once the
+  Foundation has accepted the project: until then the credit would claim a
+  signing that does not happen;
 - the owner applies on [signpath.org](https://signpath.org) and is the
   project's author, reviewer and approver, with multi-factor authentication.
 
@@ -179,8 +186,8 @@ pull request of its own.
 ## The updater key
 
 The updater installs only an installer signed with the updater key, a key of
-its own, separate from the code signing certificate. It has been in place since
-#51:
+its own. This is not Windows code signing: Windows neither sees nor checks it.
+It has been in place since #51:
 
 - Its public half is `plugins.updater.pubkey` in
   `crates/app/tauri.conf.json`. `cargo test -p app` fails if that value is
@@ -225,7 +232,7 @@ without a window: no database is downloading or opening, no position index is
 being built, no Stockfish is being installed, and no analysis began less than
 five minutes ago. The installer replaces the app and starts it again, and the
 new start shows «Міст оновлено до X». A draft is never the latest release, so
-nothing updates before the owner publishes.
+nothing updates before it is published.
 
 ## Microsoft Store
 

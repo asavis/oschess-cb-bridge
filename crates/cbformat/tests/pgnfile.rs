@@ -128,7 +128,7 @@ fn text_in_the_code_page() {
     assert!(Database::open(&pgn, &index, 1, CodePage::WESTERN).is_err());
 }
 
-/// A Chessable course's layout marks in a game's comments read as brackets
+/// Layout marks in a game's comments read as brackets
 /// where the game is shown, and stay as written in its text (#318). Made-up
 /// text.
 #[test]

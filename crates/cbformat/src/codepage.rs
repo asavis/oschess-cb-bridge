@@ -133,7 +133,7 @@ pub(crate) fn utf8_sequence(b: &[u8], i: usize) -> usize {
     }
 }
 
-/// Runs of Cyrillic UTF-8 inside single-byte text, which some Russian books
+/// Runs of Cyrillic UTF-8 inside single-byte text, which some Russian databases
 /// hold after a text in Windows-1251 (`docs/format-notes.md`, "UTF-8 inside
 /// Windows-1251"): from a two-byte sequence of a Cyrillic letter (0xd0 or
 /// 0xd1, then 0x80-0xbf) to the last, with other UTF-8 sequences
@@ -236,7 +236,7 @@ pub fn cyrillic_or_western(b: &[u8]) -> Option<CodePage> {
 ///   (`Cлон`, typed with a Latin C), and Russian notation, a Russian piece
 ///   letter before a square or a capture (`Фc2`, `Крg1`, `Kрg1` with a Latin
 ///   K, `Л:f6`); a square whose file is typed in Cyrillic (`Rе8`, `N:с2`,
-///   `е5`); one of а-е after a number, as Russian books number problems and
+///   `е5`); one of а-е after a number, as Russian databases number problems and
 ///   variations (`1.49а`, `1851г.`), and a promotion or a mate after a square
 ///   (`h8Ф`, `Фb7х`), each before a space, ASCII punctuation or the end. Not
 ///   `№` before a digit, nor any other letter before a square or after a
@@ -665,7 +665,7 @@ mod tests {
         // ChessBase's sign for ч in UTF-8 inside Windows-1251: the sign stays
         // for `crate::signs` to read.
         assert_eq!(utf8_or_legacy(b"\xed\xe5\xf0\xe0\xe7\xe1\xee\xf0\xee\x80\x89\xe8\xe2\xee"), "неразбор\u{e009}иво");
-        // Cyrillic UTF-8 after Windows-1251, as in the classic books.
+        // Cyrillic UTF-8 after Windows-1251, as in classic databases.
         let mixed = [&b"\xd5\xee\xe4? "[..], "Ход белых".as_bytes()].concat();
         assert_eq!(utf8_or_legacy(&mixed), "Ход? Ход белых");
         // What Windows-1252 forms by chance stays Windows-1252: `×»` (UTF-8

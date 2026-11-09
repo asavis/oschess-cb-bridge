@@ -2,18 +2,15 @@
 
 ## Repository
 
-- Canonical checkout: `/home/asavi/projects/oschess-cb-bridge`. Keep its `main`
-  worktree clean; make every change in a dedicated worktree under
-  `.worktrees/<name>` on a feature branch.
+- Keep the `main` worktree of the canonical checkout clean; make every change
+  in a dedicated worktree under `.worktrees/<name>` on a feature branch.
 - Build in a worktree through `scripts/target_slot.py`: it runs a command with
   its Cargo builds in one of four shared target folders under
   `~/.cache/oschess-cb-bridge/targets`, which that command holds alone until it
-  ends. A worktree's own `target/` takes 8 GB, and thirty of them filled the
-  disk on 2026-11-07; one target folder shared without a lease hands a worktree
-  another worktree's build, whose tests then run the other commit's code
-  (#362). The checks below go through it, and so does a session started to
-  work in a worktree, such as a review:
-  `python3 scripts/target_slot.py -C <worktree> codex exec -C <worktree> ...`.
+  ends. A worktree's own `target/` takes 8 GB, and one target folder shared
+  without a lease hands a worktree another worktree's build, whose tests then
+  run the other commit's code (#362). The checks below go through it, and so does a session started to
+  work in a worktree, such as a review.
 - Reuse a review or stress worktree for the next round rather than adding one
   per job, and lock one kept for reuse (`git worktree lock --reason <why>
   <path>`). Remove a worktree once nothing needs it, at the latest when its
@@ -35,14 +32,11 @@
 
 ## Delivery workflow
 
-The review gate follows the scheme of the `kidschessleague` project.
-
 - Open a focused pull request for every change. Nothing is committed to `main`
   directly.
 - Every change is reviewed by the backend — Codex or Claude — that did not
   write it. A review by the implementing backend is self-review whatever
-  account it posts under, and never satisfies the gate. The review matrix is an
-  owner decision:
+  account it posts under, and never satisfies the gate:
 
   | Author | Reviewer |
   |---|---|
@@ -56,19 +50,18 @@ The review gate follows the scheme of the `kidschessleague` project.
   never leaves that to the owner, and supplies only the fixed review contract in
   [docs/review.md](docs/review.md), links to the issue and pull request, and the
   exact head commit. It does not choose the review's crux or focus.
-- The reviewer runs with its normal full tool permissions. The prompt, not a
-  sandbox, restricts it to review work: it posts findings, `CLEAN` or `BLOCKED`
+- The reviewer does review work only: it posts findings, `CLEAN` or `BLOCKED`
   in the pull request under its own GitHub identity and changes nothing else.
 - Fix every confirmed finding, then ask the same reviewer backend to review the
   new head. The gate is satisfied only by a `CB-REVIEW: CLEAN <sha>` verdict
   for the current head commit, accompanied by a prose review naming the same
   commit. Any push after a clean verdict, a rebase included, needs a new review.
 - When the reviewer's usual account is out of quota, rerun the same review at
-  once on the owner's account (`CODEX_HOME=/home/asavi/.codex`) without changing
-  the reviewing backend or its GitHub identity, and say which account ran it.
+  once on another account without changing the reviewing backend or its GitHub
+  identity, and say which account ran it.
 - Once the clean verdict is recorded, the implementing session squash-merges the
   pull request itself with `--match-head-commit <clean sha>`. This is the
-  owner's standing authorization (2026-09-30): a pull request whose current
+  owner's standing authorization: a pull request whose current
   head carries a `CB-REVIEW: CLEAN <sha>` verdict and the prose review naming
   that commit is reviewed, and an agent merges it into `main` without asking
   again.
@@ -76,27 +69,25 @@ The review gate follows the scheme of the `kidschessleague` project.
   assigned by the release workflow under `docs/release.md`, not chosen by the
   owner or agent. Major stays 1 until the owner explicitly directs a change to
   `store-version.json`; never raise it automatically. Do not request a version
-  or make a version-only Cargo commit. This supersedes the old requirement for
-  the owner to name an exact version (owner decision 2026-10-04). Publishing a
+  or make a version-only Cargo commit. Publishing a
   draft or submitting to Microsoft Store still needs the corresponding owner
   authorization; implementing release tooling does not itself authorize a release.
 
 ## Checks
 
 This repository is public, so anyone can open a pull request, and nobody else
-may trigger tests or builds (owner decision, 2026-09-23). The check workflow,
+may trigger tests or builds. The check workflow,
 `.github/workflows/ci.yml`, runs after a merge: on a push to `main`, which only
 collaborators can make, and only on our own runners (`bridge-local` for Linux,
 `bridge-windows` for Windows). `.github/workflows/stress.yml` runs
 `scripts/stress.py` at night on `bridge-local`, on a schedule, and only when
-`main` has moved past the last commit a night covered (owner decision on #235,
-2026-09-30); a collaborator can also start it by hand on `main`. Never add a
+`main` has moved past the last commit a night covered (#235); a collaborator can also start it by hand on `main`. Never add a
 workflow, trigger or job
 that a pull request, an issue, a comment or a fork can start, and never route a
-job to GitHub's hosted runners. The one exception (owner decision on #23,
-2026-09-24) is `.github/workflows/release.yml`: it runs only on a collaborator
-dispatch on `main`, on GitHub's hosted Windows runners, because SignPath
-requires every job before a signing request to run there
+job to GitHub's hosted runners. The one exception (#23) is
+`.github/workflows/release.yml`: it runs only on a collaborator dispatch on
+`main`, on GitHub's hosted Windows runners, where SignPath would need every
+job before a signing request to run if signing were switched on
 ([docs/release.md](docs/release.md)). Before a merge, every check runs on our
 own hosts, started by us: by the author before every push and by the reviewer
 on the reviewed commit.

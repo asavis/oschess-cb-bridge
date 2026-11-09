@@ -35,12 +35,11 @@ they use the same port.
    and download `oschess-bridge-setup.exe`. Your browser may warn that the file
    is not commonly downloaded; keep it. The release notes give its SHA-256,
    which `Get-FileHash .\oschess-bridge-setup.exe` in PowerShell prints too.
-2. Run it. While releases are unsigned, Windows SmartScreen says «Windows
+2. Run it. These releases are unsigned, so Windows SmartScreen says «Windows
    protected your PC»: choose **More info**, then **Run anyway**. Where Smart
    App Control is on (Windows 11, Windows Security → App & browser control),
    Windows blocks unsigned programs outright and offers no way past it; such
-   a computer needs the copy from the Microsoft Store or a signed release. The
-   release notes say whether a release is signed.
+   a computer needs the copy from the Microsoft Store.
 3. The installer needs no administrator: it installs for your Windows user
    into `%LOCALAPPDATA%\oschess bridge`, in Ukrainian or English after the
    Windows display language. Choose **Next** through its pages and
@@ -65,8 +64,7 @@ wizard's last screen shows the pairing code, and so does «Pairing code…» in
 the tray menu: in oschess, open the Library → ChessBase → «Paste the code by
 hand».
 
-Browsers: Chrome and Microsoft Edge 142 or later. Firefox has not been tried
-yet.
+Browsers: Chrome and Microsoft Edge 142 or later.
 
 Right-click the tray mark for the menu: open oschess (it pairs the browser it
 opens, so another browser or profile connects with nothing to copy), the
@@ -114,7 +112,7 @@ above.
 The reader decodes every game of a Mega Database 2026 — 11,964,285 games and
 963 million plies, including Chess960 games, set-up positions, variations and
 null moves — with every move checked for legality and for the piece it
-captures, in about 20 seconds on a desktop. Annotations are decoded for all
+captures. Annotations are decoded for all
 423,390 annotated games of that database. Comments, symbols, coloured squares
 and arrows go into the PGN for reading; the full PGN form
 (`annotations=full`, [docs/api.md](docs/api.md)) also keeps every other
@@ -122,7 +120,7 @@ annotation type, such as training questions, clocks and evaluations.
 
 The format is undocumented by its vendor. This reader is written from the
 reverse-engineered description in the
-[Morphy project](https://github.com/Yarin78/morphy/tree/main/format/v2);
+[Morphy project](https://github.com/Yarin78/morphy/tree/master/format/v2);
 [docs/format-notes.md](docs/format-notes.md) records where real databases
 differ from that description.
 
@@ -274,9 +272,11 @@ A database path may name the `.2cbh` or `.cbh` file, or the common stem of its
 files, which is read as 2CBH when a `.2cbh` file has it.
 ChessBase databases are opened read-only and read with positional reads. A
 PGN file is changed only when you save a game into it in oschess
-([docs/api.md](docs/api.md#writing-games)); nothing else on the computer is
-written apart from the bridge's own folders, and nothing leaves the machine
-except what the bridge serves to the oschess page on this computer.
+([docs/api.md](docs/api.md#writing-games)); no other file of yours is
+written, and nothing from your databases leaves the machine except what the
+bridge serves to the oschess page on this computer. The update checks and
+failure reports that do go out are listed under
+[Code signing policy](#code-signing-policy).
 
 ## The Windows app
 
@@ -301,15 +301,18 @@ restarting the bridge or interrupting its work. The windows are plain HTML, CSS 
 JavaScript in `crates/app/ui`; `crates/app/icons/generate.py` draws the tray
 marks and the app icon from the logo.
 
-The app builds on Windows only. On Linux, `scripts/clippy-windows.sh` checks
+The app runs on Windows only. On Linux, `scripts/clippy-windows.sh` checks
 it for `x86_64-pc-windows-gnu`, a target `rust-toolchain.toml` installs,
 without linking.
 
 A collaborator dispatch on `main` assigns the version and builds the release:
-`oschess-bridge.exe`, its per-user NSIS installer and their SHA-256, as a draft for the owner to publish
+`oschess-bridge.exe`, its per-user NSIS installer, the Microsoft Store package
+and their SHA-256, as a draft, published only on the owner's order
 ([docs/release.md](docs/release.md)). The app's updater reads the newest
-release's `latest.json` and installs only an installer signed with the updater
-key, whose public half is in `crates/app/tauri.conf.json`.
+release's `latest.json` and installs only an installer that carries the
+signature of the updater key, whose public half is in
+`crates/app/tauri.conf.json`. That signature is the updater's own check, not
+Windows code signing.
 
 ## Contributing
 
@@ -318,15 +321,14 @@ cross-model review every change goes through.
 
 ## Code signing policy
 
-Free code signing provided by [SignPath.io](https://about.signpath.io),
-certificate by [SignPath Foundation](https://signpath.org). Until SignPath
-Foundation accepts this project, releases are unsigned; the release notes say
-whether a release is signed.
+The copy from the Microsoft Store is signed by Microsoft. The copy from this
+repository's releases, `oschess-bridge.exe` and its installer, is not
+code-signed: Windows warns about it as the [install steps](#install) say, and
+the release notes give each file's SHA-256.
 
-What is signed: only this repository's own `oschess-bridge.exe` and its
-installer, as `.github/workflows/release.yml` builds them on GitHub's runners
-from an owner-requested dispatch on `main`, with an automatic version. Every
-release is published by the owner after checking it ([docs/release.md](docs/release.md)).
+`.github/workflows/release.yml` builds both on GitHub's runners from an
+owner-requested dispatch on `main`, with an automatic version. A release is
+published only on the owner's order ([docs/release.md](docs/release.md)).
 
 Roles:
 
@@ -336,8 +338,8 @@ Roles:
   [@oschess-codex-bot](https://github.com/oschess-codex-bot) (Codex). A
   change written by one of the two is reviewed by the other before it is
   merged ([docs/review.md](docs/review.md)).
-- Approvers: [@asavis](https://github.com/asavis), who approves every signing
-  request.
+- Releases: [@asavis](https://github.com/asavis), on whose order each one is
+  published.
 
 Privacy: the bridge collects no information about you or your databases, and
 about your computer only what a failure report below names. It opens

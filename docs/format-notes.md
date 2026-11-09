@@ -2,7 +2,7 @@
 
 The reader implements the ChessBase 2 database format (the `.2cbh` family,
 ChessBase 17 and later) from the reverse-engineered description published in
-the Morphy project, [`format/v2`](https://github.com/Yarin78/morphy/tree/main/format/v2).
+the Morphy project, [`format/v2`](https://github.com/Yarin78/morphy/tree/master/format/v2).
 That description carries no licence, so this repository copies none of its
 text; it is a reference, and this file records only where real databases
 disagree with it or add to it.
@@ -302,7 +302,7 @@ Greek below 4,000 each.
 
 **Text that is not UTF-8** (#308). 2CBH keeps its texts and names as UTF-8,
 but some are single-byte. In 313 databases besides the Mega, 7,982 comments
-are Windows-1252 (Western text of the Mega updates), and a few lesson
+are Windows-1252 (Western text of the Mega updates), and a few
 databases made on a Windows whose page is 1251 hold Russian in Windows-1251:
 4 comments, and 3 player names, which were read with replacement characters
 and so lost. The reader now reads a text or a name that is not UTF-8 in
@@ -371,11 +371,11 @@ bytes of ⩱ and ⩲) became U+E004 or U+E02E and U+E007 or U+E02F, ю (0xfe,
 passed pawn) U+E008, ч (0xf7, unclear) U+E009, and Ч (0xd7) `×`. Such a code
 point that touches a Cyrillic letter is the letter again, and `×` where it
 starts a word of Cyrillic letters (`×ернов`; not `Л×c3`, a capture): 7
-player names of the lesson databases, and `ч` inside a Russian comment in
-Windows-1251. A course exported from Chessable writes its brackets, positions
-and links as words between runs of U+E02D (`StartBracket`, `EndBRacket`,
+player names of those databases, and `ч` inside a Russian comment in
+Windows-1251. Some databases write their brackets, positions and links as
+words between runs of U+E02D (`StartBracket`, `EndBRacket`,
 `StartFEN`, `LinkStart`); they read as `(` `)`, `[` `]`, `[FEN …]` and the bare
-address. The course's own PGN export writes the same words between runs of
+address. The PGN they were imported from writes the same words between runs of
 `@` (`@@StartBracket@@`), which ChessBase turned into U+E02D; a PGN
 database's reading form reads them so too (#318, `docs/api.md`, "PGN
 files"). The examples in this section are made up or counts.
@@ -424,7 +424,7 @@ has held only the reference database's path.
 
 **Older entries** (asavis/oschess-cb-bridge#288, #300). A list kept by
 ChessBase 18 on a Windows whose ANSI code page is 1251 showed more encodings,
-first in the user's screenshots and then in the file itself, 110 entries: 64
+first in screenshots and then in the file itself, 110 entries: 64
 paths in Windows-1251 (44 of them with Windows-1251 titles, 20 with ASCII
 ones), 15 titles cut to one byte and one title escaped:
 
@@ -487,7 +487,7 @@ first, then `Databases`. The window sorts by `Sort` and `SortDir0`–`SortDir7`.
 - **`Sort` 6** (all `SortDir` 0) is the only setting seen, and ChessBase's default.
   With it, the window orders by **a**, the icon number, largest first, and
   entries with the same icon by title, last first, without regard to case.
-- **The evidence:** the owner's window, in its icon view and in its detail view
+- **The evidence:** ChessBase's window, in its icon view and in its detail view
   (whose columns show no sort mark), matched this order for all ten databases,
   three of which share icon 0 (asavis/oschess-cb-bridge#20).
 - **Other settings are not decoded:** another `Sort`, any `SortDir` other than 0,
@@ -1039,10 +1039,10 @@ The reader was checked against:
   UTF-8 is read through one code-page decoder (`cbformat::codepage`), and a
   byte the page leaves undefined reads as the C1 control of the same value.
 - **Russian databases hold Windows-1251** (asavis/oschess-cb-bridge#293). In a
-  folder of 244 Russian books, 286,811 comments and 28,743 names were
+  set of Russian databases, 286,811 comments and 28,743 names were
   Windows-1251, beside 208 comments and 5,500 names of Western text in
   Windows-1252 (a few Spanish and German databases, and German comments in one
-  Russian book). Nothing in a record names the page: the Russian comments'
+  Russian database). Nothing in a record names the page: the Russian comments'
   languages are "any" (280,184) and "English" (6,131). So, on a computer whose
   ANSI code page is 1251 or 1252, single-byte text is read in the page its words
   show (`codepage::Evidence`). A Russian or Ukrainian word is made of bytes
@@ -1053,13 +1053,13 @@ The reader was checked against:
   `été`), shows neither. A text whose words show neither (`и т.д.`,
   `Cet été`) is read as its game's other texts show together, else as the names
   in the first 64 KiB of each entity file show, else in the computer's page.
-  Read so, the 244 books show no mojibake on either computer, Western text in
+  Read so, these databases show no mojibake on either computer, Western text in
   them stays Western on a Cyrillic one (no umlaut reads as a Cyrillic letter),
   and the two computers read alike all but 51 of their 447,853 names and texts,
   nearly all a lone `и …` in a game with no other text. On a computer of another
   page, the text is read in that page as it stands.
 - **Piece bytes.** ChessBase's chess fonts draw 0xa2-0xa7 as king, queen,
-  knight, bishop, rook and pawn, and the Russian books use them in comments and
+  knight, bishop, rook and pawn, and Russian databases use them in comments and
   some names: `¤d7`, `¥xf3`, `¤ñ3` with a Cyrillic `с`, `¦:f6`, `¤ : h3`, `£+¤`,
   `d8£`, and endgame classes such as `¦¥1`. On a computer of either page the
   reader serves such a byte as the figurine ♔ ♕ ♘ ♗ ♖ ♙ only where a whole move
@@ -1069,36 +1069,36 @@ The reader was checked against:
   beside another piece, and across a plus from one. Elsewhere it is the page's
   character, since Windows-1251 has ў Ј ¤ Ґ ¦ § there (Ukrainian `Ґаєвський`,
   Serbian `Јасна`) and Windows-1252 the signs ¢ £ ¤ ¥ ¦ § (`£5-£10`, `§4-6`). In
-  the books 19,792 became figurines and 83 stayed characters: typing slips such
+  these databases 19,792 became figurines and 83 stayed characters: typing slips such
   as a square typed with a wrong letter, and pieces standing alone (`¥ (any
   move)`; the examples in this section are made up). On a computer of another
   page, such as Windows-1250 with Ł and Ą at 0xa3 and 0xa5, they are read as
   that page reads them.
-- **Signs** (#306). The chess font the books ship draws ChessBase's signs in
+- **Signs** (#306). A chess font shipped with these databases draws ChessBase's signs in
   0x80-0xbf: the pieces above, `+-` at 0x9d, `-+` at 0xb0, `±` `⩲` `⩱` at
   0xb1-0xb3, `∓` at 0xb5, `⌓` at 0xb9, `=/∞` at 0xa9 and `½` at 0xbd, read
-  from the glyphs' outlines. The books' text uses two of them where the
+  from the glyphs' outlines. Their text uses two of them where the
   pages have a letter or a sign no chess text means, and the reader serves
   them as signs where no letter follows: `½` at 0xbd (204 times, `½-½`), which
   Windows-1251 reads as the Macedonian `Ѕ`, and `∓` at 0xb5 (53 times, after a
   move or before `/-+`), which both pages read as `µ`. The others are left as
-  the page reads them: 0xb9 is `№` in the books' text (1,021 times, `№102`),
+  the page reads them: 0xb9 is `№` in their text (1,021 times, `№102`),
   0xb2 and 0xb3 are Ukrainian `І` and `і` in Windows-1251 (25 times as signs,
   which a reader cannot tell from the letters), and 0xa9 is `©` (13 times).
   0x9e (2,465 times, after `Диаграмма` and as comments of their own) is
   ChessBase's diagram mark (#314): the Mega's Western text writes it after
   "Diagram" in four languages, and 2CBH writes its counterpart U+E005 where
-  the older text has it (`cbformat::signs`). The books' font draws it as a
+  the older text has it (`cbformat::signs`). That font draws it as a
   ring with an arrow up. Touching no letter, it is dropped
   (`cbh::text::is_diagram_mark`), so `Диаграмма` keeps no `ћ` and a comment of
   the mark alone is empty; between letters it is the page's letter (`ž` in
   `Božidar`, Serbian `ћ`).
-- **Cyrillic look-alikes.** Typists of the books mixed Cyrillic letters that
+- **Cyrillic look-alikes.** Typists mixed Cyrillic letters that
   look Latin into Latin words (`сorr.`, `Bа2`, `Rе8`). A word whose bytes
   above ASCII are all such letters shows neither page, since it reads alike
   either way, and so does not turn a database's names Western. A square whose
   file is typed in Cyrillic (`Rе8`, `N:с2`, `е5`), one of а-е after a number
-  as the books number problems (`1.49а`), and a promotion or a mate after a
+  as Russian databases number problems (`1.49а`), and a promotion or a mate after a
   square (`h8Ф`, `Фb7х`), show Cyrillic.
 - **Signs in Western text** (#308). Western text holds ChessBase's signs in
   bytes Windows-1251 reads as letters, and engines and French ordinals end
@@ -1106,7 +1106,7 @@ The reader was checked against:
   move (`¹8.¤c3`, `×b6`), nor another letter after a number or a square
   (`5.00ß`, French `2è`, `d4þ`, `2þ`), shows a page; nor does a word of one
   byte repeated, nor one of only `×`, `÷` and the letters only Windows-1251
-  has (`þþ`, `××`, `÷³`). In the books, one comment of a German game changes
+  has (`þþ`, `××`, `÷³`). In these databases, one comment of a German game changes
   for it (`þþ`, which read as `юю`).
 - **UTF-8 inside Windows-1251.** Twelve comments hold a text in Windows-1251
   and then a copy in UTF-8. A run of three Cyrillic UTF-8 letters or more,
@@ -1114,7 +1114,7 @@ The reader was checked against:
   Windows-1251 reads such a letter as `Р` or `С` and a sign, which Russian text
   does not write three times in a row. Six of them start with a letter whose
   first byte the file already lost (`? Ў…`), which stays as it is.
-- **Checked against the books** (#306): every name and text read on a 1251 and
+- **Checked against these databases** (#306): every name and text read on a 1251 and
   on a 1252 computer is its bytes read in one page, with pieces, signs and
   UTF-8 runs only where the rules above put them; a letter-bigram model built
   from independent Ukrainian and English text agrees with the page chosen but
@@ -1181,7 +1181,7 @@ to its last byte by that layout.
 
 The language numbers of a content are ChessBase's text annotation languages
 (0 English … 6 Portuguese, 7 any). 1,595 of the 1,627 contents of versions 1
-and 2 say English (0), Russian books among them, so a reader cannot take the
+and 2 say English (0), Russian databases among them, so a reader cannot take the
 number for the text's language.
 
 ### The text of versions 1 and 2

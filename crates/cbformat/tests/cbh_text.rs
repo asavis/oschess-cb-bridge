@@ -55,7 +55,7 @@ fn read(f: &TempDb, computer: CodePage) -> (Vec<String>, Vec<Vec<String>>) {
     (names, texts)
 }
 
-/// A Russian book reads alike on a Cyrillic and on a Western computer. A text
+/// A Russian database reads alike on a Cyrillic and on a Western computer. A text
 /// whose own words show no page (`3.7а`, `и т.д.`, `и`) is read as the
 /// game's other texts show, else as the database's names show.
 #[test]
