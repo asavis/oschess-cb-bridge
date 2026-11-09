@@ -1,14 +1,10 @@
 # Bridge API, version 1
 
-The bridge serves the ChessBase databases of the machine it runs on to the
-oschess web app, over HTTP on the loopback interface. This document is the
+The bridge serves the ChessBase databases, PGN files and chess engine of the
+machine it runs on to the oschess web app, over HTTP on the loopback interface. This document is the
 contract: the bridge implements it, the oschess web client is written against
 it, and the fake bridge in the oschess end-to-end tests implements the same
 document with synthetic data.
-
-Endpoints marked *planned* are specified here so that clients can be designed
-for them; until the issue named with them is merged, the bridge answers them
-with `404 not_found`.
 
 ## Transport
 
@@ -284,7 +280,7 @@ streams; a forgotten stream starts afresh.
 
 ```json
 {
-  "bridge": { "version": "0.4.0", "api": 1, "features": ["explorerSearch", "fragmentSearch"] },
+  "bridge": { "version": "1.2611.801", "api": 1, "features": ["explorerSearch", "fragmentSearch"] },
   "databases": { "ready": 9, "opening": 0, "missing": 1, "cloudOnly": 1, "downloading": 1, "unsupported": 2, "unreadable": 0 },
   "download": { "present": 104857600, "total": 734003200 },
   "indexing": [ { "id": "0a1b2c3d4e5f6071", "phase": "reading", "done": 4000000, "total": 11966514 } ],
@@ -535,9 +531,9 @@ of the same games answers, apart from what the format has otherwise:
   computer's ANSI code page (Windows-1252 where the page has no table). Its
   row's names are read in the same encoding.
   `lang` changes nothing, and `annotations` is `complete`: a PGN game's
-  comments are all it has. The reading form reads the layout marks that a
-  Chessable course's export writes in comments, words between runs of two
-  `@` or more, as a 2CBH copy of the course shows them (#318):
+  comments are all it has. The reading form reads the layout marks that
+  some PGN exports write in comments, words between runs of two
+  `@` or more, as a 2CBH copy of the text shows them (#318):
   `@@StartBracket@@39@@EndBracket@@` is `(39)`, `StartSquare`/`EndSquare`
   are `[` `]`, `StartFEN`/`EndFEN` set the FEN apart as `[FEN …]`, and
   `LinkStart`/`LinkEnd` leave the address alone. The full form serves the
@@ -1173,8 +1169,8 @@ With `q` the answer also acknowledges the search (#268):
 - **`featuredGames`** (additive, API v1): up to 12 whole game rows, with
   `year` as in `topGames`, for clients that support database-relative selection.
   Use this list in its returned order when present, including an empty list;
-  fall back to `topGames` only on older bridges that omit it. The heading can
-  remain “Top games”; counts, moves and the All games list are unchanged.
+  fall back to `topGames` only on older bridges that omit it. Counts and moves
+  are the same for both lists.
   - Compute the mean of both source ratings, replacing each missing rating
     with 1500 for selection only. A half-point average stays exact. The rows
     still contain the source ratings, including zeros for unknown ratings.

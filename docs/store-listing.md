@@ -130,11 +130,9 @@ Partner Center takes at most 500 characters here.
 
 ## Notes for certification
 
-The oschess Library needs an account. The testers get the same demo account
-as Google Play and App Store review, with its admin-set permanent code
-(`docs/mobile-android.md` in the oschess repository, "Store review access").
-The owner enters its email and code under Credentials on the Additional Testing
-Information page, never in these notes or in this repository.
+The oschess Library needs an account. The owner enters a demo account's email
+and code under Credentials on the Additional Testing Information page, never
+in these notes or in this repository.
 
 > Sign-in: the oschess Library needs an account. Use the demo account in the
 > Credentials below: at https://oschess.org enter the demo email, select
@@ -153,8 +151,3 @@ the user asks, and keeps a build it installed up to date while «Update
 Stockfish automatically» is on (the default, which the first-run wizard
 shows), a release only once it is a week old, checking every download against
 the SHA-256 GitHub publishes for it (#322).
-
-Submit only once the ChessBase section is open to everyone on oschess.org
-(asavis/oschess#13368): until then the pairing link shows the testers no
-ChessBase section, and certification can fail the app for not doing what the
-listing says.

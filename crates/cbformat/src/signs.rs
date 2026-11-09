@@ -134,8 +134,8 @@ fn letter(c: char, prev: Option<char>, next: Option<char>, after: Option<char>) 
     }
 }
 
-/// A PGN comment with the layout marks of a Chessable course read (#318):
-/// the course's export writes them between runs of `@`
+/// A PGN comment with its layout marks read (#318): some exports write
+/// them between runs of `@`
 /// (`@@StartBracket@@`), where ChessBase's 2CBH copy has U+E02D. Only
 /// between runs of two `@` or more. The caller finds the comments
 /// (`crate::pgnfile`), so that a tag, a `;` comment or a `%` escape line is
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(decode(b"\xed\xe5\xf0\xe0\xe7\xe1\xee\xf0\xee\x80\x89\xe8\xe2\xee"), "неразборчиво");
     }
 
-    /// A Chessable course's marks in a PGN comment (#318). Made-up text.
+    /// Layout marks in a PGN comment (#318). Made-up text.
     #[test]
     fn a_course_layout_in_a_pgn_comment_reads_as_brackets() {
         let read = |s: &str| read_course_marks(s).into_owned();

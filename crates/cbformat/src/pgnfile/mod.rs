@@ -812,7 +812,7 @@ impl Database {
     }
 
     /// The game's text as a reader is shown it: [`Database::text`], with the
-    /// layout marks of a Chessable course in its comments read as brackets
+    /// layout marks some exports write in its comments read as brackets
     /// (`@@StartBracket@@39@@EndBracket@@` is `(39)`, #318). A write keeps
     /// the text as written.
     pub fn reading(&self, r: &Record, limit: usize) -> Result<String> {
@@ -848,7 +848,7 @@ impl Database {
     }
 }
 
-/// A game's `text` with the layout marks of a Chessable course read in its
+/// A game's `text` with the layout marks some exports write read in its
 /// `{}` comments ([`crate::signs::read_course_marks`], #318), the comments
 /// found as the reader finds them ([`lex::Lexer`]): a tag's value, a `;`
 /// comment and a `%` escape line are left as written, whatever they hold.

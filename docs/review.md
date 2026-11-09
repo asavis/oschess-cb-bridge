@@ -11,38 +11,12 @@ Post one top-level pull request comment whose entire body is the line
 `CB-REVIEW-REQUESTED <full 40-character head SHA>` immediately before each
 launch. It records the round; it is not a verdict.
 
-**Codex** (reviews Claude-authored changes), from a worktree checked out at the
-exact head:
-
-```bash
-env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL \
-    -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL \
-  GIT_AUTHOR_NAME=oschess-codex-bot \
-  GIT_AUTHOR_EMAIL=287075638+oschess-codex-bot@users.noreply.github.com \
-  GIT_COMMITTER_NAME=oschess-codex-bot \
-  GIT_COMMITTER_EMAIL=287075638+oschess-codex-bot@users.noreply.github.com \
-  CODEX_HOME=/home/asavi/.codex-oschess-bot \
-  python3 scripts/target_slot.py -C <worktree> \
-  codex exec --dangerously-bypass-approvals-and-sandbox \
-    -c model=<model> -c model_reasoning_effort=high \
-    -C <worktree> - < prompt.txt
-```
-
-`scripts/target_slot.py` gives the review one shared target folder for the
-whole session, so that the reviewer's builds neither fill a target/ of the
-review worktree's own nor meet another worktree's build. A Codex sandbox, when
-one is used instead, needs that folder writable:
-`-c 'sandbox_workspace_write.writable_roots=["/home/asavi/.cache/oschess-cb-bridge/targets"]'`.
-
-`<model>` is the newest Codex model the account offers, resolved when the
-review starts (`gpt-6.1-sol` on 2026-10-08), and the prompt names it.
-`CODEX_HOME` selects the account that pays; when it is out of quota, rerun the
-identical command with `CODEX_HOME=/home/asavi/.codex`. The git identity
-prefix is kept even though a reviewer must not commit, so that the same prefix
-is safe to copy into an implementation launch.
-
-**Claude** (reviews Codex-authored changes): a Claude session on `sonnet` at
-effort `high`, given the same prompt, posting as `oschess-claude-bot`.
+A Claude-authored change is reviewed by Codex, its newest model, and a
+Codex-authored one by Claude `sonnet`, both at effort `high`, from a worktree
+checked out at the exact head and through `scripts/target_slot.py`, which gives
+the review one shared target folder. The prompt names the model. The launch
+commands are kept on the development host
+(`~/.local/share/oschess/bridge-lane/review-launch.md`), not in this repository.
 
 ## The prompt
 
