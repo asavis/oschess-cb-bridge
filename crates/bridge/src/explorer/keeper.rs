@@ -88,8 +88,9 @@ pub fn start(app: &Arc<App>) {
     let app: Weak<App> = Arc::downgrade(app);
     let spawned =
         std::thread::Builder::new().name("bridge-keeper".into()).stack_size(crate::THREAD_STACK).spawn(move || {
-            // The last use whose memory was let go.
-            let mut released = None;
+            // The last use whose memory was let go, and the last work that
+            // kept it from being let go, told once.
+            let (mut released, mut held_by) = (None, Vec::new());
             while let Some(app) = app.upgrade() {
                 let registry = &app.catalog.explorer;
                 let Keeping { tick, active_for, .. } = *lock(&registry.keeping);
@@ -107,10 +108,18 @@ pub fn start(app: &Arc<App>) {
                     && let Some(used) = app.last_used()
                     && released != Some(used)
                     && used.elapsed() >= within
-                    && app.catalog.release_unused()
                 {
-                    released = Some(used);
-                    crate::log!("let go of the memory left by the last use");
+                    match app.catalog.release_unused() {
+                        Ok(()) => {
+                            released = Some(used);
+                            crate::log!("let go of the memory left by the last use");
+                        }
+                        Err(running) if running != held_by => {
+                            crate::log!("the memory left by the last use stays while it runs: {running:?}");
+                            held_by = running;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 drop(app);
                 std::thread::sleep(tick);

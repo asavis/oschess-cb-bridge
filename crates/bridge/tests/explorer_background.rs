@@ -628,9 +628,9 @@ fn memory_is_not_let_go_while_work_runs() {
     assert!(catalog.pgn().queue().submit(Box::new(move || {
         let _ = held.recv();
     })));
-    assert!(!catalog.release_unused(), "a job of the catalog's runs");
+    assert!(catalog.release_unused().is_err(), "a job of the catalog's runs");
     release.send(()).unwrap();
-    until("the job did not end", WAIT_LIMIT, || catalog.release_unused());
+    until("the job did not end", WAIT_LIMIT, || catalog.release_unused().is_ok());
 }
 
 /// A database replaced while the bridge watches it waits for the quiet

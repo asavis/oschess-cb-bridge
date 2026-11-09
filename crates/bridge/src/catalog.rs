@@ -684,19 +684,20 @@ impl Catalog {
 
     /// Lets go of what using the bridge left in memory, when nothing runs:
     /// the open databases, the position indexes, the heads files and all the
-    /// search caches retain (#365). Their next use opens them again. Whether
-    /// it did: not while a request or any of the catalog's work runs.
-    pub fn release_unused(&self) -> bool {
-        if crate::foreground::running() || self.shared.activity.wait_idle(Instant::now()).is_err() {
-            return false;
+    /// search caches retain (#365). Their next use opens them again. Not
+    /// while a request or any of the catalog's work runs: what runs, then.
+    pub fn release_unused(&self) -> Result<(), Vec<&'static str>> {
+        if crate::foreground::running() {
+            return Err(vec!["a request"]);
         }
+        self.shared.activity.wait_idle(Instant::now())?;
         for entry in self.listed().iter() {
             *lock(&entry.held.open) = None;
         }
         self.explorer.release();
         self.heads.release();
         crate::search::memory::evict_all();
-        true
+        Ok(())
     }
 
     /// The names of the databases on the list, read first if its sources
