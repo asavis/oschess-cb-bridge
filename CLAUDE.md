@@ -26,6 +26,10 @@
 - Never commit a chess database, a PGN export of one, or anything derived from
   a user's database. `.gitignore` excludes the database extensions; tests use
   records built by hand.
+- In anything public (files, code comments, issues, pull requests, commit
+  messages, release notes), describe a local database or file only by its
+  format and by counts. Never name a publisher, course, book or product it may
+  come from, never guess one from its contents, and never say whose it is.
 - ChessBase is a trademark of ChessBase GmbH. This project is not affiliated
   with it. Name the format descriptively and never use the trademark as the
   name of a crate, binary or repository.
