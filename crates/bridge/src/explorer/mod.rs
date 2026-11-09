@@ -971,6 +971,7 @@ mod tests {
     use crate::catalog::{Busy, Catalog};
     use crate::search::memory::Cancel;
     use crate::search::workers;
+    use crate::testing::{Power, until};
     use cbformat::fixture::{Builder, TempDb, quiet};
     use cbformat::movetable::{Color, END_OF_LINE, MOVES, Piece};
 
@@ -1187,11 +1188,7 @@ mod tests {
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         let state = catalog.explorer.state(&entry.id);
         let settled = || {
-            let until = Instant::now() + workers::tests::PATIENCE;
-            while matches!(*lock(&state), State::Working(_)) {
-                assert!(Instant::now() < until, "the build is over");
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            until("the build is over", workers::tests::PATIENCE, || !matches!(*lock(&state), State::Working(_)));
         };
         assert!(matches!(catalog.explorer.index(Arc::clone(&entry), &open), Lookup::Pending(_)));
         settled();
@@ -1230,16 +1227,6 @@ mod tests {
     /// gives this one.
     #[test]
     fn the_keeper_tries_again_a_build_that_met_busy_workers() {
-        /// A computer on mains power, whose free disk space is not known.
-        struct Mains;
-        impl Machine for Mains {
-            fn on_battery(&self) -> bool {
-                false
-            }
-            fn free_bytes(&self, _: &Path) -> Option<u64> {
-                None
-            }
-        }
         let name = "explorer::tests::the_keeper_tries_again_a_build_that_met_busy_workers";
         if !build::tests::in_child(name, 1, Duration::from_secs(120)) {
             return;
@@ -1251,7 +1238,7 @@ mod tests {
         let catalog = Catalog::new([db.dir().join("db.2cbh")]);
         let explorer = &catalog.explorer;
         explorer.set_dir(dir.clone());
-        explorer.set_machine(Arc::new(Mains));
+        explorer.set_machine(Arc::new(Power::default()));
         explorer.set_keeping(keeper::TICK, Duration::ZERO);
         explorer.set_limits(Limits { workers_wait: Duration::from_millis(100), ..Limits::default() });
         let entry = Arc::clone(&catalog.entries()[0]);
@@ -1259,11 +1246,7 @@ mod tests {
         explorer.mark_in_use(&entry.id);
         let state = explorer.state(&entry.id);
         let settled = || {
-            let until = Instant::now() + workers::tests::PATIENCE;
-            while matches!(*lock(&state), State::Working(_)) {
-                assert!(Instant::now() < until, "the build is over");
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            until("the build is over", workers::tests::PATIENCE, || !matches!(*lock(&state), State::Working(_)));
         };
         // A search holds the one worker all the while the build waits.
         let search = workers::one(&Cancel::never()).unwrap();

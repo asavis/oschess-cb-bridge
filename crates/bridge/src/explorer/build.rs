@@ -995,11 +995,9 @@ pub(crate) mod tests {
         let (built, after) = std::thread::scope(|s| {
             let build = s.spawn(|| build_with(&Unread, &plan, &target, &progress, &limits));
             // Its pre-pass starts checking, which takes a worker first.
-            let until = Instant::now() + workers::tests::PATIENCE;
-            while progress.phase() != "checking" {
-                assert!(Instant::now() < until, "the build starts checking");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            crate::testing::until("the build starts checking", workers::tests::PATIENCE, || {
+                progress.phase() == "checking"
+            });
             let asked = Instant::now();
             progress.ask_stop();
             let built = build.join().unwrap();

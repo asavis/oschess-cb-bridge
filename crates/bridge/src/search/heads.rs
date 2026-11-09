@@ -411,6 +411,8 @@ pub static ROWS_READ: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::workers::tests::PATIENCE;
+    use crate::testing::until;
 
     #[test]
     fn the_sweep_leaves_a_partial_file_being_written() {
@@ -483,11 +485,7 @@ mod tests {
         let Ok(open) = entry.open() else { panic!("the database does not open") };
         let states = || lock(&catalog.heads.states);
         catalog.attach_heads(&entry, &open);
-        let until = Instant::now() + crate::search::workers::tests::PATIENCE;
-        while matches!(states().get(&id), Some(State::Working(_))) {
-            assert!(Instant::now() < until, "the build is over");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        until("the build is over", PATIENCE, || !matches!(states().get(&id), Some(State::Working(_))));
         assert!(matches!(states().get(&id), Some(State::Waiting(_))), "the build is recorded as failed");
         assert!(cloud.written.load(Ordering::Relaxed), "the build was writing its partial file");
         let records = open.db.record_count();
@@ -499,12 +497,12 @@ mod tests {
             *at = at.checked_sub(RETRY_AFTER).expect("the clock goes back that far");
         }
         cloud.bug.store(false, Ordering::Relaxed);
-        let until = Instant::now() + crate::search::workers::tests::PATIENCE;
-        while !open.indexes.has_usable_heads() {
-            catalog.attach_heads(&entry, &open);
-            assert!(Instant::now() < until, "a heads file was attached");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        until("a heads file was attached", PATIENCE, || {
+            open.indexes.has_usable_heads() || {
+                catalog.attach_heads(&entry, &open);
+                false
+            }
+        });
         assert!(path(&dir, &id).exists() && !partial.exists());
         drop((open, entry, catalog));
         let _ = std::fs::remove_dir_all(&dir);
