@@ -139,7 +139,7 @@ fn settings_view(app: &AppHandle) -> Answer<SettingsView> {
     let autostart = autostart::state(app);
     let prefs = prefs::load(&dir);
     Ok(SettingsView {
-        version: bridge::version::shown(env!("CARGO_PKG_VERSION")),
+        version: crate::status::shown_version(env!("CARGO_PKG_VERSION")),
         port: config.port,
         extras: settings::extras(&config),
         autostart: autostart == State::On,
