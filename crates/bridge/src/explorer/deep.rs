@@ -39,13 +39,13 @@ use crate::search::SearchError;
 use crate::search::memory::Refused;
 use crate::sync::{lock, unpoisoned};
 
-use super::build::{Chunks, Out, Passes, Turns, from_bad, plan_pass};
+use super::build::{Chunks, Out, PassPlan, Passes, Turns, from_bad, plan_pass};
 use super::follow::{CHANGES, Changes, Tracker};
 use super::format::{
     BLOCK_BUCKETS, DEEP_BLOCK_BITS, DEEP_BLOCK_ENTRY, MAX_PLY, PRINT_BITS, deep_bucket, deep_print, structure_of,
     structures_in_vectors, structures_of, varint,
 };
-use super::runs::{Limits, PassTime, Progress, on_workers, pass_workers};
+use super::runs::{Limits, PassTime, Progress, on_workers};
 use super::source::MAX_STRUCTURES;
 use super::stream::{self, Stream};
 
@@ -138,9 +138,7 @@ pub(super) fn write(
         largest: 0,
     };
     let records = stream.header.records();
-    let plan = passes.room(share, pass_workers(progress), records, limits.pass_bytes)?;
-    let (mut memory, mut workers, mut room) = plan.reserve(progress)?;
-    let (mut capacity, mut want) = passes.capacity(room, workers);
+    let mut plan = PassPlan::reserve(passes, share, records, progress, limits)?;
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let mut sink = Sink { at: out.offset, table, start: 0, crc: !0, postings: 0 };
@@ -148,14 +146,7 @@ pub(super) fn write(
     while lo < block_point(counts.len() as u64) {
         // From the block the last pass ended in, counted whole.
         let first = (lo >> (u32::from(DEEP_BLOCK_BITS) + GAME_BITS)) as usize;
-        // A build promoted since the last pass takes a requested build's
-        // workers from this one on, within its share (#346).
-        if let Ok(now) = passes.room(share, pass_workers(progress), records, limits.pass_bytes)
-            && now.workers > workers
-        {
-            (workers, room) = now.more_workers(&mut memory, workers, room);
-            (capacity, want) = passes.capacity(room, workers);
-        }
+        let (capacity, want) = plan.next_pass();
         let (end, planned) = plan_pass(first, counts.len(), capacity, |block| counts[block]);
         let hi = AtomicU64::new(block_point(end as u64));
         progress.deep_passes.fetch_add(1, Ordering::Relaxed);

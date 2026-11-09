@@ -524,6 +524,56 @@ impl Passes {
     }
 }
 
+/// The memory and the workers of a section's passes (#379), the tree's or the
+/// deep section's: what they reserve when the section starts and what a build
+/// promoted meanwhile takes more. Each section's worker loops read what a
+/// pass has from here; they differ in their types, and are the hot path.
+pub(super) struct PassPlan<'a> {
+    passes: Passes,
+    share: usize,
+    records: u64,
+    progress: &'a Progress,
+    limits: &'a Limits,
+    memory: Hold,
+    workers: usize,
+    room: usize,
+    capacity: usize,
+    want: usize,
+}
+
+impl<'a> PassPlan<'a> {
+    /// Reserves what the section's `passes` take of the build's `share` of
+    /// the budget ([`Passes::room`], [`Room::reserve`]), held until this is
+    /// dropped.
+    pub fn reserve(
+        passes: Passes,
+        share: usize,
+        records: u64,
+        progress: &'a Progress,
+        limits: &'a Limits,
+    ) -> Result<PassPlan<'a>, SearchError> {
+        let planned = passes.room(share, pass_workers(progress), records, limits.pass_bytes)?;
+        let (memory, workers, room) = planned.reserve(progress)?;
+        let (capacity, want) = passes.capacity(room, workers);
+        Ok(PassPlan { passes, share, records, progress, limits, memory, workers, room, capacity, want })
+    }
+
+    /// The entries or postings the next pass's buffers hold together, and
+    /// its workers ([`Passes::capacity`]). A build promoted since the last
+    /// pass takes a requested build's workers from this one on, within its
+    /// share (#346).
+    pub fn next_pass(&mut self) -> (usize, usize) {
+        let workers = pass_workers(self.progress);
+        if let Ok(now) = self.passes.room(self.share, workers, self.records, self.limits.pass_bytes)
+            && now.workers > self.workers
+        {
+            (self.workers, self.room) = now.more_workers(&mut self.memory, self.workers, self.room);
+            (self.capacity, self.want) = self.passes.capacity(self.room, self.workers);
+        }
+        (self.capacity, self.want)
+    }
+}
+
 /// The units of a pass from `first` on, of a section's `units`, each of
 /// `count(unit)` entries or postings as the stream pass counted them: as many
 /// as `capacity` of them hold, but for a little ([`PLANNED`]), one at least.
