@@ -290,11 +290,6 @@ function showInstallProgress(progress) {
     : t(`settings.engine.progress.${progress.phase}`);
 }
 
-function toggle(id, onNow) {
-  document.getElementById(id).setAttribute('aria-checked', String(onNow));
-  document.getElementById(`${id}-state`).textContent = onNow ? t('settings.on') : t('settings.off');
-}
-
 function wire() {
   const language = document.getElementById('language');
   language.addEventListener('change', async () => {
@@ -389,19 +384,6 @@ async function revealCode(shown) {
 
 function restarting() {
   notice(() => t('settings.restarting'));
-}
-
-function notice(text) {
-  const node = document.getElementById('notice');
-  notice.text = text;
-  node.textContent = text();
-  node.hidden = false;
-  clearTimeout(notice.timer);
-  notice.timer = setTimeout(() => { node.hidden = true; }, 6000);
-}
-
-function act(promise) {
-  return promise.catch((error) => notice(() => failure(error)));
 }
 
 main();

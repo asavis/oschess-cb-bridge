@@ -26,6 +26,7 @@ use crate::i18n::Strings;
 use crate::opening::{self, FlyoutClick, LIMIT, Stage};
 use crate::reports::{Kind, Report};
 use crate::status::Asked;
+use bridge::sync::lock;
 
 /// Translate native titles as well as the documents inside their webviews.
 pub fn translate(app: &AppHandle) {
@@ -214,7 +215,7 @@ pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
     let shared = shared(app);
     let scale = app.primary_monitor().ok().flatten().map_or(1.0, |m| m.scale_factor());
     let click = {
-        let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
+        let mut flyout = lock(&shared.flyout);
         if !flyout.life.shown() && flyout.hidden_at.is_some_and(|t| t.elapsed() < REOPEN_GUARD) {
             return;
         }
@@ -244,7 +245,7 @@ fn destroy_flyout(app: &AppHandle, flyout: u64) {
 
 /// Puts the flyout by the tray mark and shows it.
 fn show_flyout(app: &AppHandle, window: &WebviewWindow) {
-    let anchor = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).anchor;
+    let anchor = lock(&shared(app).flyout).anchor;
     place(window, anchor);
     if let Err(e) = window.show().and_then(|()| window.set_focus()) {
         bridge::fault!("the flyout cannot be shown: {e}");
@@ -254,7 +255,7 @@ fn show_flyout(app: &AppHandle, window: &WebviewWindow) {
 /// A page has drawn: the flyout someone waits for shows, and any other goes.
 pub fn page_ready(app: &AppHandle, window: &WebviewWindow) {
     let Some(flyout) = flyout_number(window.label()) else { return };
-    if shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.ready(flyout) {
+    if lock(&shared(app).flyout).life.ready(flyout) {
         show_flyout(app, window);
     } else {
         destroy_flyout(app, flyout);
@@ -266,7 +267,7 @@ pub fn page_ready(app: &AppHandle, window: &WebviewWindow) {
 fn flyout_built(app: &AppHandle, flyout: u64) {
     let handle = app.clone();
     let queued = app.run_on_main_thread(move || {
-        if shared(&handle).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.unwanted(flyout) {
+        if lock(&shared(&handle).flyout).life.unwanted(flyout) {
             destroy_flyout(&handle, flyout);
         }
     });
@@ -283,7 +284,7 @@ fn flyout_failed(app: &AppHandle, flyout: u64) -> bool {
     let (answer, answered) = mpsc::channel();
     let handle = app.clone();
     let queued = app.run_on_main_thread(move || {
-        let failed = shared(&handle).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.failed(flyout);
+        let failed = lock(&shared(&handle).flyout).life.failed(flyout);
         if failed.is_some() {
             destroy_flyout(&handle, flyout);
         }
@@ -299,20 +300,20 @@ fn flyout_failed(app: &AppHandle, flyout: u64) -> bool {
 
 /// Sizes the flyout to its page, keeping it by the tray mark.
 pub fn fit_flyout(app: &AppHandle, height: f64) {
-    let wanted = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.current();
+    let wanted = lock(&shared(app).flyout).life.current();
     let Some(window) = wanted.and_then(|flyout| app.get_webview_window(&flyout_label(flyout))) else { return };
     let height = height.clamp(160.0, 720.0);
     if let Err(e) = window.set_size(tauri::LogicalSize::new(FLYOUT_WIDTH, height)) {
         bridge::fault!("the flyout cannot be sized: {e}");
     }
-    let anchor = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).anchor;
+    let anchor = lock(&shared(app).flyout).anchor;
     place(&window, anchor);
 }
 
 /// Closes the flyout: its window goes, and its WebView2 processes with it
 /// (#365).
 pub fn hide_flyout(app: &AppHandle) {
-    let abandoned = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.abandon();
+    let abandoned = lock(&shared(app).flyout).life.abandon();
     if let Some(flyout) = abandoned {
         destroy_flyout(app, flyout);
     }
@@ -469,9 +470,9 @@ pub fn on_event(window: &Window, event: &WindowEvent) {
         WindowEvent::Focused(false) => {
             let Some(flyout) = flyout_number(window.label()) else { return };
             let shared = shared(window.app_handle());
-            let closes = shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.focus_lost(flyout);
+            let closes = lock(&shared.flyout).life.focus_lost(flyout);
             if closes {
-                shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).hidden_at = Some(Instant::now());
+                lock(&shared.flyout).hidden_at = Some(Instant::now());
                 destroy_flyout(window.app_handle(), flyout);
             }
         }

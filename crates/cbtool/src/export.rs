@@ -11,6 +11,7 @@ use cbformat::pgn::{AnnotationStatus, Options};
 use cbformat::view::{self, Base};
 
 use crate::{AnyResult, LIMITS, USAGE, run_workers, threads};
+use bridge::sync::{lock, unpoisoned};
 
 /// Refuses an output path that is one of the database's own files, by name or
 /// through any alias such as a hard link: creating it would truncate the input
@@ -168,9 +169,9 @@ fn export_in_order<'db>(
                 render(chunk[done], &mut r);
                 done += 1;
             }
-            let mut t = turn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut t = lock(&turn);
             while t.next != k && t.failed.is_none() {
-                t = your_turn.wait(t).unwrap_or_else(|e| e.into_inner());
+                t = unpoisoned(your_turn.wait(t));
             }
             if t.failed.is_some() {
                 break;
@@ -197,7 +198,7 @@ fn export_in_order<'db>(
             your_turn.notify_all();
         }
     });
-    let t = turn.into_inner().unwrap_or_else(|e| e.into_inner());
+    let t = unpoisoned(turn.into_inner());
     match t.failed {
         Some(e) => Err(e.into()),
         None => Ok(t.ok),

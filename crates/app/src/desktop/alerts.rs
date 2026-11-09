@@ -4,6 +4,7 @@
 //! [`warn`] and [`inform`] run on a thread of their own, so the caller never
 //! waits for the user to close them; [`ask`] waits for the answer.
 
+use super::system::wide;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     IDOK, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST,
     MESSAGEBOX_STYLE, MessageBoxW,
@@ -38,9 +39,4 @@ fn show(title: &[u16], text: &[u16], style: MESSAGEBOX_STYLE) -> i32 {
     // SAFETY: both strings are NUL-terminated UTF-16 that outlive the call,
     // and the message has no owner window.
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), style | MB_SETFOREGROUND | MB_TOPMOST) }
-}
-
-/// `text` as a NUL-terminated UTF-16 string.
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
 }

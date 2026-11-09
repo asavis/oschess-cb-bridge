@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn the_hook_sees_the_end_another_thread_sends() {
         install(|ending| ENDED.lock().unwrap().push(ending));
-        let class: Vec<u16> = "oschess-bridge-session-test\0".encode_utf16().collect();
+        let class = crate::desktop::system::wide("oschess-bridge-session-test");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             lpszClassName: class.as_ptr(),

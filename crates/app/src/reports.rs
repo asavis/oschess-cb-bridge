@@ -240,7 +240,10 @@ pub struct Outbox {
 
 /// The extension of a waiting report, and of one being written.
 const ENVELOPE: &str = "envelope";
+/// What an older version, and `bridge::files::write_atomic`, leave half
+/// written when the bridge stops in the middle of a write.
 const PART: &str = "part";
+const TEMPORARY: &str = "tmp";
 
 impl Outbox {
     pub fn in_data(data: &Path) -> Outbox {
@@ -253,7 +256,7 @@ impl Outbox {
         std::fs::create_dir_all(&self.dir)?;
         let millis = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
         let path = self.dir.join(format!("{millis:015}-{}-{}.{ENVELOPE}", event.id, event.kind.tag()));
-        write_whole(&path, event.envelope.as_bytes())?;
+        bridge::files::write_atomic(&path, event.envelope.as_bytes())?;
         self.trim();
         Ok(path)
     }
@@ -274,7 +277,7 @@ impl Outbox {
     /// Drops the reports beyond the caps, oldest first, and what a crash left
     /// half written. Called by the one filing, so nothing else is written.
     fn trim(&self) {
-        for part in self.files(PART) {
+        for part in [PART, TEMPORARY].into_iter().flat_map(|left| self.files(left)) {
             let _gone = std::fs::remove_file(part);
         }
         let mut files: Vec<(PathBuf, u64)> = self
@@ -323,7 +326,8 @@ impl Outbox {
         seen.retain(|_, (d, _)| *d + 1 >= day);
         seen.insert(seen_key(version, kind, fingerprint), (day, code.to_string()));
         let bytes = serde_json::to_vec(&seen).unwrap_or_default();
-        let written = std::fs::create_dir_all(&self.dir).and_then(|()| write_whole(&self.seen(), &bytes));
+        let written =
+            std::fs::create_dir_all(&self.dir).and_then(|()| bridge::files::write_atomic(&self.seen(), &bytes));
         if let Err(e) = written {
             bridge::log!("report: seen.json cannot be written: {e}");
         }
@@ -339,14 +343,6 @@ fn seen_key(version: &str, kind: Kind, fingerprint: &str) -> String {
     let mut digest = bridge::sha256::Sha256::new();
     digest.update(format!("{version}\n{}\n{fingerprint}", kind.tag()).as_bytes());
     bridge::sha256::hex(&digest.finish())[..16].to_string()
-}
-
-/// Writes `bytes` to `path` aside and moves them in, so that no reader ever
-/// sees half of them.
-fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let part = path.with_extension(PART);
-    std::fs::write(&part, bytes)?;
-    std::fs::rename(&part, path)
 }
 
 /// Whether the waiting report `file` was sent by hand, by its name.

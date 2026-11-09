@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 use bridge::config;
 use bridge::stockfish::{self, Arch, Build, Transport};
 use bridge::sync::lock;
+use bridge::version::is_newer;
 use serde::Deserialize;
 
 use crate::choices::Choices;
@@ -52,7 +53,7 @@ impl Known {
     pub fn newest(&self, arch: Arch) -> Build {
         let pinned = Build::for_arch(arch);
         match &*lock(&self.0) {
-            Some(known) if known.arch == arch && stockfish::is_newer(&known.version, &pinned.version) => known.clone(),
+            Some(known) if known.arch == arch && is_newer(&known.version, &pinned.version) => known.clone(),
             _ => pinned.clone(),
         }
     }
@@ -205,7 +206,7 @@ impl Look<'_> {
         let Some(current) = chosen.as_deref().and_then(|c| stockfish::installed_version(self.data, c)) else {
             return Ok(Outcome::NotOurs);
         };
-        if !stockfish::is_newer(&newest.version, &current) {
+        if !is_newer(&newest.version, &current) {
             self.remove_older();
             return Ok(Outcome::Current);
         }

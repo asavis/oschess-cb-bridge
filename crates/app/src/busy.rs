@@ -5,6 +5,7 @@
 //! asks the event loop for a beat every few seconds ([`Watch`]): the log then
 //! names what it was running when it stopped answering.
 
+use bridge::sync::lock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ impl Busy {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<(String, Instant)>> {
-        self.now.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.now)
     }
 }
 

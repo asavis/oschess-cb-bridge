@@ -373,11 +373,6 @@ function renderStartup() {
   document.getElementById('stockfish-update').disabled = busy;
 }
 
-function toggle(id, onNow) {
-  document.getElementById(id).setAttribute('aria-checked', String(onNow));
-  document.getElementById(`${id}-state`).textContent = onNow ? t('settings.on') : t('settings.off');
-}
-
 // Applies the start-up choices that differ from how things stand.
 async function applyStartup() {
   if (!settings.autostartBlocked && autostartOn !== settings.autostart) {
@@ -470,19 +465,6 @@ function renderEngineControls() {
   const locked = busy || Boolean(enginesRead);
   for (const input of document.querySelectorAll('#engines input')) input.disabled = locked;
   for (const id of ['install-stockfish', 'pick-other', 'pick-engine']) document.getElementById(id).disabled = locked;
-}
-
-function notice(text) {
-  const node = document.getElementById('notice');
-  notice.text = text;
-  node.textContent = text();
-  node.hidden = false;
-  clearTimeout(notice.timer);
-  notice.timer = setTimeout(() => { node.hidden = true; }, 6000);
-}
-
-function act(promise) {
-  return promise.catch((error) => notice(() => failure(error)));
 }
 
 main();

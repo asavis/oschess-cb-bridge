@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::tools::{QUIET, run, run_coded, system_tool};
+use crate::version::{is_newer, is_version};
 use crate::{folders, sha256};
 
 /// A processor architecture Stockfish publishes a Windows build for.
@@ -187,29 +188,6 @@ fn folder(data: &Path, version: &str) -> PathBuf {
 /// version the settings window sends names no other file.
 pub fn licence(data: &Path, version: &str) -> Option<PathBuf> {
     is_version(version).then(|| folder(data, version).join(LICENCE))
-}
-
-/// Whether `text` is a release's version: numbers joined by dots, such as
-/// `19` or `17.1`.
-fn is_version(text: &str) -> bool {
-    text.len() <= 16 && text.split('.').all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Whether the release `version` is newer than `than`, compared number by
-/// number: 19 < 19.1 < 20, and 19.0 is 19. A text that is not a version is
-/// newer than nothing, and nothing is newer than it.
-pub fn is_newer(version: &str, than: &str) -> bool {
-    let numbers = |text: &str| -> Option<Vec<u64>> {
-        if !is_version(text) {
-            return None;
-        }
-        let mut numbers: Vec<u64> = text.split('.').map(|n| n.parse().ok()).collect::<Option<_>>()?;
-        while numbers.len() > 1 && numbers.last() == Some(&0) {
-            numbers.pop();
-        }
-        Some(numbers)
-    };
-    numbers(version).zip(numbers(than)).is_some_and(|(version, than)| version > than)
 }
 
 /// The version of the build the bridge installed whose executable is `exe`:

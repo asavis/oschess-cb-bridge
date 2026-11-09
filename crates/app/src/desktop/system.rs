@@ -81,6 +81,7 @@ fn get(root: HKEY, key: &str, value: &str, flags: REG_ROUTINE_FLAGS, data: *mut 
     status == ERROR_SUCCESS
 }
 
-fn wide(text: &str) -> Vec<u16> {
+/// `text` as a NUL-terminated UTF-16 string, as Windows' calls take it.
+pub(super) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }

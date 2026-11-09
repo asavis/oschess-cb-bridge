@@ -12,6 +12,7 @@ use tauri::AppHandle;
 use super::reporting;
 use crate::busy::{self, BUSY, Event, Watch};
 use crate::reports::{Kind, Report};
+use bridge::sync::lock;
 
 /// How often the event loop is asked for a beat.
 const BEAT: Duration = Duration::from_secs(5);
@@ -27,7 +28,7 @@ pub fn start(app: &AppHandle) {
             if !asked.swap(true, Ordering::AcqRel) {
                 let (beat, answered) = (last.clone(), asked.clone());
                 let posted = app.run_on_main_thread(move || {
-                    *beat.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                    *lock(&beat) = Instant::now();
                     answered.store(false, Ordering::Release);
                 });
                 // The event loop has ended: the app is exiting.
@@ -36,7 +37,7 @@ pub fn start(app: &AppHandle) {
                 }
             }
             std::thread::sleep(BEAT);
-            let (beat, now) = (*last.lock().unwrap_or_else(|e| e.into_inner()), Instant::now());
+            let (beat, now) = (*lock(&last), Instant::now());
             match watch.check(beat, now) {
                 Some(Event::Stopped { silent }) => {
                     let running = BUSY.current();

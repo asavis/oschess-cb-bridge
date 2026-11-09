@@ -26,9 +26,11 @@ use windows::core::{AgileReference, Interface, PCWSTR};
 
 use super::server::Shared;
 use super::shared;
+use super::system::wide;
 use super::updater::report;
 use crate::channel::STORE_PAGE;
 use crate::updates::{self, Phase, StoreCalls, StoreOutcome, StoreStep};
+use bridge::sync::lock;
 
 /// What automatic looks told this run: `Some(false)` that an update waits,
 /// `Some(true)` that one is required. A notice is repeated only when it says
@@ -99,7 +101,7 @@ impl Drop for OwnerWindow {
 /// A hidden top-level window of the system's own `STATIC` class, as a number
 /// so that it can cross threads.
 fn hidden_window() -> Result<usize, String> {
-    let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+    let class = wide("STATIC");
     // SAFETY: a window of a system class, no parent, no menu and no parameter;
     // the strings outlive the call.
     let hwnd = unsafe {
@@ -198,7 +200,7 @@ pub fn look_and_install(app: &AppHandle, asked: bool) -> Result<Phase, String> {
             })
         }
         StoreStep::Tell { mandatory } => {
-            let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+            let mut told = lock(&TOLD);
             if told.is_none_or(|was| mandatory && !was) {
                 let title = if mandatory {
                     strings.get("toast.update.required.title")
