@@ -52,6 +52,7 @@
 
   "failure.title": "oschess міст",
   "failure.window.settings": "Не вдалося відкрити налаштування мосту.",
+  "failure.window.flyout": "Не вдалося відкрити вікно стану моста.",
   "failure.window.firstRun": "Не вдалося відкрити вікно першого запуску мосту.",
   "failure.stage.requested": "Вікно не створилося.",
   "failure.stage.built": "Вікно створилося, але його вміст не завантажився.",

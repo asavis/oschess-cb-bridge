@@ -13,6 +13,7 @@
 //! stage it stopped at, and the user is told so in a native message. Before,
 //! the click did nothing and left nothing in the log.
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tauri::{
@@ -22,7 +23,7 @@ use tauri::{
 
 use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
-use crate::opening::{self, LIMIT, Stage};
+use crate::opening::{self, FlyoutClick, LIMIT, Stage};
 use crate::reports::{Kind, Report};
 use crate::status::Asked;
 
@@ -37,7 +38,7 @@ pub fn translate(app: &AppHandle) {
 pub fn translate_window(window: &WebviewWindow, strings: &Strings) {
     let title = match window.label() {
         SETTINGS => strings.get("window.settings"),
-        FLYOUT => strings.get("window.flyout"),
+        label if is_flyout(label) => strings.get("window.flyout"),
         FIRST_RUN => strings.get("window.firstRun"),
         _ => return,
     };
@@ -46,7 +47,21 @@ pub fn translate_window(window: &WebviewWindow, strings: &Strings) {
     }
 }
 
-pub const FLYOUT: &str = "flyout";
+/// The start of the label of every window of the flyout, which has a number
+/// of its own after it ([`FlyoutLife`]).
+pub const FLYOUT: &str = "flyout-";
+
+fn flyout_label(flyout: u64) -> String {
+    format!("{FLYOUT}{flyout}")
+}
+
+fn is_flyout(label: &str) -> bool {
+    label.starts_with(FLYOUT)
+}
+
+fn flyout_number(label: &str) -> Option<u64> {
+    label.strip_prefix(FLYOUT)?.parse().ok()
+}
 pub const SETTINGS: &str = "settings";
 pub const FIRST_RUN: &str = "first-run";
 
@@ -66,7 +81,9 @@ type Builder<'a> = WebviewWindowBuilder<'a, Wry, AppHandle>;
 /// A window to build: its label, its page in `ui/` with the page's query, its
 /// title in the app's language, and the rest of its look.
 struct Spec {
-    label: &'static str,
+    label: String,
+    /// Which flyout it is, when it is one.
+    flyout: Option<u64>,
     page: &'static str,
     query: String,
     title: String,
@@ -78,22 +95,27 @@ struct Spec {
 fn spawn_window(app: &AppHandle, spec: Spec) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if app.get_webview_window(spec.label).is_some() {
+        if app.get_webview_window(&spec.label).is_some() {
             return;
         }
         // A second click while the window is being built builds nothing.
-        let Some(attempt) = shared(&app).openings.request(spec.label, Instant::now()) else { return };
-        watch_opening(&app, spec.label, attempt);
+        let Some(attempt) = shared(&app).openings.request(&spec.label, Instant::now()) else { return };
+        watch_opening(&app, spec.label.clone(), spec.flyout, attempt);
         if faults::on("build-hangs") {
             std::future::pending::<()>().await;
         }
         match build_window(&app, &spec) {
-            Ok(_) => shared(&app).openings.built(spec.label, attempt),
+            Ok(_) => {
+                shared(&app).openings.built(&spec.label, attempt);
+                if let Some(flyout) = spec.flyout {
+                    flyout_built(&app, flyout);
+                }
+            }
             Err(e) => {
                 let line = format!("the {} window: {e}", spec.label);
                 bridge::log!("{line}");
-                shared(&app).openings.failed(spec.label, attempt);
-                failed_to_open(&app, spec.label, Stage::Requested, &line);
+                shared(&app).openings.failed(&spec.label, attempt);
+                failed_to_open(&app, &spec.label, spec.flyout, Stage::Requested, &line);
             }
         }
     });
@@ -105,31 +127,33 @@ fn build_window(app: &AppHandle, spec: &Spec) -> Result<WebviewWindow, String> {
     }
     let lang = shared(app).strings.lang().code();
     let url = WebviewUrl::App(format!("{}.html?lang={lang}{}", spec.page, spec.query).into());
-    let builder = WebviewWindowBuilder::new(app, spec.label, url).title(spec.title.as_str());
+    let builder = WebviewWindowBuilder::new(app, &spec.label, url).title(spec.title.as_str());
     (spec.configure)(builder).build().map_err(|e| e.to_string())
 }
 
 /// Watches `attempt` of `label`'s window from a thread of its own: a page that
 /// is not ready after [`LIMIT`] is logged, and the user is told.
-fn watch_opening(app: &AppHandle, label: &'static str, attempt: u64) {
-    let watched = app.clone();
+fn watch_opening(app: &AppHandle, label: String, flyout: Option<u64>, attempt: u64) {
+    let (watched, name) = (app.clone(), label.clone());
     let spawned = std::thread::Builder::new().name("window-watch".into()).spawn(move || {
         std::thread::sleep(LIMIT);
-        let Some(stage) = shared(&watched).openings.overdue(label, attempt) else { return };
+        let Some(stage) = shared(&watched).openings.overdue(&label, attempt) else { return };
         let line = format!("the {label} window stopped at \"{}\" after {} s", stage.name(), LIMIT.as_secs());
         bridge::log!("{line}");
-        failed_to_open(&watched, label, stage, &line);
+        failed_to_open(&watched, &label, flyout, stage, &line);
     });
     if let Err(e) = spawned {
-        bridge::fault!("the {label} window is not watched: {e}");
+        bridge::fault!("the {name} window is not watched: {e}");
     }
 }
 
 /// Reports that `label`'s window did not open (#333), its log `line` the
 /// report's message, and tells the user in a native message how far it got,
-/// with the report's code, copied. The flyout, built hidden at the start, is
-/// reported and not shown: nobody has asked for it yet.
-fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str) {
+/// with the report's code, copied. A flyout no click waits for any more is
+/// reported and not shown: nobody is waiting for it.
+fn failed_to_open(app: &AppHandle, label: &str, flyout: Option<u64>, stage: Stage, line: &str) {
+    // Every flyout under one name in the report.
+    let label = if flyout.is_some() { "flyout" } else { label };
     let code = reporting::file(Report {
         kind: Kind::Window,
         message: line.to_string(),
@@ -138,9 +162,12 @@ fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str
     });
     let shared = shared(app);
     let strings = &shared.strings;
+    // The click is answered here, and the window its page failed in goes.
+    let waited = flyout.is_some_and(|flyout| flyout_failed(app, flyout));
     let what = match label {
         SETTINGS => strings.get("failure.window.settings"),
         FIRST_RUN => strings.get("failure.window.firstRun"),
+        "flyout" if waited => strings.get("failure.window.flyout"),
         _ => return,
     };
     let why = match stage {
@@ -157,60 +184,123 @@ fn failed_to_open(app: &AppHandle, label: &'static str, stage: Stage, line: &str
     alerts::warn(strings.get("failure.title"), &text);
 }
 
-/// Builds the flyout, hidden until the tray mark is clicked.
-pub fn create_flyout(app: &AppHandle) {
-    spawn_window(
-        app,
-        Spec {
-            label: FLYOUT,
-            page: "flyout",
-            query: String::new(),
-            title: shared(app).strings.get("window.flyout").to_string(),
-            configure: |b| {
-                b.inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
-                    .decorations(false)
-                    .resizable(false)
-                    .skip_taskbar(true)
-                    .always_on_top(true)
-                    .shadow(true)
-                    .visible(false)
-            },
+/// The window of flyout number `flyout`, hidden when built: it shows once its
+/// page is ready.
+fn flyout_spec(app: &AppHandle, flyout: u64) -> Spec {
+    Spec {
+        label: flyout_label(flyout),
+        flyout: Some(flyout),
+        page: "flyout",
+        query: String::new(),
+        title: shared(app).strings.get("window.flyout").to_string(),
+        configure: |b| {
+            b.inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
+                .decorations(false)
+                .resizable(false)
+                .skip_taskbar(true)
+                .always_on_top(true)
+                .shadow(true)
+                .visible(false)
         },
-    );
+    }
 }
 
 /// Opens the flyout by the tray mark at `rect`, or closes it when it is open.
-/// A click in the moment before the flyout is built does nothing.
+/// The flyout exists only while someone uses it, as its WebView2 processes
+/// hold some 200 MB (#365): a click builds it, and it shows when its page is
+/// ready ([`page_ready`]). Which one is wanted is [`FlyoutLife`]'s, decided
+/// here on the event loop's thread.
 pub fn toggle_flyout(app: &AppHandle, rect: Rect) {
-    let Some(window) = app.get_webview_window(FLYOUT) else { return };
-    if window.is_visible().unwrap_or(false) {
-        if let Err(e) = window.hide() {
-            bridge::fault!("the flyout cannot be hidden: {e}");
-        }
-        return;
-    }
     let shared = shared(app);
-    let anchor = {
+    let scale = app.primary_monitor().ok().flatten().map_or(1.0, |m| m.scale_factor());
+    let click = {
         let mut flyout = shared.flyout.lock().unwrap_or_else(|e| e.into_inner());
-        if flyout.hidden_at.is_some_and(|t| t.elapsed() < REOPEN_GUARD) {
+        if !flyout.life.shown() && flyout.hidden_at.is_some_and(|t| t.elapsed() < REOPEN_GUARD) {
             return;
         }
-        let scale = window.scale_factor().unwrap_or(1.0);
         let at = rect.position.to_physical::<f64>(scale);
         let size = rect.size.to_physical::<f64>(scale);
         flyout.anchor = Some((at.x, at.y, size.width, size.height));
-        flyout.anchor
+        flyout.life.click()
     };
-    place(&window, anchor);
-    shared.ask(Asked::Window);
+    match click {
+        FlyoutClick::Build(flyout) => {
+            shared.ask(Asked::Window);
+            spawn_window(app, flyout_spec(app, flyout));
+        }
+        FlyoutClick::Close(flyout) => destroy_flyout(app, flyout),
+        FlyoutClick::Wait => {}
+    }
+}
+
+/// Destroys flyout number `flyout`, if its window is there.
+fn destroy_flyout(app: &AppHandle, flyout: u64) {
+    if let Some(window) = app.get_webview_window(&flyout_label(flyout))
+        && let Err(e) = window.destroy()
+    {
+        bridge::log!("the flyout could not be destroyed: {e}");
+    }
+}
+
+/// Puts the flyout by the tray mark and shows it.
+fn show_flyout(app: &AppHandle, window: &WebviewWindow) {
+    let anchor = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).anchor;
+    place(window, anchor);
     if let Err(e) = window.show().and_then(|()| window.set_focus()) {
         bridge::fault!("the flyout cannot be shown: {e}");
     }
 }
 
+/// A page has drawn: the flyout someone waits for shows, and any other goes.
+pub fn page_ready(app: &AppHandle, window: &WebviewWindow) {
+    let Some(flyout) = flyout_number(window.label()) else { return };
+    if shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.ready(flyout) {
+        show_flyout(app, window);
+    } else {
+        destroy_flyout(app, flyout);
+    }
+}
+
+/// Flyout number `flyout` has been built: decided on the event loop's thread,
+/// a window nobody wants any more goes.
+fn flyout_built(app: &AppHandle, flyout: u64) {
+    let handle = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        if shared(&handle).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.unwanted(flyout) {
+            destroy_flyout(&handle, flyout);
+        }
+    });
+    if let Err(e) = queued {
+        bridge::fault!("the flyout's build is not followed: {e}");
+    }
+}
+
+/// Flyout number `flyout` failed to open: decided on the event loop's thread,
+/// where the clicks are handled, it goes unless it is showing after all.
+/// Whether a click waited for it, to be told. Call it off that thread: it
+/// waits for the answer.
+fn flyout_failed(app: &AppHandle, flyout: u64) -> bool {
+    let (answer, answered) = mpsc::channel();
+    let handle = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let failed = shared(&handle).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.failed(flyout);
+        if failed.is_some() {
+            destroy_flyout(&handle, flyout);
+        }
+        // The caller gave up waiting only after a long stall, and then knows.
+        answer.send(failed == Some(true)).ok();
+    });
+    if let Err(e) = queued {
+        bridge::fault!("the flyout's failure is not handled: {e}");
+        return false;
+    }
+    answered.recv_timeout(LIMIT).unwrap_or(false)
+}
+
 /// Sizes the flyout to its page, keeping it by the tray mark.
 pub fn fit_flyout(app: &AppHandle, height: f64) {
-    let Some(window) = app.get_webview_window(FLYOUT) else { return };
+    let wanted = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.current();
+    let Some(window) = wanted.and_then(|flyout| app.get_webview_window(&flyout_label(flyout))) else { return };
     let height = height.clamp(160.0, 720.0);
     if let Err(e) = window.set_size(tauri::LogicalSize::new(FLYOUT_WIDTH, height)) {
         bridge::fault!("the flyout cannot be sized: {e}");
@@ -219,11 +309,12 @@ pub fn fit_flyout(app: &AppHandle, height: f64) {
     place(&window, anchor);
 }
 
+/// Closes the flyout: its window goes, and its WebView2 processes with it
+/// (#365).
 pub fn hide_flyout(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(FLYOUT)
-        && let Err(e) = window.hide()
-    {
-        bridge::fault!("the flyout cannot be hidden: {e}");
+    let abandoned = shared(app).flyout.lock().unwrap_or_else(|e| e.into_inner()).life.abandon();
+    if let Some(flyout) = abandoned {
+        destroy_flyout(app, flyout);
     }
 }
 
@@ -254,7 +345,8 @@ fn place(window: &WebviewWindow, anchor: Option<(f64, f64, f64, f64)>) {
 pub fn open_settings(app: &AppHandle, section: &str) {
     hide_flyout(app);
     let spec = Spec {
-        label: SETTINGS,
+        label: SETTINGS.to_string(),
+        flyout: None,
         page: "settings",
         query: format!("&section={section}"),
         title: shared(app).strings.get("window.settings").to_string(),
@@ -333,10 +425,10 @@ fn to_primary(window: &WebviewWindow) -> Result<(), String> {
 /// loop removes a destroyed window a moment later, and [`spawn_window`] builds
 /// none while a window of the label is still there.
 fn build_when_gone(app: &AppHandle, spec: Spec) {
-    let (app, label) = (app.clone(), spec.label);
+    let (app, label) = (app.clone(), spec.label.clone());
     let spawned = std::thread::Builder::new().name("window-again".into()).spawn(move || {
         let start = Instant::now();
-        while app.get_webview_window(spec.label).is_some() {
+        while app.get_webview_window(&spec.label).is_some() {
             if start.elapsed() > GONE_WAIT {
                 bridge::fault!(
                     "the {} window is still there {} s after it was destroyed",
@@ -357,7 +449,8 @@ fn build_when_gone(app: &AppHandle, spec: Spec) {
 /// Opens the first-run wizard (#201): its steps, then the pairing screen.
 pub fn open_first_run(app: &AppHandle) {
     let spec = Spec {
-        label: FIRST_RUN,
+        label: FIRST_RUN.to_string(),
+        flyout: None,
         page: "first-run",
         query: String::new(),
         title: shared(app).strings.get("window.firstRun").to_string(),
@@ -367,18 +460,20 @@ pub fn open_first_run(app: &AppHandle) {
     spawn_window(app, spec);
 }
 
-/// The flyout hides when it loses the focus, as the system's own flyouts do.
+/// The flyout closes when it loses the focus, as the system's own flyouts do.
 /// A window that is gone ends its opening (#332): one closed before its page
 /// was ready is not reported as stopped.
 pub fn on_event(window: &Window, event: &WindowEvent) {
     match event {
         WindowEvent::Destroyed => shared(window.app_handle()).openings.closed(window.label()),
-        WindowEvent::Focused(false) if window.label() == FLYOUT => {
-            if let Err(e) = window.hide() {
-                bridge::fault!("the flyout cannot be hidden: {e}");
-            }
+        WindowEvent::Focused(false) => {
+            let Some(flyout) = flyout_number(window.label()) else { return };
             let shared = shared(window.app_handle());
-            shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).hidden_at = Some(Instant::now());
+            let closes = shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).life.focus_lost(flyout);
+            if closes {
+                shared.flyout.lock().unwrap_or_else(|e| e.into_inner()).hidden_at = Some(Instant::now());
+                destroy_flyout(window.app_handle(), flyout);
+            }
         }
         _ => {}
     }

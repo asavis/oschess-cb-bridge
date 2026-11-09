@@ -52,6 +52,7 @@
 
   "failure.title": "oschess bridge",
   "failure.window.settings": "The bridge's settings could not be opened.",
+  "failure.window.flyout": "The bridge's status window could not be opened.",
   "failure.window.firstRun": "The bridge's first-run window could not be opened.",
   "failure.stage.requested": "The window was not created.",
   "failure.stage.built": "The window was created, but its contents did not load.",

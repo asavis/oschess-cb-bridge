@@ -206,6 +206,8 @@ fn capabilities() -> Vec<(String, Vec<String>)> {
             let file: Value = serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
             let windows: Vec<&str> = file["windows"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
             let [window] = windows[..] else { panic!("{:?} is not for one window", e.file_name()) };
+            // Every flyout has a label of its own, by number (#365).
+            let window = window.strip_suffix("-*").unwrap_or(window);
             let permissions = file["permissions"].as_array().unwrap().iter().filter_map(Value::as_str);
             let commands = permissions
                 .filter(|p| !p.contains(':'))
@@ -220,9 +222,8 @@ fn capabilities() -> Vec<(String, Vec<String>)> {
     found
 }
 
-/// Only a window a user opens asks for a look at the databases: the flyout,
-/// built hidden at the start, must not make the bridge open every database
-/// at a sign-in (#365).
+/// Only a window a user opens asks for a look at the databases: a window
+/// built hidden must not make the bridge open every database (#365).
 #[test]
 fn only_the_windows_a_user_opens_ask_for_a_look() {
     let files = sources();
@@ -231,12 +232,53 @@ fn only_the_windows_a_user_opens_ask_for_a_look() {
         let body = body(windows, opens).unwrap_or_else(|| panic!("no fn {opens}"));
         assert!(body.contains("ask(Asked::Window)"), "{opens} does not ask for a look");
     }
-    for builds in ["spawn_window", "build_window", "create_flyout"] {
+    for builds in ["spawn_window", "build_window", "flyout_spec"] {
         let body = body(windows, builds).unwrap_or_else(|| panic!("no fn {builds}"));
         assert!(!body.contains(".ask("), "{builds} asks for a look, also for a window built hidden");
     }
     let start = source(&files, "mod.rs");
     assert!(!start.contains(".ask("), "the start asks for a look");
+}
+
+/// No WebView2 lives while no window is open (#365): nothing builds the
+/// flyout at the start or for a Store look, a click builds it, and its events
+/// are decided on the event loop's thread, each about one window by number.
+#[test]
+fn the_flyout_lives_only_while_it_is_used() {
+    let files = sources();
+    assert!(!source(&files, "mod.rs").contains("flyout_spec"), "the start builds the flyout");
+    assert!(!source(&files, "store_updates.rs").contains("FLYOUT"), "a Store look takes the flyout again");
+    assert!(source(&files, "commands.rs").contains("windows::page_ready"), "its page does not show it");
+    let windows = source(&files, "windows.rs");
+    assert!(
+        body(windows, "toggle_flyout").unwrap().contains("spawn_window(app, flyout_spec(app, flyout))"),
+        "a click does not build it"
+    );
+    assert!(
+        body(windows, "flyout_spec").unwrap().contains("flyout_label(flyout)"),
+        "a window without a number of its own"
+    );
+    assert!(body(windows, "hide_flyout").unwrap().contains("destroy_flyout"), "closing the flyout keeps it");
+    assert!(
+        body(windows, "page_ready").unwrap().contains("destroy_flyout"),
+        "a page nobody waits for leaves its window"
+    );
+    assert!(
+        body(windows, "spawn_window").unwrap().contains("flyout_built"),
+        "a build nobody waits for leaves its window"
+    );
+    assert!(body(windows, "failed_to_open").unwrap().contains("flyout_failed"), "a failed page leaves its window");
+    for off_the_event_loop in ["flyout_built", "flyout_failed"] {
+        assert!(
+            body(windows, off_the_event_loop).unwrap().contains("run_on_main_thread"),
+            "{off_the_event_loop} decides off the event loop"
+        );
+    }
+    let on_event = body(windows, "on_event").unwrap();
+    assert!(
+        on_event.contains("focus_lost(flyout)"),
+        "losing the focus does not ask which flyout, or whether it was shown"
+    );
 }
 
 #[test]

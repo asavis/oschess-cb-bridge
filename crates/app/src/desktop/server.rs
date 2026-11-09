@@ -12,7 +12,7 @@ use bridge::start::{self, Cause, Options};
 
 use crate::diagnostics::PageErrors;
 use crate::i18n::Strings;
-use crate::opening::Openings;
+use crate::opening::{FlyoutLife, Openings};
 use crate::status::{Asked, Problem, View};
 
 /// How long a start waits for its port: after a restart the process before
@@ -52,6 +52,8 @@ pub struct Flyout {
     /// When the flyout last hid because it lost the focus. A click on the
     /// tray mark takes the focus first, so that click must not reopen it.
     pub hidden_at: Option<Instant>,
+    /// Who wants it, which keeps it alive (#365).
+    pub life: FlyoutLife,
 }
 
 /// A started bridge, and what the start should show.
