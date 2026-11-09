@@ -612,6 +612,10 @@ fn memory_is_let_go_some_time_after_the_last_request() {
     });
     let entry = Arc::clone(&bridge.app.catalog.entries()[0]);
     until("the memory was not let go", WAIT_LIMIT, || !entry.is_open() && !explorer.holds(&id));
+    // A snapshot the tray takes for the end of some work opens the database
+    // again, with no use: it is let go again.
+    assert!(entry.open().is_ok());
+    until("the memory was not let go again", WAIT_LIMIT, || !entry.is_open());
     until("the next request did not answer", WAIT_LIMIT, || bridge.explorer(&id).0 == 200);
     assert!(entry.is_open() && explorer.holds(&id), "the next request opens them again");
     assert_eq!(bridge.explorer(&id), (200, answer), "and answers the same");
@@ -629,8 +633,10 @@ fn memory_is_not_let_go_while_work_runs() {
         let _ = held.recv();
     })));
     assert!(catalog.release_unused().is_err(), "a job of the catalog's runs");
+    assert!(catalog.entries()[0].open().is_ok());
     release.send(()).unwrap();
     until("the job did not end", WAIT_LIMIT, || catalog.release_unused().is_ok());
+    assert_eq!(catalog.release_unused(), Ok(false), "nothing is left to let go");
 }
 
 /// A database replaced while the bridge watches it waits for the quiet
