@@ -14,7 +14,7 @@ use cbformat::pgnfile;
 
 use crate::activity::Activity;
 use crate::fetch::Progress;
-use crate::indexdir::{self, Unlisted};
+use crate::indexdir::{self, Kept, Unlisted};
 use crate::serial::Serial;
 use crate::sync::lock;
 
@@ -55,17 +55,9 @@ impl Default for Registry {
     }
 }
 
-/// What a file in the header index folder is, by its name.
-enum Kept {
-    /// `<id>.head`: a PGN database's header index.
-    Index,
-    /// `<id>.head.partial`: a build's work, which only the build running for
-    /// `<id>` uses.
-    Work,
-}
-
-/// The database id and kind of a header index folder entry; `None` for
-/// anything the bridge did not write there, which is never touched.
+/// The database id and kind of a header index folder entry: `<id>.head` is a
+/// PGN database's header index and `<id>.head.partial` a build's work; `None`
+/// for anything the bridge did not write there, which is never touched.
 fn index_entry(name: &str) -> Option<(&str, Kept)> {
     let (id, kind) = indexdir::db_id(name, &[".head", ".head.partial"])?;
     Some((id, if kind == 0 { Kept::Index } else { Kept::Work }))
@@ -127,33 +119,14 @@ impl Registry {
     /// write.
     pub fn sweep(&self, listed: &HashSet<String>) {
         let Some(dir) = self.dir() else { return };
-        let Ok(entries) = std::fs::read_dir(&dir) else { return };
-        let now = Instant::now();
-        let mut unlisted = lock(&self.unlisted);
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some((id, kind)) = name.to_str().and_then(index_entry) else { continue };
-            // Held while the file goes, so no build of `id` starts meanwhile.
-            let build = self.build(id);
+        lock(&self.unlisted).sweep(&dir, listed, index_entry, |file| {
+            // Held while the file goes, so no build of its database starts meanwhile.
+            let build = self.build(file.id());
             let b = lock(&build);
-            if matches!(*b, Build::Working(_)) {
-                continue;
+            if !matches!(*b, Build::Working(_)) {
+                file.settle(|| {});
             }
-            let path = entry.path();
-            match kind {
-                Kept::Index if listed.contains(id) => {}
-                Kept::Index => {
-                    if !unlisted.due(id, now) || std::fs::remove_file(&path).is_err() {
-                        unlisted.still(id);
-                    }
-                }
-                Kept::Work => {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-        // A database back on the list, or an index gone, starts afresh.
-        unlisted.retain();
+        });
     }
 
     /// Where the header index of database `id` is kept, when there is a
