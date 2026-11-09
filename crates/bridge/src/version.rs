@@ -23,13 +23,16 @@ pub fn is_newer(version: &str, than: &str) -> bool {
     numbers(version).zip(numbers(than)).is_some_and(|(version, than)| version > than)
 }
 
-/// Whether `version` is one a release was stamped with: `major.yymm.ddnn`,
-/// as `scripts/store_version.py` allocates them (`docs/release.md`).
+/// Whether `version` is one a release can have been stamped with: exactly
+/// what `scripts/store_version.py` allocates (`docs/release.md`), a major up
+/// to 65535 and `yymm.ddnn` of a day in 2000 to 2099, in numbers without
+/// leading zeros.
 pub fn is_release(version: &str) -> bool {
-    let numbers: Option<Vec<u32>> = version.split('.').map(|n| n.parse().ok()).collect();
+    let number = |n: &str| n.parse::<u32>().ok().filter(|v| v.to_string() == n);
+    let numbers: Option<Vec<u32>> = version.split('.').map(number).collect();
     let Some(&[major, yymm, ddnn]) = numbers.as_deref() else { return false };
-    major >= 1
-        && yymm >= 2000
+    (1..=65535).contains(&major)
+        && yymm <= 9912
         && (1..=12).contains(&(yymm % 100))
         && (1..=31).contains(&(ddnn / 100))
         && (1..=99).contains(&(ddnn % 100))
