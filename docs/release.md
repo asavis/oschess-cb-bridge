@@ -69,7 +69,10 @@ that identity and is included in the draft. A reservation alone is not proof
 of a successful build. Exhausting 99 daily numbers, a backwards clock/major,
 corrupt history, an exhausted technical counter or a year outside 2000–2099
 stops allocation; none automatically increments major. Ordinary development
-keeps the committed Cargo version: release-number commits are unnecessary.
+keeps the committed Cargo version: release-number commits are unnecessary. A
+build made by hand shows `dev` in its flyout and settings in place of that
+number, which no release has; `/v1/status`, the log and the update comparisons
+keep it.
 
 ## Cutting a release
 

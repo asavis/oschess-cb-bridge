@@ -66,6 +66,17 @@ impl Serialize for Progress {
     }
 }
 
+/// The number `crates/app/Cargo.toml` holds between releases. A release's
+/// build replaces it, so only a build made by hand has it.
+const COMMITTED_VERSION: &str = "1.4.0";
+
+/// What a person reads for the running `version`: `dev` for a build made by
+/// hand, whose committed number no release ever had (#387), and a release's
+/// number otherwise. Only for showing: what compares versions keeps the number.
+pub fn shown_version(version: &str) -> &str {
+    if version == COMMITTED_VERSION { "dev" } else { version }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
@@ -131,7 +142,7 @@ impl View {
     /// The view of a serving bridge, or of one whose server stopped.
     pub fn of(snapshot: &Snapshot) -> View {
         View {
-            version: snapshot.version.to_string(),
+            version: shown_version(snapshot.version).to_string(),
             port: snapshot.port,
             problem: snapshot.stopped.clone().map(|reason| Problem::Stopped { reason }),
             databases: snapshot
@@ -160,7 +171,7 @@ impl View {
     /// (#365): at the start none is touched until someone uses the bridge.
     pub fn serving(version: &str, port: u16) -> View {
         View {
-            version: version.to_string(),
+            version: shown_version(version).to_string(),
             port,
             problem: None,
             databases: Vec::new(),
@@ -175,7 +186,7 @@ impl View {
     /// The view of a bridge that could not start.
     pub fn failed(version: &str, port: u16, problem: Problem) -> View {
         View {
-            version: version.to_string(),
+            version: shown_version(version).to_string(),
             port,
             problem: Some(problem),
             databases: Vec::new(),
@@ -351,7 +362,7 @@ pub(crate) mod testing {
     /// served yet.
     pub(crate) fn snapshot() -> Snapshot {
         Snapshot {
-            version: "0.1.0",
+            version: "1.2611.801",
             port: 39581,
             stopped: None,
             databases: Vec::new(),
@@ -567,10 +578,17 @@ mod tests {
         };
         let view = View::of(&snapshot);
         assert_eq!(view.problem, None);
+        assert_eq!(View::of(&Snapshot { version: "1.4.0", ..testing::snapshot() }).version, "dev", "a build by hand");
+        assert_eq!(View::serving("1.4.0", 1).version, "dev");
+        assert_eq!(View::failed("1.4.0", 1, Problem::PortBusy { port: 1 }).version, "dev");
+        assert_eq!(View::serving("1.2611.901", 1).version, "1.2611.901", "a release");
+        // A build made by hand has this crate's own number, so a new one in
+        // Cargo.toml must change the constant too.
+        assert_eq!(super::COMMITTED_VERSION, env!("CARGO_PKG_VERSION"));
         let json = serde_json::to_string(&view).unwrap();
         assert_eq!(
             json,
-            r#"{"version":"0.1.0","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"connected":true,"known":true,"mark":"ready"}"#
+            r#"{"version":"1.2611.801","port":40000,"problem":null,"databases":[{"id":"0123456789abcdef","name":"Mega","format":"2cbh","state":"ready","records":7,"size":null,"progress":null}],"connected":true,"known":true,"mark":"ready"}"#
         );
         let stopped = View::of(&Snapshot { stopped: Some("accept failed".into()), ..snapshot });
         assert_eq!(stopped.problem, Some(Problem::Stopped { reason: "accept failed".into() }));
