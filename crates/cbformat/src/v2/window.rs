@@ -7,14 +7,8 @@ use std::borrow::Cow;
 use super::frame::{frame_at, read_frame_into};
 use super::{Database, FILE_HEADER, MoveData, Record, position};
 use crate::Result;
-use crate::recordfile::span;
-
-/// The `.2cbg` bytes a buffer holds: from `at`, `len` of them.
-#[derive(Clone, Copy, Debug)]
-pub struct MoveWindow {
-    at: u64,
-    len: usize,
-}
+pub use crate::recordfile::MoveWindow;
+use crate::recordfile::read_move_window;
 
 impl Database {
     /// Reads into `buf` the `.2cbg` bytes from the first to past the last
@@ -31,16 +25,7 @@ impl Database {
         buf: &mut Vec<u8>,
     ) -> Result<Option<MoveWindow>> {
         let offset = |r: &Record| position(r.moves_offset());
-        let Some(range) = span(records.iter().map(offset), next.map(offset), self.moves.size()?, FILE_HEADER) else {
-            return Ok(None);
-        };
-        let Some(len) = usize::try_from(range.end - range.start).ok().filter(|&l| l <= buf.capacity()) else {
-            return Ok(None);
-        };
-        buf.clear();
-        buf.resize(len, 0);
-        self.moves.read_into(range.start, buf)?;
-        Ok(Some(MoveWindow { at: range.start, len }))
+        read_move_window(&self.moves, records.iter().map(offset), next.map(offset), FILE_HEADER, buf)
     }
 
     /// The move record of `record` from `window`, which `buf` holds, or `None`
