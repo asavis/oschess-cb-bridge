@@ -25,13 +25,13 @@ use crate::indexdir::crc32_update;
 use crate::search::SearchError;
 use crate::search::memory::{Hold, Refused};
 
-use super::build::{Chunks, Counted, Out, Passes, Turns, from_bad, plan_pass};
+use super::build::{Chunks, Counted, Out, PassPlan, Passes, Turns, from_bad, plan_pass};
 use super::follow::{Keys, standard_keys};
 use super::format::{
     BLOCK_DATA, BLOCK_ENTRY, BLOCK_KEYS, Block, Counts, KEY_ENTRY, MAX_BLOCK_DATA, MAX_PLY, NO_MOVE, TOP_GAMES,
     encode_record, order_moves, part_of, rank_top,
 };
-use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, grow, on_workers, pass_workers};
+use super::runs::{ENTRY_BYTES, Entry, Limits, MAX_GAME, PassTime, Progress, grow, on_workers};
 use super::stream::{self, Stream};
 
 /// A position's run of entries this long or shorter is left as it is when a
@@ -178,23 +178,14 @@ pub(super) fn write(
         largest: largest.saturating_mul(ENTRY_BYTES),
     };
     let records = stream.header.records();
-    let plan = passes.room(share, pass_workers(progress), records, limits.pass_bytes)?;
-    let (mut memory, mut workers, mut room) = plan.reserve(progress)?;
-    let (mut capacity, mut want) = passes.capacity(room, workers);
+    let mut plan = PassPlan::reserve(passes, share, records, progress, limits)?;
     let mut table = Vec::new();
     table.try_reserve_exact(table_bytes).map_err(|_| Refused::Busy)?;
     let table_memory = Hold::default();
     let mut sink = Sink { at: out.offset, table, table_memory, keys: 0, blocks: 0, games: 0, progress };
     let mut first = 0;
     while first < counts.len() {
-        // A build promoted since the last pass takes a requested build's
-        // workers from this one on, within its share (#346).
-        if let Ok(now) = passes.room(share, pass_workers(progress), records, limits.pass_bytes)
-            && now.workers > workers
-        {
-            (workers, room) = now.more_workers(&mut memory, workers, room);
-            (capacity, want) = passes.capacity(room, workers);
-        }
+        let (capacity, want) = plan.next_pass();
         let (end, planned) = plan_pass(first, counts.len(), capacity, collected);
         let hi = AtomicUsize::new(end);
         progress.tree_passes.fetch_add(1, Ordering::Relaxed);
