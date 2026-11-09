@@ -366,28 +366,8 @@ impl Games for cbh::Database {
     }
 }
 
-impl Source for v2::Database {
-    fn newest_date(&self, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
-        newest_date(self, first, last, work)
-    }
-
-    fn records(&self) -> u32 {
-        self.record_count()
-    }
-
-    fn lines(
-        &self,
-        first: u32,
-        last: u32,
-        max_ply: u8,
-        work: &mut Workspace,
-        each: &mut dyn FnMut(&Line),
-    ) -> Result<()> {
-        lines(self, first, last, max_ply, work, each)
-    }
-}
-
-impl Source for cbh::Database {
+/// Both ChessBase formats are read the same way.
+impl<S: Games + Sync> Source for S {
     fn newest_date(&self, first: u32, last: u32, work: &mut Workspace) -> Result<u32> {
         newest_date(self, first, last, work)
     }

@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use chesscore::{Bitboard, Board, BoardBuilder, CastleSide, Color, Move, Piece, Replayer, Square};
 
+use cbformat::file::read_exact_at;
 use cbformat::movetable::FIRST_PIECE_WORD;
 use cbformat::replay;
 
@@ -41,7 +42,7 @@ use crate::search::memory::{Evict, Hold, Refused, register};
 use crate::search::{Adding, Members};
 use crate::sync::lock;
 
-use super::file::{Bad, read_at};
+use super::file::Bad;
 use super::format::{NO_MOVE, Outcome, pack_move};
 use super::map::Map;
 
@@ -509,7 +510,7 @@ impl Stream {
         let file = File::open(path).map_err(Bad::Io)?;
         let len = file.metadata().map_err(Bad::Io)?.len();
         let mut head = [0u8; HEADER_LEN];
-        read_at(&file, 0, &mut head).map_err(Bad::Io)?;
+        read_exact_at(&file, &mut head, 0).map_err(Bad::Io)?;
         let header = Header::decode(&head).ok_or(Bad::Corrupt("stream header"))?;
         let (records, blocks) = (header.records(), u64::from(header.blocks));
         // The table must end the file and have a block for every BATCH
@@ -530,7 +531,7 @@ impl Stream {
         let mut table = Vec::new();
         table.try_reserve_exact(table_len).map_err(|_| Bad::Busy)?;
         table.resize(table_len, 0);
-        read_at(&file, header.table_offset, &mut table).map_err(Bad::Io)?;
+        read_exact_at(&file, &mut table, header.table_offset).map_err(Bad::Io)?;
         if crc32(&table) != header.table_crc {
             return Err(Bad::Corrupt("stream table"));
         }

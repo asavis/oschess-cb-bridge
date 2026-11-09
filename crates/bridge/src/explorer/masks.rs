@@ -21,6 +21,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use cbformat::file::read_exact_at;
 use chesscore::{Bitboard, Color, Piece, Replayer};
 
 use crate::indexdir::{self, crc32, u32_at, u64_at};
@@ -190,7 +191,7 @@ impl Masks {
         let file = File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
         let mut h = [0u8; HEADER];
-        super::file::read_at(&file, 0, &mut h).ok()?;
+        read_exact_at(&file, &mut h, 0).ok()?;
         let header = &stream.header;
         if h[0..8] != MAGIC
             || u32_at(&h, 8) != VERSION
@@ -210,7 +211,7 @@ impl Masks {
             return None;
         }
         let mut table = vec![0u8; blocks * 4];
-        super::file::read_at(&file, table_at, &mut table).ok()?;
+        read_exact_at(&file, &mut table, table_at).ok()?;
         if crc32(&table) != u32_at(&h, 44) {
             return None;
         }

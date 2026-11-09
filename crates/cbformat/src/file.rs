@@ -470,13 +470,17 @@ pub(crate) fn with_extensions<'a>(stem: &Path, extensions: impl IntoIterator<Ite
     extensions.into_iter().map(|ext| with_extension(stem, ext)).collect()
 }
 
+/// Fills `buf` from `file` at `offset`, without moving the file's position,
+/// so that several threads can read one handle.
 #[cfg(unix)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
 }
 
+/// Fills `buf` from `file` at `offset`. Windows moves the handle's position
+/// as it reads; every read of a shared handle here gives its own offset.
 #[cfg(windows)]
-fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+pub fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match file.seek_read(buf, offset) {

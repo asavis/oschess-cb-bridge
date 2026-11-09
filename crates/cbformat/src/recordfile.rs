@@ -173,6 +173,36 @@ pub(crate) fn span(
     (end > at).then_some(at..end)
 }
 
+/// The bytes of a moves file a buffer holds: from `at`, `len` of them.
+#[derive(Clone, Copy, Debug)]
+pub struct MoveWindow {
+    pub(crate) at: u64,
+    pub(crate) len: usize,
+}
+
+/// Reads into `buf` the bytes of the moves file `file` from the first to past
+/// the last of the move records at `offsets`, as [`span`] bounds them. `buf`
+/// grows within its capacity only; the window is `None` when the span does
+/// not fit there or the offsets name no span.
+pub(crate) fn read_move_window(
+    file: &DbFile,
+    offsets: impl IntoIterator<Item = u64>,
+    next: Option<u64>,
+    min: u64,
+    buf: &mut Vec<u8>,
+) -> Result<Option<MoveWindow>> {
+    let Some(range) = span(offsets, next, file.size()?, min) else {
+        return Ok(None);
+    };
+    let Some(len) = usize::try_from(range.end - range.start).ok().filter(|&l| l <= buf.capacity()) else {
+        return Ok(None);
+    };
+    buf.clear();
+    buf.resize(len, 0);
+    file.read_into(range.start, buf)?;
+    Ok(Some(MoveWindow { at: range.start, len }))
+}
+
 /// A record of `size` bytes refused as over `limit`, the one a caller set or
 /// the room of its buffer, in the words every reader uses after naming the
 /// record.

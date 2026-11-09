@@ -6,6 +6,8 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use cbformat::file::read_exact_at;
+
 use crate::indexdir::{crc32, u32_at, u64_at};
 use crate::search::memory::{Hold, Refused};
 
@@ -42,7 +44,7 @@ impl IndexFile {
         let file = File::open(path).map_err(Bad::Io)?;
         let len = file.metadata().map_err(Bad::Io)?.len();
         let mut head = [0u8; HEADER_LEN];
-        read_at(&file, 0, &mut head).map_err(Bad::Io)?;
+        read_exact_at(&file, &mut head, 0).map_err(Bad::Io)?;
         let header = Header::decode(&head).ok_or(Bad::Corrupt("header"))?;
         let (blocks, keys) = (u64::from(header.blocks), header.keys);
         // Every count must fit the bytes the file has, before anything is
@@ -75,7 +77,7 @@ impl IndexFile {
         let mut table = Vec::new();
         table.try_reserve_exact(table_len as usize).map_err(|_| Bad::Busy)?;
         table.resize(table_len as usize, 0);
-        read_at(&file, header.table_offset, &mut table).map_err(Bad::Io)?;
+        read_exact_at(&file, &mut table, header.table_offset).map_err(Bad::Io)?;
         if crc32(&table) != header.table_crc {
             return Err(Bad::Corrupt("block table"));
         }
@@ -117,7 +119,7 @@ impl IndexFile {
         let mut buf = Vec::new();
         buf.try_reserve_exact(len as usize).map_err(|_| Bad::Busy)?;
         buf.resize(len as usize, 0);
-        read_at(&self.file, offset, &mut buf).map_err(Bad::Io)?;
+        read_exact_at(&self.file, &mut buf, offset).map_err(Bad::Io)?;
         if crc32(&buf) != crc {
             return Err(Bad::Corrupt("deep block"));
         }
@@ -134,7 +136,7 @@ impl IndexFile {
         let mut buf = Vec::new();
         buf.try_reserve_exact(block.bytes()).map_err(|_| Bad::Busy)?;
         buf.resize(block.bytes(), 0);
-        read_at(&self.file, block.offset, &mut buf).map_err(Bad::Io)?;
+        read_exact_at(&self.file, &mut buf, block.offset).map_err(Bad::Io)?;
         if crc32(&buf) != block.crc {
             return Err(Bad::Corrupt("block"));
         }
@@ -153,7 +155,7 @@ fn deep_table(file: &File, header: &Header, len: u64) -> Result<Vec<(u64, u32, u
     let mut table = Vec::new();
     table.try_reserve_exact(len as usize).map_err(|_| Bad::Busy)?;
     table.resize(len as usize, 0);
-    read_at(file, header.deep_table_offset, &mut table).map_err(Bad::Io)?;
+    read_exact_at(file, &mut table, header.deep_table_offset).map_err(Bad::Io)?;
     if crc32(&table) != header.deep_table_crc {
         return Err(Bad::Corrupt("deep table"));
     }
@@ -172,28 +174,6 @@ fn deep_table(file: &File, header: &Header, len: u64) -> Result<Vec<(u64, u32, u
         return Err(Bad::Corrupt("deep layout"));
     }
     Ok(blocks)
-}
-
-#[cfg(unix)]
-pub(super) fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
-}
-
-#[cfg(windows)]
-pub(super) fn read_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        match file.seek_read(buf, offset) {
-            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => {
-                buf = &mut buf[n..];
-                offset += n as u64;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
