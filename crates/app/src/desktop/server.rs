@@ -9,6 +9,7 @@ use bridge::config::{self, DEFAULT_PORT};
 use bridge::pairing;
 use bridge::snapshot::{Background, Pulse};
 use bridge::start::{self, Cause, Options};
+use bridge::sync::lock;
 
 use crate::diagnostics::PageErrors;
 use crate::i18n::Strings;
@@ -126,14 +127,14 @@ impl Shared {
 
     /// Asks the status thread for a look at the databases, and wakes it.
     pub fn ask(&self, asked: Asked) {
-        let mut waiting = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waiting = lock(&self.asked);
         *waiting = (*waiting).max(asked);
         self.wake.notify_all();
     }
 
     /// Waits up to `limit` for a look to be asked for, and takes what asked.
     pub fn wait_asked(&self, limit: Duration) -> Asked {
-        let waiting = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        let waiting = lock(&self.asked);
         let (mut waiting, _) = self
             .wake
             .wait_timeout_while(waiting, limit, |asked| *asked == Asked::Nothing)
@@ -171,11 +172,11 @@ impl Shared {
 
     /// The state the status thread saw last.
     pub fn view(&self) -> View {
-        self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.view).clone()
     }
 
     pub fn set_view(&self, view: View) {
-        *self.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
+        *lock(&self.view) = view;
     }
 
     /// The pairing code and link: the serving bridge's, else the stored ones

@@ -19,6 +19,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::status::View;
+use bridge::sync::lock;
+use bridge::version::is_newer;
 
 /// The file in the data folder that names the version being installed, so
 /// that the start after the installer can say the bridge was updated.
@@ -125,11 +127,11 @@ impl Monitor {
     }
 
     pub fn snapshot(&self) -> Progress {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.0).clone()
     }
 
     pub fn begin(&self) -> Option<Progress> {
-        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut progress = lock(&self.0);
         if progress.busy {
             return None;
         }
@@ -142,7 +144,7 @@ impl Monitor {
     pub fn finish(&self, job: impl FnOnce() -> Result<Phase, String>) -> (Progress, Option<String>) {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
             .unwrap_or_else(|_| Err("the update task stopped unexpectedly".into()));
-        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut progress = lock(&self.0);
         progress.revision += 1;
         progress.phase = outcome.as_ref().copied().unwrap_or(Phase::Failed);
         progress.busy = progress.phase.busy();
@@ -150,7 +152,7 @@ impl Monitor {
     }
 
     pub fn report(&self, phase: Phase, version: Option<String>) -> Progress {
-        let mut progress = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut progress = lock(&self.0);
         *progress = Progress { revision: progress.revision + 1, phase, busy: phase.busy(), version };
         progress.clone()
     }
@@ -357,15 +359,8 @@ pub fn updated(dir: &Path, running: &str) -> Option<String> {
     let _ = write_note(dir, LAST, running);
     let reached = to.is_some_and(|v| v.trim() == running);
     let moved = from.is_some_and(|v| !v.trim().is_empty() && v.trim() != running);
-    let newer = last.is_some_and(|v| newer_than(running, v.trim()));
+    let newer = last.is_some_and(|v| is_newer(running, v.trim()));
     (reached || moved || newer).then(|| running.to_string())
-}
-
-/// Whether version `a` is newer than `b`, both dotted numbers such as
-/// `1.10.0`; `false` when either is not one, as nothing is then said.
-fn newer_than(a: &str, b: &str) -> bool {
-    let parts = |v: &str| v.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
-    matches!((parts(a), parts(b)), (Some(a), Some(b)) if a > b)
 }
 
 #[cfg(test)]
@@ -647,18 +642,6 @@ mod tests {
         assert_eq!(updated(&dir, "1.11.0"), None, "a record that is no version");
         assert_eq!(updated(&dir, "1.12.0-rc.1"), None, "a version that is no dotted number");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn versions_compare_as_numbers() {
-        assert!(newer_than("1.3.3", "1.3.2"));
-        assert!(newer_than("1.10.0", "1.9.9"));
-        assert!(newer_than("2.0.0", "1.99.99"));
-        assert!(!newer_than("1.3.2", "1.3.2"));
-        assert!(!newer_than("1.3.1", "1.3.2"));
-        assert!(!newer_than("", "1.3.2"));
-        assert!(!newer_than("1.3.3", ""));
-        assert!(!newer_than("1.3.x", "1.3.2"));
     }
 
     /// A note that cannot be written fails with an error the updater logs as

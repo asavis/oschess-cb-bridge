@@ -5,6 +5,7 @@
 //! ready is reported with the stage it stopped at. Before, such a click did
 //! nothing and left nothing in the log.
 
+use bridge::sync::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -213,7 +214,7 @@ impl Openings {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Opening>> {
-        self.latest.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.latest)
     }
 }
 

@@ -18,6 +18,7 @@ use cbformat::v2::{self, Token};
 use cbformat::view::{self, Base};
 
 use crate::{AnyResult, LIMITS, opts, page, pgn_file, run_workers, threads};
+use bridge::sync::lock;
 
 /// What `verify` counts.
 #[derive(Default)]
@@ -97,7 +98,7 @@ struct Failures(Mutex<Vec<(u32, String)>>);
 impl Failures {
     fn add(&self, s: &mut Stats, id: u32, msg: String) {
         s.failures += 1;
-        let mut f = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut f = lock(&self.0);
         if f.len() < KEPT_FAILURES {
             f.push((id, msg));
         }
@@ -251,7 +252,7 @@ pub(crate) fn verify(path: &str, rest: &[String]) -> AnyResult<bool> {
                     }
                 }
             }
-            total.lock().unwrap_or_else(|e| e.into_inner()).add(&s);
+            lock(&total).add(&s);
         });
     }
     let stats = total.into_inner().unwrap_or_else(|e| e.into_inner());

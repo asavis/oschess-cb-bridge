@@ -17,6 +17,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use super::{alerts, channel, shared, system};
 use crate::diagnostics;
 use crate::reports::{self, Context, Dsn, Kind, Outbox, Report, Transport};
+use bridge::sync::lock;
 
 /// How long the sender sleeps when nothing waits; a report filed meanwhile
 /// wakes it.
@@ -83,7 +84,7 @@ pub fn available() -> bool {
 pub fn turned_off(app: &AppHandle) {
     let Ok(data) = shared(app).dir() else { return };
     // After any filing under way: what it filed is dropped as well.
-    let _filing = REPORTER.get().map(|r| r.filing.lock().unwrap_or_else(|e| e.into_inner()));
+    let _filing = REPORTER.get().map(|r| lock(&r.filing));
     let dropped = Outbox::in_data(&data).drop_automatic();
     if dropped > 0 {
         bridge::log!("report: turned off, so {dropped} waiting reports are dropped");
@@ -100,7 +101,7 @@ pub fn file(report: Report) -> Option<String> {
     let (code, filed) = file_now(reporter, &report)?;
     if filed {
         let (filed, wake) = &reporter.filed;
-        *filed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *lock(filed) = true;
         wake.notify_one();
     }
     Some(code)
@@ -117,14 +118,14 @@ fn raise(file: &str, line: u32, text: &str) {
         fingerprint: format!("{}:{line}", diagnostics::source_file(file)),
     };
     {
-        let mut waiting = FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waiting = lock(&FAULTS);
         if waiting.len() >= MAX_FAULTS {
             return;
         }
         waiting.push_back(report);
     }
     let (filed, wake) = &reporter.filed;
-    *filed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *lock(filed) = true;
     wake.notify_one();
 }
 
@@ -148,7 +149,7 @@ impl Drop for Filing {
 fn file_now(reporter: &Reporter, report: &Report) -> Option<(String, bool)> {
     // The switch is read under the filing lock that `turned_off` takes too:
     // a report either is filed before the outbox is emptied, or sees it off.
-    let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
+    let _filing = lock(&reporter.filing);
     file_in(&reporter.data, report, || context(reporter))
 }
 
@@ -232,7 +233,7 @@ fn file_at_exit_in(data: &Path, report: Report, transport: &dyn Transport) {
     };
     match REPORTER.get() {
         Some(reporter) => {
-            let _filing = reporter.filing.lock().unwrap_or_else(|e| e.into_inner());
+            let _filing = lock(&reporter.filing);
             file_in(data, &report, context);
         }
         None => {
@@ -255,7 +256,7 @@ fn send() {
     loop {
         // The failures raised meanwhile, filed here, where no lock is held.
         loop {
-            let next = FAULTS.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            let next = lock(&FAULTS).pop_front();
             let Some(report) = next else { break };
             let _filing = Filing::enter();
             file_now(reporter, &report);
@@ -266,7 +267,7 @@ fn send() {
         failures = if waits { failures + 1 } else { 0 };
         let wait = if waits { reports::retry_after(failures) } else { IDLE };
         let (filed, wake) = &reporter.filed;
-        let guard = filed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = lock(filed);
         let (mut guard, _) = wake.wait_timeout_while(guard, wait, |filed| !*filed).unwrap_or_else(|e| e.into_inner());
         *guard = false;
     }

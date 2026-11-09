@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::i18n::Lang;
+use bridge::sync::lock;
 
 const FILE: &str = "app.json";
 
@@ -68,7 +69,7 @@ static CHANGING: Mutex<()> = Mutex::new(());
 /// Each writer reads the latest preferences under the same lock, so a
 /// concurrent Stockfish dismissal cannot overwrite a language choice.
 pub fn update(dir: &Path, change: impl FnOnce(&mut Prefs)) -> Result<(), String> {
-    let _guard = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock(&CHANGING);
     let mut prefs = load(dir);
     change(&mut prefs);
     save(dir, &prefs)
@@ -83,7 +84,7 @@ pub struct Held {
 /// now, so that what the caller does next follows them as they are (#322);
 /// `None` when they do not.
 pub fn hold_if(dir: &Path, keep: impl FnOnce(&Prefs) -> bool) -> Option<Held> {
-    let guard = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = lock(&CHANGING);
     keep(&load(dir)).then_some(Held { _changing: guard })
 }
 

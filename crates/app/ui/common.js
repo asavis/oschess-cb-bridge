@@ -232,3 +232,24 @@ function extraRow(extra, action) {
   path.title = extra.path;
   return el('div', 'row', icon(extra.folder ? 'folder' : 'db', 20), el('div', 'text', path, el('div', 'cap12', detail)), action);
 }
+
+// A short message at the bottom of the window, and a promise whose failure
+// shows there.
+function notice(text) {
+  const node = document.getElementById('notice');
+  notice.text = text;
+  node.textContent = text();
+  node.hidden = false;
+  clearTimeout(notice.timer);
+  notice.timer = setTimeout(() => { node.hidden = true; }, 6000);
+}
+
+function act(promise) {
+  return promise.catch((error) => notice(() => failure(error)));
+}
+
+// A switch, and the word beside it.
+function toggle(id, onNow) {
+  document.getElementById(id).setAttribute('aria-checked', String(onNow));
+  document.getElementById(`${id}-state`).textContent = onNow ? t('settings.on') : t('settings.off');
+}
