@@ -305,16 +305,23 @@ fn a_database_that_keeps_changing_waits_until_it_is_quiet() {
 
 /// A requested build stops the background build of another database at its
 /// next batch and goes first; the stopped build waits and then completes,
-/// without a request.
+/// without a request. The background build is held at its first pass until
+/// the test lets it go, so that the order is the test's and no load can run a
+/// fixed wait out: a large database only made it likely (#366).
 #[test]
 fn a_requested_build_goes_before_a_background_one() {
-    let (large, small) = (copies("background-first-large", 20_000), copies("background-first-small", 20));
+    static HOLD: AtomicBool = AtomicBool::new(true);
+    fn held(progress: &Progress) {
+        while HOLD.load(Ordering::SeqCst) && !progress.requested() && !progress.stopped() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let (large, small) = (copies("background-first-large", 200), copies("background-first-small", 20));
     let paths = [large.dir().join("db.2cbh"), small.dir().join("db.2cbh")];
     let (a, b) = (id_of(&paths[0]), id_of(&paths[1]));
     let dir = data_dir("first");
     let catalog = Catalog::new(paths.clone());
-    // Builds of many passes, so that the large one takes a while.
-    catalog.explorer.set_limits(Limits { pass_bytes: Some(256 << 10), ..Limits::default() });
+    catalog.explorer.set_limits(Limits { pass_started: Some(held), ..Limits::default() });
     let bridge = served(catalog, &dir);
     bridge.keep(TICK, Duration::ZERO);
     // The largest database is in use from the start: its build runs.
@@ -327,11 +334,12 @@ fn a_requested_build_goes_before_a_background_one() {
     assert!(built_for(&dir, &a).is_none(), "the background build ended first");
     assert!(phase(bridge.port, &a).is_some(), "the stopped build waits again");
     // It completes afterwards, asked for by nobody.
+    HOLD.store(false, Ordering::SeqCst);
     until("the stopped build did not complete", WAIT_LIMIT, || built_for(&dir, &a) == Some(generation(&paths[0])));
     until("the build did not end", WAIT_LIMIT, || bridge.building().is_empty());
     let (status, body) = bridge.explorer(&a);
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains(r#""games":20000,"#), "{body}");
+    assert!(body.contains(r#""games":200,"#), "{body}");
     drop(bridge);
     std::fs::remove_dir_all(&dir).unwrap();
 }
