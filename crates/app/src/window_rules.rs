@@ -301,6 +301,23 @@ fn windows_are_built_off_the_event_loop() {
     assert!(task.contains("build_window("), "build_window is called inside the spawned task");
 }
 
+/// Where the WebView2 loader finds no runtime, no window is built (#389):
+/// `spawn_window`, where every window is built, asks first and returns when
+/// the answer is no, before an opening starts or a build is posted.
+#[test]
+fn no_window_is_built_without_webview2() {
+    let files = sources();
+    let windows = source(&files, "windows.rs");
+    let spawn = body(windows, "spawn_window").unwrap();
+    let asked = spawn.find("if !webview2_found(&app, &spec) {").expect("spawn_window asks whether WebView2 can draw");
+    assert_eq!(spawn[asked..].lines().nth(1).map(str::trim), Some("return;"), "and builds nothing when it cannot");
+    for later in ["openings.request(", "build_window("] {
+        assert!(spawn.find(later).is_some_and(|at| asked < at), "it asks before {later}");
+    }
+    let found = body(windows, "webview2_found").unwrap();
+    assert!(found.contains("tauri::webview_version()") && found.contains("opening::webview2_found("));
+}
+
 /// A command that may open a window is asynchronous, so it does not run on the
 /// event loop's thread in the first place.
 #[test]

@@ -45,7 +45,9 @@ they use the same port.
    Windows display language. Choose **Next** through its pages and
    **Install**; if Windows lacks Microsoft's WebView2 runtime, the installer
    downloads it first. On the last page leave «Run oschess bridge» ticked and
-   choose **Finish**.
+   choose **Finish**. Should that download fail, the bridge opens no window:
+   it says that the WebView2 runtime is missing and where Microsoft offers
+   it, and its windows open once it is installed.
 4. The bridge starts in the tray, as the oschess mark by the clock, and shows
    the «Let's set up the bridge» wizard: Databases, Engine and Start-up.
    Everything it found is already chosen, so **Next** is usually all it takes.

@@ -95,6 +95,8 @@ pub enum Kind {
     Manual,
     /// A failure `bridge::fault!` raised (#342).
     Error,
+    /// No WebView2 Runtime was found where a window was to be built (#389).
+    WebView2,
 }
 
 impl Kind {
@@ -106,6 +108,7 @@ impl Kind {
             Kind::Script => "script",
             Kind::Manual => "manual",
             Kind::Error => "error",
+            Kind::WebView2 => "webview2",
         }
     }
 
