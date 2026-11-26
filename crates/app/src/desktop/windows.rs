@@ -12,8 +12,8 @@
 //! window whose page is not ready within `opening::LIMIT` is logged with the
 //! stage it stopped at, and the user is told so in a native message. Before,
 //! the click did nothing and left nothing in the log. Where no WebView2
-//! Runtime is found, no window is built, and the user is told what to install
-//! (#389).
+//! Runtime was found as the app started, no window is built, and the user is
+//! told what to install (#389).
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use tauri::{
 
 use super::{alerts, faults, reporting, shared};
 use crate::i18n::Strings;
-use crate::opening::{self, FlyoutClick, LIMIT, Stage};
+use crate::opening::{self, FlyoutClick, LIMIT, Stage, WebView2AtStart};
 use crate::reports::{Kind, Report};
 use crate::status::Asked;
 use bridge::sync::lock;
@@ -129,17 +129,30 @@ fn spawn_window(app: &AppHandle, spec: Spec) {
     });
 }
 
-/// Whether WebView2 can draw `spec`'s window (`opening::webview2_found`).
-/// Where it cannot, that is logged and reported, and the user is told why in
-/// a native message, with the report's code, copied. As in
-/// [`failed_to_open`], a flyout no click waits for any more is reported and
-/// not shown.
+/// What the WebView2 loader answered as the app started (#389).
+static WEBVIEW2: WebView2AtStart = WebView2AtStart::new();
+
+/// Asks the WebView2 loader for the runtime, as Tauri has just asked it while
+/// it started, and keeps the answer. Call it as the app starts, before any
+/// window is built.
+pub fn look_for_webview2() {
+    WEBVIEW2.remember(webview2_now);
+}
+
+fn webview2_now() -> Result<String, String> {
+    if faults::on("no-webview2") {
+        return Err("the fault no-webview2".to_string());
+    }
+    tauri::webview_version().map_err(|e| e.to_string())
+}
+
+/// Whether WebView2 can draw `spec`'s window (`opening::webview2_found`),
+/// from the loader's answer at the start. Where it cannot, that is logged and
+/// reported, and the user is told why in a native message, with the report's
+/// code, copied. As in [`failed_to_open`], a flyout no click waits for any
+/// more is reported and not shown.
 fn webview2_found(app: &AppHandle, spec: &Spec) -> bool {
-    let lookup = if faults::on("no-webview2") {
-        Err("the fault no-webview2".to_string())
-    } else {
-        tauri::webview_version().map_err(|e| e.to_string())
-    };
+    let lookup = WEBVIEW2.answer(webview2_now);
     // Every flyout under one name in the report.
     let window = if spec.flyout.is_some() { "flyout" } else { spec.label.as_str() };
     let file = |report: Report| {

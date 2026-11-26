@@ -5,14 +5,14 @@
 //! ready is reported with the stage it stopped at. Before, such a click did
 //! nothing and left nothing in the log.
 //!
-//! A window is built only where WebView2 can draw it ([`webview2_found`],
-//! #389).
+//! A window is built only where WebView2 can draw it, as the WebView2 loader
+//! answered at the start ([`WebView2AtStart`], [`webview2_found`], #389).
 
 use bridge::sync::lock;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::i18n::Strings;
@@ -242,12 +242,42 @@ pub fn on_a_screen(window: Rect, screens: &[Rect]) -> bool {
     })
 }
 
+/// What the WebView2 loader answered when the app started (#389): the WebView2
+/// Runtime's version, or why none was found (`tauri::webview_version()`).
+/// Tauri asks the same once, as it starts, and keeps the answer: with no
+/// runtime then, it refuses every WebView2 until the app ends, and a release
+/// build also shows a message of its own, in English, on the event loop,
+/// which holds the loop until it is closed. A runtime installed later is used
+/// only after a restart, so the bridge keeps the same answer.
+pub struct WebView2AtStart(OnceLock<Result<String, String>>);
+
+impl WebView2AtStart {
+    pub const fn new() -> WebView2AtStart {
+        WebView2AtStart(OnceLock::new())
+    }
+
+    /// Keeps the answer `lookup` gives; once one is kept, nothing changes it.
+    pub fn remember(&self, lookup: impl FnOnce() -> Result<String, String>) {
+        self.0.get_or_init(lookup);
+    }
+
+    /// The answer kept at the start, or, before there is one, `now`'s.
+    pub fn answer(&self, now: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+        self.0.get().cloned().unwrap_or_else(now)
+    }
+}
+
+impl Default for WebView2AtStart {
+    fn default() -> WebView2AtStart {
+        WebView2AtStart::new()
+    }
+}
+
 /// Whether the window `window` may be built: only where WebView2 can draw it
-/// (#389). `lookup` is the WebView2 Runtime's version as the WebView2 loader
-/// finds it (`tauri::webview_version()`). The lookup fails where no runtime is
-/// installed, and so does the creation of every WebView2. Tauri creates that
-/// one on the event loop after it has returned the window, and only logs the
-/// failure there, so such a window stopped at *built* and never loaded.
+/// (#389). `lookup` is the loader's answer at the start ([`WebView2AtStart`]).
+/// Where it found no runtime, Tauri refuses the WebView2 on the event loop
+/// after it has returned the window, and only logs why, so such a window
+/// stopped at *built* and never loaded.
 ///
 /// With a runtime, it answers `true` and does nothing else. Without one, it
 /// answers `false`, and the caller builds nothing: `file` gets one report of
@@ -505,7 +535,7 @@ mod tests {
 
     /// Opens `window` as `windows::spawn_window` does, `lookup` the loader's
     /// answer and `code` what filing a report answers.
-    fn open(lookup: Result<String, &str>, window: &str, strings: &Strings, code: Option<&str>) -> Opened {
+    fn open(lookup: Result<String, String>, window: &str, strings: &Strings, code: Option<&str>) -> Opened {
         let mut filed = Vec::new();
         let mut told = Vec::new();
         let found = webview2_found(
@@ -528,8 +558,7 @@ mod tests {
     #[test]
     fn without_webview2_no_window_is_built_and_the_user_is_told_why() {
         use crate::i18n::Lang;
-        // What the loader answers then, as `windows::core::Error` prints it.
-        let missing = || Err("The system cannot find the file specified. (0x80070002)");
+        let missing = || Err(NOT_FOUND.to_string());
         let mut texts = Vec::new();
         for lang in [Lang::Uk, Lang::En] {
             let strings = Strings::new(lang);
@@ -570,5 +599,35 @@ mod tests {
 
         let found = open(Ok("142.0.3595.53".into()), "first-run", &Strings::new(Lang::En), Some("3f9a1c2e"));
         assert!(found.built && found.filed.is_empty() && found.told.is_empty());
+    }
+
+    /// What the loader answers where no runtime is installed, as
+    /// `windows::core::Error` prints it.
+    const NOT_FOUND: &str = "The system cannot find the file specified. (0x80070002)";
+
+    /// A runtime installed while the bridge runs is used only after a restart,
+    /// as Tauri keeps what it found as it started (#389). So the answer kept at
+    /// the start stays, no window is built, and the message says to start the
+    /// bridge again.
+    #[test]
+    fn a_runtime_installed_after_the_start_waits_for_a_restart() {
+        use crate::i18n::Lang;
+        let installed = || Ok("142.0.3595.53".to_string());
+        let at_start = WebView2AtStart::new();
+        assert_eq!(at_start.answer(installed), installed(), "before the start, a lookup now");
+        at_start.remember(|| Err(NOT_FOUND.to_string()));
+        // The runtime is installed: a later lookup finds it.
+        at_start.remember(installed);
+        let answer = at_start.answer(installed);
+        assert_eq!(answer, Err(NOT_FOUND.to_string()), "the start's answer stays");
+        for (lang, quit) in
+            [(Lang::Uk, "(меню біля годинника → «Вийти»)"), (Lang::En, "(the menu by the clock → “Quit”)")]
+        {
+            let strings = Strings::new(lang);
+            let opened = open(answer.clone(), "settings", &strings, None);
+            assert!(!opened.built, "no window is built");
+            let [(_, text, _)] = opened.told.as_slice() else { panic!("told once, not {}", opened.told.len()) };
+            assert!(text.contains(quit) && text.contains(strings.get("menu.quit")), "it says to restart: {text}");
+        }
     }
 }
