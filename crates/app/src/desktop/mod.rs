@@ -112,6 +112,9 @@ pub fn run() {
             let _busy = BUSY.mark("the start");
             // First: an end of the session during the start ends the bridge too (#340).
             session::start(app.handle());
+            // As Tauri asked a moment ago, while it started: its answer stays
+            // until the app ends, and so does this one (#389).
+            windows::look_for_webview2();
             let started = Shared::start(strings);
             let shared = Arc::new(started.shared);
             app.manage(shared.clone());

@@ -7,6 +7,7 @@
 //!
 //! - `build-hangs`: a window's build never finishes;
 //! - `build-fails`: a window's build fails;
+//! - `no-webview2`: the WebView2 loader finds no runtime (#389);
 //! - `page-not-ready`: no page says it is ready;
 //! - `show-fails`: the settings window cannot be brought forward;
 //! - `view-blocks`: the command `view`, which every page calls as it loads,

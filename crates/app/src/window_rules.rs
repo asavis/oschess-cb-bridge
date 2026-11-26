@@ -301,6 +301,32 @@ fn windows_are_built_off_the_event_loop() {
     assert!(task.contains("build_window("), "build_window is called inside the spawned task");
 }
 
+/// Where the WebView2 loader found no runtime as the app started, no window
+/// is built (#389): `spawn_window`, where every window is built, asks first
+/// and returns when the answer is no, before an opening starts or a build is
+/// posted. The answer is the one kept at the start, as Tauri keeps its own,
+/// and the start keeps it before the tray or any window is made.
+#[test]
+fn no_window_is_built_without_webview2() {
+    let files = sources();
+    let windows = source(&files, "windows.rs");
+    let spawn = body(windows, "spawn_window").unwrap();
+    let asked = spawn.find("if !webview2_found(&app, &spec) {").expect("spawn_window asks whether WebView2 can draw");
+    assert_eq!(spawn[asked..].lines().nth(1).map(str::trim), Some("return;"), "and builds nothing when it cannot");
+    for later in ["openings.request(", "build_window("] {
+        assert!(spawn.find(later).is_some_and(|at| asked < at), "it asks before {later}");
+    }
+    let found = body(windows, "webview2_found").unwrap();
+    assert!(found.contains("WEBVIEW2.answer(") && found.contains("opening::webview2_found("), "the start's answer");
+    assert!(body(windows, "look_for_webview2").unwrap().contains("WEBVIEW2.remember("));
+    assert_eq!(count(&files, "tauri::webview_version()").iter().find(|(n, _)| n == "windows.rs").map(|c| c.1), Some(1));
+    let run = body(source(&files, "mod.rs"), "run").unwrap();
+    let kept = run.find("windows::look_for_webview2();").expect("the start keeps the loader's answer");
+    for later in ["tray::create(", "windows::open_first_run(", "commands::open_pairing_now("] {
+        assert!(run.find(later).is_some_and(|at| kept < at), "it is kept before {later}");
+    }
+}
+
 /// A command that may open a window is asynchronous, so it does not run on the
 /// event loop's thread in the first place.
 #[test]
